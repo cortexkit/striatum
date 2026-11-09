@@ -1,0 +1,6 @@
+[
+  {"outcome":"contract_error","before_ledger":"error","after_ledger":"interrupted","availability_penalty":false,"affinity":"kept"},
+  {"outcome":"session_error","before_ledger":"error","after_ledger":"interrupted","availability_penalty":false,"affinity":"kept"},
+  {"outcome":"interrupted","before_ledger":"error","after_ledger":"interrupted","availability_penalty":false,"affinity":"kept"},
+  {"outcome":"launch_failed","before_ledger":"error","after_ledger":"interrupted","availability_penalty":false,"affinity":"kept"}
+]

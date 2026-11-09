@@ -1,0 +1,17 @@
+{
+  "admission_id": "run-sid-EXAMPLEadmission0000000",
+  "caller": {
+    "runner": "broca"
+  },
+  "event_id": "11111111-2222-4333-8444-555555555555:42",
+  "headers": {
+    "anthropic-ratelimit-unified-5h-utilization": "0.42",
+    "anthropic-ratelimit-unified-status": "allowed"
+  },
+  "kind": "account_limit_exhausted",
+  "limit_window": "5h",
+  "observed_at_ms": 1793895481382,
+  "resets_at_ms": 1793899081382,
+  "resets_at_source": "header",
+  "upstream_origin": "upstream"
+}

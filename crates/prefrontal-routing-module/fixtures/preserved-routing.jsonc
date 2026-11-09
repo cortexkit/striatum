@@ -1,0 +1,32 @@
+{
+  // Every preserved key.
+  "catalog": {"poll_ms": 12345},
+  "account_selection": {"enabled": true},
+  "model_routing": {
+    "exclude": {
+      "all": ["anthropic", "-anthropic/claude-5", "openai/gpt-6/high"],
+      "mason": ["openai/gpt-6-astra", "kimi-code-plan-global/k3"],
+      "sidekick": ["xai", "-xai/grok-5"],
+      "athena": ["local/model"],
+      "lab": ["google/gemini-4"],
+      "core": ["deepseek"]
+    },
+    "subscription": ["openai", "-openai/metered"],
+    "score_alias": {"anthropic-platform": "anthropic"},
+    "models": {
+      "openai/gpt-6/high": {
+        "elo": 1800, "eq": 1750, "speed": 90,
+        "cost_per_mtok_out": 4, "context_window": 100000,
+        "vision": true, "speed_multiplier": 1.5, "subscription_multiplier": 20
+      }
+    },
+    "elo_overrides": {"openai/gpt-6/high": 1900},
+    "demand_exponent": 1.5,
+    "overqualification": {"threshold": 10, "doubling": 20, "base": 0.5},
+    "min_best_effort_adequacy": 0.7,
+    "consecutive_terminal_failure_threshold": 4,
+    "providers_without_prompt_cache": ["local", "xai"],
+    "subscription_multipliers": {"openai": 40},
+    "keep_free_percent": {"openai": 15},
+  },
+}

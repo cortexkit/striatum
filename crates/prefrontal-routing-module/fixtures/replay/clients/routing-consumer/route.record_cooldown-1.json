@@ -1,0 +1,5 @@
+{
+  "routeKey": "openai/gpt-5.5/high",
+  "capacityKey": "openai/gpt-5.5",
+  "cooldownUntil": 1780000100000
+}

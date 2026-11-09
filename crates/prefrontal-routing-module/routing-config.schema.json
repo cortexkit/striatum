@@ -1,0 +1,1490 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoutingConfigFile",
+  "type": "object",
+  "properties": {
+    "accounts": {
+      "$ref": "#/$defs/ProviderAccountsPolicy",
+      "default": {
+        "floors": null,
+        "hold_when_reset_within": null,
+        "max_hold": null,
+        "metered_fallback": false,
+        "order": null,
+        "ordered": null,
+        "paid_credits": null,
+        "soft_quota_remaining_percent": null,
+        "spend_budget": null,
+        "spend_budget_reset_at_ms": null,
+        "strategy": null,
+        "unknown_reset_retry": null
+      }
+    },
+    "catalog": {
+      "$ref": "#/$defs/CatalogSection",
+      "default": {
+        "poll_ms": null
+      }
+    },
+    "consecutive_terminal_failure_threshold": {
+      "description": "Terminal send failures required before the route-local safety backoff starts.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "uint32",
+      "default": null,
+      "minimum": 1
+    },
+    "consumers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ConsumerPolicy"
+      },
+      "default": {}
+    },
+    "demand_exponent": {
+      "description": "Power-curve exponent mapping caller IQ demand to the request frontier.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "default": null,
+      "exclusiveMinimum": 0
+    },
+    "head_agents": {
+      "description": "Target agents that are heads: operator-facing sessions that may spend\na subscription's kept-free reserve. Matched case-insensitively.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "min_best_effort_adequacy": {
+      "description": "Minimum adequacy for best-effort selection (sanity band). Default 0.6.\nClamped to [0, 1]; NaN is rejected loudly at parse time.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double",
+      "default": null
+    },
+    "model_naming": {
+      "description": "How providers spell model ids and which model families the capability\nheuristic recognizes; see `ModelNamingConfig`.",
+      "$ref": "#/$defs/ModelNamingConfig",
+      "default": {
+        "basic_families": [],
+        "provider_rewrites": {},
+        "vendor_prefixes": []
+      }
+    },
+    "models": {
+      "description": "Keyed by \"provider/model\" or \"provider/model/variant\".",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ModelFactOverride"
+      },
+      "default": {}
+    },
+    "overqualification": {
+      "description": "Over-qualification term added to selection cost for routes far above the\nrequest's iq demand. Absent fields take the routing-core defaults.",
+      "$ref": "#/$defs/OverqualificationSection",
+      "default": {
+        "base": null,
+        "doubling": null,
+        "threshold": null
+      }
+    },
+    "panels": {
+      "$ref": "#/$defs/PanelPolicies",
+      "default": {}
+    },
+    "providers": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderPolicy"
+      },
+      "default": {}
+    },
+    "quota_model_pools": {
+      "description": "Quota pools that meter only some models: a routed model whose id\nstarts with `model_prefix` draws on `pool` beside its family pool.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/QuotaModelPoolConfig"
+      }
+    },
+    "runners": {
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/RunnerPolicy"
+      }
+    },
+    "subscription_multipliers": {
+      "description": "Provider-wide subscription multipliers. Legacy route keys are accepted\nonly to warn and discard them; model-level values never override these.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "number",
+        "format": "double"
+      },
+      "writeOnly": true
+    },
+    "substrates": {
+      "description": "Route-to-harness mapping. Resolve the workload group, consumer group,\nthen `all`, taking each group's longest matching route key or default.\nRoutes not covered by any group run on Broca.",
+      "$ref": "#/$defs/SubstrateGroups",
+      "default": {}
+    },
+    "variants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {}
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "AccountDuration": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "AccountPoolFloor": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pool": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "remaining_percent": {
+          "type": "number",
+          "format": "double"
+        },
+        "window_minutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "remaining_percent"
+      ]
+    },
+    "BasicFamilyConfig": {
+      "type": "object",
+      "properties": {
+        "family": {
+          "type": "string"
+        },
+        "needles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "family",
+        "needles"
+      ]
+    },
+    "CatalogSection": {
+      "type": "object",
+      "properties": {
+        "poll_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "ConsumerMode": {
+      "type": "string",
+      "enum": [
+        "demand",
+        "ladder"
+      ]
+    },
+    "ConsumerPolicy": {
+      "type": "object",
+      "properties": {
+        "context_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "eq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "iq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "ladder": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "max_output_tokens": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "default": null,
+          "minimum": 0
+        },
+        "mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ConsumerMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "owner": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "pay_per_token": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "pin": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SynthesizerPin"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "projects": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ProjectPolicy"
+          },
+          "default": {}
+        },
+        "runner": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "service_tiers": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "$ref": "#/$defs/Tier"
+          },
+          "default": null
+        },
+        "tool_capabilities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "variants": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ExtraRanking": {
+      "type": "string",
+      "enum": [
+        "random",
+        "iq",
+        "eq",
+        "cost"
+      ]
+    },
+    "Harness": {
+      "description": "Harness names are a closed config contract, not inferred from providers.",
+      "type": "string",
+      "enum": [
+        "broca",
+        "opencode",
+        "pi"
+      ]
+    },
+    "ModelFactOverride": {
+      "description": "One per-model override. Every field is optional: a present field is operator-owned,\nwhile a withdrawn field returns to its non-override authority.",
+      "type": "object",
+      "properties": {
+        "context_window": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "cost_per_mtok_out": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "elo": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "eq": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "not_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "only_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "pin_only": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "pin_only_for": {
+          "description": "Like `pin_only`, but only for these consumers and their dotted\ndescendants: other admitted consumers still route here automatically.\nLets a scarce model serve one consumer by choice and others by pin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "speed": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "speed_multiplier": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0,
+          "maximum": 2
+        },
+        "subscription": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "subscription_multiplier": {
+          "description": "Retained for old operator files. Ignored with a warning at load because\nsubscription value belongs to the provider, not an individual model.",
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double"
+        },
+        "vision": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelNamingConfig": {
+      "description": "Operator config for `prefrontal_routing_core::ModelNaming`, the model-id\nspelling `route.resolve_model` applies per provider and the model families\n`route.model_capabilities` recognizes by name. The config converter writes\nthe shipped values from its data file.",
+      "type": "object",
+      "properties": {
+        "basic_families": {
+          "description": "Families recognized by a substring of the normalized model id, each\nwith the basic variants. The first match wins.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/BasicFamilyConfig"
+          }
+        },
+        "provider_rewrites": {
+          "description": "The rewrites each provider applies to a model id, in order.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/ModelRewriteConfig"
+            }
+          },
+          "default": {}
+        },
+        "vendor_prefixes": {
+          "description": "For a gateway serving other vendors' models as `vendor/model`: the\nvendor of a bare model id, by the id's prefix. The first match wins.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/VendorPrefixConfig"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "ModelRewriteConfig": {
+      "description": "`vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a\ndashed two-part Claude-style version with a dot; `{\"preview_alias\": a}`\nexpands the bare alias `a` to its `-preview` id.",
+      "oneOf": [
+        {
+          "type": "string",
+          "enum": [
+            "vendor_prefix",
+            "dot_version"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "preview_alias": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "preview_alias"
+          ]
+        }
+      ]
+    },
+    "OverqualificationSection": {
+      "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
+      "type": "object",
+      "properties": {
+        "base": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        },
+        "doubling": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "exclusiveMinimum": 0
+        },
+        "threshold": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "PanelPolicies": {
+      "type": "object",
+      "properties": {
+        "audit": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "design_review": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "diagnose": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "evaluate": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "explain": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "lab": {
+          "$ref": "#/$defs/PanelPolicy"
+        },
+        "spec": {
+          "$ref": "#/$defs/PanelPolicy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PanelPolicy": {
+      "type": "object",
+      "properties": {
+        "by": {
+          "$ref": "#/$defs/Ranking"
+        },
+        "extra": {
+          "type": "integer",
+          "format": "uint8",
+          "default": 0,
+          "maximum": 7,
+          "minimum": 0
+        },
+        "extraBy": {
+          "$ref": "#/$defs/ExtraRanking"
+        },
+        "floor": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 100,
+          "minimum": 0
+        },
+        "topK": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 8,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "extra": {
+                "minimum": 1
+              }
+            },
+            "required": [
+              "extra"
+            ]
+          },
+          "then": {
+            "properties": {
+              "extraBy": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "extraBy"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 7
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 2
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 6
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 3
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 5
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 4
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 4
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 5
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 3
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 6
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 2
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 7
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "topK": {
+                "const": 8
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "extra": {
+                "maximum": 0
+              }
+            }
+          }
+        }
+      ],
+      "required": [
+        "topK",
+        "by",
+        "extraBy",
+        "floor"
+      ]
+    },
+    "ProjectPolicy": {
+      "type": "object",
+      "properties": {
+        "pin": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderAccountsPolicy": {
+      "description": "Per-provider account controls. Metered fallback requires explicit opt-in.",
+      "type": "object",
+      "properties": {
+        "floors": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "$ref": "#/$defs/AccountPoolFloor"
+          }
+        },
+        "hold_when_reset_within": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "max_hold": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "metered_fallback": {
+          "type": "boolean",
+          "default": false
+        },
+        "order": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "ordered": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "paid_credits": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "soft_quota_remaining_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "spend_budget_reset_at_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int64",
+          "default": null
+        },
+        "strategy": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "unknown_reset_retry": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AccountDuration"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderPolicy": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "$ref": "#/$defs/ProviderAccountsPolicy",
+          "default": {
+            "floors": null,
+            "hold_when_reset_within": null,
+            "max_hold": null,
+            "metered_fallback": false,
+            "order": null,
+            "ordered": null,
+            "paid_credits": null,
+            "soft_quota_remaining_percent": null,
+            "spend_budget": null,
+            "spend_budget_reset_at_ms": null,
+            "strategy": null,
+            "unknown_reset_retry": null
+          }
+        },
+        "keep_free_percent": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        },
+        "models": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "not_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "only_for": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "pin_only": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "pin_only_for": {
+          "description": "Like `pin_only`, but only for these consumers and their dotted\ndescendants: other admitted consumers still route here automatically.\nLets a scarce model serve one consumer by choice and others by pin.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "prompt_cache": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "service_tier": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Tier"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "subscription": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "subscription_multiplier": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "double",
+          "default": null
+        }
+      },
+      "additionalProperties": false
+    },
+    "QuotaModelPoolConfig": {
+      "type": "object",
+      "properties": {
+        "model_prefix": {
+          "type": "string"
+        },
+        "pool": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model_prefix",
+        "pool"
+      ]
+    },
+    "Ranking": {
+      "type": "string",
+      "enum": [
+        "iq",
+        "eq",
+        "cost"
+      ]
+    },
+    "RunnerPolicy": {
+      "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
+      "type": "object",
+      "properties": {
+        "module": {
+          "description": "The runner's module id. Only a route principal the daemon verified as\nthis module may call the runner operations.",
+          "type": "string",
+          "pattern": "^\\S+$"
+        },
+        "routes": {
+          "description": "The routes it runs, in the exclusion grammar (`provider`,\n`provider/model`, `provider/model/variant`). Absent: every route it\nserves. With `via_vault`, reach also requires a serving vault credential.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "tool_capabilities": {
+          "description": "Tool capability tags (such as `code.read/v1`) the runner can reach a\ntool provider for. A select that lists tool capabilities is answered\nonly on a runner reaching every one of them.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "via_vault": {
+          "description": "When true, reaching this runner also requires a serving vault credential.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "module"
+      ]
+    },
+    "SubstrateGroups": {
+      "type": "object",
+      "properties": {
+        "all": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "athena": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "codemode": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "core": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "flow": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "hire": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "lab": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "mason": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "persona_seat": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.comments": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.explore": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.gather": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.librarian": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.map": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.planner": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.reader": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        },
+        "sidekick.reviewer": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/Harness"
+          },
+          "propertyNames": {
+            "allOf": [
+              {
+                "pattern": "^[^/]+(/[\\s\\S]+)?$"
+              },
+              {
+                "not": {
+                  "pattern": "^[-\\s]|\\s$"
+                }
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "SynthesizerPin": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string",
+          "pattern": "^[^/\\s]+/[^\\s]+$"
+        },
+        "variant": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "model",
+        "variant"
+      ]
+    },
+    "Tier": {
+      "type": "string",
+      "enum": [
+        "standard",
+        "fast",
+        "ultrafast"
+      ]
+    },
+    "VendorPrefixConfig": {
+      "type": "object",
+      "properties": {
+        "prefix": {
+          "type": "string"
+        },
+        "vendor": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "prefix",
+        "vendor"
+      ]
+    }
+  }
+}

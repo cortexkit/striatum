@@ -1,0 +1,13 @@
+{
+  "providerID": "openai",
+  "modelID": "gpt-5.4",
+  "runtimeModel": {
+    "limit": {
+      "output": 128000
+    }
+  },
+  "desired": {
+    "variant": "high",
+    "maxTokens": 64000
+  }
+}

@@ -1,0 +1,1078 @@
+[
+  {
+    "row": "credential-fence",
+    "reason": "Known route-fence resets now produce timed pin_unavailable refusals instead of untimed no_eligible_account; the public pin refusal is recorded and fallback names quota_exhausted.",
+    "changes": [
+      {
+        "op": "replace",
+        "path": "/launches/0/reply/result/detail/pin_reason",
+        "before": "no_eligible_account",
+        "after": "quota_exhausted"
+      },
+      {
+        "op": "append",
+        "path": "/launches/1/after_select/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/code",
+        "before": "no_eligible_account",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted",
+          "reset_at_ms": 1800000600000
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/message",
+        "before": "example-subscription/model-c: no eligible account",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/1/state/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/after_select/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          },
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/code",
+        "before": "no_eligible_account",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted",
+          "reset_at_ms": 1800000600000
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/message",
+        "before": "example-subscription/model-c: no eligible account",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/state/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          },
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "row": "no-eligible-account",
+    "reason": "The zero-wait probe now preserves the known quota reset in pin_unavailable and records the public pin refusal; existing holdable pin answers are unchanged.",
+    "changes": [
+      {
+        "op": "append",
+        "path": "/launches/2/after_select/model_route_decisions",
+        "before": 3,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/code",
+        "before": "quota_exhausted",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted",
+          "reset_at_ms": 1800000600000
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/message",
+        "before": "example-subscription/model-c: quota_exhausted until 2027-01-15T08:10:00Z",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/state/model_route_decisions",
+        "before": 3,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000600000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "row": "all-accounts-held",
+    "reason": "The zero-wait probe now preserves the short known quota reset in pin_unavailable and records the public pin refusal; existing holdable pin answers are unchanged.",
+    "changes": [
+      {
+        "op": "append",
+        "path": "/launches/2/after_select/model_route_decisions",
+        "before": 3,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000005000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/code",
+        "before": "quota_exhausted",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted",
+          "reset_at_ms": 1800000005000
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/message",
+        "before": "example-subscription/model-c: quota_exhausted until 2027-01-15T08:00:05Z",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/state/model_route_decisions",
+        "before": 3,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted",
+                  "reset_at_ms": 1800000005000
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "row": "unknown-reset",
+    "reason": "Account limits without a known reset now use untimed pin_unavailable, never invent reset_at_ms; public pin refusals are recorded and fallback names quota_exhausted.",
+    "changes": [
+      {
+        "op": "replace",
+        "path": "/launches/0/reply/result/detail/pin_reason",
+        "before": "account_pool_reserve_limited",
+        "after": "quota_exhausted"
+      },
+      {
+        "op": "append",
+        "path": "/launches/1/after_select/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/code",
+        "before": "account_pool_reserve_limited",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted"
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/message",
+        "before": "example-subscription/model-c: account_pool_reserve_limited; clearing time unknown",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/1/state/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/after_select/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          },
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/code",
+        "before": "account_pool_reserve_limited",
+        "after": "pin_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/detail",
+        "before": {},
+        "after": {
+          "pin": "example-subscription/model-c",
+          "reason": "quota_exhausted"
+        }
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/message",
+        "before": "example-subscription/model-c: account_pool_reserve_limited; clearing time unknown",
+        "after": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+      },
+      {
+        "op": "append",
+        "path": "/launches/2/state/model_route_decisions",
+        "before": 2,
+        "after": [
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000002",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          },
+          {
+            "allowed_account_class": "not_pay_per_token",
+            "allowed_providers_json": null,
+            "anchor_version": 5,
+            "catalog_fingerprint": "6d44b9223a879429",
+            "consumer": "example_summary",
+            "created_at": 1800000000000,
+            "decision_kind": "single",
+            "explanation_json": {
+              "correlation_id": null,
+              "failureReason": "quota_exhausted",
+              "pin": "example-subscription/model-c",
+              "refusal": {
+                "code": "pin_unavailable",
+                "detail": {
+                  "pin": "example-subscription/model-c",
+                  "reason": "quota_exhausted"
+                },
+                "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+              }
+            },
+            "harness": null,
+            "id": "dec_000000000003",
+            "outcome": null,
+            "outcome_at": null,
+            "outcome_error": null,
+            "parent_session_id": null,
+            "policy_revision": null,
+            "previous_decision_id": null,
+            "project_id": null,
+            "project_root": null,
+            "provider_identity_json": null,
+            "quota_signal_json": null,
+            "rejected_json": [],
+            "requirements_json": {
+              "iq": 50
+            },
+            "score_json": {},
+            "selected_harness": null,
+            "selected_model_id": null,
+            "selected_provider_id": null,
+            "selected_route_key": null,
+            "selected_variant": null,
+            "selected_workload": null,
+            "send_id": null,
+            "service_tier_accounts_json": null,
+            "service_tier_chosen": null,
+            "target_agent": "example_summary",
+            "task_id": null,
+            "workdir": null
+          }
+        ]
+      }
+    ]
+  }
+]

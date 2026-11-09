@@ -1,0 +1,10 @@
+{
+  "admission_id": "run-sid-EXAMPLEadmission0000000",
+  "caller": {
+    "runner": "broca"
+  },
+  "event_id": "11111111-2222-4333-8444-555555555555:42",
+  "kind": "attempt",
+  "terminal_reason": "transport_failure",
+  "upstream_origin": "upstream"
+}

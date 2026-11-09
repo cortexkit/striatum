@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "module_id": "prefrontal-routing",
+  "entries": [
+    {
+      "entry_id": "prefrontal-routing/store",
+      "class": "portable",
+      "mechanism": "page-db",
+      "path": "store.db",
+      "writer_interaction": "read-transaction-live",
+      "exclude_tables": [
+        "model_route_decisions",
+        "account_observation",
+        "account_decision",
+        "quota_reading_log",
+        "route_winner_baseline",
+        "fusiform_catalog_cursor",
+        "routing_operator_quality_state",
+        "routing_operator_quality"
+      ]
+    },
+    {
+      "entry_id": "prefrontal-routing/engram-catalog",
+      "class": "excluded",
+      "mechanism": "filetree",
+      "path": "engram-catalog.json",
+      "reason": "The module regenerates this catalog from its bundled crate source at startup."
+    }
+  ]
+}

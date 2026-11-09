@@ -1,0 +1,2236 @@
+{
+  "body_source": "public routing/v1 route.select replies through the real frame handler; availability table scenarios",
+  "cases": [
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000001",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000003",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        }
+      ],
+      "name": "available"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "cooldown"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "cooldown",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: cooldown"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "cooldown",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: cooldown"
+          }
+        }
+      ],
+      "name": "route-cooldown"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "quota_exhausted"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: quota_exhausted"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: quota_exhausted"
+          }
+        }
+      ],
+      "name": "quota-wall"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "quota_exhausted"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: quota_exhausted"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: quota_exhausted"
+          }
+        }
+      ],
+      "name": "provider-wall"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "quota_exhausted"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        }
+      ],
+      "name": "credential-fence"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000001",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        }
+      ],
+      "name": "no-eligible-account"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000001",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted",
+              "reset_at_ms": 1800000005000
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        }
+      ],
+      "name": "all-accounts-held"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "concurrency_slots": [
+              {
+                "key": "example-subscription/model-c",
+                "limit": 1,
+                "queued": 1,
+                "running": 1
+              }
+            ],
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000001",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "no-fallback",
+          "params": {
+            "concurrency_slots": [
+              {
+                "key": "example-subscription/model-c",
+                "limit": 1,
+                "queued": 1,
+                "running": 1
+              }
+            ],
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000002",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Response",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 200000,
+              "decision_id": "dec_000000000003",
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-subscription/model-c on runner-one for consumer example_summary, chosen by the request's pin.",
+              "max_output_tokens": 64000,
+              "pin_outcome": "pinned",
+              "route": {
+                "model": "model-c",
+                "provider": "example-subscription"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-c",
+                  "provider": "example-subscription"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        }
+      ],
+      "name": "capacity-exhausted"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "missing/model",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "unknown_provider"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "missing/model",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "missing/model",
+              "reason": "unknown_provider"
+            },
+            "message": "the pin \"missing/model\" cannot be served: unknown_provider"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "missing/model",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "missing/model",
+              "reason": "unknown_provider"
+            },
+            "message": "the pin \"missing/model\" cannot be served: unknown_provider"
+          }
+        }
+      ],
+      "name": "unsupported-pin"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Error",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "missing-runner"
+            ]
+          },
+          "reply": {
+            "code": "no_route",
+            "detail": {
+              "reason": "no_available_model"
+            },
+            "message": "no route meets the request: no_available_model"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "missing-runner"
+            ]
+          },
+          "reply": {
+            "code": "no_route",
+            "detail": {
+              "reason": "no_available_model"
+            },
+            "message": "no route meets the request: no_available_model"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            },
+            "runners": [
+              "missing-runner"
+            ]
+          },
+          "reply": {
+            "code": "no_route",
+            "detail": {
+              "reason": "no_available_model"
+            },
+            "message": "no route meets the request: no_available_model"
+          }
+        }
+      ],
+      "name": "unsupported-runner"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Response",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "result": {
+              "context_window": 128000,
+              "decision_id": "dec_000000000001",
+              "detail": {
+                "pin_reason": "quota_exhausted"
+              },
+              "expires_at_ms": 1800000600000,
+              "explanation": "example-provider/model-b on runner-one for consumer example_summary, chosen by the lowest-cost route that meets the requirements.",
+              "max_output_tokens": 16000,
+              "pin_outcome": "fell_back",
+              "route": {
+                "model": "model-b",
+                "provider": "example-provider"
+              },
+              "runner": {
+                "harness": "alpha",
+                "model": {
+                  "model": "model-b",
+                  "provider": "example-provider"
+                },
+                "module": "runner-one"
+              }
+            }
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted"
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "quota_exhausted"
+            },
+            "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
+          }
+        }
+      ],
+      "name": "unknown-reset"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Error",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "no_route",
+            "detail": {
+              "blockingCauses": [
+                {
+                  "adequateRoutes": [
+                    {
+                      "resetAtMs": 1800000600000.0,
+                      "routeKey": "example-provider/model-a"
+                    },
+                    {
+                      "resetAtMs": 1800000600000.0,
+                      "routeKey": "example-provider/model-b"
+                    },
+                    {
+                      "resetAtMs": 1800000600000.0,
+                      "routeKey": "example-subscription/model-c"
+                    },
+                    {
+                      "resetAtMs": 1800000600000.0,
+                      "routeKey": "example-subscription/model-d"
+                    }
+                  ],
+                  "count": 4,
+                  "reason": "cooldown_active",
+                  "routes": [
+                    {
+                      "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                      "reason": "cooldown_active",
+                      "routeKey": "example-provider/model-a"
+                    },
+                    {
+                      "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                      "reason": "cooldown_active",
+                      "routeKey": "example-provider/model-b"
+                    },
+                    {
+                      "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                      "reason": "cooldown_active",
+                      "routeKey": "example-subscription/model-c"
+                    },
+                    {
+                      "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                      "reason": "cooldown_active",
+                      "routeKey": "example-subscription/model-d"
+                    }
+                  ]
+                },
+                {
+                  "adequateRoutes": [
+                    {
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    }
+                  ],
+                  "count": 46,
+                  "reason": "no_eligible_account",
+                  "routes": [
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-build-0.1"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    }
+                  ]
+                }
+              ],
+              "reason": "quota_or_cooldown",
+              "rejected": [
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-8"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-sonnet-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.1-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.5-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4-mini"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-build-0.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.2"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.7-code"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/qwen3.5:397b"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/mistral-large-3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-fable-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "kimi-for-coding/k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.7-flash"
+                },
+                {
+                  "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                  "reason": "cooldown_active",
+                  "routeKey": "example-provider/model-a"
+                },
+                {
+                  "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                  "reason": "cooldown_active",
+                  "routeKey": "example-provider/model-b"
+                },
+                {
+                  "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                  "reason": "cooldown_active",
+                  "routeKey": "example-subscription/model-c"
+                },
+                {
+                  "detail": "wall for 600s more (until_ms=1800000600000, now_ms=1800000000000)",
+                  "reason": "cooldown_active",
+                  "routeKey": "example-subscription/model-d"
+                }
+              ],
+              "reset_at_ms": 1800000600000
+            },
+            "message": "no route meets the request: quota_or_cooldown: no admissible model route for requirements. Earliest route wall expiry: example-provider/model-a (until_ms=1800000600000); other fences may remain. cooldown active: 4 (example-provider/model-a, until_ms=1800000600000, example-provider/model-b, until_ms=1800000600000, example-subscription/model-c, until_ms=1800000600000, example-subscription/model-d, until_ms=1800000600000); no_eligible_account: 46 (alibaba-token-plan, anthropic, google, kimi-for-coding, ollama-cloud, openai, xai)."
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "cooldown",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: cooldown"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "cooldown",
+              "reset_at_ms": 1800000600000
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: cooldown"
+          }
+        }
+      ],
+      "name": "all-routes-timed-unavailable"
+    },
+    {
+      "launches": [
+        {
+          "frame_type": "Error",
+          "kind": "fallback",
+          "params": {
+            "consumer": "example_summary",
+            "exclude": [
+              "example-provider/model-a",
+              "example-provider/model-b",
+              "example-subscription/model-c",
+              "example-subscription/model-d"
+            ],
+            "pin": "example-subscription/model-c",
+            "pin_fallback": "route",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "no_route",
+            "detail": {
+              "blockingCauses": [
+                {
+                  "adequateRoutes": [
+                    {
+                      "routeKey": "example-provider/model-a"
+                    },
+                    {
+                      "routeKey": "example-provider/model-b"
+                    },
+                    {
+                      "routeKey": "example-subscription/model-c"
+                    },
+                    {
+                      "routeKey": "example-subscription/model-d"
+                    }
+                  ],
+                  "count": 4,
+                  "reason": "excluded",
+                  "routes": [
+                    {
+                      "reason": "excluded",
+                      "routeKey": "example-provider/model-a"
+                    },
+                    {
+                      "reason": "excluded",
+                      "routeKey": "example-provider/model-b"
+                    },
+                    {
+                      "reason": "excluded",
+                      "routeKey": "example-subscription/model-c"
+                    },
+                    {
+                      "reason": "excluded",
+                      "routeKey": "example-subscription/model-d"
+                    }
+                  ]
+                },
+                {
+                  "adequateRoutes": [
+                    {
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "routeKey": "xai/grok-build-0.1"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    }
+                  ],
+                  "count": 46,
+                  "reason": "no_eligible_account",
+                  "routes": [
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-7"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-4-8"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-sonnet-4-6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.1-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.5-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.4"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.4-mini"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-build-0.1"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-sol"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-sol-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-terra"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-terra-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-luna"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "openai/gpt-5.6-luna-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/glm-5.2"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-pro"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.7-code"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/glm-5.1"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m2.7"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/minimax-m2.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k2.5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/qwen3.5:397b"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/mistral-large-3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-fable-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "kimi-for-coding/k3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.7-max"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.6-flash"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "anthropic/claude-opus-5"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "alibaba-token-plan/qwen3.8-max"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "ollama-cloud/kimi-k3"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "xai/grok-4.6"
+                    },
+                    {
+                      "reason": "no_eligible_account",
+                      "routeKey": "google/antigravity-gemini-3.7-flash"
+                    }
+                  ]
+                }
+              ],
+              "reason": "no_available_model",
+              "rejected": [
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-8"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-sonnet-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.1-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.5-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4-mini"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-build-0.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.2"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.7-code"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/qwen3.5:397b"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/mistral-large-3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-fable-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "kimi-for-coding/k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.7-flash"
+                },
+                {
+                  "reason": "excluded",
+                  "routeKey": "example-provider/model-a"
+                },
+                {
+                  "reason": "excluded",
+                  "routeKey": "example-provider/model-b"
+                },
+                {
+                  "reason": "excluded",
+                  "routeKey": "example-subscription/model-c"
+                },
+                {
+                  "reason": "excluded",
+                  "routeKey": "example-subscription/model-d"
+                }
+              ]
+            },
+            "message": "no route meets the request: no_available_model: no admissible model route for requirements"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "no-fallback",
+          "params": {
+            "consumer": "example_summary",
+            "exclude": [
+              "example-provider/model-a",
+              "example-provider/model-b",
+              "example-subscription/model-c",
+              "example-subscription/model-d"
+            ],
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "excluded"
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: excluded"
+          }
+        },
+        {
+          "frame_type": "Error",
+          "kind": "probe",
+          "params": {
+            "consumer": "example_summary",
+            "exclude": [
+              "example-provider/model-a",
+              "example-provider/model-b",
+              "example-subscription/model-c",
+              "example-subscription/model-d"
+            ],
+            "hold_ok": false,
+            "hold_wait_max_s": 0,
+            "pin": "example-subscription/model-c",
+            "requirements": {
+              "iq": 50
+            }
+          },
+          "reply": {
+            "code": "pin_unavailable",
+            "detail": {
+              "pin": "example-subscription/model-c",
+              "reason": "excluded"
+            },
+            "message": "the pin \"example-subscription/model-c\" cannot be served: excluded"
+          }
+        }
+      ],
+      "name": "all-routes-untimed-unavailable"
+    }
+  ],
+  "clock_ms": 1800000000000
+}

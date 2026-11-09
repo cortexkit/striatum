@@ -1,0 +1,18 @@
+{
+  "cases": [
+    {
+      "name": "accepted-legacy-explain-spellings",
+      "body_source": "main.rs::RouteExplainParams serde aliases; main.rs::route_explain_by_send_id_returns_recorded_rejections_verbatim (policy spelling probes, not captured client traffic)",
+      "core": true,
+      "steps": [
+        {"method": "route.select", "params": {"targetAgent": "athena", "consumer": "athena", "executor": "broca", "substrate": "broca", "requirements": {"iq": 50, "eq": 0}, "sendID": "replay-explain"}},
+        {"method": "route.explain", "params": {"decisionID": "$decision"}},
+        {"method": "route.explain", "params": {"decisionId": "$decision"}},
+        {"method": "route.explain", "params": {"decision_id": "$decision"}},
+        {"method": "route.explain", "params": {"sendID": "replay-explain"}},
+        {"method": "route.explain", "params": {"sendId": "replay-explain"}},
+        {"method": "route.explain", "params": {"send_id": "replay-explain"}}
+      ]
+    }
+  ]
+}

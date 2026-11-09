@@ -1,0 +1,546 @@
+[
+  {
+    "providerID": "anthropic",
+    "modelID": "claude-opus-4-5",
+    "scores": {
+      "elo": 698,
+      "eq": 1698,
+      "speed": 76
+    },
+    "contextWindow": 200000,
+    "costTier": 4,
+    "costPerMTokOut": 25,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "high"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "anthropic",
+    "modelID": "claude-opus-4-6",
+    "scores": {
+      "elo": 1130,
+      "eq": 1751.7,
+      "speed": 61
+    },
+    "contextWindow": 1000000,
+    "costTier": 4,
+    "costPerMTokOut": 25,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "anthropic",
+    "modelID": "claude-opus-4-7",
+    "scores": {
+      "elo": 1635,
+      "eq": 1949.8,
+      "speed": 61
+    },
+    "contextWindow": 1000000,
+    "costTier": 4,
+    "costPerMTokOut": 25,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "anthropic",
+    "modelID": "claude-opus-4-8",
+    "scores": {
+      "elo": 1728,
+      "eq": 2115.5,
+      "speed": 72
+    },
+    "contextWindow": 1000000,
+    "costTier": 4,
+    "costPerMTokOut": 25,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "anthropic",
+    "modelID": "claude-sonnet-4-6",
+    "scores": {
+      "elo": 637,
+      "eq": 1752.4,
+      "speed": 68
+    },
+    "contextWindow": 1000000,
+    "costTier": 3,
+    "costPerMTokOut": 15,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "max"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "google",
+    "modelID": "antigravity-claude-opus-4-6-thinking",
+    "scores": {
+      "elo": 1442.1000000000001,
+      "eq": 1751.7,
+      "speed": 61
+    },
+    "contextWindow": 1000000,
+    "costTier": 4,
+    "costPerMTokOut": 25,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "google",
+    "modelID": "antigravity-claude-sonnet-4-6-thinking",
+    "scores": {
+      "elo": 1557.6000000000001,
+      "eq": 1752.4,
+      "speed": 68
+    },
+    "contextWindow": 1000000,
+    "costTier": 3,
+    "costPerMTokOut": 15,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "google",
+    "modelID": "antigravity-gemini-3.1-pro",
+    "scores": {
+      "elo": 1280,
+      "eq": 1532.6,
+      "speed": 143
+    },
+    "contextWindow": 1048576,
+    "costTier": 3,
+    "costPerMTokOut": 12,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "high"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "google",
+    "modelID": "antigravity-gemini-3.5-flash",
+    "scores": {
+      "elo": 1345,
+      "eq": 1490,
+      "speed": 237
+    },
+    "contextWindow": 1048576,
+    "costTier": 3,
+    "costPerMTokOut": 9,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "high"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.4",
+    "scores": {
+      "elo": 1589,
+      "eq": 1585.7,
+      "speed": 161
+    },
+    "contextWindow": 1050000,
+    "costTier": 3,
+    "costPerMTokOut": 15,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.4-mini",
+    "scores": {
+      "elo": 956,
+      "eq": 1430,
+      "speed": 194
+    },
+    "contextWindow": 400000,
+    "costTier": 2,
+    "costPerMTokOut": 4.5,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.5",
+    "scores": {
+      "elo": 1690,
+      "eq": 1596.5,
+      "speed": 63
+    },
+    "contextWindow": 1050000,
+    "costTier": 4,
+    "costPerMTokOut": 30,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "deepseek-v4-flash",
+    "scores": {
+      "elo": 1180,
+      "eq": 1494.2,
+      "speed": 120
+    },
+    "contextWindow": 1000000,
+    "costTier": 0,
+    "costPerMTokOut": 0.28,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "deepseek-v4-pro",
+    "scores": {
+      "elo": 1461.8999999999999,
+      "eq": 1599.8,
+      "speed": 102
+    },
+    "contextWindow": 1000000,
+    "costTier": 2,
+    "costPerMTokOut": 3.48,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "glm-5",
+    "scores": {
+      "elo": 1303.5,
+      "eq": 1533.2,
+      "speed": 65
+    },
+    "contextWindow": 202752,
+    "costTier": 2,
+    "costPerMTokOut": 3.2,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "glm-5.1",
+    "scores": {
+      "elo": 988,
+      "eq": 1557,
+      "speed": 90
+    },
+    "contextWindow": 202752,
+    "costTier": 2,
+    "costPerMTokOut": 4.4,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "glm-5.2",
+    "scores": {
+      "elo": 1660,
+      "eq": 1565,
+      "speed": 118
+    },
+    "contextWindow": 1000000,
+    "costTier": 2,
+    "costPerMTokOut": 4.4,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "kimi-k2.5",
+    "scores": {
+      "elo": 599,
+      "eq": 1541.7,
+      "speed": 42
+    },
+    "contextWindow": 262144,
+    "costTier": 1,
+    "costPerMTokOut": 3,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "kimi-k2.6",
+    "scores": {
+      "elo": 1215,
+      "eq": 1575.8,
+      "speed": 33
+    },
+    "contextWindow": 262144,
+    "costTier": 2,
+    "costPerMTokOut": 4,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "minimax-m2.5",
+    "scores": {
+      "elo": 520,
+      "eq": 1490,
+      "speed": 227
+    },
+    "contextWindow": 204800,
+    "costTier": 1,
+    "costPerMTokOut": 1.2,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "minimax-m2.7",
+    "scores": {
+      "elo": 984,
+      "eq": 1510,
+      "speed": 47
+    },
+    "contextWindow": 204800,
+    "costTier": 1,
+    "costPerMTokOut": 1.2,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "minimax-m3",
+    "scores": {
+      "elo": 1311,
+      "eq": 1520,
+      "speed": 65
+    },
+    "contextWindow": 512000,
+    "costTier": 0,
+    "costPerMTokOut": 0.4,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "qwen3.6-plus",
+    "scores": {
+      "elo": 1306.8,
+      "eq": 1510,
+      "speed": 52
+    },
+    "contextWindow": 1000000,
+    "costTier": 1,
+    "costPerMTokOut": 3,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "qwen3.7-max",
+    "scores": {
+      "elo": 1254,
+      "eq": 1690,
+      "speed": 202
+    },
+    "contextWindow": 1000000,
+    "costTier": 3,
+    "costPerMTokOut": 7.5,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "opencode-go",
+    "modelID": "qwen3.7-plus",
+    "scores": {
+      "elo": 715,
+      "eq": 1533,
+      "speed": 51
+    },
+    "contextWindow": 1000000,
+    "costTier": 1,
+    "costPerMTokOut": 1.6,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "xai",
+    "modelID": "grok-4.3",
+    "scores": {
+      "elo": 659,
+      "eq": 1480,
+      "speed": 153
+    },
+    "contextWindow": 1000000,
+    "costTier": 1,
+    "costPerMTokOut": 2.5,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "high"
+    },
+    "confidence": "curated"
+  },
+  {
+    "providerID": "xai",
+    "modelID": "grok-build-0.1",
+    "scores": {
+      "elo": 1313.3999999999999,
+      "eq": 1530,
+      "speed": 70
+    },
+    "contextWindow": 256000,
+    "costTier": 1,
+    "costPerMTokOut": 2,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "confidence": "curated"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-sol",
+    "scores": {
+      "elo": 1838,
+      "eq": 1610,
+      "speed": 55
+    },
+    "contextWindow": 1050000,
+    "costTier": 4,
+    "costPerMTokOut": 30,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-sol-pro",
+    "scores": {
+      "elo": 1838,
+      "eq": 1610,
+      "speed": 15
+    },
+    "contextWindow": 1050000,
+    "costTier": 4,
+    "costPerMTokOut": 30,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "pro route: same price as sibling, same benchmarked Elo as its sibling (AA does not cover pro), extended compute (slow); structurally unroutable: reserved for explicit Athena-v2 selection"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-terra",
+    "scores": {
+      "elo": 1685,
+      "eq": 1590,
+      "speed": 95
+    },
+    "contextWindow": 1050000,
+    "costTier": 3,
+    "costPerMTokOut": 15,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-terra-pro",
+    "scores": {
+      "elo": 1685,
+      "eq": 1590,
+      "speed": 22
+    },
+    "contextWindow": 1050000,
+    "costTier": 3,
+    "costPerMTokOut": 15,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "pro route: same price as sibling, same benchmarked Elo as its sibling (AA does not cover pro), extended compute (slow); structurally unroutable: reserved for explicit Athena-v2 selection"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-luna",
+    "scores": {
+      "elo": 1621,
+      "eq": 1555,
+      "speed": 160
+    },
+    "contextWindow": 1050000,
+    "costTier": 2,
+    "costPerMTokOut": 6,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline"
+  },
+  {
+    "providerID": "openai",
+    "modelID": "gpt-5.6-luna-pro",
+    "scores": {
+      "elo": 1621,
+      "eq": 1555,
+      "speed": 35
+    },
+    "contextWindow": 1050000,
+    "costTier": 2,
+    "costPerMTokOut": 6,
+    "supportsVision": true,
+    "supportsToolUse": true,
+    "promptDefaults": {
+      "variant": "xhigh"
+    },
+    "confidence": "curated",
+    "notes": "pro route: same price as sibling, same benchmarked Elo as its sibling (AA does not cover pro), extended compute (slow); structurally unroutable: reserved for explicit Athena-v2 selection"
+  }
+]

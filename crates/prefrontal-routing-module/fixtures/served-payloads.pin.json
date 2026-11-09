@@ -1,0 +1,6 @@
+{
+  "repository": "CortexKit/fusiform",
+  "commit": "7d604d1623b9085b3f3277c889d417d2ccb6f5e0",
+  "path": "crates/fusiform-module/fixtures/served-payloads.json",
+  "sha256": "f9555ed07197b60119627a391d75ffa59a3f9f5647df28251220fbe19faee1fc"
+}

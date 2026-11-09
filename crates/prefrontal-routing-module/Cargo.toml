@@ -1,0 +1,54 @@
+[package]
+name = "prefrontal-routing-module"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+description = "The prefrontal-routing subc module: registers a ManagementSurface and serves route.select and the other route.* operations over the subc wire, running the pure prefrontal-routing-core scorer against the model catalog and route state kept in prefrontal-routing-store's SQLite store, with live quota readings consumed from the Insula module."
+
+[[bin]]
+name = "ck-prefrontal-routing"
+path = "src/main.rs"
+
+[build-dependencies]
+sha2 = { workspace = true }
+
+[dependencies]
+async-nats = { workspace = true, default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+cortexkit-bus-naming = { workspace = true }
+cortexkit-bus-nats = { workspace = true }
+cortexkit-bus-trait = { workspace = true }
+# The routing/v1 role contract: wire shapes and validators for the v1 ops.
+cortexkit-role-routing = { workspace = true }
+cortexkit-role-classifier = { workspace = true }
+cortexkit-project-identity = { workspace = true }
+cortexkit-role-llm-runner = { workspace = true }
+subc-client-rs = { workspace = true }
+cortexkit-claustrum-client = { workspace = true }
+prefrontal-routing-core = { path = "../prefrontal-routing-core" }
+prefrontal-routing-store = { path = "../prefrontal-routing-store" }
+cortexkit-store-types = { workspace = true }
+subc-protocol = { workspace = true }
+subc-transport = { workspace = true }
+subc-os = { workspace = true }
+subc-jsonc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+schemars = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+cortexkit-bus-inmemory = { workspace = true }
+# Drives this module through every routing/v1 contract rule.
+cortexkit-role-routing-conformance = { workspace = true }
+prefrontal-routing-store = { path = "../prefrontal-routing-store", features = ["test-support"] }
+cortexkit-test-support = "=0.1.13"
+rusqlite = { workspace = true, features = ["bundled"] }
+# The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
+# this package's graph turns on tokio's process feature any more.
+tokio = { workspace = true, features = ["process"] }

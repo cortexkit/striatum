@@ -1,0 +1,15 @@
+{
+  "catalog_version": 0,
+  "models": {
+    "synthetic-quality-reseller/synthetic-model": {
+      "quality.elo": 1284,
+      "quality.eq": 1599.8
+    }
+  },
+  "quality_scores": {
+    "graded_at_ms": 123,
+    "graded_by": "operator"
+  },
+  "resolved_at_ms": -1,
+  "source": "models.dev"
+}

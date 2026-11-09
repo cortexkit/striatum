@@ -1,0 +1,1385 @@
+{
+  "body_source": "src/panel_policy_tests.rs::PanelRig::params; core consult/runtime.rs::round_zero_select_input uses AUDIT and SPEC",
+  "catalog": [
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 4.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-opus-4-5",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 698.0,
+        "eq": 1698.0,
+        "speed": 53.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 4.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-opus-4-6",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 1130.0,
+        "eq": 1751.7,
+        "speed": 48.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 4.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-opus-4-7",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 1635.0,
+        "eq": 1949.8,
+        "speed": 52.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 4.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-opus-4-8",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 1728.0,
+        "eq": 2115.5,
+        "speed": 57.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 15.0,
+      "costTier": 3.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-sonnet-4-6",
+      "promptDefaults": {
+        "variant": "max"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 637.0,
+        "eq": 1752.4,
+        "speed": 61.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 4.0,
+      "family": "claude",
+      "modelID": "antigravity-claude-opus-4-6-thinking",
+      "providerID": "google",
+      "scores": {
+        "elo": 1617.0,
+        "eq": 1751.7,
+        "speed": 48.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 15.0,
+      "costTier": 3.0,
+      "family": "claude",
+      "modelID": "antigravity-claude-sonnet-4-6-thinking",
+      "providerID": "google",
+      "scores": {
+        "elo": 1584.0,
+        "eq": 1752.4,
+        "speed": 61.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1048576.0,
+      "costPerMTokOut": 12.0,
+      "costTier": 3.0,
+      "family": "gemini",
+      "modelID": "antigravity-gemini-3.1-pro",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "google",
+      "scores": {
+        "elo": 1280.0,
+        "eq": 1532.6,
+        "speed": 123.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1048576.0,
+      "costPerMTokOut": 9.0,
+      "costTier": 3.0,
+      "family": "gemini",
+      "modelID": "antigravity-gemini-3.5-flash",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "google",
+      "scores": {
+        "elo": 1345.0,
+        "eq": 1490.0,
+        "speed": 222.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 15.0,
+      "costTier": 3.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.4",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1589.0,
+        "eq": 1585.7,
+        "speed": 80.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 400000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.4-mini",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 956.0,
+        "eq": 1430.0,
+        "speed": 157.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 30.0,
+      "costTier": 4.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.5",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1690.0,
+        "eq": 1596.5,
+        "speed": 58.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 2.5,
+      "costTier": 1.0,
+      "family": "grok",
+      "maxOutputTokens": 32768,
+      "modelID": "grok-4.3",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "xai",
+      "scores": {
+        "elo": 659.0,
+        "eq": 1480.0,
+        "speed": 187.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "family": "grok",
+      "maxOutputTokens": 32768,
+      "modelID": "grok-build-0.1",
+      "notes": "xai subscription-only; iq/speed/eq user-curated (absent from AA + models.dev)",
+      "providerID": "xai",
+      "scores": {
+        "elo": 1320.0,
+        "eq": 1530.0,
+        "speed": 156.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 30.0,
+      "costTier": 4.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-sol",
+      "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1838.0,
+        "eq": 1610.0,
+        "speed": 55.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 30.0,
+      "costTier": 4.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-sol-pro",
+      "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1838.0,
+        "eq": 1610.0,
+        "speed": 15.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 15.0,
+      "costTier": 3.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-terra",
+      "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1685.0,
+        "eq": 1590.0,
+        "speed": 95.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 15.0,
+      "costTier": 3.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-terra-pro",
+      "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1685.0,
+        "eq": 1590.0,
+        "speed": 22.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 2.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-luna",
+      "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1621.0,
+        "eq": 1555.0,
+        "speed": 160.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1050000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 2.0,
+      "family": "gpt",
+      "maxOutputTokens": 128000,
+      "modelID": "gpt-5.6-luna-pro",
+      "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "openai",
+      "scores": {
+        "elo": 1621.0,
+        "eq": 1555.0,
+        "speed": 35.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 500000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 2.0,
+      "family": "grok",
+      "maxOutputTokens": 32768,
+      "modelID": "grok-4.5",
+      "notes": "AA Intelligence Index 54 (2026-07-08); eq curated; speed AA-measured 120 tok/s",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "xai",
+      "scores": {
+        "elo": 1649.0,
+        "eq": 1550.0,
+        "speed": 120.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 4.4,
+      "costTier": 2.0,
+      "family": "glm",
+      "modelID": "glm-5.2",
+      "notes": "user-curated iq (AA 51); eq curated above glm-5.1; cost carried from glm-5.1",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1660.0,
+        "eq": 1565.0,
+        "speed": 196.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 512000.0,
+      "costPerMTokOut": 2.4,
+      "costTier": 1.0,
+      "family": "minimax",
+      "modelID": "minimax-m3",
+      "notes": "AA v4.1 44; context/cost carried from opencode-go/minimax-m3",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1311.0,
+        "eq": 1520.0,
+        "speed": 44.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 3.48,
+      "costTier": 2.0,
+      "family": "deepseek",
+      "modelID": "deepseek-v4-pro",
+      "notes": "AA v4.1 44; context/cost carried from opencode-go/deepseek-v4-pro",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1284.0,
+        "eq": 1599.8,
+        "speed": 48.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 4.0,
+      "costTier": 2.0,
+      "family": "kimi",
+      "modelID": "kimi-k2.6",
+      "notes": "AA v4.1 44; cost carried from opencode-go/kimi-k2.6",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1215.0,
+        "eq": 1575.8,
+        "speed": 43.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 4.0,
+      "costTier": 2.0,
+      "family": "kimi",
+      "modelID": "kimi-k2.7-code",
+      "notes": "AA v4.1 42; eq curated near k2.6; cost like k2.6",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1102.0,
+        "eq": 1570.0,
+        "speed": 45.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 0.28,
+      "costTier": 0.0,
+      "family": "deepseek",
+      "modelID": "deepseek-v4-flash",
+      "notes": "bridge from old 46.5; context/cost carried from opencode-go/deepseek-v4-flash",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1180.0,
+        "eq": 1494.2,
+        "speed": 113.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 202752.0,
+      "costPerMTokOut": 4.4,
+      "costTier": 2.0,
+      "family": "glm",
+      "modelID": "glm-5.1",
+      "notes": "bridge from old 51.4; context/cost carried from opencode-go/glm-5.1",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 988.0,
+        "eq": 1557.0,
+        "speed": 52.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 204800.0,
+      "costPerMTokOut": 1.2,
+      "costTier": 1.0,
+      "family": "minimax",
+      "modelID": "minimax-m2.7",
+      "notes": "bridge; context/cost carried from opencode-go/minimax-m2.7",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 984.0,
+        "eq": 1510.0,
+        "speed": 65.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 204800.0,
+      "costPerMTokOut": 1.2,
+      "costTier": 1.0,
+      "family": "minimax",
+      "modelID": "minimax-m2.5",
+      "notes": "bridge; context/cost carried from opencode-go/minimax-m2.5",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 520.0,
+        "eq": 1490.0,
+        "speed": 206.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 3.0,
+      "costTier": 1.0,
+      "family": "kimi",
+      "modelID": "kimi-k2.5",
+      "notes": "AA v4.1 ~35; cost carried from opencode-go/kimi-k2.5",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 599.0,
+        "eq": 1541.7,
+        "speed": 35.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 262000.0,
+      "family": "qwen",
+      "modelID": "qwen3.5:397b",
+      "notes": "AA ~34-40 (reasoning); rough; no defensible cost datapoint",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1617.0,
+        "eq": 1500.0,
+        "speed": 50.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "family": "mistral",
+      "modelID": "mistral-large-3",
+      "notes": "AA v4.1 16; below most floors by design",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 520.0,
+        "eq": 1450.0,
+        "speed": 42.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 50.0,
+      "costTier": 5.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-fable-5",
+      "notes": "Real list price $10 in / $50 out (Ufuk, 2026-07-25)",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 1911.0,
+        "eq": 2160.0,
+        "speed": 55.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 8.0,
+      "costTier": 3.0,
+      "family": "kimi",
+      "maxOutputTokens": 131072,
+      "modelID": "k3",
+      "notes": "curated 1 iq below opus-4-8 pending real-work evidence; eq opus-200; subscription-served",
+      "promptDefaults": {},
+      "providerID": "kimi-for-coding",
+      "scores": {
+        "elo": 1742.0,
+        "eq": 1915.5,
+        "speed": 50.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": false
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 3.0,
+      "family": "qwen",
+      "maxOutputTokens": 65536,
+      "modelID": "qwen3.8-max-preview",
+      "notes": "curated k3/terra-band per operator 2026-07-19 pending AA evidence; subscription-served",
+      "promptDefaults": {},
+      "providerID": "alibaba-token-plan",
+      "scores": {
+        "elo": 1721.0,
+        "eq": 1895.0,
+        "speed": 45.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 128000.0,
+      "costPerMTokOut": 0.4,
+      "costTier": 1.0,
+      "family": "qwen",
+      "modelID": "qwen3.6-flash",
+      "notes": "flash tier, fastest of the plan",
+      "promptDefaults": {},
+      "providerID": "alibaba-token-plan",
+      "scores": {
+        "elo": 1122.0,
+        "eq": 1440.0,
+        "speed": 110.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 1.6,
+      "costTier": 2.0,
+      "family": "qwen",
+      "modelID": "qwen3.7-plus",
+      "notes": "plus tier, 3.7 generation",
+      "promptDefaults": {},
+      "providerID": "alibaba-token-plan",
+      "scores": {
+        "elo": 715.0,
+        "eq": 1530.0,
+        "speed": 70.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 5.0,
+      "costTier": 3.0,
+      "family": "qwen",
+      "modelID": "qwen3.7-max",
+      "notes": "prior max generation, below 3.8-preview",
+      "promptDefaults": {},
+      "providerID": "alibaba-token-plan",
+      "scores": {
+        "elo": 1254.0,
+        "eq": 1620.0,
+        "speed": 50.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1048576.0,
+      "costPerMTokOut": 9.0,
+      "costTier": 3.0,
+      "family": "gemini",
+      "modelID": "antigravity-gemini-3.6-flash",
+      "notes": "Scores carried from antigravity-gemini-3.5-flash (retired to exclude list 2026-07-22)",
+      "promptDefaults": {
+        "variant": "high"
+      },
+      "providerID": "google",
+      "scores": {
+        "elo": 1410.0,
+        "eq": 1490.0,
+        "speed": 222.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 25.0,
+      "costTier": 3.0,
+      "family": "claude",
+      "maxOutputTokens": 64000,
+      "modelID": "claude-opus-5",
+      "notes": "Ufuk curation 2026-07-25: iq one below Fable 5, eq equal to Fable 5; speed carried from opus-4-8",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "anthropic",
+      "scores": {
+        "elo": 1905.0,
+        "eq": 2160.0,
+        "speed": 57.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 3.0,
+      "family": "qwen",
+      "maxOutputTokens": 65536,
+      "modelID": "qwen3.8-max",
+      "notes": "Stable release of qwen3.8-max-preview; all fields carried from the preview sibling pending its own measurement",
+      "providerID": "alibaba-token-plan",
+      "scores": {
+        "elo": 1721.0,
+        "eq": 1895.0,
+        "speed": 45.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 0.28,
+      "costTier": 0.0,
+      "family": "deepseek",
+      "modelID": "deepseek-v4-flash:0731",
+      "notes": "Ufuk curation 2026-08-05: materially more capable than deepseek-v4-flash, iq set to gemini-3.6-flash parity (44); eq and speed carried from the older build",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1610.0,
+        "eq": 1494.2,
+        "speed": 113.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 256000.0,
+      "costPerMTokOut": 4.0,
+      "costTier": 3.0,
+      "family": "kimi",
+      "maxOutputTokens": 131072,
+      "modelID": "kimi-k3",
+      "notes": "K3 served via ollama-cloud; scores mirror kimi-for-coding/k3",
+      "providerID": "ollama-cloud",
+      "scores": {
+        "elo": 1742.0,
+        "eq": 1915.5,
+        "speed": 45.0
+      },
+      "supportsToolUse": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 500000.0,
+      "costPerMTokOut": 6.0,
+      "costTier": 2.0,
+      "family": "grok",
+      "maxOutputTokens": 32768,
+      "modelID": "grok-4.6",
+      "notes": "Ufuk curation 2026-08-13: elo 1798 (~4% below sol per his sizing, value his call); eq grok-4.5+50; speed, context, output ceiling carried from grok-4.5",
+      "promptDefaults": {
+        "variant": "xhigh"
+      },
+      "providerID": "xai",
+      "scores": {
+        "elo": 1798.0,
+        "eq": 1600.0,
+        "speed": 120.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 1000000.0,
+      "costPerMTokOut": 9.0,
+      "costTier": 1.0,
+      "family": "gemini",
+      "maxOutputTokens": 65536,
+      "modelID": "antigravity-gemini-3.7-flash",
+      "notes": "Succession seed 2026-08-14: scores carried from 3.6-flash pending AA index; supersedes 3.6-flash in selection via the exclusion below",
+      "providerID": "google",
+      "scores": {
+        "elo": 1410.0,
+        "eq": 1490.0,
+        "speed": 222.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "gpt",
+      "modelID": "gpt-6-astra",
+      "providerID": "openai",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1800.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "kimi",
+      "modelID": "k3",
+      "providerID": "kimi-code-plan-global",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1750.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "claude",
+      "modelID": "a",
+      "providerID": "anthropic",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1700.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "claude",
+      "modelID": "b",
+      "providerID": "anthropic",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1690.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "gemini",
+      "modelID": "g",
+      "providerID": "google",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1680.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "grok",
+      "modelID": "g",
+      "providerID": "xai",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 1650.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    },
+    {
+      "confidence": "curated",
+      "contextWindow": 200000.0,
+      "costPerMTokOut": 4.5,
+      "costTier": 2.0,
+      "family": "qwen",
+      "modelID": "small",
+      "providerID": "low",
+      "scoreProvenance": "override",
+      "scores": {
+        "elo": 100.0,
+        "eq": 1700.0,
+        "speed": 90.0
+      },
+      "supportsToolUse": true,
+      "supportsVision": true
+    }
+  ],
+  "clock_ms": 1800000000000,
+  "panels": [
+    {
+      "budgets": [
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "openai/gpt-6-astra",
+          "tokens": 76000
+        },
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "kimi-code-plan-global/k3",
+          "tokens": 76000
+        },
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "anthropic/b",
+          "tokens": 76000
+        }
+      ],
+      "name": "Athena audit",
+      "reply": {
+        "result": {
+          "decisionID": "dec_000000000000",
+          "members": [
+            {
+              "contextWindow": 200000,
+              "family": "gpt",
+              "harness": "broca",
+              "promptParams": {
+                "variant": "xhigh"
+              },
+              "routeKey": "openai/gpt-6-astra"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "kimi",
+              "harness": "broca",
+              "promptParams": {},
+              "routeKey": "kimi-code-plan-global/k3"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "claude",
+              "harness": "broca",
+              "promptParams": {},
+              "routeKey": "anthropic/b"
+            }
+          ],
+          "policy": {
+            "by": "iq",
+            "class": "audit",
+            "extra": 1,
+            "extraBy": "random",
+            "floor": 80,
+            "funnel": {
+              "adequacyEligible": 6,
+              "callerAdmitted": 53,
+              "capabilityEligible": 7,
+              "catalog": 53,
+              "distinctFamilies": 5,
+              "gateOrder": [
+                "deprecated_upstream",
+                "unscored_awaiting_placement",
+                "excluded_by_operator",
+                "excluded",
+                "unavailable",
+                "capability",
+                "quota_or_backoff",
+                "package_fit",
+                "sibling_collapse",
+                "family_labeled",
+                "phase_adequacy",
+                "distinct_families",
+                "initially_admitted"
+              ],
+              "initiallyAdmitted": 3,
+              "operatorAdmitted": 53,
+              "packageFit": 7,
+              "quotaEligible": 7,
+              "reachable": 7,
+              "scored": 53
+            },
+            "pins": {
+              "synthesizer": null
+            },
+            "seatedVariants": [
+              {
+                "reasoningVariant": "xhigh",
+                "reasoningVariantSource": "consumer",
+                "routeKey": "openai/gpt-6-astra",
+                "slot": 0,
+                "variant": "base"
+              },
+              {
+                "reasoningVariantSource": "curated",
+                "routeKey": "kimi-code-plan-global/k3",
+                "slot": 1,
+                "variant": "base"
+              },
+              {
+                "reasoningVariantSource": "curated",
+                "routeKey": "anthropic/b",
+                "slot": 2,
+                "variant": "base"
+              }
+            ],
+            "seats": [
+              {
+                "rank": 1,
+                "reason": "topK",
+                "routeKey": "openai/gpt-6-astra",
+                "slot": 0
+              },
+              {
+                "rank": 2,
+                "reason": "topK",
+                "routeKey": "kimi-code-plan-global/k3",
+                "slot": 1
+              },
+              {
+                "rank": null,
+                "reason": "extra",
+                "routeKey": "anthropic/b",
+                "slot": 2
+              }
+            ],
+            "seed": "explicit-seed",
+            "selection": "class_policy",
+            "siblingCollapses": [],
+            "topK": 2,
+            "width": 3
+          },
+          "runnerUp": [
+            {
+              "contextWindow": 200000,
+              "family": "claude",
+              "phase": "topK",
+              "promptParams": {
+                "variant": "high"
+              },
+              "routeKey": "anthropic/a"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "gemini",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "google/g"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "grok",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "xai/g"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "qwen",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "low/small"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "grok",
+              "phase": "extra",
+              "promptParams": {},
+              "routeKey": "xai/g"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "gemini",
+              "phase": "extra",
+              "promptParams": {},
+              "routeKey": "google/g"
+            }
+          ]
+        }
+      },
+      "request": {
+        "availableModels": [
+          "openai/gpt-6-astra",
+          "kimi-code-plan-global/k3",
+          "anthropic/a",
+          "anthropic/b",
+          "google/g",
+          "xai/g",
+          "low/small"
+        ],
+        "panelSpec": {
+          "class": "AUDIT"
+        },
+        "seed": "explicit-seed",
+        "taskId": "audit-consult"
+      }
+    },
+    {
+      "budgets": [
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "openai/gpt-6-astra",
+          "tokens": 76000
+        },
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "kimi-code-plan-global/k3",
+          "tokens": 76000
+        },
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "anthropic/a",
+          "tokens": 76000
+        },
+        {
+          "contextWindow": 200000,
+          "contextWindowKnown": true,
+          "routeKey": "xai/g",
+          "tokens": 76000
+        }
+      ],
+      "name": "Spec round zero",
+      "reply": {
+        "result": {
+          "decisionID": "dec_000000000001",
+          "members": [
+            {
+              "contextWindow": 200000,
+              "family": "gpt",
+              "harness": "broca",
+              "promptParams": {
+                "variant": "xhigh"
+              },
+              "routeKey": "openai/gpt-6-astra"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "kimi",
+              "harness": "broca",
+              "promptParams": {},
+              "routeKey": "kimi-code-plan-global/k3"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "claude",
+              "harness": "broca",
+              "promptParams": {
+                "variant": "high"
+              },
+              "routeKey": "anthropic/a"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "grok",
+              "harness": "broca",
+              "promptParams": {},
+              "routeKey": "xai/g"
+            }
+          ],
+          "policy": {
+            "by": "iq",
+            "class": "spec",
+            "extra": 1,
+            "extraBy": "random",
+            "floor": 80,
+            "funnel": {
+              "adequacyEligible": 6,
+              "callerAdmitted": 53,
+              "capabilityEligible": 7,
+              "catalog": 53,
+              "distinctFamilies": 5,
+              "gateOrder": [
+                "deprecated_upstream",
+                "unscored_awaiting_placement",
+                "excluded_by_operator",
+                "excluded",
+                "unavailable",
+                "capability",
+                "quota_or_backoff",
+                "package_fit",
+                "sibling_collapse",
+                "family_labeled",
+                "phase_adequacy",
+                "distinct_families",
+                "initially_admitted"
+              ],
+              "initiallyAdmitted": 4,
+              "operatorAdmitted": 53,
+              "packageFit": 7,
+              "quotaEligible": 7,
+              "reachable": 7,
+              "scored": 53
+            },
+            "pins": {
+              "synthesizer": null
+            },
+            "seatedVariants": [
+              {
+                "reasoningVariant": "xhigh",
+                "reasoningVariantSource": "consumer",
+                "routeKey": "openai/gpt-6-astra",
+                "slot": 0,
+                "variant": "base"
+              },
+              {
+                "reasoningVariantSource": "curated",
+                "routeKey": "kimi-code-plan-global/k3",
+                "slot": 1,
+                "variant": "base"
+              },
+              {
+                "reasoningVariant": "high",
+                "reasoningVariantSource": "consumer",
+                "routeKey": "anthropic/a",
+                "slot": 2,
+                "variant": "base"
+              },
+              {
+                "reasoningVariantSource": "curated",
+                "routeKey": "xai/g",
+                "slot": 3,
+                "variant": "base"
+              }
+            ],
+            "seats": [
+              {
+                "rank": 1,
+                "reason": "topK",
+                "routeKey": "openai/gpt-6-astra",
+                "slot": 0
+              },
+              {
+                "rank": 2,
+                "reason": "topK",
+                "routeKey": "kimi-code-plan-global/k3",
+                "slot": 1
+              },
+              {
+                "rank": 3,
+                "reason": "topK",
+                "routeKey": "anthropic/a",
+                "slot": 2
+              },
+              {
+                "rank": null,
+                "reason": "extra",
+                "routeKey": "xai/g",
+                "slot": 3
+              }
+            ],
+            "seed": "explicit-seed",
+            "selection": "class_policy",
+            "siblingCollapses": [],
+            "topK": 3,
+            "width": 4
+          },
+          "runnerUp": [
+            {
+              "contextWindow": 200000,
+              "family": "claude",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "anthropic/b"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "gemini",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "google/g"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "qwen",
+              "phase": "topK",
+              "promptParams": {},
+              "routeKey": "low/small"
+            },
+            {
+              "contextWindow": 200000,
+              "family": "gemini",
+              "phase": "extra",
+              "promptParams": {},
+              "routeKey": "google/g"
+            }
+          ]
+        }
+      },
+      "request": {
+        "availableModels": [
+          "openai/gpt-6-astra",
+          "kimi-code-plan-global/k3",
+          "anthropic/a",
+          "anthropic/b",
+          "google/g",
+          "xai/g",
+          "low/small"
+        ],
+        "panelSpec": {
+          "class": "SPEC"
+        },
+        "seed": "explicit-seed",
+        "taskId": "audit-consult"
+      }
+    }
+  ],
+  "policy": {
+    "model_routing": {
+      "variants": {
+        "athena": {
+          "anthropic/a": "high",
+          "openai/gpt-6-astra": "xhigh"
+        }
+      }
+    }
+  }
+}
