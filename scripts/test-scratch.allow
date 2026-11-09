@@ -1,0 +1,10 @@
+# Existing production temporary roots, not test fixtures. Freeze counts by
+# enclosing function; new test scratch must use the shared scratch helper.
+# path enclosing-function maximum-call-count
+crates/prefrontal-routing-module/src/fusiform_catalog.rs catalog_refresh_loop 1
+crates/prefrontal-routing-module/src/main.rs resolve_storage_descriptor 1
+crates/prefrontal-routing-module/src/main.rs quota_refresh_loop 1
+crates/prefrontal-routing-module/src/account_quota.rs account_quota_loop 1
+crates/prefrontal-routing-module/src/fusiform_catalog.rs ingest_before_upsert 1
+crates/prefrontal-routing-module/src/main.rs account_quota_dry_run 1
+crates/prefrontal-routing-module/src/quota_events.rs run 1

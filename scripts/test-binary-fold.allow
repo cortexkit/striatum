@@ -1,0 +1,5 @@
+# Repository-relative entry point<TAB>reason for retaining its own process.
+crates/prefrontal-routing-core/tests/it/main.rs	Consolidated integration harness.
+crates/prefrontal-routing-module/tests/it/main.rs	Consolidated integration harness.
+crates/prefrontal-routing-store/tests/it/main.rs	Consolidated integration harness.
+crates/prefrontal-routing-core/tests/model_router.rs	Two tests replace the process-global speed-multiplier map and do not restore it.

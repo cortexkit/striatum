@@ -1,4 +1,5 @@
 /target/
+__pycache__/
 .cortexkit/*
 !.cortexkit/release-notes/
 !.cortexkit/skills/

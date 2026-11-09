@@ -1,0 +1,2 @@
+# Source path<TAB>enclosing function<TAB>count<TAB>reason for the raw lookup.
+crates/prefrontal-routing-store/src/test_exe.rs	current_test_exe	1	Routing's test-only helper stages mounted-volume binaries using cortexkit-test-support without a prefrontal dependency.
