@@ -480,6 +480,24 @@ impl crate::AccountTx<'_> {
         let until_ms = until_ms.min(
             now_ms.saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS),
         );
+        if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            let (deadline, why, observed) = match kind {
+                PoolWallKind::Billing => ("walled_until", "wall_reason", "wall_observed_at"),
+                PoolWallKind::RateLimited => {
+                    ("cooldown_until", "cooldown_reason", "cooldown_observed_at")
+                }
+            };
+            // A new refusal supersedes its earlier horizon, including uncapped
+            // raw deadlines retained during migration. Delayed older reports
+            // must not extend or replace the newer evidence.
+            self.conn.execute(&format!("INSERT INTO pool_key_state(provider,credential_id,{deadline},{why},updated_at,{observed})
+                VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(provider,credential_id) DO UPDATE SET
+                {deadline}=excluded.{deadline},{why}=excluded.{why},{observed}=excluded.{observed},
+                updated_at=MAX(pool_key_state.updated_at,excluded.updated_at)
+                WHERE excluded.{observed}>=COALESCE(pool_key_state.{observed},pool_key_state.updated_at)"),
+                params![provider,credential_id,until_ms,reason,now_ms]).map_err(err)?;
+            return Ok(());
+        }
         let statement = match kind {
             PoolWallKind::Billing => {
                 "INSERT INTO pool_key_state (provider, credential_id, walled_until, wall_reason, updated_at)
@@ -502,13 +520,70 @@ impl crate::AccountTx<'_> {
                 params![provider, credential_id, until_ms, reason, now_ms],
             )
             .map_err(err)?;
-        let observed = match kind {
-            PoolWallKind::Billing => "wall_observed_at",
-            PoolWallKind::RateLimited => "cooldown_observed_at",
-        };
-        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
-            return Ok(());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wall_generation_tests {
+    use super::*;
+    #[test]
+    fn newer_pool_refusal_replaces_a_long_migrated_deadline_with_its_short_retry() {
+        let scratch = cortexkit_test_support::ScratchDir::new("migrated-pool-short-retry");
+        let descriptor = crate::dev_descriptor(
+            "migrated-pool-short-retry",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let now = crate::now_ms();
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        old.store.with_conn(|conn|conn.execute("INSERT INTO pool_key_state(provider,credential_id,walled_until,cooldown_until,updated_at)
+            VALUES ('p','key',?1,?1,?2)",params![now+86_400_000,now-100])).unwrap();
+        drop(old);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let probe_at = now + 3_600_000;
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, probe_at, Some("probe")))
+            .unwrap());
+        for kind in [PoolWallKind::Billing, PoolWallKind::RateLimited] {
+            store
+                .pool_wall(
+                    "p",
+                    "key",
+                    kind,
+                    probe_at + 10_001,
+                    "short refusal",
+                    probe_at + 1,
+                )
+                .unwrap();
         }
-        self.conn.execute(&format!("UPDATE pool_key_state SET {observed}=MAX(COALESCE({observed},?3),?3) WHERE provider=?1 AND credential_id=?2"),params![provider,credential_id,now_ms]).map(|_|()).map_err(err)
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(clocks.len(), 2);
+        assert!(
+            clocks
+                .iter()
+                .all(|clock| clock.next_recheck_at == probe_at + 10_001),
+            "new short retries must replace the old raw 24h wall: {clocks:?}"
+        );
+        for kind in [PoolWallKind::Billing, PoolWallKind::RateLimited] {
+            store
+                .pool_wall(
+                    "p",
+                    "key",
+                    kind,
+                    probe_at + 3_600_000,
+                    "older delayed refusal",
+                    probe_at,
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .fence_rechecks()
+                .unwrap()
+                .iter()
+                .all(|clock| clock.next_recheck_at == probe_at + 10_001),
+            "an older report must not overwrite newer short evidence"
+        );
     }
 }
