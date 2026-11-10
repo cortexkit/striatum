@@ -232,7 +232,7 @@ impl Layers {
         workspace: Option<&Path>,
     ) -> Result<(Self, bool), String> {
         fn read(root: &Path) -> Result<Option<Arc<Document>>, String> {
-            let path = root.join(".cortexkit/prefrontal-routing.jsonc");
+            let path = crate::config_overrides::config_path_in(&root.join(".cortexkit"));
             match std::fs::read_to_string(&path) {
                 Ok(raw) => parse(&path, &raw)
                     .map(|doc| Some(Arc::new(doc)))
@@ -264,7 +264,11 @@ impl Layers {
             documents: [project, workspace]
                 .into_iter()
                 .flatten()
-                .map(|root| load(&Path::new(root).join(".cortexkit/prefrontal-routing.jsonc")))
+                .map(|root| {
+                    load(&crate::config_overrides::config_path_in(
+                        &Path::new(root).join(".cortexkit"),
+                    ))
+                })
                 .collect(),
         }
     }
@@ -352,6 +356,69 @@ mod tests {
             ))
             .unwrap();
         path
+    }
+
+    #[test]
+    fn striatum_tier_files_prefer_primary_fall_back_and_never_merge() {
+        let global = crate::config_overrides::LiveConfig::default();
+        for workspace in [false, true] {
+            for (primary_exists, previous_exists) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let dir = cortexkit_test_support::ScratchDir::new("striatum-tier-settings");
+                let root = dir.join("root");
+                std::fs::create_dir_all(root.join(".cortexkit")).unwrap();
+                if primary_exists {
+                    std::fs::write(
+                        root.join(".cortexkit/striatum.jsonc"),
+                        r#"{"models":{"p/m":{"service_tier":"fast"}}}"#,
+                    )
+                    .unwrap();
+                }
+                if previous_exists {
+                    write(
+                        &root,
+                        r#"{"models":{"p/other":{"service_tier":"ultrafast"}}}"#,
+                    );
+                }
+                let projects = if workspace {
+                    Vec::new()
+                } else {
+                    vec![root.clone()]
+                };
+                let workspace_root = workspace.then_some(root.as_path());
+                let (layers, applied) = Layers::from_roots(&projects, workspace_root).unwrap();
+                assert_eq!(applied, primary_exists || previous_exists);
+                let cached = Layers::new(
+                    (!workspace).then(|| root.to_str().unwrap()),
+                    workspace.then(|| root.to_str().unwrap()),
+                );
+                for layers in [layers, cached] {
+                    assert_eq!(
+                        layers.resolve(&global, "worker", "p", "m", None),
+                        primary_exists.then_some(ServiceTier::Fast)
+                    );
+                    assert_eq!(
+                        layers.resolve(&global, "worker", "p", "other", None),
+                        (!primary_exists && previous_exists).then_some(ServiceTier::Ultrafast)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn striatum_tier_primary_appearing_later_is_read_and_invalid_primary_never_falls_back() {
+        let dir = cortexkit_test_support::ScratchDir::new("striatum-tier-switch");
+        let root = dir.join("root");
+        write(&root, r#"{"models":{"p/m":{"service_tier":"fast"}}}"#);
+        let global = crate::config_overrides::LiveConfig::default();
+        let decision =
+            || Layers::new(root.to_str(), None).resolve(&global, "worker", "p", "m", None);
+        assert_eq!(decision(), Some(ServiceTier::Fast));
+        std::fs::write(root.join(".cortexkit/striatum.jsonc"), "not json").unwrap();
+        assert_eq!(decision(), None);
+        assert!(Layers::from_roots(&[root], None).is_err());
     }
 
     #[test]

@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
-const CONFIG_RELATIVE_PATH: &str = "cortexkit/prefrontal-routing.jsonc";
+const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
+const PREVIOUS_CONFIG_BASENAME: &str = "prefrontal-routing.jsonc";
 const OLD_CONFIG_BASENAME: &str = "alfonso-routing.jsonc";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 
@@ -286,8 +287,11 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
 }
 
 fn old_config_path(path: &Path) -> Option<PathBuf> {
-    (path.file_name()? == "prefrontal-routing.jsonc")
-        .then(|| path.with_file_name(OLD_CONFIG_BASENAME))
+    matches!(
+        path.file_name()?.to_str()?,
+        "striatum.jsonc" | PREVIOUS_CONFIG_BASENAME
+    )
+    .then(|| path.with_file_name(OLD_CONFIG_BASENAME))
 }
 
 fn reject_old_config(path: &Path, stamp: ConfigStamp) -> Result<(), String> {
@@ -1464,7 +1468,52 @@ fn config_home_path(relative: &str) -> PathBuf {
 
 /// The config-home path for this module's own config file.
 pub fn config_path() -> PathBuf {
-    config_home_path(CONFIG_RELATIVE_PATH)
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    // Pin the startup choice so every reader and refresh loop uses the same
+    // file. When using the fallback, a new striatum.jsonc needs a restart.
+    PATH.get_or_init(|| {
+        let primary = config_home_path(CONFIG_RELATIVE_PATH);
+        config_path_in(primary.parent().expect("config path has a parent"))
+    })
+    .clone()
+}
+
+/// Choose one settings document, never merging the old and new names. Tier
+/// roots are discovered on demand, so report each migration notice only once.
+pub(crate) fn config_path_in(directory: &Path) -> PathBuf {
+    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    config_path_in_with_reporter(directory, |message| {
+        if REPORTED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(message.to_owned())
+        {
+            eprintln!("{message}");
+        }
+    })
+}
+
+fn config_path_in_with_reporter(directory: &Path, mut report: impl FnMut(&str)) -> PathBuf {
+    let primary = directory.join("striatum.jsonc");
+    let previous = directory.join(PREVIOUS_CONFIG_BASENAME);
+    if previous.exists() {
+        if primary.exists() {
+            report(&format!(
+                "[prefrontal-routing] config_renamed: {} is ignored; routing reads {}",
+                previous.display(),
+                primary.display()
+            ));
+        } else {
+            report(&format!(
+                "[prefrontal-routing] config_renamed: routing reads {}; rename it to {}",
+                previous.display(),
+                primary.display()
+            ));
+            return previous;
+        }
+    }
+    primary
 }
 
 /// Parse `provider/model` or `provider/model/variant`.

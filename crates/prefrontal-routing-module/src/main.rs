@@ -1053,12 +1053,13 @@ async fn main() -> Result<(), ModuleError> {
     let connection_file_path = match parse_startup_mode(std::env::args_os().skip(1))? {
         StartupMode::PrintManifest => return print_manifest(),
         StartupMode::CheckConfig => {
+            let path = config_overrides::config_path();
             let report = config_overrides::check_config_offline(
-                &config_overrides::config_path(),
+                &path,
                 config_overrides::default_store_path().as_deref(),
             )
             .map_err(ModuleError::Message)?;
-            eprintln!("{report}");
+            eprintln!("config check passed: {}\n{report}", path.display());
             return Ok(());
         }
         StartupMode::PrintConfigSchema => {

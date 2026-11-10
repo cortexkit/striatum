@@ -2,7 +2,7 @@
 
 Striatum picks the model and the account for every model call in the CortexKit fleet.
 
-It runs as the `prefrontal-routing` module under subc. The crates, the `ck-prefrontal-routing` binary, the `prefrontal-routing.jsonc` settings file and the store at `~/.local/share/cortexkit/prefrontal-routing/store.db` keep their old names until a later rename.
+It runs as the `prefrontal-routing` module under subc. The crates, the `ck-prefrontal-routing` binary and the store at `~/.local/share/cortexkit/prefrontal-routing/store.db` keep their old names until a later rename. Settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`); project and workspace tier settings use `.cortexkit/striatum.jsonc` under each root. In each directory, routing falls back to `prefrontal-routing.jsonc` if the new file is absent and logs a rename reminder. If both exist, only `striatum.jsonc` is read and the old file is logged as ignored. Global config readers and live reload keep the startup choice until restart, so restart after moving the fallback file to the new name. `--check-config` validates and names the same selected global file.
 
 ## Build and test
 

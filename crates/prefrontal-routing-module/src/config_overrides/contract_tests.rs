@@ -1,4 +1,5 @@
 use super::*;
+use cortexkit_role_routing::service_tier::ServiceTier;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Rig {
@@ -43,6 +44,113 @@ impl Drop for Rig {
 }
 
 const GOOD: &str = r#"{"model_routing":{"exclude":{"all":["anthropic"]},"panels":{"audit":{"topK":1,"by":"iq"}},"pins":{"synthesizer":{"model":"openai/gpt-6","variant":"high"}}}}"#;
+
+#[test]
+fn striatum_global_config_prefers_primary_falls_back_and_never_merges() {
+    for (primary_exists, previous_exists) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let dir = cortexkit_test_support::ScratchDir::new("striatum-global-config");
+        let primary = dir.join("striatum.jsonc");
+        let previous = dir.join("prefrontal-routing.jsonc");
+        if primary_exists {
+            crate::test_config::write_raw(
+                &primary,
+                r#"{"consumers":{"head":{"service_tier":"fast"}}}"#,
+            )
+            .unwrap();
+        }
+        if previous_exists {
+            crate::test_config::write_raw(
+                &previous,
+                r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
+            )
+            .unwrap();
+        }
+        let mut reports = Vec::new();
+        let chosen = config_path_in_with_reporter(primary.parent().unwrap(), |message| {
+            reports.push(message.to_owned())
+        });
+        assert_eq!(
+            chosen,
+            if primary_exists || !previous_exists {
+                primary.clone()
+            } else {
+                previous.clone()
+            }
+        );
+        let config = live_config_at(&chosen, Instant::now()).unwrap();
+        assert_eq!(
+            config.service_tier("head", "p", "m"),
+            primary_exists.then_some(ServiceTier::Fast)
+        );
+        assert_eq!(
+            config.service_tier("sidekick", "p", "m"),
+            (!primary_exists && previous_exists).then_some(ServiceTier::Ultrafast)
+        );
+        assert_eq!(reports.len(), usize::from(previous_exists));
+        if previous_exists {
+            let report = &reports[0];
+            assert!(
+                report.starts_with("[prefrontal-routing] config_renamed:"),
+                "{report}"
+            );
+            assert!(
+                report.contains(&previous.display().to_string())
+                    && report.contains(&primary.display().to_string()),
+                "{report}"
+            );
+            assert!(
+                report.contains(if primary_exists {
+                    "is ignored"
+                } else {
+                    "rename it to"
+                }),
+                "{report}"
+            );
+        }
+        live_configs().lock().unwrap().remove(&chosen);
+    }
+}
+
+#[test]
+fn striatum_fallback_reload_reads_selected_file() {
+    let mut rig = Rig::new();
+    rig.write(GOOD);
+    let chosen = config_path_in(&rig.dir);
+    assert_eq!(chosen, rig.path);
+    let now = Instant::now();
+    live_config_at(&chosen, now).unwrap();
+    crate::test_config::write_raw(rig.dir.join("striatum.jsonc"), "not json").unwrap();
+    rig.write(r#"{"model_routing":{"exclude":{"all":["xai"]}}}"#);
+    live_config_at(&chosen, now).unwrap();
+    let updated = live_config_at(&chosen, now + RELOAD_DEBOUNCE).unwrap();
+    assert_eq!(updated.operator_policy().exclude, ["xai"]);
+}
+
+#[test]
+fn striatum_still_refuses_alfonso_legacy_file() {
+    for primary_exists in [false, true] {
+        let dir = cortexkit_test_support::ScratchDir::new("striatum-alfonso-legacy");
+        let primary = dir.join("striatum.jsonc");
+        let legacy = dir.join("alfonso-routing.jsonc");
+        if primary_exists {
+            crate::test_config::write_raw(&primary, "{}").unwrap();
+        }
+        crate::test_config::write_raw(&legacy, "not json").unwrap();
+        let error = initialize_config(&primary).unwrap_err();
+        assert!(
+            error.contains("config_renamed")
+                && error.contains(&legacy.display().to_string())
+                && error.contains(&primary.display().to_string()),
+            "{error}"
+        );
+        assert!(
+            error.contains(if primary_exists { "delete" } else { "move" }),
+            "{error}"
+        );
+    }
+}
 
 fn first_load_refuses(document: &str, message: &str) {
     let mut rig = Rig::new();
