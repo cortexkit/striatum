@@ -293,6 +293,12 @@ impl ClassContext {
         Ok(())
     }
 
+    /// Whether media account admission (`route.account_for`) would find a
+    /// usable credential for this engine right now. Engine selection asks this
+    /// so it skips a provider whose media keys are all blocked: refused by the
+    /// provider (credential fence), under a pooled-key wall, or on an account
+    /// with a route fence or transient backoff. A refused key that is due for
+    /// its six-hour probe still counts as usable, so the provider can be retried.
     pub(crate) fn engine_has_eligible_credential(
         &mut self,
         provider: &str,
