@@ -491,6 +491,43 @@ impl BrocaCredentials {
         self.providers.clone()
     }
 
+    /// Complete missing vault account ids only from an unambiguous producer
+    /// linkage. Keep the vault listing unchanged: this copy is for admission
+    /// and refusal recovery, not a new vault listing.
+    pub(crate) fn with_quota_account_ids(
+        &self,
+        quota: &crate::account_quota::AccountQuotaState,
+    ) -> Self {
+        let mut joined = self.clone();
+        for row in &mut joined.listed {
+            if row.account_id.is_some() {
+                continue;
+            }
+            let providers = credential_providers(row, &self.catalog_providers);
+            let accounts: BTreeSet<_> = quota
+                .readings
+                .readings
+                .values()
+                .filter(|reading| {
+                    reading.tombstoned_at_ms.is_none()
+                        && reading
+                            .entry
+                            .get("credentialRef")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(row.id.as_str())
+                        && reading.routing_provider().is_some_and(|provider| {
+                            providers.iter().any(|listed| listed == provider)
+                        })
+                })
+                .map(|reading| reading.account_id.clone())
+                .collect();
+            if accounts.len() == 1 {
+                row.account_id = accounts.into_iter().next();
+            }
+        }
+        joined
+    }
+
     /// Only metered consumers learn vault payment methods in admission-only
     /// copies. Other consumers keep the catalog facts, as do availability and billing.
     pub(crate) fn admission_facts(

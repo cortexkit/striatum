@@ -79,8 +79,8 @@ pub(crate) fn probe_allowed(code: &str, has_quota_signal: bool, age_ms: i64) -> 
 /// The join is by vault account id only, never by provider name: Insula's
 /// provider spelling (for example the usage feed) and routing's provider id
 /// (the catalog vendor) need not match. Any non-tombstoned reading counts as
-/// a signal, even a stale one: a subscription account keeps its signal while
-/// its reading ages, and a pay-per-token credential never gains one.
+/// quota window counts as a signal, even a stale one: a subscription account
+/// keeps its signal while its reading ages. A spend-only balance is not a quota.
 pub(crate) fn has_quota_signal(
     quota: &crate::account_quota::AccountQuotaState,
     credentials: &crate::broca_credentials::BrocaCredentials,
@@ -93,7 +93,7 @@ pub(crate) fn has_quota_signal(
 }
 
 /// The reset a quota hold on `credential_id` runs until, when its latest
-/// fresh reading shows an exhausted window (at or near 100%) with a future
+/// fresh reading shows a window at its limit or inside the allocator reserve with a future
 /// reset. Returns the latest such reset, so a run-reported reset and a
 /// reading reset combine by taking the later. `None` when the credential has
 /// no reading, the latest reading is not fresh, or no exhausted window names
@@ -103,21 +103,22 @@ pub(crate) fn exhausted_quota_reset(
     credentials: &crate::broca_credentials::BrocaCredentials,
     credential_id: &str,
     now_ms: i64,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
 ) -> Option<i64> {
     let account_id = credential_account_id(credentials, credential_id)?;
-    exhausted_quota_reset_for_account(quota, &account_id, now_ms)
+    exhausted_quota_reset_for_account(quota, &account_id, now_ms, policy)
 }
 
 /// Latest fresh exhausted reset for one vault account, by account id.
 /// Fresh means the reading's producer date is inside the full (under 5 minutes)
 /// or discounted (under 20 minutes) age band defined in `account_quota`, with
-/// no entry error and no unrecognized stale class. Exhausted means at or above
-/// [`QUOTA_HOLD_USED_THRESHOLD`] with a future reset; the latest such reset
-/// wins.
+/// no entry error and no unrecognized stale class. A window at the hold threshold
+/// or inside the allocator reserve holds until its reset; the latest reset wins.
 pub(crate) fn exhausted_quota_reset_for_account(
     quota: &crate::account_quota::AccountQuotaState,
     account_id: &str,
     now_ms: i64,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
 ) -> Option<i64> {
     let entry = latest_fresh_entry(quota, account_id, now_ms)?;
     let usage = entry.usage.as_ref()?;
@@ -136,7 +137,7 @@ pub(crate) fn exhausted_quota_reset_for_account(
             .flatten()
             .filter_map(|extra| extra.window.as_ref()),
     ) {
-        if window.used_percent.is_finite() && window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
+        if window.used_percent.is_finite() && !window_has_headroom(window, policy) {
             if let Some(reset) = window
                 .resets_at
                 .as_deref()
@@ -151,7 +152,8 @@ pub(crate) fn exhausted_quota_reset_for_account(
 }
 
 /// Whether a fresh reading with headroom arrived after `fence_observed_ms`
-/// for `account_id`: no window at or above the hold threshold. A quota hold
+/// for `account_id`: every window has capacity above its allocator reserve
+/// and below the hold threshold. A quota hold
 /// lifts on such a reading. An older reading cannot heal a newer refusal.
 /// Entitlement fences must not use quota readings for recovery.
 pub(crate) fn fresh_headroom_after_for_account(
@@ -159,6 +161,7 @@ pub(crate) fn fresh_headroom_after_for_account(
     account_id: &str,
     fence_observed_ms: i64,
     now_ms: i64,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
 ) -> bool {
     let Some(entry) = latest_fresh_entry(quota, account_id, now_ms) else {
         return false;
@@ -183,7 +186,7 @@ pub(crate) fn fresh_headroom_after_for_account(
     .flatten()
     {
         saw_window = true;
-        if !window.used_percent.is_finite() || window.used_percent >= QUOTA_HOLD_USED_THRESHOLD {
+        if !window_has_headroom(window, policy) {
             return false;
         }
     }
@@ -191,15 +194,28 @@ pub(crate) fn fresh_headroom_after_for_account(
         for extra in extras {
             if let Some(window) = extra.window.as_ref() {
                 saw_window = true;
-                if !window.used_percent.is_finite()
-                    || window.used_percent >= QUOTA_HOLD_USED_THRESHOLD
-                {
+                if !window_has_headroom(window, policy) {
                     return false;
                 }
             }
         }
     }
     saw_window
+}
+
+fn window_has_headroom(
+    window: &prefrontal_routing_core::quota::RateWindow,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
+) -> bool {
+    let reserve = if window.window_minutes == Some(300) {
+        policy.reserve_five_hour
+    } else {
+        policy.reserve_seven_day
+    }
+    .max(policy.soft_quota_remaining_percent.unwrap_or(0.0));
+    window.used_percent.is_finite()
+        && (0.0..QUOTA_HOLD_USED_THRESHOLD).contains(&window.used_percent)
+        && 100.0 - window.used_percent > reserve
 }
 
 pub(crate) fn latest_reading_for_account<'a>(
@@ -334,16 +350,30 @@ pub(crate) fn roster_account_id(
     })
 }
 
-/// Whether `account_id` has any non-tombstoned quota reading.
+/// Whether `account_id` has any non-tombstoned reading with quota windows.
 pub(crate) fn has_quota_signal_for_account(
     quota: &crate::account_quota::AccountQuotaState,
     account_id: &str,
 ) -> bool {
-    quota
-        .readings
-        .readings
-        .values()
-        .any(|reading| reading.account_id == account_id && reading.tombstoned_at_ms.is_none())
+    quota.readings.readings.values().any(|reading| {
+        reading.account_id == account_id
+            && reading.tombstoned_at_ms.is_none()
+            && reading.entry.get("usage").is_some_and(|usage| {
+                ["primary", "secondary", "tertiary"]
+                    .iter()
+                    .any(|slot| usage.get(slot).is_some_and(serde_json::Value::is_object))
+                    || usage
+                        .get("extraRateWindows")
+                        .and_then(serde_json::Value::as_array)
+                        .is_some_and(|extras| {
+                            extras.iter().any(|extra| {
+                                extra
+                                    .get("window")
+                                    .is_some_and(serde_json::Value::is_object)
+                            })
+                        })
+            })
+    })
 }
 
 /// Store a reported refusal against the credential's current vault listing.

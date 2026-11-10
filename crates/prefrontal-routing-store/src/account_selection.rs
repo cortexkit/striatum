@@ -865,6 +865,20 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Replace a quota horizon without reporting another refusal. Compare the
+    /// evidence originally read so a concurrent report cannot be overwritten.
+    pub fn reconcile_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+        until_ms: i64,
+        last_reported_at: i64,
+    ) -> RouteStateResult<()> {
+        self.store.with_conn(|conn: &Connection| {
+            conn.execute("UPDATE account_route_fence SET until_ms=?1 WHERE provider=?2 AND credential_id=?3 AND model=?4 AND wall_class='quota' AND until_ms=?5 AND COALESCE(last_reported_at,recorded_at)=?6",
+                params![until_ms, fence.provider, fence.credential_id, fence.model, fence.until_ms, last_reported_at]).map(|_| ())
+        }).map_err(err)
+    }
+
     /// Latest evidence per credential, separate from the fence's first receipt.
     pub fn account_route_fence_latest_reports(
         &self,

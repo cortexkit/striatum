@@ -608,6 +608,7 @@ impl ClassContext {
         let quota = accounts
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
+        let credentials = credentials.with_quota_account_ids(&quota);
         let mut route_fences = store
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
@@ -635,6 +636,7 @@ impl ClassContext {
                     &account,
                     newest_report,
                     now_ms,
+                    &config.allocator_policy(&fence.provider),
                 )
                 .then(|| fence.credential_id.clone())
             })
@@ -651,13 +653,35 @@ impl ClassContext {
                 &credentials,
                 &fence.credential_id,
                 now_ms,
-            )
-            .filter(|reset| *reset > fence.until_ms)
-            {
-                fence.until_ms = reset;
-                store
-                    .record_account_route_fence(fence)
-                    .map_err(|error| error.to_string())?;
+                &config.allocator_policy(&fence.provider),
+            ) {
+                let fetched = crate::credential_fences::credential_account_id(
+                    &credentials,
+                    &fence.credential_id,
+                )
+                .and_then(|account| {
+                    crate::credential_fences::latest_reading_for_account(&quota, &account)
+                })
+                .and_then(|reading| reading.entry.get("fetchedAt").and_then(Value::as_str))
+                .and_then(account_quota::parse_rfc3339_ms);
+                let newer = fetched
+                    .zip(latest_reports.get(&fence.credential_id))
+                    .is_some_and(|(fetched, reported)| fetched > *reported);
+                let until = if newer {
+                    reset
+                } else {
+                    reset.max(fence.until_ms)
+                };
+                if until != fence.until_ms {
+                    store
+                        .reconcile_account_route_fence(
+                            fence,
+                            until,
+                            latest_reports[&fence.credential_id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    fence.until_ms = until;
+                }
             }
         }
         let refusals = refresh_credential_quota_holds(
@@ -871,7 +895,7 @@ impl ClassContext {
             ModelReach::All
         };
         AccountView {
-            account_id,
+            account_id: account_id.clone(),
             routing_provider: fact.provider_id.clone(),
             refresh_adapter: row.refresh_adapter.clone().unwrap_or_default(),
             credentials: vec![CredentialRecord {
@@ -880,14 +904,18 @@ impl ClassContext {
                 needs_reauth: false,
             }],
             model_reach,
-            quota: reading.and_then(|reading| {
-                quota_reading_for_model(
-                    &reading.entry,
-                    &reading.account_id,
-                    Some(&capacity),
-                    &model_pools,
-                )
-            }),
+            quota: reading
+                .filter(|_| {
+                    crate::credential_fences::has_quota_signal_for_account(&self.quota, &account_id)
+                })
+                .and_then(|reading| {
+                    quota_reading_for_model(
+                        &reading.entry,
+                        &reading.account_id,
+                        Some(&capacity),
+                        &model_pools,
+                    )
+                }),
         }
     }
 
@@ -921,26 +949,24 @@ impl ClassContext {
             && !self.refusals.iter().any(|fence| {
                 fence.provider_id == fact.provider_id
                     && fence.credential_id == row.id
-                    && (self.targets.contains_key(&fact.provider_id)
-                        || !crate::credential_fences::probe_allowed(
-                            &fence.code,
-                            self.has_quota_signal(&fact.provider_id, &row.id),
-                            self.now_ms.saturating_sub(fence.observed_at_ms),
-                        ))
+                    && !crate::credential_fences::probe_allowed(
+                        &fence.code,
+                        self.has_quota_signal(&fact.provider_id, &row.id),
+                        self.now_ms.saturating_sub(fence.observed_at_ms),
+                    )
             })
     }
 
     fn probe_eligible(&self, provider: &str, credential: &str) -> bool {
-        !self.targets.contains_key(provider)
-            && self.refusals.iter().any(|fence| {
-                fence.provider_id == provider
-                    && fence.credential_id == credential
-                    && crate::credential_fences::probe_allowed(
-                        &fence.code,
-                        self.has_quota_signal(provider, credential),
-                        self.now_ms.saturating_sub(fence.observed_at_ms),
-                    )
-            })
+        self.refusals.iter().any(|fence| {
+            fence.provider_id == provider
+                && fence.credential_id == credential
+                && crate::credential_fences::probe_allowed(
+                    &fence.code,
+                    self.has_quota_signal(provider, credential),
+                    self.now_ms.saturating_sub(fence.observed_at_ms),
+                )
+        })
     }
 
     fn quota_hold_reset(&self, provider: &str, credential: &str) -> Option<i64> {
@@ -967,6 +993,7 @@ impl ClassContext {
                 &self.credentials,
                 credential,
                 self.now_ms,
+                &self.config.allocator_policy(provider),
             ))
             .max()
     }
@@ -1152,7 +1179,16 @@ impl ClassContext {
     /// backoff observation, each with its deadline. Report fences name the
     /// credential that served; observations already name the whole account.
     fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
-        let mut fenced = self.accounts_fenced_by(&self.route_fences, provider, model);
+        // A refusal probe must reach admission to claim its single-request
+        // reservation. A quota route fence must not hide that same probe;
+        // allocator quota blocks and observation backoffs still apply.
+        let enforcing: Vec<_> = self
+            .route_fences
+            .iter()
+            .filter(|fence| !self.probe_eligible(&fence.provider, &fence.credential_id))
+            .cloned()
+            .collect();
+        let mut fenced = self.accounts_fenced_by(&enforcing, provider, model);
         for (named_provider, account, until) in &self.observation_backoffs {
             if named_provider == provider && *until > self.now_ms {
                 fenced
@@ -2413,6 +2449,7 @@ pub(crate) fn refresh_credential_quota_holds_in(
     route_fences: &[prefrontal_routing_store::AccountRouteFence],
     now: EpochMs,
 ) -> RouteStateResult<Vec<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>> {
+    let credentials = &credentials.with_quota_account_ids(quota);
     let mut kept = Vec::new();
     for refusal in refusals {
         if !crate::credential_fences::is_billing_code(&refusal.code) {
@@ -2438,8 +2475,9 @@ pub(crate) fn refresh_credential_quota_holds_in(
         let policy = config.allocator_policy(&refusal.provider_id);
         let reading = crate::credential_fences::latest_reading_for_account(quota, &account)
             .and_then(|reading| quota_reading_for_model(&reading.entry, &account, None, &[]));
-        let reading_reset =
-            crate::credential_fences::exhausted_quota_reset_for_account(quota, &account, now);
+        let reading_reset = crate::credential_fences::exhausted_quota_reset_for_account(
+            quota, &account, now, &policy,
+        );
         let lifted = (|| -> RouteStateResult<bool> {
             let blocks: Vec<_> = tx
                 .active_pool_fences(&refusal.provider_id)?
@@ -2458,23 +2496,42 @@ pub(crate) fn refresh_credential_quota_holds_in(
                     ResetTime::At(reset) => reset,
                     _ => 0,
                 });
-            let reset = reading_reset
-                .into_iter()
-                .chain(prior.iter().filter_map(|fence| match fence.reset {
-                    ResetTime::At(reset) if reset > refusal.observed_at_ms => Some(reset),
-                    _ => None,
-                }))
-                .max();
+            let newer_reading = reading
+                .as_ref()
+                .and_then(|reading| reading.observed_at_ms)
+                .is_some_and(|fetched| fetched > refusal.observed_at_ms);
+            if crate::credential_fences::fresh_headroom_after_for_account(
+                quota,
+                &account,
+                refusal.observed_at_ms,
+                now,
+                &policy,
+            ) {
+                for block in &blocks {
+                    tx.clear_fence(&block.evidence.fence_id, now, "fresh_headroom")?;
+                }
+                return Ok(true);
+            }
+            let reset = reading_reset.filter(|_| newer_reading).or_else(|| {
+                reading_reset
+                    .into_iter()
+                    .chain(prior.iter().filter_map(|fence| match fence.reset {
+                        ResetTime::At(reset) if reset > refusal.observed_at_ms => Some(reset),
+                        _ => None,
+                    }))
+                    .max()
+            });
             let Some(mut reset) = reset else {
                 return Ok(crate::credential_fences::fresh_headroom_after_for_account(
                     quota,
                     &account,
                     refusal.observed_at_ms,
                     now,
+                    &policy,
                 ));
             };
-            // A run and a reading may name different windows. Neither
-            // known reset may shorten the other's hold on the account.
+            // Contemporaneous reports can name different windows. Newer
+            // quota evidence supersedes an older report's guessed horizon.
             for route in route_fences.iter().filter(|route| {
                 route.provider == refusal.provider_id
                     && crate::credential_fences::credential_account_id(
@@ -2484,7 +2541,13 @@ pub(crate) fn refresh_credential_quota_holds_in(
                     .as_deref()
                         == Some(account.as_str())
             }) {
-                reset = reset.max(route.until_ms);
+                if !reading
+                    .as_ref()
+                    .and_then(|reading| reading.observed_at_ms)
+                    .is_some_and(|fetched| fetched > route.recorded_at)
+                {
+                    reset = reset.max(route.until_ms);
+                }
             }
             let mut fence = prior.unwrap_or_else(|| Fence {
                 account_id: account.clone(),
@@ -2514,6 +2577,9 @@ pub(crate) fn refresh_credential_quota_holds_in(
                         && fence.observed_at_ms == refusal.observed_at_ms
                 })
             }) {
+                for block in &blocks {
+                    tx.clear_fence(&block.evidence.fence_id, now, "quota_evidence_updated")?;
+                }
                 tx.insert_pool_fence(&AccountPoolFenceRow {
                     evidence: AccountFenceRow {
                         fence_id: format!("{prefix}{}", new_id("hold")),

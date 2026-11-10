@@ -3321,3 +3321,212 @@ async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() 
         reply.1
     );
 }
+
+fn stale_xai_fixture(used: f64) -> Arc<Harness> {
+    let (harness, mut credentials) = setup("xai", false);
+    let mut fact = crate::tests::fact("xai", "grok-4.7");
+    fact.auth_methods = Some(vec!["oauth".into()]);
+    fact.billing_plane = Some(BillingPlane {
+        provider_id: "xai".into(),
+        auth_method: "oauth".into(),
+        kind: "subscription".into(),
+        selection_reason: "subscription".into(),
+        rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })]
+            .into_iter()
+            .collect(),
+    });
+    harness.install_facts(&[fact.clone()]);
+    catalog_fact(&harness, &fact);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-missing-vault-account-id".into(),
+            credentials: vec![ListedCredential {
+                id: "oauth:xai".into(),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["xai".into()],
+                credential_type: "oauth".into(),
+                auth_method: Some("oauth".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact]),
+    );
+    harness.set_credentials(credentials);
+    let reported = NOW as i64 - 5 * 86_400_000;
+    harness
+        .store()
+        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+            provider: "xai".into(),
+            credential_id: "oauth:xai".into(),
+            model: "grok-4.7".into(),
+            until_ms: reported + 8 * 86_400_000,
+            decision_id: "dec_916ab7900382".into(),
+            recorded_at: reported,
+        })
+        .unwrap();
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: "xai".into(),
+                credential_id: "oauth:xai".into(),
+                code: "billing_exhausted".into(),
+            },
+            Some("provider_ids=xai;plan_tier=;state=active"),
+            NOW as i64 - 12 * 86_400_000,
+        )
+        .unwrap();
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_usage_reply(
+        &mut state,
+        &serde_json::to_vec(&json!({
+            "result":[{"provider":"grok", "apiProvider":"xai", "credentialRef":"oauth:xai",
+                "account":"819c167d-1ebc-4945-a7b9-7197a98a207e", "source":"vault",
+                "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+                "usage":{"primary":{"usedPercent":used,"windowMinutes":10080,
+                    "resetsAt":crate::account_selection::rfc3339(NOW as i64 + 2 * 86_400_000)}}}],
+            "completeProviders":["grok"]
+        }))
+        .unwrap(),
+        NOW as i64,
+    )
+    .unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+    harness
+}
+
+#[tokio::test]
+async fn stale_xai_eight_day_fence_lifts_on_attested_fresh_headroom() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = stale_xai_fixture(0.0);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason", "requirements":{"iq":30}, "pin":"xai/grok-4.7"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    assert!(harness
+        .store()
+        .account_route_fences(NOW as i64)
+        .unwrap()
+        .is_empty());
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .is_empty());
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let admitted = runner.call("route.account_for", &json!({"provider":"xai","model":"grok-4.7",
+        "conversation_key":"healthy-grok","admission_id":"healthy-grok", "decision_id":selected.1["result"]["decision_id"]})).await;
+    assert_credential(&admitted, "oauth:xai");
+    assert_eq!(
+        admitted.1["result"]["account"]["account_id"],
+        "819c167d-1ebc-4945-a7b9-7197a98a207e"
+    );
+}
+
+#[tokio::test]
+async fn stale_xai_guess_shortens_to_newer_reset_and_near_wall_stays_fenced() {
+    for used in [100.0, 96.0] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let harness = stale_xai_fixture(used);
+        harness.edit_config(|config| {
+            config["accounts"]["soft_quota_remaining_percent"] = json!(5.0);
+        });
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &json!({"provider":"xai","model":"grok-4.7",
+            "conversation_key":"near-wall","admission_id":"near-wall"}),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{used}: {}", blocked.1);
+        let fences = harness.store().account_route_fences(NOW as i64).unwrap();
+        assert_eq!(fences.len(), 1, "{used}: {fences:?}");
+        assert_eq!(fences[0].until_ms, NOW as i64 + 2 * 86_400_000);
+        assert_eq!(fences[0].recorded_at, NOW as i64 - 5 * 86_400_000);
+        if used == 100.0 {
+            assert_eq!(
+                harness
+                    .store()
+                    .credential_entitlement_fences()
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn stale_api_billing_probe_passes_its_route_fence_once_even_with_spend_reading() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let old = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1;
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "apikey:test".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            old,
+        )
+        .unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "apikey:test".into(),
+            model: "model".into(),
+            until_ms: NOW as i64 + 8 * 86_400_000,
+            recorded_at: old,
+            decision_id: "billing-refusal".into(),
+        })
+        .unwrap();
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_usage_reply(&mut state, &serde_json::to_vec(&json!({
+        "result":[{"provider":"platform", "apiProvider":"synthetic", "account":"apikey-account",
+            "credentialRef":"apikey:test", "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+            "usage":{}, "spend":[{"id":"credits","remaining":{"minor":20000,"exponent":2,"unit":"USD"}}]}]
+    })).unwrap(), NOW as i64).unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"codemode", "requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let mut request = account_request("synthetic", "due-api-probe");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "apikey:test");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"],
+        "credential_fence_probe"
+    );
+    request["admission_id"] = json!("second-api-probe");
+    request["conversation_key"] = json!("second-api-probe");
+    assert_eq!(
+        runner.call("route.account_for", &request).await.0,
+        FrameType::Error
+    );
+    assert_eq!(
+        harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
+        NOW as i64
+    );
+}

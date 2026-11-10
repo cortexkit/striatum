@@ -340,7 +340,7 @@ fn credential_fences(
             });
             let reading_reset = account_id.as_deref().and_then(|account| {
                 crate::credential_fences::exhausted_quota_reset_for_account(
-                    quota, account, now_ms,
+                    quota, account, now_ms, &Default::default(),
                 )
             });
             let quota_reset = stored_reset.into_iter().chain(reading_reset).max();
