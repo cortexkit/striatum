@@ -56,6 +56,8 @@ mod operator_quality;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod key_pool;
+mod fence_rechecks;
+pub use fence_rechecks::FenceRecheck;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
@@ -308,7 +310,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 80] {
+fn route_state_migrations() -> [Migration; 81] {
     [
         Migration {
             version: 1,
@@ -629,6 +631,10 @@ fn route_state_migrations() -> [Migration; 80] {
         Migration {
             version: 81,
             statements: include_str!("../migrations/081_engine_measurements.sql"),
+        },
+        Migration {
+            version: 82,
+            statements: include_str!("../migrations/082_fence_rechecks.sql"),
         },
     ]
 }
