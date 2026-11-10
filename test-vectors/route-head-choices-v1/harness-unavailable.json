@@ -1,0 +1,1 @@
+{"refusal":{"code":"no_route","message":"runner harness-runner does not host harness pi","detail":{"reason":"harness_unavailable"}},"request":{"method":"route.head_choices","params":{"harness":"pi","runner_module":"harness-runner"}}}

@@ -1,0 +1,1 @@
+{"reply":{"result":{"catalog_version":"41","models":[{"billing":"subscription","model":"claude","pin_only":false,"provider":"anthropic","service_tiers":["standard"],"variants":["high","low","medium","xhigh"]}],"runner_module":"harness-runner"}},"request":{"method":"route.head_choices","params":{"harness":"claude-code","runner_module":"harness-runner"}}}

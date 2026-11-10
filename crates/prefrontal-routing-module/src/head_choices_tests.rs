@@ -696,48 +696,95 @@ async fn serving_bytes_match_tagged_vectors() {
     use sha2::{Digest, Sha256};
     let (harness, mut credentials) = fixture();
     let non_starting_runner = "non-starting-runner";
+    let harness_runner = "harness-runner";
     let mut declaration = credentials.runner_declarations[RUNNER].clone();
     declaration.starts_sessions = false;
     credentials
         .runner_declarations
         .insert(non_starting_runner.into(), declaration);
+    credentials.runner_declarations.insert(
+        harness_runner.into(),
+        super::runners::parse_declaration(&json!({"runner": {
+            "pairs":[{"wire_api":WIRE,"auth_method":"oauth"},
+                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
+            "follows_account_choice":true,
+            "harnesses":["opencode2","claude-code"],
+            "default_harness":"opencode2",
+            "harness_limits":{"claude-code": {
+                "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],
+                "explicit_providers":["anthropic"]
+            }}
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"module":non_starting_runner,"via_vault":true}));
+            .extend([
+                json!({"module":non_starting_runner,"via_vault":true}),
+                json!({"module":harness_runner,"via_vault":true}),
+            ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");
     let update = std::env::var_os("UPDATE_ROUTE_HEAD_CHOICES_VECTORS").is_some();
     let mut sums = String::new();
-    for (name, runner) in [
-        ("with-tiers.json", RUNNER),
-        ("without-tiers.json", NO_TIERS),
-        ("policy-excluded.json", "policy-runner"),
-        ("pin-only.json", "pin-runner"),
-        ("pin-only-pay-per-token.json", API_KEY_RUNNER),
-        ("unknown-runner.json", "missing"),
-        ("non-starting-runner.json", non_starting_runner),
+    for (name, runner, selected_harness) in [
+        ("with-tiers.json", RUNNER, None),
+        ("without-tiers.json", NO_TIERS, None),
+        ("policy-excluded.json", "policy-runner", None),
+        ("pin-only.json", "pin-runner", None),
+        ("pin-only-pay-per-token.json", API_KEY_RUNNER, None),
+        ("unknown-runner.json", "missing", None),
+        ("non-starting-runner.json", non_starting_runner, None),
+        ("harness-narrowed.json", harness_runner, Some("claude-code")),
+        ("harness-runner-wide.json", harness_runner, Some("opencode2")),
+        ("harness-unavailable.json", harness_runner, Some("pi")),
     ] {
-        let request = json!({"method":"route.head_choices","params":{"runner_module":runner}});
+        let mut request = json!({"method":"route.head_choices","params":{"runner_module":runner}});
+        if let Some(selected_harness) = selected_harness {
+            request["params"]["harness"] = json!(selected_harness);
+        }
         let (ty, bytes) = route
             .call_raw("route.head_choices", &request["params"])
             .await;
-        assert_eq!(
-            ty,
-            FrameType::Response,
-            "{}",
-            String::from_utf8_lossy(&bytes)
-        );
-        let reply: Value = serde_json::from_slice(&bytes).unwrap();
-        check_contract(runner, &reply["result"]);
-        if ["missing", non_starting_runner].contains(&runner) {
-            assert_eq!(reply["result"]["models"], json!([]), "{name}");
-        }
-        let bytes = serde_json::to_vec(&json!({"request":request,"reply":reply})).unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let bytes = if selected_harness == Some("pi") {
+            assert_eq!(ty, FrameType::Error, "{body}");
+            assert_eq!(body["code"], "no_route", "{name}");
+            assert_eq!(body["detail"]["reason"], "harness_unavailable", "{name}");
+            // Preserve the refusal body bytes, including the handler's field order.
+            let mut pair = b"{\"refusal\":".to_vec();
+            pair.extend_from_slice(&bytes);
+            pair.extend_from_slice(b",\"request\":");
+            serde_json::to_writer(&mut pair, &request).unwrap();
+            pair.push(b'}');
+            pair
+        } else {
+            assert_eq!(ty, FrameType::Response, "{body}");
+            check_contract(runner, &body["result"]);
+            if ["missing", non_starting_runner].contains(&runner) {
+                assert_eq!(body["result"]["models"], json!([]), "{name}");
+            }
+            match selected_harness {
+                Some("claude-code") => {
+                    assert_eq!(ids(&body["result"]), vec!["anthropic/claude"], "{name}");
+                }
+                Some("opencode2") => {
+                    assert_eq!(
+                        ids(&body["result"]),
+                        vec!["anthropic/claude", "openai/a-head", "openai/pinned"],
+                        "{name}"
+                    );
+                }
+                _ => {}
+            }
+            serde_json::to_vec(&json!({"request":request,"reply":body})).unwrap()
+        };
         let path = directory.join(name);
         if update {
             std::fs::write(&path, &bytes).unwrap();
