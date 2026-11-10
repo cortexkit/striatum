@@ -1848,6 +1848,7 @@ pub(super) async fn handle_select_request(
                 })
     };
     if !host_run {
+        let mut no_account = Vec::new();
         mapped_availability.models.retain(|key| {
             let capacity = facts
                 .iter()
@@ -1855,15 +1856,34 @@ pub(super) async fn handle_select_request(
                 .find(|route| route.route_key == *key)
                 .map(|route| route.capacity_key)
                 .unwrap_or_else(|| key.clone());
-            select_policy::choose_runner(
+            let runnable = select_policy::choose_runner(
                 &configured_runners,
                 consumer_policy.runner.as_deref(),
                 key,
                 &capacity,
                 &runner_runs,
             )
-            .is_some()
+            .is_some();
+            if !runnable
+                && configured_runners
+                    .iter()
+                    .filter(|runner| {
+                        consumer_policy
+                            .runner
+                            .as_deref()
+                            .is_none_or(|module| module == runner.module)
+                    })
+                    .any(|runner| runner_registry.no_runner_account(&runner.module, key, &capacity))
+            {
+                no_account.push(key.clone());
+            }
+            runnable
         });
+        for key in no_account {
+            mapped_availability
+                .rejected
+                .insert(key, "no_runner_account".into());
+        }
     }
     for fact in &facts {
         let route = fact_to_route(fact);

@@ -27,10 +27,12 @@ async fn selection_before_first_plane_load_waits_then_prices_muse_as_subscriptio
     fact.cache_read_rate = Some(0.002);
     store.upsert_fact(&fact, FactSource::Override).unwrap();
     let credentials = cold_credentials();
+    let mut muse = muse_credential("oauth", true);
+    muse.account_id = Some("muse-account".into());
     credentials.lock().unwrap().apply_listing(
         &cortexkit_claustrum_client::ScopedCredentialListing {
             view: "muse-subscription".into(),
-            credentials: vec![muse_credential("oauth", true)],
+            credentials: vec![muse],
             ..Default::default()
         },
         crate::now_ms(),

@@ -1128,3 +1128,92 @@ fn broca_head_selection_v2_routing_tier_discovery() {
         }
     }
 }
+
+#[test]
+fn broca_account_reach_uses_raw_vault_identity_but_api_keys_keep_their_fallback() {
+    let facts = vec![fact("xai", "grok-4.7", Some(&["oauth", "apikey"]))];
+    for method in ["oauth", "apikey"] {
+        let mut missing = row(&["xai"], &[], Some(method));
+        missing.id = format!("{method}:xai");
+        missing.account_id = None;
+        let credentials = credentials(&facts, missing.clone(), NOW);
+        for module in ["broca", "other-runner"] {
+            let mut runner = policy(None);
+            runner.module = module.into();
+            let registry = Registry::build(vec![runner], &credentials, &facts, NOW);
+            let expected = method == "apikey" || module != "broca";
+            assert_eq!(
+                registry.runs(module, "xai/grok-4.7", "xai/grok-4.7"),
+                expected
+            );
+            assert_eq!(
+                registry.no_runner_account(module, "xai/grok-4.7", "xai/grok-4.7"),
+                !expected
+            );
+        }
+        let mut known = missing;
+        known.id = "second-record".into();
+        known.account_id = Some("provider-account".into());
+        let mut credentials = credentials.clone();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "healthy-sibling".into(),
+                credentials: vec![credentials.listed_credentials()[0].clone(), known],
+                ..Default::default()
+            },
+            NOW,
+        );
+        let mut runner = policy(None);
+        runner.module = "broca".into();
+        let registry = Registry::build(vec![runner], &credentials, &facts, NOW);
+        assert!(registry.runs("broca", "xai/grok-4.7", "xai/grok-4.7"));
+        assert!(!registry.no_runner_account("broca", "xai/grok-4.7", "xai/grok-4.7"));
+    }
+}
+
+#[tokio::test]
+async fn broca_missing_provider_account_is_rejected_on_both_select_surfaces_despite_insula_linkage()
+{
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("broca-no-runner-account");
+    for seeded in harness.store().get_facts().unwrap() {
+        harness
+            .store()
+            .delete_fact(&prefrontal_routing_core::fact_to_route(&seeded).route_key)
+            .unwrap();
+    }
+    let facts = vec![fact("xai", "grok-4.7", Some(&["oauth"]))];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| config["runners"] = json!([{"module":"broca", "via_vault":true}]));
+    let mut missing = row(&["xai"], &[], Some("oauth"));
+    missing.id = "oauth:xai".into();
+    missing.account_id = None;
+    harness.set_credentials(credentials(&facts, missing, NOW));
+    let mut quota = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_usage_reply(
+        &mut quota,
+        &serde_json::to_vec(&json!({
+            "result":[{"provider":"grok", "apiProvider":"xai", "credentialRef":"oauth:xai",
+                "account":"819c167d-1ebc-4945-a7b9-7197a98a207e", "source":"vault",
+                "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+                "usage":{"primary":{"usedPercent":0.0,"windowMinutes":10080,
+                    "resetsAt":crate::account_selection::rfc3339(NOW as i64 + 2 * 86_400_000)}}}]
+        }))
+        .unwrap(),
+        NOW as i64,
+    )
+    .unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    for request in [
+        json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
+        json!({"targetAgent":"mason", "consumer":"mason", "substrate":"broca", "requirements":{"iq":1,"eq":0}}),
+    ] {
+        let reply = caller.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert!(
+            reply.1.to_string().contains("no_runner_account"),
+            "{reply:?}"
+        );
+    }
+}

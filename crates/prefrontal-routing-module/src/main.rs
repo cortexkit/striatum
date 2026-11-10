@@ -5350,6 +5350,7 @@ mod tests {
                             id: id.into(),
                             categories: vec!["llm-provider".into()],
                             credential_type: "apikey".into(),
+                            auth_method: Some("apikey".into()),
                             state: "active".into(),
                             provider_ids: vec![provider.into()],
                             plan_tier: plan_tier
@@ -5816,6 +5817,7 @@ mod tests {
                         id: id.into(),
                         categories: vec!["llm-provider".into()],
                         credential_type: "apikey".into(),
+                        auth_method: Some("apikey".into()),
                         state: "active".into(),
                         provider_ids: vec![provider.into()],
                         plan_tier: None,
@@ -11732,8 +11734,8 @@ mod tests {
             store.upsert_fact(fact, FactSource::Override).unwrap();
         }
         let credentials = vault_listing(&[
-            ("oauth:anthropic", &["anthropic"], None),
-            ("chatgpt:openai", &["openai"], None),
+            ("oauth:anthropic", &["anthropic"], Some("anthropic-account")),
+            ("chatgpt:openai", &["openai"], Some("openai-account")),
         ]);
         let params = |available: serde_json::Value| {
             json!({
@@ -13720,6 +13722,7 @@ mod tests {
                     id: "apikey:anthropic:wsampleyahoo".into(),
                     categories: vec!["llm-provider".into()],
                     credential_type: "apikey".into(),
+                    auth_method: Some("apikey".into()),
                     state: "active".into(),
                     provider_ids: vec!["anthropic-platform".into()],
                     serves: vec!["anthropic".into()],

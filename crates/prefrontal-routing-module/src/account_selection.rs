@@ -3436,6 +3436,10 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                     .collect();
                 return because(
                     "candidates_filter",
+                    // An empty candidate list needs a permanent refusal, not
+                    // a timed retry or reauthentication. The pinned routing
+                    // contract does not yet declare account_selection_unsupported;
+                    // retain the existing code until that contract addition lands.
                     OpReply::typed(
                         "account_selection_unavailable",
                         "The runner's candidate list leaves out every account that can serve this model, so routing admitted none. Each exclusion names an account the runner didn't offer. Offer those accounts as candidates, or send no candidate list to let routing choose.",

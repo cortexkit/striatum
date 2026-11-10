@@ -34,6 +34,13 @@ fn credential_reaches_runner(
     fact: &ModelFact,
     row: &cortexkit_claustrum_client::ListedCredential,
 ) -> bool {
+    if !routing_v1::runners::can_offer_account(
+        &runner.policy.module,
+        runner.follows_account_choice,
+        row,
+    ) {
+        return false;
+    }
     // Registry::runs establishes model reach through any account. Billing
     // must use the accounts whose wire/auth pair this runner can actually use.
     runner.pairs.as_ref().is_none_or(|pairs| {

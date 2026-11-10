@@ -751,6 +751,19 @@ async fn select_at_tier(
         .iter()
         .filter_map(|fact| {
             let route = fact_to_route(fact);
+            if !runners
+                .iter()
+                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+                && runners.iter().any(|runner| {
+                    registry.no_runner_account(
+                        &runner.module,
+                        &route.route_key,
+                        &route.capacity_key,
+                    )
+                })
+            {
+                return Some((route.route_key, "no_runner_account".into()));
+            }
             let unverified = !runners
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))

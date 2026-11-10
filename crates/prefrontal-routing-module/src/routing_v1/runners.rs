@@ -48,6 +48,26 @@ pub(crate) struct EffectiveRunner {
     statically_reachable_models: BTreeSet<String>,
     #[serde(skip)]
     unverified_wire_models: BTreeSet<String>,
+    #[serde(skip)]
+    no_account_models: BTreeSet<String>,
+}
+
+pub(crate) fn can_offer_account(
+    module: &str,
+    follows_account_choice: bool,
+    row: &cortexkit_claustrum_client::ListedCredential,
+) -> bool {
+    // Broca's subscription candidates require a vault provider account id;
+    // API-key candidates instead fall back to the credential id. Insula's
+    // credentialRef join cannot supply metadata to Broca's separate listing.
+    // Replace the module-specific rule with a runner declaration capability
+    // such as candidates_require_provider_account when the contract exposes it.
+    // This temporary compatibility bridge uses the legacy wire's runner name
+    // until the declaration can advertise that candidate requirement.
+    module != crate::legacy_wire::BROCA
+        || !follows_account_choice
+        || row.auth_method.as_deref() == Some("apikey")
+        || row.account_id.is_some()
 }
 
 fn is_true(value: &bool) -> bool {
@@ -125,6 +145,7 @@ impl Registry {
                 reachable_models: reachable,
                 statically_reachable_models: models,
                 unverified_wire_models: BTreeSet::new(),
+                no_account_models: BTreeSet::new(),
             }],
         }
     }
@@ -147,7 +168,10 @@ impl Registry {
                     report_unknown_pair_tokens_once(&policy.module, declaration);
                 }
                 let needs_vault = declaration.is_some() || policy.via_vault;
+                let follows_account_choice =
+                    declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
                 let mut unverified_wire_models = BTreeSet::new();
+                let mut no_account_models = BTreeSet::new();
                 let statically_reachable_models: BTreeSet<_> = facts
                     .iter()
                     .filter(|fact| {
@@ -186,6 +210,20 @@ impl Registry {
                                                 })
                                             }
                                     })
+                                    && {
+                                        let offers = can_offer_account(
+                                            &policy.module,
+                                            follows_account_choice,
+                                            row,
+                                        );
+                                        if !offers {
+                                            no_account_models.insert(format!(
+                                                "{}/{}",
+                                                fact.provider_id, fact.model_id
+                                            ));
+                                        }
+                                        offers
+                                    }
                             })
                     })
                     .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))
@@ -199,6 +237,7 @@ impl Registry {
                     BTreeSet::new()
                 };
                 unverified_wire_models.retain(|model| !reachable_models.contains(model));
+                no_account_models.retain(|model| !statically_reachable_models.contains(model));
                 let route_policy = policy.routes.clone();
                 let routes = facts
                     .iter()
@@ -219,8 +258,6 @@ impl Registry {
                     })
                     .collect();
                 policy.routes = Some(routes);
-                let follows_account_choice =
-                    declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
                 let standing_limits = declaration.and_then(|d| d.standing_limits.clone());
                 let routed_accounts = credentials
                     .runner_routed_accounts
@@ -246,6 +283,7 @@ impl Registry {
                     reachable_models,
                     statically_reachable_models,
                     unverified_wire_models,
+                    no_account_models,
                 }
             })
             .collect();
@@ -283,6 +321,16 @@ impl Registry {
     pub(crate) fn can_run(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
             runner.statically_reachable_models.contains(capacity)
+                && runner
+                    .route_policy
+                    .as_ref()
+                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+        })
+    }
+
+    pub(crate) fn no_runner_account(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            runner.no_account_models.contains(capacity)
                 && runner
                     .route_policy
                     .as_ref()
