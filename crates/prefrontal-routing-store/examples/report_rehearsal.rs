@@ -68,6 +68,19 @@ fn main() {
         }
     }
     println!("schedule counts (kind,quota): {counts:?}");
+    // An empty claim exercises the admission synchronization transaction but
+    // consumes no probe. Measure the copy, never the serving database.
+    let mut sync_us = Vec::new();
+    for _ in 0..20 {
+        let started = Instant::now();
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&[], clock_ms()))
+            .unwrap());
+        sync_us.push(started.elapsed().as_micros());
+    }
+    sync_us.sort_unstable();
+    println!("admission sync (20 writer transactions, no claims): mean_us={} p50_us={} p95_us={} max_us={}",
+        sync_us.iter().sum::<u128>()/sync_us.len() as u128,sync_us[9],sync_us[18],sync_us[19]);
     drop(store);
     let first = schedules(&path);
     let reopened =

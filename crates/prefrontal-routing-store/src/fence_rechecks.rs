@@ -114,6 +114,12 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
     }
+    // Materialize once and index the compound origin key. A correlated lookup
+    // against the UNION view otherwise rebuilds its JSON keys for every clock.
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;
+        CREATE UNIQUE INDEX IF NOT EXISTS current_fence_origin_key ON current_fence_origin(kind,origin_key);
+        DELETE FROM current_fence_origin;
+        INSERT INTO current_fence_origin SELECT * FROM fence_origin;")?;
     // A changed evidence value is new evidence, not a probe. Pool evidence
     // omits the shared last-used timestamp so leasing a key cannot extend its
     // retry deadline merely by changing that timestamp.
@@ -124,7 +130,7 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
           evidence,evidence_at,COALESCE(quota,0),
           CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER),
           CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END
-         FROM fence_origin WHERE true
+         FROM current_fence_origin WHERE true
          ON CONFLICT(kind,origin_key) DO UPDATE SET evidence=excluded.evidence,evidence_at=excluded.evidence_at,
           quota=excluded.quota,
           next_recheck_at=CASE WHEN excluded.evidence_at>=COALESCE(fence_recheck.last_claimed_at,-9223372036854775808)
@@ -136,7 +142,7 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
     // Observation evidence is append-only and read through a bounded sparse
     // index. Its clock survives that lookback until a successful probe heals it.
     conn.execute("DELETE FROM fence_recheck WHERE kind!='observation' AND NOT EXISTS
-        (SELECT 1 FROM fence_origin o WHERE o.kind=fence_recheck.kind AND o.origin_key=fence_recheck.origin_key)", [])?;
+        (SELECT 1 FROM current_fence_origin o WHERE o.kind=fence_recheck.kind AND o.origin_key=fence_recheck.origin_key)", [])?;
     // Older writers stored account-local errors on model/provider rows.
     // Snapshot reads ignore those rows as model/provider walls. Exclude their
     // retry clocks too, so one account's error cannot hide healthy siblings.
@@ -528,7 +534,6 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        sync(self.conn).map_err(err)?;
         claim_owned(self.conn, origins, now, owner, None, owner).map_err(err)
     }
     pub fn claim_fence_rechecks_for_authorized_admission(
@@ -546,7 +551,6 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        sync(self.conn).map_err(err)?;
         claim_owned(self.conn, origins, now, None, owner, owner).map_err(err)
     }
     /// Success can heal only evidence older than this request's admission. A
@@ -749,7 +753,6 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<bool> {
-        sync(self.conn).map_err(err)?;
         claim(self.conn, origins, now).map_err(err)
     }
 }
@@ -1046,6 +1049,41 @@ mod tests {
         assert!(store
             .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 970_000))
             .unwrap());
+    }
+
+    #[test]
+    fn admission_sync_uses_linear_origin_membership_not_a_correlated_view_scan() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        unsafe extern "C" fn count(pointer: *mut std::ffi::c_void) -> std::ffi::c_int {
+            // SAFETY: the counter lives until the connection's callback is removed.
+            unsafe { &*(pointer as *const AtomicU64) }.fetch_add(1000, Ordering::Relaxed);
+            0
+        }
+        let scratch = cortexkit_test_support::ScratchDir::new("linear-admission-sync");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "linear-admission-sync",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store.store.with_conn(|conn| {
+            conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
+                INSERT INTO account_non_quota_route_fence SELECT 'p','c'||i,'m',8640000000000000,'d',100,100,'billing' FROM n;")?;
+            sync(conn)?;
+            let steps = AtomicU64::new(0);
+            // SAFETY: the store mutex owns this live handle, and the callback
+            // touches only the counter, never SQLite or the surrounding store.
+            unsafe { rusqlite::ffi::sqlite3_progress_handler(conn.handle(),1000,Some(count),&steps as *const _ as *mut std::ffi::c_void); }
+            let started = std::time::Instant::now();
+            let result = sync(conn);
+            let elapsed = started.elapsed();
+            // SAFETY: remove the callback before its stack counter goes away.
+            unsafe { rusqlite::ffi::sqlite3_progress_handler(conn.handle(),0,None,std::ptr::null_mut()); }
+            result?;
+            let steps = steps.load(Ordering::Relaxed);
+            eprintln!("admission_sync origins=10000 steps={steps} elapsed_us={}",elapsed.as_micros());
+            assert!(steps<40_000_000,"origin membership must be indexed, not quadratic: {steps} VM steps");
+            Ok(())
+        }).unwrap();
     }
 
     #[test]
