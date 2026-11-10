@@ -837,6 +837,90 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_runner_route_facts(
+        &self,
+        routes: &[cortexkit_role_routing_conformance::RunnerRouteFacts],
+    ) -> Result<bool, String> {
+        let harness = self.harness();
+        let shared = harness.broca_credentials.lock().unwrap().clone();
+        let mut credentials = shared.lock().unwrap();
+        let mut facts = harness
+            .store()
+            .get_facts()
+            .map_err(|error| error.to_string())?;
+        let mut serving = std::collections::BTreeSet::new();
+        for route in routes {
+            let fact = facts
+                .iter_mut()
+                .find(|fact| {
+                    prefrontal_routing_core::fact_to_route(fact).route_key == route.route_key
+                })
+                .ok_or_else(|| {
+                    format!("runner route fact {} has no catalog model", route.route_key)
+                })?;
+            credentials
+                .wire_apis
+                .insert(route.route_key.clone(), route.wire_api.clone());
+            serving.insert((fact.provider_id.clone(), route.auth_method.clone()));
+            let mut plane = prefrontal_routing_core::billing::BillingPlane {
+                provider_id: fact.provider_id.clone(),
+                auth_method: route.auth_method.clone(),
+                kind: "upstream".into(),
+                selection_reason: "conformance runner route facts".into(),
+                rates: Default::default(),
+            };
+            plane.rates.insert(
+                "rate.output".into(),
+                prefrontal_routing_core::billing::BillingRate::Priced {
+                    rate: fact.cost_per_m_tok_out.unwrap(),
+                },
+            );
+            fact.billing_plane = Some(plane);
+        }
+        let mut rows: Vec<_> = credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| {
+                !serving
+                    .iter()
+                    .any(|(provider, _)| row.provider_ids.contains(provider))
+            })
+            .cloned()
+            .collect();
+        rows.extend(
+            serving
+                .into_iter()
+                .map(|(provider, method)| ListedCredential {
+                    id: format!("runner-fact-{provider}-{method}"),
+                    provider_ids: vec![provider.clone()],
+                    serves: vec![provider],
+                    auth_method: Some(method.clone()),
+                    credential_type: method,
+                    categories: vec!["llm-provider".into()],
+                    state: "active".into(),
+                    ..Default::default()
+                }),
+        );
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "runner-route-facts".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            crate::now_ms(),
+        );
+        credentials.refresh_serving_methods(
+            &Default::default(),
+            &facts,
+            crate::now_ms() as i64,
+            &[],
+        );
+        let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
+            .with_wire_apis(&credentials.wire_apis);
+        credentials.publish_billing_catalog(catalog);
+        Ok(true)
+    }
+
     async fn configure_continue_credentials(
         &self,
         credentials: &[cortexkit_role_routing_conformance::ContinueCredential],
@@ -954,7 +1038,7 @@ impl RoutingSubject for KitSubject {
         &self,
         modules: &[CatalogModule],
     ) -> Result<(), String> {
-        super::consumers::replace_catalog(&Value::Array(
+        let catalog = Value::Array(
             modules
                 .iter()
                 .map(|module| {
@@ -965,11 +1049,15 @@ impl RoutingSubject for KitSubject {
                     })
                 })
                 .collect(),
-        ));
+        );
+        super::consumers::replace_catalog(&catalog);
         // Engine fixtures need a metadata-only media key as well as the kit's
         // LLM accounts. Synthetic ids deliberately carry no auth-method prefix.
         let shared = self.harness().broca_credentials.lock().unwrap().clone();
         let mut credentials = shared.lock().unwrap();
+        credentials
+            .runner_declarations
+            .extend(super::runners::declarations_from_catalog(&catalog));
         let mut rows = credentials.listed_credentials().to_vec();
         rows.retain(|row| !row.id.starts_with("synthetic-media-"));
         let providers: std::collections::BTreeSet<_> = super::consumers::engine_declarations()
@@ -1239,6 +1327,10 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "observe_credential_refused_requires_backoff",
         "credential_refused_blocks_credential",
         "credential_refused_retry_at_ms_refused",
+        "account_observe_credit_without_reset_accepted",
+        "harness_limits_pairs_narrow",
+        "harness_limits_providers_narrow",
+        "harness_limits_invalid_falls_back",
     ] {
         assert_eq!(
             report.outcome(check),

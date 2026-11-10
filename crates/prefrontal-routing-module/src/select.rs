@@ -1744,11 +1744,12 @@ pub(super) async fn handle_select_request(
     let runner_registry = broca_credentials
         .lock()
         .map(|credentials| {
-            routing_v1::runners::Registry::build(
+            routing_v1::runners::Registry::build_for_harness(
                 operator_config.v1_runners(),
                 &credentials,
                 &facts,
                 snapshot.now as u64,
+                params.harness.as_deref(),
             )
         })
         .unwrap_or_default();

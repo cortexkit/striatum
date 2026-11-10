@@ -202,6 +202,124 @@ fn ids(reply: &Value) -> Vec<String> {
         .collect()
 }
 
+fn declare_harness_limits(credentials: &mut BrocaCredentials, limits: Value) {
+    credentials.runner_declarations.insert(
+        RUNNER.into(),
+        super::runners::parse_declaration(&json!({"runner": {
+            "pairs":[{"wire_api":WIRE,"auth_method":"oauth"},
+                {"wire_api":"anthropic.messages","auth_method":"oauth"}],
+            "follows_account_choice":true,
+            "harnesses":["claude-code","codex"],
+            "default_harness":"claude-code",
+            "harness_limits":limits
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn harness_choices_narrow_pairs_and_absent_harness_keeps_runner_union() {
+    let (harness, mut credentials) = fixture();
+    declare_harness_limits(
+        &mut credentials,
+        json!({"claude-code": {
+            "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]
+        }}),
+    );
+    harness.set_credentials(credentials);
+    let route = harness.bind(reserved("occipital"), None).await;
+    let (ty, reply) = route
+        .call(
+            "route.head_choices",
+            &json!({
+                "runner_module":RUNNER,"harness":"claude-code"
+            }),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    assert_eq!(ids(&reply["result"]), vec!["anthropic/claude"]);
+    let union = query(&harness, RUNNER).await;
+    assert!(ids(&union).contains(&"openai/a-head".into()), "{union}");
+    assert!(ids(&union).contains(&"anthropic/claude".into()), "{union}");
+    let (ty, reply) = route
+        .call(
+            "route.head_choices",
+            &json!({
+                "runner_module":RUNNER,"harness":"unhosted"
+            }),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Error, "{reply}");
+    assert_eq!(reply["code"], "no_route", "{reply}");
+    assert_eq!(reply["detail"]["reason"], "harness_unavailable", "{reply}");
+    for malformed in [json!(42), json!("not a token"), json!("Claude-Code")] {
+        let (ty, reply) = route
+            .call(
+                "route.head_choices",
+                &json!({
+                    "runner_module":RUNNER,"harness":malformed
+                }),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Error, "{reply}");
+        assert_eq!(reply["code"], "invalid_request", "{reply}");
+    }
+}
+
+#[tokio::test]
+async fn harness_choices_narrow_providers_and_malformed_map_falls_back_for_every_harness() {
+    let (harness, mut credentials) = fixture();
+    declare_harness_limits(
+        &mut credentials,
+        json!({"claude-code": {
+            "explicit_providers":["anthropic"]
+        }}),
+    );
+    let narrowed = crate::head_choices::choices_for_harness(
+        harness.store(),
+        &harness.operator_config(),
+        &credentials,
+        RUNNER,
+        Some("claude-code"),
+    )
+    .unwrap();
+    assert_eq!(ids(&narrowed), vec!["anthropic/claude"]);
+    declare_harness_limits(
+        &mut credentials,
+        json!({
+            "claude-code":{"explicit_providers":["anthropic"]},
+            "codex":{"pairs":[]}
+        }),
+    );
+    crate::take_operator_warnings();
+    for hosted in ["claude-code", "codex"] {
+        let fallback = crate::head_choices::choices_for_harness(
+            harness.store(),
+            &harness.operator_config(),
+            &credentials,
+            RUNNER,
+            Some(hosted),
+        )
+        .unwrap();
+        assert!(
+            ids(&fallback).contains(&"openai/a-head".into()),
+            "{fallback}"
+        );
+        assert!(
+            ids(&fallback).contains(&"anthropic/claude".into()),
+            "{fallback}"
+        );
+    }
+    let warnings = crate::take_operator_warnings();
+    assert!(
+        warnings.iter().any(|warning| warning
+            .contains("runner.harness_limits.codex.pairs is empty")
+            && warning.contains("using runner-level limits")),
+        "{warnings:?}"
+    );
+}
+
 #[tokio::test]
 async fn reachability_uses_declared_pairs_and_vault_fallback() {
     let (harness, _) = fixture();

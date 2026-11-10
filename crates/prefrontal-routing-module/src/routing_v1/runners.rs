@@ -156,6 +156,40 @@ impl Registry {
         facts: &[ModelFact],
         now_ms: u64,
     ) -> Self {
+        Self::build_resolved(policies, credentials, facts, now_ms, None, false)
+    }
+
+    pub(crate) fn build_for_harness(
+        policies: Vec<RunnerPolicy>,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+        harness: Option<&str>,
+    ) -> Self {
+        Self::build_resolved(policies, credentials, facts, now_ms, harness, false)
+    }
+
+    /// Session selection resolves defaults; a picker without a harness instead
+    /// uses build() or build_for_harness(None) to keep every model allowed by
+    /// the runner's top-level pairs and provider limits.
+    pub(crate) fn build_for_selection(
+        policies: Vec<RunnerPolicy>,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+        harness: Option<&str>,
+    ) -> Self {
+        Self::build_resolved(policies, credentials, facts, now_ms, harness, true)
+    }
+
+    fn build_resolved(
+        policies: Vec<RunnerPolicy>,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+        harness: Option<&str>,
+        resolve_default: bool,
+    ) -> Self {
         let catalog = facts
             .iter()
             .map(|fact| fact.provider_id.clone())
@@ -163,7 +197,39 @@ impl Registry {
         let entries = policies
             .into_iter()
             .map(|mut policy| {
-                let declaration = credentials.runner_declarations.get(&policy.module);
+                let resolved_declaration =
+                    credentials
+                        .runner_declarations
+                        .get(&policy.module)
+                        .map(|declaration| {
+                            let selected = harness.or_else(|| {
+                                resolve_default
+                                    .then(|| {
+                                        declaration.default_harness.as_deref().or_else(|| {
+                                            match declaration.harnesses.as_deref() {
+                                                Some([only]) => Some(only.as_str()),
+                                                _ => None,
+                                            }
+                                        })
+                                    })
+                                    .flatten()
+                            });
+                            let mut resolved = declaration.clone();
+                        match declaration.limits_for_harness(selected) {
+                                Ok(limits) => {
+                                    resolved.pairs = limits.pairs.unwrap_or_default();
+                                    if let Some(providers) = limits.explicit_providers {
+                                        resolved
+                                            .standing_limits
+                                            .get_or_insert_with(Default::default)
+                                            .explicit_providers = Some(providers);
+                                    }
+                                }
+                                Err(error) => report_harness_limits_once(&policy.module, &error),
+                            }
+                            resolved
+                        });
+                let declaration = resolved_declaration.as_ref();
                 if let Some(declaration) = declaration {
                     report_unknown_pair_tokens_once(&policy.module, declaration);
                 }
@@ -377,6 +443,21 @@ pub(crate) fn parse_declaration(
 
 fn known_pair(pair: &RunnerPair) -> bool {
     WIRE_APIS.contains(&pair.wire_api.as_str()) && AUTH_METHODS.contains(&pair.auth_method.as_str())
+}
+
+fn report_harness_limits_once(
+    module: &str,
+    error: &cortexkit_role_routing::declarations::HarnessLimitsError,
+) {
+    use std::sync::Mutex;
+    static REPORTED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+    if let Ok(mut reported) = REPORTED.lock() {
+        if reported.insert((module.into(), error.to_string())) {
+            crate::warn_operator(format!(
+                "[prefrontal-routing] runner {module}: {error}; using runner-level limits for all harnesses"
+            ));
+        }
+    }
 }
 
 fn report_unknown_pair_tokens_once(module: &str, declaration: &RunnerDeclaration) {

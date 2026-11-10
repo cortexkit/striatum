@@ -6,6 +6,8 @@ use prefrontal_routing_store::PublishedEfforts;
 #[serde(deny_unknown_fields)]
 struct Params {
     runner_module: String,
+    #[serde(default)]
+    harness: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -123,11 +125,12 @@ fn store_error(_: impl fmt::Display) -> ErrorBody {
     )
 }
 
-pub(crate) fn choices(
+pub(crate) fn choices_for_harness(
     store: &SqliteRouteStateStore,
     config: &config_overrides::LiveConfig,
     credentials: &BrocaCredentials,
     module: &str,
+    harness: Option<&str>,
 ) -> Result<serde_json::Value, ErrorBody> {
     if credentials.listing_version().is_none() {
         return Err(not_ready());
@@ -142,8 +145,24 @@ pub(crate) fn choices(
     let aliases = credentials.catalog_targets(&facts);
     prefrontal_routing_core::score_alias::append_alias_rows(&mut facts, &aliases);
     config.apply(&mut facts);
-    let registry =
-        routing_v1::runners::Registry::build(config.v1_runners(), credentials, &facts, now_ms());
+    let registry = routing_v1::runners::Registry::build_for_harness(
+        config.v1_runners(),
+        credentials,
+        &facts,
+        now_ms(),
+        harness,
+    );
+    if let Some(harness) = harness.filter(|harness| {
+        !registry
+            .get(module)
+            .is_some_and(|runner| runner.harnesses.iter().any(|known| known == *harness))
+    }) {
+        return Err(ErrorBody {
+            code: "no_route".into(),
+            message: format!("runner {module} does not host harness {harness}"),
+            detail: Some(json!({"reason":"harness_unavailable"})),
+        });
+    }
     let Some(runner) = registry.get(module).filter(|runner| runner.starts_sessions) else {
         return Ok(
             json!({"catalog_version": catalog_version, "runner_module": module, "models": []}),
@@ -298,13 +317,23 @@ pub(super) async fn serve(
             .ok()
             .filter(|body| !body.params.runner_module.is_empty()
                 && !body.params.runner_module.chars().any(char::is_whitespace))
-            .ok_or_else(|| ErrorBody::new("invalid_request", "Send exactly one field, runner_module, naming the head's runner, for example thalamus-harness."))?;
+            .ok_or_else(|| ErrorBody::new("invalid_request", "Send runner_module naming the head's runner, for example thalamus-harness, and optionally harness naming an exact token from that runner's harnesses. No other fields are accepted."))?;
+        cortexkit_role_routing::head_choices::parse_head_choices_request(&json!({
+            "runner_module": params.params.runner_module,
+            "harness": params.params.harness,
+        }))
+        .map_err(|refusal| ErrorBody {
+            code: refusal.code.to_string(),
+            message: refusal.message,
+            detail: Some(serde_json::Value::Object(refusal.detail)),
+        })?;
         let guard = credentials.lock().map_err(|_| not_ready())?;
-        choices(
+        choices_for_harness(
             store,
             &config_overrides::live_config(operator_config_path),
             &guard,
             &params.params.runner_module,
+            params.params.harness.as_deref(),
         )
     })();
     let result = match result {

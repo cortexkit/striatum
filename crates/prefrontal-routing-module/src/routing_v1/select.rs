@@ -608,11 +608,12 @@ async fn select_at_tier(
                     })
                     .unwrap_or_default();
             }
-            super::runners::Registry::build(
+            super::runners::Registry::build_for_selection(
                 operator_config.v1_runners(),
                 &credentials,
                 &facts,
                 now as u64,
+                request.harness.as_deref(),
             )
         })
         .unwrap_or_default();
