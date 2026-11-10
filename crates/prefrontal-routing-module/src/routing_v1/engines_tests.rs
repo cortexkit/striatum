@@ -41,6 +41,139 @@ async fn selected(route: &Route, request: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines() {
+    use serde::de::DeserializeOwned;
+    use std::future::Future;
+    use subc_client_rs::SubcConsumer;
+
+    // Infer the SDK reply type used by refresh_loop, including its module schema.
+    fn decode<T: DeserializeOwned, E, Fut: Future<Output = Result<T, E>>>(
+        _catalog_list: impl FnOnce(SubcConsumer) -> Fut,
+        wire: Value,
+    ) -> T {
+        serde_json::from_value(wire).unwrap()
+    }
+    let snapshot: Value = serde_json::from_str(include_str!(
+        "../../fixtures/2026-11-10-daemon-catalog.json"
+    ))
+    .unwrap();
+    assert_eq!(snapshot["op"], "catalog.list");
+    let catalog = decode(
+        |consumer| async move { consumer.catalog_list().await },
+        snapshot.clone(),
+    );
+    assert_eq!(catalog.generation, 1);
+    assert!(catalog.subc_ops.is_empty());
+    let modules = serde_json::to_value(catalog.modules).unwrap();
+    let media_slot = |modules: &Value| {
+        modules
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["module_id"] == "colliculus")
+            .unwrap()["role_declarations"]["media-provider/v1"]
+            .clone()
+    };
+    assert_eq!(modules.as_array().unwrap().len(), 1);
+    assert_eq!(media_slot(&modules), media_slot(&snapshot["modules"]));
+
+    let harness = Harness::new("daemon-catalog-engines");
+    harness.edit_config(|config| {
+        config["consumers"] = json!({"media.smoke":{"pay_per_token":true}});
+    });
+    super::consumers::replace_catalog(&modules);
+    let mut credential = key("opaque-transcription");
+    credential.provider_ids = vec!["openai".into(), "google".into()];
+    harness.set_credentials(media_credentials(vec![credential]));
+    let route = harness.bind(reserved("smoke"), None).await;
+    let request = json!({"consumer":"media.smoke","kind":"transcribe",
+        "privacy":"remote_allowed","requirements":{}});
+    let answer = selected(&route, &request).await;
+    assert_eq!(answer["engine"]["module"], "colliculus");
+    let declarations = super::consumers::engine_declarations();
+    let identities: Vec<_> = declarations["colliculus"]
+        .engines
+        .iter()
+        .map(|engine| {
+            (
+                engine.provider.as_str(),
+                engine.model.as_str(),
+                engine.local,
+            )
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        vec![
+            ("openai", "gpt-transcribe", false),
+            ("google", "gemini-3.8-flash", false),
+        ]
+    );
+    for (requirements, provider, model) in [
+        (json!({"format":"audio/mp4"}), "openai", "gpt-transcribe"),
+        (json!({"duration_ms":1500001}), "google", "gemini-3.8-flash"),
+    ] {
+        let mut params = request.clone();
+        params["requirements"] = requirements;
+        let answer = selected(&route, &params).await;
+        assert_eq!(answer["engine"]["module"], "colliculus");
+        assert_eq!(answer["engine"]["provider"], provider);
+        assert_eq!(answer["engine"]["model"], model);
+    }
+}
+
+#[test]
+fn catalog_engine_projection_keeps_strict_validation_and_reports_each_issue_once() {
+    let mut unknown = engine("unknown-field", false);
+    unknown["unexpected"] = json!(true);
+    let mut malformed = engine("malformed-local", false);
+    malformed["local"] = json!("false");
+    let slots = [
+        json!({"engines":[engine("valid", false), unknown], "groups":["jobs"]}),
+        json!({"engines":[malformed], "jobs_survive_restart":true}),
+        json!({"groups":["jobs"]}),
+        json!({"engines":{}}),
+        json!([]),
+        json!({"engines":[engine("valid", false)], "groups":["jobs"], "unknown":true}),
+    ];
+    let modules: Vec<_> = slots
+        .into_iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            json!({"module_id":format!("invalid-projection-{index}"), "nonce_verified":true,
+            "role_declarations":{"media-provider/v1":slot}})
+        })
+        .collect();
+    let modules = json!(modules);
+    crate::take_operator_warnings();
+    super::consumers::replace_catalog(&modules);
+    assert!(super::consumers::engine_declarations().is_empty());
+    let warnings = crate::take_operator_warnings();
+    assert_eq!(warnings.len(), 6, "{warnings:?}");
+    for index in 0..6 {
+        assert!(
+            warnings.iter().any(|line| line.contains(&format!(
+                "Module invalid-projection-{index} declares media engines routing can't read"
+            ))),
+            "{warnings:?}"
+        );
+    }
+    assert!(
+        warnings[0].contains("unknown_member at engines[1].unexpected"),
+        "{warnings:?}"
+    );
+    super::consumers::replace_catalog(&modules);
+    assert!(crate::take_operator_warnings().is_empty());
+    let mut changed = modules;
+    changed[0]["role_declarations"]["media-provider/v1"]["engines"] = json!({});
+    super::consumers::replace_catalog(&changed);
+    let warnings = crate::take_operator_warnings();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains("Module invalid-projection-0"));
+    assert!(warnings[0].contains("invalid_params at engines"));
+}
+
+#[tokio::test]
 async fn engine_privacy_and_ordered_filters_name_the_emptying_filter() {
     let harness = setup(vec![engine("remote", false)]);
     let route = harness.bind(reserved("colliculus"), None).await;

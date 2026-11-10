@@ -28,3 +28,16 @@ folders are routing-produced samples; these are frozen consumer inputs.
 | `crates/prefrontal-core-module/fixtures/routing-wire/states.json` | `7764f333ede371a21628f8b241d8ad21eb133c4ed90e654d9f8d3b60281018ef` |
 | `crates/prefrontal-core-module/fixtures/routing-wire/panels.json` | `460ffaf99610412ea664e2a599c152cad5d63e024b7e500484f3b098b36b8540` |
 | `test-vectors/broca-request-invalid-v1/run_status.request_invalid_openai.json` | `cb03a7ce9d9fa35ff201b6efc4ce3824ab1bdd18da3594bd5c130c8878a86f25` |
+
+## Captured daemon catalog
+
+`2026-11-10-daemon-catalog.json` is trimmed to only colliculus's complete module
+entry, copied verbatim from the `ck --json catalog` capture supplied on
+10 November 2026, around 13:06 UTC. The original source artifact is
+`.cortexkit/internal-docs/research/2026-11-10-daemon-catalog.json`, with SHA-256
+`2e15ab501a348b95e60d827394cd3b52fcc9ecb1609fc2e085af3c26917b36e9`.
+The entry is wrapped in a full `catalog.list` reply envelope with fixture
+generation 1 and an empty daemon-operation list (`subc_ops`). The engine
+regression decodes that reply through the pinned catalog client's actual reply
+type before replacing routing's catalog and selecting both colliculus
+transcription engines. No other module entries are retained.
