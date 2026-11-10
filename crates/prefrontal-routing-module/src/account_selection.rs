@@ -292,6 +292,28 @@ impl ClassContext {
         self.media_route = true;
         Ok(())
     }
+
+    pub(crate) fn engine_has_eligible_credential(
+        &mut self,
+        provider: &str,
+        model: &str,
+    ) -> Result<bool, String> {
+        self.for_engine(provider, model)?;
+        if !self
+            .credentials
+            .media_listing_ready(self.now_ms.max(0) as u64)
+        {
+            return Ok(false);
+        }
+        let (mut roster, _) = self.roster_and_fences_for(provider, model, true);
+        self.avoid_transient_accounts(&mut roster, provider, model);
+        Ok(roster.roster.is_some_and(|roster| {
+            roster
+                .accounts
+                .iter()
+                .any(|account| !account.credentials.is_empty())
+        }))
+    }
     pub(crate) fn apply_configured_service_tiers(
         &mut self,
         facts: &mut [prefrontal_routing_core::ModelFact],
@@ -549,8 +571,22 @@ impl ClassContext {
             .map_err(|error| error.to_string())?;
         let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let targets = credentials.catalog_targets(&facts);
+        let media_providers: BTreeSet<_> = credentials
+            .listed_credentials()
+            .iter()
+            .flat_map(|row| {
+                row.provider_ids
+                    .iter()
+                    .filter(|provider| media_credential_serves(row, provider))
+                    .cloned()
+            })
+            .collect();
         let mut pool_walls = BTreeSet::new();
-        for provider in targets.keys() {
+        for provider in targets
+            .keys()
+            .chain(media_providers.iter())
+            .collect::<BTreeSet<_>>()
+        {
             for (credential, state) in store
                 .pool_key_states(provider, now_ms)
                 .map_err(|error| error.to_string())?
@@ -632,6 +668,7 @@ impl ClassContext {
                 facts
                     .iter()
                     .map(|fact| fact.provider_id.clone())
+                    .chain(media_providers.iter().cloned())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .map(|provider| Ok((provider.clone(), load_fences(tx, &provider)?)))
@@ -4471,6 +4508,16 @@ fn serve(
         }
     }
     let decision_id = new_id("acd");
+    let mut context = json!({ "roster": roster.context });
+    if ctx
+        .classes
+        .as_ref()
+        .is_some_and(|classes| classes.media_route)
+    {
+        // Persist the admission's media origin; the same provider can also
+        // serve LLM runs, whose success is reported through route.report.
+        context["media_admission"] = json!(true);
+    }
     tx.insert_decision(&decision_record(RecordInput {
         decision_id: &decision_id,
         mode: DECISION_MODE_SERVE,
@@ -4479,7 +4526,7 @@ fn serve(
         admission_id: Some(&params.admission_id),
         request_mode: Some(params.mode.as_str()),
         decision: &decision,
-        context: json!({ "roster": roster.context }),
+        context,
         now_ms: now,
     }))?;
     if let Some(tier) = params.service_tier_chosen {
@@ -5295,6 +5342,25 @@ fn apply_bound_observation(
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
+                let media = tx
+                    .decision_context(&admission.decision_id)?
+                    .and_then(|context| serde_json::from_str::<Value>(&context).ok())
+                    .is_some_and(|context| context["media_admission"] == true);
+                if media
+                    && !tx.admission_reported_failure(principal, id)?
+                    && crate::credential_fences::lift_after_success_in(
+                        tx,
+                        &admission.provider,
+                        &admission.credential_id,
+                        now,
+                    )?
+                {
+                    effects.push(json!({
+                        "effect": "credential_fence_lifted",
+                        "provider": admission.provider,
+                        "credential_id": admission.credential_id,
+                    }));
+                }
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
             }

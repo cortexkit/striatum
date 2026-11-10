@@ -8,6 +8,52 @@ const PLAIN_KEY: &str = "apikey:catalog:main";
 const SIX_HOURS: i64 = 21_600_000;
 
 #[tokio::test]
+async fn llm_run_finished_does_not_lift_a_successful_probe_fence() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: BORROWED.into(),
+                credential_id: PLAIN_KEY.into(),
+                code: "credential_refused".into(),
+            },
+            None,
+            crate::now_ms() as i64 - SIX_HOURS - 1,
+        )
+        .unwrap();
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    result(
+        runner
+            .call(
+                "route.account_for",
+                &admit("llm-probe", BORROWED, "model-a", PLAIN_KEY),
+            )
+            .await,
+    );
+    let finished = observe(
+        &runner,
+        json!({"event_id":"llm-probe/finished", "kind":"run_finished",
+        "admission_id":"llm-probe"}),
+    )
+    .await;
+    assert!(
+        !finished["observation"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|effect| serde_json::from_str::<Value>(effect.as_str().unwrap()).unwrap())
+            .any(|effect| effect["effect"] == "credential_fence_lifted"),
+        "{finished}"
+    );
+    let fences = harness.store().credential_entitlement_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].credential_id, PLAIN_KEY);
+    assert_eq!(fences[0].observed_at_ms, crate::now_ms() as i64);
+}
+
+#[tokio::test]
 async fn pool_credential_entitlement_fence_explains_its_untimed_recovery() {
     let _clock = crate::InjectedClock::set(1_800_000_000_000);
     let harness = harness_with_routed_accounts(Some(&["apikey"]));

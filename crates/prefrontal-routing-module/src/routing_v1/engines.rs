@@ -102,6 +102,15 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
                 .map(|(index, engine)| EngineCandidate::caller_local(index, engine)),
         );
     }
+    let mut accounts = crate::account_selection::ClassContext::read(
+        deps.store,
+        deps.broca_credentials,
+        config.clone(),
+        crate::ACCOUNT_QUOTA.get(),
+        inputs.facts,
+        now as i64,
+    )
+    .map_err(store_refusal)?;
     for candidate in &mut candidates {
         candidate.cost = catalog
             .as_ref()
@@ -129,6 +138,11 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
             .flatten()
             .any(|until| until > now as f64)
                 || state.credential_refusal.is_some();
+        }
+        if !candidate.engine.local && candidate.engine.kind == request.kind {
+            candidate.fenced |= !accounts
+                .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
+                .map_err(store_refusal)?;
         }
         #[cfg(test)]
         let facts = media_facts.get(&(key, candidate.engine.kind.as_str().to_owned()));

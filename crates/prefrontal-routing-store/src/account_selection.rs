@@ -527,6 +527,63 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn decision_context(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT context_json FROM account_decision WHERE decision_id = ?1",
+                [decision_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(|context| context.flatten())
+            .map_err(err)
+    }
+
+    /// A failed attempt must not be healed by its later run_finished event.
+    pub fn admission_reported_failure(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM account_observation
+                 WHERE principal = ?1 AND admission_id = ?2
+                 AND kind IN ('credential_refused', 'transient_backoff', 'account_limit_exhausted'))",
+                params![principal, admission_id],
+                |row| row.get(0),
+            )
+            .map_err(err)
+    }
+
+    pub fn credential_entitlement_fence(
+        &self,
+        provider: &str,
+        credential: &str,
+    ) -> RouteStateResult<
+        Option<prefrontal_routing_core::route_state_store::CredentialEntitlementFence>,
+    > {
+        self.conn
+            .query_row(
+                "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
+             FROM credential_entitlement_fences WHERE provider_id = ?1 AND credential_id = ?2",
+                params![provider, credential],
+                |row| {
+                    Ok(
+                        prefrontal_routing_core::route_state_store::CredentialEntitlementFence {
+                            provider_id: row.get(0)?,
+                            credential_id: row.get(1)?,
+                            code: row.get(2)?,
+                            listing_fingerprint: row.get(3)?,
+                            observed_at_ms: row.get(4)?,
+                        },
+                    )
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
     /// Account-wide backoffs are derived from committed, bound observation
     /// effects. Keeping the evidence and effect in one row makes event retries
     /// and a restart preserve the same deadline without another write.

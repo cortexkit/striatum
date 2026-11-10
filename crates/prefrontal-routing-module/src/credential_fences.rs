@@ -31,10 +31,10 @@ use std::collections::HashSet;
 
 use prefrontal_routing_core::route_state_store::{CredentialEntitlementFence, CredentialRefusal};
 use prefrontal_routing_core::{
-    CredentialRefusalMark, ModelFact, ModelRouteStateSnapshot, REASON_CREDENTIAL_BILLING_EXHAUSTED,
-    REASON_CREDENTIAL_UNENTITLED,
+    CredentialRefusalMark, ModelFact, ModelRouteStateSnapshot, RouteStateResult,
+    REASON_CREDENTIAL_BILLING_EXHAUSTED, REASON_CREDENTIAL_UNENTITLED,
 };
-use prefrontal_routing_store::SqliteRouteStateStore;
+use prefrontal_routing_store::{AccountTx, SqliteRouteStateStore};
 
 use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 
@@ -282,21 +282,41 @@ pub(crate) fn clear_quota_holds(
     fence: &CredentialEntitlementFence,
     reason: &str,
 ) -> Result<(), String> {
-    let prefix = quota_hold_prefix(fence);
     store
         .account_transaction(|tx| {
-            for block in tx.active_pool_fences(&fence.provider_id)? {
-                if block.evidence.fence_id.starts_with(&prefix) {
-                    tx.clear_fence(
-                        &block.evidence.fence_id,
-                        crate::account_selection::now_ms(),
-                        reason,
-                    )?;
-                }
-            }
-            Ok(())
+            clear_quota_holds_in(tx, fence, reason, crate::account_selection::now_ms())
         })
         .map_err(|error| error.to_string())
+}
+
+fn clear_quota_holds_in(
+    tx: &AccountTx<'_>,
+    fence: &CredentialEntitlementFence,
+    reason: &str,
+    now: i64,
+) -> RouteStateResult<()> {
+    let prefix = quota_hold_prefix(fence);
+    for block in tx.active_pool_fences(&fence.provider_id)? {
+        if block.evidence.fence_id.starts_with(&prefix) {
+            tx.clear_fence(&block.evidence.fence_id, now, reason)?;
+        }
+    }
+    Ok(())
+}
+
+/// Lift a successful media probe's fence without leaving its observation transaction.
+pub(crate) fn lift_after_success_in(
+    tx: &AccountTx<'_>,
+    provider: &str,
+    credential: &str,
+    now: i64,
+) -> RouteStateResult<bool> {
+    if let Some(fence) = tx.credential_entitlement_fence(provider, credential)? {
+        clear_quota_holds_in(tx, &fence, "run_succeeded", now)?;
+        tx.clear_credential_entitlement_fence(provider, credential)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// The vault account for `credential_id` from the quota state's roster, when

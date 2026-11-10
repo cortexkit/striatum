@@ -9,6 +9,9 @@ use subc_protocol::FrameType;
 #[path = "engine_measurements_tests.rs"]
 mod measurements;
 
+#[path = "engine_credentials_tests.rs"]
+mod credentials;
+
 fn engine(model: &str, local: bool) -> Value {
     json!({"kind":"transcribe","provider":"media-vendor","model":model,"local":local,
         "formats":["audio/wav"],"languages":["en"],"latency_class":"interactive"})
@@ -23,6 +26,7 @@ fn setup(engines: Vec<Value>) -> Arc<Harness> {
         {"module_id":"colliculus","nonce_verified":true,"role_declarations":{"media-provider/v1":{"engines":engines}}},
         {"module_id":"callosum","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
     ]));
+    harness.set_credentials(media_credentials(vec![key("opaque-media")]));
     harness
 }
 
@@ -68,7 +72,7 @@ async fn engine_privacy_and_ordered_filters_name_the_emptying_filter() {
 }
 
 fn facts(harness: &Harness, measurements: &[(&str, &str, Option<f64>, Option<f64>)]) {
-    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    let mut credentials = media_credentials(vec![key("opaque-media")]);
     credentials.engine_test_facts = measurements
         .iter()
         .map(|(model, kind, accuracy, cost)| {
@@ -193,6 +197,12 @@ fn listing(rows: Vec<ListedCredential>, granted: bool) -> ScopedCredentialListin
     }
 }
 
+fn media_credentials(rows: Vec<ListedCredential>) -> crate::broca_credentials::BrocaCredentials {
+    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    credentials.apply_listing(&listing(rows, true), crate::now_ms());
+    credentials
+}
+
 #[test]
 fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids() {
     let valid = key("opaque-17");
@@ -311,7 +321,7 @@ async fn engine_transcription_prices_use_audio_units_and_never_guess_token_conve
     );
     assert_eq!(first.engine_cost(&parsed, "media-vendor", "b"), None);
     assert_eq!(first.engine_cost(&parsed, "media-vendor", "a"), None);
-    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    let mut credentials = media_credentials(vec![key("opaque-media")]);
     credentials.catalog_snapshot = Some(Arc::new(first));
     harness.set_credentials(credentials);
     // Declarations need to state a duration limit before a duration request can match.
@@ -329,7 +339,7 @@ async fn engine_transcription_prices_use_audio_units_and_never_guess_token_conve
     models["media-vendor/b"]["limit.audio_tokens_per_second"] = json!(32);
     let second = snapshot(&models);
     assert!((second.engine_cost(&parsed, "media-vendor", "b").unwrap() - 0.00288).abs() < 1e-12);
-    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    let mut credentials = media_credentials(vec![key("opaque-media")]);
     credentials.catalog_snapshot = Some(Arc::new(second));
     harness.set_credentials(credentials);
     assert_eq!(selected(&route, &params).await["engine"]["model"], "b");
