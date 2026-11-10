@@ -24,14 +24,22 @@ CREATE TABLE fence_recheck (
   PRIMARY KEY (kind, origin_key)
 );
 CREATE INDEX fence_recheck_scope ON fence_recheck(provider, credential_id, account_id, model);
+-- A completed probe may heal exactly the evidence its launch was authorized
+-- to test, even when that evidence names no pool or another credential for
+-- the same account.
+CREATE TABLE fence_probe_authorization (
+ owner TEXT NOT NULL,kind TEXT NOT NULL,origin_key TEXT NOT NULL,
+ evidence TEXT NOT NULL,evidence_at INTEGER NOT NULL,claimed_at INTEGER NOT NULL,
+ PRIMARY KEY(owner,kind,origin_key)
+);
 -- Clearing one route must not leave it blocked by a provider fanout origin.
 -- The exception matches evidence, so a later provider refusal fences it again.
 CREATE TABLE fence_recheck_route_clear (
  kind TEXT NOT NULL,origin_key TEXT NOT NULL,provider TEXT NOT NULL,model TEXT NOT NULL,evidence TEXT NOT NULL,
  PRIMARY KEY(kind,origin_key,provider,model)
 );
--- A successful request proves recovery only for the pools it actually used.
--- Whole-account evidence still requires every recorded pool to recover.
+-- An ordinary success proves recovery only for the pools it actually used.
+-- A probe instead uses its exact evidence authorization above as its scope.
 CREATE TABLE fence_success_pool (
  fence_id TEXT NOT NULL,
  pool_key_json TEXT NOT NULL,evidence_at INTEGER NOT NULL,healed_at INTEGER NOT NULL,

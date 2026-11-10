@@ -11,6 +11,7 @@ pub use prefrontal_routing_core::fence_lifetimes::{
 
 #[derive(Clone, Debug)]
 pub struct FenceRecheck {
+    pub evidence: String,
     pub kind: String,
     pub origin_key: String,
     pub provider: String,
@@ -181,9 +182,10 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
         return Ok(Vec::new());
     }
     let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-        evidence_at,quota,next_recheck_at,reset_check_at,last_claimed_at,claim_owner FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
+        evidence_at,quota,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,evidence FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
     let rows = statement.query_map([], |row| {
         Ok(FenceRecheck {
+            evidence: row.get(15)?,
             kind: row.get(0)?,
             origin_key: row.get(1)?,
             provider: row.get(2)?,
@@ -282,6 +284,7 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
             next = next.max(prior.unwrap().2);
         }
         effective.push(FenceRecheck {
+            evidence,
             kind: key.0,
             origin_key: key.1,
             provider: row.get(2)?,
@@ -315,7 +318,16 @@ pub(crate) fn claim(
     origins: &[FenceRecheck],
     now: i64,
 ) -> rusqlite::Result<bool> {
-    claim_owned(conn, origins, now, None, None)
+    claim_owned(conn, origins, now, None, None, None)
+}
+
+pub(crate) fn claim_with_authorization(
+    conn: &Connection,
+    origins: &[FenceRecheck],
+    now: i64,
+    owner: &str,
+) -> rusqlite::Result<bool> {
+    claim_owned(conn, origins, now, None, None, Some(owner))
 }
 
 fn claim_owned(
@@ -324,6 +336,7 @@ fn claim_owned(
     now: i64,
     consume_owner: Option<&str>,
     grant_owner: Option<&str>,
+    authorization: Option<&str>,
 ) -> rusqlite::Result<bool> {
     sync(conn)?;
     // Check the entire conjunction before updating any clock. BEGIN IMMEDIATE
@@ -336,8 +349,8 @@ fn claim_owned(
         let state = conn
             .query_row(
                 "SELECT quota,next_recheck_at,reset_check_at,claim_owner FROM fence_recheck
-            WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND cleared_at IS NULL",
-                params![origin.kind, origin.origin_key, origin.evidence_at],
+             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
+                params![origin.kind, origin.origin_key, origin.evidence_at,origin.evidence],
                 |row| {
                     Ok((
                         row.get::<_, bool>(0)?,
@@ -378,6 +391,15 @@ fn claim_owned(
         return Ok(false);
     }
     for (origin, owned, due) in states {
+        for owner in [authorization.or(grant_owner), consume_owner]
+            .into_iter()
+            .flatten()
+        {
+            conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at)
+                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET
+                evidence=excluded.evidence,evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at",
+                params![owner,origin.kind,origin.origin_key,origin.evidence,origin.evidence_at,now])?;
+        }
         if owned && !due {
             conn.execute(
                 "UPDATE fence_recheck SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
@@ -400,6 +422,7 @@ fn claim_owned(
 impl SqliteRouteStateStore {
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
         self.account_transaction(|tx| {
+            tx.transfer_probe_authorization(from, to)?;
             tx.conn
                 .execute(
                     "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
@@ -417,6 +440,68 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn transfer_probe_authorization(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at
+            FROM fence_probe_authorization WHERE owner=?1
+            ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
+            evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at",params![from,to]).map_err(err)?;
+        self.conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1 AND owner!=?2",
+                params![from, to],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
+    /// The durable launch authorization, not a reported credential or guessed
+    /// pool, is the scope of a successful probe. New evidence never matches it.
+    pub fn heal_authorized_probe(
+        &self,
+        owner: &str,
+        provider: &str,
+        model: &str,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        let origins = self.fence_rechecks()?;
+        for origin in origins.iter().filter(|origin| {
+            origin.provider == provider
+                && origin.model.as_deref().is_none_or(|value| value == model)
+        }) {
+            let claimed: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT claimed_at FROM fence_probe_authorization
+                WHERE owner=?1 AND kind=?2 AND origin_key=?3 AND evidence=?4 AND evidence_at=?5",
+                    params![
+                        owner,
+                        origin.kind,
+                        origin.origin_key,
+                        origin.evidence,
+                        origin.evidence_at
+                    ],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(err)?;
+            if let Some(at) = claimed.filter(|at| origin.evidence_at < *at) {
+                self.heal_origins(std::slice::from_ref(origin), model, at, now, None, true)?;
+            }
+        }
+        self.conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1",
+                [owner],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
     pub(crate) fn successful_quota_pools(
         &self,
         id: &str,
@@ -444,7 +529,16 @@ impl AccountTx<'_> {
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
         sync(self.conn).map_err(err)?;
-        claim_owned(self.conn, origins, now, owner, None).map_err(err)
+        claim_owned(self.conn, origins, now, owner, None, owner).map_err(err)
+    }
+    pub fn claim_fence_rechecks_for_authorized_admission(
+        &self,
+        origins: &[FenceRecheck],
+        now: i64,
+        owner: Option<&str>,
+        admission: &str,
+    ) -> RouteStateResult<bool> {
+        claim_owned(self.conn, origins, now, owner, None, Some(admission)).map_err(err)
     }
     pub fn grant_fence_rechecks(
         &self,
@@ -453,7 +547,7 @@ impl AccountTx<'_> {
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
         sync(self.conn).map_err(err)?;
-        claim_owned(self.conn, origins, now, None, owner).map_err(err)
+        claim_owned(self.conn, origins, now, None, owner, owner).map_err(err)
     }
     /// Success can heal only evidence older than this request's admission. A
     /// late completion of an older run must not erase a more recent refusal.
@@ -493,18 +587,42 @@ impl AccountTx<'_> {
         scope: Option<&QuotaSuccessScope>,
     ) -> RouteStateResult<()> {
         let origins = self.fence_rechecks()?;
-        for origin in origins.iter().filter(|origin| {
-            origin.applies(provider, account, credential, model)
-                && origin.evidence_at < admitted_at
-                && origin.principal.is_none()
-                && origin
-                    .size_class
-                    .is_none_or(|class| Some(class as u32) == size)
-        }) {
+        let origins: Vec<_> = origins
+            .into_iter()
+            .filter(|origin| {
+                origin.applies(provider, account, credential, model)
+                    && origin.evidence_at < admitted_at
+                    && origin.principal.is_none()
+                    && origin
+                        .size_class
+                        .is_none_or(|class| Some(class as u32) == size)
+            })
+            .collect();
+        self.heal_origins(&origins, model, admitted_at, now, scope, false)
+    }
+
+    fn heal_origins(
+        &self,
+        origins: &[FenceRecheck],
+        model: &str,
+        admitted_at: i64,
+        now: i64,
+        scope: Option<&QuotaSuccessScope>,
+        authorized: bool,
+    ) -> RouteStateResult<()> {
+        for origin in origins {
+            let provider = origin.provider.as_str();
+            let credential = origin.credential_id.as_deref().unwrap_or("");
             let key: Vec<serde_json::Value> =
                 serde_json::from_str(&origin.origin_key).map_err(err)?;
             match origin.kind.as_str() {
                 "account" => {
+                    if authorized {
+                        self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='probe_succeeded'
+                            WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
+                        self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",params![origin.kind,origin.origin_key,now]).map_err(err)?;
+                        continue;
+                    }
                     let Some(scope) = scope else {
                         continue;
                     };
@@ -553,7 +671,16 @@ impl AccountTx<'_> {
                     } else {
                         "account_non_quota_route_fence"
                     };
-                    self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND COALESCE(last_reported_at,recorded_at)<?4"),params![provider,credential,model,admitted_at]).map_err(err)?;
+                    if origin.kind == "account_route" {
+                        self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND COALESCE(last_reported_at,recorded_at)<?4"),params![provider,credential,model,admitted_at]).map_err(err)?;
+                    } else {
+                        let kind = if origin.kind == "transient_route" {
+                            "transient"
+                        } else {
+                            "billing"
+                        };
+                        self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND last_reported_at<?4 AND wall_kind=?5"),params![provider,credential,model,admitted_at,kind]).map_err(err)?;
+                    }
                 }
                 "size" | "non_quota_size" => {
                     let table = if origin.kind == "size" {
@@ -575,10 +702,14 @@ impl AccountTx<'_> {
                     self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE route_key=?1",[key[0].as_str()]).map_err(err)?;
                 }
                 "provider" => {
-                    self.conn.execute("UPDATE model_route_state SET
-                        cooldown_until=CASE WHEN cooldown_until<=(SELECT cooldown_until FROM provider_cooldown_state WHERE provider_key=?1) THEN NULL ELSE cooldown_until END,
-                        quota_exhausted_until=CASE WHEN quota_exhausted_until<=(SELECT quota_exhausted_until FROM provider_cooldown_state WHERE provider_key=?1) THEN NULL ELSE quota_exhausted_until END
-                        WHERE provider_id=?1",[provider]).map_err(err)?;
+                    // Only the rows stamped by this provider evidence inherit
+                    // its recovery. A separate model refusal has its own clock.
+                    self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+                        WHERE provider_id=?1 AND COALESCE(wall_observed_at,last_error_at,updated_at)=?2
+                        AND COALESCE(wall_observed_at,last_error_at,updated_at)<?3
+                        AND last_error IS (SELECT last_error FROM provider_cooldown_state WHERE provider_key=?1)
+                        AND COALESCE(cooldown_until,0)<=(SELECT COALESCE(cooldown_until,0) FROM provider_cooldown_state WHERE provider_key=?1)
+                        AND COALESCE(quota_exhausted_until,0)<=(SELECT COALESCE(quota_exhausted_until,0) FROM provider_cooldown_state WHERE provider_key=?1)",params![provider,origin.evidence_at,admitted_at]).map_err(err)?;
                     self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE provider_key=?1",[provider]).map_err(err)?;
                 }
                 "failure" => {
@@ -626,6 +757,241 @@ impl AccountTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn successful_probe_heals_only_its_authorized_empty_and_named_generations() {
+        let scratch = cortexkit_test_support::ScratchDir::new("authorized-quota-success");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "authorized-quota-success",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let named = prefrontal_routing_core::accounts::PoolKey {
+            name: Some("P".into()),
+            scope: prefrontal_routing_core::accounts::PoolScope::EveryModel,
+            window_minutes: Some(300),
+        };
+        store.store.with_conn(|conn| {
+            for (id,pool) in [("empty",None),("named",Some(&named)),("unclaimed",Some(&named))] {
+                conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
+                    VALUES (?1,'p','a','{}','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',100,'test',100,?2,'[]')",
+                    params![id,pool.map(|pool|serde_json::to_string(pool).unwrap())])?;
+            }
+            Ok(())
+        }).unwrap();
+        let claimed: Vec<_> = store
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .filter(|origin| !origin.origin_key.contains("unclaimed"))
+            .collect();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &claimed,
+                900_100,
+                Some("probe-decision")
+            ))
+            .unwrap());
+        // Unknown-pool successes unrelated to this authorization remain unable
+        // to heal anything, including the unclaimed origin on the same account.
+        store
+            .account_transaction(|tx| {
+                tx.heal_serving_fences("p", "a", "c", "m", None, 900_100, 900_101)
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .account_read(|tx| tx.active_fences("p"))
+                .unwrap()
+                .len(),
+            3
+        );
+        store
+            .account_transaction(|tx| tx.heal_authorized_probe("probe-decision", "p", "m", 900_101))
+            .unwrap();
+        let remaining = store.account_read(|tx| tx.active_fences("p")).unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "the exact claimed empty and named origins must heal"
+        );
+        assert_eq!(remaining[0].fence_id, "unclaimed");
+    }
+
+    #[test]
+    fn authorized_sibling_probe_heals_claimed_rows_but_never_a_newer_generation() {
+        let scratch = cortexkit_test_support::ScratchDir::new("authorized-sibling-success");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "authorized-sibling-success",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        for credential in ["c2", "newer", "unclaimed"] {
+            store
+                .record_billing_account_route_fence(&crate::AccountRouteFence {
+                    provider: "p".into(),
+                    credential_id: credential.into(),
+                    model: "m".into(),
+                    until_ms: 1000,
+                    recorded_at: 100,
+                    decision_id: "old".into(),
+                })
+                .unwrap();
+        }
+        let claimed: Vec<_> = store
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .filter(|origin| origin.credential_id.as_deref() != Some("unclaimed"))
+            .collect();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &claimed,
+                1000,
+                Some("sibling-probe")
+            ))
+            .unwrap());
+        store
+            .record_billing_account_route_fence(&crate::AccountRouteFence {
+                provider: "p".into(),
+                credential_id: "newer".into(),
+                model: "m".into(),
+                until_ms: 10_000,
+                recorded_at: 1001,
+                decision_id: "repeat".into(),
+            })
+            .unwrap();
+        store
+            .account_transaction(|tx| tx.heal_authorized_probe("sibling-probe", "p", "m", 1002))
+            .unwrap();
+        let remaining = store.non_quota_account_route_fences(1002).unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "only the claimed older generation heals, regardless of serving sibling"
+        );
+        assert!(remaining.iter().any(|f| f.credential_id == "newer"));
+        assert!(remaining.iter().any(|f| f.credential_id == "unclaimed"));
+    }
+
+    #[test]
+    fn provider_probe_success_preserves_a_newer_independent_model_refusal() {
+        let scratch = cortexkit_test_support::ScratchDir::new("provider-evidence-success");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "provider-evidence-success",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store.store.with_conn(|conn|conn.execute_batch("
+            INSERT INTO provider_cooldown_state(provider_key,cooldown_until,last_error,last_error_at,updated_at,wall_observed_at)
+                VALUES ('p',86400100,'old',100,100,100);
+            INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,cooldown_until,last_error,last_error_at,wall_observed_at)
+                VALUES ('p/m','p/m','p','m',100,86400100,'old',100,100);
+        ")).unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &origins,
+                3_600_100,
+                Some("provider-probe")
+            ))
+            .unwrap());
+        store.store.with_conn(|conn|conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,cooldown_until,last_error,last_error_at,wall_observed_at)
+            VALUES ('p/other','p/other','p','other',3600101,3610101,'independent',3600101,3600101)",[])).unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.heal_serving_fences("p", "a", "c", "m", None, 3_600_100, 3_600_102)
+            })
+            .unwrap();
+        let until: Option<i64> = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row(
+                    "SELECT cooldown_until FROM model_route_state WHERE route_key='p/other'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            until,
+            Some(3_610_101),
+            "old provider recovery cannot erase an independent model's newer generation"
+        );
+    }
+
+    #[test]
+    fn pool_probe_authorization_survives_renewal_and_moves_to_the_serving_decision() {
+        use prefrontal_routing_core::key_pool::PoolKey;
+        let scratch = cortexkit_test_support::ScratchDir::new("pool-success-authorization");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "pool-success-authorization",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .pool_wall(
+                "p",
+                "apikey:p",
+                crate::PoolWallKind::Billing,
+                1000,
+                "credits",
+                100,
+            )
+            .unwrap();
+        let keys = vec![PoolKey::new("apikey:p", Some("a"), "active")];
+        let crate::PoolAcquireOutcome::Leased(lease) = store
+            .pool_acquire_for_route(
+                &crate::PoolAcquire {
+                    provider: "p",
+                    session_id: "session",
+                    keys: &keys,
+                    now_ms: 1000,
+                    lease_ms: 120_000,
+                    affinity_idle_ms: 120_000,
+                },
+                &["p"],
+                "m",
+                &[],
+                &Default::default(),
+            )
+            .unwrap()
+        else {
+            panic!("due pool probe must lease")
+        };
+        assert!(store
+            .pool_renew(
+                "p",
+                "session",
+                &lease.lease_id,
+                Some("apikey:p"),
+                1001,
+                120_000
+            )
+            .unwrap()
+            .is_some());
+        assert!(
+            !store.fence_rechecks().unwrap().is_empty(),
+            "renewal is not success"
+        );
+        store
+            .bind_fence_probe_owner(&lease.lease_id, "decision")
+            .unwrap();
+        store
+            .pool_release("p", "session", Some(&lease.lease_id), true, 1002)
+            .unwrap();
+        assert!(
+            !store.fence_rechecks().unwrap().is_empty(),
+            "release is not success either"
+        );
+        store
+            .account_transaction(|tx| tx.heal_authorized_probe("decision", "p", "m", 1003))
+            .unwrap();
+        assert!(
+            store.fence_rechecks().unwrap().is_empty(),
+            "a linked typed success heals the claimed pool wall"
+        );
+    }
 
     #[test]
     fn linked_quota_reset_opens_the_whole_conjunction_but_not_after_a_newer_refusal() {

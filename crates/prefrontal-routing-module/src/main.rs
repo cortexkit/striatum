@@ -3148,6 +3148,12 @@ async fn handle_set_decision_outcome(
                                 pool:prefrontal_routing_core::quota_extract::antigravity_pool_for_capacity(&format!("{provider}/{model}")).map(str::to_string)};
                             store
                                 .account_transaction(|tx| {
+                                    tx.heal_authorized_probe(
+                                        &params.decision_id,
+                                        provider,
+                                        model,
+                                        observed_at_ms,
+                                    )?;
                                     let size = tx.size_admission_for_model_decision(
                                         &params.decision_id,
                                         provider,
@@ -3163,26 +3169,17 @@ async fn handle_set_decision_outcome(
                                         size.map_or(decision.created_at as i64, |(_, at)| at),
                                         observed_at_ms,
                                         Some(&scope),
-                                    )
+                                    )?;
+                                    credential_fences::lift_after_success_in(
+                                        tx,
+                                        provider,
+                                        credential,
+                                        observed_at_ms,
+                                        decision.created_at as i64,
+                                    )?;
+                                    Ok(())
                                 })
                                 .map_err(|e| ModuleError::Message(e.to_string()))?;
-                        }
-                        if let Err(e) = credential_fences::lift_after_success(
-                            store,
-                            provider,
-                            credential,
-                            decision.created_at as i64,
-                        ) {
-                            return send_route_error(
-                                writer,
-                                ver,
-                                channel,
-                                epoch,
-                                corr,
-                                "store_error",
-                                &format!("set_decision_outcome: lifting credential fence: {e}"),
-                            )
-                            .await;
                         }
                     }
                 }
@@ -3198,6 +3195,34 @@ async fn handle_set_decision_outcome(
                         &format!("set_decision_outcome: reading decision: {e}"),
                     )
                     .await
+                }
+            }
+        } else if let Some(decision) = store
+            .get_decision_by_id(&params.decision_id)
+            .map_err(|error| ModuleError::Message(error.to_string()))?
+        {
+            let frozen = store
+                .decision_provider_identity(&params.decision_id)
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+            if frozen
+                .as_ref()
+                .and_then(|identity| identity.credential_id.as_deref())
+                .is_none()
+            {
+                if let (Some(provider), Some(model)) = (
+                    decision.selected_provider_id.as_deref(),
+                    decision.selected_model_id.as_deref(),
+                ) {
+                    store
+                        .account_transaction(|tx| {
+                            tx.heal_authorized_probe(
+                                &params.decision_id,
+                                provider,
+                                model,
+                                observed_at_ms,
+                            )
+                        })
+                        .map_err(|error| ModuleError::Message(error.to_string()))?;
                 }
             }
         }
@@ -5567,6 +5592,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    async fn report_legacy_outcome_for_fence_test(store: &SharedStore, params: serde_json::Value) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method":ROUTE_SET_DECISION_OUTCOME_OP,"params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/fence-outcome.jsonc"),
+            &SharedBrocaCredentials::default(),
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    #[tokio::test]
+    async fn legacy_completed_cannot_heal_a_credential_that_did_not_serve() {
+        use prefrontal_routing_core::route_state_store::{CredentialRefusal, ProviderOutcome};
+        let rig = Rig::new("mismatched-serving-success");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .record_credential_entitlement_fence(
+                &CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "B".into(),
+                    code: "billing_exhausted".into(),
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        let decision = store
+            .record_decision(&DecisionInput {
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("m".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_decision_provider_identity(
+                &decision,
+                &ProviderOutcome {
+                    account_ref: "account-A".into(),
+                    credential_id: Some("A".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        report_legacy_outcome_for_fence_test(
+            &store,
+            json!({"decisionID":decision,"outcome":"completed",
+            "providerOutcome":{"accountRef":"account-B","credentialId":"B"}}),
+        )
+        .await;
+        assert_eq!(
+            store.credential_entitlement_fences().unwrap().len(),
+            1,
+            "B did not serve the decision frozen to A"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_legacy_probe_success_heals_its_actual_launch_authorization() {
+        let rig = Rig::new("anonymous-probe-success");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let receipt = now_ms() as i64;
+        let _clock = InjectedClock::set((receipt + 1000) as u64);
+        store
+            .update_route_state(
+                "p/m",
+                "p/m",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    cooldown_until: Some((receipt + 1000) as f64),
+                    observed_at_ms: Some(receipt - 3_599_000),
+                    unscoped_wall: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decision = store
+            .record_decision(&DecisionInput {
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("m".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(!origins.is_empty());
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &origins,
+                receipt + 1000,
+                Some(&decision)
+            ))
+            .unwrap());
+        report_legacy_outcome_for_fence_test(
+            &store,
+            json!({"decisionID":decision,"outcome":"completed"}),
+        )
+        .await;
+        assert!(
+            store.fence_rechecks().unwrap().is_empty(),
+            "anonymous serving success must retire the route/provider origin it probed"
+        );
     }
 
     #[tokio::test]

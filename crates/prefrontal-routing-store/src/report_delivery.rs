@@ -80,9 +80,18 @@ impl SqliteRouteStateStore {
                         let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
                         let identity=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok());
                         if identity.as_ref().and_then(|identity|identity.credential_id.as_deref()).is_none_or(|id|id==credential) {
+                            account.heal_authorized_probe(decision_id,provider,&model,now).map_err(sql_error)?;
                             let account_id=identity.as_ref().map_or(credential.as_str(),|identity|identity.account_ref.as_str());
                             let size=account.size_admission_for_model_decision(decision_id,provider,credential,&model).map_err(sql_error)?;
                             account.heal_serving_fences_in_scope(provider,account_id,credential,&model,size.map(|(class,_)|class),size.map_or(admitted_at,|(_,at)|at),now,effects.quota_scope.as_ref()).map_err(sql_error)?;
+                        }
+                    } else {
+                        let (provider,model,identity):(Option<String>,Option<String>,Option<String>)=tx.query_row(
+                            "SELECT selected_provider_id,selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",
+                            [decision_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                        let pinned=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok()).and_then(|identity|identity.credential_id);
+                        if let (None,Some(provider),Some(model))=(pinned,provider,model) {
+                            account.heal_authorized_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
                         }
                     }
                 }

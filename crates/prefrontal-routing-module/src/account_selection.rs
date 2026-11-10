@@ -3269,6 +3269,10 @@ pub(crate) fn refresh_credential_quota_holds_in(
 
 /// The pool a request's model draws on: the one the caller names, or else
 /// the pool the reading assigns that model's route, if any.
+fn admission_probe_owner(principal: &str, admission: &str) -> String {
+    json!(["account_admission", principal, admission]).to_string()
+}
+
 fn request_pool(named: Option<&str>, provider: &str, model: &str) -> Option<String> {
     named.map(str::to_string).or_else(|| {
         prefrontal_routing_core::quota_extract::antigravity_pool_for_capacity(&format!(
@@ -5352,10 +5356,11 @@ fn serve(
             });
             Ok(
                 if ready
-                    && tx.claim_fence_rechecks_for_admission(
+                    && tx.claim_fence_rechecks_for_authorized_admission(
                         &applicable,
                         now,
                         params.model_decision_id.as_deref(),
+                        &admission_probe_owner(principal, &params.admission_id),
                     )?
                 {
                     prefrontal_routing_store::CredentialProbeClaim::Claimed
@@ -6323,6 +6328,12 @@ fn apply_bound_observation(
                     }));
                 }
                 if media && !tx.admission_reported_failure(principal, id)? {
+                    tx.heal_authorized_probe(
+                        &admission_probe_owner(&admission.principal, &admission.admission_id),
+                        &admission.provider,
+                        &admission.model,
+                        now,
+                    )?;
                     tx.heal_serving_fences_in_scope(
                         &admission.provider,
                         &admission.account_id,

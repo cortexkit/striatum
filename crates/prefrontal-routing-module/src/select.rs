@@ -2330,6 +2330,9 @@ pub(super) async fn handle_select_request(
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
+                        store
+                            .bind_fence_probe_owner(&grant.lease_id, &decision_id)
+                            .map_err(|error| ModuleError::Message(error.to_string()))?;
                         result["poolLease"] = grant.lease_json();
                     }
                 }
@@ -3046,6 +3049,11 @@ fn runner_for_route(
         session,
     )
     .map_err(|refusal| (refusal.code, refusal.message))?;
+    if let Some(owner) = owner {
+        store
+            .bind_fence_probe_owner(&grant.lease_id, owner)
+            .map_err(|error| ("store_error".into(), error.to_string()))?;
+    }
     Ok((grant.runner.clone(), Some(grant)))
 }
 
