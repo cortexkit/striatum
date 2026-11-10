@@ -135,6 +135,11 @@ def clone_backup(old, backup, expected):
     source, cloned = store_identity(old / "store.db"), store_identity(backup / "store.db")
     if (source["device"], source["inode"]) == (cloned["device"], cloned["inode"]):
         raise RuntimeError("backup store is a hard link, not an independent clone")
+    # Engram treats any immediate subfolder of the data home that holds an
+    # engram-catalog.json as a module; a catalog naming prefrontal-routing in
+    # the backup's folder would read as misplaced and degrade its health. The
+    # module rewrites this file at startup, so a restore loses nothing.
+    (backup / "engram-catalog.json").unlink(missing_ok=True)
 
 
 def tar_backup(old, backup, expected):

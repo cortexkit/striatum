@@ -148,7 +148,8 @@ ctypes.CDLL = stubbed_cdll
         self.assertEqual((self.new / "boot-strikes.json").read_text(), '{"strikes": []}\n')
         backups = [path for path in self.base.glob("prefrontal-routing-backup-*") if path.is_dir()]
         self.assertEqual(len(backups), 1)
-        self.assertTrue((backups[0] / "engram-catalog.json").is_file())
+        # Engram would read a catalog left in the backup folder as a misplaced module.
+        self.assertFalse((backups[0] / "engram-catalog.json").exists())
         self.assertTrue((backups[0] / "writer.lease").is_file())
         self.assertEqual((backups[0] / "nested/metadata.json").read_text(), '{"keep":"whole directory"}\n')
         self.assertTrue((backups[0] / "ledger-link").is_symlink())
