@@ -108,6 +108,268 @@ fn opus_wire_catalog() -> Value {
     catalog
 }
 
+fn wire_api_declaration(required: Option<bool>) -> runners::RunnerDeclaration {
+    let mut value = json!({"runner": {
+        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"oauth"}],
+        "follows_account_choice":true
+    }});
+    if let Some(required) = required {
+        value["runner"]["requires_wire_api"] = json!(required);
+    }
+    runners::parse_declaration(&value).unwrap().unwrap()
+}
+
+#[test]
+fn requires_wire_api_is_runner_local_and_defaults_to_false() {
+    let facts = vec![fact("anthropic", "model", Some(&["oauth"]))];
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+    for required in [None, Some(false), Some(true)] {
+        credentials
+            .runner_declarations
+            .insert("fixture-runner".into(), wire_api_declaration(required));
+        let mut unrestricted = policy(None);
+        unrestricted.module = "unrestricted".into();
+        credentials
+            .runner_declarations
+            .insert("unrestricted".into(), wire_api_declaration(None));
+        let registry = Registry::build(vec![policy(None), unrestricted], &credentials, &facts, NOW);
+        assert_eq!(
+            registry.runs("fixture-runner", "anthropic/model", "anthropic/model"),
+            required != Some(true)
+        );
+        assert_eq!(
+            registry.requires_wire_api("fixture-runner", "anthropic/model", "anthropic/model"),
+            required == Some(true)
+        );
+        assert!(registry.runs("unrestricted", "anthropic/model", "anthropic/model"));
+    }
+}
+
+#[test]
+fn requires_wire_api_uses_the_alias_targets_auth_specific_plane() {
+    let facts = vec![fact("anthropic", "model", Some(&["oauth", "apikey"]))];
+    let mut credentials = credentials(
+        &facts,
+        row(&["anthropic-platform"], &["anthropic"], Some("oauth")),
+        NOW,
+    );
+    credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+    credentials.wire_api_models.insert("anthropic/model".into());
+    let mut borrowed = facts.clone();
+    prefrontal_routing_core::score_alias::append_alias_rows(
+        &mut borrowed,
+        &credentials.catalog_targets(&facts),
+    );
+    let alias = borrowed
+        .iter()
+        .find(|fact| fact.provider_id == "anthropic-platform")
+        .unwrap();
+    assert!(credentials.row_serves_wire_api(alias, "oauth"));
+    for served in [false, true] {
+        let mut entry = json!({"wire.family":"anthropic.messages"});
+        if served {
+            entry["wire.api"] = json!({"value":"https://api.anthropic.com", "from":"curated"});
+        }
+        credentials.publish_billing_catalog(
+            crate::fusiform_catalog::PlaneCatalog::default().with_test_plane(
+                &serde_json::to_vec(&json!({
+                    "plane":{"provider_id":"anthropic", "auth_method":"oauth", "kind":"upstream"},
+                    "models":{"anthropic/model":entry}
+                }))
+                .unwrap(),
+            ),
+        );
+        assert_eq!(credentials.row_serves_wire_api(alias, "oauth"), served);
+        assert!(credentials.row_serves_wire_api(alias, "apikey"));
+        credentials
+            .runner_declarations
+            .insert("fixture-runner".into(), wire_api_declaration(Some(true)));
+        let registry = Registry::build(vec![policy(None)], &credentials, &borrowed, NOW);
+        assert_eq!(
+            registry.runs(
+                "fixture-runner",
+                "anthropic-platform/model",
+                "anthropic-platform/model"
+            ),
+            served
+        );
+    }
+}
+
+#[tokio::test]
+async fn requires_wire_api_filters_select_head_choices_panels_and_refreshes() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("requires-wire-api");
+    let facts = vec![
+        fact("anthropic", "claude-opus-5-5", Some(&["oauth"])),
+        fact("anthropic", "claude-sonnet-4-5", Some(&["oauth"])),
+    ];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"fixture-runner", "via_vault":true}]);
+        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+    });
+    let consumer = harness.bind(reserved("example-consumer"), None).await;
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let head = harness.bind(reserved("occipital"), None).await;
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+    credentials
+        .runner_declarations
+        .insert("fixture-runner".into(), wire_api_declaration(Some(true)));
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(credentials));
+    let mut catalog = opus_wire_catalog();
+    catalog["models"]["anthropic/claude-sonnet-4-5"] =
+        served_wire_example("catalog.get — one model, current")["models"]
+            ["anthropic/claude-sonnet-4-5"]
+            .clone();
+    for model in ["claude-opus-5-5", "claude-sonnet-4-5"] {
+        let entry = &mut catalog["models"][format!("anthropic/{model}")];
+        entry.as_object_mut().unwrap().remove("wire.api");
+        entry["model.lineage"] = json!("claude");
+    }
+    catalog["models"]["anthropic/claude-sonnet-4-5"]["wire.api"] =
+        json!("https://api.anthropic.com");
+    for (version, served, required) in [(1, false, true), (2, true, true), (3, false, false)] {
+        catalog["catalog_version"] = json!(version);
+        if served {
+            catalog["models"]["anthropic/claude-opus-5-5"]["wire.api"] =
+                json!({"value":"https://api.anthropic.com", "from":"curated"});
+        } else {
+            catalog["models"]["anthropic/claude-opus-5-5"]
+                .as_object_mut()
+                .unwrap()
+                .remove("wire.api");
+        }
+        shared.lock().unwrap().runner_declarations.insert(
+            "fixture-runner".into(),
+            wire_api_declaration(Some(required)),
+        );
+        let snapshot =
+            crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
+                .unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(
+            harness.store(),
+            &snapshot,
+            Some(&shared),
+            None,
+        )
+        .unwrap();
+        harness.set_credentials(shared.lock().unwrap().clone());
+        let admitted = served || !required;
+        let pinned = consumer
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":"mason", "requirements":{"iq":0}, "pin":"anthropic/claude-opus-5-5"
+                }),
+            )
+            .await;
+        assert_eq!(
+            pinned.0,
+            if admitted {
+                FrameType::Response
+            } else {
+                FrameType::Error
+            },
+            "{pinned:?}"
+        );
+        if admitted {
+            assert_eq!(pinned.1["result"]["route"]["model"], "claude-opus-5-5");
+        } else {
+            assert_eq!(pinned.1["code"], "pin_unavailable", "{pinned:?}");
+            let selected = consumer
+                .call(
+                    "route.select",
+                    &json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
+                )
+                .await;
+            assert_eq!(selected.0, FrameType::Response, "{selected:?}");
+            assert_eq!(selected.1["result"]["route"]["model"], "claude-sonnet-4-5");
+            assert!(
+                selected.1["result"]["detail"]["rejected"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["routeKey"] == "anthropic/claude-opus-5-5"
+                        && row["reason"] == "runner_requires_wire_api"),
+                "{selected:?}"
+            );
+            let what_if = operator
+                .call("route.what_if", &json!({"consumer":"mason", "iqs":[0]}))
+                .await;
+            assert_eq!(what_if.0, FrameType::Response, "{what_if:?}");
+            assert!(
+                what_if.1["result"]["results"][0]["excluded"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["route"] == "anthropic/claude-opus-5-5"
+                        && row["reason"] == "runner_requires_wire_api"),
+                "{what_if:?}"
+            );
+        }
+        let legacy = consumer
+            .call(
+                "route.select",
+                &json!({
+                        "targetAgent":"mason", "consumer":"mason", "substrate":"broca",
+                "requirements":{"iq":10,"eq":0}, "availableModels":["anthropic/claude-opus-5-5"]
+                    }),
+            )
+            .await;
+        assert_eq!(
+            legacy.0,
+            if admitted {
+                FrameType::Response
+            } else {
+                FrameType::Error
+            },
+            "{legacy:?}"
+        );
+        if admitted {
+            assert_eq!(
+                legacy.1["result"]["selected"]["routeKey"], "anthropic/claude-opus-5-5",
+                "{legacy:?}"
+            );
+        } else {
+            assert!(
+                legacy.1["rejected"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["routeKey"] == "anthropic/claude-opus-5-5"
+                        && row["reason"] == "runner_requires_wire_api"),
+                "{legacy:?}"
+            );
+        }
+        let choices = head
+            .call(
+                "route.head_choices",
+                &json!({"runner_module":"fixture-runner"}),
+            )
+            .await;
+        assert_eq!(choices.0, FrameType::Response, "{choices:?}");
+        assert_eq!(
+            choices.1["result"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|model| model["model"] == "claude-opus-5-5"),
+            admitted,
+            "{choices:?}"
+        );
+        let panel = consumer.call("route.select_panel", &json!({
+            "class":"audit", "consumer":"mason", "available_routes":["anthropic/claude-opus-5-5"], "seed":"wire-api"
+        })).await;
+        assert_eq!(panel.0, FrameType::Response, "{panel:?}");
+        assert_eq!(
+            panel.1["result"]["seats"].as_array().unwrap().len(),
+            usize::from(admitted),
+            "{panel:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn thalamus_opencode_selects_anthropic_opus_through_oauth() {
     let _clock = crate::InjectedClock::set(NOW);

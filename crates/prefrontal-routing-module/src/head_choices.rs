@@ -55,6 +55,7 @@ fn credential_reaches_runner(
                 fact.billing_plane
                     .as_ref()
                     .is_none_or(|plane| plane.auth_method == method)
+                    && (!runner.requires_wire_api || credentials.row_serves_wire_api(fact, method))
                     && credentials.wire_api(fact, method).is_some_and(|wire| {
                         pairs.iter().any(|pair| {
                             WIRE_APIS.contains(&pair.wire_api.as_str())

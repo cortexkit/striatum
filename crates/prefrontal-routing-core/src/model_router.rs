@@ -55,6 +55,7 @@ pub const REASON_EXCLUDED: &str = "excluded";
 /// attach it as the rejection's detail.
 pub const REASON_NOT_AVAILABLE: &str = "not_available";
 pub const REASON_RUNNER_WIRE_FAMILY_UNVERIFIED: &str = "runner_wire_family_unverified";
+pub const REASON_RUNNER_REQUIRES_WIRE_API: &str = "runner_requires_wire_api";
 /// A route the upstream catalog marks `deprecated` (Fusiform's `model.status`):
 /// the provider no longer serves it, so no selection, panel seat or pin may
 /// use it. Checked before every other fence, because no policy can make a
@@ -943,11 +944,16 @@ pub fn admit_routes_with_availability(
         }
         if unavailable {
             let refusal = runtime.credential_refusal.as_ref();
-            let wire_unverified = availability_rejections
+            let runner_rejection = availability_rejections
                 .get(&route.route_key)
-                .is_some_and(|reason| reason == REASON_RUNNER_WIRE_FAMILY_UNVERIFIED);
+                .filter(|reason| {
+                    matches!(
+                        reason.as_str(),
+                        REASON_RUNNER_WIRE_FAMILY_UNVERIFIED | REASON_RUNNER_REQUIRES_WIRE_API
+                    )
+                });
             rejected.push(RejectedRoute {
-                detail: if refusal.is_some() || wire_unverified {
+                detail: if refusal.is_some() || runner_rejection.is_some() {
                     None
                 } else {
                     availability_rejections.get(&route.route_key).cloned()
@@ -955,11 +961,7 @@ pub fn admit_routes_with_availability(
                 route_key: route.route_key,
                 reason: refusal
                     .map_or(
-                        if wire_unverified {
-                            REASON_RUNNER_WIRE_FAMILY_UNVERIFIED
-                        } else {
-                            REASON_NOT_AVAILABLE
-                        },
+                        runner_rejection.map_or(REASON_NOT_AVAILABLE, String::as_str),
                         |mark| mark.reason,
                     )
                     .to_string(),

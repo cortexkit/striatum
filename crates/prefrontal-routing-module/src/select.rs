@@ -1850,6 +1850,7 @@ pub(super) async fn handle_select_request(
     };
     if !host_run {
         let mut no_account = Vec::new();
+        let mut missing_wire_api = Vec::new();
         mapped_availability.models.retain(|key| {
             let capacity = facts
                 .iter()
@@ -1874,6 +1875,19 @@ pub(super) async fn handle_select_request(
                             .as_deref()
                             .is_none_or(|module| module == runner.module)
                     })
+                    .any(|runner| runner_registry.requires_wire_api(&runner.module, key, &capacity))
+            {
+                missing_wire_api.push(key.clone());
+            }
+            if !runnable
+                && configured_runners
+                    .iter()
+                    .filter(|runner| {
+                        consumer_policy
+                            .runner
+                            .as_deref()
+                            .is_none_or(|module| module == runner.module)
+                    })
                     .any(|runner| runner_registry.no_runner_account(&runner.module, key, &capacity))
             {
                 no_account.push(key.clone());
@@ -1884,6 +1898,12 @@ pub(super) async fn handle_select_request(
             mapped_availability
                 .rejected
                 .insert(key, "no_runner_account".into());
+        }
+        for key in missing_wire_api {
+            mapped_availability.rejected.insert(
+                key,
+                prefrontal_routing_core::model_router::REASON_RUNNER_REQUIRES_WIRE_API.into(),
+            );
         }
     }
     for fact in &facts {

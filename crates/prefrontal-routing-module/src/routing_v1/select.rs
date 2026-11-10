@@ -756,6 +756,22 @@ async fn select_at_tier(
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
+                    registry.requires_wire_api(
+                        &runner.module,
+                        &route.route_key,
+                        &route.capacity_key,
+                    )
+                })
+            {
+                return Some((
+                    route.route_key,
+                    prefrontal_routing_core::model_router::REASON_RUNNER_REQUIRES_WIRE_API.into(),
+                ));
+            }
+            if !runners
+                .iter()
+                .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
+                && runners.iter().any(|runner| {
                     registry.no_runner_account(
                         &runner.module,
                         &route.route_key,

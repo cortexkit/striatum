@@ -305,6 +305,8 @@ pub(crate) struct CatalogSnapshot {
     facts: Vec<FusiformFactUpdate>,
     rates: BTreeMap<String, ModelRates>,
     pub(crate) wire_apis: BTreeMap<String, String>,
+    /// Rows serving an endpoint in `wire.api`, distinct from `wire_apis`' wire families.
+    pub(crate) wire_api_models: BTreeSet<String>,
     pub(crate) model_kinds: BTreeMap<String, String>,
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
     quality_scores: Option<QualityScores>,
@@ -488,6 +490,7 @@ struct PlanePage {
     plane: PlaneDescriptor,
     rates: BTreeMap<String, ModelRates>,
     wire_apis: BTreeMap<String, String>,
+    wire_api_models: BTreeSet<String>,
     billing_rules: Vec<BillingRule>,
 }
 
@@ -511,6 +514,15 @@ fn wire_families(models: &Value) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn row_serves_wire_api(entry: &Value) -> bool {
+    entry.get("wire.api").is_some_and(|fact| {
+        fact.get("value")
+            .unwrap_or(fact)
+            .as_str()
+            .is_some_and(|endpoint| !endpoint.trim().is_empty())
+    })
+}
+
 fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
     let value = unwrap_tool_result(bytes)?;
     let refusal = value.get("error").unwrap_or(&value);
@@ -529,6 +541,13 @@ fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
             .map_err(FusiformCatalogError::Json)?,
         rates: model_rates(&value["models"])?,
         wire_apis: wire_families(&value["models"]),
+        wire_api_models: value["models"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, entry)| row_serves_wire_api(entry))
+            .map(|(model, _)| model.clone())
+            .collect(),
         billing_rules: serde_json::from_value(
             value
                 .get("billing_rules")
@@ -600,6 +619,15 @@ impl PlaneCatalog {
         }
     }
 
+    /// A served plane's endpoint facts override the ordinary catalog, even when absent.
+    pub(crate) fn row_serves_wire_api(&self, model: &str, auth_method: &str) -> Option<bool> {
+        let provider = model.split_once('/')?.0;
+        match self.pages.get(&(provider.into(), auth_method.into())) {
+            Some(PlaneReply::Served(page)) => Some(page.wire_api_models.contains(model)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn subscription_plan_providers(&self) -> BTreeSet<String> {
         self.pages
             .values()
@@ -627,6 +655,16 @@ impl PlaneCatalog {
         for reply in self.pages.values_mut() {
             if let PlaneReply::Served(page) = reply {
                 page.wire_apis = wire_apis.clone();
+            }
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_wire_api_models(mut self, models: &BTreeSet<String>) -> Self {
+        for reply in self.pages.values_mut() {
+            if let PlaneReply::Served(page) = reply {
+                page.wire_api_models = models.clone();
             }
         }
         self
@@ -674,6 +712,7 @@ impl PlaneCatalog {
                         )]),
                         billing_rules: vec![],
                         wire_apis: BTreeMap::new(),
+                        wire_api_models: BTreeSet::new(),
                     }),
                 );
                 continue;
@@ -913,6 +952,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut rates = BTreeMap::new();
     let mut retained = BTreeSet::new();
     let mut wire_apis = BTreeMap::new();
+    let mut wire_api_models = BTreeSet::new();
     let mut model_kinds = BTreeMap::new();
     let mut audio_input_prices = BTreeMap::new();
     let mut grades = BTreeMap::new();
@@ -966,6 +1006,9 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
                     model_kinds.insert(served_key.clone(), kind.to_owned());
                 }
                 facts.push(fact);
+                if row_serves_wire_api(&entry) {
+                    wire_api_models.insert(served_key.clone());
+                }
                 if let Some(api) = entry.get("wire.family").and_then(Value::as_str) {
                     wire_apis.insert(served_key.clone(), api.to_owned());
                 }
@@ -987,6 +1030,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         rates,
         retained,
         wire_apis,
+        wire_api_models,
         model_kinds,
         audio_input_prices,
         quality_scores: reply.quality_scores,
@@ -1640,6 +1684,7 @@ pub(crate) fn apply_mapped_catalog(
             .lock()
             .map_err(|_| error("credential cache poisoned"))?;
         credentials.wire_apis = snapshot.wire_apis.clone();
+        credentials.wire_api_models = snapshot.wire_api_models.clone();
         credentials.catalog_snapshot = Some(Arc::new(snapshot.clone()));
     }
     Ok(())

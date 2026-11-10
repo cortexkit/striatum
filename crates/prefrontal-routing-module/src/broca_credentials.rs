@@ -47,6 +47,8 @@ pub struct BrocaCredentials {
     pub(crate) classifier_models: BTreeMap<String, Vec<crate::routing_v1::classifier::ServedModel>>,
     pub(crate) plan_prices: serde_json::Value,
     pub(crate) wire_apis: BTreeMap<String, String>,
+    /// Endpoint presence from served `wire.api`; `wire_apis` stores `wire.family`.
+    pub(crate) wire_api_models: BTreeSet<String>,
     serving: BTreeMap<String, ServingMethod>,
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
     subscription_plan_providers: Option<HashSet<String>>,
@@ -210,6 +212,17 @@ impl BrocaCredentials {
         self.billing_catalog
             .wire_api(&model, auth_method)
             .unwrap_or_else(|| self.wire_apis.get(&model).map(String::as_str))
+    }
+
+    pub(crate) fn row_serves_wire_api(&self, fact: &ModelFact, auth_method: &str) -> bool {
+        let provider = self
+            .priced_targets
+            .get(&fact.provider_id)
+            .unwrap_or(&fact.provider_id);
+        let model = format!("{provider}/{}", fact.model_id);
+        self.billing_catalog
+            .row_serves_wire_api(&model, auth_method)
+            .unwrap_or_else(|| self.wire_api_models.contains(&model))
     }
     /// The vault's listed facts, without deriving a credential kind from its id
     /// or refresh adapter. Selection uses these facts to classify account coverage.

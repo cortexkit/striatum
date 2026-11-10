@@ -40,6 +40,8 @@ pub(crate) struct EffectiveRunner {
     pub default_harness: Option<String>,
     #[serde(skip_serializing_if = "is_true")]
     pub starts_sessions: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub requires_wire_api: bool,
     #[serde(skip)]
     route_policy: Option<Vec<String>>,
     #[serde(skip)]
@@ -48,6 +50,8 @@ pub(crate) struct EffectiveRunner {
     statically_reachable_models: BTreeSet<String>,
     #[serde(skip)]
     unverified_wire_models: BTreeSet<String>,
+    #[serde(skip)]
+    missing_wire_api_models: BTreeSet<String>,
     #[serde(skip)]
     no_account_models: BTreeSet<String>,
 }
@@ -72,6 +76,10 @@ pub(crate) fn can_offer_account(
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl EffectiveRunner {
@@ -141,10 +149,12 @@ impl Registry {
                 harnesses: Vec::new(),
                 default_harness: None,
                 starts_sessions: true,
+                requires_wire_api: false,
                 route_policy: None,
                 reachable_models: reachable,
                 statically_reachable_models: models,
                 unverified_wire_models: BTreeSet::new(),
+                missing_wire_api_models: BTreeSet::new(),
                 no_account_models: BTreeSet::new(),
             }],
         }
@@ -215,7 +225,7 @@ impl Registry {
                                     .flatten()
                             });
                             let mut resolved = declaration.clone();
-                        match declaration.limits_for_harness(selected) {
+                            match declaration.limits_for_harness(selected) {
                                 Ok(limits) => {
                                     resolved.pairs = limits.pairs.unwrap_or_default();
                                     if let Some(providers) = limits.explicit_providers {
@@ -237,6 +247,7 @@ impl Registry {
                 let follows_account_choice =
                     declaration.map_or(policy.via_vault, |d| d.follows_account_choice);
                 let mut unverified_wire_models = BTreeSet::new();
+                let mut missing_wire_api_models = BTreeSet::new();
                 let mut no_account_models = BTreeSet::new();
                 let statically_reachable_models: BTreeSet<_> = facts
                     .iter()
@@ -273,7 +284,19 @@ impl Registry {
                                                         && api == pair.wire_api
                                                         && row.auth_method.as_ref()
                                                             == Some(&pair.auth_method)
-                                                })
+                                                }) && {
+                                                    let admitted = declaration.admits_row(
+                                                        credentials
+                                                            .row_serves_wire_api(fact, method),
+                                                    );
+                                                    if !admitted {
+                                                        missing_wire_api_models.insert(format!(
+                                                            "{}/{}",
+                                                            fact.provider_id, fact.model_id
+                                                        ));
+                                                    }
+                                                    admitted
+                                                }
                                             }
                                     })
                                     && {
@@ -303,6 +326,8 @@ impl Registry {
                     BTreeSet::new()
                 };
                 unverified_wire_models.retain(|model| !reachable_models.contains(model));
+                missing_wire_api_models
+                    .retain(|model| !statically_reachable_models.contains(model));
                 no_account_models.retain(|model| !statically_reachable_models.contains(model));
                 let route_policy = policy.routes.clone();
                 let routes = facts
@@ -345,10 +370,12 @@ impl Registry {
                         .unwrap_or_default(),
                     default_harness: declaration.and_then(|d| d.default_harness.clone()),
                     starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
+                    requires_wire_api: declaration.is_some_and(|d| d.requires_wire_api()),
                     route_policy,
                     reachable_models,
                     statically_reachable_models,
                     unverified_wire_models,
+                    missing_wire_api_models,
                     no_account_models,
                 }
             })
@@ -407,6 +434,16 @@ impl Registry {
     pub(crate) fn wire_family_unverified(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
             runner.unverified_wire_models.contains(capacity)
+                && runner
+                    .route_policy
+                    .as_ref()
+                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+        })
+    }
+
+    pub(crate) fn requires_wire_api(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            runner.missing_wire_api_models.contains(capacity)
                 && runner
                     .route_policy
                     .as_ref()

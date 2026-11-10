@@ -921,6 +921,27 @@ impl RoutingSubject for KitSubject {
         Ok(true)
     }
 
+    async fn configure_route_wire_api(
+        &self,
+        route_key: &str,
+        endpoint: Option<&str>,
+    ) -> Result<bool, String> {
+        let harness = self.harness();
+        let shared = harness.broca_credentials.lock().unwrap().clone();
+        let mut credentials = shared.lock().unwrap();
+        if endpoint.is_some() {
+            credentials.wire_api_models.insert(route_key.into());
+        } else {
+            credentials.wire_api_models.remove(route_key);
+        }
+        let catalog = credentials
+            .billing_catalog
+            .clone()
+            .with_wire_api_models(&credentials.wire_api_models);
+        credentials.publish_billing_catalog(catalog);
+        Ok(true)
+    }
+
     async fn configure_continue_credentials(
         &self,
         credentials: &[cortexkit_role_routing_conformance::ContinueCredential],
@@ -1331,6 +1352,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "harness_limits_pairs_narrow",
         "harness_limits_providers_narrow",
         "harness_limits_invalid_falls_back",
+        "runner_requires_wire_api",
     ] {
         assert_eq!(
             report.outcome(check),
