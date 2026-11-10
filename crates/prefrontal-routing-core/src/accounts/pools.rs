@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::eligibility::age_band;
 use super::types::{
     AllocatorPolicy, EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, QuotaReading,
-    ResetTime, ScopedList,
+    ScopedList,
 };
 use super::AgeBand;
 
@@ -376,21 +376,8 @@ pub fn block_end(
     now: EpochMs,
     policy: &AllocatorPolicy,
 ) -> Option<BlockEnd> {
-    match fence.reset {
-        ResetTime::At(reset) => {
-            if now > reset {
-                return Some(BlockEnd::ResetPassed);
-            }
-        }
-        ResetTime::Missing | ResetTime::Unparsable => {
-            let retry_at = fence
-                .retry_hint_ms
-                .unwrap_or(fence.observed_at_ms + policy.unknown_reset_retry_ms);
-            if now >= retry_at {
-                return Some(BlockEnd::RetryDue);
-            }
-        }
-    }
+    // Reset dates schedule a trial, not evidence of recovery. Only a later,
+    // fresh reading with reserve-aware headroom can retire quota evidence.
     let reading = later_fresh_reading(fence, reading, now, policy)?;
     let windows = reported_windows(reading, policy);
     let lifted = match &fence.pool {
@@ -474,7 +461,7 @@ impl AllowedAccountClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{ConfirmationSource, ScopedWindow};
+    use crate::accounts::{ConfirmationSource, ResetTime, ScopedWindow};
 
     const NOW: EpochMs = 1_790_683_200_000;
     const MINUTE: i64 = 60_000;
@@ -525,6 +512,48 @@ mod tests {
 
     fn ends(fence: &Fence, reading: &QuotaReading) -> Option<BlockEnd> {
         block_end(fence, Some(reading), NOW, &AllocatorPolicy::default())
+    }
+
+    #[test]
+    fn quota_fence_has_no_fixed_end_without_headroom() {
+        for reset in [
+            ResetTime::Missing,
+            ResetTime::Unparsable,
+            ResetTime::At(NOW - 1),
+        ] {
+            let fence = block(None, reset);
+            assert_eq!(
+                block_end(
+                    &fence,
+                    None,
+                    NOW + 30 * 24 * HOUR,
+                    &AllocatorPolicy::default()
+                ),
+                None
+            );
+        }
+        let fence = block(None, ResetTime::At(NOW + 30 * 24 * HOUR));
+        assert_eq!(
+            ends(
+                &fence,
+                &reading(NOW, &[(None, 300, 0.0), (None, 10080, 0.0)])
+            ),
+            Some(BlockEnd::Reading)
+        );
+        let policy = AllocatorPolicy {
+            reserve_seven_day: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_end(
+                &fence,
+                Some(&reading(NOW, &[(None, 300, 0.0), (None, 10080, 96.0)])),
+                NOW,
+                &policy
+            ),
+            None,
+            "weekly reserve remains binding"
+        );
     }
 
     #[test]
@@ -686,22 +715,16 @@ mod tests {
     }
 
     #[test]
-    fn a_known_reset_ends_the_block_and_an_unknown_one_retries() {
+    fn reset_and_retry_dates_do_not_retire_quota_evidence() {
         let policy = AllocatorPolicy::default();
         let reset = NOW + 10 * MINUTE;
         let known = block(None, ResetTime::At(reset));
         assert_eq!(block_end(&known, None, reset, &policy), None);
-        assert_eq!(
-            block_end(&known, None, reset + 1000, &policy),
-            Some(BlockEnd::ResetPassed)
-        );
+        assert_eq!(block_end(&known, None, reset + 1000, &policy), None);
         let unknown = block(None, ResetTime::Missing);
-        let six_hours = unknown.observed_at_ms + 6 * HOUR;
-        assert_eq!(block_end(&unknown, None, six_hours - 1, &policy), None);
-        assert_eq!(
-            block_end(&unknown, None, six_hours, &policy),
-            Some(BlockEnd::RetryDue)
-        );
+        let check = unknown.observed_at_ms + 15 * MINUTE;
+        assert_eq!(block_end(&unknown, None, check - 1, &policy), None);
+        assert_eq!(block_end(&unknown, None, check, &policy), None);
         let mut hinted = unknown.clone();
         hinted.retry_hint_ms = Some(unknown.observed_at_ms + 30 * MINUTE);
         assert_eq!(
@@ -715,7 +738,7 @@ mod tests {
         );
         assert_eq!(
             block_end(&hinted, None, unknown.observed_at_ms + 30 * MINUTE, &policy),
-            Some(BlockEnd::RetryDue)
+            None
         );
     }
 

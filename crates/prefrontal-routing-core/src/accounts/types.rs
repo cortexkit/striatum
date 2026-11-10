@@ -525,7 +525,7 @@ pub struct AllocatorPolicy {
     pub model_pools: Vec<crate::quota_extract::ModelPool>,
 }
 
-/// Six hours, the quota overlay's own re-probe horizon for a window with no
+/// Fifteen minutes, the quota overlay's own recheck horizon for a window with no
 /// reported reset.
 fn default_unknown_reset_retry_ms() -> i64 {
     crate::quota::NO_RESET_REPROBE_HORIZON_MS as i64

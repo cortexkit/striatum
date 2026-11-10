@@ -3016,6 +3016,8 @@ async fn handle_set_decision_outcome(
         outcome
     };
     let observed_at_ms = now_ms() as i64;
+    let quota=ACCOUNT_QUOTA.get().and_then(|state|state.lock().ok().map(|state|state.clone()));
+    let fence_config=config_overrides::live_config(_routing_config_path);
     if let Err(error) = record_provider_reset_fence(
         store,
         broca_credentials,
@@ -3027,6 +3029,8 @@ async fn handle_set_decision_outcome(
             .as_deref()
             .is_some_and(|error| error.starts_with("account_limit_exhausted:")),
         observed_at_ms,
+        quota.as_ref(),
+        Some(&fence_config),
     ) {
         return send_route_error(
             writer,
@@ -3072,8 +3076,14 @@ async fn handle_set_decision_outcome(
             match store.get_decision_by_id(&params.decision_id) {
                 Ok(Some(decision)) => {
                     if let Some(provider) = decision.selected_provider_id.as_deref() {
+                        let frozen=store.decision_provider_identity(&params.decision_id).map_err(|e|ModuleError::Message(e.to_string()))?;
+                        if let Some(identity)=frozen.as_ref().filter(|identity|identity.credential_id.as_deref()==Some(credential)) {
+                            store.account_transaction(|tx|tx.heal_serving_fences(provider,&identity.account_ref,credential,
+                                decision.selected_model_id.as_deref().unwrap_or(""),None,decision.created_at as i64,observed_at_ms))
+                                .map_err(|e|ModuleError::Message(e.to_string()))?;
+                        }
                         if let Err(e) =
-                            credential_fences::lift_after_success(store, provider, credential)
+                            credential_fences::lift_after_success(store, provider, credential,decision.created_at as i64)
                         {
                             return send_route_error(
                                 writer,
@@ -3137,6 +3147,8 @@ fn record_provider_reset_fence(
     provider: Option<&prefrontal_routing_core::route_state_store::ProviderOutcome>,
     account_exhausted: bool,
     now: i64,
+    quota: Option<&account_quota::AccountQuotaState>,
+    config: Option<&config_overrides::LiveConfig>,
 ) -> Result<(), String> {
     if *outcome == RouteOutcome::Completed {
         return Ok(());
@@ -3144,21 +3156,16 @@ fn record_provider_reset_fence(
     let Some(provider) = provider.filter(|p| p.credential_refusal.is_none()) else {
         return Ok(());
     };
-    // Unknown refill times need a finite recheck, not an effectively permanent
-    // fence. Keep the former eight-day safety bound only for missing or unreadable
-    // resets; a readable provider date, including a monthly reset, stands as given.
-    const UNKNOWN_RESET_RECHECK_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
+    // A reset is evidence for an extra check, never an expiry. Zero represents
+    // an unknown reset internally; the separate quota retry clock still runs.
     let reset = match provider.resets_at_ms {
         Some(reset)
             if account_quota::parse_rfc3339_ms(&account_selection::rfc3339(reset)).is_some() =>
         {
-            if reset <= now {
-                return Ok(());
-            }
             reset
         }
-        Some(_) => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
-        None if account_exhausted => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
+        Some(_) => 0,
+        None if account_exhausted => 0,
         // Provider identity on an ordinary interruption is not quota evidence.
         None => return Ok(()),
     };
@@ -3200,18 +3207,19 @@ fn record_provider_reset_fence(
     } else {
         return Ok(());
     };
-    // Provider resets can describe monthly windows as well as weekly ones.
-    // A shorter fence would reopen the route before its account can serve again.
-    store
-        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+    // Preserve the provider's date as evidence, without inventing a deadline.
+    let contradicted=quota.is_some_and(|quota| credentials.lock().ok().is_some_and(|credentials|
+        credential_fences::quota_refusal_contradicted(quota,&credentials,&credential,now,
+            &config.map(|config|config.allocator_policy(&provider_id)).unwrap_or_default())));
+    let fence=prefrontal_routing_store::AccountRouteFence {
             provider: provider_id,
             credential_id: credential,
             model,
-            until_ms: reset,
+            until_ms: if contradicted {now.saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS)} else {reset},
             decision_id: decision_id.into(),
             recorded_at: now,
-        })
-        .map_err(|e| e.to_string())
+        };
+    if contradicted {store.record_transient_account_route_fence(&fence)} else {store.record_account_route_fence(&fence)}.map_err(|e|e.to_string())
 }
 
 async fn handle_record_usage(
@@ -5287,11 +5295,55 @@ mod tests {
             Some(&identity),
             true,
             now,
+            None,
+            None,
         )
         .unwrap();
         let fences = store.account_route_fences(now).unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].until_ms, 1_795_357_028_612);
+    }
+
+    #[test]
+    fn xai_spending_limit_with_fresh_zero_usage_is_a_non_quota_refusal() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        let now=account_quota::parse_rfc3339_ms("2026-11-10T13:57:00Z").unwrap();
+        for used in [0.0,100.0] {
+            let rig=Rig::new("xai-contradictory-quota");
+            let store:SharedStore=Arc::new(rig.open_store());
+            let credentials=vault_listing(&[("oauth:xai",&["xai"],Some("xai-account"))]);
+            let mut quota=account_quota::AccountQuotaState::default();
+            quota.readings.readings.insert(("xai".into(),"xai-account".into()),account_quota::StoredReading {
+                provider:"xai".into(),account_id:"xai-account".into(),received_at_ms:now-600_000,tombstoned_at_ms:None,
+                entry:json!({"provider":"xai","apiProvider":"xai","account":"xai-account","fetchedAt":"2026-11-10T13:47:00Z",
+                    "usage":{"secondary":{"usedPercent":used,"windowMinutes":10080}}}),
+            });
+            let decision=store.record_decision(&DecisionInput {selected_provider_id:Some("xai".into()),selected_model_id:Some("grok-4.3".into()),..Default::default()}).unwrap();
+            let identity=ProviderOutcome {account_ref:"xai-account".into(),credential_id:Some("oauth:xai".into()),..Default::default()};
+            store.set_decision_provider_identity(&decision,&identity).unwrap();
+            // The legacy runner typed the 403 spending-limit refusal as account
+            // exhaustion, with no reset. Classification must use the reading,
+            // not the provider's free-form personal-team-blocked message.
+            record_provider_reset_fence(&store,&credentials,&decision,&RouteOutcome::Interrupted,Some(&identity),true,now,Some(&quota),None).unwrap();
+            let quota_rows=store.account_route_fences(now).unwrap();
+            let other_rows=store.transient_account_route_fences(now).unwrap();
+            if used==0.0 {
+                assert!(quota_rows.is_empty());
+                assert_eq!(other_rows.len(),1);
+                let clocks=store.fence_rechecks().unwrap();
+                assert_eq!(clocks[0].kind,"non_quota_route");
+                assert_eq!(clocks[0].next_recheck_at,now+3_600_000);
+                assert!(!store.account_transaction(|tx|tx.claim_fence_rechecks(&clocks,now+15*60_000)).unwrap());
+                // Another fresh zero reading does not heal the non-quota wall.
+                assert_eq!(store.transient_account_route_fences(now+60_000).unwrap().len(),1);
+                assert!(store.account_transaction(|tx|tx.claim_fence_rechecks(&clocks,now+3_600_000)).unwrap());
+                assert!(!store.account_transaction(|tx|tx.claim_fence_rechecks(&clocks,now+3_600_000)).unwrap());
+            } else {
+                assert_eq!(quota_rows.len(),1);
+                assert!(other_rows.is_empty());
+                assert_eq!(store.fence_rechecks().unwrap()[0].next_recheck_at,now+15*60_000);
+            }
+        }
     }
 
     /// Replay of a live incident: vault credential `apikey:cline-pass` was mapped to

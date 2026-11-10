@@ -6,6 +6,7 @@ use prefrontal_routing_core::{route_state_store::CredentialRefusal, RouteOutcome
 #[derive(Default)]
 pub struct V1ReportEffects {
     pub route_fence: Option<AccountRouteFence>,
+    pub non_quota_route_fence: Option<AccountRouteFence>,
     pub eligibility: Option<AccountEligibilityFact>,
     pub credential_refusal: Option<(CredentialRefusal, Option<String>)>,
     pub size_refusal: Option<AccountSizeRefusal>,
@@ -71,7 +72,18 @@ impl SqliteRouteStateStore {
             if first {
                 let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
-                apply_account_effects(&account, effects, now)?;
+                let admitted_at:i64=tx.query_row("SELECT created_at FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
+                apply_account_effects(&account, effects, now,admitted_at)?;
+                if outcome==RouteOutcome::Completed {
+                    if let Some((provider,credential))=&effects.lift_credential {
+                        let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                        let identity=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok());
+                        if identity.as_ref().and_then(|identity|identity.credential_id.as_deref()).is_none_or(|id|id==credential) {
+                            let account_id=identity.as_ref().map_or(credential.as_str(),|identity|identity.account_ref.as_str());
+                            account.heal_serving_fences(provider,account_id,credential,&model,effects.clear_size.as_ref().map(|(_,_,_,size)|*size),admitted_at,now).map_err(sql_error)?;
+                        }
+                    }
+                }
                 reconcile(&account).map_err(sql_error)?;
                 if failed {
                     tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL",
@@ -96,6 +108,12 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        self.conn.execute("INSERT INTO account_non_quota_route_fence VALUES (?1,?2,?3,?4,?5,?6,?6)
+            ON CONFLICT(provider,credential_id,model) DO UPDATE SET until_ms=excluded.until_ms,
+            last_reported_at=MAX(account_non_quota_route_fence.last_reported_at,excluded.last_reported_at),decision_id=excluded.decision_id",
+            params![fence.provider,fence.credential_id,fence.model,fence.until_ms.min(fence.recorded_at.saturating_add(3_600_000)),fence.decision_id,fence.recorded_at]).map(|_|()).map_err(err)
+    }
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
         &self,
@@ -107,7 +125,7 @@ impl AccountTx<'_> {
             credential_refusal: Some((refusal.clone(), fingerprint.map(str::to_owned))),
             ..Default::default()
         };
-        apply_account_effects(self, &effects, now).map_err(err)
+        apply_account_effects(self, &effects, now, 0).map_err(err)
     }
 
     pub fn clear_credential_entitlement_fence(
@@ -139,10 +157,10 @@ impl AccountTx<'_> {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
     }
 
-    pub fn report_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
-        let mut statement=self.conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class='quota' AND until_ms>?1 ORDER BY provider,credential_id,model").map_err(err)?;
+    pub fn report_route_fences(&self, _now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
+        let mut statement=self.conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class='quota' ORDER BY provider,credential_id,model").map_err(err)?;
         let rows = statement
-            .query_map([now], |r| {
+            .query_map([], |r| {
                 Ok(AccountRouteFence {
                     provider: r.get(0)?,
                     credential_id: r.get(1)?,
@@ -172,14 +190,18 @@ fn apply_account_effects(
     tx: &AccountTx<'_>,
     effects: &V1ReportEffects,
     now: i64,
+    admitted_at: i64,
 ) -> rusqlite::Result<()> {
     let conn = tx.conn;
+    if let Some(fence) = &effects.non_quota_route_fence {
+        tx.record_non_quota_route_fence(fence).map_err(sql_error)?;
+    }
     if let Some(fence) = &effects.route_fence {
         conn.execute(
             "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class)
              VALUES (?1,?2,?3,?4,?5,?6,?6,'quota') ON CONFLICT(provider,credential_id,model) DO UPDATE SET
-             until_ms=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at OR account_route_fence.wall_class='transient'
-               THEN excluded.until_ms ELSE MAX(account_route_fence.until_ms,excluded.until_ms) END,
+             until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at)
+               THEN excluded.until_ms ELSE account_route_fence.until_ms END,
              wall_class='quota', recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at),
              last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
             params![fence.provider, fence.credential_id, fence.model, fence.until_ms, fence.decision_id, fence.recorded_at],
@@ -214,14 +236,16 @@ fn apply_account_effects(
             serde_json::json!([provider, credential])
         );
         for fence in fences {
-            if fence.evidence.fence_id.starts_with(&prefix) {
+            if fence.evidence.fence_id.starts_with(&prefix)
+                && fence.evidence.observed_at < admitted_at
+            {
                 tx.clear_fence(&fence.evidence.fence_id, now, "run_succeeded")
                     .map_err(sql_error)?;
             }
         }
         conn.execute(
-            "DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2",
-            params![provider, credential],
+            "DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",
+            params![provider, credential,admitted_at],
         )?;
     }
     Ok(())

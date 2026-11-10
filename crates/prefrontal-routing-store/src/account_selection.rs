@@ -814,9 +814,8 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// Record a quota route fence. Two reports on the same route and credential
-    /// keep the later reset: each report fences until its own reset, so the
-    /// route stays closed until both have passed.
+    /// Record quota evidence; the reported reset schedules an extra check, not
+    /// an expiry. New evidence replaces the old reset without extending a hold.
     pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
         self.record_classified_account_route_fence(fence, "quota")
     }
@@ -825,7 +824,7 @@ impl SqliteRouteStateStore {
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
-        self.record_classified_account_route_fence(fence, "transient")
+        self.account_transaction(|tx| tx.record_non_quota_route_fence(fence))
     }
 
     fn record_classified_account_route_fence(
@@ -838,11 +837,7 @@ impl SqliteRouteStateStore {
                 conn.execute(
                     "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=CASE \
-                  WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.until_ms \
-                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' THEN account_route_fence.until_ms \
-                  WHEN account_route_fence.wall_class='transient' AND excluded.wall_class='quota' THEN excluded.until_ms \
-                  ELSE MAX(account_route_fence.until_ms,excluded.until_ms) END, \
+                until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at) THEN excluded.until_ms ELSE account_route_fence.until_ms END, \
                 wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
                   WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
                 recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
@@ -906,16 +901,15 @@ impl SqliteRouteStateStore {
 
     fn classified_account_route_fences(
         &self,
-        now: i64,
+        _now: i64,
         class: &str,
     ) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
-            if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_route_fence WHERE until_ms<=?1)", [now], |row| row.get::<_, bool>(0))? {
-                conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
-            }
-            let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class=?1 ORDER BY provider,credential_id,model")?;
-            let rows = statement.query_map([class], |row| Ok(AccountRouteFence {
+            let table=if class=="transient" {"account_non_quota_route_fence"} else {"account_route_fence"};
+            let filter=if class=="transient" {""} else {"WHERE wall_class='quota'"};
+            let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM {table} {filter} ORDER BY provider,credential_id,model"))?;
+            let rows = statement.query_map([], |row| Ok(AccountRouteFence {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
             }))?;
             rows.collect()

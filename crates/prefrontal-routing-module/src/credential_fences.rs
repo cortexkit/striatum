@@ -203,6 +203,22 @@ pub(crate) fn fresh_headroom_after_for_account(
     saw_window
 }
 
+/// A typed quota refusal contradicted by current headroom is not a measured
+/// quota wall. Keep it as a non-quota refusal until a request proves recovery;
+/// otherwise every telemetry refresh would immediately reopen a billing wall.
+pub(crate) fn quota_refusal_contradicted(
+    quota: &crate::account_quota::AccountQuotaState,
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    credential: &str,
+    now: i64,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
+) -> bool {
+    let credentials = credentials.with_quota_account_ids(quota);
+    credential_account_id(&credentials, credential).is_some_and(|account| {
+        fresh_headroom_after_for_account(quota, &account, i64::MIN, now, policy)
+    })
+}
+
 fn window_has_headroom(
     window: &prefrontal_routing_core::quota::RateWindow,
     policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
@@ -236,7 +252,7 @@ pub(crate) fn latest_reading_for_account<'a>(
         })
 }
 
-fn latest_fresh_entry(
+pub(crate) fn latest_fresh_entry(
     quota: &crate::account_quota::AccountQuotaState,
     account_id: &str,
     now_ms: i64,
@@ -326,8 +342,12 @@ pub(crate) fn lift_after_success_in(
     provider: &str,
     credential: &str,
     now: i64,
+    admitted_at: i64,
 ) -> RouteStateResult<bool> {
     if let Some(fence) = tx.credential_entitlement_fence(provider, credential)? {
+        if fence.observed_at_ms >= admitted_at {
+            return Ok(false);
+        }
         clear_quota_holds_in(tx, &fence, "run_succeeded", now)?;
         tx.clear_credential_entitlement_fence(provider, credential)?;
         return Ok(true);
@@ -530,7 +550,20 @@ pub(crate) fn lift_after_success(
     store: &SqliteRouteStateStore,
     provider_id: &str,
     credential_id: &str,
+    admitted_at: i64,
 ) -> Result<bool, String> {
+    if store
+        .credential_entitlement_fences()
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|fence| {
+            fence.provider_id == provider_id
+                && fence.credential_id == credential_id
+                && fence.observed_at_ms >= admitted_at
+        })
+    {
+        return Ok(false);
+    }
     for fence in store
         .credential_entitlement_fences()
         .map_err(|error| error.to_string())?

@@ -321,10 +321,9 @@ impl<'a> Allocator<'a> {
     }
 
     /// Blocks on this account that restrict the requested model, newest
-    /// first. A block stops restricting once [`block_end`] says it ended: its
-    /// known reset passed, its retry time came, or a fresh reading observed
-    /// after it shows headroom on its pool (design, "Blocks are driven by
-    /// evidence").
+    /// first. Only newer fresh headroom retires evidence. For a due probe, the
+    /// module omits its own fence from allocation and atomically advances its
+    /// recheck clock at admission, leaving the stored evidence in place.
     fn fences_for(&self, account_id: &str) -> Vec<&'a Fence> {
         if self.using_credits(account_id) {
             return Vec::new();

@@ -5,8 +5,9 @@ use crate::{err, AccountTx, SqliteRouteStateStore};
 use prefrontal_routing_core::RouteStateResult;
 use rusqlite::{params, Connection};
 
-pub const QUOTA_FENCE_RECHECK_MS: i64 = 15 * 60_000;
-pub const NON_QUOTA_FENCE_MAX_MS: i64 = 60 * 60_000;
+pub use prefrontal_routing_core::fence_lifetimes::{
+    NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS,
+};
 
 #[derive(Clone, Debug)]
 pub struct FenceRecheck {
@@ -57,19 +58,33 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
          FROM fence_origin WHERE true
          ON CONFLICT(kind,origin_key) DO UPDATE SET evidence=excluded.evidence,evidence_at=excluded.evidence_at,
           quota=excluded.quota,next_recheck_at=excluded.next_recheck_at,reset_check_at=excluded.reset_check_at,
-          last_claimed_at=NULL WHERE fence_recheck.evidence!=excluded.evidence",
+          last_claimed_at=NULL,classified=0,cleared_at=NULL WHERE fence_recheck.evidence!=excluded.evidence",
         [],
     )?;
     // Observation evidence is append-only and read through a bounded sparse
     // index. Its clock survives that lookback until a successful probe heals it.
     conn.execute("DELETE FROM fence_recheck WHERE kind!='observation' AND NOT EXISTS
         (SELECT 1 FROM fence_origin o WHERE o.kind=fence_recheck.kind AND o.origin_key=fence_recheck.origin_key)", [])?;
+    // Older writers stored account-local errors on model/provider rows.
+    // Snapshot reads ignore those rows as model/provider walls. Exclude their
+    // retry clocks too, so one account's error cannot hide healthy siblings.
+    for (table,key,kind) in [("model_route_state","route_key","route"),("provider_cooldown_state","provider_key","provider")] {
+        let mut statement=conn.prepare(&format!("SELECT {key},last_error,wall_class FROM {table}"))?;
+        let rows=statement.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?)))?;
+        for row in rows {
+            let (key,error,class)=row?;
+            let class=class.and_then(|class|prefrontal_routing_core::RouteWallClass::parse(&class).ok());
+            if prefrontal_routing_core::account_wall::account_scoped_wall(error.as_deref(),class) {
+                conn.execute("DELETE FROM fence_recheck WHERE kind=?1 AND origin_key=?2",params![kind,serde_json::json!([key]).to_string()])?;
+            }
+        }
+    }
     Ok(())
 }
 
 pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
     let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-        evidence_at,quota,next_recheck_at,reset_check_at FROM fence_recheck ORDER BY kind,origin_key")?;
+        evidence_at,quota,next_recheck_at,reset_check_at FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
     let rows = statement.query_map([], |row| {
         Ok(FenceRecheck {
             kind: row.get(0)?,
@@ -125,6 +140,91 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Success can heal only evidence older than this request's admission. A
+    /// late completion of an older run must not erase a more recent refusal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn heal_serving_fences(
+        &self,
+        provider: &str,
+        account: &str,
+        credential: &str,
+        model: &str,
+        size: Option<u32>,
+        admitted_at: i64,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        let origins = self.fence_rechecks()?;
+        for origin in origins.iter().filter(|origin| {
+            origin.applies(provider, account, credential, model)
+                && origin.evidence_at < admitted_at
+                && origin.principal.is_none()
+                && origin
+                    .size_class
+                    .is_none_or(|class| Some(class as u32) == size)
+        }) {
+            let key: Vec<serde_json::Value> =
+                serde_json::from_str(&origin.origin_key).map_err(err)?;
+            match origin.kind.as_str() {
+                "account" => {
+                    self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='run_succeeded' WHERE fence_id=?1 AND observed_at<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
+                }
+                "credential" => {
+                    self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",params![provider,credential,admitted_at]).map_err(err)?;
+                }
+                "account_route" | "non_quota_route" => {
+                    let table = if origin.kind == "account_route" {
+                        "account_route_fence"
+                    } else {
+                        "account_non_quota_route_fence"
+                    };
+                    self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND COALESCE(last_reported_at,recorded_at)<?4"),params![provider,credential,model,admitted_at]).map_err(err)?;
+                }
+                "size" => {
+                    self.conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",params![provider,credential,model,origin.size_class,admitted_at]).map_err(err)?;
+                }
+                "pool_billing" | "pool_rate" => {
+                    let field = if origin.kind == "pool_billing" {
+                        "walled_until"
+                    } else {
+                        "cooldown_until"
+                    };
+                    self.conn.execute(&format!("UPDATE pool_key_state SET {field}=NULL WHERE provider=?1 AND credential_id=?2"),params![provider,credential]).map_err(err)?;
+                }
+                "route" => {
+                    self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE route_key=?1",[key[0].as_str()]).map_err(err)?;
+                }
+                "provider" => {
+                    self.conn.execute("UPDATE model_route_state SET
+                        cooldown_until=CASE WHEN cooldown_until<=(SELECT cooldown_until FROM provider_cooldown_state WHERE provider_key=?1) THEN NULL ELSE cooldown_until END,
+                        quota_exhausted_until=CASE WHEN quota_exhausted_until<=(SELECT quota_exhausted_until FROM provider_cooldown_state WHERE provider_key=?1) THEN NULL ELSE quota_exhausted_until END
+                        WHERE provider_id=?1",[provider]).map_err(err)?;
+                    self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE provider_key=?1",[provider]).map_err(err)?;
+                }
+                "failure" => {
+                    self.conn.execute("UPDATE model_route_state SET failure_backoff_until=NULL WHERE route_key=?1",[key[0].as_str()]).map_err(err)?;
+                }
+                _ => {}
+            }
+            self.conn
+                .execute(
+                    "UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",
+                    params![origin.kind, origin.origin_key, now],
+                )
+                .map_err(err)?;
+        }
+        Ok(())
+    }
+    pub fn classify_credential_quota(
+        &self,
+        provider: &str,
+        credential: &str,
+        quota: bool,
+    ) -> RouteStateResult<bool> {
+        sync(self.conn).map_err(err)?;
+        self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
+            WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND classified=0",params![provider,credential,quota]).map_err(err)?;
+        self.conn.query_row("SELECT quota FROM fence_recheck WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![provider,credential],|row|row.get(0)).map_err(err)
+    }
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
         sync(self.conn).map_err(err)?;
         read(self.conn).map_err(err)
@@ -143,6 +243,75 @@ impl AccountTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn success_heals_only_serving_identity_and_evidence_older_than_admission() {
+        let scratch=cortexkit_test_support::ScratchDir::new("fence-success-boundary");
+        let store=SqliteRouteStateStore::open(&crate::dev_descriptor("fence-success-boundary",scratch.path().join("store.db").to_string_lossy())).unwrap();
+        for credential in ["served","sibling"] {
+            store.record_account_route_fence(&crate::AccountRouteFence {provider:"p".into(),credential_id:credential.into(),model:"m".into(),until_ms:0,decision_id:"d".into(),recorded_at:100}).unwrap();
+            store.record_transient_account_route_fence(&crate::AccountRouteFence {provider:"p".into(),credential_id:credential.into(),model:"m".into(),until_ms:10_000,decision_id:"d".into(),recorded_at:100}).unwrap();
+        }
+        store.account_transaction(|tx|tx.heal_serving_fences("p","a","served","m",None,99,200)).unwrap();
+        assert_eq!(store.account_route_fences(200).unwrap().len(),2);
+        store.account_transaction(|tx|tx.heal_serving_fences("p","a","served","m",None,101,200)).unwrap();
+        assert_eq!(store.account_route_fences(200).unwrap()[0].credential_id,"sibling");
+        assert_eq!(store.transient_account_route_fences(200).unwrap()[0].credential_id,"sibling");
+    }
+
+    #[test]
+    fn quota_rechecks_every_fifteen_minutes_and_reset_only_adds_a_check() {
+        for reset in [0, 60_000, 2 * QUOTA_FENCE_RECHECK_MS] {
+            let scratch = cortexkit_test_support::ScratchDir::new("quota-recheck");
+            let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "quota-recheck",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap();
+            store
+                .record_account_route_fence(&crate::AccountRouteFence {
+                    provider: "p".into(),
+                    credential_id: "c".into(),
+                    model: "m".into(),
+                    until_ms: reset,
+                    decision_id: "d".into(),
+                    recorded_at: 0,
+                })
+                .unwrap();
+            let clocks = store.fence_rechecks().unwrap();
+            assert_eq!(clocks[0].next_recheck_at, QUOTA_FENCE_RECHECK_MS);
+            let first = if reset == 60_000 {
+                reset
+            } else {
+                QUOTA_FENCE_RECHECK_MS
+            };
+            assert!(!store
+                .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, first - 1))
+                .unwrap());
+            assert!(store
+                .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, first))
+                .unwrap());
+            assert!(!store
+                .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, first))
+                .unwrap());
+            assert_eq!(
+                store
+                    .account_route_fences(100 * QUOTA_FENCE_RECHECK_MS)
+                    .unwrap()
+                    .len(),
+                1,
+                "a date never expires quota evidence"
+            );
+            let updated = store.fence_rechecks().unwrap();
+            assert_eq!(updated[0].next_recheck_at, first + QUOTA_FENCE_RECHECK_MS);
+            assert_eq!(updated[0].evidence_at, 0);
+            if reset > first {
+                assert_eq!(updated[0].due_at(), reset);
+            } else {
+                assert_eq!(updated[0].reset_check_at, None);
+            }
+        }
+    }
 
     #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {
@@ -203,46 +372,56 @@ mod tests {
 
     #[test]
     fn strict_probe_claim_is_atomic_across_distinct_connections() {
-        let scratch = cortexkit_test_support::ScratchDir::new("fence-concurrency");
-        let path = scratch.path().join("store.db");
-        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "fence-concurrency",
-            path.to_string_lossy(),
-        ))
-        .unwrap();
-        store.store.with_conn(|conn| conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','ENTITLEMENT_ERROR',NULL,0)",[])).unwrap();
-        let origins = store.fence_rechecks().unwrap();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let path = path.clone();
-                let barrier = barrier.clone();
-                let origins = origins.clone();
-                std::thread::spawn(move || {
-                    let mut conn = Connection::open(path).unwrap();
-                    conn.busy_timeout(std::time::Duration::from_secs(10))
-                        .unwrap();
-                    barrier.wait();
-                    let tx = conn
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                        .unwrap();
-                    let won = claim(&tx, &origins, NON_QUOTA_FENCE_MAX_MS).unwrap();
-                    tx.commit().unwrap();
-                    won
+        for case in ["credential", "account", "combined"] {
+            let scratch = cortexkit_test_support::ScratchDir::new("fence-concurrency");
+            let path = scratch.path().join("store.db");
+            let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "fence-concurrency",
+                path.to_string_lossy(),
+            ))
+            .unwrap();
+            store.store.with_conn(|conn| {
+            if case!="account" {conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','ENTITLEMENT_ERROR',NULL,0)",[])?;}
+            if case!="credential" {conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at)
+                VALUES ('f','p','a','null','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',0,'test',0)",[])?;}
+            if case=="combined" {conn.execute("INSERT INTO account_route_fence VALUES ('p','c','m',0,'d',0,0,'quota')",[])?;}
+            Ok(())
+        }).unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    let origins = origins.clone();
+                    std::thread::spawn(move || {
+                        let mut conn = Connection::open(path).unwrap();
+                        conn.busy_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                        barrier.wait();
+                        let tx = conn
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                            .unwrap();
+                        let won = claim(&tx, &origins, NON_QUOTA_FENCE_MAX_MS).unwrap();
+                        tx.commit().unwrap();
+                        won
+                    })
                 })
-            })
-            .collect();
-        assert_eq!(
-            threads
-                .into_iter()
-                .map(|thread| thread.join().unwrap() as usize)
-                .sum::<usize>(),
-            1
-        );
-        assert_eq!(
-            store.credential_entitlement_fences().unwrap()[0].observed_at_ms,
-            0,
-            "claim preserves refusal evidence"
-        );
+                .collect();
+            assert_eq!(
+                threads
+                    .into_iter()
+                    .map(|thread| thread.join().unwrap() as usize)
+                    .sum::<usize>(),
+                1
+            );
+            if case != "account" {
+                assert_eq!(
+                    store.credential_entitlement_fences().unwrap()[0].observed_at_ms,
+                    0,
+                    "claim preserves refusal evidence"
+                );
+            }
+        }
     }
 }

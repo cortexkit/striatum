@@ -15,7 +15,7 @@
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{
-    parse_report_request_serving, Outcome, ReportAnswer, ReportRequest, RESET_FENCE_CAP_MS,
+    parse_report_request_serving, Outcome, ReportAnswer, ReportRequest,
 };
 use prefrontal_routing_core::{RouteOutcome, RouteStateStore};
 use prefrontal_routing_store::V1Recorded;
@@ -225,16 +225,17 @@ fn prepare_account_facts(
                 && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
         })
     };
-    // A failed run with a future reset closes this route on the account that
-    // served it, and nothing wider. The serving identity routing admitted for
-    // the decision names that account; the report's own claim is the
-    // fallback. A reset already past is a normal race ("retry in 5 s" landing
-    // 6 s later), so the failure stands with no fence.
+    // Quota evidence belongs to the serving identity, not its healthy siblings.
+    // A reset schedules an extra check; a missing date does not erase a typed
+    // quota refusal. Fresh headroom contradicts the quota interpretation and
+    // retains the refusal as an independent non-quota wall instead.
     if params["outcome"] == "failed" {
-        if let Some(reset) = params
-            .get("reset_at_ms")
-            .and_then(Value::as_i64)
-            .filter(|reset| *reset > now)
+        let reset = params.get("reset_at_ms").and_then(Value::as_i64);
+        if reset.is_some_and(|reset| reset > now)
+            || matches!(
+                params["runner_code"].as_str(),
+                Some("account_limit_exhausted" | "quota_exhausted")
+            )
         {
             let served = identity
                 .as_ref()
@@ -246,10 +247,29 @@ fn prepare_account_facts(
                     provider: decision.provider.clone(),
                     credential_id: served.into(),
                     model: decision.model.clone(),
-                    until_ms: reset.min(now.saturating_add(RESET_FENCE_CAP_MS as i64)),
+                    until_ms: reset.unwrap_or(0),
                     decision_id: decision.decision_id.clone(),
                     recorded_at: now,
                 });
+                let contradicted = crate::ACCOUNT_QUOTA
+                    .get()
+                    .and_then(|quota| quota.lock().ok())
+                    .is_some_and(|quota| {
+                        crate::credential_fences::quota_refusal_contradicted(
+                            &quota,
+                            &credentials,
+                            served,
+                            now,
+                            &super::operator_config(deps).allocator_policy(&decision.provider),
+                        )
+                    });
+                if contradicted {
+                    let mut fence = effects.route_fence.take().unwrap();
+                    fence.until_ms = now.saturating_add(
+                        prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
+                    );
+                    effects.non_quota_route_fence = Some(fence);
+                }
             }
         }
     }

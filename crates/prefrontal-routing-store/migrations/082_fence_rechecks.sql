@@ -13,12 +13,24 @@ CREATE TABLE fence_recheck (
   evidence TEXT NOT NULL,
   evidence_at INTEGER NOT NULL,
   quota INTEGER NOT NULL CHECK (quota IN (0,1)),
+  classified INTEGER NOT NULL DEFAULT 0,
   next_recheck_at INTEGER NOT NULL,
   reset_check_at INTEGER,
   last_claimed_at INTEGER,
+  cleared_at INTEGER,
   PRIMARY KEY (kind, origin_key)
 );
 CREATE INDEX fence_recheck_scope ON fence_recheck(provider, credential_id, account_id, model);
+
+-- Independent quota and non-quota refusals must not overwrite each other.
+CREATE TABLE account_non_quota_route_fence (
+ provider TEXT NOT NULL, credential_id TEXT NOT NULL, model TEXT NOT NULL,
+ until_ms INTEGER NOT NULL, decision_id TEXT NOT NULL, recorded_at INTEGER NOT NULL,
+ last_reported_at INTEGER NOT NULL, PRIMARY KEY(provider,credential_id,model)
+);
+INSERT INTO account_non_quota_route_fence
+ SELECT provider,credential_id,model,until_ms,decision_id,recorded_at,COALESCE(last_reported_at,recorded_at)
+ FROM account_route_fence WHERE wall_class='transient';
 
 -- JSON arrays make compound identities unambiguous even when ids contain ':'
 -- or '/'. Provider cooldown fanout is represented by its provider origin only.
@@ -37,7 +49,11 @@ UNION ALL
 SELECT 'account_route',json_array(provider,credential_id,model),provider,NULL,credential_id,model,NULL,NULL,NULL,
        json_array(wall_class,until_ms,COALESCE(last_reported_at,recorded_at)),COALESCE(last_reported_at,recorded_at),
        wall_class='quota',until_ms,CASE WHEN wall_class='quota' THEN until_ms END
-FROM account_route_fence
+FROM account_route_fence WHERE wall_class='quota'
+UNION ALL
+SELECT 'non_quota_route',json_array(provider,credential_id,model),provider,NULL,credential_id,model,NULL,NULL,NULL,
+       json_array(until_ms,last_reported_at),last_reported_at,0,until_ms,NULL
+FROM account_non_quota_route_fence
 UNION ALL
 SELECT 'pool_billing',json_array(provider,credential_id),provider,NULL,credential_id,NULL,NULL,NULL,NULL,
        json_array(walled_until,wall_reason),updated_at,0,walled_until,NULL

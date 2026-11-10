@@ -173,6 +173,7 @@ impl Ctx<'_> {
 /// One immutable vault/config/catalog view shared by selection and allocation.
 #[derive(Clone)]
 pub(crate) struct ClassContext {
+    rechecks: Vec<prefrontal_routing_store::FenceRecheck>,
     pub credentials: crate::broca_credentials::BrocaCredentials,
     pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
     pub facts: Vec<prefrontal_routing_core::ModelFact>,
@@ -703,7 +704,9 @@ impl ClassContext {
                     .collect()
             })
             .map_err(|error| error.to_string())?;
+        let rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
         Ok(Self {
+            rechecks,
             credentials,
             config,
             facts,
@@ -733,12 +736,14 @@ impl ClassContext {
         store: &SqliteRouteStateStore,
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
     ) -> Result<(), String> {
-        let probes = self
-            .refusals
-            .iter()
-            .filter(|fence| self.probe_eligible(&fence.provider_id, &fence.credential_id))
-            .map(|fence| (fence.provider_id.clone(), fence.credential_id.clone()))
-            .collect::<Vec<_>>();
+        let mut probes = Vec::new();
+        for row in self.credentials.listed_credentials() {
+            for fact in &self.facts {
+                if self.probe_eligible(&fact.provider_id, &row.id) {
+                    probes.push((fact.provider_id.clone(), row.id.clone()));
+                }
+            }
+        }
         if probes.is_empty() {
             return Ok(());
         }
@@ -757,6 +762,7 @@ impl ClassContext {
             &self.route_fences,
             self.now_ms,
         )?;
+        self.rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -904,6 +910,19 @@ impl ClassContext {
             model_reach,
             quota: reading
                 .filter(|_| {
+                    !self.rechecks.iter().any(|origin| {
+                        origin.quota
+                            && self.origin_applies(
+                                origin,
+                                &fact.provider_id,
+                                &account_id,
+                                &row.id,
+                                &fact.model_id,
+                            )
+                            && self.origin_due(origin, &account_id)
+                    })
+                })
+                .filter(|_| {
                     crate::credential_fences::has_quota_signal_for_account(&self.quota, &account_id)
                 })
                 .and_then(|reading| {
@@ -922,18 +941,23 @@ impl ClassContext {
         row: &cortexkit_claustrum_client::ListedCredential,
         fact: &prefrontal_routing_core::ModelFact,
     ) -> bool {
-        !self
-            .pool_walls
-            .contains(&(fact.provider_id.clone(), row.id.clone()))
-            && (!self.probe_eligible(&fact.provider_id, &row.id)
-                || probe_reservations::blocked_until(
-                    &self.probe_scope,
-                    &fact.provider_id,
-                    &row.id,
-                    self.probe_owner.as_deref(),
-                    self.now_ms,
-                )
-                .is_none())
+        !self.rechecks.iter().any(|origin| {
+            self.origin_applies(
+                origin,
+                &fact.provider_id,
+                row.account_id.as_deref().unwrap_or(&row.id),
+                &row.id,
+                &fact.model_id,
+            ) && !self.origin_due(origin, row.account_id.as_deref().unwrap_or(&row.id))
+        }) && (!self.probe_eligible(&fact.provider_id, &row.id)
+            || probe_reservations::blocked_until(
+                &self.probe_scope,
+                &fact.provider_id,
+                &row.id,
+                self.probe_owner.as_deref(),
+                self.now_ms,
+            )
+            .is_none())
             && self.tier_accounts.as_ref().is_none_or(|accounts| {
                 accounts
                     .get(&format!("{}/{}", fact.provider_id, fact.model_id))
@@ -947,24 +971,85 @@ impl ClassContext {
             && !self.refusals.iter().any(|fence| {
                 fence.provider_id == fact.provider_id
                     && fence.credential_id == row.id
-                    && !crate::credential_fences::probe_allowed(
-                        &fence.code,
-                        self.has_quota_signal(&fact.provider_id, &row.id),
-                        self.now_ms.saturating_sub(fence.observed_at_ms),
-                    )
+                    && !self.probe_eligible(&fact.provider_id, &row.id)
             })
     }
 
     fn probe_eligible(&self, provider: &str, credential: &str) -> bool {
-        self.refusals.iter().any(|fence| {
-            fence.provider_id == provider
-                && fence.credential_id == credential
-                && crate::credential_fences::probe_allowed(
-                    &fence.code,
-                    self.has_quota_signal(provider, credential),
-                    self.now_ms.saturating_sub(fence.observed_at_ms),
-                )
+        let account =
+            crate::credential_fences::credential_account_id(&self.credentials, credential)
+                .unwrap_or_else(|| credential.into());
+        self.rechecks.iter().any(|origin| {
+            origin.applies(
+                provider,
+                &account,
+                credential,
+                origin.model.as_deref().unwrap_or(""),
+            ) && origin.principal.is_none()
+                && origin.size_class.is_none()
+                && self.origin_due(origin, &account)
         })
+    }
+
+    fn origin_applies(
+        &self,
+        origin: &prefrontal_routing_store::FenceRecheck,
+        provider: &str,
+        account: &str,
+        credential: &str,
+        model: &str,
+    ) -> bool {
+        origin.principal.is_none()
+            && origin.size_class.is_none()
+            && origin.applies(provider, account, credential, model)
+            && (origin.kind != "account"
+                || self.fences.get(provider).is_some_and(|fences| {
+                    fences.iter().any(|fence| {
+                        fence.account_id == account
+                            && fence.observed_at_ms == origin.evidence_at
+                            && fence.applies_to(
+                                model,
+                                self.config
+                                    .allocator_policy(provider)
+                                    .family_for_model(model),
+                                None,
+                            )
+                    })
+                }))
+    }
+
+    fn origin_due(&self, origin: &prefrontal_routing_store::FenceRecheck, account: &str) -> bool {
+        if origin.quota
+            && matches!(origin.kind.as_str(), "provider" | "route")
+            && crate::credential_fences::fresh_headroom_after_for_account(
+                &self.quota,
+                account,
+                origin.evidence_at,
+                self.now_ms,
+                &self.config.allocator_policy(&origin.provider),
+            )
+        {
+            return true;
+        }
+        origin.due_at() <= self.now_ms
+            && (!origin.quota
+                || !crate::credential_fences::has_quota_signal_for_account(&self.quota, account)
+                || crate::credential_fences::latest_fresh_entry(&self.quota, account, self.now_ms)
+                    .is_none())
+    }
+
+    fn probe_fences(&self, provider: &str, model: &str, fences: Vec<Fence>) -> Vec<Fence> {
+        fences
+            .into_iter()
+            .filter(|fence| {
+                !self.rechecks.iter().any(|origin| {
+                    origin.kind == "account"
+                        && origin.applies(provider, &fence.account_id, "", model)
+                        && origin.evidence_at == fence.observed_at_ms
+                        && self.origin_due(origin, &fence.account_id)
+                })
+            })
+            .collect()
     }
 
     fn quota_hold_reset(&self, provider: &str, credential: &str) -> Option<i64> {
@@ -1180,19 +1265,32 @@ impl ClassContext {
         // A refusal probe must reach admission to claim its single-request
         // reservation. A quota route fence must not hide that same probe;
         // allocator quota blocks and observation backoffs still apply.
-        let enforcing: Vec<_> = self
-            .route_fences
-            .iter()
-            .filter(|fence| !self.probe_eligible(&fence.provider, &fence.credential_id))
-            .cloned()
-            .collect();
-        let mut fenced = self.accounts_fenced_by(&enforcing, provider, model);
-        for (named_provider, account, until) in &self.observation_backoffs {
-            if named_provider == provider && *until > self.now_ms {
+        let mut fenced = BTreeMap::new();
+        for origin in self.rechecks.iter().filter(|origin| {
+            matches!(
+                origin.kind.as_str(),
+                "account_route" | "non_quota_route" | "observation"
+            )
+        }) {
+            let account = origin.account_id.clone().or_else(|| {
+                origin.credential_id.as_ref().and_then(|id| {
+                    crate::credential_fences::credential_account_id(&self.credentials, id)
+                })
+            });
+            let Some(account) = account else { continue };
+            if origin.applies(
+                provider,
+                &account,
+                origin.credential_id.as_deref().unwrap_or(""),
+                model,
+            ) && !self.origin_due(origin, &account)
+            {
                 fenced
-                    .entry(account.clone())
-                    .and_modify(|reset| *reset = (*reset).max(*until))
-                    .or_insert(*until);
+                    .entry(account)
+                    .and_modify(|at: &mut i64| {
+                        *at = (*at).max(origin.due_at().max(self.now_ms + 1))
+                    })
+                    .or_insert(origin.due_at().max(self.now_ms + 1));
             }
         }
         fenced
@@ -1205,9 +1303,10 @@ impl ClassContext {
         model: &str,
     ) -> BTreeMap<String, i64> {
         let mut fenced: BTreeMap<String, i64> = BTreeMap::new();
-        for fence in fences.iter().filter(|fence| {
-            fence.provider == provider && fence.model == model && fence.until_ms > self.now_ms
-        }) {
+        for fence in fences
+            .iter()
+            .filter(|fence| fence.provider == provider && fence.model == model)
+        {
             let account = self
                 .credentials
                 .listed_credentials()
@@ -1215,8 +1314,17 @@ impl ClassContext {
                 .find(|row| row.id == fence.credential_id)
                 .and_then(|row| row.account_id.clone())
                 .unwrap_or_else(|| fence.credential_id.clone());
-            let until = fenced.entry(account).or_insert(fence.until_ms);
-            *until = (*until).max(fence.until_ms);
+            if let Some(origin) = self.rechecks.iter().find(|origin| {
+                origin.kind == "non_quota_route"
+                    && origin.applies(provider, &account, &fence.credential_id, model)
+            }) {
+                if !self.origin_due(origin, &account) {
+                    let until = fenced
+                        .entry(account)
+                        .or_insert(origin.due_at().max(self.now_ms + 1));
+                    *until = (*until).max(origin.due_at().max(self.now_ms + 1));
+                }
+            }
         }
         fenced
     }
@@ -1366,7 +1474,11 @@ impl ClassContext {
             &AllocatorState {
                 roster: self.roster_for(provider, model, priced).roster,
                 affinity,
-                fences: self.fences.get(provider).cloned().unwrap_or_default(),
+                fences: self.probe_fences(
+                    provider,
+                    model,
+                    self.fences.get(provider).cloned().unwrap_or_default(),
+                ),
                 principal_exclusions: Vec::new(),
                 admissions: Vec::new(),
                 operator_override: None,
@@ -1511,12 +1623,20 @@ impl ClassContext {
         model: &str,
     ) -> prefrontal_routing_core::accounts::AllocationContext {
         let mut context = prefrontal_routing_core::accounts::AllocationContext::default();
-        for fence in self.refusals.iter().filter(|fence| {
-            fence.provider_id == provider && self.probe_eligible(provider, &fence.credential_id)
+        for row in self.credentials.listed_credentials().iter().filter(|row| {
+            self.rechecks.iter().any(|origin| {
+                self.origin_applies(
+                    origin,
+                    provider,
+                    row.account_id.as_deref().unwrap_or(&row.id),
+                    &row.id,
+                    model,
+                ) && self.origin_due(origin, row.account_id.as_deref().unwrap_or(&row.id))
+            })
         }) {
             context.credential_probe_notes.insert(
-                fence.credential_id.clone(),
-                crate::credential_fences::probe_note(provider, &fence.credential_id),
+                row.id.clone(),
+                crate::credential_fences::probe_note(provider, &row.id),
             );
         }
         let class = self
@@ -2471,6 +2591,27 @@ pub(crate) fn refresh_credential_quota_holds_in(
         };
         let prefix = crate::credential_fences::quota_hold_prefix(&refusal);
         let policy = config.allocator_policy(&refusal.provider_id);
+        let prior_hold = tx
+            .active_pool_fences(&refusal.provider_id)?
+            .iter()
+            .any(|block| block.evidence.fence_id.starts_with(&prefix));
+        let quota_interpretation = prior_hold
+            || (crate::credential_fences::has_quota_signal_for_account(quota, &account)
+                && !crate::credential_fences::quota_refusal_contradicted(
+                    quota,
+                    credentials,
+                    &refusal.credential_id,
+                    now,
+                    &policy,
+                ));
+        if !tx.classify_credential_quota(
+            &refusal.provider_id,
+            &refusal.credential_id,
+            quota_interpretation,
+        )? {
+            kept.push(refusal);
+            continue;
+        }
         let reading = crate::credential_fences::latest_reading_for_account(quota, &account)
             .and_then(|reading| quota_reading_for_model(&reading.entry, &account, None, &[]));
         let reading_reset = crate::credential_fences::exhausted_quota_reset_for_account(
@@ -4459,12 +4600,76 @@ fn serve(
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
     let admissions = load_demand(tx, provider, roster.roster.as_ref(), &policy, &inputs)?;
+    let blocks = load_blocks(tx, provider)?;
+    let origins: Vec<_> = tx
+        .fence_rechecks()?
+        .into_iter()
+        .filter(|origin| {
+            origin.kind != "account"
+                || blocks.iter().any(|(id, fence)| {
+                    origin.origin_key == json!([id]).to_string()
+                        && fence.applies_to(
+                            &params.model,
+                            policy.family_for_model(&params.model),
+                            params.pool.as_deref(),
+                        )
+                })
+        })
+        .collect();
+    let mut probe_roster = roster.roster.clone();
+    if let Some(roster) = &mut probe_roster {
+        for account in &mut roster.accounts {
+            let fresh = account.quota.as_ref().is_some_and(|reading| {
+                prefrontal_routing_core::accounts::fresh_for_recovery(reading, now, &policy)
+            });
+            if !fresh
+                && origins.iter().any(|origin| {
+                    origin.quota
+                        && origin.due_at() <= now
+                        && account.credentials.iter().any(|credential| {
+                            origin.applies(
+                                provider,
+                                &account.account_id,
+                                &credential.credential_id,
+                                &params.model,
+                            )
+                        })
+                })
+            {
+                // A stale reading is not an independent wall against the very
+                // probe that will recheck its retained quota evidence.
+                account.quota = None;
+            }
+        }
+    }
+    let mut fences = load_fences(tx, provider)?;
+    fences.retain(|fence| {
+        !origins.iter().any(|origin| {
+            origin.kind == "account"
+                && origin.account_id.as_deref() == Some(&fence.account_id)
+                && origin.evidence_at == fence.observed_at_ms
+                && origin.due_at() <= now
+                && !roster
+                    .roster
+                    .as_ref()
+                    .and_then(|roster| {
+                        roster
+                            .accounts
+                            .iter()
+                            .find(|account| account.account_id == fence.account_id)
+                    })
+                    .and_then(|account| account.quota.as_ref())
+                    .is_some_and(|reading| {
+                        prefrontal_routing_core::accounts::fresh_for_recovery(reading, now, &policy)
+                    })
+        })
+    });
     let mut state = AllocatorState {
-        roster: roster.roster.clone(),
+        roster: probe_roster,
         affinity: affinity_row
             .as_ref()
             .map(|row| conversation_affinity(row, now)),
-        fences: load_fences(tx, provider)?,
+        fences,
         principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
         admissions,
         operator_override: None,
@@ -4479,16 +4684,42 @@ fn serve(
             break decision;
         };
         let credential = admission.credential_id.clone();
-        if !inputs.credential_probe_notes.contains_key(&credential) {
+        let applicable: Vec<_> = origins
+            .iter()
+            .filter(|origin| {
+                origin.applies(provider, &admission.account_id, &credential, &params.model)
+                    && origin.principal.as_deref().is_none_or(|id| id == principal)
+                    && origin
+                        .admission_id
+                        .as_deref()
+                        .is_none_or(|id| id == params.admission_id)
+                    && origin.size_class.is_none_or(|class| {
+                        class
+                            == prefrontal_routing_core::accounts::input_size_class(
+                                params
+                                    .request_input_tokens
+                                    .unwrap_or_else(|| params.initial_input_bytes.div_ceil(4)),
+                            ) as i64
+                    })
+            })
+            .cloned()
+            .collect();
+        if applicable.is_empty() {
             break decision;
         }
         let claim = || {
-            tx.claim_credential_probe(
-                provider,
-                &credential,
-                now.saturating_sub(crate::credential_fences::FENCE_PROBE_RECHECK_MS),
-                now,
-            )
+            let ready = applicable.iter().all(|origin| {
+                ctx.classes
+                    .as_ref()
+                    .map_or(origin.due_at() <= now, |classes| {
+                        classes.origin_due(origin, &admission.account_id)
+                    })
+            });
+            Ok(if ready && tx.claim_fence_rechecks(&applicable, now)? {
+                prefrontal_routing_store::CredentialProbeClaim::Claimed
+            } else {
+                prefrontal_routing_store::CredentialProbeClaim::Blocked
+            })
         };
         let claimed = if let Some(classes) = &ctx.classes {
             probe_reservations::claim(
@@ -5420,6 +5651,17 @@ fn apply_bound_observation(
                     .decision_context(&admission.decision_id)?
                     .and_then(|context| serde_json::from_str::<Value>(&context).ok())
                     .is_some_and(|context| context["media_admission"] == true);
+                if media && !tx.admission_reported_failure(principal, id)? {
+                    tx.heal_serving_fences(
+                        &admission.provider,
+                        &admission.account_id,
+                        &admission.credential_id,
+                        &admission.model,
+                        None,
+                        admission.committed_at,
+                        now,
+                    )?;
+                }
                 if media
                     && !tx.admission_reported_failure(principal, id)?
                     && crate::credential_fences::lift_after_success_in(
@@ -5427,6 +5669,7 @@ fn apply_bound_observation(
                         &admission.provider,
                         &admission.credential_id,
                         now,
+                        admission.committed_at,
                     )?
                 {
                     effects.push(json!({
@@ -5645,6 +5888,33 @@ fn apply_confirmation(
 ) -> RouteStateResult<()> {
     match confirm_exhaustion(observation) {
         ConfirmationOutcome::Confirmed { mut fence } => {
+            let mut prior = fence.clone();
+            prior.observed_at_ms = i64::MIN;
+            if matches!(
+                observation.kind,
+                ObservationKind::BrocaLimitExhausted { .. }
+            ) && block_end(
+                &prior,
+                latest_reading,
+                ctx.now_ms,
+                &ctx.provider_policy(&admission.provider),
+            )
+            .is_some()
+            {
+                tx.record_non_quota_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                    provider: admission.provider.clone(),
+                    credential_id: admission.credential_id.clone(),
+                    model: admission.model.clone(),
+                    until_ms: ctx.now_ms.saturating_add(
+                        prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
+                    ),
+                    decision_id: admission.decision_id.clone(),
+                    recorded_at: ctx.now_ms,
+                })?;
+                effects
+                    .push(json!({"effect":"fence","fence_id":new_id("acf"),"fence":wire(&fence)}));
+                return Ok(());
+            }
             if fence.pool.is_none() {
                 // A whole-account block lifts only on a reading that reports
                 // every pool the account's latest fresh reading reported.
@@ -6132,6 +6402,17 @@ mod tests {
         } else {
             ACCOUNT_A
         };
+        for reading in fixture
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .values_mut()
+            .filter(|reading| reading.account_id == account)
+        {
+            reading.entry["usage"]["secondary"]["usedPercent"] = json!(100.0);
+        }
         let observed = result(fixture.call(&ctx,ACCOUNT_OBSERVE_OP,BROCA,json!({
             "event_id":"exhausted-account","caller":{"runner":"broca"},"kind":"account_limit_exhausted",
             "admission_id":"wall-1","limit_window":"seven_day","resets_at_ms":NOW+77*3_600_000,
@@ -7489,7 +7770,16 @@ mod tests {
         // The same event again is recognized and changes nothing.
         let repeat = result(fixture.call(&ctx, ACCOUNT_OBSERVE_OP, BROCA, exhausted("e-2")));
         assert_eq!(repeat["observation"]["duplicate"], true);
-        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 1);
+        assert_eq!(fixture.store().account_serving_counts().unwrap().fences, 0);
+        assert_eq!(
+            fixture
+                .store()
+                .transient_account_route_fences(NOW)
+                .unwrap()
+                .len(),
+            1,
+            "headroom contradicts this refusal, so only its non-quota route fence stands"
+        );
 
         // A new cold admission now avoids the fenced account.
         let next = result(fixture.call(
@@ -7871,6 +8161,44 @@ mod tests {
         resets_at_ms: Value,
         resets_at_source: Value,
     ) -> Value {
+        // Quota recovery tests need a refusal consistent with its reading.
+        // Contradictory headroom is exercised separately as a non-quota wall.
+        if let Some(admission) = fixture
+            .store()
+            .account_read(|tx| tx.admission(BROCA, admission_id))
+            .unwrap()
+        {
+            fn exhausted_windows(value: &mut Value) {
+                match value {
+                    Value::Object(fields) => {
+                        for (name, value) in fields {
+                            if name == "usedPercent" {
+                                *value = json!(100.0);
+                            } else {
+                                exhausted_windows(value);
+                            }
+                        }
+                    }
+                    Value::Array(values) => {
+                        for value in values {
+                            exhausted_windows(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for reading in fixture
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .values_mut()
+                .filter(|reading| reading.account_id == admission.account_id)
+            {
+                exhausted_windows(&mut reading.entry);
+            }
+        }
         result(fixture.call(
             &fixture.ctx(true, at),
             ACCOUNT_OBSERVE_OP,
@@ -7885,7 +8213,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_account_block_ends_at_its_reset_and_a_new_exhaustion_blocks_again() {
+    fn a_whole_account_reset_schedules_one_probe_without_expiring_evidence() {
         let fixture = fixture("trial-run");
         let first = result(fixture.call(
             &fixture.ctx(true, NOW),
@@ -7904,6 +8232,16 @@ mod tests {
             json!("header"),
         );
         let fence = &observed["observation"]["effects"][0]["fence"];
+        for reading in fixture
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .values_mut()
+        {
+            reading.entry["fetchedAt"] = json!(rfc3339(NOW - 3_600_000));
+        }
         assert_eq!(
             fence["pool"],
             Value::Null,
@@ -7922,10 +8260,24 @@ mod tests {
             Some("account_hold")
         );
         assert!(
-            at(reset, "trial-2").code().is_some(),
-            "blocked until the reset passes"
+            at(reset - 1, "trial-2").code().is_some(),
+            "blocked until the extra reset check"
         );
-        let trial = result(at(reset + 1000, "trial-3"));
+        let trial = result(at(reset, "trial-3"));
+        assert!(
+            at(reset, "concurrent-trial").code().is_some(),
+            "the reset admits only one probe"
+        );
+        assert!(
+            !fixture
+                .store
+                .as_ref()
+                .unwrap()
+                .account_read(|tx| tx.active_fences("anthropic"))
+                .unwrap()
+                .is_empty(),
+            "a probe does not delete quota evidence"
+        );
         assert_eq!(
             trial["account"]["account_id"],
             first["account"]["account_id"]
@@ -7943,20 +8295,20 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_reset_retries_after_six_hours_or_at_the_retry_hint() {
+    fn quota_without_readings_rechecks_at_fifteen_minutes_even_with_a_later_hint() {
         let confirmed = NOW + 1000;
         for (label, resets_at, source, retry_at) in [
             (
-                "six-hours",
+                "missing-reset",
                 Value::Null,
                 Value::Null,
-                confirmed + 6 * 3_600_000,
+                confirmed + 15 * 60_000,
             ),
             (
                 "hint",
                 json!(confirmed + 30 * 60_000),
                 json!("retry_after"),
-                confirmed + 30 * 60_000,
+                confirmed + 15 * 60_000,
             ),
         ] {
             let fixture = fixture(label);
@@ -7975,6 +8327,16 @@ mod tests {
                 resets_at,
                 source,
             );
+            for reading in fixture
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .values_mut()
+            {
+                reading.entry["fetchedAt"] = json!(rfc3339(NOW - 3_600_000));
+            }
             let at = |now: i64, id: String| {
                 fixture.call(
                     &fixture.ctx(true, now),
@@ -7988,6 +8350,7 @@ mod tests {
                 "{label}"
             );
             let retried = result(at(retry_at, format!("{label}-3")));
+            assert!(at(retry_at, format!("{label}-concurrent")).code().is_some());
             assert_eq!(
                 retried["account"]["account_id"], first["account"]["account_id"],
                 "{label}"

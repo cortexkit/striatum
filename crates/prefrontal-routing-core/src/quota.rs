@@ -323,7 +323,7 @@ pub const DEFAULT_HARD_BLOCK_THRESHOLD: f64 = 0.99;
 /// Local retry-probe horizon for exhausted windows whose provider reports no reset.
 /// This is OUR pacing policy for when to re-ask, not a provider reset claim: QTA's
 /// no-fabrication rule still holds on the wire.
-pub const NO_RESET_REPROBE_HORIZON_MS: f64 = 6.0 * 60.0 * 60.0 * 1000.0;
+pub const NO_RESET_REPROBE_HORIZON_MS: f64 = crate::fence_lifetimes::QUOTA_FENCE_RECHECK_MS as f64;
 
 /// The per-capacity quota signal one account derives from windows that target it.
 #[derive(Debug, Clone, Default, PartialEq)]
