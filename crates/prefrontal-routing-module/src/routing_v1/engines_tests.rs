@@ -123,7 +123,7 @@ async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines
 }
 
 #[test]
-fn catalog_engine_projection_keeps_strict_validation_and_reports_each_issue_once() {
+fn catalog_engines_ignore_slot_extensions_but_report_each_invalid_engine_issue_once() {
     let mut unknown = engine("unknown-field", false);
     unknown["unexpected"] = json!(true);
     let mut malformed = engine("malformed-local", false);
@@ -147,10 +147,12 @@ fn catalog_engine_projection_keeps_strict_validation_and_reports_each_issue_once
     let modules = json!(modules);
     crate::take_operator_warnings();
     super::consumers::replace_catalog(&modules);
-    assert!(super::consumers::engine_declarations().is_empty());
+    let declarations = super::consumers::engine_declarations();
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations["invalid-projection-5"].engines.len(), 1);
     let warnings = crate::take_operator_warnings();
-    assert_eq!(warnings.len(), 6, "{warnings:?}");
-    for index in 0..6 {
+    assert_eq!(warnings.len(), 5, "{warnings:?}");
+    for index in 0..5 {
         assert!(
             warnings.iter().any(|line| line.contains(&format!(
                 "Module invalid-projection-{index} declares media engines routing can't read"

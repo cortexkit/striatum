@@ -24,11 +24,6 @@ pub(crate) struct Catalog {
 
 static CATALOG: OnceLock<RwLock<Catalog>> = OnceLock::new();
 
-// These describe declaration members come from cortexkit-role-media. Role-routing
-// 0.7.7 rejects them; remove the projection when routing takes role-routing 0.7.9,
-// whose engine parser ignores non-engines members of the media-provider/v1 slot.
-const MEDIA_DESCRIBE_MEMBERS: [&str; 2] = ["groups", "jobs_survive_restart"];
-
 pub(crate) fn replace_catalog(modules: &Value) {
     let snapshot = Catalog::from_catalog(modules);
     static REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -103,13 +98,7 @@ impl Catalog {
                 .get("role_declarations")
                 .and_then(|roles| roles.get("media-provider/v1"))
             {
-                let mut engine_slot = slot.clone();
-                if let Some(object) = engine_slot.as_object_mut() {
-                    for member in MEDIA_DESCRIBE_MEMBERS {
-                        object.remove(member);
-                    }
-                }
-                match cortexkit_role_routing::parse_engine_declarations(&engine_slot) {
+                match cortexkit_role_routing::parse_engine_declarations(slot) {
                     Ok(declarations) => {
                         catalog.engines.insert(module.to_owned(), declarations);
                     }
