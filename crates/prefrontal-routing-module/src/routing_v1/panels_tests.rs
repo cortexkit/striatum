@@ -12,6 +12,9 @@ use super::conformance_tests::{
     install_catalog, install_panel_families, reserved, upgrade_harness, Harness, Route,
 };
 
+#[path = "panels_tests/tests.rs"]
+mod shortfall_diagnostics;
+
 async fn configured() -> (Arc<Harness>, Route, Value) {
     let h = Harness::new("public-panels");
     let mut catalog = fixture::catalog();

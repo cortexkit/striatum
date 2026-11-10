@@ -71,8 +71,14 @@ fn panel_shortfall_reports_candidate_funnel_not_catalog_noise() {
     let noisy = select(noisy);
     assert_eq!(keys(&noisy), keys(&baseline));
     assert_eq!(
-        noisy.shortfall.as_ref().unwrap().detail,
-        baseline.shortfall.as_ref().unwrap().detail
+        baseline.shortfall.as_ref().unwrap().code,
+        PanelShortfallCode::DiversityUnmeetable
+    );
+    // The low-IQ routes add another reachable family, but only if the IQ floor
+    // is relaxed. Their rejection evidence changes the cause, not the seats.
+    assert_eq!(
+        noisy.shortfall.as_ref().unwrap().code,
+        PanelShortfallCode::IqFloorUnmeetable
     );
     let base = serde_json::to_value(&baseline).unwrap();
     let value = serde_json::to_value(&noisy).unwrap();

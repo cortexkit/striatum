@@ -422,6 +422,11 @@ pub struct SelectedPanel {
     /// Route-local availability refusals survive even when every seat is filled.
     #[serde(skip)]
     pub availability_rejections: Vec<PanelCause>,
+    /// Admission evidence remains available after the scorer fills the panel,
+    /// because the sender's later runner-availability or credential checks may
+    /// still remove seats.
+    #[serde(skip)]
+    pub rejected_causes: Vec<PanelCause>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -745,6 +750,26 @@ fn select_panel_admitted(
     context: &PanelSelectionContext,
     availability_rejections: &HashMap<String, String>,
 ) -> Result<SelectedPanel, InvalidPanelRequest> {
+    select_panel_admitted_inner(
+        input,
+        config,
+        class_policy,
+        context,
+        availability_rejections,
+        input.package_tokens,
+        true,
+    )
+}
+
+fn select_panel_admitted_inner(
+    input: &SelectPanelInput<'_>,
+    config: &RoutingConfig,
+    class_policy: &ClassPanelPolicy,
+    context: &PanelSelectionContext,
+    availability_rejections: &HashMap<String, String>,
+    package_tokens: Option<usize>,
+    explain_shortfall: bool,
+) -> Result<SelectedPanel, InvalidPanelRequest> {
     // Class policy owns automatic panel width and quality, so panel_spec.size
     // and panel_spec.iq_floor cannot invalidate it. The family rule below also
     // comes from class policy, not panel_spec.diversity. Legacy rosters still
@@ -924,7 +949,7 @@ fn select_panel_admitted(
     let mut package_limits = Vec::new();
     for (admitted, is_subscription) in admitted {
         let model = admitted.route.capacity_key.clone();
-        if input.selection == PanelSelection::NPick && input.package_tokens.is_some() {
+        if input.selection == PanelSelection::NPick && package_tokens.is_some() {
             let ceiling = seat_package_ceiling(
                 &admitted.route.route_key,
                 context_window_tokens(&admitted.route.fact),
@@ -935,14 +960,14 @@ fn select_panel_admitted(
                     .unwrap_or(0usize)
                     .max(ceiling.tokens),
             );
-            if input.package_tokens.unwrap() > ceiling.tokens {
+            if package_tokens.unwrap() > ceiling.tokens {
                 package_limits.push((ceiling.route_key.clone(), ceiling.tokens));
                 causes.push(PanelCause {
                     model,
                     reason: PanelCauseReason::PackageTooLarge,
                     reset_at_ms: None,
                     detail: Some(package_cause_detail(
-                        input.package_tokens.unwrap(),
+                        package_tokens.unwrap(),
                         &ceiling,
                         admitted.route.fact.max_output_tokens,
                     )),
@@ -1002,10 +1027,6 @@ fn select_panel_admitted(
     }
     let clears_bar =
         |candidate: &Candidate| iq_bar.is_none_or(|bar| candidate.route.fact.scores.elo >= bar);
-    let iq_eligible_count = candidates
-        .iter()
-        .filter(|candidate| clears_bar(candidate))
-        .count();
     let mut selected = Vec::new();
     let mut seats = Vec::new();
     let mut selected_families = HashSet::new();
@@ -1106,7 +1127,7 @@ fn select_panel_admitted(
         extra_candidates = extras;
     }
 
-    if enforce_family_diversity && selected.len() < width {
+    if enforce_family_diversity {
         for (index, candidate) in candidates.iter().enumerate() {
             if selected.contains(&index) {
                 continue;
@@ -1197,16 +1218,54 @@ fn select_panel_admitted(
             ),
         )
     };
-    let shortfall_kind = if input.package_tokens.is_some()
+    // A rejected route is not necessarily a lost seat: it may share a seated
+    // family or fail the extra-seat floor even with an unlimited package budget.
+    // Probe the same selector without recursively probing diagnostics. Package
+    // fit is binding only if removing that gate adds seats. Otherwise test the
+    // floor on the package-unconstrained pool, so a route blocked by both gates
+    // does not turn an adequacy shortage into an invented diversity shortage.
+    let package_blocked = package_tokens.is_some()
         && members.len() < width
         && causes
             .iter()
             .any(|cause| cause.reason == PanelCauseReason::PackageTooLarge)
-    {
+        && (!explain_shortfall
+            || select_panel_admitted_inner(
+                input,
+                config,
+                class_policy,
+                context,
+                availability_rejections,
+                None,
+                false,
+            )?
+            .members
+            .len()
+                > members.len());
+    let floor_blocked = !package_blocked
+        && members.len() < width
+        && iq_bar.is_some()
+        && (!explain_shortfall
+            || select_panel_admitted_inner(
+                input,
+                config,
+                &ClassPanelPolicy {
+                    floor: None,
+                    ..*class_policy
+                },
+                context,
+                availability_rejections,
+                None,
+                false,
+            )?
+            .members
+            .len()
+                > members.len());
+    let shortfall_kind = if package_blocked {
         Some((
             PanelShortfallCode::PackageUnmeetable,
             package_refusal(
-                input.package_tokens.unwrap(),
+                package_tokens.unwrap(),
                 members.len(),
                 width,
                 &package_limits,
@@ -1214,10 +1273,13 @@ fn select_panel_admitted(
         ))
     } else if admitted_count == 0 {
         Some(size_reduced())
-    } else if let Some(bar) = iq_bar.filter(|_| iq_eligible_count == 0 && members.len() < width) {
+    } else if let Some(bar) = iq_bar.filter(|_| floor_blocked) {
         Some((
             PanelShortfallCode::IqFloorUnmeetable,
-            format!("no admitted model clears demand bar {bar:.2}"),
+            format!(
+                "only {} of {width} requested panel slots can be filled with demand bar {bar:.2}",
+                members.len()
+            ),
         ))
     } else if enforce_family_diversity && members.len() < width {
         Some((
@@ -1254,14 +1316,31 @@ fn select_panel_admitted(
         PanelShortfall {
             code,
             detail,
-            causes,
+            causes: causes.clone(),
             funnel: automatic.then(|| funnel.clone()),
         }
     });
 
+    for collapse in &sibling_collapses {
+        causes.extend(
+            collapse
+                .collapsed_route_keys
+                .iter()
+                .map(|route| PanelCause {
+                    model: route.clone(),
+                    reason: PanelCauseReason::FamilyDuplicate,
+                    reset_at_ms: None,
+                    detail: Some(format!(
+                        "same model as retained sibling {}",
+                        collapse.retained_route_key
+                    )),
+                }),
+        );
+    }
+
     let policy = (input.selection == PanelSelection::NPick).then(|| PanelPolicy {
         funnel: Some(funnel),
-        package_tokens: input.package_tokens,
+        package_tokens,
         largest_package_ceiling,
         replacements: Vec::new(),
         selection: "class_policy".into(),
@@ -1313,6 +1392,7 @@ fn select_panel_admitted(
     Ok(SelectedPanel {
         candidates: quality_candidates,
         availability_rejections: availability_causes,
+        rejected_causes: causes,
         members,
         runner_up,
         shortfall,

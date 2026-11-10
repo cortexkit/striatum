@@ -13,6 +13,7 @@ use serde_json::{json, Map};
 
 mod policy_pipeline;
 mod policy_records;
+mod shortfall_diagnostics;
 
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
@@ -367,7 +368,7 @@ fn iq_floor_uses_the_request_elo_frontier() {
     assert_eq!(routes, HashSet::from(["p/frontier", "p/at-boundary"]));
     assert_eq!(
         selected.shortfall.unwrap().code,
-        PanelShortfallCode::DiversityUnmeetable
+        PanelShortfallCode::IqFloorUnmeetable
     );
 
     let selected = select_panel_with_policy(
@@ -863,8 +864,8 @@ fn shortfall_precedence_and_empty_success() {
     let below = select_panel(below_input).unwrap();
     assert_eq!(
         below.shortfall.unwrap().code,
-        PanelShortfallCode::IqFloorUnmeetable,
-        "iq-empty outranks diversity"
+        PanelShortfallCode::DiversityUnmeetable,
+        "the below-floor IQ top seat is admitted; lowering the floor adds no family"
     );
     let diversity = select_panel(n_pick_input(
         vec![fact("one", 60.0, Some("a"))],
@@ -961,7 +962,7 @@ fn policy_eq_reuses_elo_floor_and_fact_prompt_defaults() {
     assert_eq!(boundary.prompt_params["temperature"], 0.4);
     assert_eq!(
         selected.shortfall.unwrap().code,
-        PanelShortfallCode::DiversityUnmeetable
+        PanelShortfallCode::IqFloorUnmeetable
     );
 }
 

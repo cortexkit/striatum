@@ -11979,6 +11979,7 @@ mod tests {
         let panel = SelectedPanel {
             candidates: Vec::new(),
             availability_rejections: Vec::new(),
+            rejected_causes: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
             shortfall: None,
@@ -12020,6 +12021,7 @@ mod tests {
         let panel = SelectedPanel {
             candidates: Vec::new(),
             availability_rejections: Vec::new(),
+            rejected_causes: Vec::new(),
             members: Vec::new(),
             runner_up: Vec::new(),
             shortfall: None,
