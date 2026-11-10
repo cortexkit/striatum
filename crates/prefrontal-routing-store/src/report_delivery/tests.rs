@@ -10,6 +10,65 @@ fn descriptor() -> StorageDescriptor {
     dev_descriptor("report-delivery", path.to_string_lossy().into_owned())
 }
 
+#[test]
+fn inconclusive_v1_reports_release_only_their_non_quota_probe_claim() {
+    for (outcome, error, neutral) in [
+        (RouteOutcome::Cancelled, None, true),
+        (RouteOutcome::Interrupted, None, true),
+        (RouteOutcome::Error, Some("content_policy"), true),
+        (RouteOutcome::Error, Some("request_invalid"), true),
+        (RouteOutcome::Error, Some("account_limit_exhausted"), false),
+        (RouteOutcome::Error, Some("server_error"), false),
+    ] {
+        let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+        seed(&store, "d", "p");
+        store
+            .record_billing_account_route_fence(&AccountRouteFence {
+                provider: "example".into(),
+                credential_id: "key".into(),
+                model: "model".into(),
+                until_ms: 1000,
+                recorded_at: 100,
+                decision_id: "old".into(),
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 1000, Some("d")))
+            .unwrap());
+        store
+            .v1_commit_report(
+                "d",
+                "outcome",
+                "r",
+                &V1Recorded {
+                    body_json: "{}".into(),
+                    answer_json: "{}".into(),
+                },
+                outcome,
+                error,
+                outcome == RouteOutcome::Error,
+                &V1ReportEffects::default(),
+                None,
+                |_| Ok(()),
+                1001,
+            )
+            .unwrap()
+            .unwrap();
+        let remaining = store.fence_rechecks().unwrap();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "an inconclusive report is not serving success"
+        );
+        assert_eq!(
+            remaining[0].next_recheck_at <= 1001,
+            neutral,
+            "{outcome:?}/{error:?}"
+        );
+    }
+}
+
 fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
     store
         .seed_preupgrade_decision_for_test(

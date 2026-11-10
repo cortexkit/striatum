@@ -463,6 +463,34 @@ impl AccountTx<'_> {
         Ok(())
     }
 
+    /// A neutral terminal outcome is not evidence of recovery or refusal. Let
+    /// another request test the same non-quota generation, without undoing a
+    /// newer launch's claim or shortening the quota probe interval.
+    pub fn release_inconclusive_probe(
+        &self,
+        owner: &str,
+        provider: &str,
+        model: &str,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        sync(self.conn).map_err(err)?;
+        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?4,claim_owner=NULL
+            WHERE r.quota=0 AND r.cleared_at IS NULL AND r.provider=?2 AND (r.model IS NULL OR r.model=?3)
+            AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
+                AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
+                AND a.evidence_at=r.evidence_at AND a.claimed_at=r.last_claimed_at)",params![owner,provider,model,now]).map_err(err)?;
+        self.conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1",
+                [owner],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// The durable launch authorization, not a reported credential or guessed
     /// pool, is the scope of a successful probe. New evidence never matches it.
     pub fn heal_authorized_probe(
@@ -1049,6 +1077,75 @@ mod tests {
         assert!(store
             .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 970_000))
             .unwrap());
+    }
+
+    #[test]
+    fn inconclusive_release_preserves_quota_interval_and_a_newer_claim() {
+        let scratch = cortexkit_test_support::ScratchDir::new("neutral-claim-generation");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "neutral-claim-generation",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .record_billing_account_route_fence(&crate::AccountRouteFence {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                until_ms: 1000,
+                recorded_at: 100,
+                decision_id: "d".into(),
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 1000, Some("old")))
+            .unwrap());
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 3_601_000, Some("new")))
+            .unwrap());
+        store
+            .account_transaction(|tx| tx.release_inconclusive_probe("old", "p", "m", 3_601_001))
+            .unwrap();
+        assert_eq!(
+            store.fence_rechecks().unwrap()[0].next_recheck_at,
+            7_201_000,
+            "an older cancellation cannot undo the new launch's atomic claim"
+        );
+        store
+            .record_account_route_fence(&crate::AccountRouteFence {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                until_ms: 0,
+                recorded_at: 4_000_000,
+                decision_id: "quota".into(),
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &origins,
+                8_000_000,
+                Some("quota-probe")
+            ))
+            .unwrap());
+        store
+            .account_transaction(|tx| {
+                tx.release_inconclusive_probe("quota-probe", "p", "m", 8_000_001)
+            })
+            .unwrap();
+        let quota = store
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.quota)
+            .unwrap();
+        assert_eq!(
+            quota.next_recheck_at, 8_900_000,
+            "neutral non-quota recovery never widens the quota probe budget"
+        );
     }
 
     #[test]

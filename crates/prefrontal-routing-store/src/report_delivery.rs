@@ -95,6 +95,14 @@ impl SqliteRouteStateStore {
                         }
                     }
                 }
+                if prefrontal_routing_core::fence_lifetimes::probe_is_inconclusive(outcome,error) {
+                    let (provider,model):(Option<String>,Option<String>)=tx.query_row(
+                        "SELECT selected_provider_id,selected_model_id FROM model_route_decisions WHERE id=?1",
+                        [decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                    if let (Some(provider),Some(model))=(provider,model) {
+                        account.release_inconclusive_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
+                    }
+                }
                 reconcile(&account).map_err(sql_error)?;
                 if failed {
                     tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL",

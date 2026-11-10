@@ -3227,6 +3227,31 @@ async fn handle_set_decision_outcome(
             }
         }
     }
+    if prefrontal_routing_core::fence_lifetimes::probe_is_inconclusive(
+        outcome,
+        params.last_error.as_deref(),
+    ) {
+        if let Some(decision) = store
+            .get_decision_by_id(&params.decision_id)
+            .map_err(|error| ModuleError::Message(error.to_string()))?
+        {
+            if let (Some(provider), Some(model)) = (
+                decision.selected_provider_id.as_deref(),
+                decision.selected_model_id.as_deref(),
+            ) {
+                store
+                    .account_transaction(|tx| {
+                        tx.release_inconclusive_probe(
+                            &params.decision_id,
+                            provider,
+                            model,
+                            observed_at_ms,
+                        )
+                    })
+                    .map_err(|error| ModuleError::Message(error.to_string()))?;
+            }
+        }
+    }
     match store.record_routing_outcome(
         &params.decision_id,
         &outcome,
@@ -5709,6 +5734,63 @@ mod tests {
             store.fence_rechecks().unwrap().is_empty(),
             "anonymous serving success must retire the route/provider origin it probed"
         );
+    }
+
+    #[tokio::test]
+    async fn inconclusive_legacy_probe_reopens_its_non_quota_clock_without_healing() {
+        for (outcome, error) in [
+            ("cancelled", None),
+            ("interrupted", None),
+            ("error", Some("provider_policy_refusal: request blocked")),
+            ("error", Some("request_invalid: unsupported request shape")),
+        ] {
+            let rig = Rig::new("inconclusive-probe-clock");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let receipt = now_ms() as i64;
+            let _clock = InjectedClock::set((receipt + 1000) as u64);
+            store
+                .update_route_state(
+                    "p/m",
+                    "p/m",
+                    &prefrontal_routing_core::RouteStateUpdate {
+                        cooldown_until: Some((receipt + 1000) as f64),
+                        observed_at_ms: Some(receipt - 3_599_000),
+                        unscoped_wall: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            assert!(store
+                .account_transaction(|tx| tx.grant_fence_rechecks(
+                    &origins,
+                    receipt + 1000,
+                    Some(&decision)
+                ))
+                .unwrap());
+            report_legacy_outcome_for_fence_test(
+                &store,
+                json!({"decisionID":decision,"outcome":outcome,"lastError":error}),
+            )
+            .await;
+            let remaining = store.fence_rechecks().unwrap();
+            assert_eq!(
+                remaining.len(),
+                1,
+                "an inconclusive probe is not successful serving"
+            );
+            assert!(
+                remaining[0].next_recheck_at <= receipt + 1000,
+                "{outcome}/{error:?} must not hold a route for another hour"
+            );
+        }
     }
 
     #[tokio::test]
