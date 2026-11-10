@@ -3595,6 +3595,242 @@ async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() 
     );
 }
 
+fn credit_xai_fixture() -> (Arc<Harness>, BrocaCredentials) {
+    let (harness, mut credentials) = setup("xai", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.retain(|row| row.id == "oauth:test");
+    rows[0].id = "oauth:xai".into();
+    rows[0].account_id = Some("xai-account".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-credit".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+    credit_xai_reading(Some(0.0), NOW as i64);
+    (harness, credentials)
+}
+
+fn credit_xai_reading(used: Option<f64>, at: i64) {
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    if let Some(used) = used {
+        crate::account_quota::apply_provider_reply(&mut state, "grok", &serde_json::to_vec(&json!({
+            "result":[{"provider":"grok","apiProvider":"xai","account":"xai-account",
+                "credentialRef":"oauth:xai","source":"vault","fetchedAt":crate::account_selection::rfc3339(at),
+                "usage":{"primary":{"usedPercent":used,"windowMinutes":10080}}}],
+            "completeProviders":["grok"]
+        })).unwrap(), at).unwrap();
+    }
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+}
+
+#[tokio::test]
+async fn xai_credit_window_is_a_billing_wall_until_one_probe_and_matching_success() {
+    for (used, retry) in [
+        (Some(0.0), None),
+        (Some(100.0), None),
+        (None, None),
+        (Some(0.0), Some(45_000)),
+    ] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, mut credentials) = credit_xai_fixture();
+        let owner = harness.bind(reserved(OWNER), None).await;
+        let selected = owner
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+            )
+            .await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        assert_eq!(
+            selected.1["result"]["route"]["provider"], "xai",
+            "{}",
+            selected.1
+        );
+        assert_eq!(
+            selected.1["result"]["route"]["model"], "model",
+            "{}",
+            selected.1
+        );
+        let runner = harness
+            .bind(
+                reserved(selected.1["result"]["runner"]["module"].as_str().unwrap()),
+                None,
+            )
+            .await;
+        let mut request = account_request("xai", "credit-send");
+        request["decision_id"] = selected.1["result"]["decision_id"].clone();
+        assert_credential(
+            &runner.call("route.account_for", &request).await,
+            "oauth:xai",
+        );
+
+        let receipt = NOW + 600_000;
+        let _refusal = crate::InjectedClock::set(receipt);
+        credit_xai_reading(used, receipt as i64);
+        let mut refusal = json!({"event_id":"credit-refusal","kind":"account_limit_exhausted",
+            "admission_id":"credit-send","served_account_id":"xai-account","credential_id":"oauth:xai",
+            "limit_window":"credit","observed_at_ms":receipt});
+        if let Some(retry) = retry {
+            refusal["retry_at_ms"] = json!(receipt + retry);
+        }
+        let observed = runner.call("route.account_observe", &refusal).await;
+        assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+        let deadline = receipt + retry.unwrap_or(3_600_000);
+        let fences = harness
+            .store()
+            .non_quota_account_route_fences(receipt as i64)
+            .unwrap();
+        assert_eq!(
+            fences.len(),
+            1,
+            "credit is billing even with exhausted or missing quota: {observed:?}"
+        );
+        assert_eq!(fences[0].until_ms, deadline as i64);
+        assert!(harness
+            .store()
+            .account_route_fences(receipt as i64)
+            .unwrap()
+            .is_empty());
+        assert!(harness
+            .store()
+            .account_read(|tx| tx.active_pool_fences("xai"))
+            .unwrap()
+            .is_empty());
+
+        let _fresh = crate::InjectedClock::set(receipt + 1);
+        credit_xai_reading(Some(0.0), receipt as i64 + 1);
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-still-held"),
+            )
+            .await;
+        assert_eq!(
+            blocked.1["code"], "account_pool_exhausted",
+            "fresh zero quota cannot repay credit: {}",
+            blocked.1
+        );
+        assert_eq!(blocked.1["detail"]["reset_at_ms"], deadline);
+        let _before = crate::InjectedClock::set(deadline - 1);
+        assert_eq!(
+            runner
+                .call(
+                    "route.account_for",
+                    &account_request("xai", "credit-before-probe")
+                )
+                .await
+                .0,
+            FrameType::Error
+        );
+
+        let _due = crate::InjectedClock::set(deadline);
+        credit_xai_reading(Some(0.0), deadline as i64);
+        let rows = credentials.listed_credentials().to_vec();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "xai-credit".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            deadline,
+        );
+        harness.set_credentials(credentials.clone());
+        let probe = owner
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+            )
+            .await;
+        assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+        let mut admitted = account_request("xai", "credit-probe");
+        admitted["decision_id"] = probe.1["result"]["decision_id"].clone();
+        let other_probe = account_request("xai", "credit-other-probe");
+        let (won, lost) = tokio::join!(
+            runner.call("route.account_for", &admitted),
+            runner.call("route.account_for", &other_probe)
+        );
+        assert_credential(&won, "oauth:xai");
+        assert_eq!(lost.0, FrameType::Error, "only one probe: {}", lost.1);
+        let retry_at = lost.1["detail"]["reset_at_ms"].as_u64().unwrap();
+        assert!(
+            (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
+            "{}",
+            lost.1
+        );
+        let after_claim = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-after-claim"),
+            )
+            .await;
+        assert_eq!(after_claim.1["detail"]["reset_at_ms"], deadline + 3_600_000);
+        assert_eq!(
+            harness
+                .store()
+                .non_quota_account_route_fences(deadline as i64)
+                .unwrap()
+                .len(),
+            1,
+            "a probe permission is not recovery"
+        );
+        let completed = owner
+            .call(
+                "route.report",
+                &json!({"decision_id":probe.1["result"]["decision_id"],
+            "outcome":"completed","credential_id":"oauth:xai"}),
+            )
+            .await;
+        assert_eq!(completed.0, FrameType::Response, "{}", completed.1);
+        assert!(harness
+            .store()
+            .non_quota_account_route_fences(deadline as i64)
+            .unwrap()
+            .is_empty());
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &account_request("xai", "credit-recovered"),
+                )
+                .await,
+            "oauth:xai",
+        );
+    }
+}
+
+#[tokio::test]
+async fn credit_window_is_not_an_undeclared_v1_report_extension() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = credit_xai_fixture();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let reply = owner
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],
+        "outcome":"failed","runner_code":"account_limit_exhausted","credential_id":"oauth:xai",
+        "limit_window":"credit"}),
+        )
+        .await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "invalid_request");
+    assert!(harness
+        .store()
+        .non_quota_account_route_fences(NOW as i64)
+        .unwrap()
+        .is_empty());
+}
+
 fn stale_xai_fixture(used: f64) -> Arc<Harness> {
     let (harness, mut credentials) = setup("xai", false);
     let mut fact = crate::tests::fact("xai", "grok-4.7");

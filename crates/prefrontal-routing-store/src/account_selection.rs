@@ -991,6 +991,37 @@ impl SqliteRouteStateStore {
             })
             .map_err(err)
     }
+
+    /// An explicit operator clear lifts quota, billing and transient route
+    /// evidence. Quota-reading reconciliation must remain quota-only.
+    pub fn clear_all_account_route_fences_for_credential(
+        &self,
+        credential_id: &str,
+    ) -> RouteStateResult<usize> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = conn.unchecked_transaction()?;
+                let mut cleared = 0;
+                for table in ["account_route_fence", "account_non_quota_route_fence"] {
+                    if account_fact_table_exists(&tx, table)? {
+                        cleared += tx.execute(
+                            &format!("DELETE FROM {table} WHERE credential_id=?1"),
+                            [credential_id],
+                        )?;
+                    }
+                }
+                if crate::fence_rechecks::enabled(&tx)? {
+                    tx.execute(
+                        "DELETE FROM fence_recheck WHERE credential_id=?1
+                    AND kind IN ('account_route','non_quota_route','transient_route')",
+                        [credential_id],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(cleared)
+            })
+            .map_err(err)
+    }
 }
 
 // Upgrade fixtures issue admissions on the old schema before reopening it with

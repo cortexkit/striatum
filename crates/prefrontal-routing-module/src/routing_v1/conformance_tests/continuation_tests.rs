@@ -417,6 +417,32 @@ async fn continuation_refuses_a_caller_pinned_account_and_records_exhaustion() {
 }
 
 #[tokio::test]
+async fn continuation_refuses_credit_without_creating_quota_or_billing_evidence() {
+    let (subject, _, runner, mut request) = paused().await;
+    request["exhausted"]["limit_window"] = json!("credit");
+    request["exhausted"]
+        .as_object_mut()
+        .unwrap()
+        .remove("resets_at_ms");
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    let rows: i64 = conn
+        .query_row(
+            "SELECT (SELECT count(*) FROM account_fence) +
+        (SELECT count(*) FROM account_non_quota_route_fence)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        rows, 0,
+        "continuation is quota-only, not a credit observation"
+    );
+}
+
+#[tokio::test]
 async fn continuation_offer_replays_after_store_reopen() {
     let (subject, consumer, runner, request) = paused().await;
     let first = result(runner.call("route.account_for", &request).await);

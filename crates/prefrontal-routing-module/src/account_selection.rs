@@ -6381,6 +6381,37 @@ fn apply_bound_observation(
             }
         }
         "account_limit_exhausted" => {
+            if parsed.limit_window.as_deref() == Some("credit") {
+                // Credit is a spending wall on a valid credential, not a quota
+                // pool. Utilization cannot prove that the account can pay again.
+                let cap = now.saturating_add(
+                    prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
+                );
+                let retry = parsed
+                    .retry_at_ms
+                    .map(|at| i64::try_from(at).unwrap_or(i64::MAX))
+                    .or_else(|| {
+                        (parsed.resets_at_source == Some(ResetSource::RetryAfter))
+                            .then_some(parsed.resets_at_ms)
+                            .flatten()
+                    });
+                let until = retry.unwrap_or(cap).min(cap);
+                tx.record_non_quota_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                    provider: admission.provider.clone(),
+                    credential_id: admission.credential_id.clone(),
+                    model: admission.model.clone(),
+                    until_ms: until,
+                    decision_id: admission.decision_id.clone(),
+                    recorded_at: now,
+                })?;
+                effects.push(json!({"effect":"fence","fence_id":new_id("acf"),
+                    "fence":wire(&Fence {
+                        account_id: admission.account_id.clone(), pool: None, recovery_set: Vec::new(),
+                        observed_at_ms: now, reset: ResetTime::Missing, retry_hint_ms: Some(until),
+                        source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,
+                    })}));
+                return Ok(());
+            }
             let observation = ExhaustionObservation {
                 account_id: admission.account_id.clone(),
                 bound: true,
