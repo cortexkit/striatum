@@ -299,7 +299,8 @@ fn key(id: &str) -> ListedCredential {
     ListedCredential {
         id: id.into(),
         categories: vec!["media-provider".into(), "llm-provider".into()],
-        credential_type: "api_key".into(),
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
         state: "active".into(),
         provider_ids: vec!["media-vendor".into()],
         ..Default::default()
@@ -348,7 +349,10 @@ fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids
     row.categories = vec!["llm-provider".into()];
     cases.push(row);
     let mut row = valid.clone();
-    row.refresh_adapter = Some("oauth".into());
+    row.auth_method = Some("oauth".into());
+    cases.push(row);
+    let mut row = valid.clone();
+    row.auth_method = None;
     cases.push(row);
     let mut row = valid.clone();
     row.provider_ids.clear();
@@ -358,7 +362,7 @@ fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids
     row.state = "disabled".into();
     cases.push(row);
     let mut row = valid.clone();
-    row.credential_type = "oauth".into();
+    row.auth_method = Some("oauth".into());
     row.id = "apikey:synthetic".into();
     cases.push(row);
     for row in cases {
@@ -367,12 +371,28 @@ fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids
             "{row:?}"
         );
     }
-    let mut row = valid;
-    row.credential_type = "oauth".into();
-    row.refresh_adapter = Some("api_key".into());
+}
+
+/// The vault's real listing row for a media key, as `ck auth list --json`
+/// showed it on 10 November 2026: auth method `apikey`, no refresh adapter.
+/// Claustrum's producer fixture decodes API-key rows to the same auth method
+/// (`broca_credentials::producer_fixture_list_only_and_all_auth_method_rows_decode`).
+/// An earlier check compared against `api_key`, which no vault row carries,
+/// so every media engine was unreachable.
+#[test]
+fn engine_media_key_matches_the_vault_listing_spelling() {
+    let row = ListedCredential {
+        id: "apikey:openai:frank".into(),
+        categories: vec!["llm-provider".into(), "media-provider".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
+        refresh_adapter: None,
+        provider_ids: vec!["openai".into()],
+        state: "active".into(),
+        ..Default::default()
+    };
     assert!(crate::account_selection::media_credential_serves(
-        &row,
-        "media-vendor"
+        &row, "openai"
     ));
 }
 

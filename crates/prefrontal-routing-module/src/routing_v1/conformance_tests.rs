@@ -979,7 +979,8 @@ impl RoutingSubject for KitSubject {
         rows.extend(providers.into_iter().map(|provider| ListedCredential {
             id: format!("synthetic-media-{provider}"),
             categories: vec!["media-provider".into()],
-            credential_type: "api_key".into(),
+            credential_type: "apikey".into(),
+            auth_method: Some("apikey".into()),
             provider_ids: vec![provider],
             state: "active".into(),
             ..Default::default()

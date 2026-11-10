@@ -217,11 +217,9 @@ pub(crate) fn media_credential_serves(
             .categories
             .iter()
             .any(|category| category == "media-provider")
-        && row
-            .refresh_adapter
-            .as_deref()
-            .unwrap_or(&row.credential_type)
-            == "api_key"
+        // The vault lists an API key with auth method `apikey`, the same
+        // spelling the rest of routing's credential matching uses.
+        && row.auth_method.as_deref() == Some("apikey")
         && row.provider_ids.iter().any(|id| id == provider)
 }
 

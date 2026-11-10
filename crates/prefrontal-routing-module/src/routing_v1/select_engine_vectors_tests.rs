@@ -40,7 +40,8 @@ fn key() -> ListedCredential {
     ListedCredential {
         id: KEY.into(),
         categories: vec!["media-provider".into()],
-        credential_type: "api_key".into(),
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
         state: "active".into(),
         provider_ids: vec![PROVIDER.into()],
         ..Default::default()
