@@ -1806,6 +1806,15 @@ pub struct EvaluatedRoute {
     pub adequacy: f64,
     pub cost_usd: Option<f64>,
     pub normalized_cost: f64,
+    /// The scorer's own task economics for this route (token profile, list
+    /// cost, the subscription value multiplier, and plan pressure: the
+    /// scarcity factor from the plan's remaining quota and time to reset),
+    /// so an operator can check the arithmetic behind `cost_usd`.
+    pub task_pricing: Option<TaskRoutePricing>,
+    /// The per-million-token rate the scorer applied for each token kind
+    /// (fresh input, cached read, cache write, output, reasoning); `None`
+    /// marks a kind with no rate.
+    pub rates_per_mtok: BTreeMap<&'static str, Option<f64>>,
 }
 
 fn admit_and_price_shortlist(
@@ -2118,6 +2127,11 @@ fn admit_and_price_shortlist(
                         .filter(|p| p.price_unit == "task")
                         .and_then(|p| p.final_cost_usd),
                     normalized_cost: s.objective.cost,
+                    task_pricing: s.objective.task_pricing.clone(),
+                    rates_per_mtok: BasketDimension::ALL
+                        .into_iter()
+                        .map(|dimension| (dimension.as_str(), a.route.fact.basket_rate(dimension)))
+                        .collect(),
                 })
             })
             .collect();
