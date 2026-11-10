@@ -3986,6 +3986,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1",params![provider_key,updated_at,update.unscoped_wall])?;
+                    fence_rechecks::register(&tx,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
                 tx.commit()
             })
@@ -4159,6 +4160,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 )?;
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE route_key=?1",params![route_key,observed_at,update.unscoped_wall])?;
+                    fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
                 }
                 tx.commit()
             })
@@ -4387,10 +4389,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                         )?;
                         if cooldown_until.is_some() {
                             tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
+                            fence_rechecks::register(&tx,"failure",&serde_json::json!([route_key]).to_string())?;
                         }
                     }
                 }
 
+                fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
                 tx.commit()
             })
             .map_err(err)

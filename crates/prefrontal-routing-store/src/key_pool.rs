@@ -440,8 +440,8 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Wall one key until `until_ms`. A later wall of the same kind extends it;
-    /// an earlier one never shortens it.
+    /// Record a key refusal, replacing the same kind's older horizon when the
+    /// evidence is newer. The deadline is capped at one hour from receipt.
     pub fn pool_wall(
         &self,
         provider: &str,
@@ -496,6 +496,17 @@ impl crate::AccountTx<'_> {
                 updated_at=MAX(pool_key_state.updated_at,excluded.updated_at)
                 WHERE excluded.{observed}>=COALESCE(pool_key_state.{observed},pool_key_state.updated_at)"),
                 params![provider,credential_id,until_ms,reason,now_ms]).map_err(err)?;
+            let origin = if kind == PoolWallKind::Billing {
+                "pool_billing"
+            } else {
+                "pool_rate"
+            };
+            crate::fence_rechecks::register(
+                self.conn,
+                origin,
+                &serde_json::json!([provider, credential_id]).to_string(),
+            )
+            .map_err(err)?;
             return Ok(());
         }
         let statement = match kind {

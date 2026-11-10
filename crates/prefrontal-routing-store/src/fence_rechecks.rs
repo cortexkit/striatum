@@ -114,31 +114,18 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
     }
-    // Materialize once and index the compound origin key. A correlated lookup
-    // against the UNION view otherwise rebuilds its JSON keys for every clock.
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;
-        CREATE UNIQUE INDEX IF NOT EXISTS current_fence_origin_key ON current_fence_origin(kind,origin_key);
-        DELETE FROM current_fence_origin;
-        INSERT INTO current_fence_origin SELECT * FROM fence_origin;")?;
-    // A changed evidence value is new evidence, not a probe. Pool evidence
-    // omits the shared last-used timestamp so leasing a key cannot extend its
-    // retry deadline merely by changing that timestamp.
-    conn.execute(
-        "INSERT INTO fence_recheck (kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-          evidence,evidence_at,quota,next_recheck_at,reset_check_at)
-         SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-          evidence,evidence_at,COALESCE(quota,0),
-          CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER),
-          CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END
-         FROM current_fence_origin WHERE true
-         ON CONFLICT(kind,origin_key) DO UPDATE SET evidence=excluded.evidence,evidence_at=excluded.evidence_at,
-          quota=excluded.quota,
-          next_recheck_at=CASE WHEN excluded.evidence_at>=COALESCE(fence_recheck.last_claimed_at,-9223372036854775808)
-            THEN excluded.next_recheck_at ELSE MAX(fence_recheck.next_recheck_at,excluded.next_recheck_at) END,
-          reset_check_at=CASE WHEN excluded.reset_check_at>COALESCE(fence_recheck.last_claimed_at,-9223372036854775808) THEN excluded.reset_check_at END,
-          classified=0,cleared_at=NULL,claim_owner=NULL WHERE fence_recheck.evidence!=excluded.evidence",
-        [],
+    snapshot_origins(conn)?;
+    let retired = conn.execute(
+        "INSERT OR REPLACE INTO fence_retired_origin
+        SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
+        WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
+            WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)",
+        [crate::now_ms()],
     )?;
+    if retired > 0 {
+        snapshot_origins(conn)?;
+    }
+    upsert_clocks(conn, None, None)?;
     // Observation evidence is append-only and read through a bounded sparse
     // index. Its clock survives that lookback until a successful probe heals it.
     conn.execute("DELETE FROM fence_recheck WHERE kind!='observation' AND NOT EXISTS
@@ -152,6 +139,49 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
             params![kind, key],
         )?;
     }
+    Ok(())
+}
+
+/// Install a new refusal's clock at receipt, even if its shorter deadline is
+/// already due. Only the named origin is registered; historical rows are not
+/// mistaken for a new refusal merely because another account reported one.
+pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Result<()> {
+    if !enabled(conn)? {
+        return Ok(());
+    }
+    snapshot_origins(conn)?;
+    upsert_clocks(conn, Some(kind), Some(key))
+}
+
+fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
+    // Materialize once and index the compound origin key. A correlated lookup
+    // against the UNION view otherwise rebuilds its JSON keys for every clock.
+    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;
+        CREATE UNIQUE INDEX IF NOT EXISTS current_fence_origin_key ON current_fence_origin(kind,origin_key);
+        DELETE FROM current_fence_origin;
+        INSERT INTO current_fence_origin SELECT * FROM fence_origin;")
+}
+
+fn upsert_clocks(conn: &Connection, kind: Option<&str>, key: Option<&str>) -> rusqlite::Result<()> {
+    // A changed evidence value is new evidence, not a probe. Pool evidence
+    // omits the shared last-used timestamp so leasing a key cannot extend its
+    // retry deadline merely by changing that timestamp.
+    conn.execute(
+        "INSERT INTO fence_recheck (kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
+          evidence,evidence_at,quota,next_recheck_at,reset_check_at)
+         SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
+          evidence,evidence_at,COALESCE(quota,0),
+          CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER),
+          CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END
+         FROM current_fence_origin WHERE (?1 IS NULL OR (kind=?1 AND origin_key=?2))
+         ON CONFLICT(kind,origin_key) DO UPDATE SET evidence=excluded.evidence,evidence_at=excluded.evidence_at,
+          quota=excluded.quota,
+          next_recheck_at=CASE WHEN excluded.evidence_at>=COALESCE(fence_recheck.last_claimed_at,-9223372036854775808)
+            THEN excluded.next_recheck_at ELSE MAX(fence_recheck.next_recheck_at,excluded.next_recheck_at) END,
+          reset_check_at=CASE WHEN excluded.reset_check_at>COALESCE(fence_recheck.last_claimed_at,-9223372036854775808) THEN excluded.reset_check_at END,
+          classified=0,cleared_at=NULL,claim_owner=NULL WHERE fence_recheck.evidence!=excluded.evidence",
+        params![kind,key],
+    )?;
     Ok(())
 }
 
@@ -279,6 +309,9 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
         let quota = row.get::<_, Option<bool>>(11)?.unwrap_or(false);
         let deadline = row.get::<_, Option<f64>>(12)?.map(|at| at as i64);
         let reset = row.get::<_, Option<f64>>(13)?.map(|at| at as i64);
+        if !quota && deadline.is_some_and(|at| at < crate::now_ms()) {
+            continue;
+        }
         let last_claimed_at = prior.and_then(|(_, claimed, _)| *claimed);
         let mut next = if quota {
             evidence_at.saturating_add(QUOTA_FENCE_RECHECK_MS)
@@ -1032,7 +1065,17 @@ mod tests {
             scratch.path().join("store.db").to_string_lossy(),
         ))
         .unwrap();
-        store.store.with_conn(|conn|conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','billing_exhausted',NULL,0)",[])).unwrap();
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "billing_exhausted".into(),
+                },
+                None,
+                0,
+            )
+            .unwrap();
         store
             .account_transaction(|tx| tx.classify_credential_quota("p", "c", true))
             .unwrap();
@@ -1813,6 +1856,111 @@ mod tests {
     }
 
     #[test]
+    fn migration_retires_expired_non_quota_evidence_but_never_expires_quota() {
+        let scratch = cortexkit_test_support::ScratchDir::new("retire-expired-migration");
+        let descriptor = crate::dev_descriptor(
+            "retire-expired-migration",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let now = crate::now_ms();
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        old.store.with_conn(|conn|conn.execute_batch(&format!("
+            INSERT INTO account_route_fence VALUES ('p','quota','m',0,'d',100,100,'quota');
+            INSERT INTO account_route_fence VALUES ('p','transient','m',{},'d',100,100,'transient');
+            INSERT INTO credential_entitlement_fences VALUES ('p','expired','ENTITLEMENT_ERROR',NULL,{});
+            INSERT INTO pool_key_state(provider,credential_id,walled_until,cooldown_until,updated_at) VALUES ('p','expired',{0},{0},100);
+            INSERT INTO pool_key_state(provider,credential_id,walled_until,updated_at) VALUES ('p','live',{},100);
+            INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,cooldown_until,failure_backoff_until)
+                VALUES ('p/m','p/m','p','m',100,{0},{0});
+            INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at) VALUES ('old',{0},100);
+        ",now-10_000,now-7*3_600_000,now+86_400_000))).unwrap();
+        drop(old);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(
+            clocks.len(),
+            2,
+            "expired non-quota rows must not return as route-wide probe gates: {clocks:?}"
+        );
+        assert!(clocks
+            .iter()
+            .any(|f| f.quota && f.credential_id.as_deref() == Some("quota")));
+        assert!(clocks
+            .iter()
+            .any(|f| f.kind == "pool_billing" && f.credential_id.as_deref() == Some("live")));
+        assert!(
+            store.credential_entitlement_fences().unwrap().is_empty(),
+            "raw credential readers must not revive the retired row"
+        );
+    }
+
+    #[test]
+    fn sync_retires_unmanaged_expired_origins_but_preserves_managed_short_retries() {
+        let scratch = cortexkit_test_support::ScratchDir::new("retire-expired-sync");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "retire-expired-sync",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let now = crate::now_ms();
+        store.store.with_conn(|conn|conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at,wall_observed_at) VALUES ('legacy',?1,100,100)",[now-10_000])).unwrap();
+        assert!(
+            store.fence_rechecks().unwrap().is_empty(),
+            "unmanaged historical evidence must retire at sync too"
+        );
+        let archived_before: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM fence_retired_origin", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(archived_before, 0, "scoring must remain read-only");
+        store
+            .account_transaction(|tx| {
+                assert!(tx.claim_fence_rechecks(&[], now)?);
+                Ok(())
+            })
+            .unwrap();
+        let archived_after: i64 = store
+            .store
+            .with_conn(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM fence_retired_origin", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            archived_after, 1,
+            "writer synchronization archives the retired generation"
+        );
+        store
+            .pool_wall(
+                "p",
+                "managed",
+                crate::PoolWallKind::RateLimited,
+                now - 1,
+                "new refusal, immediate retry",
+                now - 100,
+            )
+            .unwrap();
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(
+            clocks.len(),
+            1,
+            "new typed evidence must get its clock at ingress, even when already due"
+        );
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, now))
+            .unwrap());
+        let clocks = store.fence_rechecks().unwrap();
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, now))
+            .unwrap());
+    }
+
+    #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {
         let scratch = cortexkit_test_support::ScratchDir::new("fence-migration");
         let descriptor = crate::dev_descriptor(
@@ -1879,14 +2027,31 @@ mod tests {
                 path.to_string_lossy(),
             ))
             .unwrap();
+            if case != "account" {
+                store
+                    .record_credential_entitlement_fence(
+                        &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                            provider_id: "p".into(),
+                            credential_id: "c".into(),
+                            code: "ENTITLEMENT_ERROR".into(),
+                        },
+                        None,
+                        0,
+                    )
+                    .unwrap();
+            }
             store.store.with_conn(|conn| {
-            if case!="account" {conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','ENTITLEMENT_ERROR',NULL,0)",[])?;}
             if case!="credential" {conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at)
                 VALUES ('f','p','a','null','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',0,'test',0)",[])?;}
             if case=="combined" {conn.execute("INSERT INTO account_route_fence VALUES ('p','c','m',0,'d',0,0,'quota')",[])?;}
             Ok(())
         }).unwrap();
             let origins = store.fence_rechecks().unwrap();
+            assert_eq!(
+                origins.len(),
+                if case == "combined" { 3 } else { 1 },
+                "the concurrency proof must claim a real managed origin set"
+            );
             let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
             let threads: Vec<_> = (0..8)
                 .map(|_| {

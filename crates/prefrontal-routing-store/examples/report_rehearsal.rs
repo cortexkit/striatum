@@ -107,6 +107,17 @@ fn main() {
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .unwrap();
+    let mut retired = conn
+        .prepare("SELECT kind,COUNT(*) FROM fence_retired_origin GROUP BY kind ORDER BY kind")
+        .unwrap();
+    let retired = retired
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    println!("retired expired non-quota generations per kind: {retired:?}");
     let extended: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM fence_recheck r JOIN fence_origin o USING(kind,origin_key)

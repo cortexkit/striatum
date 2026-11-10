@@ -176,6 +176,52 @@ SELECT 'observation',json_array(provider,account_id),provider,account_id,NULL,NU
        json_array(evidence_key,effects_json),evidence_at,0,retry_at_ms,NULL
 FROM account_transient_backoff;
 
+-- Expired pre-schedule evidence is archived, not revived as a new probe gate.
+-- fence_retire_enforcement also retires unmanaged history found at runtime;
+-- rows with a matching managed clock instead keep their periodic probe.
+CREATE TABLE fence_retired_origin (
+ kind TEXT NOT NULL,origin_key TEXT NOT NULL,evidence TEXT NOT NULL,
+ evidence_at INTEGER NOT NULL,retired_at INTEGER NOT NULL,
+ PRIMARY KEY(kind,origin_key,evidence)
+);
+CREATE TRIGGER fence_retire_enforcement AFTER INSERT ON fence_retired_origin BEGIN
+ DELETE FROM credential_entitlement_fences WHERE NEW.kind='credential'
+  AND provider_id=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]');
+ DELETE FROM account_non_quota_route_fence WHERE
+  ((NEW.kind='transient_route' AND wall_kind='transient') OR (NEW.kind='non_quota_route' AND wall_kind='billing'))
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]') AND model=json_extract(NEW.origin_key,'$[2]');
+ DELETE FROM account_route_fence WHERE NEW.kind='transient_route' AND wall_class='transient'
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]') AND model=json_extract(NEW.origin_key,'$[2]');
+ UPDATE pool_key_state SET walled_until=NULL,wall_reason=NULL WHERE NEW.kind='pool_billing'
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]');
+ UPDATE pool_key_state SET cooldown_until=NULL,cooldown_reason=NULL WHERE NEW.kind='pool_rate'
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]');
+ UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE NEW.kind='provider'
+  AND provider_id=json_extract(NEW.origin_key,'$[0]') AND EXISTS (SELECT 1 FROM provider_cooldown_state p
+   WHERE p.provider_key=model_route_state.provider_id AND p.last_error IS model_route_state.last_error
+   AND COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)=COALESCE(model_route_state.wall_observed_at,model_route_state.last_error_at,model_route_state.updated_at)
+   AND COALESCE(p.cooldown_until,0)>=COALESCE(model_route_state.cooldown_until,0)
+   AND COALESCE(p.quota_exhausted_until,0)>=COALESCE(model_route_state.quota_exhausted_until,0));
+ UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+  WHERE NEW.kind='provider' AND provider_key=json_extract(NEW.origin_key,'$[0]');
+ UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+  WHERE NEW.kind='route' AND route_key=json_extract(NEW.origin_key,'$[0]');
+ UPDATE model_route_state SET failure_backoff_until=NULL,failure_backoff_reason=NULL
+  WHERE NEW.kind='failure' AND route_key=json_extract(NEW.origin_key,'$[0]');
+ DELETE FROM account_non_quota_size_refusal WHERE NEW.kind='non_quota_size'
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND credential_id=json_extract(NEW.origin_key,'$[1]')
+  AND model=json_extract(NEW.origin_key,'$[2]') AND size_class=json_extract(NEW.origin_key,'$[3]');
+ DELETE FROM account_principal_exclusion WHERE NEW.kind='principal' AND principal=json_extract(NEW.origin_key,'$[0]')
+  AND admission_id=json_extract(NEW.origin_key,'$[1]') AND credential_id=json_extract(NEW.origin_key,'$[2]');
+ DELETE FROM account_transient_backoff WHERE NEW.kind='observation'
+  AND provider=json_extract(NEW.origin_key,'$[0]') AND account_id=json_extract(NEW.origin_key,'$[1]');
+END;
+CREATE TEMP TABLE expired_fence_origin AS
+ SELECT kind,origin_key,evidence,evidence_at,at AS retired_at FROM fence_origin CROSS JOIN fence_migration_clock
+ WHERE quota=0 AND deadline<at;
+INSERT INTO fence_retired_origin SELECT * FROM expired_fence_origin;
+DROP TABLE expired_fence_origin;
+
 -- Capture one clock value for the entire conversion. Reopening the store does
 -- not repeat the conversion or move an existing retry time forward.
 INSERT INTO fence_recheck

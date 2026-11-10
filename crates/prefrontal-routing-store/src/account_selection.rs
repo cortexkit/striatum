@@ -2022,7 +2022,8 @@ impl AccountTx<'_> {
     /// Record a scoped not-found. Returns false when this admission already
     /// excluded the credential.
     pub fn insert_exclusion(&self, row: &AccountExclusionRow) -> RouteStateResult<bool> {
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "INSERT INTO account_principal_exclusion (principal, admission_id, credential_id, \
                    runner_view_digest, roster_view_digest, observation_id, recorded_at) \
@@ -2038,8 +2039,17 @@ impl AccountTx<'_> {
                     row.recorded_at,
                 ],
             )
-            .map(|changed| changed == 1)
-            .map_err(err)
+            .map_err(err)?;
+        if changed == 1 {
+            crate::fence_rechecks::register(
+                self.conn,
+                "principal",
+                &serde_json::json!([row.principal, row.admission_id, row.credential_id])
+                    .to_string(),
+            )
+            .map_err(err)?;
+        }
+        Ok(changed == 1)
     }
 
     pub fn insert_exclusion_with_recheck(
@@ -2049,7 +2059,6 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<bool> {
         let inserted = self.insert_exclusion(row)?;
         if inserted && crate::fence_rechecks::enabled(self.conn).map_err(err)? {
-            crate::fence_rechecks::sync(self.conn).map_err(err)?;
             self.conn
                 .execute(
                     "UPDATE fence_recheck SET next_recheck_at=MIN(next_recheck_at,?2)
@@ -2193,7 +2202,15 @@ impl AccountTx<'_> {
             ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
                 evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at",params![id,effects]).map_err(err)?;
         if changed > 0 {
-            crate::fence_rechecks::sync(self.conn).map_err(err)?;
+            let mut statement=self.conn.prepare("SELECT json_array(provider,account_id) FROM account_transient_backoff WHERE json_extract(evidence_key,'$[0]')=?1").map_err(err)?;
+            let keys = statement
+                .query_map([id], |row| row.get::<_, String>(0))
+                .map_err(err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(err)?;
+            for key in keys {
+                crate::fence_rechecks::register(self.conn, "observation", &key).map_err(err)?;
+            }
         }
         Ok(())
     }

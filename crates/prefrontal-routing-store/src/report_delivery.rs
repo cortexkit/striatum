@@ -135,7 +135,19 @@ impl AccountTx<'_> {
         self.conn.execute("INSERT INTO account_non_quota_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
             ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
             WHERE excluded.observed_at>=account_non_quota_size_refusal.observed_at",
-            params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map(|_|()).map_err(err)
+            params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map_err(err)?;
+        crate::fence_rechecks::register(
+            self.conn,
+            "non_quota_size",
+            &serde_json::json!([
+                fact.provider,
+                fact.credential_id,
+                fact.model,
+                fact.size_class
+            ])
+            .to_string(),
+        )
+        .map_err(err)
     }
     pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
         self.record_account_route_backoff(fence, "billing")
@@ -162,8 +174,17 @@ impl AccountTx<'_> {
                         .to_string()
                 ],
             )
-            .map(|_| ())
-            .map_err(err)
+            .map_err(err)?;
+        crate::fence_rechecks::register(
+            self.conn,
+            if kind == "transient" {
+                "transient_route"
+            } else {
+                "non_quota_route"
+            },
+            &serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string(),
+        )
+        .map_err(err)
     }
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
@@ -271,6 +292,11 @@ fn apply_account_effects(
         )?;
         if crate::fence_rechecks::enabled(conn)? {
             conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+            crate::fence_rechecks::register(
+                conn,
+                "credential",
+                &serde_json::json!([refusal.provider_id, refusal.credential_id]).to_string(),
+            )?;
         }
     }
     if let Some(fact) = &effects.size_refusal {
