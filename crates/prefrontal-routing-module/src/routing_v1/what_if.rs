@@ -71,11 +71,11 @@ pub(super) async fn what_if_with_profile_lookup(
     if params
         .runner
         .as_deref()
-        .is_some_and(|runner| runner != "broca")
+        .is_some_and(|runner| runner != crate::legacy_wire::BROCA)
     {
         return Err(Refusal::invalid_request(
             "runner",
-            "runner must be broca when supplied",
+            format!("runner must be {} when supplied", crate::legacy_wire::BROCA),
         ));
     }
     let started = std::time::Instant::now();
