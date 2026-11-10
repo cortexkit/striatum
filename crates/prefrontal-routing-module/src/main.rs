@@ -173,6 +173,7 @@ const ROUTE_CLEAR_COOLDOWN_OP: &str = "route.clear_cooldown";
 /// once, for use right after topping it up. Operator-only: only the `direct`
 /// and `reserved:callosum` principals may call it.
 const ROUTE_CLEAR_CREDENTIAL_FENCES_OP: &str = "route.clear_credential_fences";
+const ROUTE_WHAT_IF_OP: &str = "route.what_if";
 /// Observability op: reports whether the outbound quota-consumer connection is
 /// live and how fresh its windows are. Lets a consumer (and the e2e) confirm the
 /// module->module quota path actually round-tripped, not just that it didn't hang.
@@ -4278,6 +4279,7 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_CLEAR_FAILURE_BACKOFF_OP
             | ROUTE_CLEAR_COOLDOWN_OP
             | ROUTE_CLEAR_CREDENTIAL_FENCES_OP
+            | ROUTE_WHAT_IF_OP
             | ROUTE_COOLDOWN_STATUS_OP
             | ROUTE_EXPLAIN_OP
             | ROUTE_DECISIONS_LIST_OP
@@ -4429,6 +4431,11 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
                 "Lift every credential entitlement fence on one vault credential, for use right after topping it up (operator-only: direct and reserved:callosum routes)"
                     .to_string(),
             ),
+        },
+        ManagementOperation {
+            name: ROUTE_WHAT_IF_OP.to_string(),
+            kind: ManagementOperationKind::Query,
+            description: Some("Evaluate routing with call-local model policy changes, without recording anything (operator-only: direct and reserved:callosum routes)".to_string()),
         },
         ManagementOperation {
             name: ROUTE_COOLDOWN_STATUS_OP.to_string(),
@@ -13810,7 +13817,11 @@ mod tests {
             ("apikey:anthropic:usersamplegmail", platform, None),
             ("apikey:anthropic:ysample", platform, None),
             ("apikey:anthropic:unmapped", &["anthropic"], None),
-            ("oauth:anthropic:ysample", &["anthropic"], Some("acct-ysample")),
+            (
+                "oauth:anthropic:ysample",
+                &["anthropic"],
+                Some("acct-ysample"),
+            ),
         ]);
         let mut members: Vec<String> = credentials
             .lock()

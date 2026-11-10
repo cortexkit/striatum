@@ -749,6 +749,30 @@ pub(super) fn price_selection_inputs(
     credentialed: bool,
     priced_per_token: bool,
 ) -> Result<PricedSelection, ModuleError> {
+    price_selection_inputs_with_probes(
+        facts,
+        quota_signal_json,
+        sources,
+        store,
+        broca_credentials,
+        credentialed,
+        priced_per_token,
+        true,
+    )
+}
+
+/// Evaluation passes an isolated account store and skips probe reservations:
+/// it never holds a credential's next retry of a previous provider refusal.
+pub(super) fn price_selection_inputs_with_probes(
+    facts: &mut Vec<ModelFact>,
+    quota_signal_json: String,
+    sources: &SelectionPolicySources<'_>,
+    store: &SharedStore,
+    broca_credentials: &SharedBrocaCredentials,
+    credentialed: bool,
+    priced_per_token: bool,
+    reserve_probes: bool,
+) -> Result<PricedSelection, ModuleError> {
     let mut classes = if credentialed {
         Some(
             account_selection::ClassContext::read(
@@ -764,7 +788,7 @@ pub(super) fn price_selection_inputs(
     } else {
         None
     };
-    if let Some(classes) = &mut classes {
+    if let Some(classes) = classes.as_mut().filter(|_| reserve_probes) {
         classes
             .reserve_selection_probes(store, broca_credentials)
             .map_err(ModuleError::Message)?;

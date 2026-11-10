@@ -46,6 +46,9 @@ mod select;
 #[cfg(test)]
 mod service_tier_tests;
 mod shapes;
+mod what_if;
+#[cfg(test)]
+mod what_if_tests;
 
 #[cfg(test)]
 mod account_classes_tests;
@@ -119,7 +122,8 @@ pub(crate) fn claims(body: &[u8]) -> bool {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return false;
     };
-    shapes::claims(method, request.get("params").unwrap_or(&Value::Null))
+    method == crate::ROUTE_WHAT_IF_OP
+        || shapes::claims(method, request.get("params").unwrap_or(&Value::Null))
 }
 
 /// Everything a v1 op reads besides its request and its caller.
@@ -255,6 +259,9 @@ pub(crate) fn record_call(
 ) -> Result<(), ModuleError> {
     if let Ok(request) = serde_json::from_slice::<Value>(body) {
         if let Some(method) = request.get("method").and_then(Value::as_str) {
+            if method == crate::ROUTE_WHAT_IF_OP {
+                return Ok(());
+            }
             let params = request.get("params").unwrap_or(&Value::Null);
             let caller = Caller::for_route(channel, epoch);
             store
@@ -276,6 +283,7 @@ async fn answer(
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
     match method {
+        crate::ROUTE_WHAT_IF_OP => what_if::what_if(params, caller, deps).await,
         ops::ROLE_DESCRIBE => describe::describe(deps),
         ops::ROUTE_SELECT => select::select(params, caller, deps).await,
         ops::ROUTE_SELECT_ENGINE => engines::select(params, caller, deps),

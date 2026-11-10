@@ -121,31 +121,67 @@ async fn select_kind(
     deps: &Deps<'_>,
     panel_seat: bool,
 ) -> Result<Value, Refusal> {
-    let lookup = |workload: &str, iq: f64, facts: &[ModelFact]| {
-        let complete = crate::select::task_profiles_for(workload, iq, facts);
-        if !complete.profiles.is_empty() || facts.len() <= 1 {
-            return complete;
-        }
-        // Resolve each route from one refresh snapshot. The core scorer, which
-        // knows the final adequate shortlist, enforces all-or-nothing pricing;
-        // an excluded or inadequate route must not prevent the remaining routes
-        // from using profile pricing.
-        let snapshot = crate::task_profile_refresh::cache().snapshot();
-        crate::select::TaskProfileLookup {
-            profiles: facts
-                .iter()
-                .flat_map(|fact| snapshot.lookup(workload, iq, std::slice::from_ref(fact)))
-                .collect(),
-            providers_without_cache_write_reports: snapshot
-                .providers_without_cache_write_reports
-                .clone(),
-        }
-    };
-    select_with_profile_lookup_kind(params, caller, deps, &lookup, panel_seat).await
+    select_with_profile_lookup_kind(params, caller, deps, &live_profile_lookup, panel_seat).await
+}
+
+pub(super) fn live_profile_lookup(
+    workload: &str,
+    iq: f64,
+    facts: &[ModelFact],
+) -> crate::select::TaskProfileLookup {
+    let complete = crate::select::task_profiles_for(workload, iq, facts);
+    if !complete.profiles.is_empty() || facts.len() <= 1 {
+        return complete;
+    }
+    // Resolve each route from one refresh snapshot. The core scorer, which
+    // knows the final adequate shortlist, enforces all-or-nothing pricing;
+    // an excluded or inadequate route must not prevent the remaining routes
+    // from using profile pricing.
+    let snapshot = crate::task_profile_refresh::cache().snapshot();
+    crate::select::TaskProfileLookup {
+        profiles: facts
+            .iter()
+            .flat_map(|fact| snapshot.lookup(workload, iq, std::slice::from_ref(fact)))
+            .collect(),
+        providers_without_cache_write_reports: snapshot
+            .providers_without_cache_write_reports
+            .clone(),
+    }
 }
 
 pub(super) type ProfileLookup =
     dyn Fn(&str, f64, &[ModelFact]) -> crate::select::TaskProfileLookup + Sync;
+
+pub(super) struct Evaluation<'a> {
+    pub live_config: std::sync::Arc<config_overrides::LiveConfig>,
+    pub operator_config: std::sync::Arc<config_overrides::LiveConfig>,
+    pub account_store: &'a crate::SharedStore,
+    pub iq: f64,
+    pub eq: Option<f64>,
+    pub evidence: std::sync::Mutex<prefrontal_routing_core::model_router::RouteEvaluation>,
+}
+
+pub(super) async fn evaluate(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    view: &Evaluation<'_>,
+    profile_lookup: &ProfileLookup,
+) -> Result<Value, Refusal> {
+    select_at_tier(
+        params,
+        caller,
+        deps,
+        profile_lookup,
+        None,
+        None,
+        &mut TierTrace::default(),
+        &crate::tier_settings::Layers::new(None, None),
+        false,
+        Some(view),
+    )
+    .await
+}
 
 pub(super) async fn select_with_profile_lookup(
     params: &serde_json::Value,
@@ -281,6 +317,7 @@ async fn select_with_tier_fallback(
             &mut trace,
             settings_layers,
             panel_seat,
+            None,
         )
         .await;
     };
@@ -317,6 +354,7 @@ async fn select_with_tier_fallback(
                     &mut trace,
                     settings_layers,
                     panel_seat,
+                    None,
                 )
                 .await
                 {
@@ -344,6 +382,7 @@ async fn select_with_tier_fallback(
             &mut trace,
             settings_layers,
             panel_seat,
+            None,
         )
         .await
         {
@@ -442,6 +481,7 @@ async fn select_at_tier(
     tier_trace: &mut TierTrace,
     tier_settings: &crate::tier_settings::Layers,
     panel_seat: bool,
+    evaluation: Option<&Evaluation<'_>>,
 ) -> Result<Value, Refusal> {
     tier_trace.rejections.clear();
     super::refuse_unknown_members(params, MEMBERS)?;
@@ -463,11 +503,19 @@ async fn select_at_tier(
         &crate::tier_settings::without_context(params),
         super::describe::CAPABILITIES,
     )?;
-    let live_config = config_overrides::live_config(deps.routing_config_path);
-    let operator_config = operator_config(deps);
+    let live_config = evaluation.map_or_else(
+        || config_overrides::live_config(deps.routing_config_path),
+        |view| view.live_config.clone(),
+    );
+    let operator_config = evaluation.map_or_else(
+        || operator_config(deps),
+        |view| view.operator_config.clone(),
+    );
     let consumer = request.consumer.clone();
     let consumers = super::consumers::effective(&operator_config);
-    consumers.admit(&consumer, caller)?;
+    if evaluation.is_none() {
+        consumers.admit(&consumer, caller)?;
+    }
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
     let request = parse_select_request_serving(
         &crate::tier_settings::without_context(&effective_params),
@@ -522,14 +570,15 @@ async fn select_at_tier(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &catalog_targets,
     };
-    let mut priced = crate::price_selection_inputs(
+    let mut priced = crate::select::price_selection_inputs_with_probes(
         &mut facts,
         quota_signal_json,
         &sources,
-        deps.store,
+        evaluation.map_or(deps.store, |view| view.account_store),
         deps.broca_credentials,
         true,
         priced_per_token,
+        evaluation.is_none(),
     )
     .map_err(|error| store_refusal(error.to_string()))?;
 
@@ -883,10 +932,12 @@ async fn select_at_tier(
         ModelRequirements {
             iq: operator_demand
                 .iq
-                .unwrap_or_else(|| f64::from(requirements.iq)),
-            eq: operator_demand
-                .eq
-                .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0))),
+                .unwrap_or_else(|| evaluation.map_or(f64::from(requirements.iq), |view| view.iq)),
+            eq: operator_demand.eq.unwrap_or_else(|| {
+                evaluation
+                    .and_then(|view| view.eq)
+                    .unwrap_or_else(|| f64::from(requirements.eq.unwrap_or(0)))
+            }),
         }
     };
     let vision = modalities.contains(&Modality::Image);
@@ -973,6 +1024,11 @@ async fn select_at_tier(
         hold_wait_max_s: params.get("hold_wait_max_s").and_then(Value::as_u64),
         conversation_key: request.affinity.as_deref().unwrap_or("select"),
     };
+
+    if let Some(view) = evaluation {
+        let mut evidence = view.evidence.lock().unwrap();
+        let _ = selection.score_candidates_evaluated(&usable, Some(&mut evidence));
+    }
 
     let project_pin = request
         .settings
@@ -1147,7 +1203,9 @@ async fn select_at_tier(
         }
         Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
         Err(select_policy::OrderFailure::Score(no_route)) => {
-            selection.record_refusal(&no_route, &priced.provenance);
+            if evaluation.is_none() {
+                selection.record_refusal(&no_route, &priced.provenance);
+            }
             // Account preflight is separate from model scoring. Only name an
             // account block when an otherwise adequate, policy-allowed model
             // would have been selected without that block.
@@ -1198,6 +1256,14 @@ async fn select_at_tier(
         &runs,
     )
     .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
+
+    if evaluation.is_some() {
+        return Ok(json!({
+            "route": selected.route_key,
+            "variant": selected.prompt_params.variant,
+            "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
+        }));
+    }
 
     // Record the decision in the ledger every selection writes, then bind it.
     let mut decision = crate::decision_input_for(
@@ -1513,6 +1579,14 @@ impl<'a> Selection<'a> {
         &self,
         available: &HashSet<String>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
+        self.score_candidates_evaluated(available, None)
+    }
+
+    fn score_candidates_evaluated(
+        &self,
+        available: &HashSet<String>,
+        evaluation: Option<&mut prefrontal_routing_core::model_router::RouteEvaluation>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
         let allowed = available
             .iter()
             .filter(|route| {
@@ -1541,7 +1615,7 @@ impl<'a> Selection<'a> {
         }
         let input = self.pass().input(&allowed, snapshot);
         let result = self
-            .score_input(input, self.consumer_exclude, None)
+            .score_input_evaluated(input, self.consumer_exclude, None, evaluation)
             .map_err(select_policy::describe_filter_refusal);
         select_policy::explain_dotted_exclusions(
             result,
@@ -1552,9 +1626,19 @@ impl<'a> Selection<'a> {
 
     fn score_input(
         &self,
+        input: prefrontal_routing_core::SelectModelRouteInput<'_>,
+        consumer_exclude: &[String],
+        explicit_variant: Option<&str>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
+        self.score_input_evaluated(input, consumer_exclude, explicit_variant, None)
+    }
+
+    fn score_input_evaluated(
+        &self,
         mut input: prefrontal_routing_core::SelectModelRouteInput<'_>,
         consumer_exclude: &[String],
         explicit_variant: Option<&str>,
+        evaluation: Option<&mut prefrontal_routing_core::model_router::RouteEvaluation>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
         let groups = self.sources.operator_config.variant_groups();
@@ -1603,13 +1687,14 @@ impl<'a> Selection<'a> {
             })
             .collect();
         input.providers_without_cache_write_reports = lookup.providers_without_cache_write_reports;
-        prefrontal_routing_core::model_router::select_model_route_with_profiles(
+        prefrontal_routing_core::model_router::evaluate_model_route_with_profiles(
             input,
             self.routing_config,
             self.slots,
             consumer_exclude,
             self.rejections,
             &profiles,
+            evaluation,
         )
     }
 

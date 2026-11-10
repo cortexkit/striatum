@@ -190,6 +190,42 @@ impl RoutingConfigFile {
 }
 
 impl LiveConfig {
+    pub(crate) fn with_model_policy_patch(
+        &self,
+        models: &std::collections::BTreeMap<String, super::ModelPolicyPatch>,
+    ) -> Result<Self, String> {
+        let mut patched = self.clone();
+        for (route, patch) in models {
+            if super::parse_model_key(route).is_none() {
+                return Err(format!("invalid provider/model key {route:?}"));
+            }
+            let rules = &mut patched
+                .config
+                .model_routing
+                .models
+                .entry(route.clone())
+                .or_default()
+                .rules;
+            if let Some(value) = &patch.pin_only_for {
+                rules.pin_only_for = Some(value.clone());
+            }
+            if let Some(value) = patch.pin_only {
+                rules.pin_only = Some(value);
+            }
+            if let Some(value) = &patch.not_for {
+                rules.not_for = Some(value.clone());
+            }
+            if let Some(value) = &patch.only_for {
+                rules.only_for = Some(value.clone());
+            }
+        }
+        Ok(patched)
+    }
+
+    pub(crate) fn route_policy_refusal(&self, consumer: &str, route: &str) -> Option<String> {
+        self.config.route_refusal(consumer, route, false)
+    }
+
     /// Resolve entity restrictions from this snapshot for the full request name.
     /// Unknown roots have no matching consumer group, just as undotted unknown names do.
     pub fn consumer_exclusions(&self, consumer: &str) -> Vec<String> {

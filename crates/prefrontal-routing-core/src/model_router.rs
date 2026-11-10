@@ -27,9 +27,10 @@ use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRO
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
-    demand_for_score, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR, COST_REFERENCE_PER_MTOK,
-    DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST, MIN_BEST_EFFORT_ADEQUACY,
-    OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS, SPEED_FLOOR_TPS,
+    demand_bar, demand_for_score, RoutingConfig, TopRoutableScores, ADEQUACY_FLOOR,
+    COST_REFERENCE_PER_MTOK, DEFAULT_ROUTING_CONFIG, EFFECTIVELY_FREE_SELECTION_COST,
+    MIN_BEST_EFFORT_ADEQUACY, OBJECTIVE_WEIGHT_QUOTA, RELATIVE_SHORTLIST_DELTA, SPEED_CEILING_TPS,
+    SPEED_FLOOR_TPS,
 };
 use crate::slot_saturation::{
     pick_unsaturated, ConcurrencySlots, SlotSaturation, REASON_PROVIDER_SATURATED,
@@ -1788,6 +1789,25 @@ fn fleet_vector_unusable_reason(fleet: Option<&ClassVector>) -> String {
     }
 }
 
+/// Evidence from the same admission and pricing pass that selects the winner.
+/// Kept separate from decision scores so diagnostic reads do not change ledger bytes.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RouteEvaluation {
+    pub bar: BTreeMap<String, f64>,
+    pub top_routable: BTreeMap<String, f64>,
+    pub adequate: Vec<EvaluatedRoute>,
+    pub excluded: Vec<RejectedRoute>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct EvaluatedRoute {
+    pub route: String,
+    pub fit: BTreeMap<ModelMetric, MetricFit>,
+    pub adequacy: f64,
+    pub cost_usd: Option<f64>,
+    pub normalized_cost: f64,
+}
+
 fn admit_and_price_shortlist(
     input: &SelectModelRouteInput<'_>,
     config: &RoutingConfig,
@@ -1796,6 +1816,7 @@ fn admit_and_price_shortlist(
     operator_group: &[String],
     availability_rejections: &HashMap<String, String>,
     profiles: &RouteTaskProfiles,
+    mut evaluation: Option<&mut RouteEvaluation>,
 ) -> Result<PricedAdmission, NoRouteError> {
     let requirements = input.requirements;
 
@@ -1855,6 +1876,22 @@ fn admit_and_price_shortlist(
         config,
         availability_rejections,
     );
+    if let Some(view) = evaluation.as_deref_mut() {
+        view.top_routable = BTreeMap::from([
+            ("elo".into(), top_routable.elo),
+            ("eq".into(), top_routable.eq),
+        ]);
+        view.bar = BTreeMap::from([
+            (
+                "elo".into(),
+                demand_bar(top_routable.elo, requirements.iq, config.demand_exponent),
+            ),
+            (
+                "eq".into(),
+                demand_bar(top_routable.eq, requirements.eq, config.demand_exponent),
+            ),
+        ]);
+    }
 
     admissible.retain(|a| {
         let covered = subscription_route_covered(&a.route, input.is_subscription_route.as_deref());
@@ -1871,6 +1908,20 @@ fn admit_and_price_shortlist(
         }
         permitted
     });
+    if let Some(view) = evaluation.as_deref_mut() {
+        view.excluded = rejected.clone();
+        view.excluded.extend(
+            admissible
+                .iter()
+                .filter(|a| !a.adequacy.clears_adequacy_floor())
+                .map(|a| RejectedRoute {
+                    route_key: a.route.route_key.clone(),
+                    reason: "below_floor".into(),
+                    detail: None,
+                    credential_ids: Vec::new(),
+                }),
+        );
+    }
 
     if admissible.is_empty() {
         let (earliest_reset, earliest_reset_route) =
@@ -2051,6 +2102,26 @@ fn admit_and_price_shortlist(
         })
         .collect();
 
+    if let Some(view) = evaluation {
+        view.adequate = scored
+            .iter()
+            .filter_map(|s| {
+                let a = &admissible[s.idx];
+                a.adequacy.clears_adequacy_floor().then(|| EvaluatedRoute {
+                    route: a.route.route_key.clone(),
+                    fit: a.adequacy.metrics.clone(),
+                    adequacy: a.adequacy.adequacy,
+                    cost_usd: s
+                        .objective
+                        .task_pricing
+                        .as_ref()
+                        .filter(|p| p.price_unit == "task")
+                        .and_then(|p| p.final_cost_usd),
+                    normalized_cost: s.objective.cost,
+                })
+            })
+            .collect();
+    }
     Ok(PricedAdmission {
         admissible,
         rejected,
@@ -2108,6 +2179,7 @@ pub fn price_selection_shortlist_with_profiles(
         &[],
         &HashMap::new(),
         profiles,
+        None,
     )?;
     Ok(PricedShortlist {
         use_basket: priced.use_basket,
@@ -2195,6 +2267,27 @@ pub fn select_model_route_with_profiles(
     availability_rejections: &HashMap<String, String>,
     profiles: &RouteTaskProfiles,
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    evaluate_model_route_with_profiles(
+        input,
+        config,
+        slots,
+        operator_group,
+        availability_rejections,
+        profiles,
+        None,
+    )
+}
+
+/// Run selection with optional diagnostic evidence, without changing the winner or its score.
+pub fn evaluate_model_route_with_profiles(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
+    profiles: &RouteTaskProfiles,
+    evaluation: Option<&mut RouteEvaluation>,
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
         mut rejected,
@@ -2212,6 +2305,7 @@ pub fn select_model_route_with_profiles(
         operator_group,
         availability_rejections,
         profiles,
+        evaluation,
     )?;
 
     // Deterministic ordering. COST-PRIMARY lexicographic among adequate models.

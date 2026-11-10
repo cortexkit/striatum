@@ -53,6 +53,16 @@ pub struct LiveConfig {
     pricing: RoutePricing,
 }
 
+/// The deliberately narrow, call-local policy overlay accepted by `route.what_if`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct ModelPolicyPatch {
+    pub pin_only_for: Option<Vec<String>>,
+    pub pin_only: Option<bool>,
+    pub not_for: Option<Vec<String>>,
+    pub only_for: Option<Vec<String>>,
+}
+
 impl LiveConfig {
     pub(crate) fn service_tier(
         &self,

@@ -361,6 +361,28 @@ pub(super) struct Route {
 }
 
 impl Route {
+    pub(super) async fn what_if_with_profiles(
+        &self,
+        params: &Value,
+        lookup: &super::select::ProfileLookup,
+    ) -> Result<Value, cortexkit_role_routing::errors::Refusal> {
+        let config_path = self.harness.config_path.lock().unwrap().clone();
+        let credentials = Arc::clone(&self.harness.broca_credentials.lock().unwrap());
+        super::what_if::what_if_with_profile_lookup(
+            params,
+            &super::Caller::for_route(self.channel, self.epoch),
+            &super::Deps {
+                quota_cache: &self.harness.quota_cache,
+                store: &self.harness.store,
+                routing_config_path: &config_path,
+                operator_config_path: &config_path,
+                broca_credentials: &credentials,
+            },
+            lookup,
+        )
+        .await
+    }
+
     /// Exercise the select handler with a fixed refresh snapshot instead of the
     /// process-wide cache, so profile tests cannot change another test's prices.
     pub(super) async fn select_with_profiles(

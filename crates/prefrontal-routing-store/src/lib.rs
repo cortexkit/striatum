@@ -1071,7 +1071,7 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// The sqlite-backed route-state store. Opening acquires the single-writer lease
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
-    store: SqliteStore,
+    store: evaluation_snapshot::ConnectionStore,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
     /// window, recomputed from the whole population on every route selection
@@ -1094,6 +1094,8 @@ pub struct SqliteRouteStateStore {
     #[cfg(any(test, feature = "test-support"))]
     account_write_transactions: AtomicU64,
 }
+
+mod evaluation_snapshot;
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
 /// `model_facts` writes (bumped by the temporary triggers that
@@ -1375,7 +1377,13 @@ impl SqliteRouteStateStore {
         if let Err(error) = store.with_conn(install_catalog_change_tracking) {
             tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
         }
-        Ok(Self {
+        Ok(Self::from_inner(
+            evaluation_snapshot::ConnectionStore::Live(store),
+        ))
+    }
+
+    fn from_inner(store: evaluation_snapshot::ConnectionStore) -> Self {
+        Self {
             store,
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
@@ -1384,7 +1392,7 @@ impl SqliteRouteStateStore {
             catalog_fingerprint: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             account_write_transactions: AtomicU64::new(0),
-        })
+        }
     }
 
     /// The single-writer fence epoch for this open (for diagnostics / future
