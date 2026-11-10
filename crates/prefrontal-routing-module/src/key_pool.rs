@@ -319,7 +319,7 @@ pub fn acquire(
     };
     if let (Some(from), Some(reason)) = (&lease.moved_from, &lease.move_reason) {
         eprintln!(
-            "[prefrontal-routing] key pool {provider}: session {session} moved from workspace {from} to {} ({reason})",
+            "[striatum] key pool {provider}: session {session} moved from workspace {from} to {} ({reason})",
             lease.workspace
         );
     }

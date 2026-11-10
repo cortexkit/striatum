@@ -1,6 +1,6 @@
 # Architecture
 
-Striatum decides which model and which account serve each model call in the CortexKit fleet. It runs as one supervised module, `ck-prefrontal-routing`, under subc, the daemon that supervises modules and routes calls between them. It serves the `routing/v1` role and its `route.*` operations.
+Striatum decides which model and which account serve each model call in the CortexKit fleet. It registers as `striatum`, running `ck-striatum` under subc, the daemon that supervises modules and routes calls between them. It serves the `routing/v1` role and its `route.*` operations. Its default store is `$XDG_DATA_HOME/cortexkit/striatum/store.db`, with data home defaulting to `~/.local/share`.
 
 ## Terms
 
@@ -20,6 +20,8 @@ Routing owns no model facts and no credentials. It reads them from the modules t
 - **Runners:** which models and service tiers each runner can serve, from its `role.describe`.
 
 ## Crates
+
+The crates keep their `prefrontal-routing-*` names for now; their rename is separate from the runtime switch.
 
 - `prefrontal-routing-core`: the selection policy (scoring, eligibility, quota pressure, account allocation), with no SQL and no transport.
 - `prefrontal-routing-store`: routing's SQLite store and its migrations. Routing alone opens it.

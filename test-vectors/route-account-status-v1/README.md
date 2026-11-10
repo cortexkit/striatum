@@ -1,6 +1,6 @@
 # route.account_status v1
 
-Producer: **routing** (`prefrontal-routing`). Consumer: **Broca**, through the
+Producer: **routing** (`striatum`). Consumer: **Broca**, through the
 same runner management route used for `route.account_for`.
 
 Each JSON file contains a wire request and reply. The examples use routing's

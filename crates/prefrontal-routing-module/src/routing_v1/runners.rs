@@ -528,7 +528,7 @@ fn report_unknown_pair_tokens_once(module: &str, declaration: &RunnerDeclaration
         ] {
             if !known.contains(&token) && reported.insert((module.into(), field, token.into())) {
                 crate::warn_operator(format!(
-                    "[prefrontal-routing] runner {module}: unknown {field} token {token:?}; pair cannot match"
+                    "[striatum] runner {module}: unknown {field} token {token:?}; pair cannot match"
                 ));
             }
         }
@@ -553,7 +553,7 @@ pub(crate) fn declarations_from_catalog(
             }
             Ok(None) => None,
             Err(error) => {
-                crate::warn_operator(format!("[prefrontal-routing] ignored invalid runner declaration from {module}: {error}"));
+                crate::warn_operator(format!("[striatum] ignored invalid runner declaration from {module}: {error}"));
                 None
             }
         }

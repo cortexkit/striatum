@@ -13,7 +13,7 @@ pub fn write_startup_catalog() {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "routing data home is unavailable"))
         .and_then(|directory| write_catalog_at(&directory, CATALOG_BYTES));
     if let Err(error) = result {
-        eprintln!("[prefrontal-routing] WARN: could not write engram catalog: {error}");
+        eprintln!("[striatum] WARN: could not write engram catalog: {error}");
     }
 }
 
@@ -84,10 +84,10 @@ mod tests {
 
     const EXPECTED_CATALOG: &str = r#"{
   "schema_version": 1,
-  "module_id": "prefrontal-routing",
+  "module_id": "striatum",
   "entries": [
     {
-      "entry_id": "prefrontal-routing/store",
+      "entry_id": "striatum/store",
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
@@ -104,7 +104,7 @@ mod tests {
       ]
     },
     {
-      "entry_id": "prefrontal-routing/engram-catalog",
+      "entry_id": "striatum/engram-catalog",
       "class": "excluded",
       "mechanism": "filetree",
       "path": "engram-catalog.json",
@@ -150,14 +150,14 @@ mod tests {
         assert_eq!(CATALOG_BYTES, EXPECTED_CATALOG.as_bytes());
     }
 
-    // Engram keeps page-by-page backup state per entry id, so renaming the store's id
-    // makes it a new entry: the next capture uploads the whole database again and the
-    // old history drops out. The id must stay what it was first published as.
+    // Engram requires each entry id to start with its module id. The coordinated
+    // store move starts a new backup stream with a full baseline; old backups
+    // remain restorable under the retired entry id until retention expires.
     #[test]
-    fn store_entry_keeps_its_published_id() {
+    fn store_entry_uses_the_registered_module_id() {
         assert!(entries(CATALOG_BYTES)
             .iter()
-            .any(|(id, path)| id == "prefrontal-routing/store" && path == "store.db"));
+            .any(|(id, path)| id == "striatum/store" && path == "store.db"));
     }
 
     #[test]
@@ -233,11 +233,16 @@ mod tests {
     fn committed_catalog_passes_engram_catalog_validation_contract() {
         let catalog: Value = serde_json::from_slice(CATALOG_BYTES).expect("catalog JSON");
         assert_eq!(catalog["schema_version"], 1);
-        assert_eq!(catalog["module_id"], "prefrontal-routing");
+        assert_eq!(catalog["module_id"], "striatum");
+        assert_eq!(catalog["module_id"], crate::DEFAULT_MODULE_ID);
         let entries = catalog["entries"].as_array().expect("entries array");
         let mut ids = std::collections::HashSet::new();
         for entry in entries {
             let id = entry["entry_id"].as_str().expect("entry id");
+            assert!(
+                id.starts_with("striatum/"),
+                "entry must belong to striatum: {id}"
+            );
             assert!(ids.insert(id), "duplicate entry id {id}");
             let class = entry["class"].as_str().expect("entry class");
             assert!(matches!(class, "portable" | "device-local" | "excluded"));
@@ -262,10 +267,11 @@ mod tests {
     fn catalog_database_path_matches_the_route_store_opener() {
         let path = entries(CATALOG_BYTES)
             .into_iter()
-            .find_map(|(entry_id, path)| (entry_id == "prefrontal-routing/store").then_some(path))
+            .find_map(|(entry_id, path)| (entry_id == "striatum/store").then_some(path))
             .expect("route-state entry");
         let opened_path = crate::config_overrides::default_store_path().expect("store path");
         assert_eq!(opened_path.file_name().unwrap().to_string_lossy(), path);
+        assert!(opened_path.ends_with("cortexkit/striatum/store.db"));
         assert_eq!(path, "store.db");
     }
 

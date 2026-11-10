@@ -476,7 +476,7 @@ pub(crate) fn record(
         .record_credential_entitlement_fence(refusal, fingerprint.as_deref(), observed_at_ms)
         .map_err(|e| e.to_string())?;
     eprintln!(
-        "[prefrontal-routing] credential entitlement fence recorded provider={} credential={} code={}",
+        "[striatum] credential entitlement fence recorded provider={} credential={} code={}",
         refusal.provider_id, refusal.credential_id, refusal.code
     );
     Ok(())
@@ -532,7 +532,7 @@ pub(crate) fn live(
                     )
                     .map_err(|e| e.to_string())?;
                 eprintln!(
-                    "[prefrontal-routing] credential entitlement fence lifted provider={} credential={}: its vault listing changed",
+                    "[striatum] credential entitlement fence lifted provider={} credential={}: its vault listing changed",
                     fence.provider_id, fence.credential_id
                 );
             }
@@ -628,7 +628,7 @@ pub(crate) fn lift_after_success(
         })
         .map_err(|error| error.to_string())?;
     if lifted {
-        eprintln!("[prefrontal-routing] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded");
+        eprintln!("[striatum] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded");
     }
     Ok(lifted)
 }
@@ -644,7 +644,7 @@ pub(crate) fn lift_for_operator(
         .map_err(|e| e.to_string())?;
     if route_fences > 0 {
         eprintln!(
-            "[prefrontal-routing] account route fences lifted credential={credential_id} count={route_fences}: operator lift after top-up"
+            "[striatum] account route fences lifted credential={credential_id} count={route_fences}: operator lift after top-up"
         );
     }
     let lifted = store
@@ -653,7 +653,7 @@ pub(crate) fn lift_for_operator(
     for fence in &lifted {
         clear_quota_holds(store, fence, "operator_lift")?;
         eprintln!(
-            "[prefrontal-routing] credential entitlement fence lifted provider={} credential={}: operator lift after top-up",
+            "[striatum] credential entitlement fence lifted provider={} credential={}: operator lift after top-up",
             fence.provider_id, fence.credential_id
         );
     }

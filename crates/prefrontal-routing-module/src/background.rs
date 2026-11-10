@@ -89,7 +89,7 @@ where
     tokio::select! {
         frame = read_frame(read_half) => frame.map_err(|e| ModuleError::Message(e.to_string())),
         stopped = loops.next_stop() => {
-            eprintln!("[prefrontal-routing] background-loop-stopped: {stopped}");
+            eprintln!("[striatum] background-loop-stopped: {stopped}");
             Err(stopped)
         }
     }

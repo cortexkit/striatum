@@ -58,7 +58,7 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             out,
-            "[prefrontal-routing] {}: ignoring tier settings file {} ({}{}{}); the next level's settings apply",
+            "[striatum] {}: ignoring tier settings file {} ({}{}{}); the next level's settings apply",
             self.code,
             self.path.display(),
             self.key,

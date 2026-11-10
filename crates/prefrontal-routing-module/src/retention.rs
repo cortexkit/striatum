@@ -541,10 +541,8 @@ mod tests {
 
     #[test]
     fn a_bad_retention_block_does_not_depend_on_the_rest_of_the_file() {
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-retention-config-{}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-retention-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prefrontal-routing.jsonc");
         // `model_routing.demand_exponent` has the wrong type, which fails the
@@ -588,14 +586,12 @@ mod tests {
 
     #[test]
     fn one_pass_purges_at_most_its_shadow_budget_and_the_next_continues() {
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-retention-pass-{}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-retention-pass-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db").to_string_lossy().into_owned();
-        let store = SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", path))
-            .expect("open store");
+        let store =
+            SqliteRouteStateStore::open(&dev_descriptor("striatum", path)).expect("open store");
         store
             .account_transaction(|tx| {
                 for index in 0..20 {
@@ -637,14 +633,12 @@ mod tests {
     /// decision a restore left out of the ledger, on the decision window.
     #[test]
     fn a_pass_prunes_old_event_keys_and_orphaned_parent_failures() {
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-retention-keys-{}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-retention-keys-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db");
         let store = SqliteRouteStateStore::open(&dev_descriptor(
-            "prefrontal-routing",
+            "striatum",
             path.to_string_lossy().into_owned(),
         ))
         .expect("open store");

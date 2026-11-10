@@ -1402,7 +1402,7 @@ async fn select_at_tier(
             deps.broca_credentials,
         ) {
             crate::warn_operator(format!(
-                "[prefrontal-routing] WARN: v1 decision {decision_id} for {} has no remembered serving identity: {error}",
+                "[striatum] WARN: v1 decision {decision_id} for {} has no remembered serving identity: {error}",
                 selected.route_key
             ));
         }

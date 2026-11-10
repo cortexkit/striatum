@@ -1814,7 +1814,8 @@ pub async fn account_quota_loop(
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: PathBuf,
 ) {
-    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota");
+    let project_root =
+        std::env::temp_dir().join(format!("{}-account-quota", crate::DEFAULT_MODULE_ID));
     let _ = std::fs::create_dir_all(&project_root);
     loop {
         let listing = resolver.list_scoped().await;
@@ -1914,7 +1915,7 @@ mod tests {
 
     /// A live Insula reply to `usage.get {"provider":"claude"}`, captured
     /// read-only on 2026-09-30 with
-    /// `ck-prefrontal-routing --account-quota-dry-run --capture`, with identities
+    /// `ck-striatum --account-quota-dry-run --capture`, with identities
     /// replaced: each account UUID became `00000000-0000-4000-8000-00000000000N`
     /// and each email `account-N@example.invalid` (N = 1..5 in reply order, the
     /// same substitution everywhere, org names included). Every other byte
@@ -2123,15 +2124,13 @@ mod tests {
 
     #[test]
     fn retained_windows_and_stale_disclosure_survive_store_restart() {
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-last-good-{}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-last-good-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db").to_string_lossy().into_owned();
         let open = || {
             SqliteRouteStateStore::open(&prefrontal_routing_store::dev_descriptor(
-                "prefrontal-routing",
+                "striatum",
                 path.clone(),
             ))
             .unwrap()
@@ -2345,7 +2344,7 @@ mod tests {
     #[test]
     fn readings_restore_after_restart_with_their_source_dates_and_survive_a_partial_first_poll() {
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-account-quota-restore-{}",
+            "striatum-account-quota-restore-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2353,7 +2352,7 @@ mod tests {
         let path = dir.join("store.db").to_string_lossy().into_owned();
         let open = || {
             SqliteRouteStateStore::open(&prefrontal_routing_store::dev_descriptor(
-                "prefrontal-routing",
+                "striatum",
                 path.clone(),
             ))
             .expect("open store")

@@ -2575,7 +2575,7 @@ fn quota_reading_for_model(
                         && claim_unattributable_scope_warning(account_id)
                     {
                         crate::warn_operator(format!(
-                            "[prefrontal-routing] account {account_id}: ignored unattributable extraRateWindows window without an id; general quota windows still apply"
+                            "[striatum] account {account_id}: ignored unattributable extraRateWindows window without an id; general quota windows still apply"
                         ));
                     }
                     Some(ScopedWindow {
@@ -6876,8 +6876,7 @@ mod tests {
 
     fn open_store(dir: &std::path::Path) -> SqliteRouteStateStore {
         let path = dir.join("store.db").to_string_lossy().into_owned();
-        SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", path))
-            .expect("open store")
+        SqliteRouteStateStore::open(&dev_descriptor("striatum", path)).expect("open store")
     }
 
     fn claude_entry(account: &str) -> Value {

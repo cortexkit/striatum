@@ -82,7 +82,7 @@ impl World {
         let now = clock_ms(baseline);
         let n = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-baseline-{label}-{}-{n}",
+            "striatum-baseline-{label}-{}-{n}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);

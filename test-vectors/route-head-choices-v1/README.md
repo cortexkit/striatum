@@ -37,7 +37,7 @@ paths listed above and `SHA256SUMS` under `test-vectors/route-head-choices-v1/`.
 copies the generated files back to the same paths in the local worktree:
 
 ```sh
-UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-prefrontal-routing -E 'test(=routing_v1::head_choices_tests::serving_bytes_match_tagged_vectors)'
+UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-striatum -E 'test(=routing_v1::head_choices_tests::serving_bytes_match_tagged_vectors)'
 ```
 
 Setting `UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1` writes the generated files.

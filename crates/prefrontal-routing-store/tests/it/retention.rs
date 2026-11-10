@@ -33,7 +33,7 @@ impl Rig {
     fn new(label: &str) -> Self {
         let id = NEXT_RIG.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-retention-{label}-{}-{id}",
+            "striatum-retention-{label}-{}-{id}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -46,7 +46,7 @@ impl Rig {
 
     fn open(&self) -> SqliteRouteStateStore {
         let path = self.db_path().to_string_lossy().into_owned();
-        SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", path))
+        SqliteRouteStateStore::open(&dev_descriptor("striatum", path))
             .expect("open route-state store")
     }
 

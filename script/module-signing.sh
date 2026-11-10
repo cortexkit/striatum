@@ -16,7 +16,7 @@ case "$kind" in routing) ;; *) usage_error "unsupported module kind: '$kind'" ;;
 # Always pass an explicit identifier: codesign otherwise derives one from the
 # file name, and a temporary name would change the identity that keychain
 # items and privacy grants are tied to once modules carry a team signature.
-identifier="ck-prefrontal-$kind"
+identifier="ck-striatum"
 sign() {
   codesign -f -s - -o runtime --identifier "$identifier" "$1"
 }

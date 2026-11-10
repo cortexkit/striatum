@@ -106,7 +106,7 @@ async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
         consumer,
         identity: BindIdentity::new(
             path.parent().unwrap_or(std::path::Path::new(".")),
-            "prefrontal-routing",
+            super::DEFAULT_MODULE_ID,
             "bus",
         ),
         principal: ConsumerIdentity {

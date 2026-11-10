@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! The module-to-module quota-consumption proof: a real subc-core daemon
-//! supervises BOTH insula AND prefrontal-routing, and prefrontal-routing
+//! supervises BOTH insula AND striatum, and striatum
 //! holds TWO independent authenticated connections to the daemon at once: its
 //! INBOUND provider connection (serving route.select) and its OUTBOUND consumer
 //! connection (calling insula's usage.get): without the daemon
@@ -10,7 +10,7 @@
 //! This exercises the three concerns flagged before the wire path was built:
 //!   (a) a second outbound consumer connection from a process that is also a
 //!       provider: independent, not a self-reference the daemon rejects;
-//!   (b) module->module route.open (prefrontal-routing -> insula) works
+//!   (b) module->module route.open (striatum -> insula) works
 //!       identically to an external consumer;
 //!   (c) no deadlock when the serve loop's selection path consults quota.
 //!
@@ -87,9 +87,8 @@ fn build_bin(repo: &Path, bin: &str) -> PathBuf {
 async fn start_both_modules_daemon() -> RealDaemon {
     let subc_core = cortexkit_test_support::SubcDaemonBinary::build(&["commons"]);
     let quota_module = build_bin(&sibling(QUOTA_REPO_REL), "ck-insula");
-    let routing_module = cortexkit_test_support::stage_test_binary(Path::new(env!(
-        "CARGO_BIN_EXE_ck-prefrontal-routing"
-    )));
+    let routing_module =
+        cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
     cortexkit_test_support::warm_exec_fenced(&routing_module);
     assert!(routing_module.exists());
 
@@ -148,7 +147,7 @@ async fn start_both_modules_daemon() -> RealDaemon {
     }
 }
 
-/// Both modules register; prefrontal-routing serves route.select on its INBOUND
+/// Both modules register; striatum serves route.select on its INBOUND
 /// provider connection WHILE its OUTBOUND consumer connection calls quota: the
 /// two coexist on one process. We drive an external consumer to confirm both
 /// modules are routable, and assert routing's selection still works (which it can

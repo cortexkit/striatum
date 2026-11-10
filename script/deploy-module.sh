@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build, validate, sign and place ck-prefrontal-routing, then verify the
+# Build, validate, sign and place ck-striatum, then verify the
 # supervisor generation, running inode, boot ledger and health on macOS.
 # Usage: script/deploy-module.sh [routing]
 # DEPLOY_PREBUILT=<binary> skips tests/build but requires known build provenance.
@@ -11,7 +11,7 @@ CONN="$HOME/.local/share/cortexkit/run/subc-connection.json"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 case "${1:-routing}" in
-  routing) NAME="ck-prefrontal-routing"; MODULE="prefrontal-routing" ;;
+  routing) NAME="ck-striatum"; MODULE="striatum" ;;
   *) echo "usage: $0 [routing]" >&2; exit 2 ;;
 esac
 

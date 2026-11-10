@@ -123,7 +123,7 @@ dedicated persistence tests and are absent from the historical recording.
 To re-record only the public export, run:
 
 ```sh
-PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-prefrontal-routing -E 'test(=routing_v1::replay_tests::replay_availability_cases)'
+PREFRONTAL_RECORD_ROUTING_PUBLIC_AVAILABILITY=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-striatum -E 'test(=routing_v1::replay_tests::replay_availability_cases)'
 ```
 
 For remote recording, return
@@ -142,7 +142,7 @@ Follow `.cortexkit/WORKER.md` at the repository root. For example:
 
 ```sh
 cargo nextest run --locked -p prefrontal-core-module --lib --bins -E 'test(=routing_cooldown::v1_select_wire_tests::core_replay_requests_match_recording) | test(/replay_core_usage_attribution$/)'
-cargo nextest run --locked -p prefrontal-routing-module --bin ck-prefrontal-routing -E 'test(/^routing_v1::replay_tests::/)'
+cargo nextest run --locked -p prefrontal-routing-module --bin ck-striatum -E 'test(/^routing_v1::replay_tests::/)'
 ```
 
 The panel, tier-consumer, model-fact and renderer recorders also have `replay_`

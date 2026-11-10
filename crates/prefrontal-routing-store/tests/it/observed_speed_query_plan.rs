@@ -20,13 +20,13 @@ fn observed_speed_sample_query_searches_the_route_time_index_without_a_temp_btre
         .unwrap()
         .as_nanos();
     let directory = cortexkit_test_support::scratch_root().join(format!(
-        "prefrontal-routing-observed-speed-plan-{}-{timestamp}-{id}",
+        "striatum-observed-speed-plan-{}-{timestamp}-{id}",
         std::process::id()
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let database = directory.join("store.db");
     let descriptor = dev_descriptor(
-        &format!("prefrontal-routing-observed-speed-plan-{id}"),
+        &format!("striatum-observed-speed-plan-{id}"),
         database.to_string_lossy(),
     );
     let store = SqliteRouteStateStore::open(&descriptor).expect("open applies migrations");
@@ -87,13 +87,13 @@ fn workload_class_usage_query_uses_the_workload_class_observed_index() {
         .unwrap()
         .as_nanos();
     let directory = cortexkit_test_support::scratch_root().join(format!(
-        "prefrontal-routing-workload-class-plan-{}-{timestamp}-{id}",
+        "striatum-workload-class-plan-{}-{timestamp}-{id}",
         std::process::id()
     ));
     std::fs::create_dir_all(&directory).unwrap();
     let database = directory.join("store.db");
     let descriptor = dev_descriptor(
-        &format!("prefrontal-routing-workload-class-plan-{id}"),
+        &format!("striatum-workload-class-plan-{id}"),
         database.to_string_lossy(),
     );
     let store = SqliteRouteStateStore::open(&descriptor).expect("open applies migrations");

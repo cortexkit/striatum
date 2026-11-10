@@ -283,9 +283,13 @@ pub(crate) async fn refresh_loop(
         })
         .await;
         match next {
-            Ok(Ok(())) => {},
-            Ok(Err(error)) => crate::warn_operator(format!("[prefrontal-routing] task profile refresh failed; keeping last snapshot: {error}")),
-            Err(error) => crate::warn_operator(format!("[prefrontal-routing] task profile refresh worker failed; keeping last snapshot: {error}")),
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => crate::warn_operator(format!(
+                "[striatum] task profile refresh failed; keeping last snapshot: {error}"
+            )),
+            Err(error) => crate::warn_operator(format!(
+                "[striatum] task profile refresh worker failed; keeping last snapshot: {error}"
+            )),
         }
     }
 }

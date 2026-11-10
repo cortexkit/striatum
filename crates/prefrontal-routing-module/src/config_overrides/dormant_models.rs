@@ -111,7 +111,7 @@ impl LiveConfig {
                 .iter()
                 .filter(|key| presence.manual_upsert_keys.contains(*key))
                 .collect::<Vec<_>>();
-            eprintln!("[prefrontal-routing] {} has models entries the catalog doesn't serve (catalog version {version}), so they do nothing: {keys:?}; of these, routes kept by a manual upsert, where the settings still apply: {manual:?}", path.display());
+            eprintln!("[striatum] {} has models entries the catalog doesn't serve (catalog version {version}), so they do nothing: {keys:?}; of these, routes kept by a manual upsert, where the settings still apply: {manual:?}", path.display());
         }
     }
 }

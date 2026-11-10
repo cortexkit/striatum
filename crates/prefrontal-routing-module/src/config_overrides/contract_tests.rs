@@ -91,10 +91,7 @@ fn striatum_global_config_prefers_primary_falls_back_and_never_merges() {
         assert_eq!(reports.len(), usize::from(previous_exists));
         if previous_exists {
             let report = &reports[0];
-            assert!(
-                report.starts_with("[prefrontal-routing] config_renamed:"),
-                "{report}"
-            );
+            assert!(report.starts_with("[striatum] config_renamed:"), "{report}");
             assert!(
                 report.contains(&previous.display().to_string())
                     && report.contains(&primary.display().to_string()),
@@ -932,7 +929,7 @@ fn generated_schema_is_current_and_closed() {
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
         generated,
-        "regenerate using ck-prefrontal-routing --print-config-schema"
+        "regenerate using ck-striatum --print-config-schema"
     );
     let schema: serde_json::Value = serde_json::from_str(&generated).unwrap();
     assert_eq!(schema["additionalProperties"], false);

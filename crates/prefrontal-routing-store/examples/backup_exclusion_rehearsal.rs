@@ -22,7 +22,7 @@ use rusqlite::Connection;
 
 fn open(path: &std::path::Path) -> SqliteRouteStateStore {
     SqliteRouteStateStore::open(&dev_descriptor(
-        "prefrontal-routing",
+        "striatum",
         path.to_string_lossy().into_owned(),
     ))
     .expect("open route-state store")

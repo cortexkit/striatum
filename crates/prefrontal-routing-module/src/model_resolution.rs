@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn capabilities_reply_states_the_catalog_it_was_computed_against() {
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-capabilities-version-{}-{}",
+            "striatum-capabilities-version-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -542,7 +542,7 @@ mod tests {
         let store: SharedStore = std::sync::Arc::new(
             prefrontal_routing_store::SqliteRouteStateStore::open(
                 &prefrontal_routing_store::dev_descriptor(
-                    "prefrontal-routing-capabilities-version",
+                    "striatum-capabilities-version",
                     dir.join("store.db").to_string_lossy().into_owned(),
                 ),
             )

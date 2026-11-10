@@ -78,7 +78,7 @@ pub(crate) fn decode_usage_result(
                 let account = field("account").map(str::to_string);
                 let reason = format!("routing could not decode this usage.get entry: {error}");
                 eprintln!(
-                    "[prefrontal-routing] quota refresh: {provider} account {}: {reason}",
+                    "[striatum] quota refresh: {provider} account {}: {reason}",
                     account.as_deref().unwrap_or("-")
                 );
                 prefrontal_routing_core::quota::ProviderUsage {
@@ -187,7 +187,7 @@ impl QuotaConsumer {
             "target": { "kind": kind, "module_id": module },
             "identity": {
                 "project_root": project_root,
-                "harness": "prefrontal-routing",
+                "harness": "striatum",
                 "session": "quota-consumer",
             },
             "config": [],
@@ -401,7 +401,7 @@ mod tests {
             .unwrap()
             .subsec_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-quota-consumer-{pid}-{nanos}-{n}.json",
+            "striatum-quota-consumer-{pid}-{nanos}-{n}.json",
             pid = std::process::id()
         ));
         std::fs::write(

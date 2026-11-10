@@ -41,7 +41,7 @@
 //! Delivery: the routing module holds no room identity and no connection to the
 //! core module's room plane (`rooms.post` requires a room member as caller), so
 //! the notice is written to stderr at the fixed [`NOTICE_PREFIX`]. The daemon
-//! captures module stderr in `run/logs/prefrontal-routing.stderr.log`, where the
+//! captures module stderr in `run/logs/striatum.stderr.log`, where the
 //! health sentinel's route-winner arm reads and relays it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -61,7 +61,7 @@ use crate::config_overrides;
 
 /// Fixed prefix of every winner-change notice line. The health sentinel matches
 /// on this exact text, so changing it silently disconnects the relay.
-pub(crate) const NOTICE_PREFIX: &str = "[prefrontal-routing] route-winner-changed ";
+pub(crate) const NOTICE_PREFIX: &str = "[striatum] route-winner-changed ";
 
 /// The announcement rule, carried in every notice so a reader does not have to
 /// know this module to interpret the routes it names.
@@ -575,7 +575,7 @@ fn store_baseline(store: &SqliteRouteStateStore, ladder: &WinnerLadder, trigger:
                 .map_err(|error| error.to_string())
         });
     if let Err(error) = written {
-        eprintln!("[prefrontal-routing] winner ladder baseline not saved: {error}");
+        eprintln!("[striatum] winner ladder baseline not saved: {error}");
     }
 }
 
@@ -600,7 +600,7 @@ pub(crate) fn announce(
         Ok(Some(ladder)) => ladder,
         Ok(None) => return None,
         Err(error) => {
-            eprintln!("[prefrontal-routing] winner ladder unavailable ({trigger}): {error}");
+            eprintln!("[striatum] winner ladder unavailable ({trigger}): {error}");
             return None;
         }
     };
@@ -609,7 +609,7 @@ pub(crate) fn announce(
             Ok(ladder) => Some(ladder),
             Err(reason) => {
                 eprintln!(
-                    "[prefrontal-routing] stored winner ladder {reason}; replacing it without announcing"
+                    "[striatum] stored winner ladder {reason}; replacing it without announcing"
                 );
                 None
             }
@@ -618,7 +618,7 @@ pub(crate) fn announce(
         Err(error) => {
             // Without the baseline there is nothing honest to compare against,
             // and overwriting it would lose a pending move.
-            eprintln!("[prefrontal-routing] winner ladder baseline unreadable: {error}");
+            eprintln!("[striatum] winner ladder baseline unreadable: {error}");
             return None;
         }
     };

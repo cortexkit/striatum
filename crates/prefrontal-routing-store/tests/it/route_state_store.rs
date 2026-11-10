@@ -47,7 +47,7 @@ impl Rig {
         self.dir.join("store.db").to_string_lossy().into_owned()
     }
     fn open(&self) -> SqliteRouteStateStore {
-        let d = dev_descriptor("prefrontal-routing", self.db_path());
+        let d = dev_descriptor("striatum", self.db_path());
         SqliteRouteStateStore::open(&d).expect("open store")
     }
 }
@@ -344,7 +344,7 @@ fn migration_004_preserves_a_preseeded_override() {
     use rusqlite::Connection;
 
     let rig = Rig::new("v3-preseeded-gpt56-override");
-    let descriptor = dev_descriptor("prefrontal-routing", rig.db_path());
+    let descriptor = dev_descriptor("striatum", rig.db_path());
     {
         let v3 = open_sqlite(&descriptor).unwrap();
         v3.migrate(
@@ -479,7 +479,7 @@ fn capacity_keys_for_provider() {
 fn single_writer_lease_rejects_a_second_live_open() {
     let rig = Rig::new("lease");
     let _held = rig.open(); // holds the single-writer lease (same db path)
-    let d = dev_descriptor("prefrontal-routing", rig.db_path());
+    let d = dev_descriptor("striatum", rig.db_path());
     let second = SqliteRouteStateStore::open(&d);
     assert!(
         second.is_err(),
@@ -1051,7 +1051,7 @@ fn migration_030_preserves_real_028_era_decision_rows_without_join_identity() {
     }
 
     let rig = Rig::new("migration-030-028-era-row");
-    let descriptor = dev_descriptor("prefrontal-routing", rig.db_path());
+    let descriptor = dev_descriptor("striatum", rig.db_path());
     let migrations = [
         migration!(1, "001_route_state.sql"),
         migration!(2, "002_usage.sql"),
@@ -2308,7 +2308,7 @@ fn panel_decision_kind_and_migration() {
     use rusqlite::Connection;
 
     let rig = Rig::new("v4-panel-migration");
-    let descriptor = dev_descriptor("prefrontal-routing", rig.db_path());
+    let descriptor = dev_descriptor("striatum", rig.db_path());
     {
         let v4 = open_sqlite(&descriptor).unwrap();
         v4.migrate(
@@ -2426,7 +2426,7 @@ fn migration_007_rebases_catalog_and_preserves_overrides() {
     use rusqlite::Connection;
 
     let rig = Rig::new("v7-aa-v41-rebase");
-    let descriptor = dev_descriptor("prefrontal-routing", rig.db_path());
+    let descriptor = dev_descriptor("striatum", rig.db_path());
     {
         // Apply through migration 6 only, then plant a deliberate override on a
         // route that 007 would otherwise rewrite.

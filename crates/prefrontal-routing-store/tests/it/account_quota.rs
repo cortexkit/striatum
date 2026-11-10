@@ -24,7 +24,7 @@ impl Rig {
 
     fn open(&self) -> SqliteRouteStateStore {
         let path = self.dir.join("store.db").to_string_lossy().into_owned();
-        SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", path))
+        SqliteRouteStateStore::open(&dev_descriptor("striatum", path))
             .expect("open route-state store")
     }
 }

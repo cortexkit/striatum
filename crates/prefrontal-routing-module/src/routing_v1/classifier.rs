@@ -64,7 +64,7 @@ pub(crate) async fn fetch_describe(
                 connection_file
                     .parent()
                     .unwrap_or(std::path::Path::new(".")),
-                "prefrontal-routing",
+                crate::DEFAULT_MODULE_ID,
                 "classifier-models",
             ),
             DESCRIBE_REQUEST.to_vec(),

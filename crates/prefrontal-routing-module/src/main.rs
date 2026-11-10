@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-//! The prefrontal-routing subc module.
+//! The striatum subc module.
 //!
 //! Lifecycle (mirrors the canonical module handshake, same shape as quota-module):
 //!   1. read `--subc <connection-file>`, HMAC-authenticate as a client to subc;
@@ -135,7 +135,7 @@ use tokio::{
     sync::mpsc,
 };
 
-const DEFAULT_MODULE_ID: &str = "prefrontal-routing";
+const DEFAULT_MODULE_ID: &str = "striatum";
 const ROUTE_SELECT_OP: &str = "route.select";
 const ROUTE_RESOLVE_POLICY_OP: &str = "route.resolve_policy";
 const ROUTE_SELECT_PANEL_OP: &str = "route.select_panel";
@@ -498,7 +498,7 @@ fn merge_quota_windows(
                             None => replacement.provider.clone(),
                         };
                         eprintln!(
-                            "[prefrontal-routing] retaining last healthy quota window for {provider} after degraded refresh: {reason}"
+                            "[striatum] retaining last healthy quota window for {provider} after degraded refresh: {reason}"
                         );
                         now_ms
                     });
@@ -542,7 +542,7 @@ impl QuotaRefreshWarnings {
             .collect();
         if !unsupported.is_empty() && self.reported_value_sets.insert(unsupported.clone()) {
             warnings.push(format!(
-                "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {unsupported:?}"
+                "[striatum] quota refresh ignored unsupported spend funding values: {unsupported:?}"
             ));
         }
 
@@ -588,7 +588,7 @@ impl QuotaRefreshWarnings {
                 .get(provider)
                 .expect("active provider has a withheld-balance description");
             warnings.push(format!(
-                "[prefrontal-routing] provider {provider} walled on empty spendable pools while non-spendable pools hold {} - policy, not a quota bug (only granted/subscription funding may spend)",
+                "[striatum] provider {provider} walled on empty spendable pools while non-spendable pools hold {} - policy, not a quota bug (only granted/subscription funding may spend)",
                 withheld.iter().cloned().collect::<Vec<_>>().join(", ")
             ));
         }
@@ -741,7 +741,7 @@ fn record_quota_refresh_failure(cache: &mut QuotaCache, phase: &str, error: impl
     // refresh failing on every retry for hours with nothing in the stderr log.
     if cache.last_error.as_deref() != Some(error.as_str()) {
         eprintln!(
-            "[prefrontal-routing] quota refresh failed; selection keeps the snapshot from refreshedAtMs {} until a refresh succeeds or it goes stale: {error}",
+            "[striatum] quota refresh failed; selection keeps the snapshot from refreshedAtMs {} until a refresh succeeds or it goes stale: {error}",
             cache.refreshed_at_ms
         );
     }
@@ -912,7 +912,7 @@ fn take_operator_warnings() -> Vec<String> {
 fn record_failed_selection_decision(store: &impl RouteStateStore, decision: &DecisionInput) {
     if let Err(error) = store.record_decision(decision) {
         warn_operator(format!(
-            "[prefrontal-routing] WARN: a failed route.select for {} (task {}, send {}) has no decision row: {error}",
+            "[striatum] WARN: a failed route.select for {} (task {}, send {}) has no decision row: {error}",
             decision.target_agent,
             decision.task_id.as_deref().unwrap_or("-"),
             decision.send_id.as_deref().unwrap_or("-"),
@@ -1124,7 +1124,8 @@ async fn account_quota_dry_run(
     connection_file_path: PathBuf,
     capture_dir: Option<PathBuf>,
 ) -> Result<(), ModuleError> {
-    let project_root = std::env::temp_dir().join("prefrontal-routing-account-quota-dry-run");
+    let project_root =
+        std::env::temp_dir().join(format!("{DEFAULT_MODULE_ID}-account-quota-dry-run"));
     let _ = std::fs::create_dir_all(&project_root);
     let mut consumer = QuotaConsumer::connect(&connection_file_path, &project_root)
         .await
@@ -1614,7 +1615,7 @@ async fn answer_route_request<F, Fut>(
     };
     let when = if replied { " after replying" } else { "" };
     warn_operator(format!(
-        "[prefrontal-routing] WARN: route request on channel {channel} (corr {corr}) failed{when}: {error}"
+        "[striatum] WARN: route request on channel {channel} (corr {corr}) failed{when}: {error}"
     ));
     if replied || !egress_open {
         return;
@@ -1631,7 +1632,7 @@ async fn answer_route_request<F, Fut>(
     .await
     {
         warn_operator(format!(
-            "[prefrontal-routing] WARN: route request on channel {channel} (corr {corr}) got no failure reply: {send_error}"
+            "[striatum] WARN: route request on channel {channel} (corr {corr}) got no failure reply: {send_error}"
         ));
     }
 }
@@ -5149,7 +5150,7 @@ mod tests {
         .unwrap();
         let error = check_config_at(&path).unwrap_err().to_string();
         assert!(
-            error.contains("model_routing") && error.contains("prefrontal-routing config-convert"),
+            error.contains("model_routing") && error.contains("ck-striatum config-convert"),
             "{error}"
         );
     }
@@ -5252,7 +5253,7 @@ mod tests {
             emitted.push(warning.to_string())
         });
         assert_eq!(emitted, [
-            "[prefrontal-routing] quota refresh ignored unsupported spend funding values: {\"issuer_credit_v2\"}"
+            "[striatum] quota refresh ignored unsupported spend funding values: {\"issuer_credit_v2\"}"
         ]);
         // A second refresh with the same value set, even on another provider,
         // produces no log line.
@@ -7566,7 +7567,7 @@ mod tests {
         static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         PATH.get_or_init(|| {
             let path = cortexkit_test_support::scratch_root().join(format!(
-                "prefrontal-routing-test-operator-{}.json",
+                "striatum-test-operator-{}.json",
                 std::process::id()
             ));
             crate::test_config::write(&path, "{}").unwrap();
@@ -11738,6 +11739,14 @@ mod tests {
             provenance.build_lock_digest.as_deref().map(str::len),
             Some(64)
         );
+    }
+
+    #[test]
+    fn default_manifest_registers_striatum() {
+        assert_eq!(DEFAULT_MODULE_ID, "striatum");
+        let printed: serde_json::Value =
+            serde_json::from_str(&printed_manifest_json(DEFAULT_MODULE_ID).unwrap()).unwrap();
+        assert_eq!(printed["manifest"]["module_id"], "striatum");
     }
 
     #[test]

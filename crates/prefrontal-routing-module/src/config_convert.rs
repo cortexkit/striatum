@@ -4,7 +4,7 @@
 
 use serde_json::{json, Map, Value};
 
-pub const COMMAND: &str = "ck-prefrontal-routing config-convert";
+pub const COMMAND: &str = "ck-striatum config-convert";
 
 pub(crate) fn defaults() -> Value {
     serde_json::from_str(include_str!("../data/config_convert_defaults.json"))

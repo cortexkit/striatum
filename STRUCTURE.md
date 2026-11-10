@@ -1,16 +1,16 @@
 # Structure
 
-A Rust workspace of three crates. This file is a map: search the code for a specific symbol.
+A Rust workspace of three crates. They keep their `prefrontal-routing-*` names for now, while the module registers as `striatum` and runs as `ck-striatum`. This file is a map: search the code for a specific symbol.
 
 ```text
 crates/
   prefrontal-routing-core/     selection policy and domain types (no SQL, no wire)
   prefrontal-routing-store/    SQLite store and numbered migrations
-  prefrontal-routing-module/   ck-prefrontal-routing binary and wire handlers
+  prefrontal-routing-module/   ck-striatum binary and wire handlers
 docs/specs/model-routing.md    routing policy specification
 test-vectors/route-*/          reply samples routing publishes for its consumers
 scripts/                       source checks and rust-test-gate.sh
-script/                        deploy and signing scripts
+script/                        deploy, signing and offline store-move scripts
 .cargo/                        SQLite build flag and the macOS test-binary signer
 .config/nextest.toml           test timeouts and real-daemon test limits
 ```

@@ -884,7 +884,7 @@ fn report_refused_rate_once(served_key: &str, catalog_key: &str, detail: &str) {
     };
     if reported.insert(format!("{served_key}\u{1e}{catalog_key}\u{1e}{detail}")) {
         eprintln!(
-            "[prefrontal-routing] fusiform served {catalog_key} for {served_key} but this consumer refused it ({detail}); that rate stays absent"
+            "[striatum] fusiform served {catalog_key} for {served_key} but this consumer refused it ({detail}); that rate stays absent"
         );
     }
 }
@@ -1128,7 +1128,7 @@ fn report_unreadable_entries_once(catalog_version: i64, unreadable: &[(String, S
         ""
     };
     eprintln!(
-        "[prefrontal-routing] fusiform catalog version {catalog_version}: skipped {} unreadable entries, their stored routes left unchanged: {named}{more}",
+        "[striatum] fusiform catalog version {catalog_version}: skipped {} unreadable entries, their stored routes left unchanged: {named}{more}",
         unreadable.len()
     );
 }
@@ -1219,7 +1219,7 @@ impl FusiformCatalogConsumer {
                 "target": { "kind": "tool_provider", "module_id": FUSIFORM_MODULE_ID },
                 "identity": {
                     "project_root": project_root,
-                    "harness": "prefrontal-routing",
+                    "harness": "striatum",
                     "session": "fusiform-catalog-consumer",
                 },
                 "config": [],
@@ -1577,7 +1577,7 @@ fn apply_catalog_snapshot(
         );
         if !shadowed.is_empty() {
             eprintln!(
-                "[prefrontal-routing] these models entries set elo or eq over the grade Fusiform serves, and the settings win: {shadowed:?}"
+                "[striatum] these models entries set elo or eq over the grade Fusiform serves, and the settings win: {shadowed:?}"
             );
         }
         report_dormant_config_models(store, path, snapshot.cursor.catalog_version, credentials)?;
@@ -1621,7 +1621,7 @@ fn report_unserved_routes(
         let newly_reported = health.note_unserved_routes(routes);
         if !newly_reported.is_empty() {
             eprintln!(
-                "[prefrontal-routing] Fusiform does not serve these routes: {}",
+                "[striatum] Fusiform does not serve these routes: {}",
                 newly_reported.join(", ")
             );
         }
@@ -1875,7 +1875,8 @@ pub async fn catalog_refresh_loop(
     ladder_sources: LadderSources,
     credentials: crate::broca_credentials::SharedBrocaCredentials,
 ) {
-    let project_root = std::env::temp_dir().join("prefrontal-routing-fusiform-consumer");
+    let project_root =
+        std::env::temp_dir().join(format!("{}-fusiform-consumer", crate::DEFAULT_MODULE_ID));
     let _ = std::fs::create_dir_all(&project_root);
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
@@ -1929,7 +1930,7 @@ pub async fn catalog_refresh_loop(
                 // health snapshot's lastError, a changing one is worth a log line.
                 let rendered = reason.to_string();
                 if last_logged_error.as_deref() != Some(rendered.as_str()) {
-                    eprintln!("[prefrontal-routing] fusiform catalog cycle failed: {rendered}");
+                    eprintln!("[striatum] fusiform catalog cycle failed: {rendered}");
                     last_logged_error = Some(rendered);
                 }
                 if let Ok(mut health) = health.lock() {

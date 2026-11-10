@@ -44,9 +44,8 @@ impl Home {
     }
 
     fn run_with_args(&self, xdg: bool, args: &[&str]) -> Output {
-        let binary = cortexkit_test_support::stage_test_binary(Path::new(env!(
-            "CARGO_BIN_EXE_ck-prefrontal-routing"
-        )));
+        let binary =
+            cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
         let mut command = cortexkit_test_support::fenced_command(&binary, &self.0);
         command.env("HOME", &self.0).env_remove("XDG_CONFIG_HOME");
         if xdg {
@@ -130,7 +129,7 @@ fn invalid_startup(document: &str, token: &str) {
 fn old_explicit_only_providers_refuses_startup_with_converter() {
     invalid_startup(
         r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
-        "prefrontal-routing config-convert",
+        "ck-striatum config-convert",
     );
 }
 
@@ -180,7 +179,7 @@ fn striatum_startup_and_check_config_name_the_chosen_file() {
             for message in [&startup, &report] {
                 let notices: Vec<_> = message
                     .lines()
-                    .filter(|line| line.starts_with("[prefrontal-routing] config_renamed:"))
+                    .filter(|line| line.starts_with("[striatum] config_renamed:"))
                     .collect();
                 assert_eq!(notices.len(), usize::from(previous_exists), "{message}");
                 if previous_exists {

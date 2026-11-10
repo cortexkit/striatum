@@ -82,10 +82,8 @@ impl Harness {
     pub(super) fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-v1-{label}-{}-{n}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-v1-{label}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let descriptor = prefrontal_routing_store::dev_descriptor(
             DEFAULT_MODULE_ID,

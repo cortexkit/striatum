@@ -1,7 +1,7 @@
 //! Quota usage wire types: the decode contract for `insula` (formerly `ai-provider-quota`)'s
 //! `usage.get` response, mirrored from `quota-core/src/model.rs`.
 //!
-//! These are DESERIALIZE-side mirrors: prefrontal-routing consumes quota windows
+//! These are DESERIALIZE-side mirrors: striatum consumes quota windows
 //! module-to-module, so it must decode the exact `ProviderUsage[]` shape the
 //! quota module emits (camelCase keys, silent-degrade entries carrying `error`).
 //! They also serialize back to that same shape so the routing module can persist

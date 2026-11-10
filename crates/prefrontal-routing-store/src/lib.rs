@@ -5030,11 +5030,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-private-state-{}-{timestamp}",
+            "striatum-private-state-{}-{timestamp}",
             std::process::id()
         ));
         let db = root.join("store.db");
-        let descriptor = dev_descriptor("prefrontal-routing-private-state", db.to_string_lossy());
+        let descriptor = dev_descriptor("striatum-private-state", db.to_string_lossy());
         let store = SqliteRouteStateStore::open(&descriptor).expect("open scratch routing store");
 
         let mut pending = vec![root.clone()];
@@ -5503,13 +5503,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-clear-failure-backoff-{}-{timestamp}.sqlite",
+            "striatum-clear-failure-backoff-{}-{timestamp}.sqlite",
             std::process::id()
         ));
-        let descriptor = dev_descriptor(
-            "prefrontal-routing-clear-failure-backoff",
-            path.to_string_lossy(),
-        );
+        let descriptor = dev_descriptor("striatum-clear-failure-backoff", path.to_string_lossy());
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         store
             .store
@@ -5592,11 +5589,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-catalog-generation-migration-{}-{timestamp}.sqlite",
+            "striatum-catalog-generation-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
         let descriptor = dev_descriptor(
-            "prefrontal-routing-catalog-generation-migration",
+            "striatum-catalog-generation-migration",
             path.to_string_lossy(),
         );
 
@@ -5688,13 +5685,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-shadow-retirement-{}-{timestamp}.sqlite",
+            "striatum-shadow-retirement-{}-{timestamp}.sqlite",
             std::process::id()
         ));
-        let descriptor = dev_descriptor(
-            "prefrontal-routing-shadow-retirement",
-            path.to_string_lossy(),
-        );
+        let descriptor = dev_descriptor("striatum-shadow-retirement", path.to_string_lossy());
 
         // A store as the previous binary left it: shadow decisions from the
         // timer, observations and refused requests beside served history
@@ -5827,13 +5821,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-aa-inferred-migration-{}-{timestamp}.sqlite",
+            "striatum-aa-inferred-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
-        let descriptor = dev_descriptor(
-            "prefrontal-routing-aa-inferred-migration",
-            path.to_string_lossy(),
-        );
+        let descriptor = dev_descriptor("striatum-aa-inferred-migration", path.to_string_lossy());
 
         let legacy = open_sqlite(&descriptor).unwrap();
         let migrations = route_state_migrations();
@@ -5888,13 +5879,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-family-migration-{}-{timestamp}.sqlite",
+            "striatum-family-migration-{}-{timestamp}.sqlite",
             std::process::id()
         ));
-        let descriptor = dev_descriptor(
-            "prefrontal-routing-family-migration",
-            path.to_string_lossy(),
-        );
+        let descriptor = dev_descriptor("striatum-family-migration", path.to_string_lossy());
         let fixtures = [
             (
                 "anthropic/claude-opus-4-5",
@@ -5947,11 +5935,10 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-family-refusal-{}-{timestamp}.sqlite",
+            "striatum-family-refusal-{}-{timestamp}.sqlite",
             std::process::id()
         ));
-        let descriptor =
-            dev_descriptor("prefrontal-routing-family-refusal", path.to_string_lossy());
+        let descriptor = dev_descriptor("striatum-family-refusal", path.to_string_lossy());
         let legacy = open_sqlite(&descriptor).unwrap();
         let migrations = route_state_migrations();
         legacy
@@ -5997,11 +5984,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-observed-speed-{label}-{}-{timestamp}.sqlite",
+            "striatum-observed-speed-{label}-{}-{timestamp}.sqlite",
             std::process::id()
         ));
         let descriptor = dev_descriptor(
-            &format!("prefrontal-routing-observed-speed-{label}"),
+            &format!("striatum-observed-speed-{label}"),
             path.to_string_lossy(),
         );
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();

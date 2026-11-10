@@ -161,7 +161,7 @@ impl LiveQuota {
         if let Ok(mut cache) = self.cache.lock() {
             if cache.consumer.attached != attached || cache.consumer.last_error != error {
                 eprintln!(
-                    "[prefrontal-routing] quota source={}{}",
+                    "[striatum] quota source={}{}",
                     if attached {
                         "insula events (10m snapshot backstop)"
                     } else {
@@ -461,7 +461,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         // the ack-pending window ahead of quota samples.
         if state.skipped_subjects.insert(message.subject.clone()) {
             eprintln!(
-                "[prefrontal-routing] quota consumer skipped unread event subject {}",
+                "[striatum] quota consumer skipped unread event subject {}",
                 message.subject
             );
         }
@@ -514,7 +514,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 catch_up_snapshot(source, live, state).await;
             } else {
                 eprintln!(
-                    "[prefrontal-routing] insula refused quota event {}: {code}",
+                    "[striatum] insula refused quota event {}: {code}",
                     message.id
                 );
             }
@@ -587,7 +587,7 @@ async fn update_lag(bus: &quota_bus::AttachedBus, live: &LiveQuota) -> Result<()
     let context = async_nats::jetstream::new(bus.connection.client());
     let consumer = context
         .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
-            "m_prefrontal-routing",
+            format!("m_{}", crate::DEFAULT_MODULE_ID),
             &bus.stream,
         )
         .await
@@ -612,7 +612,8 @@ pub(super) async fn run(
         store,
         snapshot_baseline: Default::default(),
     };
-    let project_root = std::env::temp_dir().join("prefrontal-routing-quota-consumer");
+    let project_root =
+        std::env::temp_dir().join(format!("{}-quota-consumer", crate::DEFAULT_MODULE_ID));
     let _ = std::fs::create_dir_all(&project_root);
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();

@@ -59,7 +59,7 @@ pub async fn serve_routing_fixtures(connection_file: &std::path::Path) -> Routin
 /// `broca` runner through the vault and the standard consumer names.
 pub fn write_operator_routing_config(routing_bin: &std::path::Path, config_dir: &std::path::Path) {
     std::fs::create_dir_all(config_dir).unwrap();
-    let input = config_dir.join("prefrontal-routing.legacy.json");
+    let input = config_dir.join("striatum.legacy.json");
     std::fs::write(&input, r#"{"model_routing": {}}"#).unwrap();
     let output = config_dir.join("prefrontal-routing.jsonc");
     // The converter reads and writes only the two files it is given.

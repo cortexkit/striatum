@@ -171,7 +171,7 @@ pub fn reasoning_catalog_for(path: &Path) -> Option<ReasoningCatalog> {
         Ok(catalog) => Some(catalog),
         Err(error) => {
             eprintln!(
-                "[prefrontal-routing] reading reasoning options for {}: {error}",
+                "[striatum] reading reasoning options for {}: {error}",
                 path.display()
             );
             None
@@ -222,12 +222,12 @@ fn check_variants_with(
 
 fn report_variant_warnings(path: &Path, warnings: Vec<String>) {
     for warning in warnings {
-        eprintln!("[prefrontal-routing] {}: {warning}", path.display());
+        eprintln!("[striatum] {}: {warning}", path.display());
     }
 }
 
 /// Where the module's routing store lives when the daemon manages storage:
-/// `$XDG_DATA_HOME/cortexkit/prefrontal-routing/store.db`, defaulting
+/// `$XDG_DATA_HOME/cortexkit/striatum/store.db`, defaulting
 /// `XDG_DATA_HOME` to `~/.local/share`.
 pub fn default_store_path() -> Option<PathBuf> {
     let data_home = std::env::var_os("XDG_DATA_HOME")
@@ -238,7 +238,12 @@ pub fn default_store_path() -> Option<PathBuf> {
                 .filter(|value| !value.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/share"))
         })?;
-    Some(data_home.join("cortexkit/prefrontal-routing/store.db"))
+    Some(
+        data_home
+            .join("cortexkit")
+            .join(crate::DEFAULT_MODULE_ID)
+            .join("store.db"),
+    )
 }
 
 /// Validate the config at `path` and check its variant overrides against the
@@ -326,7 +331,7 @@ fn reject_old_config(path: &Path, stamp: ConfigStamp) -> Result<(), String> {
 
 fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     parse_config_with_reporter(document, |warning| {
-        crate::warn_operator(format!("[prefrontal-routing] {warning}"));
+        crate::warn_operator(format!("[striatum] {warning}"));
     })
 }
 
@@ -347,7 +352,7 @@ fn parse_config_with_reporter(
     }
     if value.get("elo_overrides").is_some() {
         return Err(
-            "config_key_removed: elo_overrides; move each entry to models.<id>.elo, or run `ck-prefrontal-routing config-convert`"
+            "config_key_removed: elo_overrides; move each entry to models.<id>.elo, or run `ck-striatum config-convert`"
                 .into(),
         );
     }
@@ -427,7 +432,10 @@ pub(crate) fn validate_document(document: &str) -> Result<(), String> {
 
 fn live_config_at(path: &Path, now: Instant) -> Result<Arc<LiveConfig>, String> {
     live_config_at_with_reporter(path, now, |error| {
-        eprintln!("[prefrontal-routing] routing-config-reload-rejected: {}: {error}; keeping last good config", path.display());
+        eprintln!(
+            "[striatum] routing-config-reload-rejected: {}: {error}; keeping last good config",
+            path.display()
+        );
     })
 }
 
@@ -883,10 +891,7 @@ pub async fn config_refresh_loop(path: PathBuf, catalog_wake: Arc<tokio::sync::N
         tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
         let next = live_config(&path);
         if !Arc::ptr_eq(&active, &next) {
-            eprintln!(
-                "[prefrontal-routing] routing-config-reloaded: {}",
-                path.display()
-            );
+            eprintln!("[striatum] routing-config-reloaded: {}", path.display());
             active = next;
             catalog_wake.notify_one();
         }
@@ -987,7 +992,7 @@ struct RoutingConfigFile {
     accounts: crate::config_policy::ProviderAccountsPolicy,
 }
 
-/// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-prefrontal-routing -- --print-config-schema`.
+/// Regenerate with `cargo run -p prefrontal-routing-module --bin ck-striatum -- --print-config-schema`.
 pub fn routing_config_schema() -> String {
     serde_json::to_string_pretty(&schemars::schema_for!(RoutingConfigFile)).unwrap() + "\n"
 }
@@ -1511,13 +1516,13 @@ fn config_path_in_with_reporter(directory: &Path, mut report: impl FnMut(&str)) 
     if previous.exists() {
         if primary.exists() {
             report(&format!(
-                "[prefrontal-routing] config_renamed: {} is ignored; routing reads {}",
+                "[striatum] config_renamed: {} is ignored; routing reads {}",
                 previous.display(),
                 primary.display()
             ));
         } else {
             report(&format!(
-                "[prefrontal-routing] config_renamed: routing reads {}; rename it to {}",
+                "[striatum] config_renamed: routing reads {}; rename it to {}",
                 previous.display(),
                 primary.display()
             ));
@@ -1958,7 +1963,7 @@ where
                 .map(|cached| cached.policy.clone())
                 .unwrap_or_default();
             eprintln!(
-                "[prefrontal-routing] operator routing policy {} is unusable ({error}); keeping the last good policy ({} exclusion entries)",
+                "[striatum] operator routing policy {} is unusable ({error}); keeping the last good policy ({} exclusion entries)",
                 path.display(),
                 policy.exclude.len()
             );
@@ -2247,7 +2252,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let root = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-family-rules-{label}-{}-{timestamp}",
+            "striatum-family-rules-{label}-{}-{timestamp}",
             std::process::id()
         ));
         std::fs::create_dir_all(&root).unwrap();
@@ -2434,7 +2439,7 @@ mod tests {
     fn unreadable_override_base_is_not_replaced_from_defaults() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-override-read-fault-{}-{}",
+            "striatum-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2444,7 +2449,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("store.db");
         let store = SqliteRouteStateStore::open(&dev_descriptor(
-            "prefrontal-routing",
+            "striatum",
             db_path.to_string_lossy().into_owned(),
         ))
         .unwrap();
@@ -2481,7 +2486,7 @@ mod tests {
     fn unreadable_stale_override_base_is_not_reverted_from_seed() {
         use prefrontal_routing_store::{dev_descriptor, SqliteRouteStateStore};
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-stale-override-read-fault-{}-{}",
+            "striatum-stale-override-read-fault-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2491,7 +2496,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("store.db");
         let store = SqliteRouteStateStore::open(&dev_descriptor(
-            "prefrontal-routing",
+            "striatum",
             db_path.to_string_lossy().into_owned(),
         ))
         .unwrap();
@@ -2536,7 +2541,7 @@ mod tests {
         // pre-Elo overrides were cleaned from the live config, and the loss
         // surfaced two layers away as a roster seat failing missing_fact.
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-demote-test-{}-{}",
+            "striatum-demote-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2545,8 +2550,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let db_path = dir.join("store.db");
-        let descriptor =
-            dev_descriptor("prefrontal-routing", db_path.to_string_lossy().into_owned());
+        let descriptor = dev_descriptor("striatum", db_path.to_string_lossy().into_owned());
         let store = SqliteRouteStateStore::open(&descriptor).expect("open test store");
 
         // Round 1: config carries an override for a MIGRATION-ONLY model
@@ -2599,7 +2603,7 @@ mod tests {
     #[test]
     fn consecutive_terminal_failure_threshold_is_configurable_and_rejects_zero() {
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-failure-threshold-test-{}",
+            "striatum-failure-threshold-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2632,7 +2636,7 @@ mod tests {
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-min-band-read-test-{}-{n}",
+            "striatum-min-band-read-test-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2655,7 +2659,7 @@ mod tests {
         assert_eq!(val, Some(0.35));
 
         // File without the key → None.
-        let config_path2 = dir.join("prefrontal-routing-empty.jsonc");
+        let config_path2 = dir.join("striatum-empty.jsonc");
         crate::test_config::write(&config_path2, r#"{ "model_routing": { "models": {} } }"#)
             .unwrap();
         assert_eq!(
@@ -2664,7 +2668,7 @@ mod tests {
         );
 
         // File with NaN key → error.
-        let config_path3 = dir.join("prefrontal-routing-nan.jsonc");
+        let config_path3 = dir.join("striatum-nan.jsonc");
         crate::test_config::write(
             &config_path3,
             r#"{ "model_routing": { "min_best_effort_adequacy": NaN } }"#,
@@ -2682,7 +2686,7 @@ mod tests {
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-cache-policy-test-{}-{n}",
+            "striatum-cache-policy-test-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2722,7 +2726,7 @@ mod tests {
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-cache-policy-mtime-test-{}-{n}",
+            "striatum-cache-policy-mtime-test-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2808,7 +2812,7 @@ mod tests {
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-operator-policy-test-{}-{n}",
+            "striatum-operator-policy-test-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2903,7 +2907,7 @@ mod tests {
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-operator-policy-broken-test-{}-{n}",
+            "striatum-operator-policy-broken-test-{}-{n}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2980,10 +2984,8 @@ mod tests {
 
         static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-elo-live-test-{}-{n}",
-            std::process::id()
-        ));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-elo-live-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("prefrontal-routing.jsonc");
         let mut facts = model_facts_seed().to_vec();
@@ -3029,7 +3031,7 @@ mod overqualification_config_tests {
 
     fn apply(document: Option<&str>) -> Result<RoutingConfig, String> {
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-overqualification-{}-{}.jsonc",
+            "striatum-overqualification-{}-{}.jsonc",
             std::process::id(),
             document.map(|d| d.len()).unwrap_or(0)
         ));
@@ -3102,7 +3104,7 @@ mod catalog_poll_tests {
     #[test]
     fn catalog_poll_ms_defaults_reads_and_rejects_zero() {
         let missing = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-missing-catalog-poll-{}",
+            "striatum-missing-catalog-poll-{}",
             std::process::id()
         ));
         let _ = std::fs::remove_file(&missing);
@@ -3112,7 +3114,7 @@ mod catalog_poll_tests {
         );
 
         let path = cortexkit_test_support::scratch_root().join(format!(
-            "prefrontal-routing-catalog-poll-{}.jsonc",
+            "striatum-catalog-poll-{}.jsonc",
             std::process::id()
         ));
         crate::test_config::write(&path, r#"{ "catalog": { "poll_ms": 1234 } }"#).unwrap();

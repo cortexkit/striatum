@@ -32,7 +32,7 @@ impl Rig {
     }
 
     fn open(&self) -> SqliteRouteStateStore {
-        SqliteRouteStateStore::open(&dev_descriptor("prefrontal-routing", self.db_path()))
+        SqliteRouteStateStore::open(&dev_descriptor("striatum", self.db_path()))
             .expect("open route-state store")
     }
 }

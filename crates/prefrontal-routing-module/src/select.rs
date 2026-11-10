@@ -349,7 +349,7 @@ pub(super) fn warn_ignored_caller_policy_once(sent: bool) {
     static WARNED: Once = Once::new();
     if claim_ignored_caller_policy_warning(sent, &WARNED) {
         eprintln!(
-            "[prefrontal-routing] ignoring caller-supplied model routing policy; configure model_routing in ~/.config/cortexkit/prefrontal-routing.jsonc"
+            "[striatum] ignoring caller-supplied model routing policy; configure model_routing in ~/.config/cortexkit/striatum.jsonc"
         );
     }
 }
@@ -2692,7 +2692,7 @@ pub(super) async fn handle_select_request(
                             broca_credentials,
                         ) {
                             warn_operator(format!(
-                                "[prefrontal-routing] WARN: decision {decision_id} for {} has no remembered serving identity: {error}",
+                                "[striatum] WARN: decision {decision_id} for {} has no remembered serving identity: {error}",
                                 selected.route_key
                             ));
                         }

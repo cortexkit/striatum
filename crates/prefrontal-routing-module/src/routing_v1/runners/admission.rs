@@ -28,7 +28,7 @@ pub(crate) async fn fetch_describe(
             },
             subc_protocol::BindIdentity::new(
                 connection_file.parent().unwrap_or(Path::new(".")),
-                "prefrontal-routing",
+                crate::DEFAULT_MODULE_ID,
                 "runner-service-tiers",
             ),
             br#"{"method":"role.describe","params":{}}"#.to_vec(),
@@ -122,7 +122,7 @@ async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
                         let resolver = cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
                             path.clone(),
                             std::env::current_dir().unwrap_or_else(|_| ".".into()),
-                            "prefrontal-routing",
+                            "striatum",
                         );
                         if let Ok(listing) = resolver.list_scoped().await {
                             if let Ok(mut credentials) = credentials.lock() {

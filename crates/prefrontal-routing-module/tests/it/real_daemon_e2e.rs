@@ -112,13 +112,13 @@ impl Drop for RealDaemon {
 async fn start_real_daemon() -> RealDaemon {
     let subc_core = cortexkit_test_support::SubcDaemonBinary::build(&["commons"]);
     let module_bin = cortexkit_test_support::stage_test_binary(std::path::Path::new(env!(
-        "CARGO_BIN_EXE_ck-prefrontal-routing"
+        "CARGO_BIN_EXE_ck-striatum"
     )));
     // Warm-exec the freshly built module binary too (same assessment stall).
     cortexkit_test_support::warm_exec_fenced(&module_bin);
     assert!(module_bin.exists());
 
-    let rig = unique_temp_dir("prefrontal-routing-real-daemon");
+    let rig = unique_temp_dir("striatum-real-daemon");
     let config_dir = rig.join("config/cortexkit");
     let runtime_dir = rig.join("runtime");
     let data_home = rig.join("data");
@@ -267,7 +267,7 @@ async fn real_subc_core_supervises_routing_module_and_routes_select() {
     let health_body: serde_json::Value = serde_json::from_slice(&health.body).unwrap();
     assert_eq!(health_body["status"], "ok");
 
-    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-project");
+    let project_root = unique_temp_dir("striatum-real-daemon-project");
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
@@ -351,7 +351,7 @@ async fn real_daemon_rebinds_after_route_close_with_fresh_epoch() {
     let mut consumer = connect_consumer(&daemon.connection_file).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-rebind");
+    let project_root = unique_temp_dir("striatum-real-daemon-rebind");
     std::fs::create_dir_all(&project_root).unwrap();
     let first = route_open(&mut consumer, &project_root, 1).await;
     // A model the fixture catalog serves on a provider the fixture vault holds a key for;
@@ -390,7 +390,7 @@ async fn real_daemon_unknown_method_returns_error_frame() {
     let mut consumer = connect_consumer(&daemon.connection_file).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-err");
+    let project_root = unique_temp_dir("striatum-real-daemon-err");
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
@@ -421,7 +421,7 @@ async fn real_daemon_no_available_model_returns_typed_error() {
     let mut consumer = connect_consumer(&daemon.connection_file).await;
     wait_for_catalog(&mut consumer, MODULE_ID, SETUP_TIMEOUT).await;
 
-    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-noavail");
+    let project_root = unique_temp_dir("striatum-real-daemon-noavail");
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 
@@ -462,7 +462,7 @@ async fn real_daemon_serves_routing_v1_select_then_report() {
         "the catalog entry must list routing/v1: {entry}"
     );
 
-    let project_root = unique_temp_dir("prefrontal-routing-real-daemon-v1");
+    let project_root = unique_temp_dir("striatum-real-daemon-v1");
     std::fs::create_dir_all(&project_root).unwrap();
     let route_channel = route_open(&mut consumer, &project_root, 1).await;
 

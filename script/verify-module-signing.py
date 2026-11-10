@@ -13,6 +13,9 @@ def verify(binary, kind):
         capture_output=True, check=True,
     )
     text = (result.stdout + result.stderr).decode()
+    identifier = {"routing": "ck-striatum"}[kind]
+    if not re.search(rf"^Identifier={re.escape(identifier)}$", text, re.MULTILINE):
+        raise ValueError(f"expected signing identifier {identifier}")
     if not re.search(r"flags=0x[0-9a-fA-F]+\([^\n)]*\bruntime\b", text):
         raise ValueError("missing hardened runtime flag")
     # Explicit XML avoids codesign's human-readable dictionary display.

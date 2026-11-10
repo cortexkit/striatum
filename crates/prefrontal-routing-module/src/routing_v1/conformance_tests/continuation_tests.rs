@@ -275,7 +275,7 @@ async fn continuation_first_usageless_report_consumes_reservation_for_every_end_
         drop(subject);
         let reopened = prefrontal_routing_store::SqliteRouteStateStore::open(
             &prefrontal_routing_store::dev_descriptor(
-                "prefrontal-routing",
+                "striatum",
                 restart_path.to_string_lossy().into_owned(),
             ),
         )

@@ -10,12 +10,12 @@ use std::sync::{
 };
 
 const SUBJECT: &str = "ck.box_test.event.insula.quota_sampled.v1";
-const OWNER: DurableOwner<'_> = DurableOwner::Module("prefrontal-routing");
+const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
 
 fn fixture() -> (ScratchDir, LiveQuota) {
     let scratch = ScratchDir::new("routing-quota-events");
     let store = SqliteRouteStateStore::open(&dev_descriptor(
-        "prefrontal-routing",
+        "striatum",
         scratch.path().join("store.db").to_string_lossy(),
     ))
     .unwrap();

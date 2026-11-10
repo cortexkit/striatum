@@ -26,7 +26,7 @@ use tokio::{
     time::{timeout, Instant},
 };
 
-pub const MODULE_ID: &str = "prefrontal-routing";
+pub const MODULE_ID: &str = "striatum";
 pub const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -127,7 +127,7 @@ fn json_route_open(project_root: &Path) -> Value {
     };
     let identity = BindIdentity::new(
         project_root.to_path_buf(),
-        "prefrontal-routing-e2e".to_string(),
+        "striatum-e2e".to_string(),
         "session-1".to_string(),
     );
     // NOTE: subc-protocol 0.4 (commit e0e7ce77) removed the route.open `config`

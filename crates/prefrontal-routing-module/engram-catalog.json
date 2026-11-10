@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "module_id": "prefrontal-routing",
+  "module_id": "striatum",
   "entries": [
     {
-      "entry_id": "prefrontal-routing/store",
+      "entry_id": "striatum/store",
       "class": "portable",
       "mechanism": "page-db",
       "path": "store.db",
@@ -20,7 +20,7 @@
       ]
     },
     {
-      "entry_id": "prefrontal-routing/engram-catalog",
+      "entry_id": "striatum/engram-catalog",
       "class": "excluded",
       "mechanism": "filetree",
       "path": "engram-catalog.json",

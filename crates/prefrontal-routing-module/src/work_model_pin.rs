@@ -181,7 +181,7 @@ pub(crate) fn select_with_availability(
                 let warning = format!(
                     "variant {variant} for {identity} not checked: {why}; the runner decides whether it is admitted"
                 );
-                eprintln!("[prefrontal-routing] WARN: {pin}: {warning}");
+                eprintln!("[striatum] WARN: {pin}: {warning}");
                 variant_warning = Some(warning);
             }
         }
