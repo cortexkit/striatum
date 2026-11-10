@@ -53,12 +53,17 @@ FROM model_route_usage INDEXED BY model_route_usage_observed_idx
 WHERE observed_at > ?1 AND observed_at <= ?2
 GROUP BY provider_id";
 
-// Aggregate usage before joining decisions so multiple executions cannot multiply
-// the token sums. Do not apply the time window to individual usage rows: old rows
-// still belong to a task whose last usage is recent, and recent follow-ups must
-// reopen a closed task.
+// Find candidate tasks through the time index before reading their full history.
+// Windowing the sums themselves would lose old executions of recent tasks; the
+// final MAX must also see newer follow-ups that reopen a candidate task. Aggregate
+// before joining decisions so multiple executions cannot multiply token sums.
 const CLOSED_TASK_USAGE_SQL: &str = "
-WITH usage_totals AS (
+WITH candidate_tasks AS (
+    SELECT task_workload, task_id
+    FROM model_route_usage INDEXED BY model_route_usage_observed_idx
+    WHERE observed_at > ?1 AND observed_at <= ?2
+      AND task_id IS NOT NULL AND task_workload IS NOT NULL
+), usage_totals AS (
     SELECT task_workload AS workload, task_id,
            SUM(CAST(input_tokens AS REAL)) AS fresh_input,
            SUM(CAST(cached_read_tokens AS REAL)) AS cached_read,
@@ -72,6 +77,7 @@ WITH usage_totals AS (
            COUNT(DISTINCT provider_id) > 1 AS multi_provider
     FROM model_route_usage INDEXED BY model_route_usage_task_idx
     WHERE task_id IS NOT NULL AND task_workload IS NOT NULL
+      AND (task_workload, task_id) IN (SELECT task_workload, task_id FROM candidate_tasks)
     GROUP BY task_workload, task_id
     HAVING MAX(observed_at) > ?1 AND MAX(observed_at) <= ?2
 ), decisions AS (
@@ -105,69 +111,75 @@ JOIN model_counts m ON m.task_id = u.task_id AND m.workload = u.workload
 ORDER BY u.workload, u.task_id";
 
 impl SqliteRouteStateStore {
+    fn with_profile_usage_read<T>(
+        &self,
+        read: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        // These scans can take seconds. A pooled read-only connection keeps the
+        // request writer mutex free even when the refresh runs on a blocking thread.
+        self.store.with_read(read).map_err(err)
+    }
+
     /// Background-only reporting scan, bounded by the existing observed-time index.
     /// Providers with no rows in `(now - 30 days, now]` are not returned.
     pub fn provider_token_reporting(
         &self,
         now_ms: i64,
     ) -> RouteStateResult<Vec<ProviderTokenReporting>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(PROVIDER_TOKEN_REPORTING_SQL)?;
-                let rows =
-                    stmt.query_map(params![now_ms.saturating_sub(30 * DAY_MS), now_ms], |row| {
-                        Ok(ProviderTokenReporting {
-                            provider_id: row.get(0)?,
-                            reports_cache_write: row.get(1)?,
-                        })
-                    })?;
-                rows.collect()
-            })
-            .map_err(err)
+        self.with_profile_usage_read(|c: &Connection| {
+            let mut stmt = c.prepare(PROVIDER_TOKEN_REPORTING_SQL)?;
+            let rows =
+                stmt.query_map(params![now_ms.saturating_sub(30 * DAY_MS), now_ms], |row| {
+                    Ok(ProviderTokenReporting {
+                        provider_id: row.get(0)?,
+                        reports_cache_write: row.get(1)?,
+                    })
+                })?;
+            rows.collect()
+        })
     }
 
-    /// Recompute samples from retained rows. A task closes 24 hours after its last
+    /// Recompute samples from window candidates and their retained history.
+    /// A task closes 24 hours after its last
     /// usage and is returned when that usage is in `(now - 30 days, now - 24h]`.
     /// Later usage reopens it; later decisions can change its multi-model marker.
     /// This potentially large read belongs in the background refresh, not boot.
     pub fn closed_task_usage(&self, now_ms: i64) -> RouteStateResult<Vec<ClosedTaskUsage>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(CLOSED_TASK_USAGE_SQL)?;
-                let rows = stmt.query_map(
-                    params![
-                        now_ms.saturating_sub(30 * DAY_MS),
-                        now_ms.saturating_sub(DAY_MS)
-                    ],
-                    |row| {
-                        Ok(ClosedTaskUsage {
-                            workload: row.get(0)?,
-                            task_ref: row.get(1)?,
-                            provider_id: row.get(12)?,
-                            selected_model_id: row.get(2)?,
-                            selected_variant: row.get(3)?,
-                            iq_bucket: serde_json::from_str::<serde_json::Value>(
-                                &row.get::<_, String>(4)?,
-                            )
-                            .ok()
-                            .and_then(|value| value.get("iq").and_then(|iq| iq.as_f64()))
-                            .map(|iq| (iq / 10.0).floor() as i64),
-                            multi_model: row.get(5)?,
-                            multi_provider: row.get(13)?,
-                            totals: TaskTokenTotals {
-                                fresh_input: row.get(6)?,
-                                cached_read: row.get(7)?,
-                                cache_write: row.get(8)?,
-                                output_excluding_reasoning: row.get(9)?,
-                                reasoning: row.get(10)?,
-                            },
-                            closed_at_ms: row.get(11)?,
-                        })
-                    },
-                )?;
-                rows.collect()
-            })
-            .map_err(err)
+        self.with_profile_usage_read(|c: &Connection| {
+            let mut stmt = c.prepare(CLOSED_TASK_USAGE_SQL)?;
+            let rows = stmt.query_map(
+                params![
+                    now_ms.saturating_sub(30 * DAY_MS),
+                    now_ms.saturating_sub(DAY_MS)
+                ],
+                |row| {
+                    Ok(ClosedTaskUsage {
+                        workload: row.get(0)?,
+                        task_ref: row.get(1)?,
+                        provider_id: row.get(12)?,
+                        selected_model_id: row.get(2)?,
+                        selected_variant: row.get(3)?,
+                        iq_bucket: serde_json::from_str::<serde_json::Value>(
+                            &row.get::<_, String>(4)?,
+                        )
+                        .ok()
+                        .and_then(|value| value.get("iq").and_then(|iq| iq.as_f64()))
+                        .map(|iq| (iq / 10.0).floor() as i64),
+                        multi_model: row.get(5)?,
+                        multi_provider: row.get(13)?,
+                        totals: TaskTokenTotals {
+                            fresh_input: row.get(6)?,
+                            cached_read: row.get(7)?,
+                            cache_write: row.get(8)?,
+                            output_excluding_reasoning: row.get(9)?,
+                            reasoning: row.get(10)?,
+                        },
+                        closed_at_ms: row.get(11)?,
+                    })
+                },
+            )?;
+            rows.collect()
+        })
     }
 }
 
@@ -252,6 +264,122 @@ mod tests {
         store
             .record_usage_delivery_for_decision(&observation(id, at), decision)
             .unwrap();
+    }
+
+    #[test]
+    fn request_write_completes_while_profile_reader_is_paused() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let store = Arc::new(store("paused-profile-reader"));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let refresh_store = Arc::clone(&store);
+        let refresh = std::thread::spawn(move || {
+            refresh_store.with_profile_usage_read(|connection| {
+                connection.query_row("SELECT COUNT(*) FROM model_route_usage", [], |_| Ok(()))?;
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (request_tx, request_rx) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            request_tx
+                .send(store.record_usage_delivery(&observation("foreground", NOW)))
+                .unwrap();
+        });
+        let response = request_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        refresh.join().unwrap().unwrap();
+        request.join().unwrap();
+        assert!(
+            response
+                .expect("request waited for the paused profile reader")
+                .unwrap()
+                .usage_recorded
+        );
+    }
+
+    #[test]
+    fn both_profile_queries_complete_while_request_connection_is_held() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let store = Arc::new(store("profile-query-readers"));
+        let request_store = Arc::clone(&store);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let request = std::thread::spawn(move || {
+            request_store.store.with_conn(|_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let refresh = std::thread::spawn(move || {
+            refresh_tx
+                .send((
+                    store.closed_task_usage(NOW),
+                    store.provider_token_reporting(NOW),
+                ))
+                .unwrap();
+        });
+        let response = refresh_rx.recv_timeout(Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        request.join().unwrap().unwrap();
+        refresh.join().unwrap();
+        let (tasks, reporting) = response.expect("profile queries took the request connection");
+        assert!(tasks.unwrap().is_empty());
+        assert!(reporting.unwrap().is_empty());
+    }
+
+    #[test]
+    fn closed_task_usage_work_does_not_grow_with_unrelated_expired_tasks() {
+        let store = store("bounded-profile-query");
+        decision(
+            &store,
+            "d",
+            Some("recent"),
+            "mason",
+            ("sol", None),
+            75.0,
+            NOW - 3 * DAY_MS,
+        );
+        usage(&store, "u", "d", NOW - 2 * DAY_MS);
+        let steps = || {
+            store
+                .store
+                .with_conn(|connection| {
+                    let mut statement = connection.prepare(CLOSED_TASK_USAGE_SQL)?;
+                    let mut rows = statement.query(params![NOW - 30 * DAY_MS, NOW - DAY_MS])?;
+                    let mut count = 0;
+                    while rows.next()?.is_some() {
+                        count += 1;
+                    }
+                    drop(rows);
+                    assert_eq!(count, 1);
+                    Ok(statement.get_status(rusqlite::StatementStatus::VmStep))
+                })
+                .unwrap()
+        };
+        let before = steps();
+        store.store.with_conn(|connection| {
+            connection.execute(
+                "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<20000)
+                 INSERT INTO model_route_usage (id, task_id, task_workload, route_key, capacity_key, provider_id, observed_at)
+                 SELECT 'expired-'||x, 'expired-'||x, 'mason', 'provider/model', 'provider/model', 'provider', ?1 FROM n",
+                params![NOW - 40 * DAY_MS],
+            )
+        }).unwrap();
+        let after = steps();
+        assert!(
+            after <= before + 1000,
+            "expired tasks increased VM steps from {before} to {after}"
+        );
     }
 
     #[test]
@@ -341,7 +469,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_task_usage_query_plan_reads_tagged_usage_and_probes_task_decisions() {
+    fn closed_task_usage_query_plan_searches_window_then_task_history_and_decisions() {
         let store = store("task-query-plan");
         decision(
             &store,
@@ -362,19 +490,19 @@ mod tests {
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .unwrap();
-        let usage_accesses: Vec<_> = details
-            .iter()
-            .filter(|detail| detail.contains("model_route_usage"))
-            .collect();
         assert!(
-            !usage_accesses.is_empty(),
-            "missing usage access: {details:?}"
+            details.iter().any(|detail| detail.contains("SEARCH model_route_usage USING INDEX model_route_usage_observed_idx (observed_at>? AND observed_at<?)")),
+            "candidates must be bounded by observed time: {details:?}"
         );
         assert!(
-            usage_accesses
+            details.iter().any(|detail| detail.contains("SEARCH model_route_usage USING INDEX model_route_usage_task_idx (task_workload=? AND task_id=?)")),
+            "history must be probed by candidate workload and task: {details:?}"
+        );
+        assert!(
+            !details
                 .iter()
-                .all(|detail| detail.contains("USING INDEX model_route_usage_task_idx")),
-            "usage must read the partial task index, not scan the full table: {details:?}"
+                .any(|detail| detail.starts_with("SCAN model_route_usage")),
+            "usage must not scan the entire table or task index: {details:?}"
         );
         assert!(
             details.iter().any(|detail| {
@@ -626,6 +754,7 @@ mod tests {
             // Even a model-changing decision with no usage disqualifies the task.
             assert!(store.closed_task_usage(NOW + DAY_MS).unwrap()[0].multi_model);
             usage(&store, "other-model-follow-up", "d2", NOW + DAY_MS);
+            assert!(store.closed_task_usage(NOW).unwrap().is_empty());
             assert!(store.closed_task_usage(NOW + DAY_MS).unwrap().is_empty());
             let tasks = store.closed_task_usage(NOW + 2 * DAY_MS).unwrap();
             assert_eq!(tasks.len(), 1);
