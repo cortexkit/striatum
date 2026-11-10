@@ -868,6 +868,7 @@ impl LiveConfig {
                     .overqualification
                     .resolve()
                     .expect("validated config"),
+                ..Default::default()
             },
             applied,
             unknown_keys,

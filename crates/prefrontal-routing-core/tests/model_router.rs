@@ -20,10 +20,10 @@ use prefrontal_routing_core::model_router::{
     RouteRuntimeState, SelectModelRouteInput,
 };
 use prefrontal_routing_core::{
-    select_panel, AvailabilitySubstrate, ExclusionPolicy, OverqualificationConfig,
+    select_panel, AvailabilitySubstrate, ExclusionPolicy, ModelMetric, OverqualificationConfig,
     PanelCauseReason, PanelClass, PanelDiversity, PanelRosterEntry, PanelSelection,
-    PanelShortfallCode, PanelSpec, RoutingConfig, SelectPanelInput, DEFAULT_OVERQUALIFICATION,
-    DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY,
+    PanelShortfallCode, PanelSpec, RoutingConfig, SelectPanelInput, ADEQUACY_FLOOR,
+    DEFAULT_OVERQUALIFICATION, DEFAULT_ROUTING_CONFIG, MIN_BEST_EFFORT_ADEQUACY,
 };
 
 /// Selection with the over-qualification term switched off, for tests of
@@ -1871,6 +1871,108 @@ fn best_rejected_below_band_skips_a_route_whose_adequacy_is_not_a_number() {
         .expect("weak route is the closest survivor");
     assert_eq!(best.route_key, "p/weak");
     assert!(best.adequacy.is_finite());
+}
+
+#[test]
+fn below_bar_policy_refuses_retry_survivor_instead_of_best_effort() {
+    let facts: Vec<_> = [
+        ("openai", "strong", 1_100.0),
+        ("p", "fenced", 1_000.0),
+        ("pin-provider", "strong", 1_100.0),
+        ("cerebras", "qwen-3.8-27b", 620.0),
+    ]
+    .into_iter()
+    .map(|(provider, model, elo)| {
+        fact(FactBuilder {
+            provider_id: provider.into(),
+            model_id: model.into(),
+            scores: scores(elo, 1_500.0, 80.0),
+            ..Default::default()
+        })
+    })
+    .collect();
+    let attempt = || {
+        let mut attempt = input(
+            facts.clone(),
+            req(80.0, 0.0),
+            Extra {
+                runtime_snapshot: Some(snapshot_with_quota_exhausted("p/fenced", 2_000.0)),
+                ..Extra::default()
+            },
+        );
+        attempt.exclude_route_keys = vec!["openai".into()];
+        attempt.operator_exclude_keys = vec!["pin-provider".into()];
+        attempt
+    };
+    let selected = select_model_route_with_config(attempt(), &DEFAULT_ROUTING_CONFIG).unwrap();
+    assert_eq!(selected.route_key, "cerebras/qwen-3.8-27b");
+    assert!((selected.score.adequacy - 0.67).abs() < 0.01);
+    assert!(selected.below_floor.is_some());
+
+    let error = select_model_route_with_config(
+        attempt(),
+        &RoutingConfig {
+            allow_best_effort: false,
+            ..DEFAULT_ROUTING_CONFIG
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.reason, RouteFailureReason::NoAdequateRoute);
+    let best = error.best_rejected.as_ref().unwrap();
+    assert_eq!(best.route_key, "cerebras/qwen-3.8-27b");
+    assert!((best.adequacy - 0.67).abs() < 0.01);
+    assert!(error.message.contains("adequacy 0.67"), "{error}");
+    assert!(
+        error
+            .message
+            .contains(&format!("floor ({ADEQUACY_FLOOR:.2})")),
+        "{error}"
+    );
+    for reason in [
+        "openai/strong: excluded",
+        "excluded_by_operator",
+        "quota_exhausted",
+    ] {
+        assert!(error.message.contains(reason), "{error}");
+    }
+}
+
+#[test]
+fn below_bar_policy_requires_each_demanded_axis_to_clear() {
+    let top = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "top".into(),
+        scores: scores(1_000.0, 2_000.0, 80.0),
+        ..Default::default()
+    });
+    let medium = fact(FactBuilder {
+        provider_id: "p".into(),
+        model_id: "medium".into(),
+        scores: scores(920.0, 2_000.0, 80.0),
+        ..Default::default()
+    });
+    let attempt = || {
+        input(
+            vec![top.clone(), medium.clone()],
+            req(100.0, 100.0),
+            Extra {
+                runtime_snapshot: Some(snapshot_with_quota_exhausted("p/top", 2_000.0)),
+                ..Extra::default()
+            },
+        )
+    };
+    let selected = select_model_route_with_config(attempt(), &DEFAULT_ROUTING_CONFIG).unwrap();
+    assert!(selected.score.adequacy >= ADEQUACY_FLOOR);
+    assert!(selected.score.metrics[&ModelMetric::Elo].fit < ADEQUACY_FLOOR);
+    let error = select_model_route_with_config(
+        attempt(),
+        &RoutingConfig {
+            allow_best_effort: false,
+            ..DEFAULT_ROUTING_CONFIG
+        },
+    )
+    .unwrap_err();
+    assert_eq!(error.reason, RouteFailureReason::NoAdequateRoute);
 }
 
 /// A survivor between the floor and sanity band is returned with a warning.

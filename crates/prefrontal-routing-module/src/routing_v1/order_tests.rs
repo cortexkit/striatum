@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use cortexkit_role_routing_conformance::CatalogModel;
 use prefrontal_routing_core::billing::{BillingPlane, BillingRate};
-use prefrontal_routing_core::ModelFact;
+use prefrontal_routing_core::{ModelFact, RouteStateStore};
 use prefrontal_routing_store::{FusiformCatalogCursor, FusiformFactUpdate};
 use serde_json::{json, Value};
 use subc_protocol::FrameType;
@@ -186,6 +186,146 @@ fn legacy_route(reply: &(FrameType, Value)) -> String {
         .as_str()
         .unwrap()
         .to_owned()
+}
+
+fn below_bar_harness() -> Arc<Harness> {
+    let harness = harness(&[
+        (CHEAP, true, true, 200_000),
+        ("strong-provider/top", true, true, 200_000),
+        ("fenced-provider/top", true, true, 200_000),
+        ("manual-provider/top", true, true, 200_000),
+    ]);
+    for mut fact in harness.store().get_facts().unwrap() {
+        fact.scores.elo = match fact.provider_id.as_str() {
+            "cheap-provider" => 620.0,
+            "fenced-provider" => 1_000.0,
+            "strong-provider" | "manual-provider" => 1_100.0,
+            _ => continue,
+        };
+        harness
+            .store()
+            .upsert_fact(
+                &fact,
+                prefrontal_routing_core::route_state_store::FactSource::Override,
+            )
+            .unwrap();
+    }
+    harness.edit_config(|config| {
+        config["models"]["manual-provider/top"] = json!({"pin_only": true});
+    });
+    // The quota-blocked route still sets the maximum Elo used to compute the
+    // iq-80 quality bar. Excluding the failed provider and reserving another
+    // strong route for pins must not make the remaining weaker route adequate.
+    harness
+        .store()
+        .update_route_state(
+            "fenced-provider/top",
+            "fenced-provider/top",
+            &prefrontal_routing_core::RouteStateUpdate {
+                quota_exhausted_until: Some(crate::now_ms() as f64 + 600_000.0),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    harness
+}
+
+#[tokio::test]
+async fn below_bar_policy_is_shared_by_v1_legacy_and_what_if_and_bypassed_by_pins() {
+    let harness = below_bar_harness();
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let v1 = json!({"consumer": "mason", "requirements": {"iq": 80},
+        "exclude": ["strong-provider/top"], "detail": true});
+    let legacy = json!({"consumer": "mason", "targetAgent": "mason",
+        "executor": "broca", "substrate": "broca", "requirements": {"iq": 80, "eq": 0},
+        "excludeRouteKeys": ["strong-provider"]});
+    let selected = route.call("route.select", &v1).await;
+    assert_eq!(route_of(&selected), CHEAP);
+    assert!(
+        (selected.1["result"]["detail"]["score"]["adequacy"]
+            .as_f64()
+            .unwrap()
+            - 0.67)
+            .abs()
+            < 0.01
+    );
+    assert_eq!(
+        legacy_route(&route.call("route.select", &legacy).await),
+        CHEAP
+    );
+
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["below_bar"] = json!("refuse");
+        config["consumers"]["mason.review"] = json!({});
+    });
+    for consumer in ["mason", "mason.review"] {
+        let mut request = v1.clone();
+        request["consumer"] = json!(consumer);
+        let refused = route.call("route.select", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "no_route", "{}", refused.1);
+        assert_eq!(
+            refused.1["detail"]["reason"], "all_inadequate",
+            "{}",
+            refused.1
+        );
+        assert_eq!(
+            refused.1["detail"]["adequacyFloor"],
+            prefrontal_routing_core::ADEQUACY_FLOOR
+        );
+        assert!(
+            (refused.1["detail"]["bestRejected"]["adequacy"]
+                .as_f64()
+                .unwrap()
+                - 0.67)
+                .abs()
+                < 0.01
+        );
+        let details = refused.1["detail"]["rejected"].to_string();
+        for reason in ["excluded", "pin_only", "quota_exhausted"] {
+            assert!(details.contains(reason), "{details}");
+        }
+        request["pin"] = json!(CHEAP);
+        assert_eq!(route_of(&route.call("route.select", &request).await), CHEAP);
+    }
+    let refused = route.call("route.select", &legacy).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "no_adequate_route", "{}", refused.1);
+    assert!(
+        refused.1["message"]
+            .as_str()
+            .unwrap()
+            .contains("adequacy 0.67"),
+        "{}",
+        refused.1
+    );
+    let mut pinned = legacy.clone();
+    pinned["modelPin"] = json!(CHEAP);
+    assert_eq!(
+        legacy_route(&route.call("route.select", &pinned).await),
+        CHEAP
+    );
+
+    let operator = harness.bind(json!({"kind": "direct"}), None).await;
+    let sweep = json!({"consumer": "mason.review", "iqs": [80], "eq": 0,
+        "policy_patch": {"models": {"strong-provider/top": {"not_for": ["mason"]}}}});
+    let evaluation = operator.call("route.what_if", &sweep).await;
+    assert_eq!(evaluation.0, FrameType::Response, "{}", evaluation.1);
+    let row = &evaluation.1["result"]["results"][0];
+    assert!(row["pick"].is_null(), "{row}");
+    assert_eq!(row["refusal"]["code"], "no_route", "{row}");
+    assert_eq!(
+        row["refusal"]["detail"]["reason"], "all_inadequate",
+        "{row}"
+    );
+    assert!(
+        (row["refusal"]["detail"]["bestRejected"]["adequacy"]
+            .as_f64()
+            .unwrap()
+            - 0.67)
+            .abs()
+            < 0.01
+    );
 }
 
 /// A fresh ladder answers its first allowed entry. Demand answers the cheaper

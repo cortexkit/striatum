@@ -35,6 +35,19 @@ pub(crate) struct SelectionPass<'a> {
 }
 
 impl<'a> SelectionPass<'a> {
+    pub fn routing_config(&self) -> RoutingConfig {
+        let policy = self.operator_config.consumer_policy(
+            self.consumer,
+            &crate::config_policy::ConsumerPolicy::default(),
+            &std::collections::BTreeMap::new(),
+        );
+        RoutingConfig {
+            allow_best_effort: policy.below_bar.unwrap_or_default()
+                == crate::config_policy::BelowBarPolicy::BestEffort,
+            ..*self.config
+        }
+    }
+
     pub fn input(
         &self,
         available: &std::collections::HashSet<String>,
@@ -80,7 +93,7 @@ impl<'a> SelectionPass<'a> {
             .collect();
         let result = select_candidates(
             self.input(&allowed, self.snapshot.clone()),
-            self.config,
+            &self.routing_config(),
             self.slots,
             self.consumer_exclude,
             self.rejections,
@@ -441,6 +454,10 @@ pub(crate) fn explain_dotted_exclusions(
     config: &crate::config_overrides::LiveConfig,
     consumer: &str,
 ) -> Result<SelectedModelRoute, prefrontal_routing_core::model_router::NoRouteError> {
+    let quality_refusal = matches!(
+        &result,
+        Err(error) if error.reason == prefrontal_routing_core::model_router::RouteFailureReason::NoAdequateRoute
+    );
     let rejected = match &mut result {
         Ok(selected) => &mut selected.rejected,
         Err(error) => &mut error.rejected,
@@ -449,6 +466,10 @@ pub(crate) fn explain_dotted_exclusions(
         if rejection.reason == "excluded_by_operator" || rejection.reason == "not_available" {
             if let Some(detail) = config.dotted_rule_refusal(consumer, &rejection.route_key) {
                 rejection.detail = Some(detail);
+            } else if quality_refusal {
+                if let Some(detail) = config.route_policy_refusal(consumer, &rejection.route_key) {
+                    rejection.detail = Some(detail);
+                }
             }
         }
     }

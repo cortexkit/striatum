@@ -520,6 +520,14 @@ pub enum ConsumerMode {
     Ladder,
 }
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BelowBarPolicy {
+    #[default]
+    BestEffort,
+    Refuse,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProjectPolicy {
@@ -532,6 +540,9 @@ pub struct ConsumerPolicy {
     pub service_tier: Option<crate::tier_settings::Tier>,
     pub service_tiers: Option<BTreeMap<String, crate::tier_settings::Tier>>,
     pub mode: Option<ConsumerMode>,
+    /// Automatic selection when no route clears the adequacy floor. Defaults to
+    /// best_effort; explicit model pins are admitted without quality ranking.
+    pub below_bar: Option<BelowBarPolicy>,
     pub ladder: Option<Vec<String>>,
     pub variants: Option<BTreeMap<String, String>>,
     pub runner: Option<String>,

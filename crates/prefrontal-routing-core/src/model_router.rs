@@ -528,8 +528,8 @@ pub struct NoRouteError {
     pub message: String,
     pub rejected: Vec<RejectedRoute>,
     pub requirements: Option<ModelRequirements>,
-    /// For `AllRoutesInadequate`: the best rejected candidate (highest adequacy
-    /// below the band), so the caller can surface which route was closest.
+    /// For a quality refusal: the highest-adequacy survivor, so the caller can
+    /// surface which route was closest to the required floor or sanity band.
     pub best_rejected: Option<RejectedCandidate>,
     /// Earliest quota/cooldown wall expiry across blocked candidates (millisecond
     /// epoch). This is not a promise that other admission fences will clear then.
@@ -1967,8 +1967,9 @@ fn admit_and_price_shortlist(
     let min_band = input
         .min_best_effort_adequacy
         .unwrap_or(MIN_BEST_EFFORT_ADEQUACY);
-    if best_effort && max_adequacy < min_band {
-        // Find the best rejected candidate (highest adequacy below the band).
+    let refuse_below_bar = best_effort && !config.allow_best_effort;
+    if best_effort && (refuse_below_bar || max_adequacy < min_band) {
+        // Find the highest-adequacy survivor rejected by the quality policy.
         // A route whose adequacy is not a number has no rank, so it is never
         // reported as the closest survivor; `max_adequacy` above skips it too.
         let best_below_band = admissible
@@ -1982,13 +1983,33 @@ fn admit_and_price_shortlist(
         let (earliest_reset, earliest_reset_route) =
             earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
 
-        return Err(NoRouteError {
-            candidates: candidate_quality_scores(&input.facts, &admissible),
-            reason: RouteFailureReason::AllRoutesInadequate,
-            message: format!(
+        let message = if refuse_below_bar {
+            let unavailable = rejected
+                .iter()
+                .map(|route| match &route.detail {
+                    Some(detail) => format!("{}: {} ({detail})", route.route_key, route.reason),
+                    None => format!("{}: {}", route.route_key, route.reason),
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "no route clears the adequacy floor ({ADEQUACY_FLOOR:.2}); best candidate {} has adequacy {max_adequacy:.2}; best effort disabled by consumer policy. Unavailable routes: {}",
+                best_rejected.as_ref().map_or("unknown", |route| route.route_key.as_str()),
+                if unavailable.is_empty() { "none".into() } else { unavailable.join("; ") },
+            )
+        } else {
+            format!(
                 "no route clears the adequacy floor ({:.2}); best effort adequacy {:.2} is below the sanity band ({:.2})",
                 ADEQUACY_FLOOR, max_adequacy, min_band
-            ),
+            )
+        };
+        return Err(NoRouteError {
+            candidates: candidate_quality_scores(&input.facts, &admissible),
+            reason: if refuse_below_bar {
+                RouteFailureReason::NoAdequateRoute
+            } else {
+                RouteFailureReason::AllRoutesInadequate
+            },
+            message,
             adequate_blockers: adequate_blockers(input, config, top_routable, &rejected),
             rejected,
             requirements: Some(requirements),

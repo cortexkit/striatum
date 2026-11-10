@@ -210,6 +210,13 @@
         "needles"
       ]
     },
+    "BelowBarPolicy": {
+      "type": "string",
+      "enum": [
+        "best_effort",
+        "refuse"
+      ]
+    },
     "CatalogSection": {
       "type": "object",
       "properties": {
@@ -235,6 +242,18 @@
     "ConsumerPolicy": {
       "type": "object",
       "properties": {
+        "below_bar": {
+          "description": "Automatic selection when no route clears the adequacy floor. Defaults to\nbest_effort; explicit model pins are admitted without quality ranking.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BelowBarPolicy"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "context_tokens": {
           "type": [
             "integer",

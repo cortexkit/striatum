@@ -77,6 +77,8 @@ impl OverqualificationConfig {
 pub struct RoutingConfig {
     pub demand_exponent: f64,
     pub overqualification: OverqualificationConfig,
+    /// Whether automatic selection may use a route below the adequacy floor.
+    pub allow_best_effort: bool,
 }
 
 impl Default for RoutingConfig {
@@ -88,6 +90,7 @@ impl Default for RoutingConfig {
 pub const DEFAULT_ROUTING_CONFIG: RoutingConfig = RoutingConfig {
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
     overqualification: DEFAULT_OVERQUALIFICATION,
+    allow_best_effort: true,
 };
 
 /// The default configuration with the over-qualification term switched off, for
@@ -99,6 +102,7 @@ pub const DEFAULT_ROUTING_CONFIG: RoutingConfig = RoutingConfig {
 #[cfg(test)]
 pub(crate) const ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION: RoutingConfig = RoutingConfig {
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
+    allow_best_effort: true,
     overqualification: OverqualificationConfig {
         threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
         doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,

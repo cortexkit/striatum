@@ -7,6 +7,37 @@ fn config(value: serde_json::Value) -> LiveConfig {
 }
 
 #[test]
+fn below_bar_policy_defaults_and_inherits_per_consumer_key() {
+    use crate::config_policy::BelowBarPolicy;
+
+    let config = config(json!({"consumers": {
+        "workers": {"below_bar": "refuse"},
+        "workers.review": {"iq": 80},
+        "workers.review.quick": {"below_bar": "best_effort"}
+    }}));
+    for name in ["workers", "workers.review", "workers.review.deep"] {
+        let policy = config.consumer_policy(name, &ConsumerPolicy::default(), &BTreeMap::new());
+        assert_eq!(policy.below_bar, Some(BelowBarPolicy::Refuse));
+    }
+    let policy = config.consumer_policy(
+        "workers.review.quick.child",
+        &ConsumerPolicy::default(),
+        &BTreeMap::new(),
+    );
+    assert_eq!(policy.below_bar, Some(BelowBarPolicy::BestEffort));
+    let other = config.consumer_policy(
+        "workers-other",
+        &ConsumerPolicy::default(),
+        &BTreeMap::new(),
+    );
+    assert_eq!(
+        other.below_bar.unwrap_or_default(),
+        BelowBarPolicy::BestEffort
+    );
+    assert!(parse_config(r#"{"consumers":{"workers":{"below_bar":"ignore"}}}"#).is_err());
+}
+
+#[test]
 fn dotted_consumers_resolve_name_rules_without_reusing_root_exclusions() {
     let config = config(json!({
         "providers": {"p": {"not_for": ["athena"]}},

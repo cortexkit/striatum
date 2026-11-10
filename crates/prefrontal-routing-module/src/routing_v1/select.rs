@@ -1703,7 +1703,7 @@ impl<'a> Selection<'a> {
         input.providers_without_cache_write_reports = lookup.providers_without_cache_write_reports;
         prefrontal_routing_core::model_router::evaluate_model_route_with_profiles(
             input,
-            self.routing_config,
+            &self.pass().routing_config(),
             self.slots,
             consumer_exclude,
             self.rejections,
@@ -2070,6 +2070,15 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     refusal
         .detail
         .insert("blockingCauses".into(), json!(no_route.blocking_causes()));
+    if no_route.reason == RouteFailureReason::NoAdequateRoute {
+        refusal.detail.insert(
+            "adequacyFloor".into(),
+            json!(prefrontal_routing_core::routing_config::ADEQUACY_FLOOR),
+        );
+        refusal
+            .detail
+            .insert("bestRejected".into(), json!(no_route.best_rejected));
+    }
     refusal
 }
 
