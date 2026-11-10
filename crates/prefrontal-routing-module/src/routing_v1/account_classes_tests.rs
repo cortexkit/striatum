@@ -2434,6 +2434,101 @@ async fn subscription_quota_hold_lifts_on_fresh_headroom_reading() {
 }
 
 #[tokio::test]
+async fn credential_quota_reconciliation_requires_every_recorded_recovery_pool() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let reset = NOW as i64 + 3_600_000;
+    oauth_weekly_reading_at(10.0, reset, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    for reading in crate::ACCOUNT_QUOTA
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .readings
+        .readings
+        .values_mut()
+    {
+        reading.entry["usage"]["secondary"] = json!({"usedPercent":100.0,"windowMinutes":300,
+            "resetsAt":crate::account_selection::rfc3339(reset)});
+    }
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],
+        "outcome":"refused","credential_id":"oauth:test","runner_code":"billing_exhausted"}),
+        )
+        .await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let held = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "two-pool-held"),
+        )
+        .await;
+    assert_eq!(held.1["code"], "account_pool_exhausted", "{}", held.1);
+    assert!(harness
+        .store()
+        .account_read(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap()
+        .iter()
+        .any(|block| block.recovery_set.len() == 2));
+    oauth_weekly_reading_at(0.0, reset, NOW as i64 + 60_000);
+    let _later = crate::InjectedClock::set(NOW + 60_000);
+    let partial = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "partial-pool-held"),
+        )
+        .await;
+    assert_eq!(
+        partial.1["code"], "account_pool_exhausted",
+        "missing pool cannot heal a linked hold: {}",
+        partial.1
+    );
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .iter()
+        .any(|f| f.credential_id == "oauth:test"));
+    let probe_at = NOW + 16 * 60_000;
+    oauth_weekly_reading_at(0.0, reset, probe_at as i64);
+    let _probe_clock = crate::InjectedClock::set(probe_at);
+    let rows = credentials.listed_credentials().to_vec();
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-pool-probe".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        probe_at,
+    );
+    harness.set_credentials(credentials);
+    let probe = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "missing-pool-probe"),
+        )
+        .await;
+    assert_eq!(
+        probe.0,
+        FrameType::Response,
+        "fresh partial headroom cannot suppress the probe: {}",
+        probe.1
+    );
+}
+
+#[tokio::test]
 async fn pay_per_token_credential_without_reading_keeps_the_one_hour_probe() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);

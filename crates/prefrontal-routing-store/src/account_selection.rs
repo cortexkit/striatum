@@ -49,6 +49,48 @@ mod account_fact_tests {
     use super::*;
 
     #[test]
+    fn headroom_clear_preserves_a_newer_refusal_and_other_provider() {
+        let scratch = cortexkit_test_support::ScratchDir::new("headroom-evidence-order");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "headroom-evidence-order",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fence = |provider: &str, model: &str, at| AccountRouteFence {
+            provider: provider.into(),
+            credential_id: "c".into(),
+            model: model.into(),
+            recorded_at: at,
+            until_ms: 10_000,
+            decision_id: "d".into(),
+        };
+        store
+            .record_account_route_fence(&fence("p", "old", 100))
+            .unwrap();
+        // Reproduce a new refusal committed after the recovery snapshot was
+        // read, but before its delayed cleanup acquires the writer lock.
+        store
+            .record_account_route_fence(&fence("p", "new", 300))
+            .unwrap();
+        store
+            .record_account_route_fence(&fence("other", "old", 100))
+            .unwrap();
+        store
+            .clear_account_route_fences_before("p", "c", 200)
+            .unwrap();
+        let remaining = store.account_route_fences(400).unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "a reading heals only older evidence on its provider"
+        );
+        assert!(remaining
+            .iter()
+            .any(|row| row.provider == "p" && row.model == "new"));
+        assert!(remaining.iter().any(|row| row.provider == "other"));
+    }
+
+    #[test]
     fn observation_backoffs_use_only_committed_bound_effects_and_expire() {
         let scratch = cortexkit_test_support::ScratchDir::new("observation-backoffs");
         let descriptor = crate::dev_descriptor(
@@ -974,22 +1016,24 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// Lift all route-reset fences for a credential after an operator top-up.
-    pub fn clear_account_route_fences_for_credential(
+    /// Revalidate evidence ordering under the writer lock. The reading may
+    /// have been copied before another request recorded a newer refusal.
+    pub fn clear_account_route_fences_before(
         &self,
-        credential_id: &str,
+        provider: &str,
+        credential: &str,
+        reading_at: i64,
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                if !account_fact_table_exists(conn, "account_route_fence")? {
-                    return Ok(0);
-                }
-                conn.execute(
-                    "DELETE FROM account_route_fence WHERE credential_id=?1",
-                    [credential_id],
+        self.account_transaction(|tx| {
+            tx.conn
+                .execute(
+                    "DELETE FROM account_route_fence
+                WHERE provider=?1 AND credential_id=?2
+                AND COALESCE(last_reported_at,recorded_at)<?3",
+                    params![provider, credential, reading_at],
                 )
-            })
-            .map_err(err)
+                .map_err(err)
+        })
     }
 
     /// An explicit operator clear lifts quota, billing and transient route

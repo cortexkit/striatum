@@ -397,6 +397,26 @@ pub fn block_end(
     lifted.then_some(BlockEnd::Reading)
 }
 
+/// Current reserve pressure that speaks for this fence's pools. Headroom in
+/// an unrelated pool is neither proof of recovery nor a reason to stop probes.
+pub fn binding_pressure(
+    fence: &Fence,
+    reading: Option<&QuotaReading>,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> bool {
+    let Some(reading) = reading.filter(|reading| fresh_for_recovery(reading, now, policy)) else {
+        return false;
+    };
+    reported_windows(reading, policy).iter().any(|window| {
+        !window.above_reserve
+            && fence
+                .pool
+                .as_ref()
+                .is_none_or(|key| key.matched_by(&window.key))
+    })
+}
+
 /// The recovery set of a whole-account block after a later fresh reading
 /// adds the keys it reports, or `None` when it adds none. A key never leaves
 /// the set here: only a reading that reports a window disabled may remove it.
@@ -554,6 +574,35 @@ mod tests {
             None,
             "weekly reserve remains binding"
         );
+    }
+
+    #[test]
+    fn binding_pressure_names_the_fenced_pool_and_preserves_its_reserve() {
+        let fence = block(
+            Some(key(Some(10080), PoolScope::EveryModel, Some("missing"))),
+            ResetTime::Missing,
+        );
+        let policy = AllocatorPolicy {
+            reserve_seven_day: 5.0,
+            ..Default::default()
+        };
+        for used in [0.0, 100.0] {
+            let other = reading(NOW, &[(Some("other"), 10080, used)]);
+            assert!(!binding_pressure(&fence, Some(&other), NOW, &policy));
+            assert_eq!(block_end(&fence, Some(&other), NOW, &policy), None);
+        }
+        assert!(binding_pressure(
+            &fence,
+            Some(&reading(NOW, &[(Some("missing"), 10080, 96.0)])),
+            NOW,
+            &policy
+        ));
+        assert!(!binding_pressure(
+            &fence,
+            Some(&reading(NOW, &[(Some("missing"), 10080, 0.0)])),
+            NOW,
+            &policy
+        ));
     }
 
     #[test]
