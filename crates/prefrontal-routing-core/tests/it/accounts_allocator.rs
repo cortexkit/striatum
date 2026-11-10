@@ -816,13 +816,11 @@ fn any_blocking_window_holds_within_the_bound_and_moves_beyond_it() {
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
 }
 
-/// A block ends when its known reset passes, whatever the reading says, and a
-/// fresh reading observed after the block lifts it before the reset when it
-/// shows headroom on the blocked window. An older reading, or one observed at
-/// the same instant, does not. Replaces the earlier rule, under which only a
-/// post-reset reading lifted a passed general fence.
+/// A reset does not expire confirmed exhaustion. Only newer fresh headroom
+/// recovers its blocked window, whether that reading arrives before or after
+/// the reset; an older or simultaneous reading cannot prove recovery.
 #[test]
-fn a_block_ends_at_its_reset_or_on_newer_headroom() {
+fn a_block_survives_its_reset_and_only_newer_headroom_lifts_it() {
     let pool = |reset: ResetTime, observed_at_ms: i64, seven_used: f64| {
         let mut fresh = reading(0.0, seven_used);
         fresh.observed_at_ms = Some(observed_at_ms);
@@ -844,8 +842,12 @@ fn a_block_ends_at_its_reset_or_on_newer_headroom() {
     let passed = ResetTime::At(NOW - HOUR);
     let ahead = ResetTime::At(NOW + HOUR);
 
-    // The reset passed: the block ended, even with only an older reading.
+    // A passed reset is not recovery evidence, including with old headroom.
     let decision = decide(&request(), &pool(passed, NOW - 3 * MINUTE, 0.0), NOW);
+    assert!(fenced(&decision), "{decision:?}");
+    let decision = decide(&request(), &pool(passed, NOW - MINUTE, 100.0), NOW);
+    assert!(fenced(&decision), "{decision:?}");
+    let decision = decide(&request(), &pool(passed, NOW - MINUTE, 0.0), NOW);
     assert!(!fenced(&decision), "{decision:?}");
     assert_eq!(admitted(&decision), "acct-a");
 
@@ -887,13 +889,13 @@ fn a_migrated_unknown_scope_block_moves_only_its_family() {
 }
 
 #[test]
-fn principal_refusal_exclusion_invalidates_affinity_until_a_digest_moves() {
+fn principal_refusal_exclusion_invalidates_affinity_until_a_digest_moves_or_an_hour_passes() {
     let exclusion = PrincipalExclusion {
         principal: request().principal,
         credential_id: credential_id("acct-a"),
         runner_view_digest: "runner-view-1".into(),
         roster_view_digest: "roster-1".into(),
-        recorded_at_ms: NOW - HOUR,
+        recorded_at_ms: NOW - HOUR + 1,
     };
     let mut st = state(vec![account("acct-a", Some(reading(10.0, 10.0)))]);
     st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
@@ -923,7 +925,7 @@ fn principal_refusal_exclusion_invalidates_affinity_until_a_digest_moves() {
         AdmitReason::StickyHit
     );
 
-    // Routing's roster digest moves, or 24 hours pass: it ends too.
+    // Routing's roster digest moves, or one hour passes: it ends too.
     let mut rolled = st.clone();
     rolled.roster.as_mut().unwrap().view_digest = "roster-2".into();
     assert_eq!(
@@ -931,7 +933,7 @@ fn principal_refusal_exclusion_invalidates_affinity_until_a_digest_moves() {
         AdmitReason::StickyHit
     );
     let mut aged = st.clone();
-    aged.principal_exclusions[0].recorded_at_ms = NOW - 24 * HOUR;
+    aged.principal_exclusions[0].recorded_at_ms = NOW - HOUR;
     assert_eq!(
         decide(&req, &aged, NOW).admission().unwrap().reason,
         AdmitReason::StickyHit
@@ -1857,12 +1859,10 @@ fn an_exhausted_pool_leaves_the_other_pools_models_selectable() {
     );
 }
 
-/// With no readings at all, a confirmed exhaustion with no reset and no hint
-/// blocks the account until `unknown_reset_retry_ms` after confirmation, a
-/// Retry-After hint brings that forward, and a known reset ends the block one
-/// moment after it passes.
+/// Pure allocation never expires confirmed quota evidence. The module grants
+/// due probes by atomically claiming a separate clock before issuing a request.
 #[test]
-fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
+fn without_readings_a_quota_fence_does_not_expire_at_reset_or_retry_time() {
     let blocked = |block: prefrontal_routing_core::accounts::Fence, at: i64| {
         let mut st = state(vec![account("acct-a", None)]);
         st.fences.push(block);
@@ -1874,12 +1874,15 @@ fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
         ResetTime::Missing,
     );
     whole.pool = None;
-    let six_hours = NOW + 6 * HOUR;
+    let check = NOW + 15 * MINUTE;
     assert_eq!(
-        refused(&blocked(whole.clone(), six_hours - 1)),
+        refused(&blocked(whole.clone(), check - 1)),
         RefusalCode::AccountPoolExhausted
     );
-    assert_eq!(admitted(&blocked(whole.clone(), six_hours)), "acct-a");
+    assert_eq!(
+        refused(&blocked(whole.clone(), check)),
+        RefusalCode::AccountPoolExhausted
+    );
 
     let mut hinted = whole.clone();
     hinted.retry_hint_ms = Some(NOW + 30 * MINUTE);
@@ -1887,7 +1890,10 @@ fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
         refused(&blocked(hinted.clone(), NOW + 29 * MINUTE)),
         RefusalCode::AccountPoolExhausted
     );
-    assert_eq!(admitted(&blocked(hinted, NOW + 30 * MINUTE)), "acct-a");
+    assert_eq!(
+        refused(&blocked(hinted, NOW + 30 * MINUTE)),
+        RefusalCode::AccountPoolExhausted
+    );
 
     let mut reset = whole;
     reset.reset = ResetTime::At(NOW + 10 * MINUTE);
@@ -1896,7 +1902,7 @@ fn without_readings_a_block_ends_at_its_reset_or_its_retry_time() {
         RefusalCode::AccountPoolExhausted
     );
     assert_eq!(
-        admitted(&blocked(reset, NOW + 10 * MINUTE + 1000)),
-        "acct-a"
+        refused(&blocked(reset, NOW + 10 * MINUTE + 1000)),
+        RefusalCode::AccountPoolExhausted
     );
 }

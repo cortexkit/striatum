@@ -232,13 +232,13 @@ async fn fenced_class_is_exhausted_until_its_probe_window_on_both_entrypoints() 
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
     assert_eq!(
         refused.1["detail"]["reset_at_ms"],
-        json!(NOW + 21_600_001),
+        json!(NOW + 3_600_000),
         "{}",
         refused.1
     );
     let refusal: cortexkit_role_routing::errors::Refusal =
         serde_json::from_value(refused.1.clone()).unwrap();
-    assert_eq!(refusal.wait_until_ms(), Some(NOW + 21_600_001));
+    assert_eq!(refusal.wait_until_ms(), Some(NOW + 3_600_000));
 }
 
 #[tokio::test]
@@ -321,14 +321,14 @@ async fn route_fence_is_exhausted_with_its_reset_on_both_entrypoints() {
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
     assert_eq!(
         refused.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW + 15 * 60_000),
         "{}",
         refused.1
     );
     // The refusal is timed.
     let refusal: cortexkit_role_routing::errors::Refusal =
         serde_json::from_value(refused.1.clone()).unwrap();
-    assert_eq!(refusal.wait_until_ms(), Some(reset));
+    assert_eq!(refusal.wait_until_ms(), Some(NOW + 15 * 60_000));
     assert_eq!(refusal.code, RefusalCode::AccountPoolExhausted);
 }
 
@@ -434,7 +434,7 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
         assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
         assert_eq!(
             refused.1["detail"]["reset_at_ms"],
-            json!(NOW + 21_600_001),
+            json!(NOW + 3_600_000),
             "{}",
             refused.1
         );
@@ -608,7 +608,7 @@ async fn mixed_fence_and_policy_is_exhausted_on_both_entrypoints() {
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
     assert_eq!(
         refused.1["detail"]["reset_at_ms"],
-        json!(NOW + 21_600_001),
+        json!(NOW + 3_600_000),
         "{}",
         refused.1
     );

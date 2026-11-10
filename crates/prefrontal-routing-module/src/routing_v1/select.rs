@@ -1343,12 +1343,15 @@ async fn select_at_tier(
         )
         .map_err(store_refusal)?;
     if let Some(classes) = &priced.classes {
-        classes.bind_selected_probe(
-            &selected.model.provider_id,
-            &selected.model.model_id,
-            priced_per_token,
-            &decision_id,
-        );
+        classes
+            .bind_selected_probe(
+                deps.store,
+                &selected.model.provider_id,
+                &selected.model.model_id,
+                priced_per_token,
+                &decision_id,
+            )
+            .map_err(store_refusal)?;
     }
     let service_tier = service_tier.or_else(|| {
         configured_tiers
@@ -1452,6 +1455,7 @@ async fn select_at_tier(
             );
             let grant = key_pool::acquire(
                 &key_pool::PoolCtx {
+                    config: Some(&super::operator_config(deps)),
                     store: deps.store,
                     credentials: deps.broca_credentials,
                     catalog_targets: &catalog_targets,

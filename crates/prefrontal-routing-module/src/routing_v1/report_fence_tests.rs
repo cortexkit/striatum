@@ -127,7 +127,7 @@ async fn a_failed_report_with_a_future_reset_fences_only_that_route_on_that_acco
     );
     let fences = harness
         .store()
-        .account_route_fences(crate::account_selection::now_ms())
+        .non_quota_account_route_fences(crate::account_selection::now_ms())
         .unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert_eq!(fences[0].model, "model-c");
@@ -136,17 +136,20 @@ async fn a_failed_report_with_a_future_reset_fences_only_that_route_on_that_acco
 }
 
 #[tokio::test]
-async fn a_reset_beyond_a_day_is_capped_at_a_day() {
+async fn a_contradicted_quota_reset_is_a_non_quota_wall_capped_at_one_hour() {
     let (harness, route) = configured().await;
     let runner = runner(&harness).await;
     let (decision, account) = served_decision(&route, &runner, "cap-first").await;
     let before = crate::account_selection::now_ms();
     report_failed(&route, &decision, &account, before + 2 * DAY_MS).await;
     let after = crate::account_selection::now_ms();
-    let fences = harness.store().account_route_fences(after).unwrap();
+    let fences = harness
+        .store()
+        .non_quota_account_route_fences(after)
+        .unwrap();
     assert_eq!(fences.len(), 1, "{fences:?}");
     assert!(
-        (before + DAY_MS..=after + DAY_MS).contains(&fences[0].until_ms),
+        (before + 3_600_000..=after + 3_600_000).contains(&fences[0].until_ms),
         "{fences:?}"
     );
 }

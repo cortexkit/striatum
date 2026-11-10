@@ -14,16 +14,16 @@
 //! A fence ends three ways. A change to the credential's vault listing (provider
 //! ids, plan tier or state) ends it at once, as today. A fence older than
 //! [`FENCE_PROBE_RECHECK_MS`] admits a single probe request on that credential:
-//! the probe stamps the fence fresh so no second probe follows within the
+//! an atomic claim advances a separate retry clock so no second probe follows within the
 //! interval, a successful outcome ends the fence, and a billing or entitlement
 //! failure renews it for another interval. An operator lifts every fence on a
 //! named credential at once, for use right after topping it up.
 //!
-//! A subscription is a quota: its Insula reading already names the exhausted
-//! window and its reset, and a fresh reading with headroom lifts the hold.
-//! A billing-class refusal for such a credential is therefore
-//! a quota hold until that reset, never a billing fence with a timer. See
-//! [`probe_allowed`]: billing fences probe only without a quota signal.
+//! Billing refusals consistent with a subscription's quota become quota holds:
+//! fresh newer headroom lifts them, and without a fresh reading they permit one
+//! probe every fifteen minutes. Reset dates only schedule additional checks.
+//! Fresh headroom contradicting the refusal keeps it non-quota instead; later
+//! quota refreshes cannot immediately reopen a credit or entitlement wall.
 //! Entitlement refusals always keep the timed probe: quota utilization says
 //! nothing about entitlement, so a reading cannot lift or convert that fence.
 
@@ -39,7 +39,7 @@ use prefrontal_routing_store::{AccountTx, SqliteRouteStateStore};
 use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 
 /// How long a billing or entitlement fence holds before routing admits one
-/// probe request on the fenced credential: six hours. Topping up a balance
+/// probe request on the fenced credential: at most one hour. Topping up a balance
 /// does not change the credential's vault listing, so without a recheck the
 /// fence would hold until the listing changed for an unrelated reason.
 ///
@@ -48,12 +48,12 @@ use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 /// headroom readings instead; entitlement refusals always keep timed probes.
 pub(crate) const FENCE_PROBE_RECHECK_MS: i64 = CREDENTIAL_REFUSED_REPROBE_MS;
 
-/// A refused credential is blocked for six hours, the same interval core waits
-/// before retrying an account whose credit ran out. A pooled API key gets this
+/// A non-quota refused credential is blocked for at most one hour. A pooled API key gets this
 /// block in the key pool. Any other credential gets routing's credential
-/// refusal fence, which lets one probe request through after the six hours.
+/// refusal fence, which lets one probe request through after that interval.
 /// This interval is routing's documented credential-refusal re-probe horizon.
-pub(crate) const CREDENTIAL_REFUSED_REPROBE_MS: i64 = 6 * 60 * 60_000;
+pub(crate) const CREDENTIAL_REFUSED_REPROBE_MS: i64 =
+    prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS;
 
 /// A window reading at or above this used percent counts as exhausted for
 /// turning a billing-class refusal into a quota hold. The
@@ -70,7 +70,7 @@ pub(crate) const QUOTA_HOLD_USED_THRESHOLD: f64 = 99.0;
 /// refusal uses its quota reset and fresh headroom readings instead of blind
 /// probes. An entitlement refusal is independent of quota utilization: only a
 /// real request can discover a provider-side reversal without a listing change
-/// or an operator lift, so it keeps the six-hour probe even with quota readings.
+/// or an operator lift, so it keeps the one-hour probe even with quota readings.
 pub(crate) fn probe_allowed(code: &str, has_quota_signal: bool, age_ms: i64) -> bool {
     (!is_billing_code(code) || !has_quota_signal) && age_ms > FENCE_PROBE_RECHECK_MS
 }
@@ -219,6 +219,61 @@ pub(crate) fn quota_refusal_contradicted(
     })
 }
 
+/// A reading from before a binding window's advertised reset cannot suppress
+/// that reset's extra check. Another still-current binding window (including a
+/// near-wall weekly reserve) continues to restrict the account.
+pub(crate) fn current_quota_reading(
+    quota: &crate::account_quota::AccountQuotaState,
+    account: &str,
+    now: i64,
+    policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
+) -> bool {
+    let Some(entry) = latest_fresh_entry(quota, account, now) else {
+        return false;
+    };
+    let Some(usage) = entry.usage.as_ref() else {
+        return false;
+    };
+    let fetched = entry
+        .fetched_at
+        .as_deref()
+        .and_then(crate::account_quota::parse_rfc3339_ms)
+        .unwrap_or(i64::MIN);
+    let windows = [
+        usage.primary.as_ref(),
+        usage.secondary.as_ref(),
+        usage.tertiary.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .chain(
+        usage
+            .extra_rate_windows
+            .iter()
+            .flatten()
+            .filter_map(|extra| extra.window.as_ref()),
+    );
+    let mut valid = false;
+    let mut binding = false;
+    for window in windows.filter(|window| {
+        window.used_percent.is_finite() && (0.0..=100.0).contains(&window.used_percent)
+    }) {
+        valid = true;
+        if !window_has_headroom(window, policy) {
+            binding = true;
+            if !window
+                .resets_at
+                .as_deref()
+                .and_then(crate::account_quota::parse_rfc3339_ms)
+                .is_some_and(|reset| reset <= now && fetched < reset)
+            {
+                return true;
+            }
+        }
+    }
+    valid && !binding
+}
+
 fn window_has_headroom(
     window: &prefrontal_routing_core::quota::RateWindow,
     policy: &prefrontal_routing_core::accounts::AllocatorPolicy,
@@ -346,6 +401,14 @@ pub(crate) fn lift_after_success_in(
 ) -> RouteStateResult<bool> {
     if let Some(fence) = tx.credential_entitlement_fence(provider, credential)? {
         if fence.observed_at_ms >= admitted_at {
+            return Ok(false);
+        }
+        if tx.active_pool_fences(provider)?.iter().any(|block| {
+            block
+                .evidence
+                .fence_id
+                .starts_with(&quota_hold_prefix(&fence))
+        }) {
             return Ok(false);
         }
         clear_quota_holds_in(tx, &fence, "run_succeeded", now)?;
@@ -515,7 +578,7 @@ pub(crate) fn split(
 /// The explanation line a probed pick carries in its decision.
 pub(crate) fn probe_note(provider_id: &str, credential_id: &str) -> String {
     format!(
-        "fence probe: {provider_id} via {credential_id} is past the 6h entitlement recheck, admitting one probe request",
+        "fence probe: {provider_id} via {credential_id} is due for one scheduled recheck; refusal evidence remains until recovery",
     )
 }
 
@@ -544,43 +607,30 @@ pub(crate) fn probe_credentials(
         .collect()
 }
 
-/// End the fence on the (provider, credential) pair a run just succeeded on.
-/// True when a fence was lifted.
+/// End a successful non-quota refusal on the serving (provider, credential)
+/// pair. Quota holds use the scoped success proof inside the same admission or
+/// report transaction; unknown or unrelated pools are never guessed here.
 pub(crate) fn lift_after_success(
     store: &SqliteRouteStateStore,
     provider_id: &str,
     credential_id: &str,
     admitted_at: i64,
 ) -> Result<bool, String> {
-    if store
-        .credential_entitlement_fences()
-        .map_err(|e| e.to_string())?
-        .iter()
-        .any(|fence| {
-            fence.provider_id == provider_id
-                && fence.credential_id == credential_id
-                && fence.observed_at_ms >= admitted_at
-        })
-    {
-        return Ok(false);
-    }
-    for fence in store
-        .credential_entitlement_fences()
-        .map_err(|error| error.to_string())?
-        .iter()
-        .filter(|fence| fence.provider_id == provider_id && fence.credential_id == credential_id)
-    {
-        clear_quota_holds(store, fence, "run_succeeded")?;
-    }
     let lifted = store
-        .clear_credential_entitlement_fence(provider_id, credential_id)
-        .map_err(|e| e.to_string())?;
-    if lifted > 0 {
-        eprintln!(
-            "[prefrontal-routing] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded",
-        );
+        .account_transaction(|tx| {
+            lift_after_success_in(
+                tx,
+                provider_id,
+                credential_id,
+                crate::now_ms() as i64,
+                admitted_at,
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    if lifted {
+        eprintln!("[prefrontal-routing] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded");
     }
-    Ok(lifted > 0)
+    Ok(lifted)
 }
 
 /// End every fence naming `credential_id`, as an operator does right after

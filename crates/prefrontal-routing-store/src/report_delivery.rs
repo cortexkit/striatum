@@ -5,12 +5,13 @@ use prefrontal_routing_core::{route_state_store::CredentialRefusal, RouteOutcome
 
 #[derive(Default)]
 pub struct V1ReportEffects {
+    pub quota_scope: Option<crate::QuotaSuccessScope>,
     pub route_fence: Option<AccountRouteFence>,
     pub non_quota_route_fence: Option<AccountRouteFence>,
     pub eligibility: Option<AccountEligibilityFact>,
     pub credential_refusal: Option<(CredentialRefusal, Option<String>)>,
     pub size_refusal: Option<AccountSizeRefusal>,
-    pub clear_size: Option<(String, String, String, u32)>,
+    pub non_quota_size_refusal: Option<AccountSizeRefusal>,
     pub lift_credential: Option<(String, String)>,
 }
 
@@ -72,15 +73,16 @@ impl SqliteRouteStateStore {
             if first {
                 let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
-                let admitted_at:i64=tx.query_row("SELECT created_at FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
-                apply_account_effects(&account, effects, now,admitted_at)?;
+                let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
+                apply_account_effects(&account, effects, now)?;
                 if outcome==RouteOutcome::Completed {
                     if let Some((provider,credential))=&effects.lift_credential {
                         let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
                         let identity=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok());
                         if identity.as_ref().and_then(|identity|identity.credential_id.as_deref()).is_none_or(|id|id==credential) {
                             let account_id=identity.as_ref().map_or(credential.as_str(),|identity|identity.account_ref.as_str());
-                            account.heal_serving_fences(provider,account_id,credential,&model,effects.clear_size.as_ref().map(|(_,_,_,size)|*size),admitted_at,now).map_err(sql_error)?;
+                            let size=account.size_admission_for_model_decision(decision_id,provider,credential,&model).map_err(sql_error)?;
+                            account.heal_serving_fences_in_scope(provider,account_id,credential,&model,size.map(|(class,_)|class),size.map_or(admitted_at,|(_,at)|at),now,effects.quota_scope.as_ref()).map_err(sql_error)?;
                         }
                     }
                 }
@@ -108,11 +110,43 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn record_non_quota_size_refusal(
+        &self,
+        fact: &AccountSizeRefusal,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        self.conn.execute("INSERT INTO account_non_quota_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
+            WHERE excluded.observed_at>=account_non_quota_size_refusal.observed_at",
+            params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map(|_|()).map_err(err)
+    }
     pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
-        self.conn.execute("INSERT INTO account_non_quota_route_fence VALUES (?1,?2,?3,?4,?5,?6,?6)
-            ON CONFLICT(provider,credential_id,model) DO UPDATE SET until_ms=excluded.until_ms,
+        self.record_account_route_backoff(fence, "billing")
+    }
+    pub(crate) fn record_account_route_backoff(
+        &self,
+        fence: &AccountRouteFence,
+        kind: &str,
+    ) -> RouteStateResult<()> {
+        self.conn.execute("INSERT INTO account_non_quota_route_fence VALUES (?1,?2,?3,?4,?5,?6,?6,?7)
+            ON CONFLICT(provider,credential_id,model,wall_kind) DO UPDATE SET until_ms=excluded.until_ms,
             last_reported_at=MAX(account_non_quota_route_fence.last_reported_at,excluded.last_reported_at),decision_id=excluded.decision_id",
-            params![fence.provider,fence.credential_id,fence.model,fence.until_ms.min(fence.recorded_at.saturating_add(3_600_000)),fence.decision_id,fence.recorded_at]).map(|_|()).map_err(err)
+            params![fence.provider,fence.credential_id,fence.model,fence.until_ms.min(fence.recorded_at.saturating_add(3_600_000)),fence.decision_id,fence.recorded_at,kind]).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE fence_recheck SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
+                params![
+                    if kind == "transient" {
+                        "transient_route"
+                    } else {
+                        "non_quota_route"
+                    },
+                    serde_json::json!([fence.provider, fence.credential_id, fence.model])
+                        .to_string()
+                ],
+            )
+            .map(|_| ())
+            .map_err(err)
     }
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
@@ -125,7 +159,7 @@ impl AccountTx<'_> {
             credential_refusal: Some((refusal.clone(), fingerprint.map(str::to_owned))),
             ..Default::default()
         };
-        apply_account_effects(self, &effects, now, 0).map_err(err)
+        apply_account_effects(self, &effects, now).map_err(err)
     }
 
     pub fn clear_credential_entitlement_fence(
@@ -190,7 +224,6 @@ fn apply_account_effects(
     tx: &AccountTx<'_>,
     effects: &V1ReportEffects,
     now: i64,
-    admitted_at: i64,
 ) -> rusqlite::Result<()> {
     let conn = tx.conn;
     if let Some(fence) = &effects.non_quota_route_fence {
@@ -206,6 +239,7 @@ fn apply_account_effects(
              last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
             params![fence.provider, fence.credential_id, fence.model, fence.until_ms, fence.decision_id, fence.recorded_at],
         )?;
+        conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;
     }
     if let Some(fact) = &effects.eligibility {
         tx.record_eligibility(fact).map_err(sql_error)?;
@@ -218,6 +252,9 @@ fn apply_account_effects(
              listing_fingerprint=COALESCE(credential_entitlement_fences.listing_fingerprint,excluded.listing_fingerprint)",
             params![refusal.provider_id, refusal.credential_id, refusal.code, fingerprint, now],
         )?;
+        if crate::fence_rechecks::enabled(conn)? {
+            conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+        }
     }
     if let Some(fact) = &effects.size_refusal {
         conn.execute("INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
@@ -225,28 +262,9 @@ fn apply_account_effects(
             WHERE excluded.observed_at>=account_size_refusal.observed_at",
             params![fact.provider, fact.credential_id, fact.model, fact.size_class, fact.expires_at, fact.observed_at])?;
     }
-    if let Some((provider, credential, model, class)) = &effects.clear_size {
-        conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
-            params![provider, credential, model, class, now])?;
-    }
-    if let Some((provider, credential)) = &effects.lift_credential {
-        let fences = tx.active_pool_fences(provider).map_err(sql_error)?;
-        let prefix = format!(
-            "credential-quota:{}:",
-            serde_json::json!([provider, credential])
-        );
-        for fence in fences {
-            if fence.evidence.fence_id.starts_with(&prefix)
-                && fence.evidence.observed_at < admitted_at
-            {
-                tx.clear_fence(&fence.evidence.fence_id, now, "run_succeeded")
-                    .map_err(sql_error)?;
-            }
-        }
-        conn.execute(
-            "DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",
-            params![provider, credential,admitted_at],
-        )?;
+    if let Some(fact) = &effects.non_quota_size_refusal {
+        tx.record_non_quota_size_refusal(fact, now)
+            .map_err(sql_error)?;
     }
     Ok(())
 }

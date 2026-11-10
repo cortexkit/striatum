@@ -186,6 +186,16 @@ fn prepare_account_facts(
     now: i64,
 ) -> Result<prefrontal_routing_store::V1ReportEffects, Refusal> {
     let mut effects = prefrontal_routing_store::V1ReportEffects::default();
+    effects.quota_scope = Some(prefrontal_routing_store::QuotaSuccessScope {
+        family: super::operator_config(deps)
+            .allocator_policy(&decision.provider)
+            .family_for_model(&decision.model),
+        pool: prefrontal_routing_core::quota_extract::antigravity_pool_for_capacity(&format!(
+            "{}/{}",
+            decision.provider, decision.model
+        ))
+        .map(str::to_string),
+    });
     let identity = deps
         .store
         .decision_provider_identity(&decision.decision_id)
@@ -225,11 +235,21 @@ fn prepare_account_facts(
                 && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
         })
     };
+    let code = params
+        .get("runner_code")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let size_quota = params
+        .get("request_input_tokens")
+        .and_then(Value::as_u64)
+        .is_some()
+        && code.to_ascii_lowercase().contains("size")
+        && (code.contains("429") || code.contains("exhaust") || code.contains("quota"));
     // Quota evidence belongs to the serving identity, not its healthy siblings.
     // A reset schedules an extra check; a missing date does not erase a typed
     // quota refusal. Fresh headroom contradicts the quota interpretation and
     // retains the refusal as an independent non-quota wall instead.
-    if params["outcome"] == "failed" {
+    if params["outcome"] == "failed" && !size_quota {
         let reset = params.get("reset_at_ms").and_then(Value::as_i64);
         if reset.is_some_and(|reset| reset > now)
             || matches!(
@@ -268,6 +288,9 @@ fn prepare_account_facts(
                     fence.until_ms = now.saturating_add(
                         prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
                     );
+                    if let Some(reset) = reset.filter(|reset| *reset > now) {
+                        fence.until_ms = fence.until_ms.min(reset);
+                    }
                     effects.non_quota_route_fence = Some(fence);
                 }
             }
@@ -295,10 +318,6 @@ fn prepare_account_facts(
         });
         return Ok(effects);
     }
-    let code = params
-        .get("runner_code")
-        .and_then(Value::as_str)
-        .unwrap_or("");
     if matches!(
         code,
         "ENTITLEMENT_ERROR"
@@ -323,16 +342,7 @@ fn prepare_account_facts(
     }
     if let Some(tokens) = params.get("request_input_tokens").and_then(Value::as_u64) {
         let class = prefrontal_routing_core::accounts::input_size_class(tokens);
-        if params["outcome"] == "completed" {
-            effects.clear_size = Some((
-                decision.provider.clone(),
-                credential.into(),
-                decision.model.clone(),
-                class,
-            ));
-        } else if code.to_ascii_lowercase().contains("size")
-            && (code.contains("429") || code.contains("exhaust") || code.contains("quota"))
-        {
+        if params["outcome"] != "completed" && size_quota {
             effects.size_refusal = Some(prefrontal_routing_store::AccountSizeRefusal {
                 provider: decision.provider.clone(),
                 credential_id: credential.into(),
@@ -342,9 +352,33 @@ fn prepare_account_facts(
                     .get("reset_at_ms")
                     .and_then(Value::as_i64)
                     .filter(|reset| *reset > now)
-                    .unwrap_or(now.saturating_add(6 * 60 * 60_000)),
+                    .unwrap_or(0),
                 observed_at: now,
             });
+            if crate::ACCOUNT_QUOTA
+                .get()
+                .and_then(|quota| quota.lock().ok())
+                .is_some_and(|quota| {
+                    crate::credential_fences::quota_refusal_contradicted(
+                        &quota,
+                        &credentials,
+                        credential,
+                        now,
+                        &super::operator_config(deps).allocator_policy(&decision.provider),
+                    )
+                })
+            {
+                let mut fact = effects.size_refusal.take().unwrap();
+                let cap = now.saturating_add(
+                    prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
+                );
+                fact.expires_at = if fact.expires_at > now {
+                    fact.expires_at.min(cap)
+                } else {
+                    cap
+                };
+                effects.non_quota_size_refusal = Some(fact);
+            }
         }
     }
     Ok(effects)

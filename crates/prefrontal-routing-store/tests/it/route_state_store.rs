@@ -1540,6 +1540,7 @@ fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() 
             &RouteStateUpdate {
                 cooldown_until: Some(5_000.0),
                 quota_exhausted_until: Some(5_000.0),
+                observed_at_ms: Some(1_000),
                 wall_class: Some(RouteWallClass::Billing),
                 last_error: Some(billing_error.into()),
                 ..Default::default()
@@ -1552,6 +1553,7 @@ fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() 
             "p/quota",
             &RouteStateUpdate {
                 quota_exhausted_until: Some(6_000.0),
+                observed_at_ms: Some(1_000),
                 wall_class: Some(RouteWallClass::Quota),
                 last_error: Some("you have reached your usage limit".into()),
                 ..Default::default()
@@ -1564,6 +1566,7 @@ fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() 
             "legacy/pre-migration",
             &RouteStateUpdate {
                 quota_exhausted_until: Some(7_000.0),
+                observed_at_ms: Some(1_000),
                 ..Default::default()
             },
         )
@@ -1578,10 +1581,18 @@ fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() 
         snapshot.by_route["xai/grok-4.6"].last_error.as_deref(),
         Some(billing_error)
     );
-    assert_eq!(
-        snapshot.by_route["p/quota"].wall_class,
-        Some(RouteWallClass::Quota)
-    );
+    // Identity-free quota is a capped cooldown, not account quota. Keep the
+    // caller's class in original evidence while excluding it from inference.
+    assert_eq!(snapshot.by_route["p/quota"].wall_class, None);
+    let raw: String = rusqlite::Connection::open(rig.db_path())
+        .unwrap()
+        .query_row(
+            "SELECT wall_class FROM model_route_state WHERE route_key='p/quota'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(raw, "quota");
     assert_eq!(snapshot.by_route["legacy/pre-migration"].wall_class, None);
 
     assert!(

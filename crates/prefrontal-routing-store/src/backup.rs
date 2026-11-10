@@ -135,7 +135,7 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     (
         "provider_cooldown_state",
-        "unexpired provider walls new routes inherit",
+        "provider wall evidence and new-route inheritance; retry permissions are backed up separately",
     ),
     (
         "credential_entitlement_fences",
@@ -167,6 +167,12 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "client-visible retry answers within their window",
     ),
     ("account_fence", "confirmed account exhaustion fences"),
+    ("fence_recheck", "durable one-probe retry permissions; losing claims would admit duplicate probes"),
+    ("fence_recheck_route_clear", "route-specific recovery from provider evidence; losing it reblocks recovered routes"),
+    ("fence_success_pool", "scoped success proofs required to recover whole-account quota without erasing another pool"),
+    ("account_transient_backoff", "active account backoff, independent of excludable observation history"),
+    ("account_non_quota_route_fence", "account-local non-quota refusals cannot be reconstructed from quota readings"),
+    ("account_non_quota_size_refusal", "size-scoped non-quota refusals remain binding until their own permitted trial"),
     (
         "account_eligibility",
         "model/account eligibility facts retained until the credential listing changes; \
@@ -174,14 +180,13 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     (
         "account_size_refusal",
-        "request-size restrictions retained until expiry or a later successful request; \
-         restoring them empty would repeat oversized requests already refused",
+        "size-specific quota evidence has no fixed expiry; losing it would repeat \
+         oversized requests before fresh headroom or a successful same-class trial",
     ),
     (
         "account_route_fence",
-        "route-and-account fences from failed reports with a reset, at most 24 hours long; \
-         restoring them empty would send work to an account the provider said is closed \
-         for that route until its reset",
+        "account-route quota evidence has no fixed expiry; restoring it empty would \
+         forget a provider refusal before headroom or a permitted trial proves recovery",
     ),
     (
         "account_principal_exclusion",

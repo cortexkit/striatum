@@ -399,7 +399,21 @@ async fn continuation_refuses_a_caller_pinned_account_and_records_exhaustion() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 1);
+    assert_eq!(
+        count, 0,
+        "fresh headroom contradicts this typed quota refusal"
+    );
+    let billing: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM account_non_quota_route_fence WHERE wall_kind='billing'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        billing, 1,
+        "retain the refusal as non-quota, never erase it on headroom"
+    );
 }
 
 #[tokio::test]

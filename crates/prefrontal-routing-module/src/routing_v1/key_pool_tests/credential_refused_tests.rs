@@ -5,7 +5,7 @@ use prefrontal_routing_store::PoolWallKind;
 
 const POOL_KEY: &str = "apikey:pool-vendor:main";
 const PLAIN_KEY: &str = "apikey:catalog:main";
-const SIX_HOURS: i64 = 21_600_000;
+const ONE_HOUR: i64 = 3_600_000;
 
 #[tokio::test]
 async fn llm_run_finished_does_not_lift_a_successful_probe_fence() {
@@ -20,7 +20,7 @@ async fn llm_run_finished_does_not_lift_a_successful_probe_fence() {
                 code: "credential_refused".into(),
             },
             None,
-            crate::now_ms() as i64 - SIX_HOURS - 1,
+            crate::now_ms() as i64 - ONE_HOUR - 1,
         )
         .unwrap();
     let runner = harness.bind(reserved("zeta-runner"), None).await;
@@ -50,11 +50,14 @@ async fn llm_run_finished_does_not_lift_a_successful_probe_fence() {
     let fences = harness.store().credential_entitlement_fences().unwrap();
     assert_eq!(fences.len(), 1);
     assert_eq!(fences[0].credential_id, PLAIN_KEY);
-    assert_eq!(fences[0].observed_at_ms, crate::now_ms() as i64);
+    assert_eq!(
+        fences[0].observed_at_ms,
+        crate::now_ms() as i64 - ONE_HOUR - 1
+    );
 }
 
 #[tokio::test]
-async fn pool_credential_entitlement_fence_explains_its_untimed_recovery() {
+async fn pool_credential_entitlement_fence_explains_its_timed_probe() {
     let _clock = crate::InjectedClock::set(1_800_000_000_000);
     let harness = harness_with_routed_accounts(Some(&["apikey"]));
     harness
@@ -78,16 +81,25 @@ async fn pool_credential_entitlement_fence_explains_its_untimed_recovery() {
         .await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
-    assert_eq!(refused.1["detail"]["reset_at_ms"], Value::Null);
+    assert_eq!(
+        refused.1["detail"]["reset_at_ms"],
+        json!(crate::now_ms() as i64 + ONE_HOUR)
+    );
     let exclusion = &refused.1["detail"]["exclusions"][0];
     assert_eq!(exclusion["credential_id"], POOL_KEY);
     assert_eq!(exclusion["reason"], "billing_exhausted");
-    assert_eq!(exclusion["reset_at_ms"], Value::Null);
-    assert!(exclusion["message"].as_str().unwrap().contains("operator"));
+    assert_eq!(
+        exclusion["reset_at_ms"],
+        json!(crate::now_ms() as i64 + ONE_HOUR)
+    );
     assert!(exclusion["message"]
         .as_str()
         .unwrap()
-        .contains("vault listing"));
+        .contains("single probe"));
+    assert!(exclusion["message"]
+        .as_str()
+        .unwrap()
+        .contains("reset_at_ms"));
 }
 
 fn result(reply: (FrameType, Value)) -> Value {
@@ -148,8 +160,8 @@ async fn credential_refused_runner_blocks_pool_and_non_pool_credentials() {
         if provider == POOL {
             let states = harness.store().pool_key_states(provider, before).unwrap();
             let until = states[credential].walled_until_ms.unwrap();
-            assert!(until >= before + SIX_HOURS);
-            assert!(until <= crate::now_ms() as i64 + SIX_HOURS);
+            assert!(until >= before + ONE_HOUR);
+            assert!(until <= crate::now_ms() as i64 + ONE_HOUR);
             assert!(harness
                 .store()
                 .credential_entitlement_fences()
@@ -205,12 +217,12 @@ async fn credential_refused_runner_blocks_pool_and_non_pool_credentials() {
             assert!(!crate::credential_fences::probe_allowed(
                 &fence.code,
                 true,
-                SIX_HOURS - 1
+                ONE_HOUR - 1
             ));
             assert!(crate::credential_fences::probe_allowed(
                 &fence.code,
                 true,
-                SIX_HOURS + 1
+                ONE_HOUR + 1
             ));
         }
         let stored = harness
@@ -410,7 +422,7 @@ async fn credential_refused_extends_never_shortens_and_operator_clears() {
                         provider,
                         credential,
                         PoolWallKind::Billing,
-                        at + SIX_HOURS,
+                        at + ONE_HOUR,
                         "old",
                         at,
                     )
@@ -444,14 +456,14 @@ async fn credential_refused_extends_never_shortens_and_operator_clears() {
                     .find(|f| f.provider_id == provider && f.credential_id == credential)
                     .unwrap()
                     .observed_at_ms
-                    + SIX_HOURS
+                    + ONE_HOUR
             }
         };
         seed(start - 60_000);
         let params = json!({"event_id":"extend", "kind":"credential_refused", "credential_id":credential,
             "observed_at_ms":start - 120_000, "provider_code":"billing_exhausted"});
         observe(&runner, params.clone()).await;
-        assert!(deadline() >= start + SIX_HOURS);
+        assert!(deadline() >= start + ONE_HOUR);
         // A previously received wall may already reach further than this
         // delayed observation. Neither block mechanism may move it backwards.
         seed(start + 60_000);

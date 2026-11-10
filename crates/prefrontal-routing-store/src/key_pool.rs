@@ -107,6 +107,7 @@ fn key_states(
     now_ms: i64,
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
+    crate::fence_rechecks::sync(conn)?;
     let mut states: BTreeMap<String, PoolKeyState> = BTreeMap::new();
     let mut statement = conn.prepare(
         "SELECT credential_id, last_used_at, walled_until, cooldown_until
@@ -125,6 +126,31 @@ fn key_states(
         state.last_used_at_ms = last_used;
         state.walled_until_ms = walled;
         state.cooldown_until_ms = cooldown;
+    }
+    let rechecks = crate::fence_rechecks::read(conn)?;
+    if crate::fence_rechecks::enabled(conn)? {
+        for state in states.values_mut() {
+            state.walled_until_ms = None;
+            state.cooldown_until_ms = None;
+        }
+    }
+    for origin in rechecks.iter().filter(|origin| {
+        matches!(origin.kind.as_str(), "pool_billing" | "pool_rate")
+            && origin.provider == provider
+            && origin.account_id.is_none()
+            && origin.model.is_none()
+            && origin.principal.is_none()
+            && origin.size_class.is_none()
+    }) {
+        if let Some(credential) = &origin.credential_id {
+            let state = states.entry(credential.clone()).or_default();
+            let field = if origin.kind == "pool_rate" {
+                &mut state.cooldown_until_ms
+            } else {
+                &mut state.walled_until_ms
+            };
+            *field = Some(field.unwrap_or(0).max(origin.due_at()));
+        }
     }
     let mut statement = conn.prepare(
         "SELECT credential_id, COUNT(*) FROM pool_key_lease
@@ -201,6 +227,17 @@ impl SqliteRouteStateStore {
     /// still on an admissible key keeps it; otherwise that lease is released and
     /// a key is picked, sticking to the session's workspace while it has one.
     pub fn pool_acquire(&self, request: &PoolAcquire<'_>) -> RouteStateResult<PoolAcquireOutcome> {
+        self.pool_acquire_for_route(request, &[request.provider], "", &[], &BTreeMap::new())
+    }
+
+    pub fn pool_acquire_for_route(
+        &self,
+        request: &PoolAcquire<'_>,
+        providers: &[&str],
+        model: &str,
+        recovered: &[(String, String)],
+        accounts: &BTreeMap<String, String>,
+    ) -> RouteStateResult<PoolAcquireOutcome> {
         self.pool_transaction(|conn| {
             let now = request.now_ms;
             let existing: Option<(String, String, String)> = conn
@@ -213,19 +250,47 @@ impl SqliteRouteStateStore {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let states = key_states(
+            let mut states = key_states(
                 conn,
                 request.provider,
                 now,
                 existing.as_ref().map(|(lease, _, _)| lease.as_str()),
             )?;
+            let applies=|origin:&crate::FenceRecheck,workspace:&str,credential:&str| {
+                let account=accounts.get(credential).map_or(workspace,String::as_str);
+                let named=origin.credential_id.as_deref().filter(|id|(origin.quota || matches!(origin.kind.as_str(),"account_route"|"non_quota_route"|"transient_route"))
+                    && accounts.get(*id).is_some_and(|id|id==account)).unwrap_or(credential);
+                providers.contains(&origin.provider.as_str())
+                && origin.applies(&origin.provider,account,named,model) && origin.principal.is_none() && origin.size_class.is_none()
+                && !recovered.contains(&(origin.kind.clone(),origin.origin_key.clone()))
+            };
+            let origins=crate::fence_rechecks::read(conn)?;
+            for key in request.keys {
+                let quota_at=crate::FenceRecheck::quota_group_at(origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)),None);
+                for origin in origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)) {
+                    let state=states.entry(key.credential_id.clone()).or_default();
+                    let field=if origin.kind=="pool_rate" {&mut state.cooldown_until_ms}else{&mut state.walled_until_ms};
+                    *field=Some(field.unwrap_or(0).max(if origin.quota {quota_at}else{origin.due_at()}));
+                }
+            }
             if let Some((lease, credential, workspace)) = &existing {
                 let still_admissible = request.keys.iter().any(|key| {
                     key.credential_id == *credential
                         && key_block(key, states.get(credential).unwrap_or(&PoolKeyState::default()), now)
                             .is_none()
                 });
+                let probe=crate::fence_rechecks::enabled(conn)? && conn.query_row("SELECT fence_probe FROM pool_key_lease WHERE lease_id=?1",[lease],|row|row.get::<_,bool>(0))?;
+                if probe && !still_admissible {
+                    let blocked=request.keys.iter().filter(|key|key.credential_id==*credential).flat_map(|key|
+                        pick_pool_key(std::slice::from_ref(key),&states,Some(credential),now).err().unwrap_or_default()).collect();
+                    // An acquire is another send authorization, not a renewal.
+                    // Keep the original probe lease alive for its holder.
+                    return Ok(PoolAcquireOutcome::Exhausted(blocked));
+                }
                 if still_admissible {
+                    let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,workspace,credential)).cloned().collect();
+                    if !crate::fence_rechecks::claim(conn,&origins,now)? {return Err(rusqlite::Error::InvalidQuery);}
+                    if !origins.is_empty() {conn.execute("UPDATE pool_key_lease SET fence_probe=1 WHERE lease_id=?1",[lease])?;}
                     let valid_until = now.saturating_add(request.lease_ms);
                     conn.execute(
                         "UPDATE pool_key_lease SET valid_until = ?2 WHERE lease_id = ?1",
@@ -260,6 +325,8 @@ impl SqliteRouteStateStore {
                 Ok(pick) => pick,
                 Err(blocked) => return Ok(PoolAcquireOutcome::Exhausted(blocked)),
             };
+            let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,&pick.workspace,&pick.credential_id)).cloned().collect();
+            if !crate::fence_rechecks::claim(conn,&origins,now)? {return Err(rusqlite::Error::InvalidQuery);}
             let lease = lease_id(now);
             let valid_until = now.saturating_add(request.lease_ms);
             conn.execute(
@@ -268,6 +335,7 @@ impl SqliteRouteStateStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![lease, request.provider, request.session_id, pick.credential_id, pick.workspace, now, valid_until],
             )?;
+            if !origins.is_empty() {conn.execute("UPDATE pool_key_lease SET fence_probe=1 WHERE lease_id=?1",[&lease])?;}
             touch(conn, request.provider, request.session_id, &pick.credential_id, &pick.workspace, now, request.affinity_idle_ms)?;
             Ok(PoolAcquireOutcome::Leased(PoolLease {
                 lease_id: lease,
@@ -317,6 +385,12 @@ impl SqliteRouteStateStore {
                     let Some(credential_id) = credential_id else {
                         return Ok(None);
                     };
+                    crate::fence_rechecks::sync(conn)?;
+                    if crate::fence_rechecks::read(conn)?.iter().any(|origin|origin.provider==provider) {
+                        // Rehydrating an unknown lease cannot prove that it
+                        // owns a fenced account's one probe authorization.
+                        return Ok(None);
+                    }
                     let workspace: String = conn
                         .query_row(
                             "SELECT workspace FROM pool_session_affinity
@@ -388,9 +462,7 @@ impl SqliteRouteStateStore {
         provider: &str,
         now_ms: i64,
     ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
-        self.store
-            .with_conn(|conn: &Connection| key_states(conn, provider, now_ms, None))
-            .map_err(err)
+        self.account_transaction(|tx| key_states(tx.conn, provider, now_ms, None).map_err(err))
     }
 }
 
@@ -405,6 +477,9 @@ impl crate::AccountTx<'_> {
         reason: &str,
         now_ms: i64,
     ) -> RouteStateResult<()> {
+        let until_ms = until_ms.min(
+            now_ms.saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS),
+        );
         let statement = match kind {
             PoolWallKind::Billing => {
                 "INSERT INTO pool_key_state (provider, credential_id, walled_until, wall_reason, updated_at)
@@ -426,7 +501,14 @@ impl crate::AccountTx<'_> {
                 statement,
                 params![provider, credential_id, until_ms, reason, now_ms],
             )
-            .map(|_| ())
-            .map_err(err)
+            .map_err(err)?;
+        let observed = match kind {
+            PoolWallKind::Billing => "wall_observed_at",
+            PoolWallKind::RateLimited => "cooldown_observed_at",
+        };
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        self.conn.execute(&format!("UPDATE pool_key_state SET {observed}=MAX(COALESCE({observed},?3),?3) WHERE provider=?1 AND credential_id=?2"),params![provider,credential_id,now_ms]).map(|_|()).map_err(err)
     }
 }

@@ -8,7 +8,7 @@ use crate::RouteOutcome;
 
 pub const DEFAULT_CONSECUTIVE_TERMINAL_FAILURE_THRESHOLD: u32 = 3;
 pub const FAILURE_BACKOFF_INITIAL_MS: i64 = 10 * 60 * 1_000;
-pub const FAILURE_BACKOFF_MAX_MS: i64 = 6 * 60 * 60 * 1_000;
+pub const FAILURE_BACKOFF_MAX_MS: i64 = crate::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailureBackoffConfig {
@@ -611,7 +611,7 @@ mod tests {
     }
 
     #[test]
-    fn consecutive_failures_double_backoff_to_the_six_hour_cap() {
+    fn consecutive_failures_double_backoff_to_the_one_hour_cap() {
         let config = FailureBackoffConfig::default();
         let deadline = |previous| match failure_backoff_transition(
             previous,
