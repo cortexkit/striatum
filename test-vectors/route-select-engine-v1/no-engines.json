@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"phone.media","kind":"transcribe","privacy":"remote_allowed","requirements":{}}},"reply":{"code":"no_engine","message":"no engine remains after kind","detail":{"filter":"kind"}}}

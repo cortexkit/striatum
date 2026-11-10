@@ -92,6 +92,8 @@ mod scope_attribution_tests;
 #[cfg(test)]
 mod select_availability_tests;
 #[cfg(test)]
+mod select_engine_vectors_tests;
+#[cfg(test)]
 mod select_options_tests;
 #[cfg(test)]
 mod task_ref_tests;

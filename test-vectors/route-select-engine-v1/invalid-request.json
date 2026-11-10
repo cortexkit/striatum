@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"phone.media","effect_id":"not-supported","kind":"transcribe","privacy":"remote_allowed","requirements":{}}},"reply":{"code":"invalid_request","message":"unknown member","detail":{"field":"effect_id"}}}

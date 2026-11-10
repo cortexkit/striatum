@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"phone.media","kind":"transcribe","privacy":"remote_allowed","requirements":{}}},"reply":{"result":{"decision_id":"dec_000000000008","engine":{"caller_local":false,"local":false,"model":"fixture-transcribe","module":"fixture-media","provider":"media-vendor"},"expires_at_ms":1750000600000}}}

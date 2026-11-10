@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"phone.media","kind":"synthesize","privacy":"remote_allowed","requirements":{}}},"reply":{"result":{"decision_id":"dec_000000000001","engine":{"caller_local":false,"local":false,"model":"fixture-synthesize","module":"fixture-media","provider":"media-vendor"},"expires_at_ms":1750000600000}}}
