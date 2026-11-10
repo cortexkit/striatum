@@ -59,17 +59,16 @@ pub(super) async fn select_panel(
         ));
     }
     let (panel, _, mut rejected) = candidates(&request, &[], &[], caller, deps).await?;
-    rejected.extend(panel.rejected_causes.iter().map(|cause| json!(cause)));
     let mut seats = Vec::new();
     let mut families = HashSet::new();
     for member in &panel.members {
         let family = family(member.family.as_deref());
         if families.contains(&family) {
-            rejected.push(json!({
-                "model": member.route_key,
-                "reason": "family_duplicate",
-                "detail": format!("a seated route already represents family {family}")
-            }));
+            let mut cause = PanelRejectedCandidate::new(&member.route_key, "family_duplicate");
+            cause.detail = Some(json!(format!(
+                "a seated route already represents family {family}"
+            )));
+            rejected.push(cause);
             continue;
         }
         let slot = panel
@@ -133,7 +132,7 @@ fn panel_shortfall(
     seated: usize,
     required: usize,
     package_tokens: Option<u64>,
-    rejected: Vec<Value>,
+    rejected: Vec<PanelRejectedCandidate>,
 ) -> PanelShortfall {
     let code = scored
         .map(|s| match s.code {
@@ -143,7 +142,6 @@ fn panel_shortfall(
             scoring::PanelShortfallCode::SizeReduced => ShortfallCode::SizeReduced,
         })
         .unwrap_or(ShortfallCode::SizeReduced);
-    let mut shortfall = PanelShortfall::new(code);
     let message = match scored {
             Some(scored) => format!(
                 "{} Final admission seated {} of {} requested slots.",
@@ -154,12 +152,10 @@ fn panel_shortfall(
                 seated, required
             ),
         };
-    shortfall.detail = Some(json!({
-        "message": message,
-        "package_tokens": package_tokens,
-        "causes": rejected,
-    }));
-    shortfall
+    let mut detail = PanelShortfallDetail::new(message);
+    detail.package_tokens = package_tokens;
+    detail.causes = rejected;
+    PanelShortfall::new(code).with_typed_detail(detail)
 }
 
 fn class(request: &SelectPanelRequest) -> Result<scoring::PanelClass, Refusal> {
@@ -197,7 +193,7 @@ async fn settings(
 
 enum SeatAdmission {
     Seated(PanelSeat),
-    Rejected(Value),
+    Rejected(PanelRejectedCandidate),
 }
 
 async fn admit_seat(
@@ -238,11 +234,10 @@ async fn admit_seat(
                     | "auth_required"
             ) =>
         {
-            return Ok(SeatAdmission::Rejected(json!({
-                "model": route.pin(),
-                "reason": refusal.code,
-                "detail": refusal,
-            })))
+            let mut cause = PanelRejectedCandidate::new(route.pin(), refusal.code.as_str());
+            cause.reset_at_ms = refusal.detail.get("reset_at_ms").and_then(Value::as_u64);
+            cause.detail = Some(json!(refusal));
+            return Ok(SeatAdmission::Rejected(cause));
         }
         Err(refusal) => return Err(refusal),
     };
@@ -297,7 +292,7 @@ async fn replace(
         .filter(|s| s.slot != slot)
         .map(|s| family(s.family.as_deref()))
         .collect();
-    let (panel, package_blocked, _) =
+    let (panel, package_blocked, mut rejected) =
         candidates(&state.request, &exclude, &families, caller, deps).await?;
     let mut answer = PanelReplacement::unseated(
         id,
@@ -309,7 +304,7 @@ async fn replace(
         },
     );
     for member in &panel.members {
-        if let SeatAdmission::Seated(seat) = admit_seat(
+        match admit_seat(
             &state.request,
             member,
             slot,
@@ -319,16 +314,29 @@ async fn replace(
         )
         .await?
         {
-            state.history.insert(seat.answer.route.route_key());
-            state.answer.seats.retain(|s| s.slot != slot);
-            state.answer.seats.push(seat.clone());
-            state.answer.seats.sort_by_key(|s| s.slot);
-            answer = PanelReplacement::seated(id, seat);
-            deps.store
-                .v1_update_panel(id, &serde_json::to_string(&state).map_err(store_refusal)?)
-                .map_err(store_refusal)?;
-            break;
+            SeatAdmission::Rejected(cause) => rejected.push(cause),
+            SeatAdmission::Seated(seat) => {
+                state.history.insert(seat.answer.route.route_key());
+                state.answer.seats.retain(|s| s.slot != slot);
+                state.answer.seats.push(seat.clone());
+                state.answer.seats.sort_by_key(|s| s.slot);
+                answer = PanelReplacement::seated(id, seat);
+                deps.store
+                    .v1_update_panel(id, &serde_json::to_string(&state).map_err(store_refusal)?)
+                    .map_err(store_refusal)?;
+                break;
+            }
         }
+    }
+    if answer.cause.is_some() {
+        answer.detail = panel_shortfall(
+            panel.shortfall.as_ref(),
+            0,
+            1,
+            state.request.package_tokens,
+            rejected,
+        )
+        .detail;
     }
     serde_json::to_value(answer).map_err(store_refusal)
 }
@@ -339,7 +347,7 @@ async fn candidates(
     standing_families: &[String],
     caller: &Caller,
     deps: &Deps<'_>,
-) -> Result<(scoring::SelectedPanel, bool, Vec<Value>), Refusal> {
+) -> Result<(scoring::SelectedPanel, bool, Vec<PanelRejectedCandidate>), Refusal> {
     let config = operator_config(deps);
     let live = crate::config_overrides::live_config(deps.routing_config_path);
     // Validate the requested project id against the caller's daemon-stamped
@@ -382,11 +390,12 @@ async fn candidates(
     .map_err(store_refusal)?;
     let registry = {
         let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
-        super::runners::Registry::build(
+        super::runners::Registry::build_for_selection(
             config.v1_runners(),
             &credentials,
             &prepared.facts,
             super::now_ms(),
+            request.harness.as_deref(),
         )
     };
     let runners: Vec<_> = registry
@@ -484,7 +493,9 @@ async fn candidates(
             None
         };
         if let Some((reason, detail)) = cause {
-            rejected.push(json!({"model": route.route_key, "reason": reason, "detail": detail}));
+            let mut cause = PanelRejectedCandidate::new(route.route_key, reason);
+            cause.detail = Some(json!(detail));
+            rejected.push(cause);
             false
         } else {
             true
@@ -551,6 +562,24 @@ async fn candidates(
         .map(|fact| (fact_to_route(fact).capacity_key, fact.family.clone()))
         .collect();
     let outcome = live.apply(&mut facts);
+    let mut evidence = HashMap::new();
+    for fact in &facts {
+        let route = fact_to_route(fact);
+        let fit = request
+            .package_tokens
+            .map(|tokens| package_fit(tokens, fact));
+        let reset = prefrontal_routing_core::model_router::route_wall_until(
+            &prepared.snapshot,
+            &route.route_key,
+            &route.capacity_key,
+        )
+        .filter(|until| until.is_finite() && *until > 0.0)
+        .map(|until| until.ceil() as u64);
+        evidence
+            .entry(route.capacity_key)
+            .or_insert_with(|| (fit.clone(), reset));
+        evidence.insert(route.route_key, (fit, reset));
+    }
     let mut panel = scoring::select_panel_with_availability(
         scoring::SelectPanelInput {
             package_tokens: request.package_tokens.map(|tokens| tokens as usize),
@@ -613,7 +642,66 @@ async fn candidates(
         variant_consumer,
         &models,
     );
+    rejected.extend(panel.rejected_causes.iter().map(|cause| {
+        let reason = serde_json::to_value(cause.reason).expect("panel reason is JSON");
+        let mut candidate = PanelRejectedCandidate::new(
+            &cause.model,
+            reason.as_str().expect("panel reason is a string"),
+        );
+        candidate.detail = cause.detail.as_ref().map(|detail| json!(detail));
+        candidate.reset_at_ms = cause
+            .reset_at_ms
+            .and_then(|reset| u64::try_from(reset).ok());
+        let capacity = cortexkit_role_routing::select::RouteRef::parse_pin(&cause.model)
+            .map(|route| format!("{}/{}", route.provider, route.model));
+        if let Some((fit, reset)) = evidence
+            .get(&cause.model)
+            .or_else(|| capacity.as_ref().and_then(|key| evidence.get(key)))
+        {
+            if matches!(
+                cause.reason,
+                scoring::PanelCauseReason::PackageTooLarge
+                    | scoring::PanelCauseReason::PackageExceedsCeiling
+            ) {
+                if let Some(fit) = fit {
+                    candidate = candidate.with_typed_detail(fit.clone());
+                }
+            }
+            if matches!(
+                cause.reason,
+                scoring::PanelCauseReason::QuotaExhausted
+                    | scoring::PanelCauseReason::BackoffActive
+            ) {
+                candidate.reset_at_ms = reset.or(candidate.reset_at_ms);
+            }
+        }
+        candidate
+    }));
     Ok((panel, package_blocked, rejected))
+}
+
+fn package_fit(tokens: u64, fact: &prefrontal_routing_core::ModelFact) -> PanelPackageFit {
+    use prefrontal_routing_core::package_ceiling::{
+        seat_package_ceiling, PACKAGE_OUTPUT_RESERVE_TOKENS, SEAT_PROMPT_RESERVE_TOKENS,
+        UNKNOWN_SEAT_OUTPUT_TOKENS,
+    };
+    let output = fact.max_output_tokens.filter(|tokens| *tokens > 0);
+    let window = fact
+        .context_window
+        .filter(|window| window.is_finite() && *window >= 1.0)
+        .map(|window| window as u64);
+    let ceiling = seat_package_ceiling("", window, output);
+    PanelPackageFit::new(
+        tokens,
+        ceiling.tokens as u64,
+        ceiling.context_window,
+        ceiling.context_window_known,
+        output,
+        output
+            .unwrap_or(UNKNOWN_SEAT_OUTPUT_TOKENS)
+            .min(PACKAGE_OUTPUT_RESERVE_TOKENS),
+        SEAT_PROMPT_RESERVE_TOKENS,
+    )
 }
 
 fn prepared_models(panel: &scoring::SelectedPanel) -> HashMap<String, (String, String)> {
@@ -634,13 +722,14 @@ mod lock_tests {
 
     #[test]
     fn final_admission_shortfall_retains_refusal_without_inventing_diversity() {
-        let refused = json!({
-            "model": "example/fourth:xhigh",
-            "reason": "auth_required",
-            "detail": {"code": "auth_required", "message": "runner requires credentials"}
-        });
+        let mut refused = PanelRejectedCandidate::new("example/fourth:xhigh", "auth_required");
+        refused.detail =
+            Some(json!({"code": "auth_required", "message": "runner requires credentials"}));
         let shortfall = panel_shortfall(None, 3, 4, Some(46_960), vec![refused.clone()]);
         assert_eq!(shortfall.code, ShortfallCode::SizeReduced);
+        let decoded: PanelShortfall = serde_json::from_value(json!(shortfall)).unwrap();
+        let typed = decoded.typed_detail().unwrap().unwrap();
+        assert_eq!(typed.causes, vec![refused.clone()]);
         let detail = shortfall.detail.unwrap();
         assert_eq!(detail["package_tokens"], 46_960);
         assert_eq!(detail["causes"], json!([refused]));

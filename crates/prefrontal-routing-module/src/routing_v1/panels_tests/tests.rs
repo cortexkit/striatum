@@ -1,6 +1,52 @@
 use super::*;
 
 #[tokio::test]
+async fn typed_panel_shortfall_retains_quota_and_backoff_reset_times() {
+    use prefrontal_routing_core::RouteStateUpdate;
+    let (h, route, mut request) = configured().await;
+    let routes = request["available_routes"].as_array().unwrap().clone();
+    request["available_routes"] = json!([routes[0], routes[1]]);
+    let quota_route = routes[0].as_str().unwrap();
+    let backoff_route = routes[1].as_str().unwrap();
+    let quota_reset = crate::now_ms() + 600_000;
+    let backoff_reset = quota_reset + 60_000;
+    h.store()
+        .update_route_state(
+            quota_route,
+            quota_route,
+            &RouteStateUpdate {
+                quota_exhausted_until: Some(quota_reset as f64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    h.store()
+        .update_route_state(backoff_route, backoff_route, &RouteStateUpdate::default())
+        .unwrap();
+    rusqlite::Connection::open(h.store_path()).unwrap().execute(
+        "UPDATE model_route_state SET failure_backoff_until=?1, failure_backoff_reason='three terminal errors' WHERE route_key=?2",
+        rusqlite::params![backoff_reset as f64, backoff_route],
+    ).unwrap();
+    let answer = panel(&route, &request).await;
+    assert!(answer.seats.is_empty());
+    let encoded = serde_json::to_value(answer).unwrap();
+    let decoded: SelectPanelAnswer = serde_json::from_value(encoded).unwrap();
+    let detail = decoded.shortfall.unwrap().typed_detail().unwrap().unwrap();
+    for (model, reason, reset) in [
+        (quota_route, "quota_exhausted", quota_reset),
+        (backoff_route, "backoff_active", backoff_reset),
+    ] {
+        let cause = detail
+            .causes
+            .iter()
+            .find(|cause| cause.model == model)
+            .unwrap();
+        assert_eq!(cause.reason, reason);
+        assert_eq!(cause.reset_at_ms, Some(reset));
+    }
+}
+
+#[tokio::test]
 async fn panel_shortfall_detail_retains_package_exclusion_and_availability_evidence() {
     let (h, route, mut request) = configured().await;
     let routes = request["available_routes"].as_array().unwrap().clone();
@@ -35,10 +81,20 @@ async fn panel_shortfall_detail_retains_package_exclusion_and_availability_evide
     let causes = detail["causes"].as_array().unwrap();
     let small = causes.iter().find(|c| c["model"] == routes[0]).unwrap();
     assert_eq!(small["reason"], "package_too_large");
-    let budget = small["detail"].as_str().unwrap();
-    assert!(budget.contains("ceiling 1000 tokens"), "{budget}");
-    assert!(budget.contains("window 50000"), "{budget}");
-    assert!(budget.contains("output reserve 32000"), "{budget}");
+    let typed = shortfall.typed_detail().unwrap().unwrap();
+    let small = typed
+        .causes
+        .iter()
+        .find(|cause| cause.model == routes[0].as_str().unwrap())
+        .unwrap();
+    let budget = small.typed_detail().unwrap().unwrap();
+    assert_eq!(budget.package_tokens, 70_000);
+    assert_eq!(budget.budget_tokens, 1_000);
+    assert_eq!(budget.context_window, 50_000);
+    assert!(budget.context_window_known);
+    assert_eq!(budget.catalog_max_output_tokens, Some(32_000));
+    assert_eq!(budget.output_reserve_tokens, 32_000);
+    assert_eq!(budget.prompt_reserve_tokens, 16_000);
     assert!(causes
         .iter()
         .any(|c| c["model"] == routes[1] && c["reason"] == "excluded"));

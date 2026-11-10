@@ -361,6 +361,18 @@ async fn panel_replacement_package_cause_preserves_the_standing_seat() {
     assert_eq!(reply.0, FrameType::Response, "{reply:?}");
     let replacement: PanelReplacement = serde_json::from_value(reply.1["result"].clone()).unwrap();
     assert_eq!(replacement.cause, Some(ReplacementCause::PackageUnmeetable));
+    let detail: PanelShortfallDetail =
+        serde_json::from_value(replacement.detail.clone().unwrap()).unwrap();
+    assert_eq!(detail.package_tokens, Some(70_000));
+    let package = detail
+        .causes
+        .iter()
+        .find(|cause| cause.reason == "package_too_large")
+        .unwrap();
+    assert_eq!(
+        package.typed_detail().unwrap().unwrap().budget_tokens,
+        1_000
+    );
     assert_eq!(
         h.store()
             .v1_panel(&answer.panel_id, "reserved:prefrontal-core")
