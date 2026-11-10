@@ -28,11 +28,37 @@ The identity switch is a coordinated window: stop and disable `prefrontal-routin
 before enabling `striatum`; never run both routing providers together. While both
 are stopped, preview `script/move-store-to-striatum.sh --dry-run`, then run it
 without the flag. It backs up the old data directory, moves the store and boot
-ledger, removes the old engram catalog, and checks row counts and integrity. The
-new module writes its own catalog at startup. `--base-dir` overrides the CortexKit
-data directory for rehearsal; never rehearse against the live data directory.
-The script does not stop, start, enable or deploy either module. Keep them stopped
-throughout the move; on failure follow its printed restore instructions.
+ledger, and removes the old engram catalog. The new module writes its own catalog
+at startup. The script does not stop, start, enable or deploy either module. Keep
+them stopped throughout the move; on failure follow its printed restore instructions.
+
+The default backup is an APFS copy-on-write clone of the **whole** old directory
+to an exclusively created timestamped sibling. It uses `clonefile(2)` directly:
+`cp -cR` can silently fall back to a full copy when cloning is unsupported, but
+the script refuses instead. It compares every backup file's path/type/size with
+the source and records the listing beside the clone. `--backup-mode=tar` opts
+into a slow, uncompressed tar backup for non-APFS hosts; it is never an automatic
+fallback. `--base-dir` overrides the CortexKit data directory for rehearsal;
+never rehearse against the live data directory.
+
+The outage path checkpoints the WAL with `TRUNCATE` (refusing if busy), performs
+same-filesystem no-overwrite link/unlink moves, and verifies that the moved
+`store.db` retains its source device, inode and size. It does **not** scan rows or
+run `quick_check`/`integrity_check` by default. Every step prints elapsed seconds.
+After `striatum` is serving, optional full confirmation runs separately:
+
+```sh
+script/move-store-to-striatum.sh --verify-full /path/to/prefrontal-routing-backup-TIMESTAMP-ID
+```
+
+This mode only opens the recorded private clone, never the live store, and does
+not require either module to be stopped. It counts every application table and
+runs `PRAGMA integrity_check`, saving a report beside the clone. SQLite opens the
+private copy read-write so it can recover its own WAL/SHM files if needed; the
+report states that fact. Counts describe the frozen backup, not the now-changing
+live store. A tar archive must be restored separately; `--verify-full` accepts
+only a recorded clone directory. `--dry-run` previews either mode without
+opening SQLite or writing files (the move preview still checks module status).
 
 ```sh
 sh script/deploy-module.sh routing
