@@ -583,6 +583,13 @@ fn baseline_lists_each_slot_pin_and_an_answer_per_request() {
 /// Requests for which the new pass differs from the frozen baseline. Each
 /// listed request names the answer the new pass must give and one allowed cause.
 const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[
+    // A subscription whose credential-specific billing rates were never requested
+    // now uses the configured-multiplier list-rate fallback instead of maximum unknown cost.
+    (
+        "core-broca",
+        r#"{"refusal_code":null,"route_key":"meta/muse-spark-1.3-contributor","runner":"broca","variant":null}"#,
+        "missing subscription planes retain catalog list rates with a configured multiplier",
+    ),
     (
         "mason-excluded-model-pin",
         r#"{"refusal_code":"pinned_route_refused","route_key":null,"runner":null,"variant":null}"#,
