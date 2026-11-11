@@ -166,6 +166,80 @@ mod account_fact_tests {
     }
 
     #[test]
+    fn credential_probe_helper_uses_the_quota_recheck_interval() {
+        quota_probe_helper_control(false);
+    }
+    #[test]
+    fn credential_probe_helper_consumes_the_extra_reset_check_once() {
+        quota_probe_helper_control(true);
+    }
+
+    fn quota_probe_helper_control(reset: bool) {
+        let scratch = cortexkit_test_support::ScratchDir::new("quota-credential-probe-helper");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "quota-credential-probe-helper",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "billing_exhausted".into(),
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.classify_credential_quota("p", "c", true)?;
+                Ok(())
+            })
+            .unwrap();
+        if reset {
+            store
+                .store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE fence_recheck SET reset_check_at=200 WHERE kind='credential'",
+                        [],
+                    )
+                })
+                .unwrap();
+        }
+        let at = if reset { 200 } else { 900_100 };
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, at))
+                .unwrap(),
+            CredentialProbeClaim::Claimed
+        );
+        if reset {
+            assert_eq!(
+                store
+                    .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, at))
+                    .unwrap(),
+                CredentialProbeClaim::Blocked,
+                "the provider reset is an extra check, not a permanent due flag"
+            );
+        } else {
+            let clock = store
+                .fence_rechecks()
+                .unwrap()
+                .into_iter()
+                .find(|clock| clock.kind == "credential")
+                .unwrap();
+            assert_eq!(
+                clock.next_recheck_at,
+                at + 900_000,
+                "quota credential helpers must use 15 minutes, not the non-quota hour"
+            );
+        }
+    }
+
+    #[test]
     fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-credential-probe");
         let store = std::sync::Arc::new(
@@ -701,9 +775,12 @@ impl AccountTx<'_> {
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
         crate::fence_rechecks::sync(self.conn).map_err(err)?;
-        let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,next_recheck_at=?4+3600000
+        let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,
+            next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
             WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND evidence_at<?3
-            AND MIN(next_recheck_at,COALESCE(reset_check_at,next_recheck_at))<=?4 AND cleared_at IS NULL",params![provider,credential,before,at]).map_err(err)?;
+            AND MIN(next_recheck_at,COALESCE(reset_check_at,next_recheck_at))<=?4 AND cleared_at IS NULL",params![provider,credential,before,at,
+                prefrontal_routing_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS,
+                prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS]).map_err(err)?;
         if changed > 0 {
             return Ok(CredentialProbeClaim::Claimed);
         }

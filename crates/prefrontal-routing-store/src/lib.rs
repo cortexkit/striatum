@@ -2436,10 +2436,11 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Renew a fence's observation clock without changing its code or listing
-    /// fingerprint. A recheck probe consumes its interval this way: admitting
-    /// the probe stamps the fence fresh, so no second probe is admitted until
-    /// another interval passes or an outcome lifts or renews it.
+    /// Replace the refusal timestamp while preserving its code and listing
+    /// fingerprint. Reschedule its next permitted retry in the same transaction;
+    /// otherwise an older replacement timestamp can look like an expired fence
+    /// imported from a store that never recorded scheduled retries.
+    /// Admitting a retry uses the separate claim operation, not this setter.
     pub fn touch_credential_entitlement_fence(
         &self,
         provider_id: &str,
@@ -2448,11 +2449,19 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                let changed = tx.execute(
                     "UPDATE credential_entitlement_fences SET observed_at_ms = ?3
                       WHERE provider_id = ?1 AND credential_id = ?2",
                     params![provider_id, credential_id, observed_at_ms],
-                )
+                )?;
+                fence_rechecks::register(
+                    &tx,
+                    "credential",
+                    &serde_json::json!([provider_id, credential_id]).to_string(),
+                )?;
+                tx.commit()?;
+                Ok(changed)
             })
             .map_err(err)
     }

@@ -803,7 +803,7 @@ impl AccountTx<'_> {
         sync(self.conn).map_err(err)?;
         self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
             WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND classified=0",params![provider,credential,quota]).map_err(err)?;
-        self.conn.query_row("SELECT quota FROM fence_recheck WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![provider,credential],|row|row.get(0)).map_err(err)
+        self.conn.query_row("SELECT quota FROM fence_recheck WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![provider,credential],|row|row.get(0)).optional().map(|quota|quota.unwrap_or(false)).map_err(err)
     }
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
         read_effective(self.conn).map_err(err)
@@ -2091,6 +2091,23 @@ mod tests {
         assert_eq!(
             clocks[0].next_recheck_at, expected,
             "{kind}: a new refusal must not inherit the old raw 24h deadline"
+        );
+    }
+
+    #[test]
+    fn classification_tolerates_a_credential_retired_during_synchronization() {
+        let scratch = cortexkit_test_support::ScratchDir::new("retired-credential-classification");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "retired-credential-classification",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store.store.with_conn(|conn|conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','billing_exhausted',NULL,0)",[])).unwrap();
+        let result = store.account_transaction(|tx| tx.classify_credential_quota("p", "c", true));
+        assert_eq!(
+            result.unwrap(),
+            false,
+            "retired evidence cannot be reclassified as quota"
         );
     }
 
