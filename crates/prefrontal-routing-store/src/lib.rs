@@ -5208,13 +5208,18 @@ mod tests {
             standing
         );
         assert_eq!(restarted.account_serving_counts().unwrap().holds, 0);
-        assert_eq!(
-            restarted.credential_entitlement_fences().unwrap()[0].code,
-            "ENTITLEMENT_ERROR"
+        assert!(
+            restarted
+                .credential_entitlement_fences()
+                .unwrap()
+                .is_empty(),
+            "migration retires expired non-quota enforcement"
         );
         restarted
             .store
             .with_conn(|c| {
+                let code:String=c.query_row("SELECT json_extract(evidence,'$[0]') FROM fence_retired_origin WHERE kind='credential'",[],|row|row.get(0))?;
+                assert_eq!(code,"ENTITLEMENT_ERROR","retirement preserves the historical refusal evidence");
                 let dropped: i64 = c.query_row(
                     "SELECT COUNT(*) FROM sqlite_schema WHERE name='provider_reset_fences'",
                     [],
@@ -5341,7 +5346,9 @@ mod tests {
         .unwrap();
         insert_legacy_account_wall(&store, "anthropic/opus/medium", "quota");
         insert_legacy_account_wall(&store, "anthropic/billing", "billing");
-        let snapshot = store.build_snapshot(1791214158478.0).unwrap();
+        let now = now_ms();
+        store.store.with_conn(|conn|conn.execute("UPDATE model_route_state SET cooldown_until=?1,quota_exhausted_until=?1,updated_at=?2 WHERE route_key='anthropic/billing'",params![now+86_400_000,now-1_800_000])).unwrap();
+        let snapshot = store.build_snapshot(now as f64).unwrap();
         let scoped = &snapshot.by_route["anthropic/opus/medium"];
         assert_eq!(scoped.cooldown_until, None);
         assert_eq!(scoped.quota_exhausted_until, None);
@@ -5352,7 +5359,7 @@ mod tests {
             .contains("00000000-0000-4000-8000-0000000000a1"));
         assert_eq!(
             snapshot.by_route["anthropic/billing"].quota_exhausted_until,
-            Some(1791048824539.0 + 3_600_000.0)
+            Some((now + 1_800_000) as f64)
         );
         store.store.with_conn(|conn| {
             let stored:(i64,String) = conn.query_row("SELECT quota_exhausted_until,last_error FROM model_route_state WHERE route_key='anthropic/opus/medium'",[],|row| Ok((row.get(0)?,row.get(1)?)))?;
@@ -5366,19 +5373,19 @@ mod tests {
                 "anthropic/opus/high",
                 "anthropic/opus",
                 &RouteStateUpdate {
-                    quota_exhausted_until: Some(1791493229500.0),
+                    quota_exhausted_until: Some((now + 86_400_000) as f64),
                     wall_class: Some(RouteWallClass::Quota),
                     last_error: Some("provider pool exhausted".into()),
-                    observed_at_ms: Some(1791214158478),
+                    observed_at_ms: Some(now),
                     unscoped_wall: true,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            store.build_snapshot(1791214158478.0).unwrap().by_capacity["anthropic/opus"]
+            store.build_snapshot(now as f64).unwrap().by_capacity["anthropic/opus"]
                 .quota_exhausted_until,
-            Some(1791214158478.0 + 3_600_000.0)
+            Some((now + 3_600_000) as f64)
         );
         // A new unscoped wall must replace the old account narrative even if
         // its caller supplies no diagnostic message.
@@ -5387,17 +5394,17 @@ mod tests {
                 "anthropic/opus/medium",
                 "anthropic/opus",
                 &RouteStateUpdate {
-                    quota_exhausted_until: Some(1791493229600.0),
-                    observed_at_ms: Some(1791214158488),
+                    quota_exhausted_until: Some((now + 86_400_000) as f64),
+                    observed_at_ms: Some(now + 10),
                     unscoped_wall: true,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            store.build_snapshot(1791214158478.0).unwrap().by_route["anthropic/opus/medium"]
+            store.build_snapshot(now as f64).unwrap().by_route["anthropic/opus/medium"]
                 .quota_exhausted_until,
-            Some(1791214158488.0 + 3_600_000.0)
+            Some((now + 3_600_010) as f64)
         );
     }
 

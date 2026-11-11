@@ -2054,9 +2054,9 @@ mod tests {
             .unwrap();
         drop(old);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let at = now + 3_600_001;
         let origins = store.fence_rechecks().unwrap();
         assert_eq!(origins.len(), 1);
+        let at = origins[0].due_at() + 1;
         assert!(store
             .account_transaction(|tx| tx.grant_fence_rechecks(&origins, at - 1, Some(&decision)))
             .unwrap());

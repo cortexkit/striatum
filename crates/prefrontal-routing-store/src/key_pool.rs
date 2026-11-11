@@ -551,8 +551,8 @@ mod wall_generation_tests {
             VALUES ('p','key',?1,?1,?2)",params![now+86_400_000,now-100])).unwrap();
         drop(old);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let probe_at = now + 3_600_000;
         let origins = store.fence_rechecks().unwrap();
+        let probe_at = origins.iter().map(|origin| origin.due_at()).max().unwrap();
         assert!(store
             .account_transaction(|tx| tx.grant_fence_rechecks(&origins, probe_at, Some("probe")))
             .unwrap());

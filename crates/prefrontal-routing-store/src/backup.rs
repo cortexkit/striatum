@@ -168,6 +168,8 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     ("account_fence", "confirmed account exhaustion fences"),
     ("fence_recheck", "durable one-probe retry permissions; losing claims would admit duplicate probes"),
+    ("fence_probe_authorization", "links an admitted probe to the exact refusal evidence its success may heal"),
+    ("fence_retired_origin", "archived expired refusal generations retained after their enforcement is retired"),
     ("fence_recheck_route_clear", "route-specific recovery from provider evidence; losing it reblocks recovered routes"),
     ("fence_success_pool", "scoped success proofs required to recover whole-account quota without erasing another pool"),
     ("account_transient_backoff", "active account backoff, independent of excludable observation history"),
