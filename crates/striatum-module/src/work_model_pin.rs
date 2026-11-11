@@ -192,6 +192,13 @@ pub(crate) fn select_with_availability(
         .or_else(|| facts.iter().find(|fact| fact.variant.is_none()))
         .unwrap_or(&facts[0])
         .clone();
+    let route = fact_to_route(&fact);
+    if let Some(reason) = availability_rejections.get(&route.route_key)
+        .or_else(|| availability_rejections.get(&route.capacity_key))
+        .filter(|reason| reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:"))
+    {
+        return Err(refuse(reason, format!("{identity}: {reason}")));
+    }
     // A withdrawn model fails at the provider whatever else is true of it, so
     // say so first rather than reporting a capability gap.
     if fact.is_deprecated_upstream() {

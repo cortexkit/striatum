@@ -347,15 +347,11 @@ async fn missing_question_limit_fails_closed_and_another_modules_listing_is_igno
     let route = harness.bind(reserved("another-module"), None).await;
     refused(&route, json!({"iq":0})).await;
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let answer = result(
-        route
-            .call(
-                "route.select",
-                &json!({"consumer":"mason","requirements":{"iq":50}}),
-            )
-            .await,
-    );
-    assert_eq!(answer["runner"]["module"], "chat-runner");
+    let reply = route.call("route.select",
+        &json!({"consumer":"mason","requirements":{"iq":50}})).await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route");
+    assert!(reply.1.to_string().contains("not_chat_kind:decision"), "{}", reply.1);
 }
 
 #[tokio::test]

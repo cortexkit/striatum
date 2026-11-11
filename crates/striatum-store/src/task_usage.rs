@@ -518,16 +518,17 @@ mod tests {
     fn migration_069_preserves_historical_usage_without_task_backfill() {
         let descriptor = descriptor("migration-069");
         let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 68).unwrap();
-        decision(
-            &old,
-            "legacy",
-            Some("legacy-task"),
-            "mason",
-            ("sol", None),
-            45.0,
-            NOW - 3 * DAY_MS,
-        );
         old.store.with_conn(|c: &Connection| {
+            // Seed the old decision directly; today's decision writer hashes
+            // the catalog using model_facts columns absent from schema 68.
+            c.execute(
+                "INSERT INTO model_route_decisions (id,task_id,consumer,target_agent,
+                   selected_model_id,requirements_json,score_json,rejected_json,
+                   anchor_version,created_at,selected_harness)
+                 VALUES ('legacy','legacy-task','mason','generic-worker','sol',
+                   '{\"iq\":45.0}','{}','[]',1,?1,'broca')",
+                params![NOW - 3 * DAY_MS],
+            )?;
             c.execute(
                 "INSERT INTO model_route_usage
                    (id, task_id, route_key, capacity_key, provider_id, input_tokens,

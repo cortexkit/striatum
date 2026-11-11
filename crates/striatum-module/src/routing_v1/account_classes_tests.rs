@@ -515,7 +515,7 @@ fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
                 supports_tool_use: fact.supports_tool_use,
                 reasoning_efforts: None,
                 canonical_id: None,
-                upstream_status: None,
+                upstream_status: None, model_type: None, model_kind: None,
                 lineage: None,
             }],
             FusiformCatalogCursor {
@@ -530,12 +530,7 @@ pub(super) fn setup(provider: &str, converted_live: bool) -> (Arc<Harness>, Broc
     setup_at_version(provider, converted_live, None)
 }
 
-fn setup_at_version(
-    provider: &str,
-    converted_live: bool,
-    version: Option<u32>,
-) -> (Arc<Harness>, BrocaCredentials) {
-    let harness = Harness::new_at_version("account-classes", version);
+fn account_fact(provider: &str) -> striatum_core::ModelFact {
     let mut fact = crate::tests::fact(provider, "model");
     fact.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
     fact.billing_plane = Some(BillingPlane {
@@ -547,8 +542,22 @@ fn setup_at_version(
             .into_iter()
             .collect(),
     });
-    harness.install_facts(&[fact.clone()]);
-    catalog_fact(&harness, &fact);
+    fact
+}
+
+fn setup_at_version(
+    provider: &str,
+    converted_live: bool,
+    version: Option<u32>,
+) -> (Arc<Harness>, BrocaCredentials) {
+    let harness = Harness::new_at_version("account-classes", version);
+    let fact = account_fact(provider);
+    // Historical fixtures seed only decisions before upgrading. Current fact
+    // writers require the current schema, so install those facts after upgrade.
+    if version.is_none() {
+        harness.install_facts(&[fact.clone()]);
+        catalog_fact(&harness, &fact);
+    }
     let mut subscription = fact.clone();
     subscription.billing_plane.as_mut().unwrap().auth_method = "oauth".into();
     subscription.billing_plane.as_mut().unwrap().kind = "subscription".into();
@@ -886,6 +895,7 @@ fn demand_prices_only_the_class_that_account_for_may_serve() {
                 stale: &[],
                 defer_pool_pin: false,
             },
+            false,
             Some(crate::select_policy::Consumer::Mason),
             false,
             None,
@@ -934,7 +944,7 @@ async fn an_apikey_only_model_has_no_subscription_account_to_withhold_it() {
 #[tokio::test]
 async fn migrated_062_decisions_keep_codemode_metered_and_mason_subscription_on_both_wires() {
     let _clock = crate::InjectedClock::set(NOW);
-    let (harness, _) = setup_at_version("synthetic", false, Some(62));
+    let (harness, credentials) = setup_at_version("synthetic", false, Some(62));
     let mut decisions = Vec::new();
     for consumer in ["mason", "codemode"] {
         for legacy in [false, true] {
@@ -963,6 +973,10 @@ async fn migrated_062_decisions_keep_codemode_metered_and_mason_subscription_on_
         }
     }
     let harness = super::conformance_tests::upgrade_harness(harness);
+    let fact = account_fact("synthetic");
+    harness.install_facts(&[fact.clone()]);
+    catalog_fact(&harness, &fact);
+    harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["consumers"]["mason"]["pay_per_token"] = json!(true);
         config["consumers"]["codemode"]["pay_per_token"] = json!(false);

@@ -98,7 +98,7 @@ fn main() {
             81,
         )
         .err()
-        .expect("previous chain must refuse schema 82");
+        .expect("an older chain must refuse the migrated schema");
         assert!(error.to_string().contains("store_ahead"));
         println!("previous-chain guard: {error}");
     }

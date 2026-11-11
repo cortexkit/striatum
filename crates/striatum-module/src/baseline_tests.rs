@@ -329,7 +329,7 @@ fn install_catalog(
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
         };
         store.upsert_fact(&fact, FactSource::Override).unwrap();
         updates.push(FusiformFactUpdate {
@@ -349,7 +349,7 @@ fn install_catalog(
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: list("reasoning_efforts"),
             canonical_id: text("canonical_id"),
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
             lineage: fact.family.clone(),
         });
     }

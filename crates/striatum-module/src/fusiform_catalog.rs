@@ -239,6 +239,10 @@ struct CatalogModelFacts {
     status: Option<String>,
     #[serde(rename = "model.lineage", default)]
     lineage: Option<String>,
+    #[serde(rename = "model.type", default)]
+    model_type: Option<String>,
+    #[serde(rename = "model.kind", default)]
+    model_kind: Option<String>,
 }
 
 fn served_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -1095,6 +1099,8 @@ fn decode_model_entry(
             .filter(|canonical_id| !canonical_id.trim().is_empty()),
         upstream_status: model.status.filter(|status| !status.trim().is_empty()),
         lineage: model.lineage,
+        model_type: model.model_type,
+        model_kind: model.model_kind,
     };
     Ok((fact, model_rates))
 }
@@ -3075,6 +3081,43 @@ mod tests {
 
         let status = decode_catalog_status(&get_reply("catalog.status")).unwrap();
         assert_eq!(status.catalog_version, 0);
+    }
+
+    #[test]
+    #[ignore = "measurement requires FUSIFORM_SERVED_PAYLOADS pointing at the producer golden payloads"]
+    fn measure_golden_chat_exclusions() {
+        let path = std::env::var("FUSIFORM_SERVED_PAYLOADS").expect("producer golden payload path");
+        let bytes = std::fs::read(path).unwrap();
+        let payloads: Value = serde_json::from_slice(&bytes).unwrap();
+        let rig = Rig::new("golden-chat-exclusions");
+        let mut model = rig.store().get_facts().unwrap().remove(0);
+        let mut seen = BTreeSet::new();
+        let mut excluded = BTreeSet::new();
+        let mut catalogs = 0;
+        for (name, payload) in payloads.as_object().unwrap() {
+            let response = &payload["response"];
+            if response.get("models").is_none() {
+                continue;
+            }
+            let snapshot = decode_catalog_get(&serde_json::to_vec(response).unwrap())
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            catalogs += 1;
+            for fact in snapshot.parts().0 {
+                let route = format!("{}/{}", fact.provider_id, fact.model_id);
+                seen.insert(route.clone());
+                model.model_type = fact.model_type.clone();
+                model.model_kind = fact.model_kind.clone();
+                if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(&model, false) {
+                    excluded.insert((route, reason));
+                }
+            }
+        }
+        assert!(catalogs > 0);
+        println!("producer_sha256={:x}", Sha256::digest(&bytes));
+        println!("catalogs={catalogs} distinct_rows={} newly_excluded={}", seen.len(), excluded.len());
+        for (route, reason) in excluded {
+            println!("{route}\t{reason}");
+        }
     }
 
     #[test]

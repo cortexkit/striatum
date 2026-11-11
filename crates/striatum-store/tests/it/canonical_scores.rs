@@ -67,7 +67,7 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: canonical_id.map(str::to_string),
-        upstream_status: None,
+        upstream_status: None, model_type: None, model_kind: None,
         lineage: None,
     }
 }

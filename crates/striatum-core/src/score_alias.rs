@@ -115,14 +115,21 @@ pub fn catalog_key(aliases: &BTreeMap<String, String>, route_key: &str) -> Strin
 /// the borrowed row carries the target's live quality data (Elo overrides,
 /// observed speed), and before pricing, which attaches the resolved provider's
 /// own billing plane. A stored row the resolved provider already owns wins over
-/// a borrowed one.
+/// a borrowed one for scores and policy, but catalog classifications still come
+/// from the model it serves: an alias cannot turn an engine into a chat model.
 pub fn append_alias_rows(facts: &mut Vec<ModelFact>, aliases: &BTreeMap<String, String>) {
     let mut borrowed = Vec::new();
+    let mut classifications = Vec::new();
     for alias in aliases.keys() {
         let Some(target) = alias_target(aliases, alias) else {
             continue;
         };
         for fact in facts.iter().filter(|fact| fact.provider_id == target) {
+            for (index, _) in facts.iter().enumerate().filter(|(_, existing)| {
+                existing.provider_id == *alias && existing.model_id == fact.model_id
+            }) {
+                classifications.push((index, fact.model_type.clone(), fact.model_kind.clone()));
+            }
             let owned = facts.iter().any(|existing| {
                 existing.provider_id == *alias
                     && existing.model_id == fact.model_id
@@ -139,6 +146,10 @@ pub fn append_alias_rows(facts: &mut Vec<ModelFact>, aliases: &BTreeMap<String, 
             row.billing_plane = None;
             borrowed.push(row);
         }
+    }
+    for (index, model_type, model_kind) in classifications {
+        facts[index].model_type = model_type;
+        facts[index].model_kind = model_kind;
     }
     facts.extend(borrowed);
 }
@@ -161,6 +172,8 @@ mod tests {
             .collect();
         assert!(!facts.is_empty(), "seed has anthropic rows");
         facts[0].subscription_multiplier = Some(12.0);
+        facts[0].model_type = Some("transcription".into());
+        facts[0].model_kind = Some("decision".into());
         let source = facts[0].clone();
         let stored = facts.len();
         append_alias_rows(&mut facts, &aliases());
@@ -177,12 +190,39 @@ mod tests {
         assert_eq!(alias.context_window, source.context_window);
         assert_eq!(alias.supports_tool_use, source.supports_tool_use);
         assert_eq!(alias.family, source.family);
+        assert_eq!(alias.model_type, source.model_type);
+        assert_eq!(alias.model_kind, source.model_kind);
         assert_eq!(alias.subscription_multiplier, None);
         assert_eq!(alias.billing_plane, None);
 
         // Appending again adds nothing: rows the alias owns win.
         append_alias_rows(&mut facts, &aliases());
         assert_eq!(facts.len(), stored * 2);
+    }
+
+    #[test]
+    fn an_owned_alias_row_cannot_erase_the_catalog_classification() {
+        let mut source = model_facts_seed().iter()
+            .find(|fact| fact.provider_id == "anthropic").unwrap().clone();
+        source.model_type = Some("image".into());
+        source.model_kind = Some("extraction".into());
+        let mut owned = source.clone();
+        owned.provider_id = "anthropic-platform".into();
+        owned.variant = Some("high".into());
+        owned.model_type = None;
+        owned.model_kind = None;
+        owned.scores.elo = 1234.0;
+        let mut facts = vec![source, owned];
+        append_alias_rows(&mut facts, &aliases());
+        assert_eq!(facts.len(), 3);
+        assert_eq!(facts[1].model_type.as_deref(), Some("image"));
+        assert_eq!(facts[1].model_kind.as_deref(), Some("extraction"));
+        assert_eq!(facts[1].scores.elo, 1234.0);
+        facts[0].model_type = None;
+        facts[0].model_kind = None;
+        append_alias_rows(&mut facts, &aliases());
+        assert_eq!(facts[1].model_type, None);
+        assert_eq!(facts[1].model_kind, None);
     }
 
     #[test]

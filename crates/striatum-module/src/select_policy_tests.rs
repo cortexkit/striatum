@@ -65,7 +65,7 @@ mod consumer_and_pin {
                 cost_tier: fact.cost_tier, cost_per_mtok_out: fact.cost_per_m_tok_out,
                 input_rate: fact.input_rate, cache_read_rate: fact.cache_read_rate, cache_write_rate: fact.cache_write_rate, reasoning_rate: fact.reasoning_rate,
                 supports_vision: fact.supports_vision, supports_tool_use: fact.supports_tool_use,
-                reasoning_efforts: None, canonical_id: None, upstream_status: None, lineage: fact.family.clone(),
+                reasoning_efforts: None, canonical_id: None, upstream_status: None, model_type: None, model_kind: None, lineage: fact.family.clone(),
             };
             self.store.apply_fusiform_catalog(&[update], FusiformCatalogCursor { catalog_version: 1, resolved_at_ms: 1 }).unwrap();
         }
@@ -897,7 +897,7 @@ mod consumer_and_pin {
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
                     canonical_id: None,
-                    upstream_status: None,
+                    upstream_status: None, model_type: None, model_kind: None,
                     lineage: None,
                 }],
                 striatum_store::FusiformCatalogCursor {

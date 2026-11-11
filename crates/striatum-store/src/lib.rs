@@ -310,7 +310,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 81] {
+fn route_state_migrations() -> [Migration; 82] {
     [
         Migration {
             version: 1,
@@ -636,6 +636,10 @@ fn route_state_migrations() -> [Migration; 81] {
             version: 82,
             statements: include_str!("../migrations/082_fence_rechecks.sql"),
         },
+        Migration {
+            version: 83,
+            statements: include_str!("../migrations/083_model_classification.sql"),
+        },
     ]
 }
 
@@ -834,6 +838,8 @@ pub struct FusiformFactUpdate {
     pub upstream_status: Option<String>,
     /// Fusiform's `model.lineage`, without rewriting or inferring a value.
     pub lineage: Option<String>,
+    pub model_type: Option<String>,
+    pub model_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -866,20 +872,24 @@ struct CatalogFingerprintRow {
     reasoning_efforts_json: Option<String>,
     canonical_id: Option<String>,
     upstream_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_kind: Option<String>,
 }
 
 /// BLAKE3 over every routing-read `model_facts` column: route/capacity identity,
 /// provider/model/variant, family, Elo/EQ/speed, context and output limits, price
 /// data, vision/tool capability flags, allowed login methods, published
 /// reasoning efforts, canonical model identity (it decides which score a route
-/// borrows), upstream status (a deprecated route is refused), prompt defaults,
+/// borrows), upstream status, model type and specialist kind, prompt defaults,
 /// confidence, speed multiplier, and exclusion, plus Fusiform operator grades.
 /// Adding a routing-read column
 /// without extending this row is the defect this hash exists to catch. Query ordering—not insertion ordering—is the
 /// generation contract, so a no-op reseed or shuffled input cannot mint a different
 /// fingerprint for the same catalog.
 ///
-/// Widening this row is intentionally migration-free even though it changes every
+/// Widening this row is intentionally migration-free even when it changes a
 /// fingerprint: comparisons only have meaning within a catalog generation, and a
 /// historical NULL fingerprint was never comparable to a live catalog value.
 ///
@@ -893,7 +903,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
-                reasoning_efforts_json, canonical_id, upstream_status
+                reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -928,6 +938,8 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             reasoning_efforts_json: row.get(23)?,
             canonical_id: row.get(24)?,
             upstream_status: row.get(25)?,
+            model_type: row.get(26)?,
+            model_kind: row.get(27)?,
         })
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1952,7 +1964,7 @@ impl SqliteRouteStateStore {
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source, auth_methods_json,
-                               reasoning_efforts_json, canonical_id, upstream_status
+                               reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -1960,7 +1972,7 @@ impl SqliteRouteStateStore {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform', ?18, ?19, ?20, ?21
+                               'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23
                              )",
                             params![
                                 route_key,
@@ -1984,6 +1996,8 @@ impl SqliteRouteStateStore {
                                 reasoning_efforts_json,
                                 fact.canonical_id,
                                 fact.upstream_status,
+                                fact.model_type,
+                                fact.model_kind,
                             ],
                         )?;
                         stored_models
@@ -2032,7 +2046,8 @@ impl SqliteRouteStateStore {
                                facts_source = 'fusiform', fusiform_version = ?11,
                                fusiform_present = ?12, updated_at = ?13,
                                auth_methods_json = ?16, reasoning_efforts_json = ?17,
-                               canonical_id = ?18, upstream_status = ?19
+                               canonical_id = ?18, upstream_status = ?19,
+                               model_type = ?20, model_kind = ?21
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -2054,6 +2069,8 @@ impl SqliteRouteStateStore {
                                 reasoning_efforts_json,
                                 fact.canonical_id,
                                 fact.upstream_status,
+                                fact.model_type,
+                                fact.model_kind,
                             ],
                         )?;
                     }
@@ -3044,6 +3061,8 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         class_vector: None,
         class_vector_is_overlay: false,
         upstream_status: row.get::<_, Option<String>>("upstream_status")?,
+        model_type: row.get("model_type")?,
+        model_kind: row.get("model_kind")?,
     })
 }
 
@@ -3452,10 +3471,17 @@ impl RouteStateStore for SqliteRouteStateStore {
                      |row| row.get(0),
                  ).optional()?;
                  let family = lineage.as_ref().unwrap_or(&fact.family);
-                 // Login restrictions, the canonical model identity and the
-                 // upstream status belong to the served model, not its route
-                 // variant. When upsert_fact places a new variant's scores, it
-                 // inherits all three; updating scores cannot erase any of them.
+                 let classification = tx.query_row(
+                     "SELECT model_type, model_kind FROM model_facts
+                      WHERE provider_id = ?1 AND model_id = ?2 ORDER BY route_key LIMIT 1",
+                     params![fact.provider_id, fact.model_id],
+                     |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?)),
+                 ).optional()?;
+                 let (model_type, model_kind) = classification.unwrap_or_else(||
+                     (fact.model_type.clone(), fact.model_kind.clone()));
+                 // Catalog identity, classifications and login restrictions belong
+                 // to the served model. Score edits and new reasoning variants
+                 // must retain even an explicitly absent catalog classification.
                  tx.execute(
                      "INSERT INTO model_facts (
                        route_key, capacity_key, provider_id, model_id, variant, family, family_source,
@@ -3463,14 +3489,15 @@ impl RouteStateStore for SqliteRouteStateStore {
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
                           source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json,
-                          canonical_id, upstream_status
+                          canonical_id, upstream_status, model_type, model_kind
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
                            (SELECT auth_methods_json FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                            (SELECT canonical_id FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
-                           (SELECT upstream_status FROM model_facts
-                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1))
+                            (SELECT upstream_status FROM model_facts
+                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
+                            ?28, ?29)
                       ON CONFLICT(route_key) DO UPDATE SET
                        capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
                        model_id=excluded.model_id, variant=excluded.variant, family=excluded.family,
@@ -3519,6 +3546,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                         aa_index,
                         review_by_ms,
                         eq_source,
+                        model_type,
+                        model_kind,
                     ],
                 )?;
                 // A fresh INSERT fires the model_facts insert trigger, which creates
@@ -7317,7 +7346,7 @@ mod tests {
                     supports_tool_use: Some(true),
                     reasoning_efforts: None,
                     canonical_id: None,
-                    upstream_status: None,
+                    upstream_status: None, model_type: None, model_kind: None,
                     lineage: None,
                 }],
                 FusiformCatalogCursor {

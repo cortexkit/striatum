@@ -237,6 +237,7 @@ pub(crate) fn prepare_candidates(
     available: std::collections::HashSet<String>,
     mut rejected: HashMap<String, String>,
     source: CandidateSource<'_>,
+    classifier: bool,
     consumer: Option<Consumer>,
     priced_per_token: bool,
     allowed_providers: Option<&[String]>,
@@ -408,6 +409,16 @@ pub(crate) fn prepare_candidates(
         }
     }
     rejected.extend(filters.clone());
+    let structural: HashMap<_, _> = facts.iter().flat_map(|fact| {
+        striatum_core::model_facts::llm_classification_rejection(fact, classifier)
+            .into_iter().flat_map(|reason| {
+                let route = fact_to_route(fact);
+                [(route.route_key, reason.clone()), (route.capacity_key, reason)]
+            })
+    }).collect();
+    let mut filters = filters;
+    filters.extend(structural.clone());
+    rejected.extend(structural);
     Candidates {
         available,
         subscription_keys,
@@ -940,6 +951,7 @@ mod candidate_tests {
                 stale: &[],
                 defer_pool_pin: false,
             },
+            false,
             Some(Consumer::Mason),
             false,
             None,

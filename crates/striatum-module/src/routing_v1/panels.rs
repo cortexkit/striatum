@@ -443,6 +443,10 @@ async fn candidates(
     let mut rejected = Vec::new();
     facts.retain(|fact| {
         let route = fact_to_route(fact);
+        if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(fact, false) {
+            rejected.push(PanelRejectedCandidate::new(route.route_key, reason));
+            return false;
+        }
         let window_fits = required.and_then(|r| r.context_window).is_none_or(|min| {
             fact.context_window
                 .is_some_and(|window| window > 0.0 && window >= min as f64)

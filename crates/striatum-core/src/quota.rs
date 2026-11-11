@@ -884,7 +884,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
         }
     }
 
