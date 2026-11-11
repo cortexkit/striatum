@@ -2739,19 +2739,32 @@ mod tests {
                VALUES ('p','key',{},{},{});",
             now+99_000_000,now-100,now-100,now-100,now+99_000_000,now+10_000,now-100))).unwrap();
         drop(old);
+        // The migration stamps its own clock in whole seconds when the store
+        // opens, so bound it by the second containing `now` and a reading taken
+        // after the open, rather than assuming both land in the same second.
+        let earliest = now - now.rem_euclid(1000);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let latest = crate::now_ms();
         let clocks = store.fence_rechecks().unwrap();
         let quota = clocks
             .iter()
             .find(|clock| clock.kind == "account_route")
             .unwrap();
-        assert!(quota.next_recheck_at <= now && quota.next_recheck_at >= now - 1000);
+        assert!(
+            (earliest..=latest).contains(&quota.next_recheck_at),
+            "quota recheck {} outside migration window {earliest}..={latest}",
+            quota.next_recheck_at
+        );
         let billing = clocks
             .iter()
             .find(|clock| clock.kind == "pool_billing")
             .unwrap();
-        assert!(billing.next_recheck_at <= now + NON_QUOTA_FENCE_MAX_MS);
-        assert!(billing.next_recheck_at >= now + NON_QUOTA_FENCE_MAX_MS - 1000);
+        assert!(
+            (earliest + NON_QUOTA_FENCE_MAX_MS..=latest + NON_QUOTA_FENCE_MAX_MS)
+                .contains(&billing.next_recheck_at),
+            "non-quota cap {} is not one hour after the migration clock",
+            billing.next_recheck_at
+        );
         let short = clocks
             .iter()
             .find(|clock| clock.kind == "pool_rate")
