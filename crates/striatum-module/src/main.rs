@@ -95,7 +95,6 @@ use striatum_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
     SelectModelRouteInput, SelectedModelRoute,
 };
-use striatum_core::quota::quota_poll::record_reading_log_poll;
 use striatum_core::quota::{merge_quota_overlay, ProviderUsage};
 use striatum_core::route_state_store::FactSource;
 use striatum_core::routing_config::ANCHOR_VERSION;
@@ -637,13 +636,23 @@ fn write_quota_readings(
 ) -> Result<(), String> {
     let facts = store.get_facts().map_err(|e| e.to_string())?;
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
+    let mut rows = Vec::new();
+    let mut joined = false;
     for entry in fresh {
         let Some(join) = striatum_core::quota::quota_route_join(entry, &facts) else {
             continue;
         };
         let capacity_keys = striatum_core::quota::quota_capacity_keys(entry, &facts);
-        record_reading_log_poll(store, entry, join.provider_id, &capacity_keys, observed_at)
-            .map_err(|e| e.to_string())?;
+        joined = true;
+        rows.extend(striatum_core::quota_poll::reading_log_rows_for_poll(
+            entry, join.provider_id, &capacity_keys, observed_at,
+        ));
+    }
+    if joined {
+        // Retention is a poll boundary, not an account boundary. Append every
+        // account in one transaction instead of one fsync per account.
+        store.prune_quota_readings(observed_at).map_err(|e| e.to_string())?;
+        store.append_quota_readings(&rows).map_err(|e| e.to_string())?;
     }
     Ok(())
 }

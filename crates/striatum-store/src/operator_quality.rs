@@ -49,6 +49,27 @@ pub(super) fn fingerprint_rows(
     rows.collect()
 }
 
+pub(super) fn overlay_operator_quality(
+    c: &Connection,
+    facts: &mut [ModelFact],
+    canonical_ids: &[Option<String>],
+) -> rusqlite::Result<()> {
+    let grades = fingerprint_rows(c)?;
+    for (fact, canonical_id) in facts.iter_mut().zip(canonical_ids) {
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        let grade = grades.get(&key).or_else(|| {
+            canonical_id.as_ref().and_then(|id| grades.values().find(|grade| &grade.model == id))
+        });
+        if let Some(grade) = grade {
+            fact.scores.elo = grade.elo;
+            fact.scores.eq = grade.eq;
+            fact.score_provenance = ScoreProvenance::OperatorGrade;
+            fact.eq_source = Some("operator_grade".into());
+        }
+    }
+    Ok(())
+}
+
 impl SqliteRouteStateStore {
     /// Keep catalog grades separate from curated scores so withdrawing a grade
     /// restores the stored score rather than persisting the catalog overlay.
@@ -85,29 +106,6 @@ impl SqliteRouteStateStore {
 
     pub fn operator_quality(&self) -> RouteStateResult<BTreeMap<String, OperatorQuality>> {
         self.store.with_conn(fingerprint_rows).map_err(err)
-    }
-
-    pub(super) fn overlay_operator_quality(
-        &self,
-        facts: &mut [ModelFact],
-        canonical_ids: &[Option<String>],
-    ) -> RouteStateResult<()> {
-        let grades = self.operator_quality()?;
-        for (fact, canonical_id) in facts.iter_mut().zip(canonical_ids) {
-            let key = format!("{}/{}", fact.provider_id, fact.model_id);
-            let grade = grades.get(&key).or_else(|| {
-                canonical_id
-                    .as_ref()
-                    .and_then(|id| grades.values().find(|grade| &grade.model == id))
-            });
-            if let Some(grade) = grade {
-                fact.scores.elo = grade.elo;
-                fact.scores.eq = grade.eq;
-                fact.score_provenance = ScoreProvenance::OperatorGrade;
-                fact.eq_source = Some("operator_grade".into());
-            }
-        }
-        Ok(())
     }
 
     pub fn unscored_admissible_models(

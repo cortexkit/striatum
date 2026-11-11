@@ -68,7 +68,11 @@ pub(super) fn report_at(
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    let mut effects = prepare_account_facts(params, &decision, deps, now as i64)?;
+    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?.snapshot();
+    let quota = crate::ACCOUNT_QUOTA.get()
+        .and_then(|q| q.lock().ok().map(|q| q.clone())).unwrap_or_default();
+    let account_ids = credentials.quota_account_ids(&quota);
+    let mut effects = prepare_account_facts(params, &decision, deps, now as i64, &credentials, &quota, &account_ids)?;
     let usage = request
         .usage
         .as_ref()
@@ -118,15 +122,6 @@ pub(super) fn report_at(
     let answer_json = serde_json::to_string(&answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
     let reconcile = effects.credential_refusal.is_some();
-    let credentials = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .clone();
-    let quota = crate::ACCOUNT_QUOTA
-        .get()
-        .and_then(|q| q.lock().ok().map(|q| q.clone()))
-        .unwrap_or_default();
     let config = super::operator_config(deps);
     let standing = deps
         .store
@@ -156,7 +151,7 @@ pub(super) fn report_at(
                 if reconcile {
                     crate::account_selection::refresh_credential_quota_holds_in(
                         tx,
-                        &credentials,
+                        &account_ids,
                         &quota,
                         &config,
                         tx.report_credential_refusals()?,
@@ -184,6 +179,9 @@ fn prepare_account_facts(
     decision: &striatum_store::V1Decision,
     deps: &Deps<'_>,
     now: i64,
+    credentials: &crate::broca_credentials::BrocaCredentials,
+    quota: &crate::account_quota::AccountQuotaState,
+    account_ids: &crate::broca_credentials::CredentialAccounts,
 ) -> Result<striatum_store::V1ReportEffects, Refusal> {
     let mut effects = striatum_store::V1ReportEffects::default();
     effects.quota_scope = Some(striatum_store::QuotaSuccessScope {
@@ -214,11 +212,6 @@ fn prepare_account_facts(
     // Prepare from read-only snapshots. ClassContext::load also releases
     // reservations and reconciles fences, which must not run for a losing claim.
     let mut facts = deps.store.get_facts().map_err(store_refusal)?;
-    let credentials = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .clone();
     let targets = credentials.catalog_targets(&facts);
     striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
     let Some(fact) = facts
@@ -233,6 +226,12 @@ fn prepare_account_facts(
         credentials.listed_credentials().iter().any(|row| {
             row.id == credential
                 && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
+        })
+    };
+    let quota_contradicted = |credential: &str| {
+        crate::credential_fences::credential_account_id(account_ids, credential).is_some_and(|account| {
+            crate::credential_fences::fresh_headroom_after_for_account(quota, &account, i64::MIN, now,
+                &super::operator_config(deps).allocator_policy(&decision.provider))
         })
     };
     let code = params
@@ -271,18 +270,7 @@ fn prepare_account_facts(
                     decision_id: decision.decision_id.clone(),
                     recorded_at: now,
                 });
-                let contradicted = crate::ACCOUNT_QUOTA
-                    .get()
-                    .and_then(|quota| quota.lock().ok())
-                    .is_some_and(|quota| {
-                        crate::credential_fences::quota_refusal_contradicted(
-                            &quota,
-                            &credentials,
-                            served,
-                            now,
-                            &super::operator_config(deps).allocator_policy(&decision.provider),
-                        )
-                    });
+                let contradicted = quota_contradicted(served);
                 if contradicted {
                     let mut fence = effects.route_fence.take().unwrap();
                     fence.until_ms = now.saturating_add(
@@ -355,18 +343,7 @@ fn prepare_account_facts(
                     .unwrap_or(0),
                 observed_at: now,
             });
-            if crate::ACCOUNT_QUOTA
-                .get()
-                .and_then(|quota| quota.lock().ok())
-                .is_some_and(|quota| {
-                    crate::credential_fences::quota_refusal_contradicted(
-                        &quota,
-                        &credentials,
-                        credential,
-                        now,
-                        &super::operator_config(deps).allocator_policy(&decision.provider),
-                    )
-                })
+            if quota_contradicted(credential)
             {
                 let mut fact = effects.size_refusal.take().unwrap();
                 let cap = now.saturating_add(
@@ -453,7 +430,7 @@ fn prepare_usage(
                 .or(reported_credential)?;
             // Pricing also reads the store and account quota. Keep only owned
             // credential data here, never a guard across those other locks.
-            let credentials = deps.broca_credentials.lock().ok()?.clone();
+            let credentials = deps.broca_credentials.lock().ok()?.snapshot();
             #[cfg(test)]
             crate::account_quota::after_join_snapshot_for_test();
             let row = credentials

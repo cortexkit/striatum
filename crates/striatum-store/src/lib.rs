@@ -1126,6 +1126,9 @@ pub struct SqliteRouteStateStore {
     /// `None` until a fingerprint is computed while the change tracking is in
     /// place, and reset whenever that tracking has to be installed again.
     catalog_fingerprint: Mutex<Option<CachedCatalogFingerprint>>,
+    /// Resolved capabilities and operator grades share the catalog fingerprint's
+    /// write tracking. Unrelated writes on this connection do not invalidate it.
+    resolved_facts: Mutex<Option<(CatalogFingerprintKey, Vec<(ModelFact, bool)>)>>,
     #[cfg(any(test, feature = "test-support"))]
     account_write_transactions: AtomicU64,
 }
@@ -1425,6 +1428,7 @@ impl SqliteRouteStateStore {
             usage_generation: AtomicU64::new(0),
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
+            resolved_facts: Mutex::new(None),
             #[cfg(any(test, feature = "test-support"))]
             account_write_transactions: AtomicU64::new(0),
         }
@@ -1489,6 +1493,7 @@ impl SqliteRouteStateStore {
     /// cached entry over a different catalog and serve that entry's value.
     /// A failed install is only logged; the next read tries again.
     fn reinstall_catalog_change_tracking(&self, connection: &Connection, cause: &rusqlite::Error) {
+        *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self
             .catalog_fingerprint
             .lock()
@@ -1639,9 +1644,29 @@ impl SqliteRouteStateStore {
     /// still NULL (an older row before its first full sync), or when `source` is
     /// an operator `override`. The bool carries that final routing decision.
     fn read_resolved_facts(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
-        let rows = self
-            .store
-            .with_conn(|c: &Connection| {
+        self.store.with_conn(|c: &Connection| {
+            // Never reuse or publish a transaction-local view. The TEMP counter
+            // counts model-fact and operator-grade writes, including uncommitted
+            // ones. Rollback restores that count; different later writes could
+            // reach the same count but must not reuse the rolled-back facts.
+            let cacheable = c.is_autocommit();
+            let key = match read_catalog_fingerprint_key(c) {
+                Ok(key) => Some(key),
+                Err(cause) => {
+                    self.reinstall_catalog_change_tracking(c, &cause);
+                    None
+                }
+            };
+            if cacheable {
+                let cache = self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some((_, facts)) = cache.as_ref().filter(|(cached, _)| Some(*cached) == key) {
+                    return Ok(facts.clone());
+                }
+            }
+            // Keep catalog rows and their operator-grade overlay in one SQLite
+            // snapshot even when a second connection updates the catalog.
+            let tx = if cacheable { Some(c.unchecked_transaction()?) } else { None };
+            let rows = {
                 let mut stmt = c.prepare(
                     "SELECT *,
                             (COALESCE(fusiform_present, 1) = 1 OR source = 'override') AS present_now
@@ -1654,9 +1679,8 @@ impl SqliteRouteStateStore {
                         row.get::<_, bool>("present_now")?,
                     ))
                 })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
         let mut facts = Vec::with_capacity(rows.len());
         let mut canonical_ids = Vec::with_capacity(rows.len());
         let mut present = Vec::with_capacity(rows.len());
@@ -1666,8 +1690,14 @@ impl SqliteRouteStateStore {
             present.push(present_now);
         }
         self.share_canonical_scores(&mut facts, &canonical_ids);
-        self.overlay_operator_quality(&mut facts, &canonical_ids)?;
-        Ok(facts.into_iter().zip(present).collect())
+        operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
+        let facts: Vec<_> = facts.into_iter().zip(present).collect();
+        if let Some(tx) = tx { tx.commit()?; }
+        if let Some(key) = key.filter(|_| cacheable) {
+            *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
+        }
+        Ok(facts)
+        }).map_err(err)
     }
 
     /// Give routes without an operator score the score of a route serving the
@@ -4571,6 +4601,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.record_usage_delivery_with_decision(obs, None)
     }
     fn append_quota_readings(&self, rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
+        if rows.is_empty() { return Ok(0); }
         self.store
             .with_conn(|connection: &Connection| {
                 let transaction = connection.unchecked_transaction()?;
@@ -7388,6 +7419,46 @@ mod tests {
             )
             .unwrap();
         assert_fingerprint_follows(&store, "other connection", &mut seen);
+    }
+
+    #[test]
+    fn resolved_fact_cache_tracks_catalog_quality_external_writes_and_rollback() {
+        let scratch = cortexkit_test_support::ScratchDir::new("resolved-fact-cache");
+        let store = fingerprint_test_store(&scratch, "resolved-fact-cache");
+        let mut fact = store.get_facts().unwrap().remove(0);
+        fact.provider_id = "cache-provider".into();
+        fact.model_id = "cache-model".into();
+        fact.variant = None;
+        fact.scores.elo = 1234.0;
+        store.upsert_fact(&fact, FactSource::Override).unwrap();
+        let read = || store.get_facts().unwrap().into_iter().find(|f| f.provider_id == "cache-provider").unwrap();
+        assert_eq!(read().scores.elo, 1234.0);
+        let cached_ptr = || store.resolved_facts.lock().unwrap().as_ref().unwrap().1.as_ptr() as usize;
+        let before = cached_ptr();
+        store.store.with_conn(|c| c.execute("UPDATE model_route_state SET updated_at=updated_at+1", [])).unwrap();
+        assert_eq!(read().scores.elo, 1234.0);
+        assert_eq!(cached_ptr(), before, "ordinary routing writes must not decode the catalog again");
+        store.replace_operator_quality(true, &[("cache-provider/cache-model".into(), OperatorQuality {
+            model: "cache-model".into(), elo: 2345.0, eq: 2456.0,
+        })].into_iter().collect()).unwrap();
+        assert_eq!(read().scores.elo, 2345.0);
+        assert_eq!(store.get_fact_by_route_key("cache-provider/cache-model").unwrap().unwrap().scores.elo, 1234.0);
+        store.replace_operator_quality(false, &Default::default()).unwrap();
+        assert_eq!(read().scores.elo, 1234.0);
+        let external = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
+        external.execute("UPDATE model_facts SET context_window=765432 WHERE provider_id='cache-provider'", []).unwrap();
+        assert_eq!(read().context_window, Some(765432.0));
+        store.store.with_conn(|c| c.execute_batch("BEGIN; UPDATE model_facts SET context_window=888 WHERE provider_id='cache-provider'")).unwrap();
+        assert_eq!(read().context_window, Some(888.0));
+        store.store.with_conn(|c| c.execute_batch("ROLLBACK; UPDATE model_facts SET context_window=999 WHERE provider_id='cache-provider'")).unwrap();
+        assert_eq!(read().context_window, Some(999.0));
+        store.store.with_conn(|c| c.execute_batch("DROP TABLE temp.catalog_facts_writes")).unwrap();
+        assert_eq!(read().context_window, Some(999.0));
+        fact.context_window = Some(111.0);
+        store.upsert_fact(&fact, FactSource::Override).unwrap();
+        assert_eq!(read().context_window, Some(111.0));
+        store.delete_fact("cache-provider/cache-model").unwrap();
+        assert!(!store.get_facts().unwrap().iter().any(|f| f.provider_id == "cache-provider"));
     }
 
     #[test]

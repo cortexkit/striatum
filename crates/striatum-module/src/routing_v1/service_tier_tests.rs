@@ -690,14 +690,10 @@ async fn account_service_tier_requires_calling_runner_and_model_support() {
     for missing in ["runner", "model"] {
         let (harness, mut credentials) = setup(&["pro_200"], true, true);
         if missing == "runner" {
-            credentials.runner_declarations.insert(
-                "other-tier-runner".into(),
-                credentials.runner_declarations[RUNNER].clone(),
-            );
-            credentials.runner_service_tiers.insert(
-                "other-tier-runner".into(),
-                credentials.runner_service_tiers[RUNNER].clone(),
-            );
+            let declaration = credentials.runner_declarations[RUNNER].clone();
+            let tiers = credentials.runner_service_tiers[RUNNER].clone();
+            credentials.runner_declarations.insert("other-tier-runner".into(), declaration);
+            credentials.runner_service_tiers.insert("other-tier-runner".into(), tiers);
             runners::DescribeCache::default().reply(
                 RUNNER,
                 Some(&json!({"capabilities":[]})),

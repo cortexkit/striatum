@@ -41,6 +41,8 @@ mod panels;
 mod panels_tests;
 mod reads;
 mod report;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod request_cpu_bench;
 pub(crate) mod runners;
 mod select;
 #[cfg(test)]

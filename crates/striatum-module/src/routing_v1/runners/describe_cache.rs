@@ -169,6 +169,7 @@ impl DescribeCache {
             };
             view_event(credentials, &module, cause, now);
         }
+        let credentials = &mut **credentials;
         let fresh = |module: &String| {
             credentials
                 .runner_describe_observed

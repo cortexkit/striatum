@@ -23,6 +23,7 @@ pub struct FenceRecheck {
     pub admission_id: Option<String>,
     pub evidence_at: i64,
     pub quota: bool,
+    pub classified: bool,
     pub next_recheck_at: i64,
     pub reset_check_at: Option<i64>,
     pub last_claimed_at: Option<i64>,
@@ -218,7 +219,7 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
         return Ok(Vec::new());
     }
     let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-        evidence_at,quota,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,evidence FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
+        evidence_at,quota,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,evidence,classified FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
     let rows = statement.query_map([], |row| {
         Ok(FenceRecheck {
             evidence: row.get(15)?,
@@ -233,6 +234,7 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
             admission_id: row.get(8)?,
             evidence_at: row.get(9)?,
             quota: row.get(10)?,
+            classified: row.get(16)?,
             next_recheck_at: row.get(11)?,
             reset_check_at: row.get(12)?,
             last_claimed_at: row.get(13)?,
@@ -335,6 +337,7 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
             admission_id: row.get(8)?,
             evidence_at,
             quota,
+            classified: false,
             next_recheck_at: next,
             reset_check_at: reset.filter(|at| {
                 quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
@@ -828,6 +831,27 @@ impl AccountTx<'_> {
         }
         Ok(())
     }
+    /// Preview classification without materializing or renewing retry clocks.
+    /// Only a classification of the same evidence can be reused; admission or
+    /// reconciliation must classify new evidence under the writer lock.
+    pub fn credential_quota_classification(
+        &self,
+        provider: &str,
+        credential: &str,
+        proposed: bool,
+    ) -> RouteStateResult<(bool, bool)> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok((proposed, false));
+        }
+        let prior = self.conn.query_row(
+            "SELECT r.quota FROM fence_recheck r JOIN fence_origin o
+             ON o.kind=r.kind AND o.origin_key=r.origin_key AND o.evidence=r.evidence
+             WHERE r.kind='credential' AND r.provider=?1 AND r.credential_id=?2 AND r.classified=1",
+            params![provider, credential], |row| row.get(0),
+        ).optional().map_err(err)?;
+        Ok((prior.unwrap_or(proposed), prior.is_none()))
+    }
+
     pub fn classify_credential_quota(
         &self,
         provider: &str,

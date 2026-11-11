@@ -80,20 +80,27 @@ impl LiveQuota {
             .lock()
             .map_err(|_| "quota cache poisoned")?
             .clone();
-        let mut accounts = self
+        let readings = self
             .accounts
             .lock()
             .map_err(|_| "account cache poisoned")?
+            .readings
             .clone();
+        // Usage merges only readings; the independently refreshed vault roster
+        // need not be copied or restored by an Insula event.
+        let mut accounts = account_quota::AccountQuotaState { readings, ..Default::default() };
         let at_ms = crate::now_ms();
         // A single account event cannot replace the entire restored snapshot.
         if incremental {
             cache.restored_from_ms = None;
         }
-        crate::apply_quota_refresh(&mut cache, windows.clone(), at_ms);
         let (rows, completeness) =
             account_quota::apply_usage_reply(&mut accounts, body, at_ms as i64)?;
         crate::write_quota_readings(self.store.as_ref(), &windows, at_ms)?;
+        let baseline = (!incremental).then(|| windows.iter().map(|entry| {
+            ((entry.provider.clone(), entry.account.clone()), entry.clone())
+        }).collect::<Vec<_>>());
+        crate::apply_quota_refresh(&mut cache, windows, at_ms);
         self.store
             .put_account_quota_poll(&rows, &completeness)
             .map_err(|e| e.to_string())?;
@@ -103,13 +110,13 @@ impl LiveQuota {
         // Roster refresh has its own writer; do not overwrite its concurrent result.
         guard.readings = accounts.readings;
         guard.last_insula_error = None;
-        if !incremental {
+        if let Some(entries) = baseline {
             let mut baseline = self
                 .snapshot_baseline
                 .lock()
                 .map_err(|_| "quota baseline poisoned")?;
-            for entry in windows {
-                baseline.insert((entry.provider.clone(), entry.account.clone()), entry);
+            for (key, entry) in entries {
+                baseline.insert(key, entry);
             }
         }
         Ok(())

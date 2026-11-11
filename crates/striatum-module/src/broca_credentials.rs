@@ -23,8 +23,46 @@ const MAX_AGE_MS: u64 = 15 * 60 * 1000;
 pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
     "explicit_provider_credential_unresolved";
 
+pub(crate) type CredentialAccounts = BTreeMap<String, Option<String>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct BrocaCredentials {
+    inner: Arc<CredentialData>,
+}
+
+impl BrocaCredentials {
+    pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
+        Arc::make_mut(&mut self.inner).apply_listing(listing, at_ms)
+    }
+
+    pub(crate) fn publish_billing_catalog(&mut self, catalog: crate::fusiform_catalog::PlaneCatalog) {
+        Arc::make_mut(&mut self.inner).publish_billing_catalog(catalog);
+    }
+
+    /// Retain an immutable request view without copying catalog pages. Pollers
+    /// copy on write, so a request never holds the credentials lock across I/O.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self { inner: Arc::clone(&self.inner) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
+        Self { inner: Arc::new(CredentialData::api_test_credentials(facts)) }
+    }
+}
+
+impl std::ops::Deref for BrocaCredentials {
+    type Target = CredentialData;
+    fn deref(&self) -> &Self::Target { &self.inner }
+}
+
+impl std::ops::DerefMut for BrocaCredentials {
+    fn deref_mut(&mut self) -> &mut Self::Target { Arc::make_mut(&mut self.inner) }
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Default)]
+pub struct CredentialData {
     view: Option<String>,
     reached_at_ms: Option<u64>,
     providers: HashSet<String>,
@@ -196,7 +234,7 @@ pub(crate) async fn wait_for_billing_catalog(
     .is_ok()
 }
 
-impl BrocaCredentials {
+impl CredentialData {
     pub(crate) fn listing_is_fresh(&self, now_ms: u64) -> bool {
         self.view.is_some()
             && self
@@ -519,17 +557,15 @@ impl BrocaCredentials {
         self.providers.clone()
     }
 
-    /// Complete missing vault account ids only from an unambiguous producer
-    /// linkage. Keep the vault listing unchanged: this copy is for admission
-    /// and refusal recovery, not a new vault listing.
-    pub(crate) fn with_quota_account_ids(
+    /// Resolve only missing vault account ids from unambiguous, live producer
+    /// linkages under the credential's providers. Never modify the vault view.
+    pub(crate) fn quota_account_ids(
         &self,
         quota: &crate::account_quota::AccountQuotaState,
-    ) -> Self {
-        let mut joined = self.clone();
-        for row in &mut joined.listed {
-            if row.account_id.is_some() {
-                continue;
+    ) -> CredentialAccounts {
+        self.listed.iter().map(|row| {
+            if let Some(account) = &row.account_id {
+                return (row.id.clone(), Some(account.clone()));
             }
             let providers = credential_providers(row, &self.catalog_providers);
             let accounts: BTreeSet<_> = quota
@@ -549,11 +585,11 @@ impl BrocaCredentials {
                 })
                 .map(|reading| reading.account_id.clone())
                 .collect();
-            if accounts.len() == 1 {
-                row.account_id = accounts.into_iter().next();
-            }
-        }
-        joined
+            let account = if accounts.len() == 1 {
+                accounts.into_iter().next()
+            } else { None };
+            (row.id.clone(), account)
+        }).collect()
     }
 
     /// Only metered consumers learn vault payment methods in admission-only
@@ -1483,6 +1519,52 @@ mod tests {
             crate::tests::fact("anthropic", "m1"),
             crate::tests::fact("uncredentialed", "m2"),
         ]
+    }
+
+    #[test]
+    fn quota_account_join_preserves_vault_ids_and_filters_producer_linkages() {
+        let mut credentials = BrocaCredentials::default();
+        let mut fixed = credential("fixed", &["anthropic"]);
+        fixed.account_id = Some("vault-account".into());
+        let mut inferred = credential("inferred", &[]);
+        inferred.serves = vec!["anthropic".into()];
+        credentials.apply_listing(&listing(vec![fixed, inferred,
+            credential("joined", &["anthropic"]), credential("ambiguous", &["anthropic"]),
+            credential("wrong", &["anthropic"]), credential("gone", &["anthropic"]),
+        ]), 1);
+        credentials.refresh_serving_methods(&Default::default(), &facts(), 1, &[]);
+        let mut quota = crate::account_quota::AccountQuotaState::default();
+        for (n, (id, account, provider, tombstoned)) in [
+            ("fixed", "producer-account", "anthropic", false),
+            ("inferred", "inferred-account", "anthropic", false),
+            ("joined", "joined-account", "anthropic", false),
+            ("joined", "joined-account", "anthropic", false),
+            ("ambiguous", "a", "anthropic", false), ("ambiguous", "b", "anthropic", false),
+            ("wrong", "wrong-account", "uncredentialed", false),
+            ("gone", "gone-account", "anthropic", true),
+        ].into_iter().enumerate() {
+            quota.readings.readings.insert((format!("source-{n}"), account.into()), crate::account_quota::StoredReading {
+                provider: format!("source-{n}"), account_id: account.into(),
+                entry: serde_json::json!({"credentialRef":id,"apiProvider":provider}),
+                received_at_ms: 1, tombstoned_at_ms: tombstoned.then_some(1),
+            });
+        }
+        let accounts = credentials.quota_account_ids(&quota);
+        assert_eq!(accounts["fixed"].as_deref(), Some("vault-account"));
+        assert_eq!(accounts["inferred"].as_deref(), Some("inferred-account"));
+        assert_eq!(accounts["joined"].as_deref(), Some("joined-account"));
+        for id in ["ambiguous", "wrong", "gone"] { assert!(accounts[id].is_none()); }
+        assert!(credentials.listed_credentials().iter().find(|r| r.id == "joined").unwrap().account_id.is_none());
+    }
+
+    #[test]
+    fn request_snapshot_shares_catalog_and_is_immutable_across_refresh() {
+        let mut credentials = BrocaCredentials::api_test_credentials(&facts());
+        let snapshot = credentials.snapshot();
+        assert!(Arc::ptr_eq(&credentials.inner, &snapshot.inner));
+        credentials.apply_listing(&listing(vec![credential("new", &["anthropic"])]), 2);
+        assert!(!Arc::ptr_eq(&credentials.inner, &snapshot.inner));
+        assert_ne!(credentials.listed_credentials()[0].id, snapshot.listed_credentials()[0].id);
     }
 
     #[tokio::test]

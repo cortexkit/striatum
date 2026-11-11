@@ -83,7 +83,7 @@ pub(crate) fn probe_allowed(code: &str, has_quota_signal: bool, age_ms: i64) -> 
 /// keeps its signal while its reading ages. A spend-only balance is not a quota.
 pub(crate) fn has_quota_signal(
     quota: &crate::account_quota::AccountQuotaState,
-    credentials: &crate::broca_credentials::BrocaCredentials,
+    credentials: &crate::broca_credentials::CredentialAccounts,
     credential_id: &str,
 ) -> bool {
     let Some(account_id) = credential_account_id(credentials, credential_id) else {
@@ -100,7 +100,7 @@ pub(crate) fn has_quota_signal(
 /// a future reset: the refusal is not a quota hold.
 pub(crate) fn exhausted_quota_reset(
     quota: &crate::account_quota::AccountQuotaState,
-    credentials: &crate::broca_credentials::BrocaCredentials,
+    credentials: &crate::broca_credentials::CredentialAccounts,
     credential_id: &str,
     now_ms: i64,
     policy: &striatum_core::accounts::AllocatorPolicy,
@@ -213,8 +213,8 @@ pub(crate) fn quota_refusal_contradicted(
     now: i64,
     policy: &striatum_core::accounts::AllocatorPolicy,
 ) -> bool {
-    let credentials = credentials.with_quota_account_ids(quota);
-    credential_account_id(&credentials, credential).is_some_and(|account| {
+    let accounts = credentials.quota_account_ids(quota);
+    credential_account_id(&accounts, credential).is_some_and(|account| {
         fresh_headroom_after_for_account(quota, &account, i64::MIN, now, policy)
     })
 }
@@ -344,14 +344,10 @@ pub(crate) fn latest_fresh_entry(
 }
 
 pub(crate) fn credential_account_id(
-    credentials: &crate::broca_credentials::BrocaCredentials,
+    accounts: &crate::broca_credentials::CredentialAccounts,
     credential_id: &str,
 ) -> Option<String> {
-    credentials
-        .listed_credentials()
-        .iter()
-        .find(|row| row.id == credential_id)
-        .map(|row| row.account_id.clone().unwrap_or_else(|| row.id.clone()))
+    accounts.get(credential_id).map(|account| account.clone().unwrap_or_else(|| credential_id.to_owned()))
 }
 
 /// Stable link from refusal evidence to its ordinary account pool blocks.

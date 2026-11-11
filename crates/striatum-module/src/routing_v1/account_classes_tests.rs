@@ -1773,6 +1773,32 @@ async fn unchanged_context_reads_without_reserving_the_writer() {
 }
 
 #[tokio::test]
+async fn unchanged_quota_hold_reads_without_reserving_the_writer() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    oauth_weekly_reading_at(100.0, NOW as i64 + 3_600_000, NOW as i64);
+    harness.store().record_credential_entitlement_fence(
+        &striatum_core::route_state_store::CredentialRefusal {
+            provider_id: "synthetic".into(), credential_id: "oauth:test".into(),
+            code: "billing_exhausted".into(),
+        }, None, NOW as i64,
+    ).unwrap();
+    let credentials = harness.credentials();
+    let load = || crate::account_selection::ClassContext::load(
+        harness.store(), &credentials, harness.operator_config(), crate::ACCOUNT_QUOTA.get(), NOW as i64,
+    );
+    assert_eq!(load().unwrap().refusals.len(), 1);
+    assert_eq!(harness.store().account_read(|tx| tx.active_pool_fences("synthetic")).unwrap().len(), 1);
+    let writer = rusqlite::Connection::open(harness.store_path()).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let before = harness.store().account_write_transaction_count_for_test();
+    let result = load();
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert!(result.is_ok(), "unchanged hold reserved the writer: {:?}", result.err());
+    assert_eq!(harness.store().account_write_transaction_count_for_test(), before);
+}
+
+#[tokio::test]
 async fn selection_reuses_one_read_only_context_across_ladder_entries() {
     let (loads, _) = select_past_held_ladder_entry().await;
     assert_eq!(loads, 1);
