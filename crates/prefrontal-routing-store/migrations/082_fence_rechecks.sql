@@ -19,6 +19,7 @@ CREATE TABLE fence_recheck (
   next_recheck_at INTEGER NOT NULL,
   reset_check_at INTEGER,
   last_claimed_at INTEGER,
+  claim_generation INTEGER NOT NULL DEFAULT 0,
   claim_owner TEXT,
   cleared_at INTEGER,
   PRIMARY KEY (kind, origin_key)
@@ -30,6 +31,7 @@ CREATE INDEX fence_recheck_scope ON fence_recheck(provider, credential_id, accou
 CREATE TABLE fence_probe_authorization (
  owner TEXT NOT NULL,kind TEXT NOT NULL,origin_key TEXT NOT NULL,
  evidence TEXT NOT NULL,evidence_at INTEGER NOT NULL,claimed_at INTEGER NOT NULL,
+ claim_generation INTEGER NOT NULL,
  PRIMARY KEY(owner,kind,origin_key)
 );
 -- Clearing one route must not leave it blocked by a provider fanout origin.
@@ -78,8 +80,11 @@ ALTER TABLE model_route_state ADD COLUMN wall_unscoped INTEGER NOT NULL DEFAULT 
 ALTER TABLE model_route_state ADD COLUMN failure_observed_at INTEGER;
 ALTER TABLE provider_cooldown_state ADD COLUMN wall_observed_at INTEGER;
 ALTER TABLE provider_cooldown_state ADD COLUMN wall_unscoped INTEGER NOT NULL DEFAULT 0;
-UPDATE model_route_state SET wall_observed_at=COALESCE(last_error_at,updated_at),failure_observed_at=COALESCE(last_error_at,updated_at);
-UPDATE provider_cooldown_state SET wall_observed_at=COALESCE(last_error_at,updated_at);
+UPDATE model_route_state SET
+ wall_observed_at=CASE WHEN cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL THEN COALESCE(last_error_at,updated_at) END,
+ failure_observed_at=CASE WHEN failure_backoff_until IS NOT NULL OR consecutive_terminal_failures>0 THEN COALESCE(last_error_at,updated_at) END;
+UPDATE provider_cooldown_state SET wall_observed_at=COALESCE(last_error_at,updated_at)
+ WHERE cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL;
 CREATE TRIGGER model_route_state_inherit_fence_scope AFTER INSERT ON model_route_state
 WHEN EXISTS (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=NEW.provider_id
  AND COALESCE(p.cooldown_until,0)>=COALESCE(NEW.cooldown_until,0)
@@ -121,7 +126,7 @@ SELECT 'credential', json_array(provider_id,credential_id), provider_id,NULL,cre
        json_array(code,observed_at_ms),observed_at_ms,
        EXISTS(SELECT 1 FROM account_fence f WHERE f.cleared_at IS NULL AND
          substr(f.fence_id,1,length('credential-quota:'||json_array(c.provider_id,c.credential_id)||':'))='credential-quota:'||json_array(c.provider_id,c.credential_id)||':'),
-       observed_at_ms+21600000,NULL
+        NULL,NULL
 FROM credential_entitlement_fences c
 UNION ALL
 SELECT 'account_route',json_array(provider,credential_id,model),provider,NULL,credential_id,model,NULL,NULL,NULL,
@@ -229,7 +234,7 @@ INSERT INTO fence_recheck
   evidence,evidence_at,quota,next_recheck_at,reset_check_at)
 SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
  evidence,evidence_at,COALESCE(quota,0),
- CAST(CASE WHEN quota=1 THEN at ELSE MIN(COALESCE(deadline,at+3600000),at+3600000) END AS INTEGER),
+  CAST(CASE WHEN quota=1 OR kind='credential' THEN at ELSE MIN(COALESCE(deadline,at+3600000),at+3600000) END AS INTEGER),
  CASE WHEN quota=1 AND reset_at>at THEN reset_at END
 FROM fence_origin CROSS JOIN fence_migration_clock;
 DROP TABLE fence_migration_clock;

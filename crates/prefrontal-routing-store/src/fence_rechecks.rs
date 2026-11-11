@@ -387,7 +387,7 @@ fn claim_owned(
     for origin in origins {
         let state = conn
             .query_row(
-                "SELECT quota,next_recheck_at,reset_check_at,claim_owner FROM fence_recheck
+                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
              WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
                 params![origin.kind, origin.origin_key, origin.evidence_at,origin.evidence],
                 |row| {
@@ -396,11 +396,12 @@ fn claim_owned(
                         row.get::<_, i64>(1)?,
                         row.get::<_, Option<i64>>(2)?,
                         row.get::<_, Option<String>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((quota, next, reset, owner)) = state else {
+        let Some((quota, next, reset, owner, generation)) = state else {
             return Ok(false);
         };
         if quota != origin.quota {
@@ -416,7 +417,7 @@ fn claim_owned(
             quota_evidence = quota_evidence.max(origin.evidence_at);
             quota_resets.extend(reset);
         }
-        states.push((origin, owned, due));
+        states.push((origin, owned, due, generation));
     }
     // Quota representations of the same selected account share one periodic
     // check. A reset after its latest refusal adds a check for the whole
@@ -429,15 +430,23 @@ fn claim_owned(
     {
         return Ok(false);
     }
-    for (origin, owned, due) in states {
+    for (origin, owned, due, prior_generation) in states {
+        // Admission changes the launch time but preserves the claim generation.
+        // A cancellation can release only that claim, not a later request's.
+        let generation = if owned && !due {
+            prior_generation
+        } else {
+            prior_generation.saturating_add(1)
+        };
         for owner in [authorization.or(grant_owner), consume_owner]
             .into_iter()
             .flatten()
         {
-            conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at)
-                VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET
-                evidence=excluded.evidence,evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at",
-                params![owner,origin.kind,origin.origin_key,origin.evidence,origin.evidence_at,now])?;
+            conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+                VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET
+                evidence=excluded.evidence,evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,
+                claim_generation=excluded.claim_generation",
+                params![owner,origin.kind,origin.origin_key,origin.evidence,origin.evidence_at,now,generation])?;
         }
         if owned && !due {
             conn.execute(
@@ -451,9 +460,9 @@ fn claim_owned(
         } else {
             NON_QUOTA_FENCE_MAX_MS
         };
-        conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=?4,claim_owner=?5,
+        conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=?4,claim_owner=?5,claim_generation=?6,
             reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END WHERE kind=?1 AND origin_key=?2",
-            params![origin.kind,origin.origin_key,now.saturating_add(interval),now,grant_owner])?;
+            params![origin.kind,origin.origin_key,now.saturating_add(interval),now,grant_owner,generation])?;
     }
     Ok(true)
 }
@@ -479,14 +488,38 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Anonymous decisions may report a credential discovered only at launch.
+    /// Accept it only when the owner's recorded probe authorization names the
+    /// credential for the active fence evidence.
+    pub fn probe_authorization_names_credential(
+        &self,
+        owner: &str,
+        credential: &str,
+        model: &str,
+    ) -> RouteStateResult<bool> {
+        sync(self.conn).map_err(err)?;
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a
+            JOIN fence_recheck r ON a.kind=r.kind AND a.origin_key=r.origin_key
+                AND a.evidence=r.evidence AND a.evidence_at=r.evidence_at
+            WHERE a.owner=?1 AND r.credential_id=?2 AND (r.model IS NULL OR r.model=?3)
+                AND r.cleared_at IS NULL)",
+                params![owner, credential, model],
+                |row| row.get(0),
+            )
+            .map_err(err)
+    }
+
     pub fn transfer_probe_authorization(&self, from: &str, to: &str) -> RouteStateResult<()> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at
+        self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
             FROM fence_probe_authorization WHERE owner=?1
             ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
-            evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at",params![from,to]).map_err(err)?;
+            evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,
+            claim_generation=excluded.claim_generation",params![from,to]).map_err(err)?;
         self.conn
             .execute(
                 "DELETE FROM fence_probe_authorization WHERE owner=?1 AND owner!=?2",
@@ -514,7 +547,7 @@ impl AccountTx<'_> {
             WHERE r.quota=0 AND r.cleared_at IS NULL AND r.provider=?2 AND (r.model IS NULL OR r.model=?3)
             AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
                 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
-                AND a.evidence_at=r.evidence_at AND a.claimed_at=r.last_claimed_at)",params![owner,provider,model,now]).map_err(err)?;
+                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",params![owner,provider,model,now]).map_err(err)?;
         self.conn
             .execute(
                 "DELETE FROM fence_probe_authorization WHERE owner=?1",
@@ -529,7 +562,7 @@ impl AccountTx<'_> {
     pub fn heal_authorized_probe(
         &self,
         owner: &str,
-        provider: &str,
+        _provider: &str,
         model: &str,
         now: i64,
     ) -> RouteStateResult<()> {
@@ -537,10 +570,12 @@ impl AccountTx<'_> {
             return Ok(());
         }
         let origins = self.fence_rechecks()?;
-        for origin in origins.iter().filter(|origin| {
-            origin.provider == provider
-                && origin.model.as_deref().is_none_or(|value| value == model)
-        }) {
+        // A pool lease can probe both an alias key's billing refusal and the
+        // target provider's cooldown. Each proof keeps its own provider scope.
+        for origin in origins
+            .iter()
+            .filter(|origin| origin.model.as_deref().is_none_or(|value| value == model))
+        {
             let claimed: Option<i64> = self
                 .conn
                 .query_row(
@@ -1188,6 +1223,116 @@ mod tests {
         assert_eq!(
             quota.next_recheck_at, 8_900_000,
             "neutral non-quota recovery never widens the quota probe budget"
+        );
+    }
+
+    #[test]
+    fn consumed_authorization_neutral_release_reopens_the_claim_generation() {
+        let scratch = cortexkit_test_support::ScratchDir::new("consumed-neutral-probe");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "consumed-neutral-probe",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .record_billing_account_route_fence(&crate::AccountRouteFence {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                until_ms: 1000,
+                recorded_at: 100,
+                decision_id: "d".into(),
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 1000, Some("selection")))
+            .unwrap());
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks_for_authorized_admission(
+                &origins,
+                1001,
+                Some("selection"),
+                "admission",
+            ))
+            .unwrap());
+        store
+            .account_transaction(|tx| tx.release_inconclusive_probe("admission", "p", "m", 1002))
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(
+            store
+                .account_transaction(|tx| tx.claim_fence_rechecks(&origins, 1002))
+                .unwrap(),
+            "consumption must retain the clock generation independently of admission time"
+        );
+    }
+
+    #[test]
+    fn linked_pool_success_heals_alias_and_target_provider_origins() {
+        use prefrontal_routing_core::key_pool::PoolKey;
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("alias-pool-probe");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "alias-pool-probe",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .pool_wall(
+                "alias",
+                "key",
+                crate::PoolWallKind::Billing,
+                1000,
+                "credits",
+                100,
+            )
+            .unwrap();
+        store
+            .record_provider_cooldown(
+                "target",
+                "target/m",
+                "target/m",
+                &RouteStateUpdate {
+                    cooldown_until: Some(1000.0),
+                    observed_at_ms: Some(100),
+                    unscoped_wall: true,
+                    last_error: Some("rate limit".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let keys = vec![PoolKey::new("key", Some("a"), "active")];
+        let crate::PoolAcquireOutcome::Leased(lease) = store
+            .pool_acquire_for_route(
+                &crate::PoolAcquire {
+                    provider: "alias",
+                    session_id: "s",
+                    keys: &keys,
+                    now_ms: 1000,
+                    lease_ms: 120_000,
+                    affinity_idle_ms: 120_000,
+                },
+                &["alias", "target"],
+                "m",
+                &[],
+                &Default::default(),
+            )
+            .unwrap()
+        else {
+            panic!("both due origins must admit one lease")
+        };
+        assert_eq!(store.fence_rechecks().unwrap().len(), 2);
+        store
+            .bind_fence_probe_owner(&lease.lease_id, "decision")
+            .unwrap();
+        store
+            .account_transaction(|tx| tx.heal_authorized_probe("decision", "target", "m", 1001))
+            .unwrap();
+        assert!(
+            store.fence_rechecks().unwrap().is_empty(),
+            "success must heal the whole authorized alias/target launch, not only one provider"
         );
     }
 
@@ -1856,7 +2001,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_retires_expired_non_quota_evidence_but_never_expires_quota() {
+    fn migration_retires_real_deadlines_but_preserves_quota_and_credential_evidence() {
         let scratch = cortexkit_test_support::ScratchDir::new("retire-expired-migration");
         let descriptor = crate::dev_descriptor(
             "retire-expired-migration",
@@ -1879,7 +2024,7 @@ mod tests {
         let clocks = store.fence_rechecks().unwrap();
         assert_eq!(
             clocks.len(),
-            2,
+            3,
             "expired non-quota rows must not return as route-wide probe gates: {clocks:?}"
         );
         assert!(clocks
@@ -1888,10 +2033,24 @@ mod tests {
         assert!(clocks
             .iter()
             .any(|f| f.kind == "pool_billing" && f.credential_id.as_deref() == Some("live")));
-        assert!(
-            store.credential_entitlement_fences().unwrap().is_empty(),
-            "raw credential readers must not revive the retired row"
+        assert_eq!(
+            store.credential_entitlement_fences().unwrap().len(),
+            1,
+            "credential refusals had probe eligibility, not an expiry"
         );
+        let credential: Vec<_> = clocks
+            .into_iter()
+            .filter(|f| f.kind == "credential")
+            .collect();
+        assert_eq!(credential.len(), 1);
+        assert!(credential[0].due_at() <= crate::now_ms());
+        let at = crate::now_ms();
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&credential, at))
+            .unwrap());
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&credential, at))
+            .unwrap());
     }
 
     #[test]
@@ -2095,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn classification_tolerates_a_credential_retired_during_synchronization() {
+    fn classification_preserves_old_credentials_and_tolerates_removed_credentials() {
         let scratch = cortexkit_test_support::ScratchDir::new("retired-credential-classification");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "retired-credential-classification",
@@ -2106,8 +2265,18 @@ mod tests {
         let result = store.account_transaction(|tx| tx.classify_credential_quota("p", "c", true));
         assert_eq!(
             result.unwrap(),
-            false,
-            "retired evidence cannot be reclassified as quota"
+            true,
+            "age alone must not retire standing credential evidence"
+        );
+        store
+            .store
+            .with_conn(|conn| conn.execute("DELETE FROM credential_entitlement_fences", []))
+            .unwrap();
+        assert!(
+            !store
+                .account_transaction(|tx| tx.classify_credential_quota("p", "c", true))
+                .unwrap(),
+            "an operator removal before synchronization is tolerated"
         );
     }
 

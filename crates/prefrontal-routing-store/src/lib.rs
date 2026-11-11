@@ -5215,18 +5215,17 @@ mod tests {
             standing
         );
         assert_eq!(restarted.account_serving_counts().unwrap().holds, 0);
-        assert!(
-            restarted
-                .credential_entitlement_fences()
-                .unwrap()
-                .is_empty(),
-            "migration retires expired non-quota enforcement"
+        assert_eq!(
+            restarted.credential_entitlement_fences().unwrap().len(),
+            1,
+            "credential probe eligibility is not evidence expiry"
         );
         restarted
             .store
             .with_conn(|c| {
-                let code:String=c.query_row("SELECT json_extract(evidence,'$[0]') FROM fence_retired_origin WHERE kind='credential'",[],|row|row.get(0))?;
-                assert_eq!(code,"ENTITLEMENT_ERROR","retirement preserves the historical refusal evidence");
+                let (code,due):(String,i64)=c.query_row("SELECT json_extract(evidence,'$[0]'),next_recheck_at FROM fence_recheck WHERE kind='credential'",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                assert_eq!(code,"ENTITLEMENT_ERROR","migration preserves the standing refusal evidence");
+                assert!(due<=now_ms(),"old credentials get one immediately due probe");
                 let dropped: i64 = c.query_row(
                     "SELECT COUNT(*) FROM sqlite_schema WHERE name='provider_reset_fences'",
                     [],
