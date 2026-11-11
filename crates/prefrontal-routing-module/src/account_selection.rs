@@ -768,35 +768,79 @@ impl ClassContext {
         let transient_route_fences = store
             .transient_account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
-        let credentials_with_headroom: BTreeSet<_> = route_fences
-            .iter()
-            .filter_map(|fence| {
-                let account = crate::credential_fences::credential_account_id(
-                    &credentials,
-                    &fence.credential_id,
-                )?;
-                // Clear all routes for a credential only after a reading newer
-                // than every report on it; an older reading cannot heal a newer failure.
-                let newest_report = *latest_reports.get(&fence.credential_id)?;
-                crate::credential_fences::fresh_headroom_after_for_account(
-                    &quota,
-                    &account,
-                    newest_report,
-                    now_ms,
-                    &config.allocator_policy(&fence.provider),
-                )
-                .then(|| {
-                    let at = crate::credential_fences::latest_reading_for_account(&quota, &account)
-                        .and_then(|reading| reading.entry.get("fetchedAt").and_then(Value::as_str))
-                        .and_then(account_quota::parse_rfc3339_ms)?;
-                    Some((fence.provider.clone(), fence.credential_id.clone(), at))
-                })
-                .flatten()
-            })
-            .collect();
-        for (provider, credential, at) in &credentials_with_headroom {
+        if !route_fences.is_empty() {
             store
-                .clear_account_route_fences_before(provider, credential, *at)
+                .account_transaction(|tx| {
+                    for fence in &route_fences {
+                        let recovery = (|| -> RouteStateResult<Option<i64>> {
+                            let account = crate::credential_fences::credential_account_id(
+                                &credentials,
+                                &fence.credential_id,
+                            );
+                            let Some(account) = account else {
+                                return Ok(None);
+                            };
+                            // Clear all routes for a credential only after a reading newer
+                            // than every report and recovery of every retained account pool.
+                            let Some(newest_report) =
+                                latest_reports.get(&fence.credential_id).copied()
+                            else {
+                                return Ok(None);
+                            };
+                            let Some(latest) = crate::credential_fences::latest_reading_for_account(
+                                &quota, &account,
+                            ) else {
+                                return Ok(None);
+                            };
+                            let reading =
+                                quota_reading_for_model(&latest.entry, &account, None, &[]);
+                            let policy = config.allocator_policy(&fence.provider);
+                            let blocks: Vec<_> = tx
+                                .active_pool_fences(&fence.provider)?
+                                .into_iter()
+                                .filter(|block| block.evidence.account_id == account)
+                                .collect();
+                            let recovered = if blocks.is_empty() {
+                                crate::credential_fences::fresh_headroom_after_for_account(
+                                    &quota,
+                                    &account,
+                                    newest_report,
+                                    now_ms,
+                                    &policy,
+                                )
+                            } else {
+                                blocks.iter().all(|block| {
+                                    serde_json::from_str::<Fence>(&block.evidence.fence_json)
+                                        .is_ok_and(|mut evidence| {
+                                            evidence.pool = block.pool_key.clone();
+                                            evidence.recovery_set = block.recovery_set.clone();
+                                            evidence.observed_at_ms =
+                                                evidence.observed_at_ms.max(newest_report);
+                                            block_end(&evidence, reading.as_ref(), now_ms, &policy)
+                                                .is_some()
+                                        })
+                                })
+                            };
+                            Ok(recovered
+                                .then(|| {
+                                    latest
+                                        .entry
+                                        .get("fetchedAt")
+                                        .and_then(Value::as_str)
+                                        .and_then(account_quota::parse_rfc3339_ms)
+                                })
+                                .flatten())
+                        })()?;
+                        if let Some(at) = recovery {
+                            tx.clear_account_route_fences_before(
+                                &fence.provider,
+                                &fence.credential_id,
+                                at,
+                            )?;
+                        }
+                    }
+                    Ok(())
+                })
                 .map_err(|error| error.to_string())?;
         }
         route_fences = store
@@ -5268,8 +5312,8 @@ fn serve(
     let request = params.request(principal, affinity_row.is_none());
     let mut reserved_probe = false;
     let mut lost_probe_fences = BTreeMap::new();
-    let mut decision = loop {
-        let decision =
+    let decision = loop {
+        let mut decision =
             prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
         let Outcome::Admit(admission) = &decision.outcome else {
             break decision;
@@ -5334,8 +5378,29 @@ fn serve(
                         })
                 })
         {
-            // A live affinity waits out its independent short transient retry;
-            // the hold below does not consume any probe authorization.
+            // Use the transaction-current origins: another request may have
+            // claimed a transient probe since this roster was prepared.
+            let affinity = state.affinity.as_ref().unwrap();
+            let until = applicable
+                .iter()
+                .filter(|origin| origin.kind == "transient_route")
+                .map(|origin| origin.due_at())
+                .max()
+                .unwrap();
+            let seconds = (until.saturating_sub(now).max(0) as u64).div_ceil(1_000);
+            decision.outcome = Outcome::Hold(prefrontal_routing_core::accounts::Hold {
+                account_id: affinity.account_id.clone(),
+                credential_id: affinity.credential_id.clone(),
+                pin_id: affinity.pin_id.clone(),
+                pin_generation: affinity.pin_generation,
+                reset_at_ms: until,
+                base_retry_after_s: seconds,
+                retry_after_s: seconds,
+                basis: prefrontal_routing_core::accounts::HoldBasis::ConfirmedFence,
+            });
+            decision.explanation.affinity = prefrontal_routing_core::accounts::AffinityNote::Held {
+                account_id: affinity.account_id.clone(),
+            };
             break decision;
         }
         let claim = || {
@@ -5462,39 +5527,6 @@ fn serve(
                 Some(params),
             ) {
                 return Ok(reply);
-            }
-        }
-    }
-    if established {
-        if let (Some(affinity), Outcome::Admit(admitted), Some(classes)) = (
-            state.affinity.as_ref(),
-            &decision.outcome,
-            ctx.classes.as_ref(),
-        ) {
-            if admitted.account_id == affinity.account_id
-                && admitted.credential_id == affinity.credential_id
-            {
-                if let Some(until) = classes
-                    .accounts_fenced_by(&classes.transient_route_fences, provider, &params.model)
-                    .get(&affinity.account_id)
-                {
-                    let seconds = until.saturating_sub(now).max(0) as u64;
-                    let seconds = seconds.div_ceil(1_000);
-                    decision.outcome = Outcome::Hold(prefrontal_routing_core::accounts::Hold {
-                        account_id: affinity.account_id.clone(),
-                        credential_id: affinity.credential_id.clone(),
-                        pin_id: affinity.pin_id.clone(),
-                        pin_generation: affinity.pin_generation,
-                        reset_at_ms: *until,
-                        base_retry_after_s: seconds,
-                        retry_after_s: seconds,
-                        basis: prefrontal_routing_core::accounts::HoldBasis::ConfirmedFence,
-                    });
-                    decision.explanation.affinity =
-                        prefrontal_routing_core::accounts::AffinityNote::Held {
-                            account_id: affinity.account_id.clone(),
-                        };
-                }
             }
         }
     }
@@ -7143,6 +7175,194 @@ mod tests {
                 panic!("expected a result, got {code}: {message}")
             }
         }
+    }
+
+    #[test]
+    fn established_affinity_prepared_before_a_transient_claim_cannot_double_send() {
+        let rig = fixture("established-transient-interleaving");
+        let mut request = admit_params("first", "established-transient", "broca");
+        request["candidates"] = json!({"view_digest":"runner-view","accounts":[{
+            "account_id":ACCOUNT_A,"credential_id":"oauth:anthropic"}]});
+        let first = result(rig.call(
+            &rig.ctx(true, NOW - 1000),
+            ACCOUNT_FOR_OP,
+            BROCA,
+            request.clone(),
+        ));
+        result(rig.call(
+            &rig.ctx(true, NOW - 999),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            json!({"event_id":"started","caller":{"runner":"broca"},"kind":"admission_started",
+                "admission_id":"first","run_id":"run-first"}),
+        ));
+        rig.store()
+            .record_transient_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                provider: "anthropic".into(),
+                credential_id: "oauth:anthropic".into(),
+                model: "claude-opus-5-5".into(),
+                until_ms: NOW,
+                recorded_at: NOW - 100,
+                decision_id: "refusal".into(),
+            })
+            .unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        ));
+        shared.lock().unwrap().apply_listing(&listing(), NOW as u64);
+        let classes = ClassContext::load(
+            rig.store(),
+            &shared,
+            Default::default(),
+            Some(&rig.accounts),
+            NOW,
+        )
+        .unwrap();
+        let mut ctx = rig.ctx(true, NOW);
+        ctx.classes = Some(classes);
+        let roster = roster_for_model(&rig.ctx(true, NOW), "anthropic", Some("claude-opus-5-5"));
+        let origins = rig.store().fence_rechecks().unwrap();
+        assert!(origins
+            .iter()
+            .any(|o| o.kind == "transient_route" && o.due_at() == NOW));
+        assert!(rig
+            .store()
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, NOW, Some("winner")))
+            .unwrap());
+        request["admission_id"] = json!("distinct-second");
+        request["expected_pin"] = first["pin"].clone();
+        let parsed = parse_account_for(&request).unwrap();
+        let reply = rig
+            .store()
+            .account_transaction(|tx| {
+                serve(
+                    tx,
+                    &ctx,
+                    BROCA,
+                    &parsed,
+                    "anthropic",
+                    &roster,
+                    "second-fingerprint",
+                )
+            })
+            .unwrap();
+        match reply {
+            OpReply::Error { code, detail, .. } => {
+                assert_eq!(code, "account_hold");
+                let held = detail.unwrap();
+                assert_eq!(held["account"]["account_id"], ACCOUNT_A);
+                assert_eq!(held["reset_at"], rfc3339(NOW+3_600_000));
+                assert_eq!(held["pin"], json!({"id":first["pin"]["id"],"generation":first["pin"]["generation"]}));
+            }
+            other => panic!("the unchanged started affinity must hold after another request claims its due origin: {other:?}"),
+        }
+        assert!(
+            rig.store()
+                .account_read(|tx| tx.admission(BROCA, "distinct-second"))
+                .unwrap()
+                .is_none(),
+            "the losing interleaving cannot commit a second admission"
+        );
+    }
+
+    #[test]
+    fn partial_reading_cannot_heal_route_rows_paired_with_account_recovery_pools() {
+        let rig = fixture("partial-route-recovery");
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        ));
+        shared.lock().unwrap().apply_listing(&listing(), NOW as u64);
+        let entry = claude_entry(ACCOUNT_A);
+        let reading = quota_reading_for_model(&entry, ACCOUNT_A, None, &[]).unwrap();
+        let recovery_set = recovery_set_from(Some(&reading), NOW, &rig.policy);
+        assert!(recovery_set.len() >= 2);
+        let fence = Fence {
+            account_id: ACCOUNT_A.into(),
+            pool: None,
+            recovery_set: recovery_set.clone(),
+            observed_at_ms: NOW,
+            reset: ResetTime::Missing,
+            retry_hint_ms: None,
+            source: prefrontal_routing_core::accounts::ConfirmationSource::BrocaAccountLimit,
+        };
+        rig.store()
+            .account_transaction(|tx| {
+                tx.insert_pool_fence(&AccountPoolFenceRow {
+                    evidence: AccountFenceRow {
+                        fence_id: "paired".into(),
+                        provider: "anthropic".into(),
+                        account_id: ACCOUNT_A.into(),
+                        scope_json: "null".into(),
+                        fence_json: wire(&fence).to_string(),
+                        source: wire_str(&fence.source),
+                        observed_at: NOW,
+                        principal: BROCA.into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: NOW,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    },
+                    pool_key: None,
+                    recovery_set,
+                })
+            })
+            .unwrap();
+        rig.store()
+            .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                provider: "anthropic".into(),
+                credential_id: "oauth:anthropic".into(),
+                model: "claude-opus-5-5".into(),
+                until_ms: NOW + 3_600_000,
+                recorded_at: NOW,
+                decision_id: "route-refusal".into(),
+            })
+            .unwrap();
+        let mut partial = entry.clone();
+        partial["fetchedAt"] = json!(rfc3339(NOW + 60_000));
+        partial["usage"]["secondary"] = Value::Null;
+        partial["usage"]["extraRateWindows"] = json!([]);
+        let read = |entry| {
+            account_quota::apply_usage_reply(
+                &mut rig.accounts.lock().unwrap(),
+                &serde_json::to_vec(&json!({"result":[entry]})).unwrap(),
+                NOW + 60_000,
+            )
+            .unwrap()
+        };
+        read(partial);
+        ClassContext::load(
+            rig.store(),
+            &shared,
+            Default::default(),
+            Some(&rig.accounts),
+            NOW + 60_000,
+        )
+        .unwrap();
+        assert_eq!(
+            rig.store()
+                .account_route_fences(NOW + 60_000)
+                .unwrap()
+                .len(),
+            1,
+            "a partial healthy reading cannot delete the paired route evidence"
+        );
+        let mut complete = entry;
+        complete["fetchedAt"] = json!(rfc3339(NOW + 120_000));
+        read(complete);
+        ClassContext::load(
+            rig.store(),
+            &shared,
+            Default::default(),
+            Some(&rig.accounts),
+            NOW + 120_000,
+        )
+        .unwrap();
+        assert!(rig
+            .store()
+            .account_route_fences(NOW + 120_000)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

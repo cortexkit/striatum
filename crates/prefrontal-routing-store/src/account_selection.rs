@@ -647,6 +647,23 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Clear older route evidence in the same transaction that checked its
+    /// account's pool recovery requirements.
+    pub fn clear_account_route_fences_before(
+        &self,
+        provider: &str,
+        credential: &str,
+        reading_at: i64,
+    ) -> RouteStateResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM account_route_fence
+            WHERE provider=?1 AND credential_id=?2 AND COALESCE(last_reported_at,recorded_at)<?3",
+                params![provider, credential, reading_at],
+            )
+            .map_err(err)
+    }
+
     pub fn record_admission_probe_scope(
         &self,
         principal: &str,
@@ -1102,14 +1119,7 @@ impl SqliteRouteStateStore {
         reading_at: i64,
     ) -> RouteStateResult<usize> {
         self.account_transaction(|tx| {
-            tx.conn
-                .execute(
-                    "DELETE FROM account_route_fence
-                WHERE provider=?1 AND credential_id=?2
-                AND COALESCE(last_reported_at,recorded_at)<?3",
-                    params![provider, credential, reading_at],
-                )
-                .map_err(err)
+            tx.clear_account_route_fences_before(provider, credential, reading_at)
         })
     }
 
