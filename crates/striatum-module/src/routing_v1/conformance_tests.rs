@@ -45,6 +45,7 @@ use crate::{
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod continuation_tests;
+mod zero_config_tests;
 
 /// The provider id the account allocator's quota readings are filed under
 /// for the kit's subscription accounts; any id other than the routing
