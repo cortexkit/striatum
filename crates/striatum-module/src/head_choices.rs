@@ -194,7 +194,7 @@ pub(crate) fn choices_for_harness(
             || !credentials
                 .listed_credentials()
                 .iter()
-                .any(|row| broca_credentials::credential_serves_fact(row, fact, &providers))
+                .any(|row| broca_credentials::credential_serves_fact(row, fact, &providers, credentials))
         {
             continue;
         }
@@ -255,6 +255,7 @@ pub(crate) fn choices_for_harness(
             &reachable_credentials,
             fact,
             &providers,
+            credentials,
             &subscription_specs,
             aliases.contains_key(provider),
             false,
@@ -270,7 +271,7 @@ pub(crate) fn choices_for_harness(
         for tier in ["fast", "ultrafast"] {
             if service_tiers::model_offers(credentials, fact, tier)
                 && credentials.listed_credentials().iter().any(|row| {
-                    broca_credentials::credential_serves_fact(row, fact, &providers)
+                    broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
                         && fact.billing_plane.as_ref().is_none_or(|plane| {
                             row.auth_method.as_deref() == Some(&plane.auth_method)
                         })

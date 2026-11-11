@@ -225,7 +225,7 @@ fn prepare_account_facts(
     let serves = |credential: &str| {
         credentials.listed_credentials().iter().any(|row| {
             row.id == credential
-                && crate::broca_credentials::credential_serves_fact(row, fact, &catalog)
+                && crate::broca_credentials::credential_serves_fact(row, fact, &catalog, credentials)
         })
     };
     let quota_contradicted = |credential: &str| {

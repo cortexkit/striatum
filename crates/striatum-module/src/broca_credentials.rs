@@ -142,6 +142,7 @@ pub(crate) fn credential_serves_fact(
     row: &ListedCredential,
     fact: &ModelFact,
     catalog: &BTreeSet<String>,
+    credentials: &CredentialData,
 ) -> bool {
     row.state == "active"
         && row
@@ -154,6 +155,7 @@ pub(crate) fn credential_serves_fact(
                 .as_ref()
                 .is_some_and(|method| allowed.contains(method))
         })
+        && credentials.method_serves_fact(fact, row.auth_method.as_deref())
 }
 
 fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingMethod {
@@ -235,6 +237,24 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl CredentialData {
+    /// Known wire families require a runner's wire/auth pair. Missing wire or
+    /// declaration snapshots retain provider/allowlist reachability so discovery
+    /// gaps do not withdraw rows. Endpoint requirements remain runner-specific:
+    /// a runner's `requires_wire_api` is checked when that runner is selected.
+    fn method_serves_fact(&self, fact: &ModelFact, method: Option<&str>) -> bool {
+        if self.runner_declarations.is_empty() {
+            return true;
+        }
+        let Some(wire) = self.wire_api(fact, method.unwrap_or("")) else {
+            return true;
+        };
+        self.runner_declarations.values().any(|runner| {
+            runner.pairs.iter().any(|pair| {
+                pair.wire_api == wire && Some(pair.auth_method.as_str()) == method
+            })
+        })
+    }
+
     pub(crate) fn listing_is_fresh(&self, now_ms: u64) -> bool {
         self.view.is_some()
             && self
@@ -358,7 +378,7 @@ impl CredentialData {
         let serving = self.serving_method(fact).auth_method;
         self.listed
             .iter()
-            .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+            .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
             .filter(|row| match serving.as_deref() {
                 Some(serving) => row.auth_method.as_deref() == Some(serving),
                 None => row.auth_method.as_deref() != Some("apikey"),
@@ -377,7 +397,7 @@ impl CredentialData {
                 BTreeSet::new(),
                 self.listed
                     .iter()
-                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
                     .filter_map(|row| row.auth_method.clone())
                     .collect(),
             )
@@ -734,7 +754,7 @@ impl CredentialData {
                             // A quota identity cannot supply an absent vault auth method.
                             listed
                                 .filter(|row| {
-                                    credential_serves_fact(row, fact, &self.catalog_providers)
+                                    credential_serves_fact(row, fact, &self.catalog_providers, self)
                                 })
                                 .and_then(|row| row.auth_method.clone())
                         })
@@ -743,7 +763,7 @@ impl CredentialData {
                 let listed = self
                     .listed
                     .iter()
-                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers))
+                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
                     .filter_map(|row| row.auth_method.clone())
                     .collect();
                 (
@@ -950,7 +970,7 @@ impl CredentialData {
             .filter(|fact| {
                 self.listed
                     .iter()
-                    .any(|row| credential_serves_fact(row, fact, &catalog))
+                    .any(|row| credential_serves_fact(row, fact, &catalog, self))
             })
             .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
             .collect()
@@ -973,7 +993,7 @@ impl CredentialData {
                         && self
                             .listed
                             .iter()
-                            .any(|row| credential_serves_fact(row, fact, &catalog)))
+                            .any(|row| credential_serves_fact(row, fact, &catalog, self)))
             })
             .map(|fact| make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref()))
             .collect();

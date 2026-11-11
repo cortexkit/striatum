@@ -230,6 +230,7 @@ pub(crate) fn resolve_class<'a>(
     rows: &'a [cortexkit_claustrum_client::ListedCredential],
     fact: &striatum_core::ModelFact,
     catalog: &BTreeSet<String>,
+    credentials: &crate::broca_credentials::CredentialData,
     specs: &[striatum_core::provider_model_spec::ParsedSpec],
     borrowed: bool,
     priced_per_token: bool,
@@ -239,7 +240,7 @@ pub(crate) fn resolve_class<'a>(
     let key = format!("{}/{}", fact.provider_id, fact.model_id);
     let serving: Vec<_> = rows
         .iter()
-        .filter(|row| crate::broca_credentials::credential_serves_fact(row, fact, catalog))
+        .filter(|row| crate::broca_credentials::credential_serves_fact(row, fact, catalog, credentials))
         .collect();
     let covered = |row: &&cortexkit_claustrum_client::ListedCredential| {
         !borrowed
@@ -1072,6 +1073,7 @@ impl ClassContext {
             self.credentials.listed_credentials(),
             fact,
             &self.catalog,
+            &self.credentials,
             &specs,
             self.targets.contains_key(&fact.provider_id),
             priced_per_token,
@@ -1532,7 +1534,7 @@ impl ClassContext {
                 (!only || other.id == row.id)
                     && covered(other) == covered(row)
                     && self.eligible(other, fact)
-                    && crate::broca_credentials::credential_serves_fact(other, fact, &self.catalog)
+                    && crate::broca_credentials::credential_serves_fact(other, fact, &self.catalog, &self.credentials)
             })
             .collect();
         let roster = self.roster(
@@ -1883,7 +1885,7 @@ impl ClassContext {
             .credentials
             .listed_credentials()
             .iter()
-            .any(|row| crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog))
+            .any(|row| crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog, &self.credentials))
         {
             return None;
         }
@@ -2138,7 +2140,7 @@ impl ClassContext {
             .find(|fact| fact.provider_id == provider && fact.model_id == model);
         if let Some(fact) = class {
             for row in self.credentials.listed_credentials().iter().filter(|row| {
-                crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog)
+                crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog, &self.credentials)
             }) {
                 let account = self.account_id(row);
                 if let Some(reading) = self

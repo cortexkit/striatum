@@ -286,6 +286,8 @@ pub(crate) fn prepare_candidates(
             let full: Vec<striatum_core::route_state_store::CredentialEntitlementFence> =
                 fences.iter().chain(stale.iter()).cloned().collect();
             let guard = credentials.lock().ok();
+            let empty_credentials = crate::broca_credentials::BrocaCredentials::default();
+            let credential_data = guard.as_deref().unwrap_or(&empty_credentials);
             let rows = guard
                 .as_ref()
                 .map_or(&[][..], |guard| guard.listed_credentials());
@@ -315,11 +317,9 @@ pub(crate) fn prepare_candidates(
                     .iter()
                     .copied()
                     .filter(|row| {
-                        fact.auth_methods.as_ref().is_none_or(|methods| {
-                            row.auth_method
-                                .as_ref()
-                                .is_some_and(|method| methods.contains(method))
-                        })
+                        crate::broca_credentials::credential_serves_fact(
+                            row, fact, &catalog_providers, credential_data,
+                        )
                     })
                     .collect();
                 if serving.is_empty() {
@@ -334,6 +334,7 @@ pub(crate) fn prepare_candidates(
                     rows,
                     fact,
                     &catalog_providers,
+                    credential_data,
                     &specs,
                     catalog_targets.contains_key(&fact.provider_id),
                     priced_per_token,

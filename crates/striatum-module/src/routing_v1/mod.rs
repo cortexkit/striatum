@@ -55,6 +55,8 @@ mod what_if_tests;
 #[cfg(test)]
 mod account_classes_tests;
 #[cfg(test)]
+mod wire_pair_tests;
+#[cfg(test)]
 mod account_ops_tests;
 #[cfg(test)]
 mod account_refusal_codes_tests;

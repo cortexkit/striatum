@@ -148,6 +148,11 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     credentials.runner_declarations.insert(API_KEY_RUNNER.into(), super::runners::parse_declaration(
         &json!({"runner":{"pairs":[{"wire_api":WIRE,"auth_method":"apikey"}],"follows_account_choice":true}})
     ).unwrap().unwrap());
+    // The catalog's Anthropic row also needs a declared serving pair, even
+    // though the legacy picker itself has no runner declaration.
+    credentials.runner_declarations.insert("anthropic-wire-support".into(), super::runners::parse_declaration(
+        &json!({"runner":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}],"follows_account_choice":true}})
+    ).unwrap().unwrap());
     credentials.runner_service_tiers.insert(RUNNER.into(), super::runners::service_tiers_from_describe(
         &json!({"capabilities":["service_tier"],"service_tiers":{WIRE:{"levels":["fast"],"served":"reported"}}})
     ).unwrap());

@@ -219,6 +219,7 @@ async fn absent_settings_keeps_declared_runners_unenrolled_and_spend_policy_unre
             credentials.listed_credentials(),
             fact,
             &providers,
+            &credentials,
             &[],
             false,
             false,

@@ -3374,7 +3374,7 @@ fn record_provider_reset_fence(
         };
         let credentials = credentials.lock().map_err(|e| e.to_string())?;
         if !credentials.listed_credentials().iter().any(|row| {
-            row.id == reported && broca_credentials::credential_serves_fact(row, fact, &catalog)
+            row.id == reported && broca_credentials::credential_serves_fact(row, fact, &catalog, &credentials)
         }) {
             return Ok(());
         }

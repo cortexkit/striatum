@@ -264,7 +264,7 @@ impl Registry {
                     .filter(|fact| {
                         !needs_vault
                             || credentials.listed_credentials().iter().any(|row| {
-                                credential_serves_fact(row, fact, &catalog)
+                                credential_serves_fact(row, fact, &catalog, credentials)
                                     && declaration.is_none_or(|declaration| {
                                         declaration
                                             .standing_limits
