@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use striatum_core::{ModelFact, ScoreProvenance};
+use striatum_core::{Confidence, ModelFact, ScoreProvenance};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -65,6 +65,14 @@ pub(super) fn overlay_operator_quality(
             fact.scores.eq = grade.eq;
             fact.score_provenance = ScoreProvenance::OperatorGrade;
             fact.eq_source = Some("operator_grade".into());
+            // An operator grade is curated knowledge. The row's stored
+            // `unknown` confidence described the catalog row before it was
+            // graded (unscored or estimated), and leaving it would keep the
+            // router's unknown-fact adequacy penalty on a graded score, so the
+            // row could never clear the adequacy floor at any demand. Like the
+            // scores, this is a read-time overlay: withdrawing the grade
+            // restores the stored confidence.
+            fact.confidence = Confidence::Curated;
         }
     }
     Ok(())
@@ -320,5 +328,67 @@ mod tests {
             .is_empty());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A catalog row without a score is stored with `unknown`
+    /// confidence. Once the operator grades it, the grade is the row's score,
+    /// so the router must not also charge the unknown-fact penalty: a graded
+    /// row well above an easy bar has to clear the adequacy floor. Withdrawing
+    /// the grade returns the row to its stored, unknown state.
+    #[test]
+    fn operator_grade_lifts_unknown_confidence_so_a_graded_row_clears_the_floor() {
+        let scratch = cortexkit_test_support::ScratchDir::new("operator-grade-confidence");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "operator-grade-confidence",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fact: ModelFact = serde_json::from_value(json!({
+            "providerID": "synthetic", "modelID": "graded-later",
+            "scores": {"elo": 0, "eq": 0, "speed": 0}, "confidence": "unknown"
+        }))
+        .unwrap();
+        store.upsert_fact(&fact, FactSource::Unscored).unwrap();
+        let read = || {
+            store
+                .get_facts()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.provider_id == "synthetic" && f.model_id == "graded-later")
+                .unwrap()
+        };
+        assert_eq!(read().confidence, Confidence::Unknown);
+
+        store
+            .replace_operator_quality(
+                true,
+                &BTreeMap::from([(
+                    "synthetic/graded-later".into(),
+                    OperatorQuality {
+                        model: "synthetic/graded-later".into(),
+                        elo: 1678.0,
+                        eq: 1629.0,
+                    },
+                )]),
+            )
+            .unwrap();
+        let graded = read();
+        assert_eq!(graded.score_provenance, ScoreProvenance::OperatorGrade);
+        assert_eq!(graded.confidence, Confidence::Curated);
+        // An iq-10 demand against a 2000-elo field: the bar is far below the
+        // grade, so only the unknown-fact penalty could hold the row back.
+        let adequacy = striatum_core::score_adequacy(
+            &graded,
+            &striatum_core::ModelRequirements { iq: 10.0, eq: 0.0 },
+            striatum_core::TopRoutableScores { elo: 2000.0, eq: 2000.0 },
+            &striatum_core::RoutingConfig::default(),
+        );
+        assert_eq!(adequacy.raw_adequacy, 1.0);
+        assert!(adequacy.clears_adequacy_floor(), "{adequacy:?}");
+
+        store
+            .replace_operator_quality(false, &BTreeMap::new())
+            .unwrap();
+        assert_eq!(read().confidence, Confidence::Unknown);
     }
 }
