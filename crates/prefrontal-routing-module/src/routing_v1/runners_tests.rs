@@ -146,6 +146,111 @@ fn requires_wire_api_is_runner_local_and_defaults_to_false() {
 }
 
 #[test]
+fn pair_wire_requirements_are_row_local_and_override_the_runner_default() {
+    let facts = vec![
+        fact("anthropic", "pair-a", Some(&["oauth"])),
+        fact("anthropic", "pair-b", Some(&["oauth"])),
+        fact("anthropic", "inherited", Some(&["oauth"])),
+    ];
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+    credentials
+        .wire_apis
+        .insert("anthropic/pair-b".into(), "openai.responses".into());
+    credentials.wire_apis.insert(
+        "anthropic/inherited".into(),
+        "openai.chat_completions".into(),
+    );
+    for required in [None, Some(false), Some(true)] {
+        let mut slot = json!({"runner": {
+            "follows_account_choice":true,
+            "pairs":[
+                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
+                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":false},
+                {"wire_api":"openai.chat_completions", "auth_method":"oauth"}
+            ]
+        }});
+        if let Some(required) = required {
+            slot["runner"]["requires_wire_api"] = json!(required);
+        }
+        credentials.runner_declarations.insert(
+            "fixture-runner".into(),
+            runners::parse_declaration(&slot).unwrap().unwrap(),
+        );
+        let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
+        for (model, admitted) in [
+            ("pair-a", false),
+            ("pair-b", true),
+            ("inherited", required != Some(true)),
+        ] {
+            let key = format!("anthropic/{model}");
+            assert_eq!(
+                registry.runs("fixture-runner", &key, &key),
+                admitted,
+                "{slot}: {model}"
+            );
+            assert_eq!(
+                registry.requires_wire_api("fixture-runner", &key, &key),
+                !admitted,
+                "{slot}: {model}"
+            );
+        }
+    }
+}
+
+#[test]
+fn harness_pair_members_cannot_change_original_wire_requirements() {
+    let facts = vec![
+        fact("anthropic", "pair-a", Some(&["oauth"])),
+        fact("anthropic", "pair-b", Some(&["oauth"])),
+    ];
+    let mut credentials = credentials(&facts, row(&["anthropic"], &[], Some("oauth")), NOW);
+    credentials
+        .wire_apis
+        .insert("anthropic/pair-b".into(), "openai.responses".into());
+    for limit_requirement in [json!(true), json!(false), json!("ignored")] {
+        let slot = json!({"runner": {
+            "follows_account_choice":true, "requires_wire_api":true,
+            "pairs":[
+                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
+                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":false}
+            ],
+            "harnesses":["codex"], "default_harness":"codex",
+            "harness_limits":{"codex":{"pairs":[
+                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":limit_requirement},
+                {"wire_api":"openai.responses", "auth_method":"oauth", "requires_wire_api":limit_requirement}
+            ]}}
+        }});
+        credentials.runner_declarations.insert(
+            "fixture-runner".into(),
+            runners::parse_declaration(&slot).unwrap().unwrap(),
+        );
+        let registry = Registry::build_for_harness(
+            vec![policy(None)],
+            &credentials,
+            &facts,
+            NOW,
+            Some("codex"),
+        );
+        assert!(
+            !registry.runs("fixture-runner", "anthropic/pair-a", "anthropic/pair-a"),
+            "{slot}"
+        );
+        assert!(
+            registry.requires_wire_api("fixture-runner", "anthropic/pair-a", "anthropic/pair-a"),
+            "{slot}"
+        );
+        assert!(
+            registry.runs("fixture-runner", "anthropic/pair-b", "anthropic/pair-b"),
+            "{slot}"
+        );
+        assert!(
+            !registry.requires_wire_api("fixture-runner", "anthropic/pair-b", "anthropic/pair-b"),
+            "{slot}"
+        );
+    }
+}
+
+#[test]
 fn requires_wire_api_uses_the_alias_targets_auth_specific_plane() {
     let facts = vec![fact("anthropic", "model", Some(&["oauth", "apikey"]))];
     let mut credentials = credentials(

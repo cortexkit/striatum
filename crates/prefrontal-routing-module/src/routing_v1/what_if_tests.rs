@@ -280,6 +280,32 @@ async fn what_if_refuses_invalid_runner_slots_with_the_catalog_parser_error() {
 }
 
 #[tokio::test]
+async fn what_if_accepts_pair_wire_requirements_overriding_the_runner_default() {
+    let (harness, _) = configured().await;
+    prepare_runner_preview(&harness);
+    let operator = operator(&harness).await;
+    let baseline = evaluate(&operator, json!({"iqs":[0], "runner":"broca"})).await;
+    assert!(baseline["results"][0]["pick"].is_object(), "{baseline}");
+    let mut slot = broad_runner_slot();
+    slot["runner"]["requires_wire_api"] = json!(true);
+    for pair in slot["runner"]["pairs"].as_array_mut().unwrap() {
+        pair["requires_wire_api"] = json!(false);
+    }
+    let before = rows(&harness);
+    let credentials = credential_state(&harness);
+    let preview = evaluate(
+        &operator,
+        json!({
+            "iqs":[0], "runner":"broca", "runner_declarations":{"broca":slot}
+        }),
+    )
+    .await;
+    assert_eq!(preview["results"], baseline["results"], "{preview}");
+    assert_eq!(before, rows(&harness));
+    assert_eq!(credentials, credential_state(&harness));
+}
+
+#[tokio::test]
 async fn what_if_is_an_operator_only_management_query() {
     assert!(crate::handles("route.what_if"));
     let (harness, consumer) = configured().await;

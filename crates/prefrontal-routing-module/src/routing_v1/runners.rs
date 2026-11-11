@@ -43,6 +43,8 @@ pub(crate) struct EffectiveRunner {
     #[serde(skip_serializing_if = "is_false")]
     pub requires_wire_api: bool,
     #[serde(skip)]
+    wire_declaration: Option<RunnerDeclaration>,
+    #[serde(skip)]
     route_policy: Option<Vec<String>>,
     #[serde(skip)]
     reachable_models: BTreeSet<String>,
@@ -83,6 +85,12 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl EffectiveRunner {
+    pub(crate) fn requires_wire_api_for_pair(&self, pair: &RunnerPair) -> bool {
+        self.wire_declaration
+            .as_ref()
+            .is_some_and(|declaration| declaration.requires_wire_api_for_pair(pair))
+    }
+
     pub(crate) fn selection_harness(&self, requested: Option<&str>) -> Option<String> {
         if let Some(requested) = requested {
             return self
@@ -150,6 +158,7 @@ impl Registry {
                 default_harness: None,
                 starts_sessions: true,
                 requires_wire_api: false,
+                wire_declaration: None,
                 route_policy: None,
                 reachable_models: reachable,
                 statically_reachable_models: models,
@@ -207,6 +216,7 @@ impl Registry {
         let entries = policies
             .into_iter()
             .map(|mut policy| {
+                let wire_declaration = credentials.runner_declarations.get(&policy.module);
                 let resolved_declaration =
                     credentials
                         .runner_declarations
@@ -280,15 +290,22 @@ impl Registry {
                                                     return false;
                                                 };
                                                 declaration.pairs.iter().any(|pair| {
-                                                    known_pair(pair)
-                                                        && api == pair.wire_api
-                                                        && row.auth_method.as_ref()
-                                                            == Some(&pair.auth_method)
-                                                }) && {
-                                                    let admitted = declaration.admits_row(
-                                                        credentials
-                                                            .row_serves_wire_api(fact, method),
-                                                    );
+                                                    if !known_pair(pair)
+                                                        || api != pair.wire_api
+                                                        || row.auth_method.as_ref()
+                                                            != Some(&pair.auth_method)
+                                                    {
+                                                        return false;
+                                                    }
+                                                    // Harness limits narrow pair membership, not
+                                                    // the original runner pair's endpoint requirement.
+                                                    let admitted = wire_declaration
+                                                        .unwrap_or(declaration)
+                                                        .admits_pair_row(
+                                                            pair,
+                                                            credentials
+                                                                .row_serves_wire_api(fact, method),
+                                                        );
                                                     if !admitted {
                                                         missing_wire_api_models.insert(format!(
                                                             "{}/{}",
@@ -296,7 +313,7 @@ impl Registry {
                                                         ));
                                                     }
                                                     admitted
-                                                }
+                                                })
                                             }
                                     })
                                     && {
@@ -371,6 +388,7 @@ impl Registry {
                     default_harness: declaration.and_then(|d| d.default_harness.clone()),
                     starts_sessions: declaration.is_none_or(|d| d.starts_sessions),
                     requires_wire_api: declaration.is_some_and(|d| d.requires_wire_api()),
+                    wire_declaration: wire_declaration.cloned(),
                     route_policy,
                     reachable_models,
                     statically_reachable_models,

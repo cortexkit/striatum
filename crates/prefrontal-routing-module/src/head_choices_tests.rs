@@ -416,6 +416,48 @@ async fn billing_distinguishes_reachable_subscriptions_from_per_token_keys() {
 }
 
 #[tokio::test]
+async fn pair_wire_requirements_filter_choices_and_keep_matching_subscription_accounts() {
+    let (harness, mut credentials) = fixture();
+    for limit_requirement in [json!(false), json!(true)] {
+        credentials.runner_declarations.insert(RUNNER.into(), super::runners::parse_declaration(&json!({"runner": {
+            "requires_wire_api":true, "follows_account_choice":true,
+            "pairs":[
+                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":true},
+                {"wire_api":WIRE, "auth_method":"oauth", "requires_wire_api":false}
+            ],
+            "harnesses":["codex"], "default_harness":"codex",
+            "harness_limits":{"codex":{"pairs":[
+                {"wire_api":"anthropic.messages", "auth_method":"oauth", "requires_wire_api":limit_requirement},
+                {"wire_api":WIRE, "auth_method":"oauth", "requires_wire_api":limit_requirement}
+            ]}}
+        }})).unwrap().unwrap());
+        harness.set_credentials(credentials.clone());
+        let route = harness.bind(reserved("occipital"), None).await;
+        let (ty, reply) = route
+            .call(
+                "route.head_choices",
+                &json!({"runner_module":RUNNER, "harness":"codex"}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Response, "{reply}");
+        check_contract(RUNNER, &reply["result"]);
+        assert_eq!(
+            ids(&reply["result"]),
+            ["openai/a-head", "openai/pinned"],
+            "{reply}"
+        );
+        assert!(
+            reply["result"]["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|model| model["billing"] == "subscription"),
+            "{reply}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn billing_uses_account_selection_subscription_settings() {
     let (harness, mut credentials) = fixture();
     let mut rows = credentials.listed_credentials().to_vec();
