@@ -53,6 +53,37 @@ As if Opus were not pin-only for masons:
 The empty array replaces that model's `pin_only_for` array for this call. It does
 not clear a separate `pin_only: true`, `not_for`, provider exclusion or account-level quota, cooldown or credential restriction. If the live model uses `pin_only: true`, also patch `"pin_only": false`.
 
+As if Broca published a proposed `routing/v1` runner slot, including the head
+picker under that declaration:
+
+```json
+{
+  "method": "route.what_if",
+  "params": {
+    "consumer": "mason",
+    "iqs": [0, 50, 100],
+    "runner": "broca",
+    "runner_declarations": {
+      "broca": {
+        "runner": {
+          "follows_account_choice": true,
+          "pairs": [
+            {"auth_method": "apikey", "wire_api": "anthropic.messages"},
+            {"auth_method": "oauth", "wire_api": "anthropic.messages"}
+          ]
+        }
+      }
+    },
+    "head_choices": {"runner_module": "broca"}
+  }
+}
+```
+
+The example deliberately admits only two pairs. To evaluate a runner's actual
+proposal, use its entire `role_declarations["routing/v1"]` object as the value
+under its module name, not the surrounding catalog entry or just the inner
+`runner` object. Omit both new members for the live-policy baseline.
+
 ## Parameters
 
 * `consumer`: a registered consumer name, including a registered dotted name.
@@ -64,6 +95,15 @@ not clear a separate `pin_only: true`, `not_for`, provider exclusion or account-
   of `pin_only_for`, `pin_only`, `not_for`, `only_for`. Arrays replace arrays;
   `false` replaces `true`; omitted fields retain live settings. Other policy
   fields, price/grade edits and unknown request members are rejected.
+* `runner_declarations`: optional map from module names to complete `routing/v1`
+  slot objects containing a `runner` declaration. Each slot is validated by the
+  same role-routing parser used for catalog slots; invalid slots return its
+  error. A supplied runner declaration replaces that module's catalog declaration
+  for this call, or supplies one if the module has none. It does not register an
+  unavailable runner or change operator settings, accounts or credentials.
+* `head_choices`: optional object with required `runner_module` and optional
+  `harness`, as in `route.head_choices`. Requests the same picker response under
+  the call's policy and runner declaration overrides, alongside the IQ sweep.
 
 Consumer policy, global exclusions, configured service tiers, grades, pricing,
 runner availability and account eligibility all remain in force. As with
@@ -76,7 +116,8 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 ## Result
 
 The management response's `result` contains `consumer`, `results`, `snapshot_ms`
-and `elapsed_ms`. Each `results` row contains:
+and `elapsed_ms`, plus `head_choices` when requested (the unchanged
+`route.head_choices` response shape). Each `results` row contains:
 
 ```json
 {
@@ -120,7 +161,9 @@ Malformed requests and unauthorized callers are top-level errors, not rows.
 ## Isolation
 
 The op holds live configuration snapshots for the sweep and overlays policy in
-memory only. It uses the same preparation, scorer, selection ordering and variant
+memory only. Runner declaration overrides are applied to a call-local catalog
+snapshot shared by the sweep and optional head picker; no live catalog entry is
+changed. It uses the same preparation, scorer, selection ordering and variant
 policy as `route.select`, returning before decision persistence or pool-key
 acquisition. It also skips the counters of routing calls by method, request shape
 and principal.

@@ -134,12 +134,20 @@ pub(super) fn explain(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
 }
 
 pub(super) fn head_choices(params: &Value, deps: &Deps<'_>) -> Result<Value, Refusal> {
+    head_choices_with_config(params, deps, &super::operator_config(deps))
+}
+
+pub(super) fn head_choices_with_config(
+    params: &Value,
+    deps: &Deps<'_>,
+    config: &crate::config_overrides::LiveConfig,
+) -> Result<Value, Refusal> {
     refuse_unknown_members(params, &["runner_module", "harness"])?;
     let request = cortexkit_role_routing::head_choices::parse_head_choices_request(params)?;
     let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
     crate::head_choices::choices_for_harness(
         deps.store,
-        &super::operator_config(deps),
+        config,
         &credentials,
         &request.runner_module,
         request.harness.as_deref(),

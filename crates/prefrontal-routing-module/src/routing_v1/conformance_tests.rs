@@ -194,6 +194,10 @@ impl Harness {
         *self.broca_credentials.lock().unwrap() = Arc::new(Mutex::new(credentials));
     }
 
+    pub(super) fn credentials(&self) -> crate::SharedBrocaCredentials {
+        self.broca_credentials.lock().unwrap().clone()
+    }
+
     pub(super) fn observe_runner_describe(&self, module: &str, describe: &Value) {
         let credentials = self.broca_credentials.lock().unwrap();
         super::runners::DescribeCache::default().reply(

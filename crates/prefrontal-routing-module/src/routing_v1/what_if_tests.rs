@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use cortexkit_role_routing_conformance::fixture;
+use prefrontal_routing_core::RouteStateStore;
 use rusqlite::{types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
 use subc_protocol::FrameType;
@@ -53,6 +54,231 @@ fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
         .collect()
 }
 
+fn runner_slot() -> Value {
+    json!({"runner": {
+        "follows_account_choice": true,
+        "requires_wire_api": true,
+        "pairs": [{"wire_api":"openai.responses", "auth_method":"apikey"}],
+        "harnesses": ["codex"],
+        "default_harness": "codex",
+        "harness_limits": {"codex": {
+            "pairs": [{"wire_api":"openai.responses", "auth_method":"apikey"}]
+        }}
+    }})
+}
+
+fn broad_runner_slot() -> Value {
+    json!({"runner": {
+        "follows_account_choice": true,
+        "pairs": [
+            {"wire_api":"anthropic.messages", "auth_method":"apikey"},
+            {"wire_api":"anthropic.messages", "auth_method":"oauth"}
+        ]
+    }})
+}
+
+fn prepare_runner_preview(harness: &Harness) {
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca", "via_vault":true}]);
+    });
+    let facts = harness.store().get_facts().unwrap();
+    let models: serde_json::Map<_, _> = facts
+        .iter()
+        .map(|fact| {
+            let mut fact = fact.clone();
+            fact.supports_tool_use = Some(true);
+            harness
+                .store()
+                .upsert_fact(&fact, prefrontal_routing_core::FactSource::Override)
+                .unwrap();
+            (
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                json!({"existence":"present", "capability.tool_call":true}),
+            )
+        })
+        .collect();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({"catalog_version":41,"resolved_at_ms":123,"models":models}))
+            .unwrap(),
+    )
+    .unwrap();
+    let shared = harness.credentials();
+    let mut credentials = shared.lock().unwrap();
+    credentials.catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    credentials.runner_declarations.clear();
+}
+
+fn credential_state(harness: &Harness) -> String {
+    let shared = harness.credentials();
+    let credentials = shared.lock().unwrap();
+    format!("{credentials:?}")
+}
+
+#[tokio::test]
+async fn what_if_runner_declaration_narrows_routes_without_publishing() {
+    let (harness, _) = configured().await;
+    prepare_runner_preview(&harness);
+    let operator = operator(&harness).await;
+    let original = evaluate(&operator, json!({"iqs":[0], "runner":"broca"})).await;
+    assert!(original["results"][0]["pick"].is_object(), "{original}");
+    assert!(!original["results"][0]["adequate"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = rows(&harness);
+    let credentials = credential_state(&harness);
+    let writes = harness.store().account_write_transaction_count_for_test();
+    let narrowed = evaluate(
+        &operator,
+        json!({
+            "iqs":[0], "runner":"broca", "runner_declarations":{"broca":runner_slot()}
+        }),
+    )
+    .await;
+    assert!(narrowed["results"][0]["pick"].is_null(), "{narrowed}");
+    assert!(narrowed["results"][0]["refusal"].is_object(), "{narrowed}");
+    assert!(narrowed["results"][0]["adequate"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        original["results"],
+        evaluate(&operator, json!({"iqs":[0], "runner":"broca"})).await["results"]
+    );
+    assert_eq!(before, rows(&harness));
+    assert_eq!(credentials, credential_state(&harness));
+    assert_eq!(
+        writes,
+        harness.store().account_write_transaction_count_for_test()
+    );
+}
+
+#[tokio::test]
+async fn what_if_head_choices_matches_installed_declaration_and_keeps_live_state() {
+    let (harness, _) = configured().await;
+    prepare_runner_preview(&harness);
+    let operator = operator(&harness).await;
+    let request = json!({"runner_module":"broca"});
+    let (ty, baseline) = operator.call("route.head_choices", &request).await;
+    assert_eq!(ty, FrameType::Response, "{baseline}");
+    assert!(
+        !baseline["result"]["models"].as_array().unwrap().is_empty(),
+        "{baseline}"
+    );
+    let before = rows(&harness);
+    let credentials = credential_state(&harness);
+    let writes = harness.store().account_write_transaction_count_for_test();
+    let slot = runner_slot();
+    let preview = evaluate(
+        &operator,
+        json!({
+            "runner_declarations":{"broca":slot},
+            "head_choices":{"runner_module":"broca", "harness":"codex"}
+        }),
+    )
+    .await;
+    assert_eq!(preview["head_choices"]["models"], json!([]), "{preview}");
+    assert_eq!(before, rows(&harness));
+    assert_eq!(credentials, credential_state(&harness));
+    assert_eq!(
+        writes,
+        harness.store().account_write_transaction_count_for_test()
+    );
+    let (ty, unchanged) = operator.call("route.head_choices", &request).await;
+    assert_eq!(ty, FrameType::Response, "{unchanged}");
+    assert_eq!(baseline, unchanged);
+    let policy_models: serde_json::Map<_, _> = harness
+        .store()
+        .get_facts()
+        .unwrap()
+        .iter()
+        .map(|fact| {
+            (
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                json!({"not_for":["head"]}),
+            )
+        })
+        .collect();
+    let policy_preview = evaluate(
+        &operator,
+        json!({
+            "head_choices":request, "policy_patch":{"models":policy_models}
+        }),
+    )
+    .await;
+    assert_eq!(
+        policy_preview["head_choices"]["models"],
+        json!([]),
+        "{policy_preview}"
+    );
+
+    let shared = harness.credentials();
+    // Install through the same verified catalog parser used by catalog refreshes.
+    shared.lock().unwrap().runner_declarations = super::runners::declarations_from_catalog(
+        &json!([{"module_id":"broca", "nonce_verified":true,
+            "role_declarations":{"routing/v1":slot}}]),
+    );
+    let (ty, installed) = operator
+        .call(
+            "route.head_choices",
+            &json!({"runner_module":"broca", "harness":"codex"}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{installed}");
+    assert_eq!(preview["head_choices"], installed["result"]);
+    let replacement = evaluate(
+        &operator,
+        json!({
+            "runner_declarations":{"broca":broad_runner_slot()}, "head_choices":request
+        }),
+    )
+    .await;
+    assert_eq!(
+        replacement["head_choices"], baseline["result"],
+        "{replacement}"
+    );
+    let (ty, still_installed) = operator
+        .call(
+            "route.head_choices",
+            &json!({"runner_module":"broca", "harness":"codex"}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{still_installed}");
+    assert_eq!(installed, still_installed);
+    shared.lock().unwrap().runner_declarations.clear();
+    assert_eq!(credentials, credential_state(&harness));
+    assert_eq!(before, rows(&harness));
+}
+
+#[tokio::test]
+async fn what_if_refuses_invalid_runner_slots_with_the_catalog_parser_error() {
+    let (harness, _) = configured().await;
+    let operator = operator(&harness).await;
+    let before = rows(&harness);
+    let credentials = credential_state(&harness);
+    for slot in [
+        json!({"runner":{"pairs":"not-an-array"}}),
+        json!({"runner":{"pairs":[{"wire_api":"anthropic.messages"}]}}),
+        json!({"runner":{"pairs":[], "follows_account_choice":"yes"}}),
+        json!({"runner":{}, "consumers":"not-an-array"}),
+    ] {
+        let error = super::runners::parse_declaration(&slot).unwrap_err();
+        let (ty, body) = operator
+            .call(
+                "route.what_if",
+                &json!({
+                    "consumer":fixture::SUMMARY, "iqs":[0], "runner_declarations":{"broca":slot}
+                }),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body["code"], "invalid_request", "{body}");
+        assert!(body.to_string().contains(&error), "{body}: {error}");
+    }
+    assert_eq!(before, rows(&harness));
+    assert_eq!(credentials, credential_state(&harness));
+}
+
 #[tokio::test]
 async fn what_if_is_an_operator_only_management_query() {
     assert!(crate::handles("route.what_if"));
@@ -84,6 +310,7 @@ async fn what_if_is_an_operator_only_management_query() {
 #[tokio::test]
 async fn what_if_changes_no_rows_even_when_account_loading_heals_expired_evidence() {
     let (harness, _) = configured().await;
+    prepare_runner_preview(&harness);
     let operator = operator(&harness).await;
     Connection::open(harness.store_path()).unwrap().execute_batch(
         "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a','large',1,0);
@@ -91,7 +318,16 @@ async fn what_if_changes_no_rows_even_when_account_loading_heals_expired_evidenc
     ).unwrap();
     let before = rows(&harness);
     let writes = harness.store().account_write_transaction_count_for_test();
-    let answer = evaluate(&operator, json!({"iqs": [0, 5, 50, 100], "policy_patch": {"models": {"example-provider/model-b": {"pin_only":true}}}})).await;
+    let answer = evaluate(
+        &operator,
+        json!({
+            "iqs": [0, 5, 50, 100],
+            "policy_patch": {"models": {"example-provider/model-b": {"pin_only":true}}},
+            "runner_declarations":{"broca":broad_runner_slot()},
+            "head_choices":{"runner_module":"broca"}
+        }),
+    )
+    .await;
     assert!(answer["results"][0]["pick"].is_object(), "{answer}");
     assert_eq!(
         writes,
@@ -308,6 +544,10 @@ async fn what_if_rejects_invalid_params_before_snapshotting() {
         json!({"runner":"other"}),
         json!({"policy_patch":{"models":{"bad":{"pin_only":false}}}}),
         json!({"policy_patch":{"models":{"example-provider/model-a":{"elo":2000}}}}),
+        json!({"runner_declarations":{"broca":{}}}),
+        json!({"head_choices":{}}),
+        json!({"head_choices":{"runner_module":42}}),
+        json!({"head_choices":{"runner_module":"broca", "unexpected":true}}),
         json!({"unexpected":true}),
     ] {
         let mut params = json!({"consumer":fixture::SUMMARY,"iqs":[50]});

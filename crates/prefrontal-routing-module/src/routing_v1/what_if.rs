@@ -17,6 +17,8 @@ struct Params {
     eq: Option<f64>,
     runner: Option<String>,
     policy_patch: Option<PolicyPatch>,
+    runner_declarations: Option<BTreeMap<String, Value>>,
+    head_choices: Option<Value>,
 }
 
 #[derive(Default, Deserialize)]
@@ -79,6 +81,18 @@ pub(super) async fn what_if_with_profile_lookup(
         ));
     }
     let started = std::time::Instant::now();
+    let declarations = params
+        .runner_declarations
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(module, slot)| {
+            let field = format!("runner_declarations.{module}");
+            let declaration = super::runners::parse_declaration(&slot)
+                .map_err(|error| Refusal::invalid_request(&field, error))?
+                .ok_or_else(|| Refusal::invalid_request(&field, "slot must contain runner"))?;
+            Ok((module, declaration))
+        })
+        .collect::<Result<BTreeMap<_, _>, Refusal>>()?;
     let live = crate::config_overrides::live_config(deps.routing_config_path);
     let operator = operator_config(deps);
     let patch = params.policy_patch.unwrap_or_default();
@@ -97,6 +111,27 @@ pub(super) async fn what_if_with_profile_lookup(
             "consumer is not registered",
         ));
     }
+    // Keep declaration overlays and all credential reads on a disposable copy.
+    // Never publish the proposed slot or copy reconciled state back to the cache.
+    let mut credentials = deps
+        .broca_credentials
+        .lock()
+        .map_err(store_refusal)?
+        .clone();
+    credentials.runner_declarations.extend(declarations);
+    let credentials = Arc::new(Mutex::new(credentials));
+    let deps = Deps {
+        broca_credentials: &credentials,
+        quota_cache: deps.quota_cache,
+        store: deps.store,
+        routing_config_path: deps.routing_config_path,
+        operator_config_path: deps.operator_config_path,
+    };
+    let head_choices = params
+        .head_choices
+        .as_ref()
+        .map(|request| super::reads::head_choices_with_config(request, &deps, &operator))
+        .transpose()?;
     // Account loading heals stale evidence. Heal only a disposable projection,
     // copied once for the whole sweep; no decision or usage history is copied.
     let account_store = Arc::new(
@@ -123,7 +158,7 @@ pub(super) async fn what_if_with_profile_lookup(
             eq: params.eq,
             evidence: Mutex::new(Default::default()),
         };
-        let result = select::evaluate(&request, caller, deps, &view, profile_lookup).await;
+        let result = select::evaluate(&request, caller, &deps, &view, profile_lookup).await;
         let evidence = view.evidence.into_inner().unwrap();
         let excluded: Vec<_> = evidence
             .excluded
@@ -145,7 +180,9 @@ pub(super) async fn what_if_with_profile_lookup(
         }
         results.push(row);
     }
-    Ok(
-        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0}),
-    )
+    let mut result = json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0});
+    if let Some(choices) = head_choices {
+        result["head_choices"] = choices;
+    }
+    Ok(result)
 }
