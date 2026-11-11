@@ -494,7 +494,7 @@ impl crate::AccountTx<'_> {
                 VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(provider,credential_id) DO UPDATE SET
                 {deadline}=excluded.{deadline},{why}=excluded.{why},{observed}=excluded.{observed},
                 updated_at=MAX(pool_key_state.updated_at,excluded.updated_at)
-                WHERE excluded.{observed}>=COALESCE(pool_key_state.{observed},pool_key_state.updated_at)"),
+                WHERE pool_key_state.{observed} IS NULL OR excluded.{observed}>=pool_key_state.{observed}"),
                 params![provider,credential_id,until_ms,reason,now_ms]).map_err(err)?;
             let origin = if kind == PoolWallKind::Billing {
                 "pool_billing"
@@ -538,6 +538,42 @@ impl crate::AccountTx<'_> {
 #[cfg(test)]
 mod wall_generation_tests {
     use super::*;
+    #[test]
+    fn first_pool_refusal_survives_a_later_lease_touch() {
+        let scratch = cortexkit_test_support::ScratchDir::new("first-pool-refusal");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "first-pool-refusal",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let keys = vec![PoolKey::new("key", Some("a"), "active")];
+        assert!(matches!(
+            store
+                .pool_acquire(&PoolAcquire {
+                    provider: "p",
+                    session_id: "s",
+                    keys: &keys,
+                    now_ms: 101,
+                    lease_ms: 120_000,
+                    affinity_idle_ms: 120_000,
+                })
+                .unwrap(),
+            PoolAcquireOutcome::Leased(_)
+        ));
+        for kind in [PoolWallKind::Billing, PoolWallKind::RateLimited] {
+            store
+                .pool_wall("p", "key", kind, 1100, "first refusal", 100)
+                .unwrap();
+        }
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(
+            clocks.len(),
+            2,
+            "lease activity is not same-kind refusal evidence"
+        );
+        assert!(clocks.iter().all(|origin| origin.evidence_at == 100));
+    }
+
     #[test]
     fn newer_pool_refusal_replaces_a_long_migrated_deadline_with_its_short_retry() {
         let scratch = cortexkit_test_support::ScratchDir::new("migrated-pool-short-retry");

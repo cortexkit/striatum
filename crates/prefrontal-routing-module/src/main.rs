@@ -3180,6 +3180,29 @@ async fn handle_set_decision_outcome(
                                     Ok(())
                                 })
                                 .map_err(|e| ModuleError::Message(e.to_string()))?;
+                        } else if frozen
+                            .as_ref()
+                            .and_then(|identity| identity.credential_id.as_deref())
+                            .is_none()
+                        {
+                            let model = decision.selected_model_id.as_deref().unwrap_or("");
+                            store
+                                .account_transaction(|tx| {
+                                    if tx.probe_authorization_names_credential(
+                                        &params.decision_id,
+                                        credential,
+                                        model,
+                                    )? {
+                                        tx.heal_authorized_probe(
+                                            &params.decision_id,
+                                            provider,
+                                            model,
+                                            observed_at_ms,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })
+                                .map_err(|e| ModuleError::Message(e.to_string()))?;
                         }
                     }
                 }
@@ -5689,6 +5712,49 @@ mod tests {
             1,
             "B did not serve the decision frozen to A"
         );
+    }
+
+    #[tokio::test]
+    async fn anonymous_legacy_reported_credential_heals_only_its_claimed_authorization() {
+        for reported in ["claimed", "other"] {
+            let rig = Rig::new("anonymous-reported-credential");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let at = now_ms() as i64;
+            let _clock = InjectedClock::set((at + 1000) as u64);
+            store
+                .pool_wall(
+                    "p",
+                    "claimed",
+                    prefrontal_routing_store::PoolWallKind::Billing,
+                    at + 1000,
+                    "credits",
+                    at,
+                )
+                .unwrap();
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            assert!(store
+                .account_transaction(|tx| tx.grant_fence_rechecks(
+                    &origins,
+                    at + 1000,
+                    Some(&decision)
+                ))
+                .unwrap());
+            report_legacy_outcome_for_fence_test(
+                &store,
+                json!({"decisionID":decision,"outcome":"completed",
+                    "providerOutcome":{"accountRef":"account","credentialId":reported}}),
+            )
+            .await;
+            assert_eq!(store.fence_rechecks().unwrap().is_empty(), reported == "claimed",
+                "an anonymous decision may heal only when the reported credential appears in its authorization");
+        }
     }
 
     #[tokio::test]

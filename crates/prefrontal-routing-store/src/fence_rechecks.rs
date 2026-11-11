@@ -2371,6 +2371,244 @@ mod tests {
     }
 
     #[test]
+    fn outcome_retry_wall_replaces_migrated_horizon_and_refreshes_evidence() {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
+        };
+        let scratch = cortexkit_test_support::ScratchDir::new("outcome-wall-generation");
+        let descriptor = crate::dev_descriptor(
+            "outcome-wall-generation",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let now = crate::now_ms();
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        old.store.with_conn(|conn| conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,last_error_at,quota_exhausted_until)
+            VALUES ('p/m','p/m','p','m',?1,?1,?2)", params![now-100,now+86_400_000])).unwrap();
+        drop(old);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let report = |at, seconds| {
+            let id = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("p/m".into()),
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &id,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::QuotaExhausted {
+                            retry_after_secs: seconds,
+                        },
+                        observed_at_ms: at,
+                        last_error: Some("route capacity".into()),
+                        provider_outcome: None,
+                        failure_backoff: Default::default(),
+                    },
+                )
+                .unwrap();
+        };
+        report(now, 10);
+        let clock = store
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "route")
+            .unwrap();
+        assert_eq!(
+            clock.evidence_at, now,
+            "outcome refusals must stamp their own generation"
+        );
+        assert_eq!(
+            clock.next_recheck_at,
+            now + 10_000,
+            "short retry replaces the migrated raw horizon"
+        );
+        report(now - 1, 3600);
+        let clock = store
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.kind == "route")
+            .unwrap();
+        assert_eq!(clock.evidence_at, now);
+        assert_eq!(
+            clock.next_recheck_at,
+            now + 10_000,
+            "a delayed older refusal cannot overwrite the newer one"
+        );
+    }
+
+    #[test]
+    fn below_raised_threshold_failure_keeps_the_managed_fence_generation() {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome,
+            RouteStateStore,
+        };
+        let scratch = cortexkit_test_support::ScratchDir::new("raised-threshold-generation");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "raised-threshold-generation",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        for (at, threshold) in [(100, 1), (700_101, 10)] {
+            let id = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("p/m".into()),
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .set_decision_outcome(
+                    &id,
+                    &DecisionOutcomeUpdate {
+                        outcome: RouteOutcome::Error,
+                        observed_at_ms: at,
+                        last_error: Some("server_error".into()),
+                        provider_outcome: None,
+                        failure_backoff: FailureBackoffConfig {
+                            consecutive_terminal_failure_threshold: threshold,
+                        },
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .account_transaction(|tx| {
+                tx.claim_fence_rechecks(&[], 700_102)?;
+                Ok(())
+            })
+            .unwrap();
+        let clocks = store.fence_rechecks().unwrap();
+        assert!(clocks.iter().any(|o| o.kind == "failure" && o.evidence_at == 700_101),
+            "new failure evidence retaining an old deadline is managed, not expired legacy history: {clocks:?}");
+    }
+
+    #[test]
+    fn first_route_wall_survives_a_later_non_wall_update() {
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("first-route-wall");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "first-route-wall",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .update_route_state(
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(101),
+                    latency_ema_ms: Some(20.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_route_state(
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(100),
+                    cooldown_until: Some(1100.0),
+                    unscoped_wall: true,
+                    last_error: Some("capacity".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .fence_rechecks()
+                .unwrap()
+                .iter()
+                .any(|o| o.kind == "route" && o.evidence_at == 100),
+            "an unrelated update is not a prior refusal"
+        );
+    }
+
+    #[test]
+    fn first_provider_wall_survives_a_later_non_wall_update() {
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("first-provider-wall");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "first-provider-wall",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .record_provider_cooldown(
+                "p",
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(101),
+                    quota_pressure: Some(0.5),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_provider_cooldown(
+                "p",
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(100),
+                    cooldown_until: Some(1100.0),
+                    unscoped_wall: true,
+                    last_error: Some("capacity".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .fence_rechecks()
+                .unwrap()
+                .iter()
+                .any(|o| o.kind == "provider" && o.evidence_at == 100),
+            "an unrelated provider update is not a prior refusal"
+        );
+    }
+
+    #[test]
+    fn migration_does_not_turn_non_wall_updates_into_refusal_evidence() {
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("migrated-first-refusal");
+        let descriptor = crate::dev_descriptor(
+            "migrated-first-refusal",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        old.store.with_conn(|conn| conn.execute_batch("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at) VALUES ('p/m','p/m','p','m',101);
+            INSERT INTO provider_cooldown_state(provider_key,updated_at) VALUES ('q',101);")).unwrap();
+        drop(old);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let update = RouteStateUpdate {
+            observed_at_ms: Some(100),
+            cooldown_until: Some(1100.0),
+            unscoped_wall: true,
+            last_error: Some("capacity".into()),
+            ..Default::default()
+        };
+        store.update_route_state("p/m", "p/m", &update).unwrap();
+        store
+            .record_provider_cooldown("q", "q/m", "q/m", &update)
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert_eq!(
+            origins.len(),
+            2,
+            "migration must not invent a prior refusal from unrelated activity: {origins:?}"
+        );
+    }
+
+    #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {
         let scratch = cortexkit_test_support::ScratchDir::new("fence-migration");
         let descriptor = crate::dev_descriptor(
