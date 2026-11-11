@@ -40,7 +40,7 @@ async fn selection_before_first_plane_load_waits_then_prices_muse_as_subscriptio
     let request = crate::tests::run_route_wire_request_with_paths(
         &store,
         pricing_request(crate::ROUTE_SELECT_OP),
-        Path::new("/nonexistent/prefrontal-routing.jsonc"),
+        Path::new("/nonexistent/striatum.jsonc"),
         &credentials,
     );
     tokio::pin!(request);
@@ -97,7 +97,7 @@ async fn selection_past_first_plane_load_bound_refuses_retryably_without_a_decis
         let response = crate::tests::run_route_wire_request_with_paths(
             &store,
             pricing_request(method),
-            Path::new("/nonexistent/prefrontal-routing.jsonc"),
+            Path::new("/nonexistent/striatum.jsonc"),
             &credentials,
         )
         .await;

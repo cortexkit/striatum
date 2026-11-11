@@ -544,7 +544,7 @@ mod tests {
         let dir = cortexkit_test_support::scratch_root()
             .join(format!("striatum-retention-config-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         // `model_routing.demand_exponent` has the wrong type, which fails the
         // typed routing config; the retention block is still read.
         crate::test_config::write(

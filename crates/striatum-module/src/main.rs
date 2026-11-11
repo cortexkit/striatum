@@ -5115,7 +5115,7 @@ mod tests {
     }
 
     #[test]
-    fn config_check_uses_startup_loader_and_refuses_renamed_or_unknown_config() {
+    fn config_check_uses_startup_loader_and_refuses_unknown_config() {
         assert_eq!(
             parse_startup_mode([OsString::from("--check-config")]).unwrap(),
             StartupMode::CheckConfig
@@ -5125,16 +5125,10 @@ mod tests {
                 .is_err()
         );
         let scratch = cortexkit_test_support::ScratchDir::new("routing-config-check");
-        let path = scratch.join("prefrontal-routing.jsonc");
+        let path = scratch.join("striatum.jsonc");
         check_config_at(&path).unwrap();
-        let renamed = cortexkit_test_support::ScratchDir::new("routing-config-check-renamed");
-        crate::test_config::write(renamed.join("alfonso-routing.jsonc"), "{}").unwrap();
-        assert!(check_config_at(&renamed.join("prefrontal-routing.jsonc"))
-            .unwrap_err()
-            .to_string()
-            .contains("config_renamed"));
         let invalid = cortexkit_test_support::ScratchDir::new("routing-config-check-invalid");
-        let invalid_path = invalid.join("prefrontal-routing.jsonc");
+        let invalid_path = invalid.join("striatum.jsonc");
         crate::test_config::write(&invalid_path, "{\"not_a_routing_setting\":true}").unwrap();
         assert!(check_config_at(&invalid_path).is_err());
     }
@@ -5142,7 +5136,7 @@ mod tests {
     #[test]
     fn config_check_refuses_old_shape_and_names_converter() {
         let scratch = cortexkit_test_support::ScratchDir::new("routing-config-check-explicit");
-        let path = scratch.join("prefrontal-routing.jsonc");
+        let path = scratch.join("striatum.jsonc");
         crate::test_config::write_raw(
             &path,
             r#"{"model_routing":{"explicit_only_providers":["anthropic-platform"]}}"#,
@@ -8804,7 +8798,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(&operator_config, "{}").unwrap();
         let response = run_route_wire_request_with_operator_config(
             &store,
@@ -8861,7 +8855,7 @@ mod tests {
                 [],
             )
             .expect("stamp the stale exclusion column");
-        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["fixture/wire-only"]} } }"#,
@@ -11115,7 +11109,7 @@ mod tests {
                 "../../striatum-store/migrations/057_prune_absent_fusiform_facts.sql"
             ))
             .unwrap();
-        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": { "all": ["google/antigravity-gemini-4-argon"] } } }"#,
@@ -11172,7 +11166,7 @@ mod tests {
             fact("anthropic", "claude-opus-4-8"),
             fact("openai", "gpt-5.5"),
         ];
-        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &operator_config,
             r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
@@ -13100,7 +13094,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let operator_config = rig.dir.join("prefrontal-routing.jsonc");
+        let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(&operator_config, "{}").unwrap();
         let catalog_store = Arc::clone(&store);
         config_overrides::attach_reasoning_catalog(
@@ -13221,7 +13215,7 @@ mod tests {
     /// vendor and which `exclude.all` keeps out of automatic choice. Naming one
     /// of its models still admits it.
     fn platform_operator_config(rig: &Rig) -> PathBuf {
-        let path = rig.dir.join("prefrontal-routing.jsonc");
+        let path = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &path,
             r#"{ "model_routing": {
@@ -13587,7 +13581,7 @@ mod tests {
             row.scores.elo = elo;
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
-        let config = rig.dir.join("prefrontal-routing.jsonc");
+        let config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(&config, json!({"model_routing": {
             "exclude": {"all": ["anthropic/claude-opus-5-5", "anthropic-platform/claude-sonnet-fallback"]},
             "panels": {"audit": {"topK": 2, "extra": 0, "by": "iq"}}
@@ -15365,7 +15359,7 @@ mod tests {
         strong.cost_per_m_tok_out = Some(30.0);
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
-        let config_path = rig.dir.join("prefrontal-routing.jsonc");
+        let config_path = rig.dir.join("striatum.jsonc");
         crate::test_config::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
@@ -15670,8 +15664,8 @@ mod tests {
                 store.upsert_fact(row, FactSource::Override).unwrap();
             }
             let sources = winner_ladder::LadderSources {
-                routing_config: rig.dir.join("prefrontal-routing.jsonc"),
-                operator_config: rig.dir.join("prefrontal-routing.jsonc"),
+                routing_config: rig.dir.join("striatum.jsonc"),
+                operator_config: rig.dir.join("striatum.jsonc"),
                 observed: Arc::new(winner_ladder::ObservedSelections::default()),
             };
             Self {

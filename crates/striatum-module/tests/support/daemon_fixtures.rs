@@ -48,7 +48,7 @@ pub async fn serve_routing_fixtures(connection_file: &std::path::Path) -> Routin
 
 /// Write the routing config an operator runs with into `config_dir` (the
 /// rig's `$XDG_CONFIG_HOME/cortexkit`, where routing reads
-/// `prefrontal-routing.jsonc`).
+/// `striatum.jsonc`).
 ///
 /// Routing has no built-in runners or consumers: without this file it knows
 /// no runner to start a route on, so every executor selection answers
@@ -61,7 +61,7 @@ pub fn write_operator_routing_config(routing_bin: &std::path::Path, config_dir: 
     std::fs::create_dir_all(config_dir).unwrap();
     let input = config_dir.join("striatum.legacy.json");
     std::fs::write(&input, r#"{"model_routing": {}}"#).unwrap();
-    let output = config_dir.join("prefrontal-routing.jsonc");
+    let output = config_dir.join("striatum.jsonc");
     // The converter reads and writes only the two files it is given.
     let status = std::process::Command::new(routing_bin)
         .env_clear()

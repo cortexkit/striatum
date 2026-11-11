@@ -139,6 +139,60 @@ fn parse(path: &Path, raw: &str) -> Result<Document, ConfigError> {
 type Stamp = Option<(SystemTime, u64)>;
 type Cached = (Stamp, Arc<Document>);
 
+struct LastGoodDocument {
+    document: Arc<Document>,
+    missing_reported: bool,
+}
+
+fn read_document(path: &Path) -> Result<Option<Arc<Document>>, String> {
+    read_document_with_reporter(path, |error| {
+        eprintln!(
+            "[striatum] routing-config-reload-rejected: {}: {error}; keeping last good config",
+            path.display()
+        );
+    })
+}
+
+fn read_document_with_reporter(
+    path: &Path,
+    mut report_rejection: impl FnMut(&str),
+) -> Result<Option<Arc<Document>>, String> {
+    static CACHE: OnceLock<Mutex<HashMap<PathBuf, LastGoodDocument>>> = OnceLock::new();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    match std::fs::read_to_string(path) {
+        Ok(raw) => {
+            let document = Arc::new(parse(path, &raw).map_err(|err| err.to_string())?);
+            cache.insert(
+                path.to_owned(),
+                LastGoodDocument {
+                    document: Arc::clone(&document),
+                    missing_reported: false,
+                },
+            );
+            Ok(Some(document))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // An absent optional tier file is harmless only before it has
+            // supplied settings; removal must not withdraw an active policy.
+            let Some(previous) = cache.get_mut(path) else {
+                return Ok(None);
+            };
+            if !previous.missing_reported {
+                report_rejection("missing");
+                previous.missing_reported = true;
+            }
+            Ok(Some(Arc::clone(&previous.document)))
+        }
+        Err(err) => Err(ConfigError {
+            code: "routing_tier_config_invalid",
+            path: path.to_owned(),
+            key: String::new(),
+            reason: err.to_string(),
+        }
+        .to_string()),
+    }
+}
+
 pub(crate) fn without_context(params: &serde_json::Value) -> serde_json::Value {
     let mut params = params.clone();
     if let Some(object) = params.as_object_mut() {
@@ -165,30 +219,17 @@ fn load(path: &Path) -> Arc<Document> {
         .ok()
         .and_then(|meta| Some((meta.modified().ok()?, meta.len())));
     if let Some((previous, document)) = cache.get(path) {
-        if previous == &stamp {
+        if stamp.is_some() && previous == &stamp {
             return document.clone();
         }
     }
-    let document = match std::fs::read_to_string(path) {
-        Ok(raw) => parse(path, &raw).unwrap_or_else(|err| {
-            eprintln!("{err}");
-            Document::default()
-        }),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Document::default(),
+    let document = match read_document(path) {
+        Ok(document) => document.unwrap_or_default(),
         Err(err) => {
-            eprintln!(
-                "{}",
-                ConfigError {
-                    code: "routing_tier_config_invalid",
-                    path: path.to_owned(),
-                    key: String::new(),
-                    reason: err.to_string()
-                }
-            );
-            Document::default()
+            eprintln!("{err}");
+            Arc::default()
         }
     };
-    let document = Arc::new(document);
     cache.insert(path.to_owned(), (stamp, document.clone()));
     document
 }
@@ -233,13 +274,7 @@ impl Layers {
     ) -> Result<(Self, bool), String> {
         fn read(root: &Path) -> Result<Option<Arc<Document>>, String> {
             let path = crate::config_overrides::config_path_in(&root.join(".cortexkit"));
-            match std::fs::read_to_string(&path) {
-                Ok(raw) => parse(&path, &raw)
-                    .map(|doc| Some(Arc::new(doc)))
-                    .map_err(|err| err.to_string()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(err) => Err(format!("{}: {err}", path.display())),
-            }
+            read_document(&path)
         }
         let mut project = None;
         for root in projects {
@@ -343,7 +378,7 @@ mod tests {
 
     fn write(root: &Path, raw: &str) -> PathBuf {
         static REVISION: AtomicU64 = AtomicU64::new(0);
-        let path = root.join(".cortexkit/prefrontal-routing.jsonc");
+        let path = root.join(".cortexkit/striatum.jsonc");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, raw).unwrap();
         std::fs::File::open(&path)
@@ -359,66 +394,81 @@ mod tests {
     }
 
     #[test]
-    fn striatum_tier_files_prefer_primary_fall_back_and_never_merge() {
-        let global = crate::config_overrides::LiveConfig::default();
-        for workspace in [false, true] {
-            for (primary_exists, previous_exists) in
-                [(false, false), (true, false), (false, true), (true, true)]
-            {
-                let dir = cortexkit_test_support::ScratchDir::new("striatum-tier-settings");
-                let root = dir.join("root");
-                std::fs::create_dir_all(root.join(".cortexkit")).unwrap();
-                if primary_exists {
-                    std::fs::write(
-                        root.join(".cortexkit/striatum.jsonc"),
-                        r#"{"models":{"p/m":{"service_tier":"fast"}}}"#,
-                    )
-                    .unwrap();
-                }
-                if previous_exists {
-                    write(
-                        &root,
-                        r#"{"models":{"p/other":{"service_tier":"ultrafast"}}}"#,
-                    );
-                }
-                let projects = if workspace {
-                    Vec::new()
-                } else {
-                    vec![root.clone()]
-                };
-                let workspace_root = workspace.then_some(root.as_path());
-                let (layers, applied) = Layers::from_roots(&projects, workspace_root).unwrap();
-                assert_eq!(applied, primary_exists || previous_exists);
-                let cached = Layers::new(
-                    (!workspace).then(|| root.to_str().unwrap()),
-                    workspace.then(|| root.to_str().unwrap()),
-                );
-                for layers in [layers, cached] {
-                    assert_eq!(
-                        layers.resolve(&global, "worker", "p", "m", None),
-                        primary_exists.then_some(ServiceTier::Fast)
-                    );
-                    assert_eq!(
-                        layers.resolve(&global, "worker", "p", "other", None),
-                        (!primary_exists && previous_exists).then_some(ServiceTier::Ultrafast)
-                    );
-                }
+    fn missing_tier_file_reports_once_after_each_successful_load() {
+        let dir = cortexkit_test_support::ScratchDir::new("missing-tier-reports");
+        let root = dir.join("root");
+        let path = root.join(".cortexkit/striatum.jsonc");
+        let mut reports = Vec::new();
+        assert!(
+            read_document_with_reporter(&path, |error| reports.push(error.to_owned()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reports.is_empty(),
+            "an initially absent tier file is optional"
+        );
+
+        for expected_reports in 1..=2 {
+            write(&root, r#"{"providers":{"p":{"service_tier":"fast"}}}"#);
+            let held = read_document(&path).unwrap().unwrap();
+            std::fs::remove_file(&path).unwrap();
+            for _ in 0..3 {
+                let next =
+                    read_document_with_reporter(&path, |error| reports.push(error.to_owned()))
+                        .unwrap()
+                        .unwrap();
+                assert!(Arc::ptr_eq(&held, &next));
             }
+            assert_eq!(reports, vec!["missing"; expected_reports]);
         }
     }
 
     #[test]
-    fn striatum_tier_primary_appearing_later_is_read_and_invalid_primary_never_falls_back() {
-        let dir = cortexkit_test_support::ScratchDir::new("striatum-tier-switch");
-        let root = dir.join("root");
-        write(&root, r#"{"models":{"p/m":{"service_tier":"fast"}}}"#);
+    fn vanished_tier_file_keeps_last_good_project_and_workspace_settings() {
         let global = crate::config_overrides::LiveConfig::default();
-        let decision =
-            || Layers::new(root.to_str(), None).resolve(&global, "worker", "p", "m", None);
-        assert_eq!(decision(), Some(ServiceTier::Fast));
-        std::fs::write(root.join(".cortexkit/striatum.jsonc"), "not json").unwrap();
-        assert_eq!(decision(), None);
-        assert!(Layers::from_roots(&[root], None).is_err());
+        for workspace in [false, true] {
+            for cached in [false, true] {
+                let dir = cortexkit_test_support::ScratchDir::new("vanished-tier-settings");
+                let root = dir.join("root");
+                let path = write(&root, r#"{"providers":{"p":{"service_tier":"fast"}}}"#);
+                let read = || {
+                    if cached {
+                        Layers::new(
+                            (!workspace).then(|| root.to_str().unwrap()),
+                            workspace.then(|| root.to_str().unwrap()),
+                        )
+                    } else {
+                        let projects = if workspace {
+                            Vec::new()
+                        } else {
+                            vec![root.clone()]
+                        };
+                        let (layers, applied) =
+                            Layers::from_roots(&projects, workspace.then_some(root.as_path()))
+                                .unwrap();
+                        assert!(applied);
+                        layers
+                    }
+                };
+                assert_eq!(
+                    read().resolve(&global, "worker", "p", "m", None),
+                    Some(ServiceTier::Fast)
+                );
+                std::fs::remove_file(&path).unwrap();
+                for _ in 0..3 {
+                    assert_eq!(
+                        read().resolve(&global, "worker", "p", "m", None),
+                        Some(ServiceTier::Fast)
+                    );
+                }
+                write(&root, r#"{"providers":{"p":{"service_tier":"ultrafast"}}}"#);
+                assert_eq!(
+                    read().resolve(&global, "worker", "p", "m", None),
+                    Some(ServiceTier::Ultrafast)
+                );
+            }
+        }
     }
 
     #[test]

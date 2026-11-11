@@ -1003,7 +1003,7 @@ async fn service_tier_project_settings_change_the_next_routing_decision() {
         config["consumers"]["sidekick"] = json!({"owner":"tier-owner","mode":"demand"})
     });
     let project = harness.store_path().parent().unwrap().join("tier-project");
-    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    let path = project.join(".cortexkit/striatum.jsonc");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
@@ -1038,7 +1038,7 @@ async fn service_tier_project_settings_reach_legacy_pinned_selections() {
         .parent()
         .unwrap()
         .join("legacy-tier-project");
-    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    let path = project.join(".cortexkit/striatum.jsonc");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(
         &path,
@@ -1129,7 +1129,7 @@ async fn service_tier_project_settings_reach_legacy_panel_members() {
         .parent()
         .unwrap()
         .join("panel-tier-project");
-    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    let path = project.join(".cortexkit/striatum.jsonc");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, r#"{"consumers":{"athena":{"service_tier":"fast"}}}"#).unwrap();
     let excluded: Vec<_> = harness
@@ -1427,7 +1427,7 @@ async fn replay_tier_consumer_precedence() {
     let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
     let (harness, _) = setup(&["pro_500"], true, true);
     let project = harness.store_path().parent().unwrap().join("tier-project");
-    let path = project.join(".cortexkit/prefrontal-routing.jsonc");
+    let path = project.join(".cortexkit/striatum.jsonc");
     let settings = json!({"consumers": {
         "mason": {"service_tier":"standard"},
         "lab_planner": {"service_tier":"fast"},

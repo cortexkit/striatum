@@ -21,7 +21,7 @@ impl HarnessRig {
         for row in [cheap, paid] {
             store.upsert_fact(&row, FactSource::Override).unwrap();
         }
-        let config = rig.dir.join("prefrontal-routing.jsonc");
+        let config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &config,
             json!({"model_routing": {"substrates": mapping, "models": {

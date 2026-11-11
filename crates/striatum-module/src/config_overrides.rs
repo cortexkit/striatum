@@ -29,8 +29,6 @@ use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
-const PREVIOUS_CONFIG_BASENAME: &str = "prefrontal-routing.jsonc";
-const OLD_CONFIG_BASENAME: &str = "alfonso-routing.jsonc";
 pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
@@ -124,15 +122,9 @@ fn route_pricing(section: &ModelRoutingSection) -> RoutePricing {
 
 type FileStamp = Option<(SystemTime, u64)>;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ConfigStamp {
-    current: FileStamp,
-    old: FileStamp,
-}
-
 struct LiveConfigCache {
-    stamp: ConfigStamp,
-    pending: Option<(ConfigStamp, Instant)>,
+    stamp: FileStamp,
+    pending: Option<(FileStamp, Instant)>,
     active: Arc<LiveConfig>,
 }
 
@@ -301,34 +293,6 @@ fn file_stamp(path: &Path) -> Result<FileStamp, String> {
     }
 }
 
-fn old_config_path(path: &Path) -> Option<PathBuf> {
-    matches!(
-        path.file_name()?.to_str()?,
-        "striatum.jsonc" | PREVIOUS_CONFIG_BASENAME
-    )
-    .then(|| path.with_file_name(OLD_CONFIG_BASENAME))
-}
-
-fn reject_old_config(path: &Path, stamp: ConfigStamp) -> Result<(), String> {
-    if stamp.old.is_some() {
-        let old = old_config_path(path).expect("old-name stamp has an old-name path");
-        return Err(if stamp.current.is_some() {
-            format!(
-                "config_renamed: delete {}; routing reads {}",
-                old.display(),
-                path.display()
-            )
-        } else {
-            format!(
-                "config_renamed: move {} to {}",
-                old.display(),
-                path.display()
-            )
-        });
-    }
-    Ok(())
-}
-
 fn parse_config(document: &str) -> Result<RoutingConfigFile, String> {
     parse_config_with_reporter(document, |warning| {
         crate::warn_operator(format!("[striatum] {warning}"));
@@ -445,16 +409,7 @@ fn live_config_at_with_reporter(
     mut report_rejection: impl FnMut(&str),
 ) -> Result<Arc<LiveConfig>, String> {
     let mut caches = live_configs().lock().unwrap();
-    let stamp: Result<ConfigStamp, String> = (|| {
-        Ok(ConfigStamp {
-            current: file_stamp(path)?,
-            old: old_config_path(path)
-                .map(|old| file_stamp(&old))
-                .transpose()?
-                .flatten(),
-        })
-    })();
-    let stamp = match stamp {
+    let stamp = match file_stamp(path) {
         Ok(stamp) => stamp,
         Err(error) => {
             let Some(cache) = caches.get(path) else {
@@ -481,10 +436,17 @@ fn live_config_at_with_reporter(
         }
     }
     let next = (|| {
-        reject_old_config(path, stamp)?;
         let document = match std::fs::read_to_string(path) {
             Ok(document) => Some(document),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if caches
+                    .get(path)
+                    .is_some_and(|cache| cache.active.document.is_some())
+                {
+                    return Err("missing".to_owned());
+                }
+                None
+            }
             Err(error) => return Err(error.to_string()),
         };
         let config = match &document {
@@ -936,8 +898,8 @@ mod live_snapshot_tests {
             &published,
             &live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap()
         ));
-        let defaults = live_config_at(&path, now + RELOAD_DEBOUNCE * 2).unwrap();
-        assert!(defaults.operator_policy().subscription.is_empty());
+        let retained = live_config_at(&path, now + RELOAD_DEBOUNCE * 2).unwrap();
+        assert!(Arc::ptr_eq(&published, &retained));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
@@ -1485,51 +1447,13 @@ fn config_home_path(relative: &str) -> PathBuf {
 /// The config-home path for this module's own config file.
 pub fn config_path() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    // Pin the startup choice so every reader and refresh loop uses the same
-    // file. When using the fallback, a new striatum.jsonc needs a restart.
-    PATH.get_or_init(|| {
-        let primary = config_home_path(CONFIG_RELATIVE_PATH);
-        config_path_in(primary.parent().expect("config path has a parent"))
-    })
-    .clone()
+    PATH.get_or_init(|| config_home_path(CONFIG_RELATIVE_PATH))
+        .clone()
 }
 
-/// Choose one settings document, never merging the old and new names. Tier
-/// roots are discovered on demand, so report each migration notice only once.
+/// The routing settings document within a global or tier settings directory.
 pub(crate) fn config_path_in(directory: &Path) -> PathBuf {
-    static REPORTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    config_path_in_with_reporter(directory, |message| {
-        if REPORTED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap()
-            .insert(message.to_owned())
-        {
-            eprintln!("{message}");
-        }
-    })
-}
-
-fn config_path_in_with_reporter(directory: &Path, mut report: impl FnMut(&str)) -> PathBuf {
-    let primary = directory.join("striatum.jsonc");
-    let previous = directory.join(PREVIOUS_CONFIG_BASENAME);
-    if previous.exists() {
-        if primary.exists() {
-            report(&format!(
-                "[striatum] config_renamed: {} is ignored; routing reads {}",
-                previous.display(),
-                primary.display()
-            ));
-        } else {
-            report(&format!(
-                "[striatum] config_renamed: routing reads {}; rename it to {}",
-                previous.display(),
-                primary.display()
-            ));
-            return previous;
-        }
-    }
-    primary
+    directory.join("striatum.jsonc")
 }
 
 /// Parse `provider/model` or `provider/model/variant`.
@@ -2257,7 +2181,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let db_path = root.join("store.sqlite");
-        let config_path = root.join("prefrontal-routing.jsonc");
+        let config_path = root.join("striatum.jsonc");
         let descriptor = dev_descriptor(label, db_path.to_string_lossy().into_owned());
         (
             root,
@@ -2649,7 +2573,7 @@ mod tests {
         );
 
         // File with the key → returns clamped value.
-        let config_path = dir.join("prefrontal-routing.jsonc");
+        let config_path = dir.join("striatum.jsonc");
         crate::test_config::write(
             &config_path,
             r#"{ "model_routing": { "min_best_effort_adequacy": 0.35 } }"#,
@@ -2696,7 +2620,7 @@ mod tests {
             Vec::<String>::new()
         );
 
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         crate::test_config::write(
             &path,
             r#"{"model_routing":{"providers_without_prompt_cache":["ollama-cloud"," custom ","ollama-cloud"]}}"#,
@@ -2730,7 +2654,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2824,7 +2748,7 @@ mod tests {
             ModelRoutingPolicyInput::default()
         );
 
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2911,7 +2835,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         let set_mtime = |seconds| {
             let file = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
             file.set_times(
@@ -2987,7 +2911,7 @@ mod tests {
         let dir = cortexkit_test_support::scratch_root()
             .join(format!("striatum-elo-live-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("prefrontal-routing.jsonc");
+        let path = dir.join("striatum.jsonc");
         let mut facts = model_facts_seed().to_vec();
         let sol = |facts: &[ModelFact]| {
             facts
@@ -3246,8 +3170,11 @@ mod route_pricing_tests {
             Some(40.0)
         );
 
-        // Removing the file withdraws every multiplier and reserve.
+        // Removal keeps the published pricing; only an explicit empty document
+        // withdraws every multiplier and reserve.
         std::fs::remove_file(&path).unwrap();
+        assert!(Arc::ptr_eq(&next, &settle_live_config(&path)));
+        crate::test_config::write_raw(&path, "{}").unwrap();
         assert_eq!(
             settle_live_config(&path).pricing(),
             &RoutePricing::default()

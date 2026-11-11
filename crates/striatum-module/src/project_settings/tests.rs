@@ -69,7 +69,7 @@ pub(crate) fn root() -> PathBuf {
 
 pub(crate) fn write(root: &Path, body: &str) {
     std::fs::create_dir_all(root.join(".cortexkit")).unwrap();
-    std::fs::write(root.join(".cortexkit/prefrontal-routing.jsonc"), body).unwrap();
+    std::fs::write(root.join(".cortexkit/striatum.jsonc"), body).unwrap();
 }
 
 pub(crate) fn census(projects: &[PathBuf], workspace: Option<&Path>) -> Value {
@@ -112,6 +112,29 @@ async fn applies_project_over_workspace_with_both_contributing() {
     assert_eq!(status, ProjectSettings::Applied);
     assert_eq!(tier(&layers, "m"), Some(Fast));
     assert_eq!(tier(&layers, "other"), Some(Ultrafast));
+}
+
+#[tokio::test]
+async fn vanished_files_keep_project_and_workspace_layers_applied() {
+    use cortexkit_role_routing::service_tier::ServiceTier::*;
+    let project = root();
+    let workspace = root();
+    write(&project, r#"{"models":{"p/m":{"service_tier":"fast"}}}"#);
+    write(
+        &workspace,
+        r#"{"providers":{"p":{"service_tier":"ultrafast"}}}"#,
+    );
+    let resolver = Resolver::new(Fake::new(census(&[project.clone()], Some(&workspace))));
+    assert_eq!(resolver.layers(ID, 1).await.1, ProjectSettings::Applied);
+    for root in [&project, &workspace] {
+        std::fs::remove_file(root.join(".cortexkit/striatum.jsonc")).unwrap();
+    }
+    for now in [2, 3, 4] {
+        let (layers, status) = resolver.layers(ID, now).await;
+        assert_eq!(status, ProjectSettings::Applied);
+        assert_eq!(tier(&layers, "m"), Some(Fast));
+        assert_eq!(tier(&layers, "other"), Some(Ultrafast));
+    }
 }
 
 #[tokio::test]
@@ -185,7 +208,7 @@ async fn malformed_file_is_unresolved_without_workspace_tiers() {
 #[tokio::test]
 async fn unreadable_file_is_unresolved() {
     let project = root();
-    std::fs::create_dir_all(project.join(".cortexkit/prefrontal-routing.jsonc")).unwrap();
+    std::fs::create_dir_all(project.join(".cortexkit/striatum.jsonc")).unwrap();
     let status = Resolver::new(Fake::new(census(&[project], None)))
         .layers(ID, 1)
         .await

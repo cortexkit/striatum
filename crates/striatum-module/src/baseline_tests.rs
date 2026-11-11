@@ -94,7 +94,7 @@ impl World {
             ))
             .expect("open the routing store"),
         );
-        let config_path = dir.join("prefrontal-routing.jsonc");
+        let config_path = dir.join("striatum.jsonc");
         let mut fixture_config: Value = serde_json::from_str(
             &crate::config_convert::convert(config).expect("the fixture config converts"),
         )

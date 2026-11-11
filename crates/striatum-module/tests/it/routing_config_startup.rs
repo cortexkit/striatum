@@ -66,58 +66,12 @@ fn stderr(output: Output) -> String {
     String::from_utf8(output.stderr).unwrap()
 }
 
-fn renamed_refusal(xdg: bool) {
-    for both in [false, true] {
-        let home = Home::new();
-        let directory = home.config_dir(xdg);
-        let old = directory.join("alfonso-routing.jsonc");
-        let new = directory.join(if both {
-            "prefrontal-routing.jsonc"
-        } else {
-            "striatum.jsonc"
-        });
-        test_config::write_raw(&old, "old settings must never be read").unwrap();
-        if both {
-            test_config::write_raw(&new, "{}").unwrap();
-        }
-        let message = stderr(home.run(xdg));
-        assert!(message.contains("config_renamed"), "{message}");
-        assert!(
-            message.contains(&old.display().to_string())
-                && message.contains(&new.display().to_string()),
-            "{message}"
-        );
-        assert!(
-            message.contains(if both { "delete" } else { "move" }),
-            "{message}"
-        );
-        assert!(
-            !message.contains("missing-connection-file"),
-            "configuration must refuse before daemon connection: {message}"
-        );
-    }
-}
-
-#[test]
-fn config_renamed_resolves_xdg_paths_at_startup() {
-    renamed_refusal(true);
-}
-
-#[test]
-fn config_renamed_resolves_home_paths_at_startup() {
-    renamed_refusal(false);
-}
-
 fn invalid_startup(document: &str, token: &str) {
     let home = Home::new();
-    test_config::write_raw(
-        home.config_dir(true).join("prefrontal-routing.jsonc"),
-        document,
-    )
-    .unwrap();
+    test_config::write_raw(home.config_dir(true).join("striatum.jsonc"), document).unwrap();
     let message = stderr(home.run(true));
     assert!(message.contains(token), "{message}");
-    assert!(message.contains("prefrontal-routing.jsonc"), "{message}");
+    assert!(message.contains("striatum.jsonc"), "{message}");
     assert!(!message.contains("missing-connection-file"), "{message}");
 }
 
@@ -134,11 +88,10 @@ fn old_explicit_only_providers_refuses_startup_with_converter() {
 }
 
 #[test]
-fn absent_routing_file_with_xdg_does_not_read_home_legacy_file() {
+fn absent_routing_file_with_xdg_does_not_read_home_file() {
     let home = Home::new();
-    test_config::write_raw(home.config_dir(false).join("alfonso-routing.jsonc"), "{}").unwrap();
+    test_config::write_raw(home.config_dir(false).join("striatum.jsonc"), "not json").unwrap();
     let message = stderr(home.run(true));
-    assert!(!message.contains("config_renamed"), "{message}");
     assert!(
         message.contains(Path::new("missing-connection-file").to_str().unwrap()),
         "valid empty policy must reach daemon connection: {message}"
@@ -146,84 +99,42 @@ fn absent_routing_file_with_xdg_does_not_read_home_legacy_file() {
 }
 
 #[test]
-fn striatum_startup_and_check_config_name_the_chosen_file() {
+fn striatum_startup_and_check_config_name_the_settings_file() {
     for xdg in [false, true] {
-        for (primary_exists, previous_exists) in
-            [(false, false), (true, false), (false, true), (true, true)]
-        {
+        for primary_exists in [false, true] {
             let home = Home::new();
             let directory = home.config_dir(xdg);
             let primary = directory.join("striatum.jsonc");
-            let previous = directory.join("prefrontal-routing.jsonc");
             if primary_exists {
                 test_config::write_raw(&primary, "{}").unwrap();
             }
-            if previous_exists {
-                test_config::write_raw(&previous, if primary_exists { "not json" } else { "{}" })
-                    .unwrap();
-            }
-            let chosen = if primary_exists || !previous_exists {
-                &primary
-            } else {
-                &previous
-            };
             let startup = stderr(home.run(xdg));
             assert!(startup.contains("missing-connection-file"), "{startup}");
             let output = home.run_with_args(xdg, &["--check-config"]);
             let report = String::from_utf8(output.stderr).unwrap();
             assert!(output.status.success(), "{report}");
             assert!(
-                report.contains(&format!("config check passed: {}", chosen.display())),
+                report.contains(&format!("config check passed: {}", primary.display())),
                 "{report}"
             );
-            for message in [&startup, &report] {
-                let notices: Vec<_> = message
-                    .lines()
-                    .filter(|line| line.starts_with("[striatum] config_renamed:"))
-                    .collect();
-                assert_eq!(notices.len(), usize::from(previous_exists), "{message}");
-                if previous_exists {
-                    assert!(
-                        notices[0].contains(&previous.display().to_string())
-                            && notices[0].contains(&primary.display().to_string()),
-                        "{message}"
-                    );
-                    assert!(
-                        notices[0].contains(if primary_exists {
-                            "is ignored"
-                        } else {
-                            "rename it to"
-                        }),
-                        "{message}"
-                    );
-                }
-            }
         }
     }
 }
 
 #[test]
-fn striatum_invalid_chosen_file_refuses_startup_and_check_config_without_falling_back() {
-    for primary_exists in [false, true] {
-        let home = Home::new();
-        let directory = home.config_dir(true);
-        let primary = directory.join("striatum.jsonc");
-        let previous = directory.join("prefrontal-routing.jsonc");
-        test_config::write_raw(&previous, if primary_exists { "{}" } else { "not json" }).unwrap();
-        if primary_exists {
-            test_config::write_raw(&primary, "not json").unwrap();
-        }
-        let chosen = if primary_exists { &primary } else { &previous };
-        for output in [
-            home.run(true),
-            home.run_with_args(true, &["--check-config"]),
-        ] {
-            let message = stderr(output);
-            assert!(
-                message.contains(&format!("invalid config in {}", chosen.display())),
-                "{message}"
-            );
-            assert!(!message.contains("missing-connection-file"), "{message}");
-        }
+fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
+    let home = Home::new();
+    let primary = home.config_dir(true).join("striatum.jsonc");
+    test_config::write_raw(&primary, "not json").unwrap();
+    for output in [
+        home.run(true),
+        home.run_with_args(true, &["--check-config"]),
+    ] {
+        let message = stderr(output);
+        assert!(
+            message.contains(&format!("invalid config in {}", primary.display())),
+            "{message}"
+        );
+        assert!(!message.contains("missing-connection-file"), "{message}");
     }
 }

@@ -1,5 +1,4 @@
 use super::*;
-use cortexkit_role_routing::service_tier::ServiceTier;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 struct Rig {
@@ -18,7 +17,7 @@ impl Rig {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         Self {
-            path: dir.join("prefrontal-routing.jsonc"),
+            path: dir.join("striatum.jsonc"),
             dir,
             revision: 0,
         }
@@ -44,110 +43,6 @@ impl Drop for Rig {
 }
 
 const GOOD: &str = r#"{"model_routing":{"exclude":{"all":["anthropic"]},"panels":{"audit":{"topK":1,"by":"iq"}},"pins":{"synthesizer":{"model":"openai/gpt-6","variant":"high"}}}}"#;
-
-#[test]
-fn striatum_global_config_prefers_primary_falls_back_and_never_merges() {
-    for (primary_exists, previous_exists) in
-        [(false, false), (true, false), (false, true), (true, true)]
-    {
-        let dir = cortexkit_test_support::ScratchDir::new("striatum-global-config");
-        let primary = dir.join("striatum.jsonc");
-        let previous = dir.join("prefrontal-routing.jsonc");
-        if primary_exists {
-            crate::test_config::write_raw(
-                &primary,
-                r#"{"consumers":{"head":{"service_tier":"fast"}}}"#,
-            )
-            .unwrap();
-        }
-        if previous_exists {
-            crate::test_config::write_raw(
-                &previous,
-                r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
-            )
-            .unwrap();
-        }
-        let mut reports = Vec::new();
-        let chosen = config_path_in_with_reporter(primary.parent().unwrap(), |message| {
-            reports.push(message.to_owned())
-        });
-        assert_eq!(
-            chosen,
-            if primary_exists || !previous_exists {
-                primary.clone()
-            } else {
-                previous.clone()
-            }
-        );
-        let config = live_config_at(&chosen, Instant::now()).unwrap();
-        assert_eq!(
-            config.service_tier("head", "p", "m"),
-            primary_exists.then_some(ServiceTier::Fast)
-        );
-        assert_eq!(
-            config.service_tier("sidekick", "p", "m"),
-            (!primary_exists && previous_exists).then_some(ServiceTier::Ultrafast)
-        );
-        assert_eq!(reports.len(), usize::from(previous_exists));
-        if previous_exists {
-            let report = &reports[0];
-            assert!(report.starts_with("[striatum] config_renamed:"), "{report}");
-            assert!(
-                report.contains(&previous.display().to_string())
-                    && report.contains(&primary.display().to_string()),
-                "{report}"
-            );
-            assert!(
-                report.contains(if primary_exists {
-                    "is ignored"
-                } else {
-                    "rename it to"
-                }),
-                "{report}"
-            );
-        }
-        live_configs().lock().unwrap().remove(&chosen);
-    }
-}
-
-#[test]
-fn striatum_fallback_reload_reads_selected_file() {
-    let mut rig = Rig::new();
-    rig.write(GOOD);
-    let chosen = config_path_in(&rig.dir);
-    assert_eq!(chosen, rig.path);
-    let now = Instant::now();
-    live_config_at(&chosen, now).unwrap();
-    crate::test_config::write_raw(rig.dir.join("striatum.jsonc"), "not json").unwrap();
-    rig.write(r#"{"model_routing":{"exclude":{"all":["xai"]}}}"#);
-    live_config_at(&chosen, now).unwrap();
-    let updated = live_config_at(&chosen, now + RELOAD_DEBOUNCE).unwrap();
-    assert_eq!(updated.operator_policy().exclude, ["xai"]);
-}
-
-#[test]
-fn striatum_still_refuses_alfonso_legacy_file() {
-    for primary_exists in [false, true] {
-        let dir = cortexkit_test_support::ScratchDir::new("striatum-alfonso-legacy");
-        let primary = dir.join("striatum.jsonc");
-        let legacy = dir.join("alfonso-routing.jsonc");
-        if primary_exists {
-            crate::test_config::write_raw(&primary, "{}").unwrap();
-        }
-        crate::test_config::write_raw(&legacy, "not json").unwrap();
-        let error = initialize_config(&primary).unwrap_err();
-        assert!(
-            error.contains("config_renamed")
-                && error.contains(&legacy.display().to_string())
-                && error.contains(&primary.display().to_string()),
-            "{error}"
-        );
-        assert!(
-            error.contains(if primary_exists { "delete" } else { "move" }),
-            "{error}"
-        );
-    }
-}
 
 fn first_load_refuses(document: &str, message: &str) {
     let mut rig = Rig::new();
@@ -805,6 +700,43 @@ fn absent_file_and_missing_groups_are_empty() {
 }
 
 #[test]
+fn vanished_file_keeps_last_good_pin_only_policy_and_reports_once() {
+    let mut rig = Rig::new();
+    rig.write(r#"{"providers":{"p":{"pin_only":true}}}"#);
+    let now = Instant::now();
+    let held = live_config_at(&rig.path, now).unwrap();
+    assert!(!held.route_allowed("mason", "p/model", false));
+    assert!(held.route_allowed("mason", "p/model", true));
+    std::fs::remove_file(&rig.path).unwrap();
+
+    let mut reports = Vec::new();
+    for elapsed in [
+        Duration::ZERO,
+        RELOAD_DEBOUNCE / 2,
+        RELOAD_DEBOUNCE,
+        RELOAD_DEBOUNCE * 2,
+    ] {
+        let next = live_config_at_with_reporter(&rig.path, now + elapsed, |error| {
+            reports.push(error.to_owned());
+        })
+        .unwrap();
+        assert!(
+            Arc::ptr_eq(&held, &next),
+            "a missing file must keep the last good snapshot"
+        );
+        assert!(!next.route_allowed("mason", "p/model", false));
+        assert!(next.route_allowed("mason", "p/model", true));
+    }
+    assert_eq!(reports, ["missing"]);
+
+    rig.write(r#"{"providers":{"p":{"not_for":["mason"]}}}"#);
+    live_config_at(&rig.path, now + RELOAD_DEBOUNCE * 3).unwrap();
+    let repaired = live_config_at(&rig.path, now + RELOAD_DEBOUNCE * 4).unwrap();
+    assert!(!Arc::ptr_eq(&held, &repaired));
+    assert!(!repaired.route_allowed("mason", "p/model", true));
+}
+
+#[test]
 fn valid_panel_boundaries_all_classes_and_strict_pins() {
     let mut rig = Rig::new();
     rig.write(
@@ -837,58 +769,6 @@ fn valid_panel_boundaries_all_classes_and_strict_pins() {
     assert_eq!(
         active.slot_pin("synthesizer").unwrap().variant.as_deref(),
         Some("high")
-    );
-}
-
-#[test]
-fn renamed_first_load_refuses_old_only_and_both_files() {
-    for both in [false, true] {
-        let mut rig = Rig::new();
-        if both {
-            rig.write(GOOD);
-        }
-        let old = rig.path.with_file_name(OLD_CONFIG_BASENAME);
-        crate::test_config::write(&old, "invalid settings are never read").unwrap();
-        let error = initialize_config(&rig.path).unwrap_err();
-        assert!(error.contains("config_renamed"), "{error}");
-        assert!(
-            error.contains(&old.display().to_string())
-                && error.contains(&rig.path.display().to_string()),
-            "{error}"
-        );
-        assert!(
-            error.contains(if both { "delete" } else { "move" }),
-            "{error}"
-        );
-    }
-}
-
-#[test]
-fn renamed_reload_keeps_last_good_and_reports_once_per_old_name_change() {
-    let mut rig = Rig::new();
-    rig.write(GOOD);
-    let held = live_config(&rig.path);
-    let old = rig.path.with_file_name(OLD_CONFIG_BASENAME);
-    let mut reports = Vec::new();
-    let now = Instant::now();
-    for edit in 0..2 {
-        crate::test_config::write(&old, "x".repeat(edit + 1)).unwrap();
-        for tick in 0..3 {
-            let next = live_config_at_with_reporter(
-                &rig.path,
-                now + RELOAD_DEBOUNCE * (edit as u32 * 3 + tick),
-                |error| reports.push(error.to_owned()),
-            )
-            .unwrap();
-            assert!(Arc::ptr_eq(&held, &next));
-        }
-        assert_eq!(reports.len(), edit + 1);
-        assert!(reports[edit].contains("config_renamed"));
-    }
-    std::fs::remove_file(old).unwrap();
-    assert_eq!(
-        settle_live_config(&rig.path).operator_policy().exclude,
-        ["anthropic"]
     );
 }
 
