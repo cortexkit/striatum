@@ -233,7 +233,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         .v1_admission(&principal, &request.admission_id)
         .map_err(store_unavailable)?
     {
-        return standing_answer(first, &body_json);
+        return replay_admission(first, &body_json, &request, &authority, deps);
     }
     let mut bound_tier = None;
     let mut engine_decision = false;
@@ -412,7 +412,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             now_ms() as i64,
         )
         .map_err(store_unavailable)?;
-    standing_answer(standing, &body_json)
+    replay_admission(standing, &body_json, &request, &authority, deps)
 }
 
 fn continue_account(
@@ -480,6 +480,41 @@ fn standing_answer(first: V1Recorded, body_json: &str) -> Result<Value, Refusal>
     }
     serde_json::from_str(&first.answer_json)
         .map_err(|error| store_unavailable(format!("stored admission answer undecodable: {error}")))
+}
+
+fn replay_admission(
+    first: V1Recorded,
+    body_json: &str,
+    request: &AccountForRequest,
+    authority: &AccountCaller<'_>,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    let original = standing_answer(first, body_json)?;
+    if request.mode().as_str() != "admit" {
+        return Ok(original);
+    }
+    let current = deps
+        .store
+        .account_transaction(|tx| {
+            let id = authority.admission_key(&request.admission_id);
+            if !tx
+                .admission(&authority.principal, &id)?
+                .is_some_and(|row| row.state == "started")
+            {
+                return Ok(None);
+            }
+            tx.latest_used_continuation(&authority.principal, &id)
+        })
+        .map_err(store_unavailable)?;
+    let Some(current) = current else {
+        return Ok(original);
+    };
+    // Keep the public admission id while returning the serving decision and pin.
+    let mut result: Value = serde_json::from_str(&current.reply_json).map_err(store_unavailable)?;
+    result["admission"]["state"] = json!(current.state);
+    let mut request = request.clone();
+    request.decision_id = Some(current.decision_id);
+    admission_answer(&result, &request)
 }
 
 /// The allocator's answer in v1 shape: times in Unix milliseconds, the pin's

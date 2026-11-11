@@ -85,7 +85,132 @@ impl AccountTx<'_> {
         ).map_err(err)?;
         self.conn.execute(
             "UPDATE account_continue SET used_at_ms=?2 WHERE decision_id=?1 AND used_at_ms IS NULL AND released_at_ms IS NULL", params![decision,now],
+        ).map_err(err)?;
+        // Once a successor serves, competing offers from its predecessor cannot serve.
+        let siblings: Vec<(String, String)> = self.conn.prepare(
+            "SELECT c.principal,c.reservation_id FROM account_continue c JOIN account_continue used
+             ON c.principal=used.principal AND c.admission_id=used.admission_id AND c.run_id=used.run_id
+             AND c.previous_decision_id=used.previous_decision_id
+             WHERE used.decision_id=?1 AND used.used_at_ms IS NOT NULL
+             AND c.used_at_ms IS NULL AND c.released_at_ms IS NULL AND c.reservation_id IS NOT NULL",
+        ).map_err(err)?.query_map([decision], |row| Ok((row.get(0)?,row.get(1)?)))
+            .map_err(err)?.collect::<rusqlite::Result<_>>().map_err(err)?;
+        for (principal, reservation) in siblings {
+            self.release_continued_reservation(&principal, &reservation, now)?;
+        }
+        Ok(())
+    }
+
+    /// Observations keep the original admission identity even after the account moves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn use_observed_continuation(
+        &self,
+        principal: &str,
+        admission: &str,
+        run: &str,
+        account: &str,
+        credential: Option<&str>,
+        now: i64,
+    ) -> RouteStateResult<bool> {
+        let decision: Option<String> = self.conn.query_row(
+            "SELECT c.decision_id FROM account_continue c
+             JOIN account_admission original ON original.principal=c.principal AND original.admission_id=c.admission_id
+             JOIN account_admission reservation ON reservation.principal=c.principal AND reservation.admission_id=c.reservation_id
+             WHERE c.principal=?1 AND c.admission_id=?2 AND c.run_id=?3
+             AND original.state='started' AND original.run_id=?3
+             AND reservation.account_id=?4 AND (?5 IS NULL OR reservation.credential_id=?5)
+             AND c.used_at_ms IS NULL AND c.released_at_ms IS NULL AND c.valid_until_ms>?6
+             AND NOT EXISTS(SELECT 1 FROM account_continue successor
+                 WHERE successor.principal=c.principal AND successor.admission_id=c.admission_id
+                 AND successor.run_id=c.run_id AND successor.previous_decision_id=c.previous_decision_id
+                 AND successor.used_at_ms IS NOT NULL)
+             ORDER BY c.rowid DESC LIMIT 1",
+            params![principal,admission,run,account,credential,now], |row| row.get(0),
+        ).optional().map_err(err)?;
+        let Some(decision) = decision else {
+            return Ok(false);
+        };
+        self.use_continuation(&decision, now)?;
+        Ok(true)
+    }
+
+    pub fn latest_used_continuation(
+        &self,
+        principal: &str,
+        admission: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        let reservation: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT reservation_id FROM account_continue WHERE principal=?1 AND admission_id=?2
+             AND used_at_ms IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                params![principal, admission],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        reservation
+            .map(|id| self.admission(principal, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    fn release_continued_reservation(
+        &self,
+        principal: &str,
+        reservation: &str,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        if let Some(row) = self.admission(principal, reservation)? {
+            self.mark_admission_released(principal, reservation, now)?;
+            // Sibling reservations can share a pin with the successor that started.
+            let serving: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM account_admission WHERE pin_id=?1 AND state='started')",
+                [&row.pin_id], |row| row.get(0),
+            ).map_err(err)?;
+            if !serving {
+                self.end_lease(&row.pin_id, now)?;
+            }
+        }
+        self.conn.execute(
+            "UPDATE account_continue SET released_at_ms=?3 WHERE principal=?1 AND reservation_id=?2
+             AND used_at_ms IS NULL AND released_at_ms IS NULL",
+            params![principal,reservation,now],
         ).map(|_|()).map_err(err)
+    }
+
+    /// The original admission owns every reservation accumulated by the run.
+    pub fn finish_continuations(
+        &self,
+        principal: &str,
+        admission: &str,
+        run: &str,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        let reservations: Vec<(String, bool)> = self
+            .conn
+            .prepare(
+                "SELECT reservation_id,used_at_ms IS NOT NULL FROM account_continue
+             WHERE principal=?1 AND admission_id=?2 AND run_id=?3 AND reservation_id IS NOT NULL",
+            )
+            .map_err(err)?
+            .query_map(params![principal, admission, run], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(err)?;
+        for (reservation, used) in reservations {
+            if used {
+                if let Some(row) = self.admission(principal, &reservation)? {
+                    self.mark_admission_finished(principal, &reservation, now)?;
+                    self.end_lease(&row.pin_id, now)?;
+                }
+            } else {
+                self.release_continued_reservation(principal, &reservation, now)?;
+            }
+        }
+        Ok(())
     }
 
     /// Copy selection provenance and frozen pricing; only identity and lifecycle are new.
