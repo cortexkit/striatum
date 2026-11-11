@@ -8,8 +8,8 @@ mod accounts_support;
 
 use accounts_support::*;
 use striatum_core::accounts::{
-    decide, AccountRef, AdmissionState, AdmitReason, AffinityNote, AffinityOutcome, AgeBand,
-    ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope,
+    decide, AccountRef, AccountRequest, AdmissionState, AdmitReason, AffinityNote, AffinityOutcome,
+    AgeBand, ApplicableWindow, CallerKind, CredentialRecord, Decision, ExclusionReason, FenceScope,
     GeneralWindow, HoldBasis, ImportNote, InvalidationReason, ModelFamily, ModelReach,
     OperatorOverride, OverrideNote, PoolKey, PreviousPin, PrincipalExclusion, RefusalCode,
     RequestedAccountIgnored, RequestedAccountNote, ResetTime, ScopedList, ScopedListState,
@@ -468,9 +468,7 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
 
 #[test]
 fn blocked_affinity_uses_runner_wait_cap_and_provider_ceiling() {
-    use striatum_core::accounts::{
-        decide_with_context, AccountStrategy, AllocationContext,
-    };
+    use striatum_core::accounts::{decide_with_context, AccountStrategy, AllocationContext};
 
     for proactive in [false, true] {
         let mut quota = reading(10.0, 10.0);
@@ -1263,12 +1261,19 @@ fn reserve_excludes_zero_weight_and_broca_needs_five_points() {
         }]
     );
 
+    // Below the Broca floor with nothing above it: a Broca run is admitted
+    // there anyway, marked as a below-floor admission, and the note keeps the
+    // shortfall. The floor used to refuse this run outright.
     let st = state(vec![account("acct-a", Some(reading(10.0, 95.0)))]);
     assert_eq!(admitted(&decide(&request(), &st, NOW)), "acct-a");
     let mut broca = request();
     broca.caller = CallerKind::Broca;
     let decision = decide(&broca, &st, NOW);
-    assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
+    assert_eq!(admitted(&decision), "acct-a");
+    assert_eq!(
+        decision.admission().unwrap().reason,
+        AdmitReason::ColdBelowBrocaFloor
+    );
     assert_eq!(
         exclusions(&decision, "acct-a"),
         [ExclusionReason::BelowBrocaFloor {
@@ -1276,6 +1281,94 @@ fn reserve_excludes_zero_weight_and_broca_needs_five_points() {
             spendable: 4.0
         }]
     );
+}
+
+fn broca_request() -> AccountRequest {
+    let mut broca = request();
+    broca.caller = CallerKind::Broca;
+    broca
+}
+
+#[test]
+fn broca_floor_admits_the_most_headroom_when_no_account_clears_it() {
+    // Three accounts at 100%, 95% and 96% weekly use: none has the floor's 5
+    // spendable points, but two still have real quota. The 96% account resets
+    // sooner, so its rate-based score is better; the 95% account has more
+    // points left, and headroom decides below the floor.
+    let mut sooner = reading(10.0, 96.0);
+    sooner.seven_day.as_mut().unwrap().resets_at = ResetTime::At(NOW + HOUR);
+    let st = state(vec![
+        account("acct-a", Some(reading(10.0, 100.0))),
+        account("acct-b", Some(reading(10.0, 95.0))),
+        account("acct-c", Some(sooner)),
+    ]);
+    let decision = decide(&broca_request(), &st, NOW);
+    assert_eq!(admitted(&decision), "acct-b");
+    assert_eq!(
+        decision.admission().unwrap().reason,
+        AdmitReason::ColdBelowBrocaFloor
+    );
+    // The exhausted account stays out: the reserve still excludes it.
+    assert!(
+        exclusions(&decision, "acct-a").contains(&ExclusionReason::BelowReserve {
+            windows: vec![ApplicableWindow::SevenDay]
+        })
+    );
+    assert!(decision.account_note("acct-a").unwrap().score.is_none());
+    // The 96% account was scored and would win on score alone.
+    let score = |id| decision.account_note(id).unwrap().score.unwrap();
+    assert!(score("acct-c") < score("acct-b"));
+}
+
+#[test]
+fn broca_floor_still_prefers_an_account_that_clears_it() {
+    // The 96% account resets in an hour, so it scores far better than the
+    // 90% account; the floor still sends a Broca run to the 90% account.
+    let mut sooner = reading(10.0, 96.0);
+    sooner.seven_day.as_mut().unwrap().resets_at = ResetTime::At(NOW + HOUR);
+    let st = state(vec![
+        account("acct-a", Some(reading(10.0, 90.0))),
+        account("acct-b", Some(sooner)),
+    ]);
+    assert_eq!(admitted(&decide(&request(), &st, NOW)), "acct-b");
+    let decision = decide(&broca_request(), &st, NOW);
+    assert_eq!(admitted(&decision), "acct-a");
+    assert_eq!(
+        decision.admission().unwrap().reason,
+        AdmitReason::ColdScored
+    );
+    assert_eq!(
+        exclusions(&decision, "acct-b"),
+        [ExclusionReason::BelowBrocaFloor {
+            window: GeneralWindow::SevenDay,
+            spendable: 3.0
+        }]
+    );
+    assert!(decision.account_note("acct-b").unwrap().score.is_none());
+}
+
+#[test]
+fn broca_floor_fallback_never_crosses_the_reserve() {
+    // At 99% used the 1-point reserve leaves nothing spendable: the Broca
+    // floor's fallback does not reach past it.
+    for used in [99.0, 99.5] {
+        let st = state(vec![
+            account("acct-a", Some(reading(10.0, used))),
+            account("acct-b", Some(reading(used, 10.0))),
+        ]);
+        let decision = decide(&broca_request(), &st, NOW);
+        assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
+        assert!(
+            exclusions(&decision, "acct-a").contains(&ExclusionReason::BelowReserve {
+                windows: vec![ApplicableWindow::SevenDay]
+            })
+        );
+        assert!(
+            exclusions(&decision, "acct-b").contains(&ExclusionReason::BelowReserve {
+                windows: vec![ApplicableWindow::FiveHour]
+            })
+        );
+    }
 }
 
 #[test]

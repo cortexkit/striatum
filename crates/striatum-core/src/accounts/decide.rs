@@ -158,6 +158,14 @@ impl ColdEval<'_> {
     fn eligible(&self) -> bool {
         self.hard.reasons.is_empty() && self.quota.as_ref().is_some_and(QuotaEval::eligible)
     }
+
+    fn eligible_below_broca_floor(&self) -> bool {
+        self.hard.reasons.is_empty()
+            && self
+                .quota
+                .as_ref()
+                .is_some_and(QuotaEval::eligible_below_broca_floor)
+    }
 }
 
 /// One thing that blocks a conversation's next request on its account.
@@ -1020,11 +1028,21 @@ impl<'a> Allocator<'a> {
             );
         }
 
-        // Scoring (steps 5-7) for every eligible account.
+        // The Broca floor is a preference, not a wall: accounts that clear it
+        // compete as usual, and only when none does are accounts held back by
+        // the floor alone admitted, most headroom first. A refused run fails
+        // for certain; a run on a nearly used account fails only if it reaches
+        // the limit. Every other limit still excludes.
+        let floor_fallback = !evals.iter().any(ColdEval::eligible);
+        let admissible = |eval: &ColdEval| {
+            eval.eligible() || (floor_fallback && eval.eligible_below_broca_floor())
+        };
+
+        // Scoring (steps 5-7) for every admissible account.
         let direct_opus = self.explanation.direct_opus;
-        for eval in evals.iter_mut().filter(|eval| eval.eligible()) {
-            let quota = eval.quota.as_ref().expect("eligible has quota");
-            let weight = quota.weight.expect("eligible has weight");
+        for eval in evals.iter_mut().filter(|eval| admissible(eval)) {
+            let quota = eval.quota.as_ref().expect("admissible has quota");
+            let weight = quota.weight.expect("admissible has weight");
             // An account carried by prepaid credits has its quota reading set
             // aside, so it has no observation point of its own. Its credit
             // reading is one: without it, every admission the account ever had
@@ -1085,7 +1103,7 @@ impl<'a> Allocator<'a> {
         let mut eligible: Vec<&ColdEval> = survivors
             .iter()
             .copied()
-            .filter(|eval| eval.eligible())
+            .filter(|eval| admissible(eval))
             .collect();
         if eligible.is_empty() {
             let holds: Option<Vec<Hold>> = survivors
@@ -1138,6 +1156,16 @@ impl<'a> Allocator<'a> {
             }
         }
         eligible.sort_by(|a, b| {
+            if floor_fallback {
+                // Below the floor, the most spendable points left wins first:
+                // that run is the least likely to reach its account's limit.
+                let headroom =
+                    |eval: &ColdEval| eval.quota.as_ref().map_or(0.0, QuotaEval::headroom);
+                let by_headroom = headroom(b).total_cmp(&headroom(a));
+                if by_headroom != std::cmp::Ordering::Equal {
+                    return by_headroom;
+                }
+            }
             let order = || {
                 let order = self
                     .order_index(&a.view.account_id)
@@ -1198,7 +1226,11 @@ impl<'a> Allocator<'a> {
                 .credential_id
                 .clone()
                 .expect("eligible has a record"),
-            AdmitReason::ColdScored,
+            if floor_fallback {
+                AdmitReason::ColdBelowBrocaFloor
+            } else {
+                AdmitReason::ColdScored
+            },
         );
         if let Some(requested) = &self.request.requested_account {
             let note = self.requested_account(requested, &eligible, best_score);

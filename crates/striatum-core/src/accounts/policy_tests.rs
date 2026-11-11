@@ -320,12 +320,16 @@ fn prepaid_credits_carry_work_once_the_reserve_holds_every_account() {
     let mut inputs = AllocationContext::default();
     inputs.credits.insert("b".into(), credit(true));
 
+    // Only the Broca floor holds a and b back; with no credits, the floor
+    // gives way and the account with the most points left takes the run.
     let without_credits = decide(&broca_request(), &state, NOW);
-    assert!(
-        !matches!(without_credits.outcome, Outcome::Admit(_)),
-        "the reserve holds every account: {:?}",
-        without_credits.outcome
-    );
+    match without_credits.outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "b");
+            assert_eq!(admission.reason, AdmitReason::ColdBelowBrocaFloor);
+        }
+        other => panic!("the Broca floor is a preference, not a wall: {other:?}"),
+    }
 
     let decision = decide_with_context(&broca_request(), &state, NOW, &inputs);
     match decision.outcome {
@@ -337,12 +341,15 @@ fn prepaid_credits_carry_work_once_the_reserve_holds_every_account() {
     }
 
     // Metered overage waits for real exhaustion: it never stands in for the
-    // reserve.
+    // reserve, so the run goes to b's own remaining points instead.
     inputs.credits.insert("b".into(), credit(false));
-    assert!(!matches!(
-        decide_with_context(&broca_request(), &state, NOW, &inputs).outcome,
-        Outcome::Admit(_)
-    ));
+    match decide_with_context(&broca_request(), &state, NOW, &inputs).outcome {
+        Outcome::Admit(admission) => {
+            assert_eq!(admission.account_id, "b");
+            assert_eq!(admission.reason, AdmitReason::ColdBelowBrocaFloor);
+        }
+        other => panic!("the Broca floor is a preference, not a wall: {other:?}"),
+    }
 
     // Free quota above the reserve still comes first.
     inputs.credits.insert("b".into(), credit(true));
