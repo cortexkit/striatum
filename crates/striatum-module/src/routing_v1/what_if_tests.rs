@@ -586,3 +586,267 @@ async fn what_if_rejects_invalid_params_before_snapshotting() {
         assert_eq!(body["code"], "invalid_request", "{body}");
     }
 }
+
+/// Five same-IQ routes in distinct families, with an audit policy of two IQ
+/// top seats and one random extra, so the seed decides the third seat.
+async fn panel_harness() -> (std::sync::Arc<Harness>, Route, Vec<String>) {
+    let harness = Harness::new("what-if-panels");
+    let mut catalog = fixture::catalog();
+    let original = catalog.models[0].clone();
+    catalog.models = ["claude", "gpt", "gemini", "grok", "qwen"]
+        .iter()
+        .enumerate()
+        .map(|(i, family)| {
+            let mut model = original.clone();
+            model.model = format!("panel-{i}");
+            model.family = Some((*family).into());
+            model.iq = 90;
+            model.context_window = 200_000;
+            model.max_output_tokens = 32_000;
+            model
+        })
+        .collect();
+    let routes: Vec<_> = catalog.models.iter().map(|m| m.route_key()).collect();
+    for runner in &mut catalog.runners {
+        runner.route_keys = routes.clone();
+    }
+    super::conformance_tests::install_catalog(&harness, &catalog);
+    super::conformance_tests::install_panel_families(&harness, &catalog);
+    harness.edit_config(|c| {
+        c["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":1,"extraBy":"random","floor":0});
+        c["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+    });
+    let owner = harness.bind(reserved("prefrontal-core"), None).await;
+    (harness, owner, routes)
+}
+
+async fn dry_panels(route: &Route, panel: Value, extra: Value) -> Value {
+    let mut params = json!({"consumer": fixture::SUMMARY, "panel": panel});
+    params
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    let (ty, reply) = route.call("route.what_if", &params).await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    reply["result"].clone()
+}
+
+/// The comparable part of each seat: what was seated, where and why.
+fn dry_seats(row: &Value) -> Vec<Value> {
+    row["seats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seat| {
+            json!({"slot": seat["slot"], "phase": seat["phase"], "route": seat["route"],
+                "variant": seat["variant"], "family": seat["family"]})
+        })
+        .collect()
+}
+
+async fn live_panel(
+    route: &Route,
+    request: &Value,
+) -> cortexkit_role_routing::panel::SelectPanelAnswer {
+    let (ty, reply) = route.call("route.select_panel", request).await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    serde_json::from_value(reply["result"].clone()).unwrap()
+}
+
+fn live_seats(answer: &cortexkit_role_routing::panel::SelectPanelAnswer) -> Vec<Value> {
+    answer
+        .seats
+        .iter()
+        .map(|seat| {
+            json!({"slot": seat.slot, "phase": seat.phase, "route": seat.answer.route.route_key(),
+                "variant": seat.answer.route.variant, "family": seat.family})
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn what_if_panel_seats_what_select_panel_seats_for_the_same_seed() {
+    let (harness, owner, _) = panel_harness().await;
+    let operator = operator(&harness).await;
+    let before = rows(&harness);
+    let writes = harness.store().account_write_transaction_count_for_test();
+    let mut dry = Vec::new();
+    for seed in [None, Some("fixed"), Some("other")] {
+        let mut panel = json!({"class": "audit"});
+        if let Some(seed) = seed {
+            panel["seed"] = json!(seed);
+        }
+        let result = dry_panels(&operator, panel, json!({})).await;
+        assert_eq!(result["results"], json!([]), "{result}");
+        let row = result["panels"][0].clone();
+        assert_eq!(row["class"], "audit");
+        assert_eq!(
+            row["policy"],
+            json!({"source":"settings","top_k":2,"by":"iq","extra":1,"extra_by":"random",
+                "floor":0,"width":3})
+        );
+        assert_eq!(row["seed"], seed.unwrap_or(""), "{row}");
+        assert_eq!(
+            row["seed_source"],
+            if seed.is_some() { "request" } else { "default" }
+        );
+        assert_eq!(row["shortfall"], Value::Null, "{row}");
+        assert_eq!(row["funnel"]["catalog"], 5, "{row}");
+        assert_eq!(row["funnel"]["initiallyAdmitted"], 3, "{row}");
+        let seats = row["seats"].as_array().unwrap();
+        assert_eq!(seats.len(), 3, "{row}");
+        assert_eq!(
+            seats[0]["chosen_by"],
+            "top-2 seat ranked 1 by iq; class floor 0 does not apply to IQ-ranked top seats"
+        );
+        assert!(seats[2]["chosen_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("extra seat drawn at random with seed"));
+        dry.push((seed, dry_seats(&row)));
+    }
+    assert_eq!(before, rows(&harness), "a dry-run panel must write nothing");
+    assert_eq!(
+        writes,
+        harness.store().account_write_transaction_count_for_test()
+    );
+    for (seed, seats) in dry {
+        let mut request = json!({"class": "audit", "consumer": fixture::SUMMARY});
+        if let Some(seed) = seed {
+            request["seed"] = json!(seed);
+        }
+        let live = live_panel(&owner, &request).await;
+        assert_eq!(seats, live_seats(&live), "seed {seed:?}");
+    }
+}
+
+#[tokio::test]
+async fn what_if_panel_seed_decides_the_random_extra_seat_deterministically() {
+    let (harness, _, _) = panel_harness().await;
+    let operator = operator(&harness).await;
+    let mut extras = std::collections::BTreeSet::new();
+    for seed in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+        let panel = json!({"class": "audit", "seed": seed});
+        let first = dry_panels(&operator, panel.clone(), json!({})).await;
+        let again = dry_panels(&operator, panel, json!({})).await;
+        assert_eq!(first["panels"], again["panels"], "seed {seed}");
+        extras.insert(first["panels"][0]["seats"][2]["route"].to_string());
+    }
+    assert!(
+        extras.len() > 1,
+        "the seed never changed the extra seat: {extras:?}"
+    );
+}
+
+#[tokio::test]
+async fn what_if_panel_policy_patch_changes_seats_like_the_same_live_setting() {
+    let (harness, owner, routes) = panel_harness().await;
+    let operator = operator(&harness).await;
+    let panel = json!({"class": ["audit", "lab"], "seed": "fixed"});
+    let baseline = dry_panels(&operator, panel.clone(), json!({})).await;
+    let seated: Vec<_> = baseline["panels"][0]["seats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|seat| seat["route"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(seated.len(), 3, "{baseline}");
+    assert_eq!(baseline["panels"][1]["class"], "lab");
+    assert_eq!(baseline["panels"][1]["policy"]["source"], "default");
+    assert_eq!(baseline["panels"][1]["policy"]["width"], 4);
+    // Leave only two routes for this consumer: the three-seat audit panel
+    // falls short, and neither excluded route may be seated.
+    let unseated = routes.iter().find(|r| !seated.contains(r)).unwrap();
+    let excluded = [seated[0].clone(), unseated.clone(), seated[2].clone()];
+    let patch: serde_json::Map<_, _> = excluded
+        .iter()
+        .map(|route| (route.clone(), json!({"not_for": [fixture::SUMMARY]})))
+        .collect();
+    let before = rows(&harness);
+    let patched = dry_panels(
+        &operator,
+        panel.clone(),
+        json!({"policy_patch": {"models": patch}}),
+    )
+    .await;
+    assert_eq!(before, rows(&harness));
+    let audit = &patched["panels"][0];
+    let seats = dry_seats(audit);
+    assert_eq!(seats.len(), 2, "{audit}");
+    assert!(seats
+        .iter()
+        .all(|seat| !excluded.contains(&seat["route"].as_str().unwrap().to_owned())));
+    assert!(audit["shortfall"]["code"].is_string(), "{audit}");
+    let causes = audit["shortfall"]["detail"]["causes"].as_array().unwrap();
+    for route in &excluded {
+        assert!(
+            causes
+                .iter()
+                .any(|cause| cause["model"] == *route && cause["reason"] == "excluded_by_operator"),
+            "{route}: {audit}"
+        );
+    }
+    assert_eq!(
+        baseline["panels"],
+        dry_panels(&operator, panel, json!({})).await["panels"],
+        "a patch must not outlive its call"
+    );
+    // Applying the same setting for real seats the same routes.
+    harness.edit_config(|c| {
+        for route in &excluded {
+            c["models"][route] = json!({"not_for": [fixture::SUMMARY]});
+        }
+    });
+    let live = live_panel(
+        &owner,
+        &json!({"class": "audit", "consumer": fixture::SUMMARY, "seed": "fixed"}),
+    )
+    .await;
+    assert_eq!(seats, live_seats(&live));
+    let live_shortfall = serde_json::to_value(live.shortfall.unwrap()).unwrap();
+    assert_eq!(live_shortfall["code"], audit["shortfall"]["code"]);
+}
+
+#[tokio::test]
+async fn what_if_panel_refuses_unknown_classes_as_select_panel_does() {
+    let (harness, owner, _) = panel_harness().await;
+    let operator = operator(&harness).await;
+    let (ty, live) = owner
+        .call(
+            "route.select_panel",
+            &json!({"class": "future", "consumer": fixture::SUMMARY}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Error, "{live}");
+    let before = rows(&harness);
+    for class in [json!("future"), json!(["audit", "future"])] {
+        let (ty, dry) = operator
+            .call(
+                "route.what_if",
+                &json!({"consumer": fixture::SUMMARY, "panel": {"class": class}}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Error, "{dry}");
+        assert_eq!(dry, live);
+    }
+    for panel in [
+        json!({"class": []}),
+        json!({"class": "audit", "unexpected": true}),
+        json!({"class": "audit", "seed": 7}),
+        json!({"class": "audit", "package_tokens": "many"}),
+    ] {
+        let (ty, body) = operator
+            .call(
+                "route.what_if",
+                &json!({"consumer": fixture::SUMMARY, "panel": panel}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Error, "{body}");
+        assert_eq!(body["code"], "invalid_request", "{body}");
+    }
+    let (ty, body) = operator
+        .call("route.what_if", &json!({"consumer": fixture::SUMMARY}))
+        .await;
+    assert_eq!(ty, FrameType::Error, "iqs or panel is required: {body}");
+    assert_eq!(before, rows(&harness));
+}

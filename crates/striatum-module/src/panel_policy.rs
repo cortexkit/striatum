@@ -35,8 +35,13 @@ impl PanelRequestSpec {
     }
 }
 
-pub(crate) fn class_policy(policies: &PanelPolicies, class: PanelClass) -> ClassPanelPolicy {
-    let configured = match class {
+/// The operator's own policy for a class, when settings name one; otherwise the
+/// class runs on `ClassPanelPolicy::default_for_class`.
+pub(crate) fn configured_class_policy(
+    policies: &PanelPolicies,
+    class: PanelClass,
+) -> Option<&crate::config_policy::PanelPolicy> {
+    match class {
         PanelClass::Audit => &policies.audit,
         PanelClass::DesignReview => &policies.design_review,
         PanelClass::Diagnose => &policies.diagnose,
@@ -44,8 +49,12 @@ pub(crate) fn class_policy(policies: &PanelPolicies, class: PanelClass) -> Class
         PanelClass::Explain => &policies.explain,
         PanelClass::Spec => &policies.spec,
         PanelClass::Lab => &policies.lab,
-    };
-    let Some(policy) = configured else {
+    }
+    .as_ref()
+}
+
+pub(crate) fn class_policy(policies: &PanelPolicies, class: PanelClass) -> ClassPanelPolicy {
+    let Some(policy) = configured_class_policy(policies, class) else {
         return ClassPanelPolicy::default_for_class(class);
     };
     ClassPanelPolicy {

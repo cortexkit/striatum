@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use cortexkit_role_routing::errors::Refusal;
+use cortexkit_role_routing::panel::{
+    parse_select_panel_request_serving, PanelPhase, SelectPanelRequest,
+};
+use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder, PanelOrder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -13,13 +17,35 @@ use super::{operator_config, provider_refusal, select, store_refusal, Caller, De
 #[serde(deny_unknown_fields)]
 struct Params {
     consumer: String,
-    iqs: Vec<f64>,
+    iqs: Option<Vec<f64>>,
     eq: Option<f64>,
     runner: Option<String>,
     policy_patch: Option<PolicyPatch>,
     runner_declarations: Option<BTreeMap<String, Value>>,
     head_choices: Option<Value>,
+    panel: Option<PanelParams>,
 }
+
+/// A dry-run panel. Member values are passed to `route.select_panel`'s own
+/// request parser, so they are validated and refused exactly as there.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PanelParams {
+    class: PanelClasses,
+    package_tokens: Option<Value>,
+    runners: Option<Value>,
+    seed: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PanelClasses {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// More would only repeat a class: routing has seven.
+const MAX_PANEL_CLASSES: usize = 16;
 
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -47,18 +73,20 @@ pub(super) async fn what_if_with_profile_lookup(
             "route.what_if is operator-only (direct or reserved:callosum)",
         ));
     }
-    let params: Params = serde_json::from_value(params.clone())
+    let mut params: Params = serde_json::from_value(params.clone())
         .map_err(|error| Refusal::invalid_request("params", error.to_string()))?;
-    if params.iqs.is_empty()
-        || params.iqs.len() > 101
-        || params
-            .iqs
-            .iter()
-            .any(|iq| !iq.is_finite() || !(0.0..=100.0).contains(iq))
-    {
+    // A panel-only call may omit the IQ sweep; a supplied sweep is never empty.
+    let iqs = params.iqs.take();
+    if iqs.as_ref().map_or(params.panel.is_none(), |iqs| {
+        iqs.is_empty()
+            || iqs.len() > 101
+            || iqs
+                .iter()
+                .any(|iq| !iq.is_finite() || !(0.0..=100.0).contains(iq))
+    }) {
         return Err(Refusal::invalid_request(
             "iqs",
-            "iqs must contain 1-101 finite numbers in 0..100",
+            "iqs must contain 1-101 finite numbers in 0..100 (it may be omitted only with panel)",
         ));
     }
     if params
@@ -111,6 +139,11 @@ pub(super) async fn what_if_with_profile_lookup(
             "consumer is not registered",
         ));
     }
+    let panels = params
+        .panel
+        .map(|panel| panel_requests(panel, &params.consumer, params.runner.as_deref(), &operator))
+        .transpose()?
+        .unwrap_or_default();
     // Keep declaration overlays and all credential reads on a disposable copy.
     // Never publish the proposed slot or copy reconciled state back to the cache.
     let mut credentials = deps
@@ -140,8 +173,8 @@ pub(super) async fn what_if_with_profile_lookup(
             .map_err(store_refusal)?,
     );
     let snapshot_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut results = Vec::with_capacity(params.iqs.len());
-    for iq in params.iqs {
+    let mut results = Vec::with_capacity(iqs.as_ref().map_or(0, Vec::len));
+    for iq in iqs.unwrap_or_default() {
         let mut request =
             json!({"consumer": params.consumer, "requirements": {"iq": iq.round() as u8}});
         if let Some(eq) = params.eq {
@@ -180,9 +213,183 @@ pub(super) async fn what_if_with_profile_lookup(
         }
         results.push(row);
     }
-    let mut result = json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms, "elapsed_ms": started.elapsed().as_secs_f64() * 1000.0});
+    let mut result =
+        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms});
+    if !panels.is_empty() {
+        let dry = super::panels::DryRun {
+            live_config: live.clone(),
+            operator_config: operator.clone(),
+            account_store: &account_store,
+            profile_lookup,
+        };
+        let mut rows = Vec::with_capacity(panels.len());
+        for panel in panels {
+            let evaluated =
+                super::panels::evaluate_panel(&panel.request, panel.policy, caller, &deps, &dry)
+                    .await;
+            rows.push(panel_row(&panel, evaluated));
+        }
+        result["panels"] = json!(rows);
+    }
+    result["elapsed_ms"] = json!(started.elapsed().as_secs_f64() * 1000.0);
     if let Some(choices) = head_choices {
         result["head_choices"] = choices;
     }
     Ok(result)
+}
+
+/// One class's dry-run panel, validated before any snapshot is taken.
+struct PanelRequest {
+    class: String,
+    request: SelectPanelRequest,
+    policy: ClassPanelPolicy,
+    /// Whether operator settings name this class's policy, rather than the
+    /// class's built-in default.
+    configured: bool,
+}
+
+/// Build each class's request through `route.select_panel`'s parser and class
+/// policy lookup, so malformed members and unknown classes are refused the same way.
+fn panel_requests(
+    panel: PanelParams,
+    consumer: &str,
+    runner: Option<&str>,
+    operator: &crate::config_overrides::LiveConfig,
+) -> Result<Vec<PanelRequest>, Refusal> {
+    let classes = match panel.class {
+        PanelClasses::One(class) => vec![class],
+        PanelClasses::Many(classes) => classes,
+    };
+    if classes.is_empty() || classes.len() > MAX_PANEL_CLASSES {
+        return Err(Refusal::invalid_request(
+            "panel.class",
+            format!("panel.class must name a class or list 1-{MAX_PANEL_CLASSES} classes"),
+        ));
+    }
+    classes
+        .into_iter()
+        .map(|class| {
+            let mut params = json!({"class": class, "consumer": consumer});
+            if let Some(tokens) = &panel.package_tokens {
+                params["package_tokens"] = tokens.clone();
+            }
+            // The panel's own runner list wins; otherwise the sweep's runner applies.
+            match (&panel.runners, runner) {
+                (Some(runners), _) => params["runners"] = runners.clone(),
+                (None, Some(runner)) => params["runners"] = json!([runner]),
+                (None, None) => {}
+            }
+            if let Some(seed) = &panel.seed {
+                params["seed"] = seed.clone();
+            }
+            let request =
+                parse_select_panel_request_serving(&params, super::describe::CAPABILITIES)?;
+            let policy = super::panels::request_policy(&request, operator)?;
+            let configured = crate::panel_policy::configured_class_policy(
+                operator.panels(),
+                super::panels::class(&request)?,
+            )
+            .is_some();
+            Ok(PanelRequest {
+                class,
+                request,
+                policy,
+                configured,
+            })
+        })
+        .collect()
+}
+
+fn panel_row(
+    panel: &PanelRequest,
+    evaluated: Result<super::panels::PanelEvaluation, Refusal>,
+) -> Value {
+    let policy = panel.policy;
+    // An unseeded `route.select_panel` draws random extras with the empty seed;
+    // the dry run defaults to the same one so the two agree.
+    let (seed, seed_source) = match &panel.request.seed {
+        Some(seed) => (seed.as_str(), "request"),
+        None => ("", "default"),
+    };
+    let mut row = json!({
+        "class": panel.class,
+        "policy": {
+            "source": if panel.configured { "settings" } else { "default" },
+            "top_k": policy.top_k,
+            "by": policy.by,
+            "extra": policy.extra,
+            "extra_by": policy.extra_by,
+            "floor": policy.floor,
+            "width": policy.width(),
+        },
+        "seed": seed,
+        "seed_source": seed_source,
+        "seats": [],
+        "shortfall": null,
+        "funnel": null,
+    });
+    match evaluated {
+        Ok(evaluated) => {
+            row["seats"] = evaluated
+                .seats
+                .iter()
+                .map(|seat| {
+                    json!({
+                        "slot": seat.slot,
+                        "phase": seat.phase,
+                        "route": seat.route,
+                        "variant": seat.variant,
+                        "family": seat.family,
+                        "rank": seat.rank,
+                        "cost_usd": seat.cost_usd,
+                        "chosen_by": chosen_by(seat, policy, seed),
+                    })
+                })
+                .collect();
+            row["shortfall"] = json!(evaluated.shortfall);
+            row["funnel"] = json!(evaluated.funnel);
+        }
+        Err(refusal) => {
+            row["refusal"] = json!({"code": refusal.code, "detail": refusal.detail});
+        }
+    }
+    row
+}
+
+/// Plain-language account of the class-policy rule that seated a route.
+fn chosen_by(seat: &super::panels::EvaluatedSeat, policy: ClassPanelPolicy, seed: &str) -> String {
+    let name = |order: Value| order.as_str().unwrap_or_default().to_owned();
+    let rank = seat
+        .rank
+        .map_or_else(String::new, |rank| format!(" ranked {rank}"));
+    let (rule, floor_applies) = if seat.phase == PanelPhase::Top {
+        (
+            format!(
+                "top-{} seat{rank} by {}",
+                policy.top_k,
+                name(json!(policy.by))
+            ),
+            policy.by != PanelOrder::Iq,
+        )
+    } else if policy.extra_by == Some(PanelExtraOrder::Random) {
+        (
+            format!("extra seat drawn at random with seed {seed:?} from families not yet seated"),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "extra seat{rank} by {} among families not yet seated",
+                name(json!(policy.extra_by))
+            ),
+            true,
+        )
+    };
+    match policy.floor {
+        Some(floor) if floor_applies => format!("{rule}; clears class floor {floor}"),
+        Some(floor) => {
+            format!("{rule}; class floor {floor} does not apply to IQ-ranked top seats")
+        }
+        None => rule,
+    }
 }
