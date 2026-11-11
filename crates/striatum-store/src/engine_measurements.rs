@@ -112,7 +112,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|conn| {
-                let tx = conn.unchecked_transaction()?;
+                let tx = crate::write_transaction(conn)?;
                 let first = tx.execute(
                     "UPDATE routing_v1_decision SET engine_reported = 1
                  WHERE decision_id = ?1 AND engine_reported = 0",

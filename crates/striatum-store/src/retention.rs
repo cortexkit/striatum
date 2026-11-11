@@ -30,7 +30,7 @@
 //!   stored older generation.
 
 use striatum_core::RouteStateResult;
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection};
 
 use super::{err, SqliteRouteStateStore, DECISION_MODE_SERVE};
 
@@ -155,7 +155,7 @@ impl SqliteRouteStateStore {
         }
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let tx = crate::write_transaction(conn)?;
                 let keys: Vec<(String, String, String)> = {
                     let mut statement = tx.prepare(
                         "SELECT principal, conversation_hash, provider FROM account_affinity \

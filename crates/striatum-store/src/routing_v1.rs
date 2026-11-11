@@ -168,7 +168,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::write_transaction(c)?;
                 tx.execute(
                     "INSERT INTO routing_v1_decision
                        (decision_id, principal, consumer, project_id, provider, model, variant,
@@ -342,7 +342,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<V1Recorded> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::write_transaction(c)?;
                 let inserted = tx.execute(
                     "INSERT INTO routing_v1_report
                        (decision_id, report_id, body_json, answer_json, created_at_ms)

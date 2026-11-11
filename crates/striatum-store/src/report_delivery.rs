@@ -40,7 +40,7 @@ impl SqliteRouteStateStore {
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
         let result = self.store.with_conn(|conn: &Connection| {
-            let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+            let tx = crate::write_transaction(conn)?;
             let standing = tx.query_row(
                 "SELECT body_json, answer_json FROM routing_v1_report_delivery
                  WHERE decision_id=?1 AND delivery_key=?2",

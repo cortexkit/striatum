@@ -88,7 +88,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = crate::write_transaction(c)?;
                 tx.execute("DELETE FROM routing_operator_quality", [])?;
                 for (route, grade) in grades {
                     tx.execute(
