@@ -62,6 +62,10 @@ mod reasoning_catalog;
 mod retention;
 mod routing_v1;
 mod task_usage;
+mod transactions;
+use transactions::write_transaction;
+#[cfg(test)]
+mod transaction_contention_tests;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod replay;
@@ -664,7 +668,7 @@ impl SqliteRouteStateStore {
         requested: &str,
     ) -> RouteStateResult<Option<ClearedRouteCooldowns>> {
         self.store.with_conn(|conn: &Connection| {
-            let tx = conn.unchecked_transaction()?;
+            let tx = write_transaction(conn)?;
             let known = |key: &str| -> rusqlite::Result<bool> {
                 tx.query_row("SELECT EXISTS(SELECT 1 FROM model_facts WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM model_route_state WHERE route_key=?1 OR capacity_key=?1 UNION ALL SELECT 1 FROM routing_v1_decision WHERE provider||'/'||model=?1 OR provider||'/'||model||'/'||variant=?1 UNION ALL SELECT 1 FROM account_admission WHERE provider||'/'||model=?1)", [key], |row| row.get(0))
             };
@@ -1600,7 +1604,7 @@ impl SqliteRouteStateStore {
     pub fn prune_unserved_unpicked_facts(&self) -> RouteStateResult<Vec<String>> {
         self.store
             .with_conn(|connection: &Connection| {
-                let tx = connection.unchecked_transaction()?;
+                let tx = write_transaction(connection)?;
                 let mut statement = tx.prepare(
                     "SELECT route_key FROM model_facts
                      WHERE fusiform_present = 0 ORDER BY route_key",
@@ -1911,7 +1915,7 @@ impl SqliteRouteStateStore {
             serde_json::to_string(&retained.iter().collect::<Vec<_>>()).map_err(err)?;
         self.store
             .with_conn(|connection: &Connection| {
-                let tx = connection.unchecked_transaction()?;
+                let tx = write_transaction(connection)?;
                 if complete_snapshot {
                     tx.execute(
                         "UPDATE model_facts
@@ -2273,7 +2277,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 for reading in readings {
                     tx.execute(
                         "INSERT INTO account_quota_reading
@@ -2504,7 +2508,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 let changed = tx.execute(
                     "UPDATE credential_entitlement_fences SET observed_at_ms = ?3
                       WHERE provider_id = ?1 AND credential_id = ?2",
@@ -3480,7 +3484,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // Fact replacement and route-state insertion share one transaction.
                 // The store connection mutex serializes this with provider fanout,
                 // so a new route resolves either before fanout or after inheritance.
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 if source == FactSource::AaInferred {
                     let existing: Option<String> = tx
                         .query_row(
@@ -3644,7 +3648,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         }
         self.store
             .with_conn(|connection: &Connection| {
-                let tx = connection.unchecked_transaction()?;
+                let tx = write_transaction(connection)?;
                 let sources = tx
                     .query_row(
                         "SELECT context_window_source, max_output_tokens_source,
@@ -3808,7 +3812,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn delete_fact(&self, route_key: &str) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 tx.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
                 tx.commit()
             })
@@ -3821,7 +3825,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn demote_fact_source_to_seed(&self, route_key: &str) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 tx.execute(
                     "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
                     [route_key],
@@ -3930,7 +3934,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // upsert_fact and every other route-state writer. The provider
                 // row, inheritance row, and existing-route fanout therefore
                 // commit together or roll back together.
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
                 let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1",[&provider_key],|row|row.get(0)).optional()?.flatten();
                 if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
@@ -4114,10 +4118,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // Acquire the writer before reading: in WAL mode, upgrading a
                 // deferred read transaction can fail with BUSY without waiting
                 // for another writer, even with a busy timeout configured.
-                let tx = rusqlite::Transaction::new_unchecked(
-                    c,
-                    rusqlite::TransactionBehavior::Immediate,
-                )?;
+                let tx = write_transaction(c)?;
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
                 let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?.flatten();
@@ -4294,7 +4295,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         let update = &normalized;
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 type DecisionRoute = (
                     Option<String>,
                     Option<String>,
@@ -4507,7 +4508,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     ) -> RouteStateResult<Option<FailureBackoffState>> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 let prior = tx
                     .query_row(
                         "SELECT consecutive_terminal_failures, failure_backoff_until,
@@ -4592,7 +4593,7 @@ impl RouteStateStore for SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
-                let tx = c.unchecked_transaction()?;
+                let tx = write_transaction(c)?;
                 let panels = tx.execute(
                     "DELETE FROM routing_v1_panel WHERE panel_id IN (
                         SELECT panel_id FROM routing_v1_panel WHERE created_at_ms < ?1
@@ -4618,7 +4619,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         if rows.is_empty() { return Ok(0); }
         self.store
             .with_conn(|connection: &Connection| {
-                let transaction = connection.unchecked_transaction()?;
+                let transaction = write_transaction(connection)?;
                 let mut inserted = 0;
                 {
                     let mut statement = transaction.prepare(

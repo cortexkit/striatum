@@ -90,7 +90,7 @@ impl SqliteRouteStateStore {
             return Ok(0);
         }
         let result = self.store.with_conn(|conn: &Connection| {
-            let tx = conn.unchecked_transaction()?;
+            let tx = crate::write_transaction(conn)?;
             {
                 let mut insert = tx.prepare_cached(
                     "INSERT INTO routing_call_count (method,shape,principal,calls,last_called_at_ms)

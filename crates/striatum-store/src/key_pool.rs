@@ -14,7 +14,7 @@ use striatum_core::key_pool::{
     key_block, pick_pool_key, PoolBlockedKey, PoolKey, PoolKeyState,
 };
 use striatum_core::RouteStateResult;
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use super::{err, SqliteRouteStateStore};
 
@@ -215,7 +215,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<T> {
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let tx = crate::write_transaction(conn)?;
                 let result = f(&tx)?;
                 tx.commit()?;
                 Ok(result)

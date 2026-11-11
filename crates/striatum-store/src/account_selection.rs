@@ -1026,7 +1026,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|conn: &Connection| {
-                let conn=conn.unchecked_transaction()?;
+                let conn=crate::write_transaction(conn)?;
                 conn.execute(
                     "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
@@ -1131,7 +1131,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = conn.unchecked_transaction()?;
+                let tx = crate::write_transaction(conn)?;
                 let mut cleared = 0;
                 for table in ["account_route_fence", "account_non_quota_route_fence"] {
                     if account_fact_table_exists(&tx, table)? {
@@ -2345,7 +2345,7 @@ impl AccountTx<'_> {
 
 impl SqliteRouteStateStore {
     fn begin_account_write<'a>(&self, conn: &'a Connection) -> rusqlite::Result<Transaction<'a>> {
-        let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+        let tx = crate::write_transaction(conn)?;
         #[cfg(any(test, feature = "test-support"))]
         self.account_write_transactions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

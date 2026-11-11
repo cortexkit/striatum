@@ -138,10 +138,7 @@ impl SqliteRouteStateStore {
         store
             .with_conn(|destination| {
                 destination.pragma_update(None, "foreign_keys", false)?;
-                let tx = rusqlite::Transaction::new_unchecked(
-                    destination,
-                    rusqlite::TransactionBehavior::Deferred,
-                )?;
+                let tx = crate::write_transaction(destination)?;
                 for (table, schema, columns, rows) in copied {
                     tx.execute_batch(&schema)?;
                     let placeholders = (0..columns).map(|_| "?").collect::<Vec<_>>().join(",");
