@@ -16736,6 +16736,20 @@ mod tests {
         use super::*;
         use rusqlite::OptionalExtension;
 
+        struct StoreContention {
+            waiting: tokio::sync::oneshot::Sender<()>,
+            released: std::sync::mpsc::Receiver<()>,
+        }
+
+        static STORE_CONTENTION: Mutex<Option<StoreContention>> = Mutex::new(None);
+
+        fn wait_for_lock_release(_attempt: i32) -> bool {
+            let Some(contention) = STORE_CONTENTION.lock().unwrap().take() else {
+                return false;
+            };
+            contention.waiting.send(()).is_ok() && contention.released.recv().is_ok()
+        }
+
         /// On a current-thread runtime, a handler run on the runtime's only
         /// thread would stall every other task until its store call returned.
         /// Progress is shown by message order: the other task answers while the
@@ -16745,6 +16759,15 @@ mod tests {
             let rig = Rig::new("route-handler-store-wait");
             let store = Arc::new(rig.open_store());
             let db = rig.dir.join("store.db");
+            // Observe actual SQLite contention, then keep the handler waiting
+            // until COMMIT regardless of how long the async runtime is delayed.
+            // The production busy timeout must not race the test's lock release.
+            let (waiting, waited) = tokio::sync::oneshot::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            *STORE_CONTENTION.lock().unwrap() = Some(StoreContention { waiting, released });
+            store
+                .set_busy_handler_for_test(Some(wait_for_lock_release))
+                .unwrap();
             // A second connection holds the database's write lock, so the
             // handler's cooldown write waits inside the store call.
             let lock_holder = rusqlite::Connection::open(&db).unwrap();
@@ -16785,8 +16808,16 @@ mod tests {
             .await
             .unwrap());
 
-            // Another task on the same runtime, queued behind the route
-            // request's task, answers one ping.
+            tokio::select! {
+                waiting = waited => waiting.expect("the handler reaches SQLite's busy wait"),
+                reply = replies.recv() => panic!(
+                    "the handler must wait for the writer, not answer early: {}",
+                    String::from_utf8_lossy(&reply.unwrap().body)
+                ),
+            }
+
+            // Only start the ping once the handler is inside the store call.
+            // Another task on the same runtime must still be able to answer.
             let (ping, pinged) = tokio::sync::oneshot::channel::<()>();
             let (pong, ponged) = tokio::sync::oneshot::channel::<()>();
             tokio::spawn(async move {
@@ -16803,6 +16834,7 @@ mod tests {
             );
 
             lock_holder.execute_batch("COMMIT").unwrap();
+            release.send(()).unwrap();
             let reply = replies.recv().await.unwrap();
             assert_eq!(
                 (reply.header.ty, reply.header.corr),

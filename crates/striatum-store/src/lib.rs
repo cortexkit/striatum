@@ -1327,6 +1327,14 @@ impl SqliteRouteStateStore {
         Self::open_with_migrations(descriptor, &route_state_migrations())
     }
 
+    /// Replace the writer's timed busy wait with a test-controlled lock handshake.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_busy_handler_for_test(&self, handler: Option<fn(i32) -> bool>) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|connection| connection.busy_handler(handler))
+            .map_err(err)
+    }
+
     /// Build an older on-disk schema for upgrade tests that exercise live callers.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_at_version_for_test(
@@ -4103,7 +4111,13 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 // Read-modify-write under one transaction so counter increments,
                 // provider inheritance, and field merges see one consistent row.
-                let tx = c.unchecked_transaction()?;
+                // Acquire the writer before reading: in WAL mode, upgrading a
+                // deferred read transaction can fail with BUSY without waiting
+                // for another writer, even with a busy timeout configured.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    c,
+                    rusqlite::TransactionBehavior::Immediate,
+                )?;
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
                 let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?.flatten();
