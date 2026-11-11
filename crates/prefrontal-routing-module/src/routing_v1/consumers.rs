@@ -30,7 +30,7 @@ pub(crate) fn replace_catalog(modules: &Value) {
     if let Ok(mut reported) = REPORTED.lock() {
         for issue in &snapshot.issues {
             if reported.insert(issue.clone()) {
-                crate::warn_operator(format!("[prefrontal-routing] {issue}"));
+                crate::warn_operator(format!("[striatum] {issue}"));
             }
         }
     }

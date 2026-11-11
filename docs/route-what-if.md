@@ -13,9 +13,9 @@ The daemon-attested route principal must be `direct` (the local operator) or
 unverified clients and other reserved modules, receive `not_permitted`. A JSON
 parameter cannot grant operator authority.
 
-Send the following management request to module `prefrontal-routing` on an
+Send the following management request to module `striatum` on an
 operator route. For example, the head session can use its `AlfonsoCoreClient`
-configured with `moduleId: "prefrontal-routing"` to call `route.what_if` with
+configured with `moduleId: "striatum"` to call `route.what_if` with
 these params. A plain client script that the daemon labels `unverified` cannot
 make this call; it needs a daemon-attested `direct` route instead.
 

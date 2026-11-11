@@ -509,7 +509,7 @@ fn report_harness_limits_once(
     if let Ok(mut reported) = REPORTED.lock() {
         if reported.insert((module.into(), error.to_string())) {
             crate::warn_operator(format!(
-                "[prefrontal-routing] runner {module}: {error}; using runner-level limits for all harnesses"
+                "[striatum] runner {module}: {error}; using runner-level limits for all harnesses"
             ));
         }
     }
