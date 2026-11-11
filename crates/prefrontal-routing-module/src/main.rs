@@ -5926,7 +5926,7 @@ mod tests {
     /// (cline-pass, apikey:cline-pass): the retry avoids every cline-pass route and the
     /// decision log names the fence; the fence survives a store reopen; a fence
     /// older than the recheck interval admits exactly one probe, then holds
-    /// again; an explicit pin is not fenced; and the fence ends when the
+    /// again; an explicit pin cannot bypass it; and the fence ends when the
     /// credential's vault listing changes.
     ///
     /// The same replay covers an empty balance: Broca ends the run as permanent
@@ -6094,14 +6094,10 @@ mod tests {
         // admission reserves and records its probe. The next selection is
         // fenced until another interval passes or an outcome
         // lifts or renews it.
-        drop(store);
-        rusqlite::Connection::open(rig.dir.join("store.db"))
-            .unwrap()
-            .execute(
-                "UPDATE credential_entitlement_fences SET observed_at_ms = 0",
-                [],
-            )
+        store
+            .touch_credential_entitlement_fence("cline-pass", "apikey:cline-pass", 0)
             .unwrap();
+        drop(store);
         store = Arc::new(rig.open_store());
         let probe = select(&store, &credentials, &request).await;
         assert_eq!(

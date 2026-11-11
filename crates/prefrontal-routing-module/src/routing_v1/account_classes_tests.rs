@@ -368,19 +368,25 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
         now_ms: NOW as i64 + 1,
         classes: Some(cached),
     };
-    // The probe is already claimed: the allocator has no account left and the
-    // stale roster cannot serve, which is transient unavailability.
+    // The stale roster cannot send a second probe. Revalidation must retain
+    // the winning claim's fence and retry time, not blame runner candidates.
+    let lost = crate::account_selection::handle(
+        crate::account_selection::ACCOUNT_FOR_OP,
+        &body,
+        &format!("reserved:{RUNNER}"),
+        &ctx,
+    );
     assert_eq!(
-        crate::account_selection::handle(
-            crate::account_selection::ACCOUNT_FOR_OP,
-            &body,
-            &format!("reserved:{RUNNER}"),
-            &ctx
-        )
-        .code(),
-        Some("account_selection_unavailable"),
+        lost.code(),
+        Some("account_pool_exhausted"),
         "a stale cached roster cannot reserve a second probe"
     );
+    match lost {
+        crate::account_selection::OpReply::Error { detail, .. } => {
+            assert_eq!(detail.unwrap()["reset_at_ms"], NOW + 3_600_001)
+        }
+        _ => unreachable!(),
+    }
     let completed = caller
         .call(
             "route.report",
@@ -2905,14 +2911,23 @@ async fn a_billing_refusal_converted_without_a_reset_keeps_its_fifteen_minute_ch
         .unwrap()
         .iter()
         .any(|origin| origin.kind == "credential" && origin.quota));
+    let holds = harness
+        .store()
+        .account_read(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap();
     assert!(
-        harness
-            .store()
-            .account_read(|tx| tx.active_pool_fences("synthetic"))
-            .unwrap()
-            .is_empty(),
-        "a missing reset does not invent an account hold deadline"
+        !holds.is_empty(),
+        "quota holds retain their recovery pools even without a reset"
     );
+    for hold in holds {
+        let fence: prefrontal_routing_core::accounts::Fence =
+            serde_json::from_str(&hold.evidence.fence_json).unwrap();
+        assert_eq!(
+            fence.reset,
+            prefrontal_routing_core::accounts::ResetTime::Missing,
+            "a recovery hold must not invent a fixed reset deadline"
+        );
+    }
     *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
     let _later = crate::InjectedClock::set(NOW + 900_000);
     assert_credential(
@@ -3841,6 +3856,29 @@ async fn xai_credit_window_is_a_billing_wall_until_one_probe_and_matching_succes
             )
             .await;
         assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+        let reserved = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-reserved-elsewhere"),
+            )
+            .await;
+        assert_eq!(
+            reserved.0,
+            FrameType::Error,
+            "the selected probe is reserved: {}",
+            reserved.1
+        );
+        assert_eq!(
+            reserved.1["code"], "account_pool_exhausted",
+            "a probe reservation is a timed fence, not a missing runner candidate: {}",
+            reserved.1
+        );
+        let reserved_until = reserved.1["detail"]["reset_at_ms"].as_u64().unwrap();
+        assert!(
+            (deadline + 1..=deadline + 3_600_000).contains(&reserved_until),
+            "{}",
+            reserved.1
+        );
         let mut admitted = account_request("xai", "credit-probe");
         admitted["decision_id"] = probe.1["result"]["decision_id"].clone();
         let other_probe = account_request("xai", "credit-other-probe");

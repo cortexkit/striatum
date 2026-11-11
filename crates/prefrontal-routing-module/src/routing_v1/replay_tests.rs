@@ -476,6 +476,8 @@ fn project_additive_shape_members(value: &mut Value) {
                 "fence_recheck",
                 "fence_recheck_route_clear",
                 "fence_success_pool",
+                "fence_probe_authorization",
+                "fence_retired_origin",
                 "account_non_quota_route_fence",
                 "account_non_quota_size_refusal",
             ] {

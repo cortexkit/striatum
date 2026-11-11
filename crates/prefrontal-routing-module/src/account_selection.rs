@@ -5267,6 +5267,7 @@ fn serve(
     };
     let request = params.request(principal, affinity_row.is_none());
     let mut reserved_probe = false;
+    let mut lost_probe_fences = BTreeMap::new();
     let mut decision = loop {
         let decision =
             prefrontal_routing_core::accounts::decide_with_context(&request, &state, now, &inputs);
@@ -5383,6 +5384,17 @@ fn serve(
         };
         let Some(claimed) = claimed else {
             reserved_probe = true;
+            if let Some(until) = ctx.classes.as_ref().and_then(|classes| {
+                probe_reservations::blocked_until(
+                    &classes.probe_scope,
+                    provider,
+                    &credential,
+                    classes.probe_owner.as_deref(),
+                    now,
+                )
+            }) {
+                lost_probe_fences.insert(admission.account_id.clone(), until);
+            }
             inputs.credential_probe_notes.remove(&credential);
             if let Some(roster) = &mut state.roster {
                 for account in &mut roster.accounts {
@@ -5399,6 +5411,17 @@ fn serve(
                 inputs.credential_probe_notes.remove(&credential);
             }
             prefrontal_routing_store::CredentialProbeClaim::Blocked => {
+                // Another request can claim the probe after scoring prepared
+                // this roster. Preserve the actual fence and its retry time;
+                // removing only the credential misreports missing candidates.
+                if let Some(until) = applicable
+                    .iter()
+                    .map(|origin| origin.due_at())
+                    .filter(|until| *until > now)
+                    .max()
+                {
+                    lost_probe_fences.insert(admission.account_id.clone(), until);
+                }
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
                     for account in &mut roster.accounts {
@@ -5410,6 +5433,21 @@ fn serve(
             }
         }
     };
+    if !matches!(decision.outcome, Outcome::Admit(_)) && !lost_probe_fences.is_empty() {
+        let mut remaining = state.roster.clone();
+        if let Some(roster) = &mut remaining {
+            roster
+                .accounts
+                .retain(|account| !account.credentials.is_empty());
+        }
+        let remaining = RosterBuild {
+            roster: remaining,
+            context: roster.context.clone(),
+        };
+        if let Some(reply) = route_fence_refusal(&remaining, &lost_probe_fences, params, now) {
+            return Ok(because("route_fence", reply));
+        }
+    }
     if reserved_probe && !matches!(decision.outcome, Outcome::Admit(_)) {
         if let Some(classes) = &ctx.classes {
             if let Some(reply) = empty_roster_refusal(
@@ -7104,6 +7142,63 @@ mod tests {
             OpReply::Error { code, message, .. } => {
                 panic!("expected a result, got {code}: {message}")
             }
+        }
+    }
+
+    #[test]
+    fn a_probe_claimed_after_roster_preparation_returns_its_fence_not_missing_candidates() {
+        let fixture = fixture("claim-after-roster");
+        let ctx = fixture.ctx(true, NOW);
+        let mut roster = roster_for_model(&ctx, "anthropic", Some("claude-opus-5-5"));
+        let accounts = &mut roster.roster.as_mut().unwrap().accounts;
+        accounts.retain(|account| account.account_id == ACCOUNT_A);
+        assert_eq!(accounts.len(), 1);
+        accounts[0].quota = None;
+        fixture
+            .store()
+            .account_transaction(|tx| {
+                tx.record_non_quota_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                    provider: "anthropic".into(),
+                    credential_id: "oauth:anthropic".into(),
+                    model: "claude-opus-5-5".into(),
+                    until_ms: NOW,
+                    recorded_at: NOW - 100,
+                    decision_id: "refusal".into(),
+                })
+            })
+            .unwrap();
+        let due = fixture.store().fence_rechecks().unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(fixture
+            .store()
+            .account_transaction(|tx| tx.grant_fence_rechecks(&due, NOW, Some("winning-decision")))
+            .unwrap());
+        let mut request = admit_params("loser", "claim-after-roster", "broca");
+        request["candidates"] = json!({"view_digest":"same-runner-list","accounts":[{"account_id":ACCOUNT_A,"credential_id":"oauth:anthropic"}]});
+        let parsed = parse_account_for(&request).unwrap();
+        let reply = fixture
+            .store()
+            .account_transaction(|tx| {
+                serve(
+                    tx,
+                    &ctx,
+                    "runner",
+                    &parsed,
+                    "anthropic",
+                    &roster,
+                    "loser-fingerprint",
+                )
+            })
+            .unwrap();
+        match reply {
+            OpReply::Error { code, detail, .. } => {
+                assert_eq!(
+                    code, "account_pool_exhausted",
+                    "a lost claim must retain its fence cause"
+                );
+                assert_eq!(detail.unwrap()["reset_at_ms"], NOW + 3_600_000);
+            }
+            other => panic!("a second probe was admitted: {other:?}"),
         }
     }
 
