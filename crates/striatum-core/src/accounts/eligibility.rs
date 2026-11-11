@@ -171,6 +171,31 @@ impl QuotaEval {
             && self.weight.is_some()
     }
 
+    /// Eligible except for the Broca floor: every reserve-tier reason is
+    /// `BelowBrocaFloor`, and every other check (reserve, scope, policy
+    /// floors, quota freshness) passed with a positive weight. Cold placement
+    /// falls back to such an account only when no account clears the floor.
+    pub fn eligible_below_broca_floor(&self) -> bool {
+        self.unknown
+            .iter()
+            .all(|reason| matches!(reason, ExclusionReason::QuotaMissing))
+            && !self.reserve.is_empty()
+            && self
+                .reserve
+                .iter()
+                .all(|reason| matches!(reason, ExclusionReason::BelowBrocaFloor { .. }))
+            && self.weight.is_some()
+    }
+
+    /// The fewest spendable points left on any of the account's windows: the
+    /// window a run would hit first.
+    pub fn headroom(&self) -> f64 {
+        self.window_weights
+            .iter()
+            .map(|window| window.spendable)
+            .fold(f64::INFINITY, f64::min)
+    }
+
     pub fn write_note(&self, note: &mut AccountNote) {
         note.exclusions.extend(self.unknown.iter().cloned());
         note.exclusions.extend(self.reserve.iter().cloned());
@@ -347,6 +372,15 @@ pub fn evaluate_quota(
             w.window_minutes,
             now,
         );
+        // The Broca floor was introduced as a wall (the prefrontal repository's
+        // docs/designs/account-selection.md, "New-session rule" step 4): a
+        // Broca run is frozen to its account and core ends it at the first
+        // `account_limit_exhausted`, so it cannot move between requests the
+        // way a plugin session can. It is now a preference: the reason still
+        // keeps the account out of normal scoring, but when no account clears
+        // the floor, cold placement admits the one with the most headroom
+        // (`eligible_below_broca_floor`) rather than refusing every new run
+        // while real quota remains.
         if caller == CallerKind::Broca && weight.spendable < policy.broca_floor_points {
             eval.reserve.push(ExclusionReason::BelowBrocaFloor {
                 window,

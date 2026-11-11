@@ -3626,7 +3626,9 @@ async fn codex_selected_provider(used: [f64; 3], legacy: bool) -> String {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let result = &reply.1["result"];
     if legacy {
-        if used[2] >= 98.0 {
+        // The last account walls the pool only once routing's 1-point reserve
+        // leaves it nothing spendable; the Broca floor alone no longer does.
+        if used[2] >= 99.0 {
             assert_eq!(
                 result["selected"]["routeKey"], "fallback/adequate",
                 "{}",
@@ -3645,7 +3647,7 @@ async fn codex_selected_provider(used: [f64; 3], legacy: bool) -> String {
             .unwrap()
             .iter()
             .find(|signal| signal["capacityKey"] == "openai/gpt-6-luna");
-        if used[2] >= 98.0 {
+        if used[2] >= 99.0 {
             assert_eq!(
                 luna.unwrap()["exhaustedUntil"],
                 json!((NOW + 86_400_000) as f64)
@@ -3670,8 +3672,22 @@ async fn codex_three_exhausted_accounts_select_an_adequate_fallback() {
     let _clock = crate::InjectedClock::set(NOW);
     for legacy in [true, false] {
         assert_eq!(
-            codex_selected_provider([100.0, 100.0, 98.0], legacy).await,
+            codex_selected_provider([100.0, 100.0, 100.0], legacy).await,
             "fallback"
+        );
+    }
+}
+
+#[tokio::test]
+async fn codex_accounts_below_the_broca_floor_keep_luna() {
+    // Every account below the Broca floor's 5 spendable points, but the 95%
+    // and 96% accounts still have quota above the reserve: sidekicks keep
+    // running on them instead of losing the pool.
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [true, false] {
+        assert_eq!(
+            codex_selected_provider([100.0, 95.0, 96.0], legacy).await,
+            "openai"
         );
     }
 }

@@ -126,7 +126,8 @@ pub enum ExclusionReason {
     BelowReserve {
         windows: Vec<ApplicableWindow>,
     },
-    /// A Broca cold admission needs `broca_floor_points` spendable.
+    /// A Broca cold admission prefers `broca_floor_points` spendable; below
+    /// it, the account is used only when no account clears the floor.
     BelowBrocaFloor {
         window: GeneralWindow,
         spendable: f64,
@@ -368,6 +369,11 @@ pub enum AdmitReason {
     ImportedAffinity,
     /// Cold scoring (steps 4-7).
     ColdScored,
+    /// Cold scoring for a Broca run when no account cleared the Broca floor:
+    /// the account with the most spendable points left, admitted anyway. Its
+    /// note still lists `below_broca_floor`, so a later mid-run limit can be
+    /// traced to this choice.
+    ColdBelowBrocaFloor,
     RequestedAccount,
     OperatorOverride,
     /// The override admitted an account whose quota is unknown.

@@ -481,8 +481,9 @@ pub struct AllocatorPolicy {
     pub reserve_seven_day: f64,
     /// Reserve on a family's scoped window (0, as the reference outside its killswitch).
     pub reserve_scoped: f64,
-    /// Points that must stay spendable on every applicable general window for
-    /// a Broca cold admission.
+    /// Points a Broca cold admission prefers to have spendable on every
+    /// applicable general window. Accounts below it are used only when no
+    /// account clears it.
     pub broca_floor_points: f64,
     /// Request bytes charged when the caller could not measure its prompt.
     pub estimated_request_bytes: u64,
