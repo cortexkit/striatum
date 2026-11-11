@@ -140,9 +140,13 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
                 || state.credential_refusal.is_some();
         }
         if !candidate.engine.local && candidate.engine.kind == request.kind {
-            // Media engines have no subscription alternative or pin operation.
-            // Apply explicit operator rules, not the LLM-only metered default.
-            candidate.fenced |= !config.route_allowed(&request.consumer, &key, false);
+            // Media engines have no subscription alternative and no pin
+            // operation, so a pin-only rule (provider or model) would make an
+            // engine unusable rather than "pinned only". Evaluate operator rules
+            // as a pinned request does: `not_for` and consumer exclusions still
+            // refuse an engine, while pin-only rules and the LLM-only metered
+            // default do not.
+            candidate.fenced |= !config.route_allowed(&request.consumer, &key, true);
             candidate.fenced |= !accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
                 .map_err(store_refusal)?;

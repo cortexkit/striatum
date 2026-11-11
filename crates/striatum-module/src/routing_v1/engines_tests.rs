@@ -584,28 +584,29 @@ async fn remote_engines_are_automatic_without_llm_spending_opt_in() {
 }
 
 #[tokio::test]
-async fn remote_engine_operator_rules_still_restrict_automatic_selection() {
+async fn remote_engine_operator_rules_refuse_by_consumer_but_ignore_pin_only() {
     let harness = setup(vec![engine("remote", false)]);
     let route = harness.bind(reserved("colliculus"), None).await;
-    for rules in [json!({"pin_only":true}), json!({"not_for":["colliculus"]})] {
-        harness.edit_config(|config| config["providers"]["media-vendor"] = rules);
-        let refused = route.call("route.select_engine", &request()).await;
-        assert_eq!(refused.0, FrameType::Error, "{refused:?}");
-        assert_eq!(refused.1["code"], "no_engine");
-    }
+    // A consumer-scoped refusal still keeps the engine out.
+    harness.edit_config(|config| config["providers"]["media-vendor"] = json!({"not_for":["colliculus"]}));
+    let refused = route.call("route.select_engine", &request()).await;
+    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+    assert_eq!(refused.1["code"], "no_engine");
+    // Engines have no pin operation, so a pin-only rule must not make them
+    // unusable: a provider marked pin-only for chat models still serves media.
+    harness.edit_config(|config| config["providers"]["media-vendor"] = json!({"pin_only":true}));
+    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
     harness.edit_config(|config| {
         config["providers"]["media-vendor"] = json!({"pin_only":true});
-        config["models"]["media-vendor/remote"] = json!({"pin_only":false});
+        config["models"]["media-vendor/remote"] = json!({"pin_only":true});
     });
     assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
-    // The old exclude grammar converts to explicit entity rules, which still
-    // restrict engines even though the LLM-only billing default does not.
+    // The old exclude grammar converts to pin-only entity rules, which are
+    // likewise not a refusal for an engine.
     let excluded = crate::config_convert::convert_value(json!({"model_routing":{"exclude":{"all":["media-vendor"]}}})).unwrap();
     harness.edit_config(|config| {
         config["providers"] = excluded["providers"].clone();
         config["models"] = json!({});
     });
-    let refused = route.call("route.select_engine", &request()).await;
-    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
-    assert_eq!(refused.1["code"], "no_engine");
+    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
 }
