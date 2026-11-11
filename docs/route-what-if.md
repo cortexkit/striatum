@@ -94,7 +94,8 @@ only narrow the runner's admitted pairs.
 
 * `consumer`: a registered consumer name, including a registered dotted name.
 * `iqs`: 1–101 finite numbers in 0–100, evaluated in supplied order; fractional
-  demand is retained.
+  demand is retained. It may be omitted only when `panel` is present, and then
+  `results` is empty.
 * `eq`: optional finite demand in 0–100. If absent, normal consumer defaults apply.
 * `runner`: optional `"broca"`; omission uses the normal eligible runner set.
 * `policy_patch.models`: optional map from provider/model keys to any combination
@@ -110,6 +111,13 @@ only narrow the runner's admitted pairs.
 * `head_choices`: optional object with required `runner_module` and optional
   `harness`, as in `route.head_choices`. Requests the same picker response under
   the call's policy and runner declaration overrides, alongside the IQ sweep.
+* `panel`: optional object `{class, package_tokens?, runners?, seed?}` that
+  dry-runs `route.select_panel` for `consumer` (see [Panel dry run](#panel-dry-run)).
+  `class` is one class name or a list of 1–16 names; each is seated separately.
+  The members are passed to `route.select_panel`'s own request parser, so a
+  malformed member, and a class routing has no policy for, is refused with the
+  same error `route.select_panel` returns. `runners` defaults to `[runner]` when
+  the top-level `runner` is given. Unknown members are rejected.
 
 Consumer policy, global exclusions, configured service tiers, grades, pricing,
 runner availability and account eligibility all remain in force. As with
@@ -123,7 +131,8 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 
 The management response's `result` contains `consumer`, `results`, `snapshot_ms`
 and `elapsed_ms`, plus `head_choices` when requested (the unchanged
-`route.head_choices` response shape). Each `results` row contains:
+`route.head_choices` response shape) and `panels` when `panel` is supplied. Each
+`results` row contains:
 
 ```json
 {
@@ -164,6 +173,84 @@ remain present. If selection stops before model admission (for example no
 runner is available), bar/frontier objects and candidate arrays can be empty.
 Malformed requests and unauthorized callers are top-level errors, not rows.
 
+## Panel dry run
+
+Panels are not seated by single select. `route.select_panel` ranks top-K seats
+by the class policy's `by` order (IQ, EQ or cost), then fills extra seats by
+`extra_by` (random, IQ, EQ or cost), one route per family and per canonical
+model. The class floor (a demand bar relative to the top routable route) gates
+only non-IQ-ranked top seats and extra seats. Each scored route is then checked
+by a pinned select for runner and account admission. Class policies come from
+operator `panels` settings, or from the class's built-in default.
+
+With `panel`, the what-if runs that same code path for each listed class,
+under the call's `policy_patch` and `runner_declarations`, against the same
+account snapshot as the IQ sweep. For example, as if two routes were not for
+Athena:
+
+```json
+{
+  "method": "route.what_if",
+  "params": {
+    "consumer": "athena",
+    "panel": {"class": ["audit", "spec", "diagnose"], "seed": "task-123"},
+    "policy_patch": {
+      "models": {
+        "openai/gpt-5-5": {"not_for": ["athena"]},
+        "google/gemini-3-pro": {"not_for": ["athena"]}
+      }
+    }
+  }
+}
+```
+
+`seed` makes the random extra seat deterministic, as it does for
+`route.select_panel`. Without it the dry run uses the empty seed, which is what
+`route.select_panel` draws with when a request carries none; each row reports
+the seed used and `seed_source` (`request` or `default`). The same seed and
+inputs seat the same routes as `route.select_panel` would.
+
+The result gains `panels`, one row per class in request order:
+
+```json
+{
+  "class": "audit",
+  "policy": {"source": "settings", "top_k": 2, "by": "iq", "extra": 1,
+             "extra_by": "random", "floor": 80, "width": 3},
+  "seed": "task-123",
+  "seed_source": "request",
+  "seats": [{
+    "slot": 0,
+    "phase": "top",
+    "route": "provider/model",
+    "variant": "high",
+    "family": "claude",
+    "rank": 1,
+    "cost_usd": null,
+    "chosen_by": "top-2 seat ranked 1 by iq; class floor 80 does not apply to IQ-ranked top seats"
+  }],
+  "shortfall": null,
+  "funnel": {"catalog": 12, "scored": 12, "operatorAdmitted": 10, "...": 0}
+}
+```
+
+* `policy.source` is `settings` when operator settings name the class's policy
+  and `default` for its built-in policy.
+* `seats` are in slot order. `phase` is `top` or `extra`; `rank` is the scorer's
+  position in that phase's order, absent for a random extra draw; `chosen_by`
+  states the rule in words. `variant` and `cost_usd` are as for the IQ sweep's
+  `pick`.
+* `shortfall` is `null` when every seat of the policy's width was filled.
+  Otherwise it is `route.select_panel`'s shortfall: `code` and a `detail` whose
+  `causes` list each rejected candidate with its typed reason (for example
+  `excluded_by_operator`, `family_duplicate`, `package_too_large`, or a final
+  admission refusal such as `account_hold`).
+* `funnel` is the scorer's candidate funnel, with camelCase keys: cumulative
+  route counts at each admission gate, named in `gateOrder`.
+* A class whose panel fails for another reason (for example routing has not yet
+  loaded its first prices, refused as `routing_not_ready`) has empty `seats` and
+  `refusal: {code, detail}`.
+
 ## Isolation
 
 The op holds live configuration snapshots for the sweep and overlays policy in
@@ -172,7 +259,9 @@ snapshot shared by the sweep and optional head picker; no live catalog entry is
 changed. It uses the same preparation, scorer, selection ordering and variant
 policy as `route.select`, returning before decision persistence or pool-key
 acquisition. It also skips the counters of routing calls by method, request shape
-and principal.
+and principal. A panel dry run writes no panel row, records no seat decision and
+takes no account hold: each seat is checked by the same evaluation path as the
+IQ sweep.
 
 Account preparation normally reconciles stale eligibility/fences and expired
 continuations. The what-if reconciles only an isolated in-memory projection of

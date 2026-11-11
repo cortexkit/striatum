@@ -50,41 +50,16 @@ pub(super) async fn select_panel(
     let request = parse_select_panel_request_serving(params, super::describe::CAPABILITIES)?;
     let config = operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
-    let class = class(&request)?;
-    let policy = crate::panel_policy::class_policy(config.panels(), class);
-    if !(1..=8).contains(&policy.width()) {
-        return Err(Refusal::invalid_request(
-            "class",
-            "panel policy size must be 1-8",
-        ));
-    }
-    let (panel, _, mut rejected) = candidates(&request, &[], &[], caller, deps).await?;
-    let mut seats = Vec::new();
-    let mut families = HashSet::new();
-    for member in &panel.members {
-        let family = family(member.family.as_deref());
-        if families.contains(&family) {
-            let mut cause = PanelRejectedCandidate::new(&member.route_key, "family_duplicate");
-            cause.detail = Some(json!(format!(
-                "a seated route already represents family {family}"
-            )));
-            rejected.push(cause);
-            continue;
-        }
-        let slot = panel
-            .policy
-            .as_ref()
-            .and_then(|p| p.seats.iter().find(|s| s.route_key == member.route_key))
-            .map_or(seats.len() as u64, |seat| seat.slot as u64);
-        match admit_seat(&request, member, slot, policy.top_k as u64, caller, deps).await? {
-            SeatAdmission::Seated(seat) => {
-                families.insert(family);
-                seats.push(seat);
-            }
-            SeatAdmission::Rejected(cause) => rejected.push(cause),
-        }
-    }
-    seats.sort_by_key(|seat| seat.slot);
+    let policy = request_policy(&request, &config)?;
+    let (_, seats, shortfall) = seat_panel(&request, policy, caller, deps, None).await?;
+    // A live pass admits every seat through `route.select`, so each is `Live`.
+    let seats = seats
+        .into_iter()
+        .filter_map(|seat| match seat {
+            Seat::Live(seat) => Some(seat),
+            Seat::Evaluated(_) => None,
+        })
+        .collect();
     let mut answer = SelectPanelAnswer::new(
         striatum_store::new_decision_id(),
         PanelPolicy::new(
@@ -98,15 +73,7 @@ pub(super) async fn select_panel(
     answer.policy.extra_ranking = policy.extra_by.map(|order| json!(order));
     answer.policy.floor = policy.floor.map(|floor| json!(floor));
     answer.policy.seed = request.seed.as_ref().map(|seed| json!(seed));
-    if answer.seats.len() < policy.width() {
-        answer.shortfall = Some(panel_shortfall(
-            panel.shortfall.as_ref(),
-            answer.seats.len(),
-            policy.width(),
-            request.package_tokens,
-            rejected,
-        ));
-    }
+    answer.shortfall = shortfall;
     let state = StoredPanel {
         request,
         history: answer
@@ -125,6 +92,151 @@ pub(super) async fn select_panel(
         )
         .map_err(store_refusal)?;
     serde_json::to_value(state.answer).map_err(store_refusal)
+}
+
+/// The class policy a new panel runs under, refusing a class routing has no
+/// policy for and a configured width outside 1-8.
+pub(super) fn request_policy(
+    request: &SelectPanelRequest,
+    config: &crate::config_overrides::LiveConfig,
+) -> Result<scoring::ClassPanelPolicy, Refusal> {
+    let class = class(request)?;
+    let policy = crate::panel_policy::class_policy(config.panels(), class);
+    if !(1..=8).contains(&policy.width()) {
+        return Err(Refusal::invalid_request(
+            "class",
+            "panel policy size must be 1-8",
+        ));
+    }
+    Ok(policy)
+}
+
+/// The call-local inputs an operator what-if seats a panel with: patched
+/// configuration and a disposable account-evidence store. Seats are checked by
+/// select's evaluation path, which returns before recording a decision, taking
+/// a hold or acquiring a pool key, and no panel row is written.
+pub(super) struct DryRun<'a> {
+    pub live_config: Arc<crate::config_overrides::LiveConfig>,
+    pub operator_config: Arc<crate::config_overrides::LiveConfig>,
+    pub account_store: &'a crate::SharedStore,
+    pub profile_lookup: &'a super::select::ProfileLookup,
+}
+
+/// A seat a dry-run panel would fill. No decision backs it.
+pub(super) struct EvaluatedSeat {
+    pub slot: u64,
+    pub phase: PanelPhase,
+    pub route: Value,
+    pub variant: Value,
+    pub cost_usd: Value,
+    pub family: Option<String>,
+    /// The scorer's rank within the seat's phase; absent for a random extra draw.
+    pub rank: Option<usize>,
+}
+
+/// What a dry-run panel would seat, with the scorer's admission evidence.
+pub(super) struct PanelEvaluation {
+    pub seats: Vec<EvaluatedSeat>,
+    pub shortfall: Option<PanelShortfall>,
+    pub funnel: Option<scoring::PanelCandidateFunnel>,
+}
+
+/// Seat a new panel exactly as `route.select_panel` does, against a what-if's
+/// call-local configuration and account snapshot, and record nothing.
+pub(super) async fn evaluate_panel(
+    request: &SelectPanelRequest,
+    policy: scoring::ClassPanelPolicy,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    dry: &DryRun<'_>,
+) -> Result<PanelEvaluation, Refusal> {
+    let (panel, seats, shortfall) = seat_panel(request, policy, caller, deps, Some(dry)).await?;
+    Ok(PanelEvaluation {
+        // A dry pass checks every seat through select's evaluation path.
+        seats: seats
+            .into_iter()
+            .filter_map(|seat| match seat {
+                Seat::Evaluated(seat) => Some(seat),
+                Seat::Live(_) => None,
+            })
+            .collect(),
+        shortfall,
+        funnel: panel.policy.and_then(|policy| policy.funnel),
+    })
+}
+
+enum Seat {
+    Live(PanelSeat),
+    Evaluated(EvaluatedSeat),
+}
+
+impl Seat {
+    fn slot(&self) -> u64 {
+        match self {
+            Seat::Live(seat) => seat.slot,
+            Seat::Evaluated(seat) => seat.slot,
+        }
+    }
+}
+
+/// Rank, dedupe by family and admit every scored member, in slot order. A
+/// shortfall is returned when fewer seats than the policy's width were filled.
+async fn seat_panel(
+    request: &SelectPanelRequest,
+    policy: scoring::ClassPanelPolicy,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    dry: Option<&DryRun<'_>>,
+) -> Result<(scoring::SelectedPanel, Vec<Seat>, Option<PanelShortfall>), Refusal> {
+    let (panel, _, mut rejected) = candidates(request, &[], &[], caller, deps, dry).await?;
+    let mut seats = Vec::new();
+    let mut families = HashSet::new();
+    for member in &panel.members {
+        let family = family(member.family.as_deref());
+        if families.contains(&family) {
+            let mut cause = PanelRejectedCandidate::new(&member.route_key, "family_duplicate");
+            cause.detail = Some(json!(format!(
+                "a seated route already represents family {family}"
+            )));
+            rejected.push(cause);
+            continue;
+        }
+        let scored = panel
+            .policy
+            .as_ref()
+            .and_then(|p| p.seats.iter().find(|s| s.route_key == member.route_key));
+        let slot = scored.map_or(seats.len() as u64, |seat| seat.slot as u64);
+        let top = policy.top_k as u64;
+        let admission = match dry {
+            None => admit_seat(request, member, slot, top, caller, deps)
+                .await?
+                .map(Seat::Live),
+            Some(dry) => {
+                let rank = scored.and_then(|seat| seat.rank);
+                evaluate_seat(request, member, slot, top, rank, caller, deps, dry)
+                    .await?
+                    .map(Seat::Evaluated)
+            }
+        };
+        match admission {
+            SeatAdmission::Seated(seat) => {
+                families.insert(family);
+                seats.push(seat);
+            }
+            SeatAdmission::Rejected(cause) => rejected.push(cause),
+        }
+    }
+    seats.sort_by_key(Seat::slot);
+    let shortfall = (seats.len() < policy.width()).then(|| {
+        panel_shortfall(
+            panel.shortfall.as_ref(),
+            seats.len(),
+            policy.width(),
+            request.package_tokens,
+            rejected,
+        )
+    });
+    Ok((panel, seats, shortfall))
 }
 
 fn panel_shortfall(
@@ -158,7 +270,7 @@ fn panel_shortfall(
     PanelShortfall::new(code).with_typed_detail(detail)
 }
 
-fn class(request: &SelectPanelRequest) -> Result<scoring::PanelClass, Refusal> {
+pub(super) fn class(request: &SelectPanelRequest) -> Result<scoring::PanelClass, Refusal> {
     serde_json::from_value(json!(request.class.as_str().to_ascii_uppercase()))
         .map_err(|_| Refusal::invalid_request("class", "no policy for panel class"))
 }
@@ -191,19 +303,25 @@ async fn settings(
     Ok(crate::tier_settings::Layers::new(None, None))
 }
 
-enum SeatAdmission {
-    Seated(PanelSeat),
+enum SeatAdmission<S = PanelSeat> {
+    Seated(S),
     Rejected(PanelRejectedCandidate),
 }
 
-async fn admit_seat(
+impl<S> SeatAdmission<S> {
+    fn map<T>(self, seat: impl FnOnce(S) -> T) -> SeatAdmission<T> {
+        match self {
+            SeatAdmission::Seated(seated) => SeatAdmission::Seated(seat(seated)),
+            SeatAdmission::Rejected(cause) => SeatAdmission::Rejected(cause),
+        }
+    }
+}
+
+/// The pinned select request that checks one scored member, and its pin.
+fn seat_select(
     request: &SelectPanelRequest,
     member: &scoring::PanelMember,
-    slot: u64,
-    top: u64,
-    caller: &Caller,
-    deps: &Deps<'_>,
-) -> Result<SeatAdmission, Refusal> {
+) -> Result<(Value, cortexkit_role_routing::select::RouteRef), Refusal> {
     let mut select = serde_json::to_value(request.seat_request(&[])).map_err(store_refusal)?;
     let mut route = cortexkit_role_routing::select::RouteRef::parse_pin(&member.route_key)
         .ok_or_else(|| store_refusal("scorer returned an invalid route"))?;
@@ -222,34 +340,53 @@ async fn admit_seat(
             select["requirements"]["modalities"] = json!(modalities);
         }
     }
+    Ok((select, route))
+}
+
+/// A seat refusal that leaves the slot to the next member, or `None` when the
+/// refusal must fail the whole panel.
+fn seat_rejection(
+    route: &cortexkit_role_routing::select::RouteRef,
+    refusal: &Refusal,
+) -> Option<PanelRejectedCandidate> {
+    if !matches!(
+        refusal.code.as_str(),
+        "no_route" | "pin_unavailable" | "accounts_blocked" | "account_hold" | "auth_required"
+    ) {
+        return None;
+    }
+    let mut cause = PanelRejectedCandidate::new(route.pin(), refusal.code.as_str());
+    cause.reset_at_ms = refusal.detail.get("reset_at_ms").and_then(Value::as_u64);
+    cause.detail = Some(json!(refusal));
+    Some(cause)
+}
+
+fn seat_phase(slot: u64, top: u64) -> PanelPhase {
+    if slot < top {
+        PanelPhase::Top
+    } else {
+        PanelPhase::Extra
+    }
+}
+
+async fn admit_seat(
+    request: &SelectPanelRequest,
+    member: &scoring::PanelMember,
+    slot: u64,
+    top: u64,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<SeatAdmission, Refusal> {
+    let (select, route) = seat_select(request, member)?;
     let answer = match super::select::panel_seat(&select, caller, deps).await {
         Ok(answer) => serde_json::from_value::<SelectAnswer>(answer).map_err(store_refusal)?,
-        Err(refusal)
-            if matches!(
-                refusal.code.as_str(),
-                "no_route"
-                    | "pin_unavailable"
-                    | "accounts_blocked"
-                    | "account_hold"
-                    | "auth_required"
-            ) =>
-        {
-            let mut cause = PanelRejectedCandidate::new(route.pin(), refusal.code.as_str());
-            cause.reset_at_ms = refusal.detail.get("reset_at_ms").and_then(Value::as_u64);
-            cause.detail = Some(json!(refusal));
-            return Ok(SeatAdmission::Rejected(cause));
+        Err(refusal) => {
+            return seat_rejection(&route, &refusal)
+                .map(SeatAdmission::Rejected)
+                .ok_or(refusal)
         }
-        Err(refusal) => return Err(refusal),
     };
-    let mut seat = PanelSeat::new(
-        slot,
-        if slot < top {
-            PanelPhase::Top
-        } else {
-            PanelPhase::Extra
-        },
-        answer,
-    );
+    let mut seat = PanelSeat::new(slot, seat_phase(slot, top), answer);
     seat.family = member.family.clone();
     seat.temperature = request
         .temperatures
@@ -257,6 +394,50 @@ async fn admit_seat(
         .and_then(|t| t.get(slot as usize))
         .copied();
     Ok(SeatAdmission::Seated(seat))
+}
+
+/// `admit_seat` for a dry run: the same pinned select request, checked by
+/// select's evaluation path against the dry run's configuration and accounts.
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_seat(
+    request: &SelectPanelRequest,
+    member: &scoring::PanelMember,
+    slot: u64,
+    top: u64,
+    rank: Option<usize>,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    dry: &DryRun<'_>,
+) -> Result<SeatAdmission<EvaluatedSeat>, Refusal> {
+    let (select, route) = seat_select(request, member)?;
+    // The seat request's requirements are the inert `iq: 0`; the evaluation's
+    // demand must match it, as the live seat check reads it from the request.
+    let view = super::select::Evaluation {
+        live_config: dry.live_config.clone(),
+        operator_config: dry.operator_config.clone(),
+        account_store: dry.account_store,
+        iq: 0.0,
+        eq: None,
+        evidence: Mutex::new(Default::default()),
+    };
+    let answer =
+        match super::select::evaluate(&select, caller, deps, &view, dry.profile_lookup).await {
+            Ok(answer) => answer,
+            Err(refusal) => {
+                return seat_rejection(&route, &refusal)
+                    .map(SeatAdmission::Rejected)
+                    .ok_or(refusal)
+            }
+        };
+    Ok(SeatAdmission::Seated(EvaluatedSeat {
+        slot,
+        phase: seat_phase(slot, top),
+        route: answer["route"].clone(),
+        variant: answer["variant"].clone(),
+        cost_usd: answer["cost_usd"].clone(),
+        family: member.family.clone(),
+        rank,
+    }))
 }
 
 async fn replace(
@@ -293,7 +474,7 @@ async fn replace(
         .map(|s| family(s.family.as_deref()))
         .collect();
     let (panel, package_blocked, mut rejected) =
-        candidates(&state.request, &exclude, &families, caller, deps).await?;
+        candidates(&state.request, &exclude, &families, caller, deps, None).await?;
     let mut answer = PanelReplacement::unseated(
         id,
         slot,
@@ -347,9 +528,13 @@ async fn candidates(
     standing_families: &[String],
     caller: &Caller,
     deps: &Deps<'_>,
+    dry: Option<&DryRun<'_>>,
 ) -> Result<(scoring::SelectedPanel, bool, Vec<PanelRejectedCandidate>), Refusal> {
-    let config = operator_config(deps);
-    let live = crate::config_overrides::live_config(deps.routing_config_path);
+    let config = dry.map_or_else(|| operator_config(deps), |dry| dry.operator_config.clone());
+    let live = dry.map_or_else(
+        || crate::config_overrides::live_config(deps.routing_config_path),
+        |dry| dry.live_config.clone(),
+    );
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
     let layers = settings(request, caller, deps).await?;
@@ -378,14 +563,17 @@ async fn candidates(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &aliases,
     };
-    let mut priced = crate::price_selection_inputs(
+    // A dry run reads accounts from its disposable snapshot and reserves no
+    // probe, exactly as select's evaluation path does.
+    let mut priced = crate::select::price_selection_inputs_with_probes(
         &mut prepared.facts,
         prepared.quota_signal_json.clone(),
         &sources,
-        deps.store,
+        dry.map_or(deps.store, |dry| dry.account_store),
         deps.broca_credentials,
         true,
         metered,
+        dry.is_none(),
     )
     .map_err(store_refusal)?;
     let registry = {
