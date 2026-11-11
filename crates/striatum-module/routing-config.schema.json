@@ -196,6 +196,13 @@
         "remaining_percent"
       ]
     },
+    "BankedResets": {
+      "type": "string",
+      "enum": [
+        "emergency",
+        "capacity"
+      ]
+    },
     "BasicFamilyConfig": {
       "type": "object",
       "properties": {
@@ -985,6 +992,11 @@
             "strategy": null,
             "unknown_reset_retry": null
           }
+        },
+        "banked_resets": {
+          "description": "Saved-reset pricing: emergency credits one near the wall; capacity counts\nevery unexpired reset as a full quota window. Neither applies a reset.",
+          "$ref": "#/$defs/BankedResets",
+          "default": "emergency"
         },
         "keep_free_percent": {
           "type": [

@@ -4400,6 +4400,7 @@ fn quota_account(used: f64) -> striatum_core::subscription::QuotaAccount {
         short_windows: Vec::new(),
         banked_resets: 3,
         banked_expires_at_ms: Some(2_000_000),
+        banked_credit_expiries_ms: Vec::new(),
         prepaid_credits: false,
     }
 }
@@ -4498,6 +4499,7 @@ fn subscription_scenario(
                     keep_free_percent: if claude { margin } else { 0.0 },
                     plans,
                     allow_banked: false,
+                    banked_as_capacity: false,
                     now_ms: 1_000_000,
                 })),
                 ..Default::default()

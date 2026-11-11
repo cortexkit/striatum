@@ -91,7 +91,15 @@ impl LiveConfig {
         )
     }
     fn new(config: RoutingConfigFile, document: Option<String>) -> Self {
-        let pricing = route_pricing(&config.model_routing);
+        let mut pricing = route_pricing(&config.model_routing);
+        pricing.banked_resets_capacity = config
+            .providers
+            .iter()
+            .filter(|(_, policy)| {
+                policy.banked_resets == crate::config_policy::BankedResets::Capacity
+            })
+            .map(|(provider, _)| provider.clone())
+            .collect();
         Self {
             config,
             document,

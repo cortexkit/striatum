@@ -1432,6 +1432,7 @@ mod reset_tests {
             short_windows: vec![],
             banked_resets: 0,
             banked_expires_at_ms: None,
+            banked_credit_expiries_ms: Vec::new(),
             prepaid_credits: false,
         };
         let runtime = crate::model_router::RouteRuntimeState {

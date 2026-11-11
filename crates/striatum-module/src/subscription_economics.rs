@@ -232,6 +232,15 @@ fn account(reading: &Value, now: i64) -> Option<QuotaAccount> {
                             .min()
                     })
             }),
+        banked_credit_expiries_ms: reading["savedResets"]["credits"]
+            .as_array()
+            .map(|credits| {
+                credits
+                    .iter()
+                    .filter_map(|credit| credit["expiresAt"].as_str().and_then(parse_rfc3339_ms))
+                    .collect()
+            })
+            .unwrap_or_default(),
         prepaid_credits: carries_prepaid_credits(reading),
     })
 }
@@ -541,6 +550,7 @@ fn overlay_pools(
     }
     for (provider, pool) in pools.iter_mut() {
         pool.keep_free_percent = pricing.keep_free_percent(provider);
+        pool.banked_as_capacity = pricing.banked_resets_capacity.contains(provider);
         let elapsed = (now - pool.now_ms).max(0) as f64 / 3_600_000.0;
         for plan in &mut pool.plans {
             if elapsed > 0.25 {
@@ -1541,6 +1551,13 @@ mod tests {
         let mut entry = s.readings.readings.values().next().unwrap().entry.clone();
         entry["savedResets"] = json!({"availableCount":2,"soonestExpiresAt":"2026-10-22T21:05:54.769036000+00:00","credits":[{"expiresAt":"2026-10-29T19:37:32.795474000+00:00"},{"expiresAt":"2026-10-22T21:05:54.769036000+00:00"}]});
         let soonest = account(&entry, NOW).unwrap().banked_expires_at_ms.unwrap();
+        assert_eq!(
+            account(&entry, NOW)
+                .unwrap()
+                .banked_credit_expiries_ms
+                .len(),
+            2
+        );
         entry["savedResets"]
             .as_object_mut()
             .unwrap()
