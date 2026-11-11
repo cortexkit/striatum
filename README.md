@@ -2,14 +2,14 @@
 
 Striatum picks the model and the account for every model call in the CortexKit fleet.
 
-It runs as the `striatum` module under subc, with binary `ck-striatum` and store at `~/.local/share/cortexkit/striatum/store.db` (or `$XDG_DATA_HOME/cortexkit/striatum/store.db`). The crates keep their `prefrontal-routing-*` names until a later change.
+It runs as the `striatum` module under subc, with binary `ck-striatum` and store at `~/.local/share/cortexkit/striatum/store.db` (or `$XDG_DATA_HOME/cortexkit/striatum/store.db`). Its crates are `striatum-core`, `striatum-store` and `striatum-module`.
 
 Settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`); project and workspace tier settings use `.cortexkit/striatum.jsonc` under each root. In each directory, routing falls back to `prefrontal-routing.jsonc` if the new file is absent and logs a rename reminder. If both exist, only `striatum.jsonc` is read and the old file is logged as ignored. Global config readers and live reload keep the startup choice until restart, so restart after moving the fallback file to the new name. `--check-config` validates and names the same selected global file.
 
 ## Build and test
 
 ```sh
-cargo build --locked --release -p prefrontal-routing-module
+cargo build --locked --release -p striatum-module
 bash scripts/rust-test-gate.sh
 ```
 
@@ -18,7 +18,7 @@ The gate needs Rust 1.99.0, Python 3.10 or newer, and cargo-nextest. It runs the
 Six real-daemon tests are ignored by default because they build `../subconscious` and `../insula`, with `../commons` beside them. Run them on a machine that has those checkouts:
 
 ```sh
-cargo nextest run --locked -p prefrontal-routing-module --test it --run-ignored only \
+cargo nextest run --locked -p striatum-module --test it --run-ignored only \
   -E 'test(/^(both_modules_e2e|real_daemon_e2e)::/)'
 ```
 

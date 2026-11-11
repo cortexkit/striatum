@@ -9,11 +9,11 @@ slow-timeout = { period = "120s", terminate-after = 2, grace-period = "60s" }
 daemon = { max-threads = 8 }
 
 [[profile.default.overrides]]
-filter = 'package(=prefrontal-routing-module) and binary(=it) and test(/^(both_modules_e2e|real_daemon_e2e)::/)'
+filter = 'package(=striatum-module) and binary(=it) and test(/^(both_modules_e2e|real_daemon_e2e)::/)'
 test-group = "daemon"
 
 # The quota integration test builds both sibling daemons before exercising them;
 # a cold sibling build needs more time than an ordinary routing test.
 [[profile.default.overrides]]
-filter = 'package(=prefrontal-routing-module) and binary(=it) and test(/^both_modules_e2e::/)'
+filter = 'package(=striatum-module) and binary(=it) and test(/^both_modules_e2e::/)'
 slow-timeout = { period = "240s", terminate-after = 3, grace-period = "60s" }

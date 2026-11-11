@@ -1,6 +1,6 @@
 # Operator selection what-if
 
-`route.what_if` is a **query on the `prefrontal-routing` module's own management
+`route.what_if` is a **query on the `striatum` module's own management
 surface**, not an addition to the public `routing/v1` consumer contract. It runs
 the v1 selection pipeline without owning the consumer or recording a selection.
 It does not deploy, change settings, run a model, or reserve an account.

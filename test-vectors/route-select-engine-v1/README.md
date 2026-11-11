@@ -112,7 +112,7 @@ remove remote candidates at `reachability`. They do **not** return
 From the worktree root:
 
 ```sh
-UPDATE_ROUTE_SELECT_ENGINE_VECTORS=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-prefrontal-routing -E 'test(=routing_v1::select_engine_vectors_tests::serving_bytes_match_tagged_vectors)'
+UPDATE_ROUTE_SELECT_ENGINE_VECTORS=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::select_engine_vectors_tests::serving_bytes_match_tagged_vectors)'
 ```
 
 For a remote CortexKit build, include every JSON file in this directory and

@@ -16,7 +16,7 @@ The optional request `harness` narrows the runner's reach using its declared
 `harness_limits`; a hosted harness without an entry inherits runner-level limits.
 An unhosted harness receives `no_route` with detail reason `harness_unavailable`.
 The contract is also pinned by
-`crates/prefrontal-routing-module/fixtures/replay/head-choices-difference-9.golden.json`;
+`crates/striatum-module/fixtures/replay/head-choices-difference-9.golden.json`;
 that replay uses a different catalog and model set.
 
 - `with-tiers.json`: declared runner, an automatic subscription entry, head reasoning default and standard/fast tiers; ultrafast is absent because the runner cannot apply it.
@@ -37,7 +37,7 @@ paths listed above and `SHA256SUMS` under `test-vectors/route-head-choices-v1/`.
 copies the generated files back to the same paths in the local worktree:
 
 ```sh
-UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1 cargo nextest run --locked -p prefrontal-routing-module --bin ck-striatum -E 'test(=routing_v1::head_choices_tests::serving_bytes_match_tagged_vectors)'
+UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1 cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routing_v1::head_choices_tests::serving_bytes_match_tagged_vectors)'
 ```
 
 Setting `UPDATE_ROUTE_HEAD_CHOICES_VECTORS=1` writes the generated files.

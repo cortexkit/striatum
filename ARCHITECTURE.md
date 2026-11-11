@@ -21,15 +21,15 @@ Routing owns no model facts and no credentials. It reads them from the modules t
 
 ## Crates
 
-The crates keep their `prefrontal-routing-*` names for now; their rename is separate from the runtime switch.
+The three crates share the `striatum-*` prefix with the runtime module.
 
-- `prefrontal-routing-core`: the selection policy (scoring, eligibility, quota pressure, account allocation), with no SQL and no transport.
-- `prefrontal-routing-store`: routing's SQLite store and its migrations. Routing alone opens it.
-- `prefrontal-routing-module`: the binary. It serves the wire contract, refreshes the inputs above, and writes decisions, admissions and reports to the store.
+- `striatum-core`: the selection policy (scoring, eligibility, quota pressure, account allocation), with no SQL and no transport.
+- `striatum-store`: routing's SQLite store and its migrations. Routing alone opens it.
+- `striatum-module`: the binary. It serves the wire contract, refreshes the inputs above, and writes decisions, admissions and reports to the store.
 
 ## Rules
 
 - Consumers never repeat routing's policy. They ask, and they act on the answer.
 - A refusal names its reason and, when known, when to retry (`reset_at_ms` or `retry_after`), so the consumer can wait instead of failing.
 - Account walls (an exhausted account, a refused credential) live in routing's store and outlast restarts.
-- Wire samples from consumers sit in crate fixtures with their source recorded in `crates/prefrontal-routing-module/fixtures/IMPORTED.md`. Routing's own reply samples sit in `test-vectors/`.
+- Wire samples from consumers sit in crate fixtures with their source recorded in `crates/striatum-module/fixtures/IMPORTED.md`. Routing's own reply samples sit in `test-vectors/`.

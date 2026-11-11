@@ -16,7 +16,7 @@ Two refinements learned from the first draft, both of which produced wrong
 answers before they were fixed:
 
   RE-EXPORTS COUNT AS WIRING. `pub use panel::{...}` in lib.rs flattens a
-  module's symbols, and consumers then write `use prefrontal_routing_core::Foo`
+  module's symbols, and consumers then write `use striatum_core::Foo`
   and never name `panel` at all. Treating those as unwired flagged seven
   healthy modules.
 
@@ -50,13 +50,13 @@ ALLOWLIST = ROOT / "scripts" / "unreachable-modules.allow"
 
 # Crates that produce a running binary. Reachability is measured from these.
 BINARY_CRATES = {
-    "prefrontal-routing-module",
+    "striatum-module",
 }
 
 CRATE_ALIASES = {
-    "prefrontal_routing_core": "prefrontal-routing-core",
-    "prefrontal_routing_store": "prefrontal-routing-store",
-    "prefrontal_routing_module": "prefrontal-routing-module",
+    "striatum_core": "striatum-core",
+    "striatum_store": "striatum-store",
+    "striatum_module": "striatum-module",
 }
 
 MODULE_DECLARATION = re.compile(

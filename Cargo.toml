@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/prefrontal-routing-core",
-    "crates/prefrontal-routing-store",
-    "crates/prefrontal-routing-module",
+    "crates/striatum-core",
+    "crates/striatum-store",
+    "crates/striatum-module",
 ]
 
 # Line tables keep test backtraces useful without full debug-info link costs.

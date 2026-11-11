@@ -67,7 +67,7 @@ trap 'exit 143' TERM
 if [ -n "$PREBUILT" ]; then
   SRC="$PREBUILT"
 else
-PKG="prefrontal-routing-module"
+PKG="striatum-module"
 (
   cd "$REPO_ROOT"
   # Deployment attests this checkout, not any caller-supplied build environment.

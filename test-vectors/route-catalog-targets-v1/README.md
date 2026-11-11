@@ -1,6 +1,6 @@
 # route.catalog_targets v1
 
-Producer: `prefrontal-routing-module`, through `select::handle_select_request`
+Producer: `striatum-module`, through `select::handle_select_request`
 and `catalog_targets::serve`. The JSON files are exact subc frame body bytes
 (no trailing newline), not hand-written response examples.
 
@@ -16,7 +16,7 @@ and `catalog_targets::serve`. The JSON files are exact subc frame body bytes
 Regenerate from the worktree root with:
 
 ```sh
-CARGO_INCREMENTAL=0 UPDATE_ROUTE_CATALOG_TARGETS_VECTORS=1 cargo nextest run -p prefrontal-routing-module --bin ck-striatum -E 'test(=tests::catalog_targets_contract::serving_bytes_match_tagged_vectors)'
+CARGO_INCREMENTAL=0 UPDATE_ROUTE_CATALOG_TARGETS_VECTORS=1 cargo nextest run -p striatum-module --bin ck-striatum -E 'test(=tests::catalog_targets_contract::serving_bytes_match_tagged_vectors)'
 ```
 
 The same test, without the update variable, checks the producer bytes and hashes
