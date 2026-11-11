@@ -300,10 +300,9 @@ pub(crate) fn prepare_candidates(
                     .iter()
                     .filter(|row| {
                         row.state == "active"
-                            && row
-                                .categories
-                                .iter()
-                                .any(|category| category == "llm-provider")
+                            && row.categories.iter().any(|category| {
+                                matches!(category.as_str(), "llm-provider" | "llm-gateway")
+                            })
                             && crate::broca_credentials::credential_providers(
                                 row,
                                 &catalog_providers,
@@ -504,7 +503,7 @@ fn with_vault_methods(
             || !row
                 .categories
                 .iter()
-                .any(|category| category == "llm-provider")
+                .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         {
             continue;
         }

@@ -69,6 +69,8 @@ mod diagnostics_tests;
 #[cfg(test)]
 mod dispatch_tests;
 #[cfg(test)]
+mod gateway_tests;
+#[cfg(test)]
 #[path = "../head_choices_tests.rs"]
 mod head_choices_tests;
 #[cfg(test)]

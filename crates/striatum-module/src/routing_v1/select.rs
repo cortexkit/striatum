@@ -1443,7 +1443,15 @@ async fn select_at_tier(
         basis.as_str()
     ));
     let mut runner_ref = RunnerRef::new(runner.module.clone(), route.clone());
-    if key_pool::is_pool_provider(&catalog_targets, &route.provider) {
+    // Gateways borrow catalog rows too, but the runner uses the gateway
+    // credential's endpoint directly; they are not API-key pools.
+    if key_pool::is_pool_provider(&catalog_targets, &route.provider)
+        && !fact.is_some_and(|fact| {
+            fact.billing_plane
+                .as_ref()
+                .is_some_and(|plane| plane.auth_method == "gateway")
+        })
+    {
         let runner_admits_keys = registry.get(&runner.module).is_some_and(|runner| {
             runner
                 .routed_accounts

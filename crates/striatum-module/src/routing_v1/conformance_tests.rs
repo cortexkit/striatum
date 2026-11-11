@@ -534,7 +534,11 @@ fn account_state(
             .iter()
             .map(|account| ListedCredential {
                 id: account.credential_id.clone(),
-                categories: vec!["llm-provider".into()],
+                categories: vec![if account.method == "gateway" {
+                    "llm-gateway".into()
+                } else {
+                    "llm-provider".into()
+                }],
                 credential_type: account.method.clone(),
                 auth_method: Some(account.method.clone()),
                 provider_ids: vec![account.provider.clone()],
@@ -672,7 +676,11 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
             auth_method: Some(account.method.clone()),
             provider_ids: vec![account.provider.clone()],
             serves: vec![account.provider.clone()],
-            categories: vec!["llm-provider".into()],
+            categories: vec![if account.method == "gateway" {
+                "llm-gateway".into()
+            } else {
+                "llm-provider".into()
+            }],
             state: "active".into(),
             ..Default::default()
         }));
@@ -889,10 +897,18 @@ impl RoutingSubject for KitSubject {
             })
             .cloned()
             .collect();
-        rows.extend(
-            serving
-                .into_iter()
-                .map(|(provider, method)| ListedCredential {
+        for (provider, method) in serving {
+            let existing: Vec<_> = credentials
+                .listed_credentials()
+                .iter()
+                .filter(|row| {
+                    row.provider_ids.contains(&provider)
+                        && row.auth_method.as_deref() == Some(method.as_str())
+                })
+                .cloned()
+                .collect();
+            if existing.is_empty() {
+                rows.push(ListedCredential {
                     id: format!("runner-fact-{provider}-{method}"),
                     provider_ids: vec![provider.clone()],
                     serves: vec![provider],
@@ -901,8 +917,13 @@ impl RoutingSubject for KitSubject {
                     categories: vec!["llm-provider".into()],
                     state: "active".into(),
                     ..Default::default()
-                }),
-        );
+                });
+            } else {
+                // Route facts describe the existing login, not a replacement
+                // identity; account_for must admit the seeded credential.
+                rows.extend(existing);
+            }
+        }
         credentials.apply_listing(
             &ScopedCredentialListing {
                 view: "runner-route-facts".into(),
@@ -1355,6 +1376,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "harness_limits_providers_narrow",
         "harness_limits_invalid_falls_back",
         "runner_requires_wire_api",
+        "runner_gateway_credential",
     ] {
         assert_eq!(
             report.outcome(check),

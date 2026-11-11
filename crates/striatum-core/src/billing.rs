@@ -26,11 +26,16 @@ pub struct BillingPlane {
     pub rates: BTreeMap<String, BillingRate>,
 }
 
+/// Gateway credentials use the upstream API's metered rates, not subscription quota.
+pub fn is_api_metered_auth_method(method: &str) -> bool {
+    matches!(method, "apikey" | "gateway")
+}
+
 impl BillingPlane {
     /// Only API-balance charges with a resolved output price can be budgeted in
     /// dollars. A plan may publish token rates without charging an API balance.
     pub fn is_api_metered(&self) -> bool {
-        self.auth_method == "apikey"
+        is_api_metered_auth_method(&self.auth_method)
             && matches!(self.kind.as_str(), "upstream" | "no_coverage fallback")
             && self.rate("rate.output").is_some()
     }
@@ -66,6 +71,9 @@ mod tests {
             rates: BTreeMap::from([("rate.output".into(), BillingRate::Priced { rate: 2.0 })]),
         };
         assert!(plane.is_api_metered());
+        plane.auth_method = "gateway".into();
+        assert!(plane.is_api_metered());
+        plane.auth_method = "apikey".into();
         plane.kind = "no_coverage fallback".into();
         assert!(plane.is_api_metered());
         for kind in ["quota_proxy", "unpriced", "refused: unavailable", "unknown"] {

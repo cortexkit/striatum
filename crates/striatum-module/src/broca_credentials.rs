@@ -35,6 +35,7 @@ pub struct BrocaCredentials {
     last_error: Option<String>,
     listed: Vec<ListedCredential>,
     media_list_granted: bool,
+    gateway_grant_warned: bool,
     catalog_providers: BTreeSet<String>,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
     pub(crate) runner_service_tiers:
@@ -108,7 +109,7 @@ pub(crate) fn credential_serves_fact(
         && row
             .categories
             .iter()
-            .any(|category| category == "llm-provider")
+            .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         && credential_providers(row, catalog).contains(&fact.provider_id)
         && fact.auth_methods.as_ref().is_none_or(|allowed| {
             row.auth_method
@@ -246,7 +247,7 @@ impl BrocaCredentials {
                 && row
                     .categories
                     .iter()
-                    .any(|category| category == "llm-provider")
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         }) {
             for provider in credential_providers(row, &self.catalog_providers) {
                 mapped.entry(provider).or_default().insert(row.id.clone());
@@ -455,6 +456,20 @@ impl BrocaCredentials {
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
         self.reached_at_ms = Some(at_ms);
         self.last_error = None;
+        if !self.gateway_grant_warned
+            && !listing.grant_tuples.iter().any(|grant| {
+                grant.selector_kind == "category"
+                    && grant.selector == "llm-gateway"
+                    && grant.operation == "list"
+            })
+        {
+            // list_scoped returns the granted view without category parameters;
+            // an absent gateway grant must not discard the other credentials.
+            tracing::warn!(
+                "reserved:striatum needs list on category llm-gateway to discover company gateways; continuing with the scoped credential listing"
+            );
+            self.gateway_grant_warned = true;
+        }
         self.media_list_granted = listing.grant_tuples.iter().any(|grant| {
             grant.selector_kind == "category"
                 && grant.selector == "media-provider"
@@ -476,7 +491,7 @@ impl BrocaCredentials {
                 || !credential
                     .categories
                     .iter()
-                    .any(|category| category == "llm-provider")
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
             {
                 continue;
             }
@@ -557,7 +572,11 @@ impl BrocaCredentials {
         let mut methods_by_provider: std::collections::HashMap<_, BTreeSet<_>> =
             std::collections::HashMap::new();
         for row in &self.listed {
-            if row.state != "active" || !row.categories.iter().any(|value| value == "llm-provider")
+            if row.state != "active"
+                || !row
+                    .categories
+                    .iter()
+                    .any(|value| matches!(value.as_str(), "llm-provider" | "llm-gateway"))
             {
                 continue;
             }
@@ -612,17 +631,14 @@ impl BrocaCredentials {
                 .iter()
                 .filter(|row| {
                     row.state == "active"
-                        && row
-                            .categories
-                            .iter()
-                            .any(|category| category == "llm-provider")
+                        && row.categories.iter().any(|category| {
+                            matches!(category.as_str(), "llm-provider" | "llm-gateway")
+                        })
                 })
-                .map(
-                    |row| striatum_core::score_alias::CredentialVendors {
-                        provider_ids: &row.provider_ids,
-                        serves: &row.serves,
-                    },
-                ),
+                .map(|row| striatum_core::score_alias::CredentialVendors {
+                    provider_ids: &row.provider_ids,
+                    serves: &row.serves,
+                }),
         )
     }
 
@@ -647,7 +663,7 @@ impl BrocaCredentials {
                 && row
                     .categories
                     .iter()
-                    .any(|category| category == "llm-provider")
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         }) {
             let providers = credential_providers(row, &self.catalog_providers);
             if providers.is_empty() {
@@ -725,7 +741,7 @@ impl BrocaCredentials {
                 && row
                     .categories
                     .iter()
-                    .any(|category| category == "llm-provider")
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
             {
                 for provider in &row.provider_ids {
                     if self
@@ -818,7 +834,7 @@ impl BrocaCredentials {
             .filter(|row| {
                 row.categories
                     .iter()
-                    .any(|category| category == "llm-provider")
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
                     && row.provider_ids.iter().any(|id| id == provider)
                     // A key pool holds API keys only. A login can share a label
                     // with a key (`oauth:anthropic:ysample` beside
@@ -1031,6 +1047,101 @@ mod tests {
         );
         assert_eq!(mixed.auth_method, None);
         assert!(mixed.reason.starts_with("ambiguous"));
+    }
+
+    #[test]
+    fn gateway_category_resolves_its_own_provider_to_the_anthropic_plane() {
+        let mut row = credential("company-gateway", &["anthropic-gw-acme"]);
+        row.categories = vec!["llm-gateway".into()];
+        row.serves = vec!["anthropic".into()];
+        row.auth_method = Some("gateway".into());
+        let facts = vec![crate::tests::fact("anthropic", "claude")];
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(&listing(vec![row.clone()]), 1);
+        cache.refresh_serving_methods(&Default::default(), &facts, 1, &[]);
+        assert_eq!(
+            cache.catalog_targets(&facts),
+            BTreeMap::from([("anthropic-gw-acme".into(), "anthropic".into())])
+        );
+        assert_eq!(
+            cache.serving["anthropic-gw-acme/claude"]
+                .auth_method
+                .as_deref(),
+            Some("gateway")
+        );
+        assert_eq!(
+            cache.plane_keys(),
+            BTreeSet::from([("anthropic".into(), "gateway".into())])
+        );
+        assert_eq!(cache.health_report(1).status, HealthStatus::Ok);
+        assert_eq!(
+            cache.health_report(1).metrics.unwrap()["activeCredentials"],
+            1
+        );
+
+        for state in ["disabled", "revoked"] {
+            row.state = state.into();
+            cache.apply_listing(
+                &ScopedCredentialListing {
+                    view: state.into(),
+                    credentials: vec![row.clone()],
+                    ..Default::default()
+                },
+                2,
+            );
+            cache.refresh_serving_methods(&Default::default(), &facts, 2, &[]);
+            assert!(cache.catalog_targets(&facts).is_empty());
+            assert!(cache.plane_keys().is_empty());
+        }
+    }
+
+    #[test]
+    fn missing_gateway_grant_keeps_provider_listing_and_warns_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Warnings(Arc<AtomicUsize>);
+        impl tracing::Subscriber for Warnings {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() == tracing::Level::WARN
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, _: &tracing::Event<'_>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _subscriber = tracing::subscriber::set_default(Warnings(warnings.clone()));
+        let mut cache = BrocaCredentials::default();
+        let provider_listing = listing(vec![credential("direct-key", &["anthropic"])]);
+        let facts = vec![crate::tests::fact("anthropic", "claude")];
+        assert!(cache.apply_listing(&provider_listing, 1));
+        assert!(!cache.apply_listing(&provider_listing, 2));
+        cache.refresh_serving_methods(&Default::default(), &facts, 2, &[]);
+        assert_eq!(warnings.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.listed_credentials().len(), 1);
+        assert_eq!(cache.health_report(2).status, HealthStatus::Ok);
+        assert!(!cache
+            .plane_keys()
+            .iter()
+            .any(|(_, method)| method == "gateway"));
+
+        let mut granted = provider_listing;
+        granted
+            .grant_tuples
+            .push(cortexkit_claustrum_client::ListedGrant {
+                selector_kind: "category".into(),
+                selector: "llm-gateway".into(),
+                operation: "list".into(),
+            });
+        let mut granted_cache = BrocaCredentials::default();
+        granted_cache.apply_listing(&granted, 3);
+        assert_eq!(warnings.load(Ordering::SeqCst), 1);
     }
 
     #[test]
