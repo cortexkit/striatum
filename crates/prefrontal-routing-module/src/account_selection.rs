@@ -5360,33 +5360,37 @@ fn serve(
         if applicable.is_empty() {
             break decision;
         }
+        let owns_probe = |origin: &prefrontal_routing_store::FenceRecheck| {
+            params.model_decision_id.is_some() && origin.claim_owner == params.model_decision_id
+        };
+        let non_quota_due = |origin: &prefrontal_routing_store::FenceRecheck| {
+            ctx.classes.as_ref().map_or(
+                origin.due_at() <= now || owns_probe(origin),
+                |classes| classes.origin_due(origin, &admission.account_id, &params.model),
+            )
+        };
+        let blocking_transient_until = applicable
+            .iter()
+            .filter(|origin| {
+                origin.kind == "transient_route" && origin.due_at() > now && !owns_probe(origin)
+            })
+            .map(|origin| origin.due_at())
+            .max();
         if established
             && state.affinity.as_ref().is_some_and(|affinity| {
                 affinity.account_id == admission.account_id && affinity.credential_id == credential
             })
-            && applicable
-                .iter()
-                .any(|origin| origin.kind == "transient_route" && origin.due_at() > now)
+            && blocking_transient_until.is_some()
             && applicable
                 .iter()
                 .filter(|origin| origin.kind != "transient_route")
-                .all(|origin| {
-                    ctx.classes
-                        .as_ref()
-                        .map_or(origin.due_at() <= now, |classes| {
-                            classes.origin_due(origin, &admission.account_id, &params.model)
-                        })
-                })
+                .all(non_quota_due)
         {
             // Use the transaction-current origins: another request may have
-            // claimed a transient probe since this roster was prepared.
+            // claimed a transient probe since this roster was prepared. The
+            // selecting decision's own claim must reach atomic consumption.
             let affinity = state.affinity.as_ref().unwrap();
-            let until = applicable
-                .iter()
-                .filter(|origin| origin.kind == "transient_route")
-                .map(|origin| origin.due_at())
-                .max()
-                .unwrap();
+            let until = blocking_transient_until.unwrap();
             let seconds = (until.saturating_sub(now).max(0) as u64).div_ceil(1_000);
             decision.outcome = Outcome::Hold(prefrontal_routing_core::accounts::Hold {
                 account_id: affinity.account_id.clone(),
@@ -5414,11 +5418,7 @@ fn serve(
                             params.model_decision_id.as_deref(),
                         );
                 }
-                ctx.classes
-                    .as_ref()
-                    .map_or(origin.due_at() <= now, |classes| {
-                        classes.origin_due(origin, &admission.account_id, &params.model)
-                    })
+                non_quota_due(origin)
             });
             Ok(
                 if ready
@@ -7263,6 +7263,108 @@ mod tests {
                 .is_none(),
             "the losing interleaving cannot commit a second admission"
         );
+    }
+
+    #[test]
+    fn established_affinity_consumes_its_decisions_transient_probe_once() {
+        use prefrontal_routing_core::{DecisionInput, RouteStateStore};
+
+        for class_aware in [true, false] {
+            let rig = fixture("established-owned-transient");
+            let mut fact = crate::tests::fact("anthropic", "claude-opus-5-5");
+            fact.auth_methods = Some(vec!["oauth".into()]);
+            rig.store()
+                .upsert_fact(&fact, prefrontal_routing_core::FactSource::Override)
+                .unwrap();
+            let mut request = admit_params("first", "established-owned", "broca");
+            request["candidates"] = json!({"view_digest":"runner-view","accounts":[{
+                "account_id":ACCOUNT_A,"credential_id":"oauth:anthropic"}]});
+            let first = result(rig.call(
+                &rig.ctx(true, NOW - 1000),
+                ACCOUNT_FOR_OP,
+                BROCA,
+                request.clone(),
+            ));
+            result(rig.call(
+                &rig.ctx(true, NOW - 999),
+                ACCOUNT_OBSERVE_OP,
+                BROCA,
+                json!({"event_id":"started","caller":{"runner":"broca"},"kind":"admission_started",
+                    "admission_id":"first","run_id":"run-first"}),
+            ));
+            rig.store()
+                .record_transient_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+                    provider: "anthropic".into(),
+                    credential_id: "oauth:anthropic".into(),
+                    model: "claude-opus-5-5".into(),
+                    until_ms: NOW,
+                    recorded_at: NOW - 100,
+                    decision_id: "refusal".into(),
+                })
+                .unwrap();
+            let input = DecisionInput {
+                selected_route_key: Some("anthropic/claude-opus-5-5".into()),
+                selected_provider_id: Some("anthropic".into()),
+                selected_model_id: Some("claude-opus-5-5".into()),
+                ..Default::default()
+            };
+            let decision = rig.store().record_decision(&input).unwrap();
+            let other_decision = rig.store().record_decision(&input).unwrap();
+            let origins = rig.store().fence_rechecks().unwrap();
+            assert_eq!(origins.len(), 1);
+            assert!(rig
+                .store()
+                .account_transaction(|tx| tx.grant_fence_rechecks(&origins, NOW, Some(&decision)))
+                .unwrap());
+            let shared = Arc::new(Mutex::new(
+                crate::broca_credentials::BrocaCredentials::api_test_credentials(&[fact]),
+            ));
+            let mut live_listing = listing();
+            for row in &mut live_listing.credentials {
+                row.categories.push("llm-provider".into());
+                row.provider_ids = vec!["anthropic".into()];
+                row.auth_method = Some("oauth".into());
+            }
+            shared.lock().unwrap().apply_listing(&live_listing, NOW as u64);
+            let mut ctx = rig.ctx(true, NOW + 1);
+            if class_aware {
+                ctx.classes = Some(ClassContext::load(
+                    rig.store(), &shared, Default::default(), Some(&rig.accounts), NOW + 1,
+                ).unwrap());
+            }
+            request["expected_pin"] = first["pin"].clone();
+            request["admission_id"] = json!("other-owner");
+            request["model_decision_id"] = json!(other_decision);
+            assert_eq!(
+                rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone()).code(),
+                Some("account_hold"),
+            );
+
+            request["model_decision_id"] = json!(decision);
+            request["admission_id"] = json!("owned-probe");
+            let admitted = result(rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone()));
+            assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
+            assert_eq!(admitted["pin"]["id"], first["pin"]["id"]);
+            assert_eq!(admitted["pin"]["generation"], first["pin"]["generation"]);
+            assert!(rig.store().fence_rechecks().unwrap()[0].claim_owner.is_none());
+            request["admission_id"] = json!("owned-probe-again");
+            assert_eq!(
+                rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request).code(),
+                Some("account_hold"),
+            );
+            for id in ["other-owner", "owned-probe-again"] {
+                assert!(rig
+                    .store()
+                    .account_read(|tx| tx.admission(BROCA, id))
+                    .unwrap()
+                    .is_none());
+            }
+            assert!(rig
+                .store()
+                .account_read(|tx| tx.admission(BROCA, "owned-probe"))
+                .unwrap()
+                .is_some());
+        }
     }
 
     #[test]
