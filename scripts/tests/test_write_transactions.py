@@ -75,6 +75,17 @@ fn production() { c.unchecked_transaction(); }
         _, errors = GUARD["scan"](ROOT, GUARD["read_allowlist"](GUARD["ALLOWLIST"]))
         self.assertEqual(errors, [])
 
+    def test_a_test_filename_does_not_exempt_production_code(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            source = root / "crates/probe/src/production_tests.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("fn write() { c.unchecked_transaction(); }")
+            _, errors = GUARD["scan"](root, {})
+            self.assertEqual(len(errors), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

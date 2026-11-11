@@ -58,8 +58,6 @@ def scan(root: Path, allowed: dict[str, str]) -> tuple[int, list[str]]:
     count = 0
     for path in sorted((root / "crates").glob("*/src/**/*.rs")):
         relative = path.relative_to(root).as_posix()
-        if path.name in {"tests.rs", "test.rs"} or path.stem.endswith(("_tests", "_test")):
-            continue
         sites = transaction_sites(path.read_text())
         count += len(sites)
         for function, line in sites:
