@@ -690,6 +690,14 @@ impl PlaneCatalog {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_test_refusal(mut self, provider: &str, method: &str, bytes: &[u8]) -> Self {
+        let reply = decode_plane_get(bytes).unwrap();
+        assert!(matches!(reply, PlaneReply::Refused { .. }));
+        self.pages.insert((provider.into(), method.into()), reply);
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn ordinary_test_catalog(facts: &[striatum_core::ModelFact]) -> Self {
         let mut catalog = Self {
             version: Some(0),
@@ -751,12 +759,11 @@ impl PlaneCatalog {
     /// `multiplier_configured` says the operator configured a
     /// `subscription_multipliers` entry covering this route (see
     /// [`crate::broca_credentials::BrocaCredentials::price_facts`]). A plan whose
-    /// rates Fusiform does not serve (a `no_coverage` answer on a non-apikey
-    /// method) then bills at the catalog's base list rates, which the pricing
-    /// path divides by that multiplier. Without such an entry the rates stay
-    /// [`BillingRate::Unpriced`]: nothing states what the plan charges, and
-    /// guessing "list price" would rank the route against priced ones on a
-    /// number nobody gave.
+    /// rates Fusiform does not serve (a missing or refused subscription plane)
+    /// then bills at the catalog's base list rates, which the pricing
+    /// path divides by that multiplier. Without such an entry, only rates with
+    /// catalog inheritance are used; unmarked rates stay [`BillingRate::Unpriced`].
+    /// A missing plane uses these same inherited or operator-subsidized list rates.
     pub(crate) fn for_route(
         &self,
         model: &str,
@@ -767,6 +774,10 @@ impl PlaneCatalog {
             .split_once('/')
             .map_or(model, |(provider, _)| provider);
         let auth_method = method.auth_method.as_deref().unwrap_or("ambiguous");
+        let subscription_method = method
+            .auth_method
+            .as_deref()
+            .is_some_and(|method| !striatum_core::billing::is_api_metered_auth_method(method));
         let mut plane = BillingPlane {
             provider_id: provider.into(),
             auth_method: auth_method.into(),
@@ -774,7 +785,7 @@ impl PlaneCatalog {
             selection_reason: method.reason.clone(),
             rates: BTreeMap::new(),
         };
-        match self.pages.get(&(provider.into(), auth_method.into())) {
+        let fallback = match self.pages.get(&(provider.into(), auth_method.into())) {
             Some(PlaneReply::Served(page)) => {
                 plane.kind = page.plane.kind.clone();
                 plane.rates = page
@@ -782,39 +793,51 @@ impl PlaneCatalog {
                     .get(model)
                     .map(|rates| rates.rates.clone())
                     .unwrap_or_default();
+                false
             }
-            Some(PlaneReply::Refused { code, .. }) if code == "no_coverage" => {
-                plane.kind = "no_coverage fallback".into();
-                if let Some(base) = self.base.get(model) {
-                    plane.rates = base
-                        .rates
-                        .iter()
-                        .map(|(key, rate)| {
-                            let stated = auth_method == "apikey"
-                                || base.inherited.contains(key)
-                                || multiplier_configured;
-                            (
-                                key.clone(),
-                                if stated {
-                                    rate.clone()
-                                } else {
-                                    BillingRate::Unpriced
-                                },
-                            )
-                        })
-                        .collect();
-                    if auth_method == "apikey" && !plane.rates.contains_key("rate.reasoning") {
-                        plane.rates.insert(
-                            "rate.reasoning".into(),
-                            BillingRate::BilledAs {
-                                key: "rate.output".into(),
+            Some(PlaneReply::Refused { code, .. }) => {
+                plane.kind = if code == "no_coverage" {
+                    "no_coverage fallback".into()
+                } else {
+                    format!("refused: {code}")
+                };
+                code == "no_coverage" || subscription_method
+            }
+            None => {
+                if subscription_method {
+                    plane.kind = "missing plane fallback".into();
+                }
+                subscription_method
+            }
+        };
+        if fallback {
+            if let Some(base) = self.base.get(model) {
+                plane.rates = base
+                    .rates
+                    .iter()
+                    .map(|(key, rate)| {
+                        let stated = auth_method == "apikey"
+                            || base.inherited.contains(key)
+                            || multiplier_configured;
+                        (
+                            key.clone(),
+                            if stated {
+                                rate.clone()
+                            } else {
+                                BillingRate::Unpriced
                             },
-                        );
-                    }
+                        )
+                    })
+                    .collect();
+                if auth_method == "apikey" && !plane.rates.contains_key("rate.reasoning") {
+                    plane.rates.insert(
+                        "rate.reasoning".into(),
+                        BillingRate::BilledAs {
+                            key: "rate.output".into(),
+                        },
+                    );
                 }
             }
-            Some(PlaneReply::Refused { code, .. }) => plane.kind = format!("refused: {code}"),
-            None => {}
         }
         plane
     }
@@ -2583,6 +2606,198 @@ mod tests {
         assert_eq!(plane.rate("rate.input"), Some(2.0));
         assert_eq!(plane.rate("rate.output"), Some(4.0));
         assert_eq!(plane.rate("rate.reasoning"), Some(4.0));
+    }
+
+    fn antigravity_catalog(marked: bool) -> PlaneCatalog {
+        let mut entry = json!({"existence":"present"});
+        for (key, units) in [
+            ("rate.input", 2_000_000_000_i64),
+            ("rate.output", 10_000_000_000),
+            ("rate.reasoning", 10_000_000_000),
+            ("rate.cache_read", 100_000_000),
+            ("rate.cache_write", 2_000_000_000),
+        ] {
+            entry[key] = json!({"state":"priced", "currency":"USD", "units":units, "exponent":9});
+            if marked {
+                entry[key]["inherited_from"] = json!({
+                    "basis":"alias", "provider_id":"google", "model_id":"gemini-4-carbon"
+                });
+            }
+        }
+        PlaneCatalog::default().with_test_catalog(
+            &serde_json::to_vec(&json!({"catalog_version":1,"resolved_at_ms":1000,
+                "models":{"google/antigravity-gemini-4-carbon":entry}}))
+            .unwrap(),
+        )
+    }
+
+    fn antigravity_task_objective(
+        catalog: &PlaneCatalog,
+        configured: bool,
+    ) -> striatum_core::model_router::ObjectiveBreakdown {
+        use striatum_core::model_router::{
+            ModelRouteStateSnapshot, RouteRuntimeState, SelectModelRouteInput,
+        };
+        use striatum_core::subscription::{QuotaAccount, SubscriptionPlan, SubscriptionPool};
+        use striatum_core::task_profile::{ProfileLevel, TaskProfile, TokenVector};
+        let key = "google/antigravity-gemini-4-carbon";
+        let mut fact = crate::tests::fact("google", "antigravity-gemini-4-carbon");
+        fact.subscription_multiplier = Some(15.0);
+        fact.billing_plane = Some(catalog.for_route(
+            key,
+            &crate::broca_credentials::ServingMethod {
+                auth_method: Some("antigravity".into()),
+                reason: "selected account class".into(),
+            },
+            configured,
+        ));
+        let runtime = RouteRuntimeState {
+            subscription_pool: Some(Arc::new(SubscriptionPool {
+                provider: "google".into(),
+                now_ms: 1000,
+                plans: vec![SubscriptionPlan {
+                    tier: None,
+                    plan: None,
+                    measured: None,
+                    fee_usd: 200.0,
+                    accounts: vec![QuotaAccount {
+                        weekly_used: 50.0,
+                        weekly_remaining_fraction: 0.5,
+                        hours_to_reset: 84.0,
+                        short_walled: false,
+                        short_windows: vec![],
+                        banked_resets: 0,
+                        banked_expires_at_ms: None,
+                        prepaid_credits: false,
+                    }],
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let profile = TaskProfile {
+            tokens: TokenVector {
+                fresh_input: 1000.0,
+                output_excluding_reasoning: 2000.0,
+                reasoning: 300.0,
+                cached_read: 4000.0,
+                cache_write: 500.0,
+            },
+            level: ProfileLevel::OwnCell,
+            task_count: 20,
+            own_task_count: 20,
+            own_weight: 1.0,
+            keeps_tokenizer: true,
+        };
+        striatum_core::model_router::select_model_route_with_profiles(
+            SelectModelRouteInput {
+                target_agent: "athena".into(),
+                target_is_head: false,
+                requirements: striatum_core::ModelRequirements { iq: 20.0, eq: 0.0 },
+                available_models: [key.into()].into(),
+                facts: vec![fact],
+                runtime_snapshot: Some(ModelRouteStateSnapshot {
+                    by_capacity: [(key.into(), runtime)].into(),
+                    ..Default::default()
+                }),
+                exclude_route_keys: vec![],
+                operator_exclude_keys: vec![],
+                required_capabilities: None,
+                is_subscription_route: Some(Box::new(|_| true)),
+                min_best_effort_adequacy: None,
+                prefer_prompt_cache: false,
+                providers_without_prompt_cache: Default::default(),
+                providers_without_cache_write_reports: Default::default(),
+            },
+            &Default::default(),
+            None,
+            &[],
+            &Default::default(),
+            &[(key.into(), profile)].into(),
+        )
+        .unwrap()
+        .score
+        .objective
+    }
+
+    #[test]
+    fn antigravity_missing_or_refused_plane_prices_alias_with_multiplier_and_pressure() {
+        for refusal in [None, Some("no_coverage"), Some("unavailable")] {
+            let mut catalog = antigravity_catalog(true);
+            if let Some(code) = refusal {
+                catalog.pages.insert(
+                    ("google".into(), "antigravity".into()),
+                    PlaneReply::Refused {
+                        code: code.into(),
+                        message: "no subscription token plane".into(),
+                    },
+                );
+            }
+            let objective = antigravity_task_objective(&catalog, false);
+            let task = objective.task_pricing.unwrap();
+            let list = 0.0264;
+            assert_eq!(task.unpriced_dimensions, Vec::<String>::new(), "{refusal:?}");
+            assert!((task.list_cost_usd.unwrap() - list).abs() < 1e-12);
+            assert_eq!(task.value_multiplier, 15.0);
+            assert_eq!(task.pressure, 2.0);
+            assert!((task.final_cost_usd.unwrap() - list / 15.0 * 2.0).abs() < 1e-12);
+            assert!(!objective.price_unknown);
+        }
+    }
+
+    #[test]
+    fn missing_or_refused_metered_planes_do_not_gain_subscription_fallback() {
+        for method in ["apikey", "gateway"] {
+            for refusal in [None, Some("unavailable")] {
+                let mut catalog = antigravity_catalog(true);
+                if let Some(code) = refusal {
+                    catalog.pages.insert(
+                        ("google".into(), method.into()),
+                        PlaneReply::Refused {
+                            code: code.into(),
+                            message: "unavailable".into(),
+                        },
+                    );
+                }
+                let plane = catalog.for_route(
+                    "google/antigravity-gemini-4-carbon",
+                    &crate::broca_credentials::ServingMethod {
+                        auth_method: Some(method.into()),
+                        reason: "selected account class".into(),
+                    },
+                    true,
+                );
+                assert!(plane.rates.is_empty(), "{method} {refusal:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn antigravity_unmarked_rates_need_the_existing_configured_multiplier_override() {
+        let catalog = antigravity_catalog(false);
+        let objective = antigravity_task_objective(&catalog, false);
+        let task = objective.task_pricing.unwrap();
+        assert_eq!(task.unpriced_dimensions.len(), 5);
+        assert_eq!(task.final_cost_usd, None);
+        assert_eq!(objective.cost, 1.0);
+        assert!(objective.price_unknown);
+        let mut partial = antigravity_catalog(true);
+        partial
+            .base
+            .get_mut("google/antigravity-gemini-4-carbon")
+            .unwrap()
+            .rates
+            .insert("rate.cache_read".into(), BillingRate::Unpriced);
+        let partial_objective = antigravity_task_objective(&partial, false);
+        assert!(partial_objective.price_unknown);
+        assert_eq!(partial_objective.cost, 1.0);
+        assert_eq!(
+            partial_objective.task_pricing.unwrap().unpriced_dimensions,
+            ["cached_read"]
+        );
+        let configured = antigravity_task_objective(&catalog, true);
+        assert!(!configured.price_unknown);
+        assert_eq!(configured.task_pricing.unwrap().value_multiplier, 15.0);
     }
 
     /// OpenCode's free models on the production path: Fusiform states input and

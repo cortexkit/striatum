@@ -24,21 +24,17 @@ const OWNER: &str = "wire-pair-owner";
 
 fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
     let harness = Harness::new("wire-pairs");
-    let facts: Vec<_> = [(API, "apikey", 9.0), (ALIAS, "antigravity", 1.0)]
+    let facts: Vec<_> = [(API, "apikey", 9.0), (ALIAS, "antigravity", 9.0)]
         .into_iter()
         .map(|(model, method, rate)| {
             let mut fact = crate::tests::fact("google", model);
             // Upstream rows do not publish an auth allowlist.
             fact.auth_methods = None;
-            fact.billing_plane = Some(BillingPlane {
+            fact.cost_per_m_tok_out = Some(rate);
+            fact.billing_plane = (method == "apikey").then(|| BillingPlane {
                 provider_id: "google".into(),
                 auth_method: method.into(),
-                kind: if method == "apikey" {
-                    "upstream"
-                } else {
-                    "subscription"
-                }
-                .into(),
+                kind: "upstream".into(),
                 selection_reason: "fixture plane".into(),
                 rates: [("rate.output".into(), BillingRate::Priced { rate })].into(),
             });
@@ -48,7 +44,9 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
     harness.install_facts(&facts);
     let catalog = json!({"catalog_version":1,"resolved_at_ms":NOW,"models":{
         format!("google/{API}"): {"existence":"present","capability.tool_call":true},
-        format!("google/{ALIAS}"): {"existence":"present","capability.tool_call":true}
+        format!("google/{ALIAS}"): {"existence":"present","capability.tool_call":true,
+            "rate.output":{"state":"priced","currency":"USD","units":9,"exponent":0,
+                "inherited_from":{"basis":"alias","provider_id":"google","model_id":API}}}
     }});
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
@@ -100,9 +98,17 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
         .unwrap()
         .unwrap(),
     );
+    let fixtures: serde_json::Value =
+        serde_json::from_str(include_str!("../../fixtures/served-payloads.json")).unwrap();
     credentials.publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
-            .with_wire_apis(&credentials.wire_apis),
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts[..1])
+            .with_wire_apis(&credentials.wire_apis)
+            .with_test_catalog(&serde_json::to_vec(&catalog).unwrap())
+            .with_test_refusal(
+                "google",
+                "antigravity",
+                &serde_json::to_vec(&fixtures["refused — undeclared google antigravity"]).unwrap(),
+            ),
     );
     credentials.catalog_snapshot = Some(Arc::new(snapshot));
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
@@ -185,6 +191,11 @@ fn athena_prices_api_row_on_the_apikey_plane() {
         plane.rates["rate.output"],
         BillingRate::Priced { rate: 9.0 }
     );
+    let alias = facts.iter().find(|fact| fact.model_id == ALIAS).unwrap();
+    let plane = alias.billing_plane.as_ref().unwrap();
+    assert_eq!(plane.auth_method, "antigravity");
+    assert_eq!(plane.kind, "no_coverage fallback");
+    assert_eq!(plane.rate("rate.output"), Some(9.0));
 }
 
 #[tokio::test]

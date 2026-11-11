@@ -793,8 +793,9 @@ impl CredentialData {
                 Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect();
-        // A newly mapped provider may have no local model row yet. Its login is
-        // still enough to request the plane before the first placement arrives.
+        // Selecting a subscription account can resolve a method that is
+        // ambiguous across a model's listed credentials. Request those planes
+        // even when another method already serves a model on the same provider.
         for row in &self.listed {
             if row.state == "active"
                 && row
@@ -803,7 +804,9 @@ impl CredentialData {
                     .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
             {
                 for provider in &row.provider_ids {
-                    if self
+                    if row.auth_method.as_deref().is_some_and(
+                        striatum_core::billing::is_api_metered_auth_method,
+                    ) && self
                         .serving
                         .keys()
                         .any(|key| key.split_once('/').is_some_and(|(id, _)| id == provider))
@@ -1106,6 +1109,46 @@ mod tests {
         );
         assert_eq!(mixed.auth_method, None);
         assert!(mixed.reason.starts_with("ambiguous"));
+    }
+
+    #[test]
+    fn plane_keys_include_selected_account_methods_when_provider_serving_is_ambiguous() {
+        let mut credentials = BrocaCredentials::default();
+        credentials.listed = ["apikey", "antigravity"]
+            .into_iter()
+            .map(|method| ListedCredential {
+                id: format!("{method}:google"),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["google".into()],
+                auth_method: Some(method.into()),
+                ..Default::default()
+            })
+            .collect();
+        credentials.serving = [
+            (
+                "google/gemini-4-carbon".into(),
+                ServingMethod {
+                    auth_method: Some("apikey".into()),
+                    reason: "roster".into(),
+                },
+            ),
+            (
+                "google/antigravity-gemini-4-carbon".into(),
+                choose_method(
+                    BTreeSet::new(),
+                    BTreeSet::from(["apikey".into(), "antigravity".into()]),
+                ),
+            ),
+        ]
+        .into();
+        assert_eq!(
+            credentials.plane_keys(),
+            BTreeSet::from([
+                ("google".into(), "apikey".into()),
+                ("google".into(), "antigravity".into()),
+            ])
+        );
     }
 
     #[test]
