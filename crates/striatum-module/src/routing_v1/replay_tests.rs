@@ -588,6 +588,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_engine",
                                 "engine_reports",
                                 "engine_evals",
+                                "account_continue_resume",
                             ][..],
                         ),
                         (
@@ -675,6 +676,20 @@ fn additive_engine_projection_preserves_report_effects_and_existing_describe_mem
             "unrelated":{"engine_reported":0}
         })
     );
+}
+
+#[test]
+fn additive_resume_projection_preserves_continuation_and_serving_identity() {
+    let mut observed = json!({"method":"role.describe","reply":{"result":{
+        "capabilities":["account_continue", "account_continue_resume"],
+        "ops":[],"requirement_fields":[],
+        "account":{"account_id":"current-account","credential_id":"current-credential"}
+    }}});
+    project_additive_shape_members(&mut observed);
+    assert_eq!(observed, json!({"method":"role.describe","reply":{"result":{
+        "capabilities":["account_continue"],"ops":[],"requirement_fields":[],
+        "account":{"account_id":"current-account","credential_id":"current-credential"}
+    }}}));
 }
 
 #[test]

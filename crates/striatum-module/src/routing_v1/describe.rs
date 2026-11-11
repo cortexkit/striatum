@@ -7,6 +7,8 @@ use serde_json::Value;
 
 use super::{operator_config, Deps};
 
+const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
+
 /// The optional routing/v1 groups this provider serves, listed in
 /// `role.describe` as `capabilities` and passed to the select and account request
 /// parsers, so declarations and accepted members agree. Harnesses come from
@@ -37,6 +39,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "service_tier",
     "service_tier_settings",
     cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+    ACCOUNT_CONTINUE_RESUME,
 ];
 
 /// Params are ignored: the role defines `{}` and no refusal for this op.

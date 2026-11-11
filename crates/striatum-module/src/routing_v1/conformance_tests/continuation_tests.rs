@@ -5,6 +5,54 @@ fn result(reply: (FrameType, Value)) -> Value {
     reply.1["result"].clone()
 }
 
+fn offer_observation(offer: &Value, kind: &str, event: &str) -> Value {
+    json!({"event_id":event,"kind":kind,"admission_id":"admission","run_id":"run",
+        "served_account_id":offer["account"],"credential_id":offer["credential_id"]})
+}
+
+fn offer_state(
+    subject: &KitSubject,
+    offer: &Value,
+) -> (
+    Option<i64>,
+    Option<i64>,
+    String,
+    Option<String>,
+    Option<i64>,
+) {
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    conn.query_row(
+        "SELECT c.used_at_ms,c.released_at_ms,a.state,a.run_id,a.started_at
+         FROM account_continue c JOIN account_admission a
+         ON a.principal=c.principal AND a.admission_id=c.reservation_id WHERE c.decision_id=?1",
+        [offer["decision_id"].as_str().unwrap()],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .unwrap()
+}
+
+fn expire_offers(subject: &KitSubject, until: i64) {
+    subject
+        .harness()
+        .store()
+        .account_transaction(|tx| tx.release_expired_continuations(until))
+        .unwrap();
+}
+
+async fn next_offer(runner: &Route, request: &Value, previous: &Value) -> Value {
+    let mut next = request.clone();
+    next["selection_id"] = json!(format!(
+        "next-{}",
+        previous["decision_id"].as_str().unwrap()
+    ));
+    next["previous_decision_id"] = previous["decision_id"].clone();
+    next["exhausted"]["account"] = previous["account"].clone();
+    next["exhausted"]["credential_id"] = previous["credential_id"].clone();
+    let offer = result(runner.call("route.account_for", &next).await);
+    assert_eq!(offer["kind"], "offer", "{offer}");
+    offer
+}
+
 async fn paused() -> (KitSubject, Route, Route, Value) {
     paused_with_pin(false).await
 }
@@ -546,4 +594,330 @@ async fn continuation_preserves_owner_scope_and_refuses_a_different_project() {
     let refusal = result(other.call("route.account_for", &request).await);
     assert_eq!(refusal["kind"], "refuse", "{refusal}");
     assert_eq!(refusal["routing_code"], "unknown_decision");
+}
+
+#[tokio::test]
+async fn continuation_observation_started_uses_offer_and_is_idempotent() {
+    let (subject, _, runner, request) = paused().await;
+    let offer = result(runner.call("route.account_for", &request).await);
+    let observation = offer_observation(&offer, "admission_started", "moved-started");
+    result(runner.call("route.account_observe", &observation).await);
+    let used = offer_state(&subject, &offer);
+    assert!(used.0.is_some(), "the offered reservation must be used");
+    assert_eq!(used.1, None);
+    assert_eq!(used.2, "started");
+    assert_eq!(used.3.as_deref(), Some("run"));
+    assert_eq!(used.4, used.0);
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    conn.execute_batch("CREATE TABLE continuation_use_audit (writes INTEGER);
+        CREATE TRIGGER continuation_use_repeat AFTER UPDATE OF used_at_ms ON account_continue
+        BEGIN INSERT INTO continuation_use_audit VALUES (1); END;").unwrap();
+    let duplicate = result(runner.call("route.account_observe", &observation).await);
+    assert_eq!(duplicate["observation"]["duplicate"], true);
+    let mut later = observation;
+    later["event_id"] = json!("later-started");
+    result(runner.call("route.account_observe", &later).await);
+    later["event_id"] = json!("later-attempt");
+    later["kind"] = json!("attempt");
+    result(runner.call("route.account_observe", &later).await);
+    expire_offers(&subject, offer["valid_until_ms"].as_i64().unwrap());
+    assert_eq!(offer_state(&subject, &offer), used);
+    assert_eq!(conn.query_row("SELECT count(*) FROM continuation_use_audit", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn continuation_observation_attempt_without_credential_is_backstop() {
+    let (subject, _, runner, request) = paused().await;
+    let offer = result(runner.call("route.account_for", &request).await);
+    let mut attempt = offer_observation(&offer, "attempt", "lost-start");
+    attempt.as_object_mut().unwrap().remove("credential_id");
+    result(runner.call("route.account_observe", &attempt).await);
+    let state = offer_state(&subject, &offer);
+    assert!(state.0.is_some());
+    assert_eq!(state.2, "started");
+    expire_offers(&subject, offer["valid_until_ms"].as_i64().unwrap());
+    assert_eq!(offer_state(&subject, &offer), state);
+}
+
+#[tokio::test]
+async fn continuation_observation_identity_guards_record_only() {
+    let (subject, _, runner, request) = paused().await;
+    let offer = result(runner.call("route.account_for", &request).await);
+    result(runner.call("route.account_for", &json!({"provider":fixture::SUBSCRIPTION_PROVIDER,
+        "model":"model-c","decision_id":request["previous_decision_id"],
+        "admission_id":"different-admission","conversation_key":"other-conversation","initial_input_bytes":65536})).await);
+    result(runner.call("route.account_observe", &json!({"event_id":"other-start", "kind":"admission_started",
+        "admission_id":"different-admission","run_id":"run"})).await);
+    let initial = offer_state(&subject, &offer);
+    for (index, kind, field, value) in [
+        (
+            0,
+            "admission_started",
+            "served_account_id",
+            json!("unoffered-account"),
+        ),
+        (
+            1,
+            "attempt",
+            "served_account_id",
+            json!("unoffered-account"),
+        ),
+        (
+            2,
+            "admission_started",
+            "credential_id",
+            json!("different-credential"),
+        ),
+        (3, "attempt", "credential_id", json!("different-credential")),
+        (4, "admission_started", "run_id", json!("different-run")),
+        (5, "attempt", "run_id", json!("different-run")),
+        (
+            6,
+            "admission_started",
+            "admission_id",
+            json!("different-admission"),
+        ),
+        (7, "attempt", "admission_id", json!("different-admission")),
+        (8, "admission_started", "credential_id", Value::Null),
+        (
+            9,
+            "used_account",
+            "credential_id",
+            offer["credential_id"].clone(),
+        ),
+    ] {
+        let mut observation = offer_observation(&offer, kind, &format!("mismatch-{index}"));
+        observation[field] = value;
+        let reply = result(runner.call("route.account_observe", &observation).await);
+        assert_eq!(reply["observation"]["duplicate"], false);
+        assert_eq!(offer_state(&subject, &offer), initial, "guard {index}");
+    }
+    expire_offers(&subject, offer["valid_until_ms"].as_i64().unwrap());
+    let released = offer_state(&subject, &offer);
+    assert_eq!(released.0, None);
+    assert!(released.1.is_some());
+    assert_eq!(released.2, "released");
+}
+
+#[tokio::test]
+async fn continuation_observation_deadline_and_released_offers_record_only() {
+    for kind in ["admission_started", "attempt"] {
+        let (subject, _, runner, request) = paused().await;
+        let offer = result(runner.call("route.account_for", &request).await);
+        let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+        conn.execute("UPDATE account_continue SET valid_until_ms=0", [])
+            .unwrap();
+        let mut observation = offer_observation(&offer, kind, "late");
+        result(runner.call("route.account_observe", &observation).await);
+        assert_eq!(offer_state(&subject, &offer).0, None);
+        expire_offers(&subject, account_selection::now_ms());
+        let released = offer_state(&subject, &offer);
+        assert_eq!(released.2, "released");
+        // Even a restored deadline cannot reopen a released offer.
+        conn.execute(
+            "UPDATE account_continue SET valid_until_ms=?1",
+            [offer["valid_until_ms"].as_i64().unwrap()],
+        )
+        .unwrap();
+        observation["event_id"] = json!("after-release");
+        result(runner.call("route.account_observe", &observation).await);
+        assert_eq!(offer_state(&subject, &offer), released);
+    }
+}
+
+#[tokio::test]
+async fn continuation_observation_newest_same_account_sibling_wins() {
+    let (subject, _, runner, mut request) = paused().await;
+    let first = result(runner.call("route.account_for", &request).await);
+    request["selection_id"] = json!("newest-sibling");
+    let newest = result(runner.call("route.account_for", &request).await);
+    assert_eq!(newest["kind"], "offer", "{newest}");
+    assert_eq!(newest["account"], first["account"]);
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&newest, "attempt", "choose-newest"),
+            )
+            .await,
+    );
+    assert!(offer_state(&subject, &newest).0.is_some());
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    let lease: i64 = conn.query_row("SELECT f.lease_valid_until FROM account_affinity f
+        JOIN account_admission a ON a.pin_id=f.pin_id JOIN account_continue c
+        ON c.principal=a.principal AND c.reservation_id=a.admission_id WHERE c.decision_id=?1",
+        [newest["decision_id"].as_str().unwrap()], |r| r.get(0)).unwrap();
+    assert!(lease > account_selection::now_ms(), "releasing a sibling must not end the serving pin's lease");
+    let released = offer_state(&subject, &first);
+    assert_eq!(released.0, None);
+    assert!(released.1.is_some());
+    assert_eq!(released.2, "released");
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&first, "admission_started", "old-sibling"),
+            )
+            .await,
+    );
+    assert_eq!(offer_state(&subject, &first), released);
+}
+
+#[tokio::test]
+async fn continuation_report_releases_unused_siblings() {
+    let (subject, consumer, runner, mut request) = paused().await;
+    let first = result(runner.call("route.account_for", &request).await);
+    request["selection_id"] = json!("unused-sibling");
+    let sibling = result(runner.call("route.account_for", &request).await);
+    result(
+        consumer
+            .call(
+                "route.report",
+                &json!({"decision_id":first["decision_id"],"outcome":"failed"}),
+            )
+            .await,
+    );
+    assert!(offer_state(&subject, &first).0.is_some());
+    assert_eq!(offer_state(&subject, &sibling).2, "released");
+}
+
+#[tokio::test]
+async fn continuation_observation_second_move_and_finish_close_all_reservations() {
+    let (subject, _, runner, request) = paused().await;
+    let first = result(runner.call("route.account_for", &request).await);
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&first, "admission_started", "first-move"),
+            )
+            .await,
+    );
+    let second = next_offer(&runner, &request, &first).await;
+    assert_ne!(second["account"], first["account"]);
+    assert_ne!(second["account"], request["exhausted"]["account"]);
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&second, "attempt", "second-move"),
+            )
+            .await,
+    );
+    assert!(offer_state(&subject, &second).0.is_some());
+    let mut catalog = fixture::continue_catalog();
+    let mut extra = catalog.accounts[0].clone();
+    extra.account_id = "account-four".into();
+    extra.credential_id = "credential-four".into();
+    catalog.accounts.push(extra);
+    subject.configure_catalog(&catalog).await.unwrap();
+    let unused = next_offer(&runner, &request, &second).await;
+    let mut finished = offer_observation(&second, "run_finished", "finished");
+    finished["run_id"] = json!("different-run");
+    result(runner.call("route.account_observe", &finished).await);
+    assert_eq!(offer_state(&subject, &second).2, "started");
+    finished["run_id"] = json!("run");
+    finished["event_id"] = json!("correct-finish");
+    result(runner.call("route.account_observe", &finished).await);
+    assert_eq!(offer_state(&subject, &first).2, "finished");
+    assert_eq!(offer_state(&subject, &second).2, "finished");
+    assert_eq!(offer_state(&subject, &unused).2, "released");
+    assert!(offer_state(&subject, &unused).1.is_some());
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    let original: (String, i64) = conn
+        .query_row(
+            "SELECT state,finished_at FROM account_admission WHERE admission_id='admission'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(original.0, "finished");
+    let open_leases: i64 = conn.query_row("SELECT count(*) FROM account_affinity WHERE lease_valid_until IS NULL OR lease_valid_until>?1", [original.1], |r| r.get(0)).unwrap();
+    assert_eq!(open_leases, 0);
+    result(runner.call("route.account_observe", &finished).await);
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&unused, "attempt", "after-finish"),
+            )
+            .await,
+    );
+    assert_eq!(offer_state(&subject, &unused).0, None);
+}
+
+async fn replay_original(runner: &Route, request: &Value) -> Value {
+    result(
+        runner
+            .call(
+                "route.account_for",
+                &json!({
+                    "provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
+                    "decision_id":request["previous_decision_id"],"admission_id":"admission",
+                    "conversation_key":"conversation","initial_input_bytes":65536
+                }),
+            )
+            .await,
+    )
+}
+
+#[tokio::test]
+async fn continuation_resume_replay_tracks_last_used_offer() {
+    let (subject, _, runner, request) = paused().await;
+    let first = result(runner.call("route.account_for", &request).await);
+    let original = replay_original(&runner, &request).await;
+    assert_eq!(
+        original["account"]["account_id"],
+        request["exhausted"]["account"]
+    );
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&first, "admission_started", "move"),
+            )
+            .await,
+    );
+    for offer in [&first, &next_offer(&runner, &request, &first).await] {
+        result(
+            runner
+                .call(
+                    "route.account_observe",
+                    &offer_observation(offer, "attempt", offer["decision_id"].as_str().unwrap()),
+                )
+                .await,
+        );
+        let replay = replay_original(&runner, &request).await;
+        assert_eq!(replay["admission"]["id"], "admission");
+        assert_eq!(replay["admission"]["state"], "started");
+        assert_eq!(replay["account"]["account_id"], offer["account"]);
+        assert_eq!(replay["account"]["credential_id"], offer["credential_id"]);
+        assert_eq!(replay["reason"]["decision_id"], offer["decision_id"]);
+    }
+    assert_eq!(offer_state(&subject, &first).2, "started");
+}
+
+#[tokio::test]
+async fn continuation_resume_unmoved_replay_is_byte_identical_and_capability_is_advertised() {
+    let (subject, _, runner, request) = paused().await;
+    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    let original: String = conn
+        .query_row("SELECT answer_json FROM routing_v1_admission", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_string(&replay_original(&runner, &request).await).unwrap(),
+        original
+    );
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(offer["kind"], "offer");
+    assert_eq!(
+        serde_json::to_string(&replay_original(&runner, &request).await).unwrap(),
+        original
+    );
+    let describe = result(runner.call("role.describe", &json!({})).await);
+    let capabilities = describe["capabilities"].as_array().unwrap();
+    assert!(capabilities.contains(&json!("account_continue")));
+    assert!(capabilities.contains(&json!("account_continue_resume")));
 }

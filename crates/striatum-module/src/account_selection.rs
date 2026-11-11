@@ -6254,6 +6254,22 @@ fn record_observation(
             }
         }
         Some(row) => {
+            if matches!(parsed.kind.as_str(), "admission_started" | "attempt")
+                && (parsed.kind == "attempt" || parsed.credential_id.is_some())
+            {
+                if let (Some(run), Some(account)) = (&parsed.run_id, &parsed.served_account_id) {
+                    if tx.use_observed_continuation(
+                        &row.principal,
+                        &row.admission_id,
+                        run,
+                        account,
+                        parsed.credential_id.as_deref(),
+                        now,
+                    )? {
+                        effects.push(json!({"effect":"continuation_used"}));
+                    }
+                }
+            }
             let mismatch = parsed
                 .served_account_id
                 .as_deref()
@@ -6271,6 +6287,10 @@ fn record_observation(
                     "served_account_id": parsed.served_account_id,
                     "pin_generation": row.pin_generation,
                 }));
+                // Finishing is run-scoped, not scoped to the account that served last.
+                bound = parsed.kind == "run_finished"
+                    && parsed.run_id.is_some()
+                    && parsed.run_id == row.run_id;
             } else {
                 bound = true;
             }
@@ -6444,6 +6464,9 @@ fn apply_bound_observation(
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
+                if let Some(run) = &admission.run_id {
+                    tx.finish_continuations(&admission.principal, id, run, now)?;
+                }
                 let media = tx
                     .decision_context(&admission.decision_id)?
                     .and_then(|context| serde_json::from_str::<Value>(&context).ok())
@@ -6490,15 +6513,21 @@ fn apply_bound_observation(
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
             }
-            header_fences(
-                tx,
-                ctx,
-                principal,
-                parsed,
-                admission,
-                observation_id,
-                effects,
-            )?;
+            if parsed
+                .served_account_id
+                .as_deref()
+                .is_none_or(|account| account == admission.account_id)
+            {
+                header_fences(
+                    tx,
+                    ctx,
+                    principal,
+                    parsed,
+                    admission,
+                    observation_id,
+                    effects,
+                )?;
+            }
         }
         "attempt" => header_fences(
             tx,
