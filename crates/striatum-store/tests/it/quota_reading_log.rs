@@ -251,7 +251,7 @@ fn duplicate_composite_key_never_rewrites_the_original_reading() {
 }
 
 #[test]
-fn retention_prunes_only_rows_older_than_fourteen_days() {
+fn retention_prunes_only_rows_older_than_the_retention_window() {
     let rig = Rig::new("retention");
     let store = rig.open();
     let now = EPOCH_MS;

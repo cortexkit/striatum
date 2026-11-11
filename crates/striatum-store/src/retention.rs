@@ -1,8 +1,11 @@
 //! Bounded retention deletes for the routing store's append-only logs:
 //! account-selection history, runner observations and their event keys,
-//! per-message usage, and the per-head failure copy of the decision ledger.
-//! (The route-decision ledger, `model_route_decisions`, is pruned through
-//! `RouteStateStore::delete_decisions_older_than`.)
+//! per-message usage, the per-head failure copy of the decision ledger,
+//! routing/v1 replay records, continuation answers, speed samples, call
+//! counts, retired fence origins, unscored-model sightings and the quota
+//! reading log. (The route-decision ledger, `model_route_decisions`, is pruned
+//! through `RouteStateStore::delete_decisions_older_than`, and its scoring
+//! detail compacted in `decision_detail.rs`.)
 //!
 //! Every method here deletes at most `limit` rows in one short transaction
 //! and reports how much it did, so the caller can run several small batches
@@ -58,6 +61,19 @@ const DECISION_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
 
 fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
+}
+
+/// An account admission that still holds a run open: reserved and not yet
+/// started, or started and not yet finished.
+const LIVE_ADMISSION_STATES: &str = "('reserved', 'started')";
+
+/// What one routing/v1 decision retention batch deleted: decision bindings,
+/// and the report records that went with them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct V1DecisionRetentionBatch {
+    pub decisions: usize,
+    pub reports: usize,
+    pub deliveries: usize,
 }
 
 impl SqliteRouteStateStore {
@@ -295,5 +311,304 @@ impl SqliteRouteStateStore {
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
         Ok(deleted)
+    }
+}
+
+impl SqliteRouteStateStore {
+    /// Run one retention batch in an IMMEDIATE transaction, so the batch holds
+    /// the writer from its first read instead of upgrading a read part way.
+    fn retention_write<T>(
+        &self,
+        batch: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let result = batch(&tx)?;
+                tx.commit()?;
+                Ok(result)
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` routing/v1 decision bindings created and expired
+    /// before `before` (Unix milliseconds), oldest first, together with their
+    /// report and per-delivery replay records. A binding is kept while a live
+    /// account admission names it as its model decision, and while a stored
+    /// continuation names it as its own or its previous decision (continuation
+    /// rows go once their run is over; see
+    /// [`Self::prune_account_continuations`]).
+    pub fn prune_v1_decisions(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<V1DecisionRetentionBatch> {
+        if limit == 0 {
+            return Ok(V1DecisionRetentionBatch::default());
+        }
+        self.retention_write(|tx| {
+            let ids: Vec<String> = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT decision_id FROM routing_v1_decision \
+                       INDEXED BY routing_v1_decision_by_created \
+                     WHERE created_at_ms < ?1 AND expires_at_ms < ?1 \
+                       AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                         WHERE a.model_decision_id = routing_v1_decision.decision_id \
+                           AND a.state IN {LIVE_ADMISSION_STATES}) \
+                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
+                         WHERE c.decision_id = routing_v1_decision.decision_id) \
+                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
+                         WHERE c.previous_decision_id = routing_v1_decision.decision_id) \
+                     ORDER BY created_at_ms LIMIT ?2"
+                ))?;
+                let rows = statement
+                    .query_map(params![before, limit_param(limit)], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut batch = V1DecisionRetentionBatch::default();
+            let mut deliveries =
+                tx.prepare("DELETE FROM routing_v1_report_delivery WHERE decision_id = ?1")?;
+            let mut reports = tx.prepare("DELETE FROM routing_v1_report WHERE decision_id = ?1")?;
+            let mut decisions =
+                tx.prepare("DELETE FROM routing_v1_decision WHERE decision_id = ?1")?;
+            for id in &ids {
+                batch.deliveries += deliveries.execute([id])?;
+                batch.reports += reports.execute([id])?;
+                batch.decisions += decisions.execute([id])?;
+            }
+            Ok(batch)
+        })
+    }
+
+    /// Delete at most `limit` routing/v1 first-report records created before
+    /// `before` whose decision binding is gone (pruned, or never written).
+    /// Without its binding a report on that decision is refused as unknown,
+    /// so the record can no longer answer a replay.
+    pub fn prune_orphan_v1_reports(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM routing_v1_report WHERE rowid IN ( \
+                   SELECT rowid FROM routing_v1_report INDEXED BY routing_v1_report_by_created \
+                   WHERE created_at_ms < ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM routing_v1_decision d \
+                       WHERE d.decision_id = routing_v1_report.decision_id) \
+                   ORDER BY created_at_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` per-delivery report records created before
+    /// `before` whose decision binding is gone, for the same reason as
+    /// [`Self::prune_orphan_v1_reports`].
+    pub fn prune_orphan_v1_report_deliveries(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM routing_v1_report_delivery WHERE rowid IN ( \
+                   SELECT rowid FROM routing_v1_report_delivery \
+                     INDEXED BY routing_v1_report_delivery_by_created \
+                   WHERE created_at_ms < ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM routing_v1_decision d \
+                       WHERE d.decision_id = routing_v1_report_delivery.decision_id) \
+                   ORDER BY created_at_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` routing/v1 admission replay records created
+    /// before `before`, oldest first. A record is kept while the account
+    /// admission it answered is live, found by the same principal and id or by
+    /// the model decision its body cites, so a runner re-sending an admission
+    /// for a run still in flight gets the first answer back.
+    pub fn prune_v1_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                &format!(
+                    "DELETE FROM routing_v1_admission WHERE rowid IN ( \
+                       SELECT v.rowid FROM routing_v1_admission v \
+                         INDEXED BY routing_v1_admission_by_created \
+                       WHERE v.created_at_ms < ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.principal = v.principal AND a.admission_id = v.admission_id \
+                             AND a.state IN {LIVE_ADMISSION_STATES}) \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.model_decision_id = CASE WHEN json_valid(v.body_json) \
+                               THEN json_extract(v.body_json, '$.decision_id') END \
+                             AND a.state IN {LIVE_ADMISSION_STATES}) \
+                       ORDER BY v.created_at_ms LIMIT ?2)"
+                ),
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` routing/v1 route-affinity rows last updated
+    /// before `before`, oldest first. The row only steers the next selection
+    /// for its key back to a warm prompt cache, which is long gone by then.
+    pub fn prune_v1_affinities(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM routing_v1_affinity WHERE rowid IN ( \
+                   SELECT rowid FROM routing_v1_affinity INDEXED BY routing_v1_affinity_by_updated \
+                   WHERE updated_at_ms < ?1 ORDER BY updated_at_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` continuation answers (`account_continue`) whose
+    /// run is over and whose own times (offer deadline, use, release) are all
+    /// before `before`. The run is over when neither the run's original
+    /// admission nor the offer's reservation is still reserved or started, and
+    /// neither finished or was released at or after `before`. An admission
+    /// already deleted by account retention counts as over.
+    pub fn prune_account_continuations(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                &format!(
+                    "DELETE FROM account_continue WHERE rowid IN ( \
+                       SELECT c.rowid FROM account_continue c \
+                       WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
+                         AND COALESCE(c.used_at_ms, 0) < ?1 \
+                         AND COALESCE(c.released_at_ms, 0) < ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.principal = c.principal \
+                             AND a.admission_id IN (c.admission_id, c.reservation_id) \
+                             AND (a.state IN {LIVE_ADMISSION_STATES} \
+                               OR COALESCE(a.finished_at, 0) >= ?1 \
+                               OR COALESCE(a.released_at, 0) >= ?1)) \
+                       ORDER BY c.rowid LIMIT ?2)"
+                ),
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` generation-speed samples, oldest first: every
+    /// sample observed before `cap_before`, and every sample at or before
+    /// `read_window_start` that is not among the newest `keep_newest` of its
+    /// route and served population (service tier and speed). Observed speed
+    /// reads only samples after `read_window_start`, so nothing it reads is
+    /// deleted.
+    pub fn prune_speed_samples(
+        &self,
+        read_window_start: i64,
+        cap_before: i64,
+        keep_newest: usize,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM model_route_speed_samples WHERE rowid IN ( \
+                   SELECT s.rowid FROM model_route_speed_samples s \
+                     INDEXED BY model_route_speed_samples_by_observed \
+                   WHERE s.observed_at <= ?1 \
+                     AND (s.observed_at < ?2 OR (SELECT COUNT(*) FROM ( \
+                       SELECT 1 FROM model_route_speed_samples n \
+                       WHERE n.route_key = s.route_key \
+                         AND n.population_service_tier IS s.population_service_tier \
+                         AND n.population_speed IS s.population_speed \
+                         AND n.observed_at > s.observed_at \
+                       LIMIT ?3)) >= ?3) \
+                   ORDER BY s.observed_at LIMIT ?4)",
+                params![
+                    read_window_start,
+                    cap_before,
+                    limit_param(keep_newest),
+                    limit_param(limit)
+                ],
+            )
+        })
+    }
+
+    /// Delete at most `limit` call-count rows last called before `before`,
+    /// oldest first. Once no row that old remains, the call window's start
+    /// moves up to `before`: a method, shape and principal with no row then
+    /// truthfully had no call since the window start. Rows that stay keep
+    /// their whole count, which can include calls before the new start; an
+    /// over-count only ever keeps a handler alive.
+    pub fn prune_routing_call_counts(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            let deleted = tx.execute(
+                "DELETE FROM routing_call_count WHERE rowid IN ( \
+                   SELECT rowid FROM routing_call_count INDEXED BY routing_call_count_by_last_called \
+                   WHERE last_called_at_ms < ?1 ORDER BY last_called_at_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )?;
+            let idle_left: bool = tx.query_row(
+                "SELECT EXISTS (SELECT 1 FROM routing_call_count WHERE last_called_at_ms < ?1)",
+                [before],
+                |row| row.get(0),
+            )?;
+            if !idle_left {
+                tx.execute(
+                    "UPDATE routing_call_window SET started_at_ms = ?1 \
+                     WHERE singleton = 1 AND started_at_ms < ?1",
+                    [before],
+                )?;
+            }
+            Ok(deleted)
+        })
+    }
+
+    /// Delete at most `limit` archived fence origins retired before `before`,
+    /// oldest first. The archive's trigger acts only when a row is inserted;
+    /// deleting one changes no enforcement.
+    pub fn prune_retired_fence_origins(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM fence_retired_origin WHERE rowid IN ( \
+                   SELECT rowid FROM fence_retired_origin INDEXED BY fence_retired_origin_by_retired \
+                   WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` unscored-model sightings last seen before
+    /// `before`, oldest first. A model admitted again later is recorded as
+    /// newly seen.
+    pub fn prune_unscored_admissible_models(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM routing_unscored_admissible_models WHERE rowid IN ( \
+                   SELECT rowid FROM routing_unscored_admissible_models \
+                     INDEXED BY routing_unscored_admissible_models_by_last_seen \
+                   WHERE last_seen_ms < ?1 ORDER BY last_seen_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    /// Delete at most `limit` quota readings observed before `before`, oldest
+    /// first.
+    pub fn prune_quota_reading_log(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM quota_reading_log \
+                 WHERE (account_key, window_key, observed_at) IN ( \
+                   SELECT account_key, window_key, observed_at FROM quota_reading_log \
+                     INDEXED BY quota_reading_log_observed_idx \
+                   WHERE observed_at < ?1 ORDER BY observed_at LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
     }
 }

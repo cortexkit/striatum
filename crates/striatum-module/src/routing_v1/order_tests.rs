@@ -249,6 +249,52 @@ async fn task_profiles_use_the_recorded_workload_and_effective_iq_without_store_
     );
 }
 
+/// A real selection's score, compacted past the full-detail window, still
+/// answers what core reads from `route.explain`: the adequate set, the policy
+/// revision and the picked route's task pricing, all unchanged.
+#[tokio::test]
+async fn a_compacted_selection_keeps_the_fields_core_reads() {
+    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["iq"] = json!(75);
+    });
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let reply = route.call("route.select", &select("mason")).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let decision = reply.1["result"]["decision_id"].as_str().unwrap().to_owned();
+    let store = harness.store();
+    let full = store.get_decision_by_id(&decision).unwrap().unwrap();
+    let full_score: Value = serde_json::from_str(&full.score_json).unwrap();
+    assert!(full_score["objective"]["taskPricing"]["valueMultiplier"].is_number());
+    assert!(full_score["alsoAdequate"].is_array());
+
+    let batch = store
+        .strip_decision_detail(i64::MAX, 0, 16, super::now_ms() as i64)
+        .unwrap();
+    assert_eq!(batch.stripped, 1);
+    let compact = store.get_decision_by_id(&decision).unwrap().unwrap();
+    assert!(compact.detail_stripped_at.is_some());
+    let compact_score: Value = serde_json::from_str(&compact.score_json).unwrap();
+    for member in ["objective", "metrics", "alsoAdequate", "adequacy", "selectionCost"] {
+        assert_eq!(compact_score[member], full_score[member], "{member}");
+    }
+    assert_eq!(compact.policy_revision, full.policy_revision);
+    assert!(compact.policy_revision.is_some());
+    assert_eq!(compact.rejected_json, full.rejected_json);
+    assert_eq!(compact.explanation_json, full.explanation_json);
+    let kept: Vec<&str> = compact_score["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["routeKey"].as_str().unwrap())
+        .collect();
+    assert!(kept.contains(&compact.selected_route_key.as_deref().unwrap()));
+    assert_eq!(
+        kept.len() as u64 + compact_score["candidatesOmitted"].as_u64().unwrap(),
+        full_score["candidates"].as_array().unwrap().len() as u64
+    );
+}
+
 fn route_of(reply: &(FrameType, Value)) -> String {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let route = &reply.1["result"]["route"];

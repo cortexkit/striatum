@@ -40,6 +40,11 @@ use std::sync::Mutex;
 mod account_selection;
 mod call_counts;
 pub use call_counts::{RoutingCallCount, RoutingCallCounts};
+mod decision_detail;
+pub use decision_detail::{
+    compact_quota_signal_json, compact_score_json, decision_id_hash, in_full_detail_sample,
+    DetailStripBatch,
+};
 mod report_delivery;
 #[cfg(test)]
 mod test_exe;
@@ -77,7 +82,7 @@ pub use diagnostics::{
 pub use engine_measurements::{EngineEvaluation, EngineSpeedSample, ENGINE_SPEED_SAMPLE_LIMIT};
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
 pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
-pub use retention::AffinityRetentionBatch;
+pub use retention::{AffinityRetentionBatch, V1DecisionRetentionBatch};
 pub use routing_v1::{V1Decision, V1Recorded};
 pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
@@ -314,7 +319,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 82] {
+fn route_state_migrations() -> [Migration; 83] {
     [
         Migration {
             version: 1,
@@ -643,6 +648,10 @@ fn route_state_migrations() -> [Migration; 82] {
         Migration {
             version: 83,
             statements: include_str!("../migrations/083_model_classification.sql"),
+        },
+        Migration {
+            version: 84,
+            statements: include_str!("../migrations/084_history_retention.sql"),
         },
     ]
 }
@@ -1265,6 +1274,9 @@ pub struct DecisionExplainRow {
     pub outcome: Option<String>,
     pub outcome_at: Option<i64>,
     pub outcome_error: Option<String>,
+    /// When retention replaced the full scoring detail with the compact
+    /// summary (see `decision_detail`); `None` while the row holds full detail.
+    pub detail_stripped_at: Option<i64>,
 }
 
 /// Optional predicates for the compact decision-ledger list.
@@ -2775,7 +2787,7 @@ impl SqliteRouteStateStore {
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
                                 outcome_error, selected_harness, selected_workload, allowed_providers_json,
-                                project_id, workdir
+                                project_id, workdir, detail_stripped_at
                          FROM model_route_decisions
                          WHERE id=?1",
                         [decision_id],
@@ -2801,7 +2813,7 @@ impl SqliteRouteStateStore {
                                 rejected_json, explanation_json, quota_signal_json, policy_revision,
                                 anchor_version, catalog_fingerprint, created_at, outcome, outcome_at,
                                 outcome_error, selected_harness, selected_workload, allowed_providers_json,
-                                project_id, workdir
+                                project_id, workdir, detail_stripped_at
                          FROM model_route_decisions
                          WHERE send_id=?1
                          ORDER BY created_at DESC, id DESC
@@ -3039,6 +3051,7 @@ fn decision_explain_row(row: &Row<'_>) -> rusqlite::Result<DecisionExplainRow> {
         selected_workload: row.get(25)?,
         project_id: row.get(27)?,
         workdir: row.get(28)?,
+        detail_stripped_at: row.get(29)?,
     })
 }
 

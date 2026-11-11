@@ -6,7 +6,10 @@ use crate::route_state_store::{
     QuotaReadingLogRow, QuotaStaleDisclosure, RouteStateResult, RouteStateStore, UsageObservation,
 };
 
-pub const READING_LOG_RETENTION_DAYS: i64 = 14;
+/// Days the quota reading log keeps a reading. Nothing reads the log in
+/// production yet; three days covers any rate fit over recent polls (twenty
+/// intervals of at least ten minutes each).
+pub const READING_LOG_RETENTION_DAYS: i64 = 3;
 pub const READING_INTERVAL_MIN_ELAPSED_MS: i64 = 10 * 60_000;
 pub const READING_INTERVAL_MIN_ACCOUNT_TOKENS: f64 = 10_000.0;
 pub const READING_RATE_MIN_INTERVALS: usize = 20;
