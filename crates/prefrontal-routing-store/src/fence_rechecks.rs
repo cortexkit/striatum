@@ -1961,6 +1961,140 @@ mod tests {
     }
 
     #[test]
+    fn migrated_model_wall_uses_a_new_refusals_short_retry() {
+        migrated_wall_short_retry("route");
+    }
+    #[test]
+    fn migrated_provider_wall_uses_a_new_refusals_short_retry() {
+        migrated_wall_short_retry("provider");
+    }
+    #[test]
+    fn provider_repeat_keeps_an_independent_model_origin_and_its_generation() {
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("independent-model-provider-repeat");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "independent-model-provider-repeat",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let now = crate::now_ms();
+        store
+            .record_provider_cooldown(
+                "p",
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    cooldown_until: Some((now + 1000) as f64),
+                    observed_at_ms: Some(now),
+                    unscoped_wall: true,
+                    last_error: Some("provider-old".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_route_state(
+                "p/other",
+                "p/other",
+                &RouteStateUpdate {
+                    cooldown_until: Some((now + 10_000) as f64),
+                    observed_at_ms: Some(now + 1),
+                    unscoped_wall: true,
+                    last_error: Some("independent".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .record_provider_cooldown(
+                "p",
+                "p/m",
+                "p/m",
+                &RouteStateUpdate {
+                    cooldown_until: Some((now + 100) as f64),
+                    observed_at_ms: Some(now + 2),
+                    unscoped_wall: true,
+                    last_error: Some("provider-new".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let clocks = store.fence_rechecks().unwrap();
+        assert!(clocks.iter().any(|f|f.kind=="route" && f.model.as_deref()==Some("other") && f.evidence_at==now+1 && f.next_recheck_at==now+10_000),"provider fanout must not replace an independent model's refusal generation: {clocks:?}");
+    }
+    #[test]
+    fn migrated_failure_wall_uses_a_new_refusals_short_retry() {
+        migrated_wall_short_retry("failure");
+    }
+
+    fn migrated_wall_short_retry(kind: &str) {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore, RouteStateUpdate,
+        };
+        let scratch = cortexkit_test_support::ScratchDir::new("migrated-route-short-retry");
+        let descriptor = crate::dev_descriptor(
+            "migrated-route-short-retry",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let now = crate::now_ms();
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        old.store.with_conn(|conn| {
+            if kind=="provider" {conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,last_error,last_error_at,updated_at) VALUES ('p',?1,'old',?2,?2)",params![now+86_400_000,now-100])?;}
+            conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,last_error,last_error_at,cooldown_until,failure_backoff_until,consecutive_terminal_failures)
+                VALUES ('p/m','p/m','p','m',?1,'old',?1,?2,?3,2)",params![now-100,if kind=="failure" {None} else {Some(now+86_400_000)},if kind=="failure" {Some(now+86_400_000)} else {None}])?;
+            Ok(())
+        }).unwrap();
+        let decision = old
+            .record_decision(&DecisionInput {
+                selected_route_key: Some("p/m".into()),
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("m".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        drop(old);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let at = now + 3_600_001;
+        let origins = store.fence_rechecks().unwrap();
+        assert_eq!(origins.len(), 1);
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, at - 1, Some(&decision)))
+            .unwrap());
+        let update = RouteStateUpdate {
+            cooldown_until: Some((at + 10_000) as f64),
+            observed_at_ms: Some(at),
+            unscoped_wall: true,
+            last_error: Some("new refusal".into()),
+            ..Default::default()
+        };
+        match kind {
+            "route" => store.update_route_state("p/m", "p/m", &update).unwrap(),
+            "provider" => store
+                .record_provider_cooldown("p", "p/m", "p/m", &update)
+                .unwrap(),
+            _ => store
+                .set_decision_outcome(
+                    &decision,
+                    &DecisionOutcomeUpdate {
+                        provider_outcome: None,
+                        outcome: RouteOutcome::Error,
+                        last_error: Some("server_error".into()),
+                        observed_at_ms: at,
+                        failure_backoff: Default::default(),
+                    },
+                )
+                .unwrap(),
+        }
+        let expected = at + if kind == "failure" { 600_000 } else { 10_000 };
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(clocks.len(), 1);
+        assert_eq!(
+            clocks[0].next_recheck_at, expected,
+            "{kind}: a new refusal must not inherit the old raw 24h deadline"
+        );
+    }
+
+    #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {
         let scratch = cortexkit_test_support::ScratchDir::new("fence-migration");
         let descriptor = crate::dev_descriptor(

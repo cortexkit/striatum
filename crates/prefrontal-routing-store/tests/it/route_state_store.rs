@@ -2670,6 +2670,7 @@ fn provider_cooldown_is_durable_non_shortening_and_inherited_by_new_routes() {
             "p/a",
             &RouteStateUpdate {
                 cooldown_until: Some(20_000.0),
+                observed_at_ms: Some(300),
                 ..Default::default()
             },
         )
@@ -2683,6 +2684,7 @@ fn provider_cooldown_is_durable_non_shortening_and_inherited_by_new_routes() {
                 cooldown_until: Some(10_000.0),
                 quota_exhausted_until: Some(30_000.0),
                 increment_quota_error: true,
+                observed_at_ms: Some(200),
                 ..Default::default()
             },
         )
@@ -2698,17 +2700,15 @@ fn provider_cooldown_is_durable_non_shortening_and_inherited_by_new_routes() {
 
     let snapshot = store.build_snapshot(1_000.0).unwrap();
     assert_eq!(snapshot.by_route["p/a/high"].cooldown_until, Some(20_000.0));
-    assert_eq!(
-        snapshot.by_route["p/a/high"].quota_exhausted_until,
-        Some(30_000.0)
-    );
+    assert_eq!(snapshot.by_route["p/a/high"].quota_exhausted_until, None);
     assert_eq!(snapshot.by_route["p/b"].cooldown_until, Some(10_000.0));
     assert_eq!(
         snapshot.by_route["p/b"].quota_exhausted_until,
         Some(30_000.0)
     );
 
-    // A later, older signal cannot shorten either provider or route state.
+    // An out-of-order signal cannot replace newer provider evidence. The
+    // independent model wall does not inherit a provider evidence generation.
     store
         .record_provider_cooldown(
             "p",
@@ -2717,6 +2717,7 @@ fn provider_cooldown_is_durable_non_shortening_and_inherited_by_new_routes() {
             &RouteStateUpdate {
                 cooldown_until: Some(5_000.0),
                 quota_exhausted_until: Some(25_000.0),
+                observed_at_ms: Some(100),
                 ..Default::default()
             },
         )
@@ -2729,10 +2730,7 @@ fn provider_cooldown_is_durable_non_shortening_and_inherited_by_new_routes() {
     assert_eq!(provider.quota_exhausted_until, Some(30_000.0));
     let snapshot = store.build_snapshot(1_000.0).unwrap();
     assert_eq!(snapshot.by_route["p/a/high"].cooldown_until, Some(20_000.0));
-    assert_eq!(
-        snapshot.by_route["p/a/high"].quota_exhausted_until,
-        Some(30_000.0)
-    );
+    assert_eq!(snapshot.by_route["p/a/high"].quota_exhausted_until, None);
 
     // Minting after the provider write inherits the live provider horizons.
     store

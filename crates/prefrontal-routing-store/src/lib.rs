@@ -3855,6 +3855,19 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // row, inheritance row, and existing-route fanout therefore
                 // commit together or roll back together.
                 let tx = c.unchecked_transaction()?;
+                let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
+                let prior_at:Option<i64>=tx.query_row("SELECT COALESCE(wall_observed_at,last_error_at,updated_at) FROM provider_cooldown_state WHERE provider_key=?1",[&provider_key],|row|row.get(0)).optional()?;
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
+                // Replace inherited provider evidence only. An independent
+                // model refusal keeps its own deadline and evidence generation.
+                let mut inherited=tx.prepare("SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
+                    ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
+                     (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
+                      AND COALESCE(m.wall_observed_at,m.last_error_at,m.updated_at)=COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
+                      AND m.last_error IS p.last_error
+                      AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
+                      AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))")?
+                    .query_map([&provider_key],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3878,9 +3891,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let existing = existing
                     .filter(|state| !credential_refusal_wall(state.last_error.as_deref()))
                     .unwrap_or_default();
-                let cooldown_until = max_defined(existing.cooldown_until, update.cooldown_until);
-                let quota_exhausted_until =
-                    max_defined(existing.quota_exhausted_until, update.quota_exhausted_until);
+                let cooldown_until = if new_wall {update.cooldown_until} else {existing.cooldown_until};
+                let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else {existing.quota_exhausted_until};
                 let quota_pressure = update.quota_pressure.or(existing.quota_pressure);
                 let wall_class = update.wall_class.or(existing.wall_class);
                 let (last_error, last_error_at) = match &update.last_error {
@@ -3927,7 +3939,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // catalog yet. Materialize it from the just-merged provider row
                 // before the fanout, so it cannot miss this write.
                 let (_, model_id, variant) = route_identity(&tx, route_key, None)?;
-                tx.execute(
+                let inserted=tx.execute(
                     "INSERT OR IGNORE INTO model_route_state (
                        route_key, capacity_key, provider_id, model_id, variant,
                        cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3950,19 +3962,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                     ],
                 )?;
 
-                // Merge each horizon independently. NULL incoming values preserve
-                // route-specific state, and an older provider signal never shortens
-                // a later route or provider deadline.
+                if inserted>0 {inherited.push(route_key.to_owned());}
+                let inherited=serde_json::to_string(&inherited).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                // A repeat refusal replaces the old provider generation's raw
+                // horizons, including migrated deadlines longer than one hour.
                 tx.execute(
                     "UPDATE model_route_state SET
-                       cooldown_until = CASE
-                         WHEN ?1 IS NULL THEN cooldown_until
-                         WHEN cooldown_until IS NULL OR cooldown_until < ?1 THEN ?1
-                         ELSE cooldown_until END,
-                       quota_exhausted_until = CASE
-                         WHEN ?2 IS NULL THEN quota_exhausted_until
-                         WHEN quota_exhausted_until IS NULL OR quota_exhausted_until < ?2 THEN ?2
-                         ELSE quota_exhausted_until END,
+                       cooldown_until = ?1,
+                       quota_exhausted_until = ?2,
                        quota_pressure = COALESCE(?3, quota_pressure),
                        wall_class = COALESCE(?4, wall_class),
                        failure_count = failure_count + ?5,
@@ -3970,7 +3977,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                        last_error = COALESCE(?7, last_error),
                        last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
                        updated_at = ?8
-                     WHERE provider_id = ?9",
+                      WHERE provider_id = ?9 AND route_key IN (SELECT value FROM json_each(?10))",
                     params![
                         cooldown_until,
                         quota_exhausted_until,
@@ -3981,11 +3988,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                         last_error,
                         updated_at,
                         provider_key,
+                        inherited,
                     ],
                 )?;
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
-                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1",params![provider_key,updated_at,update.unscoped_wall])?;
+                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))",params![provider_key,updated_at,update.unscoped_wall,inherited])?;
                     fence_rechecks::register(&tx,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
                 tx.commit()
@@ -4029,6 +4037,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // provider inheritance, and field merges see one consistent row.
                 let tx = c.unchecked_transaction()?;
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
+                let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
+                let prior_at:Option<i64>=tx.query_row("SELECT COALESCE(wall_observed_at,last_error_at,updated_at) FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?;
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -4052,6 +4063,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
+                let new_route=existing.is_none();
                 let mut ex = existing.unwrap_or_default();
                 // The route's own wall from one credential's refusal keeps its
                 // evidence (last_error) but lends no horizon to this write.
@@ -4087,14 +4099,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                     provider
                 };
 
-                let cooldown_until = max_defined(
-                    max_defined(ex.cooldown_until, provider.cooldown_until),
-                    update.cooldown_until,
-                );
-                let quota_exhausted_until = max_defined(
-                    max_defined(ex.quota_exhausted_until, provider.quota_exhausted_until),
-                    update.quota_exhausted_until,
-                );
+                // A model refusal replaces its own horizon. The provider wall
+                // remains a separate origin, never a floor for this deadline.
+                let cooldown_until = if new_wall {update.cooldown_until} else if new_route {provider.cooldown_until} else {ex.cooldown_until};
+                let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else if new_route {provider.quota_exhausted_until} else {ex.quota_exhausted_until};
                 let quota_pressure = update
                     .quota_pressure
                     .or(ex.quota_pressure)
@@ -4308,13 +4316,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                let existing: Option<(i64, Option<f64>, Option<String>)> = tx
+                let existing: Option<(i64, Option<f64>, Option<String>,i64)> = tx
                     .query_row(
                         "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason
+                                failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
                          FROM model_route_state WHERE route_key=?1",
                         [&route_key],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?)),
                     )
                     .optional()?;
                 let previous_failures = existing
@@ -4322,13 +4330,16 @@ impl RouteStateStore for SqliteRouteStateStore {
                     .map(|state| state.0.max(0) as u32)
                     .unwrap_or(0);
 
-                match failure_backoff_transition(
+                let transition=if existing.as_ref().is_some_and(|state|(state.0>0 || state.1.is_some()) && state.3>update.observed_at_ms) {
+                    FailureBackoffTransition::Unchanged
+                } else {failure_backoff_transition(
                     previous_failures,
                     update.outcome,
                     update.last_error.as_deref(),
                     update.observed_at_ms,
                     update.failure_backoff,
-                ) {
+                )};
+                match transition {
                     FailureBackoffTransition::Unchanged => {}
                     FailureBackoffTransition::Reset => {
                         tx.execute(
@@ -4348,8 +4359,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     } => {
                         let previous_until = existing.as_ref().and_then(|state| state.1);
                         let previous_reason = existing.as_ref().and_then(|state| state.2.clone());
-                        let failure_backoff_until =
-                            max_defined(previous_until, cooldown_until.map(|value| value as f64));
+                        let failure_backoff_until = cooldown_until.map(|value| value as f64).or(previous_until);
                         let failure_backoff_reason = reason.or(previous_reason);
                         let surfaced_error = update
                             .last_error
