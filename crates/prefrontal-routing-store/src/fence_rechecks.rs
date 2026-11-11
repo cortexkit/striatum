@@ -535,7 +535,7 @@ impl AccountTx<'_> {
     pub fn release_inconclusive_probe(
         &self,
         owner: &str,
-        provider: &str,
+        _provider: &str,
         model: &str,
         now: i64,
     ) -> RouteStateResult<()> {
@@ -543,11 +543,13 @@ impl AccountTx<'_> {
             return Ok(());
         }
         sync(self.conn).map_err(err)?;
-        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?4,claim_owner=NULL
-            WHERE r.quota=0 AND r.cleared_at IS NULL AND r.provider=?2 AND (r.model IS NULL OR r.model=?3)
+        // An alias/target launch may own origins from multiple providers. Only
+        // its exact authorized generations may reopen, regardless of provider.
+        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?3,claim_owner=NULL
+            WHERE r.quota=0 AND r.cleared_at IS NULL AND (r.model IS NULL OR r.model=?2)
             AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
                 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
-                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",params![owner,provider,model,now]).map_err(err)?;
+                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",params![owner,model,now]).map_err(err)?;
         self.conn
             .execute(
                 "DELETE FROM fence_probe_authorization WHERE owner=?1",
@@ -1334,6 +1336,48 @@ mod tests {
             store.fence_rechecks().unwrap().is_empty(),
             "success must heal the whole authorized alias/target launch, not only one provider"
         );
+    }
+
+    #[test]
+    fn linked_pool_neutral_outcome_releases_alias_and_target_provider_origins() {
+        use prefrontal_routing_core::key_pool::PoolKey;
+        use prefrontal_routing_core::{RouteStateStore, RouteStateUpdate};
+        let scratch = cortexkit_test_support::ScratchDir::new("alias-pool-neutral-probe");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "alias-pool-neutral-probe", scratch.path().join("store.db").to_string_lossy(),
+        )).unwrap();
+        store.pool_wall("alias", "key", crate::PoolWallKind::Billing, 1000, "credits", 100).unwrap();
+        store.record_provider_cooldown("target", "target/m", "target/m", &RouteStateUpdate {
+            cooldown_until: Some(1000.0), observed_at_ms: Some(100), unscoped_wall: true,
+            last_error: Some("rate limit".into()), ..Default::default()
+        }).unwrap();
+        store.pool_wall("unrelated", "key", crate::PoolWallKind::Billing, 2000, "credits", 100).unwrap();
+        let keys = vec![PoolKey::new("key", Some("a"), "active")];
+        let crate::PoolAcquireOutcome::Leased(lease) = store.pool_acquire_for_route(
+            &crate::PoolAcquire {
+                provider: "alias", session_id: "s", keys: &keys, now_ms: 1000,
+                lease_ms: 120_000, affinity_idle_ms: 120_000,
+            }, &["alias", "target"], "m", &[], &Default::default(),
+        ).unwrap() else { panic!("both due origins must admit one lease") };
+        store.bind_fence_probe_owner(&lease.lease_id, "decision").unwrap();
+        store.account_transaction(|tx| {
+            tx.release_inconclusive_probe("decision", "target", "m", 1001)
+        }).unwrap();
+        let clocks = store.fence_rechecks().unwrap();
+        assert_eq!(clocks.len(), 3, "a neutral outcome releases claims without healing evidence");
+        let mut released = Vec::new();
+        for clock in clocks {
+            if clock.provider == "unrelated" {
+                assert_eq!(clock.next_recheck_at, 2000, "an unclaimed origin is untouched");
+            } else {
+                assert_eq!(clock.next_recheck_at, 1001, "{} must reopen its exact authorization", clock.provider);
+                assert!(clock.claim_owner.is_none());
+                released.push(clock);
+            }
+        }
+        assert_eq!(released.len(), 2);
+        assert!(store.account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001)).unwrap());
+        assert!(!store.account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001)).unwrap());
     }
 
     #[test]
