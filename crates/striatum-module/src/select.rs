@@ -1822,6 +1822,7 @@ pub(super) async fn handle_select_request(
                 defer_pool_pin: params.pin.is_some() || params.model_pin.is_some(),
             }
         },
+        false,
         params.consumer,
         priced_per_token,
         params.allowed_providers.as_deref(),

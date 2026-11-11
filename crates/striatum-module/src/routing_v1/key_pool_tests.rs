@@ -154,7 +154,7 @@ fn harness_with_pool_keys(
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: None,
             canonical_id: None,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
             lineage: fact.family.clone(),
         })
         .collect();

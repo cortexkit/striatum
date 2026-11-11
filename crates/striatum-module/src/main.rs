@@ -1983,7 +1983,7 @@ fn merge_model_upsert(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
-                upstream_status: None,
+                upstream_status: None, model_type: None, model_kind: None,
             }
         }
     };
@@ -7258,7 +7258,7 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
         }
     }
 
@@ -13080,7 +13080,7 @@ mod tests {
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
                     canonical_id: None,
-                    upstream_status: None,
+                    upstream_status: None, model_type: None, model_kind: None,
                     lineage: None,
                 },
             )
@@ -14920,7 +14920,7 @@ mod tests {
                 supports_tool_use: None,
                 reasoning_efforts: None,
                 canonical_id: canonical.map(str::to_string),
-                upstream_status: None,
+                upstream_status: None, model_type: None, model_kind: None,
                 lineage: None,
             }
         };

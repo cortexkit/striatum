@@ -41,6 +41,19 @@ async fn selected(route: &Route, request: &Value) -> Value {
 }
 
 #[tokio::test]
+async fn non_chat_catalog_classification_does_not_exclude_media_engines() {
+    let harness = setup(vec![engine("transcriber", false)]);
+    let mut fact = crate::tests::fact("media-vendor", "transcriber");
+    fact.model_type = Some("transcription".into());
+    fact.model_kind = Some("extraction".into());
+    harness.install_facts(&[fact]);
+    harness.set_credentials(media_credentials(vec![key("opaque-media")]));
+    let route = harness.bind(reserved("colliculus"), None).await;
+    let answer = selected(&route, &request()).await;
+    assert_eq!(answer["engine"]["model"], "transcriber");
+}
+
+#[tokio::test]
 async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines() {
     use serde::de::DeserializeOwned;
     use std::future::Future;

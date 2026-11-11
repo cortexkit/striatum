@@ -518,7 +518,7 @@ pub(super) fn catalog_fact(
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
-        upstream_status: None,
+        upstream_status: None, model_type: None, model_kind: None,
     }
 }
 
@@ -1397,25 +1397,22 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
 #[tokio::test]
 async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
     use striatum_store::{dev_descriptor, SqliteRouteStateStore};
+    let now = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(now as u64);
     let harness = Harness::new_at_version("upgrade-062-admission", Some(62));
-    install_catalog(&harness, &fixture::catalog());
-    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
     let request = json!({
         "provider": fixture::SUBSCRIPTION_PROVIDER,
         "model": "model-c",
         "conversation_key": "upgrade-conversation",
         "admission_id": "preupgrade-v1",
     });
-    let first = runner.call("route.account_for", &request).await;
-    assert_eq!(first.0, FrameType::Response, "{}", first.1);
+    let first = (FrameType::Response, seed_062_admission(&harness, &request, true, now));
     assert!(first.1["result"]["account"].is_object(), "{}", first.1);
     let mut legacy = request.clone();
     legacy["admission_id"] = json!("preupgrade-legacy");
     legacy["conversation_key"] = json!("legacy-upgrade-conversation");
     legacy["caller"] = json!({"runner": fixture::RUNNER_ONE});
-    let legacy_first = runner.call("route.account_for", &legacy).await;
-    assert_eq!(legacy_first.0, FrameType::Response, "{}", legacy_first.1);
-    drop(runner);
+    let legacy_first = (FrameType::Response, seed_062_admission(&harness, &legacy, false, now));
 
     // Release the old store's writer lease before reopening the same file.
     // The placeholder is a separate scratch database, never an upgrade input.
@@ -1522,6 +1519,82 @@ async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
             Ok(())
         })
         .unwrap();
+}
+
+// Historical admissions were written by the schema-62 binary. Seed its rows
+// directly: its model_facts table lacks columns today's fact readers require.
+fn seed_062_admission(harness: &Harness, request: &Value, v1: bool, now: i64) -> Value {
+    use cortexkit_role_routing::account::{
+        Account, AccountForAnswer, AccountPin, AccountReason, AccountReasonCode, Admission,
+        parse_account_for_request_serving,
+    };
+    use sha2::{Digest, Sha256};
+    let provider = request["provider"].as_str().unwrap();
+    let model = request["model"].as_str().unwrap();
+    let conversation = request["conversation_key"].as_str().unwrap();
+    let id = request["admission_id"].as_str().unwrap();
+    let principal = format!("reserved:{}", fixture::RUNNER_ONE.trim_start_matches("reserved:"));
+    let pin = format!("pin-{id}");
+    let decision = format!("decision-{id}");
+    let conversation_hash = format!("{:x}", Sha256::digest(conversation.as_bytes()));
+    assert_ne!(fixture::RUNNER_ONE, crate::legacy_wire::BROCA);
+    // Fixed-order identity encoding used by the historical plugin admission.
+    let identity = format!(r#"{{"provider":{},"model":{},"affinity_model":{},"conversation_key":{},"caller":"plugin","mode":"admit","expected_pin":null,"requested_account":null,"preferred_existing_account":null}}"#,
+        request["provider"], request["model"], request["model"], request["conversation_key"]);
+    let fingerprint = format!("{:x}", Sha256::digest(identity.as_bytes()));
+    let valid_until = now + 60_000;
+    let lease_until = now + 120_000;
+    let affinity_until = now + 3_600_000;
+    let legacy_reply = json!({
+        "admission":{"id":id,"state":"reserved"},
+        "account":{"provider":provider,"account_id":"historical-account",
+            "credential_id":"historical-credential","method":"oauth"},
+        "pin":{"id":pin,"generation":1,"mode":"conversation_lease",
+            "affinity_expires_at":account_selection::rfc3339(affinity_until),
+            "admission_valid_until":account_selection::rfc3339(valid_until),
+            "lease_valid_until":account_selection::rfc3339(lease_until)},
+        "reason":{"code":"cold_scored","decision_id":decision,"policy_version":2,
+            "quota_fetched_at":account_selection::rfc3339(now),"quota_age_band":"fresh"}
+    });
+    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
+    connection.execute(
+        "INSERT INTO account_pin (pin_id,principal,conversation_hash,provider,pin_generation,
+          affinity_model,account_id,credential_id,pin_mode,decision_id,created_at)
+         VALUES (?1,?2,?3,?4,1,?5,'historical-account','historical-credential','conversation_lease',?6,?7)",
+        rusqlite::params![pin,principal,conversation_hash,provider,model,decision,now]).unwrap();
+    connection.execute(
+        "INSERT INTO account_affinity (principal,conversation_hash,provider,affinity_model,
+          pin_id,pin_generation,account_id,credential_id,credential_binding_revision,policy_version,
+          initial_demand_bytes,created_at,last_used_at,expires_at,lease_valid_until)
+         VALUES (?1,?2,?3,?4,?5,1,'historical-account','historical-credential',1,2,0,?6,?6,?7,?8)",
+        rusqlite::params![principal,conversation_hash,provider,model,pin,now,affinity_until,lease_until]).unwrap();
+    connection.execute(
+        "INSERT INTO account_admission (principal,admission_id,request_fingerprint,request_mode,
+          decision_id,conversation_hash,provider,model,account_id,credential_id,pin_id,pin_generation,
+          state,charged,request_bytes,request_bytes_estimated,committed_at,admission_valid_until,
+          lease_valid_until,reply_json)
+         VALUES (?1,?2,?3,'admit',?4,?5,?6,?7,'historical-account','historical-credential',?8,1,
+          'reserved',1,0,0,?9,?10,?11,?12)",
+        rusqlite::params![principal,id,fingerprint,decision,conversation_hash,provider,model,pin,
+            now,valid_until,lease_until,legacy_reply.to_string()]).unwrap();
+    let answer = if v1 {
+        let parsed = parse_account_for_request_serving(request, super::describe::CAPABILITIES).unwrap();
+        let answer = AccountForAnswer::new(
+            Admission { id:id.into(), state:"reserved".into() },
+            Account { provider:provider.into(), account_id:"historical-account".into(),
+                credential_id:"historical-credential".into(), method:"oauth".into() },
+            AccountPin::new(&pin,1,affinity_until as u64,valid_until as u64,lease_until as u64,parsed.mode()),
+            AccountReason { code:AccountReasonCode::parse("cold_scored"),decision_id:decision,
+                policy_version:"2".into(),quota_fetched_at_ms:Some(now as u64),quota_age_band:"fresh".into() },
+        );
+        let answer = serde_json::to_value(answer).unwrap();
+        connection.execute("INSERT INTO routing_v1_admission VALUES (?1,?2,?3,?4,?5)",
+            rusqlite::params![principal,id,serde_json::to_string(&parsed.normalized()).unwrap(),answer.to_string(),now]).unwrap();
+        answer
+    } else {
+        legacy_reply
+    };
+    json!({"result":answer})
 }
 
 /// Reopen a released writer so migration tests exercise the real upgrade path.

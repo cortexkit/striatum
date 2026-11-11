@@ -187,7 +187,8 @@ pub(crate) fn choices_for_harness(
         // Match pin resolution's preference for the unqualified fact row.
         rows.sort_by(|a, b| a.variant.cmp(&b.variant));
         let fact = rows[0];
-        if fact.is_deprecated_upstream()
+        if striatum_core::model_facts::llm_classification_rejection(fact, false).is_some()
+            || fact.is_deprecated_upstream()
             || fact.score_provenance == striatum_core::ScoreProvenance::Unscored
             || fact.supports_tool_use != Some(true)
             || !credentials

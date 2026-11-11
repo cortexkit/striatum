@@ -2232,7 +2232,7 @@ mod tests {
 
     fn migrated_wall_short_retry(kind: &str) {
         use striatum_core::{
-            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore, RouteStateUpdate,
+            DecisionOutcomeUpdate, RouteOutcome, RouteStateStore, RouteStateUpdate,
         };
         let scratch = cortexkit_test_support::ScratchDir::new("migrated-route-short-retry");
         let descriptor = crate::dev_descriptor(
@@ -2241,20 +2241,19 @@ mod tests {
         );
         let now = crate::now_ms();
         let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81).unwrap();
+        let decision = format!("historical-{kind}");
         old.store.with_conn(|conn| {
             if kind=="provider" {conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,last_error,last_error_at,updated_at) VALUES ('p',?1,'old',?2,?2)",params![now+86_400_000,now-100])?;}
             conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,last_error,last_error_at,cooldown_until,failure_backoff_until,consecutive_terminal_failures)
                 VALUES ('p/m','p/m','p','m',?1,'old',?1,?2,?3,2)",params![now-100,if kind=="failure" {None} else {Some(now+86_400_000)},if kind=="failure" {Some(now+86_400_000)} else {None}])?;
+            // Seed the old ledger directly; today's decision writer hashes the
+            // catalog using model_facts columns absent from schema 81.
+            conn.execute("INSERT INTO model_route_decisions (id,target_agent,requirements_json,
+                selected_route_key,selected_provider_id,selected_model_id,score_json,rejected_json,
+                anchor_version,created_at)
+                VALUES (?1,'worker','{}','p/m','p','m','null','[]',2,?2)",params![decision,now])?;
             Ok(())
         }).unwrap();
-        let decision = old
-            .record_decision(&DecisionInput {
-                selected_route_key: Some("p/m".into()),
-                selected_provider_id: Some("p".into()),
-                selected_model_id: Some("m".into()),
-                ..Default::default()
-            })
-            .unwrap();
         drop(old);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let origins = store.fence_rechecks().unwrap();
@@ -2778,7 +2777,7 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"));
-        assert!(error.to_string().contains("82"));
+        assert!(error.to_string().contains("83"));
     }
 
     #[test]

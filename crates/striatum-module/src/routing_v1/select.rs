@@ -886,6 +886,7 @@ async fn select_at_tier(
             stale: &[],
             defer_pool_pin: false,
         },
+        classifier,
         legacy_consumer,
         priced_per_token,
         None,
@@ -2044,6 +2045,8 @@ fn pin_reason(
         }
         "credential_unentitled" => (PinUnavailableReason::CredentialUnentitled, None),
         "credential_billing_exhausted" => (PinUnavailableReason::CredentialBillingExhausted, None),
+        reason if reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:") =>
+            (PinUnavailableReason::parse(reason), None),
         "cooldown_active" => (
             PinUnavailableReason::Cooldown,
             deadline(|state| state.cooldown_until),

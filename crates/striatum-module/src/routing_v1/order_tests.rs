@@ -85,7 +85,7 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: None,
             canonical_id: None,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
             lineage: fact.family.clone(),
         })
         .collect();
@@ -113,6 +113,85 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
 
 fn select(consumer: &str) -> Value {
     json!({ "consumer": consumer, "requirements": { "iq": 30 } })
+}
+
+#[tokio::test]
+async fn non_chat_catalog_rows_cannot_be_selected_or_pinned() {
+    for (classification, reason) in [
+        (json!({"model.type": "transcription"}), "not_chat_model:transcription"),
+        (json!({"model.type": "image"}), "not_chat_model:image"),
+        (json!({"model.type": "future-engine"}), "not_chat_model:future-engine"),
+        (json!({"model.kind": "decision"}), "not_chat_kind:decision"),
+        (json!({"model.kind": "extraction"}), "not_chat_kind:extraction"),
+        (json!({"model.type": "chat"}), ""),
+        (json!({}), ""),
+    ] {
+        check_chat_classification(classification, reason).await;
+    }
+}
+
+async fn check_chat_classification(classification: Value, reason: &str) {
+    let harness = harness(&[(CHEAP, true, true, 200_000), (DEAR, true, true, 200_000)]);
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"topK": 1, "by": "iq", "extra": 0, "floor": 0});
+    });
+    let mut payload = json!({"catalog_version": 2, "resolved_at_ms": 2, "models": {
+        CHEAP: {"existence": "present",
+            "capability.input_modalities": ["audio", "text"],
+            "capability.output_modalities": ["text"], "wire.family": "openai-chat",
+            "capability.tool_call": true, "limit.context": 200000, "limit.output": 32000}
+    }});
+    payload["models"][CHEAP].as_object_mut().unwrap().extend(classification.as_object().unwrap().clone());
+    if classification["model.type"] == "image" {
+        payload["models"][CHEAP]["capability.output_modalities"] = json!(["image"]);
+    }
+    let catalog = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    let (updates, cursor) = catalog.parts();
+    harness.store().apply_fusiform_catalog(updates, cursor).unwrap();
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(catalog));
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let automatic = route.call("route.select", &select("mason")).await;
+    let excluded = !reason.is_empty();
+    assert_eq!(route_of(&automatic), if excluded { DEAR } else { CHEAP }, "{}", automatic.1);
+    let legacy = json!({"consumer": "mason", "targetAgent": "mason",
+        "executor": "broca", "substrate": "broca", "requirements": {"iq": 30, "eq": 0}});
+    let legacy_selected = route.call("route.select", &legacy).await;
+    assert_eq!(legacy_route(&legacy_selected), if excluded { DEAR } else { CHEAP });
+    for pin in [CHEAP.to_owned(), format!("{CHEAP}:high")] {
+        let pinned = route.call("route.select", &json!({"consumer": "mason", "requirements": {"iq": 30}, "pin": pin})).await;
+        let mut legacy_pin = legacy.clone();
+        legacy_pin["modelPin"] = json!(pin);
+        let legacy_pinned = route.call("route.select", &legacy_pin).await;
+        for reply in [pinned, legacy_pinned] {
+            if excluded {
+                assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+                assert!(reply.1.to_string().contains(reason), "{}", reply.1);
+            } else {
+                assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            }
+        }
+    }
+    let choices = route.call("route.head_choices", &json!({"runner_module": "zeta-runner"})).await;
+    assert_eq!(choices.0, FrameType::Response, "{}", choices.1);
+    let models = choices.1["result"]["models"].as_array().unwrap();
+    assert!(models.iter().any(|model| model["provider"] == "dear-provider"), "{}", choices.1);
+    assert_eq!(models.iter().any(|model| model["provider"] == "cheap-provider"), !excluded, "{}", choices.1);
+    if excluded {
+        let panel = route.call("route.select_panel", &json!({"consumer": "mason", "class": "audit", "available_routes": [CHEAP, DEAR]})).await;
+        assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
+        let seats = panel.1["result"]["seats"].as_array().unwrap();
+        assert_eq!(seats.len(), 1, "{}", panel.1);
+        assert_eq!(seats[0]["answer"]["route"]["provider"], "dear-provider", "{}", panel.1);
+        let operator = harness.bind(json!({"kind": "direct"}), None).await;
+        let sweep = operator.call("route.what_if", &json!({"consumer": "mason", "iqs": [30]})).await;
+        assert_eq!(sweep.0, FrameType::Response, "{}", sweep.1);
+        assert!(sweep.1["result"]["results"][0]["excluded"].as_array().unwrap().iter()
+            .any(|row| row["route"] == CHEAP && row["reason"] == reason), "{}", sweep.1);
+        let decision = legacy_selected.1["result"]["decisionID"].as_str().unwrap();
+        let explanation = route.call("route.explain", &json!({"decisionID": decision})).await;
+        assert_eq!(explanation.0, FrameType::Response, "{}", explanation.1);
+        assert!(explanation.1.to_string().contains(reason), "{}", explanation.1);
+    }
 }
 
 #[tokio::test]

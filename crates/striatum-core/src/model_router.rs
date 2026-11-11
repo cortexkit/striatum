@@ -909,6 +909,28 @@ pub fn admit_routes_with_availability(
             });
             continue;
         }
+        // Catalog-role refusals are structural, not account availability. Keep
+        // their reason even for an ungraded model or a route with no account.
+        if let Some(reason) = crate::model_facts::llm_classification_rejection(fact, true)
+            .or_else(|| {
+                availability_rejections
+                    .get(&route.route_key)
+                    .or_else(|| availability_rejections.get(&route.capacity_key))
+                    .filter(|reason| {
+                        reason.starts_with("not_chat_model:")
+                            || reason.starts_with("not_chat_kind:")
+                    })
+                    .cloned()
+            })
+        {
+            rejected.push(RejectedRoute {
+                route_key: route.route_key,
+                reason,
+                detail: None,
+                credential_ids: Vec::new(),
+            });
+            continue;
+        }
         if fact.score_provenance == ScoreProvenance::Unscored {
             rejected.push(RejectedRoute {
                 route_key: route.route_key,
@@ -3395,7 +3417,7 @@ mod abundance_tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None,
+            upstream_status: None, model_type: None, model_kind: None,
         }
     }
 

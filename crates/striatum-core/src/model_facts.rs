@@ -398,6 +398,26 @@ pub struct ModelFact {
     /// than deleting it, so a deprecated route is no longer served upstream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_status: Option<String>,
+    /// Fusiform's `model.type`; absent values retain legacy chat eligibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_type: Option<String>,
+    /// Fusiform's `model.kind`, reserved for specialist consumers such as classifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<String>,
+}
+
+/// A declared non-chat engine cannot serve LLM work, even if it has chat wire
+/// metadata and grades. Specialist kinds are reserved for the classifier path.
+pub fn llm_classification_rejection(fact: &ModelFact, classifier: bool) -> Option<String> {
+    if let Some(model_type) = fact.model_type.as_deref().filter(|value| *value != "chat") {
+        return Some(format!("not_chat_model:{model_type}"));
+    }
+    if !classifier {
+        if let Some(kind) = &fact.model_kind {
+            return Some(format!("not_chat_kind:{kind}"));
+        }
+    }
+    None
 }
 
 /// The `model.status` value that withdraws a route from routing.
