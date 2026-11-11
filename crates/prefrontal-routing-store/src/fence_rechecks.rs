@@ -2442,6 +2442,78 @@ mod tests {
     }
 
     #[test]
+    fn new_outcome_retry_wall_preserves_its_stamp_beneath_provider_horizon() {
+        new_model_refusal_beneath_provider_horizon(true);
+    }
+
+    #[test]
+    fn new_route_update_wall_preserves_its_stamp_beneath_provider_horizon() {
+        new_model_refusal_beneath_provider_horizon(false);
+    }
+
+    fn new_model_refusal_beneath_provider_horizon(outcome: bool) {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore, RouteStateUpdate,
+        };
+        let scratch = cortexkit_test_support::ScratchDir::new("new-model-wall-generation");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "new-model-wall-generation", scratch.path().join("store.db").to_string_lossy(),
+        )).unwrap();
+        let now = crate::now_ms();
+        store.record_provider_cooldown("p", "p/seed", "p/seed", &RouteStateUpdate {
+            quota_exhausted_until: Some((now + NON_QUOTA_FENCE_MAX_MS) as f64),
+            observed_at_ms: Some(now - 100), last_error: Some("provider capacity".into()),
+            ..Default::default()
+        }).unwrap();
+        store.update_route_state("p/telemetry", "p/telemetry", &RouteStateUpdate {
+            observed_at_ms: Some(now), latency_ema_ms: Some(50.0), ..Default::default()
+        }).unwrap();
+        store.store.with_conn(|conn| {
+            let inherited: (i64, bool) = conn.query_row(
+                "SELECT wall_observed_at,wall_unscoped FROM model_route_state WHERE route_key='p/telemetry'",
+                [], |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(inherited, (now - 100, false), "telemetry-only discovery still inherits provider provenance");
+            Ok(())
+        }).unwrap();
+        let report = |at, seconds| {
+            if outcome {
+                let id = store.record_decision(&DecisionInput {
+                    selected_route_key: Some("p/new".into()),
+                    selected_provider_id: Some("p".into()), selected_model_id: Some("new".into()),
+                    ..Default::default()
+                }).unwrap();
+                store.set_decision_outcome(&id, &DecisionOutcomeUpdate {
+                    outcome: RouteOutcome::QuotaExhausted { retry_after_secs: seconds },
+                    observed_at_ms: at, last_error: Some("model capacity".into()),
+                    provider_outcome: None, failure_backoff: Default::default(),
+                }).unwrap();
+            } else {
+                store.update_route_state("p/new", "p/new", &RouteStateUpdate {
+                    quota_exhausted_until: Some((at + seconds as i64 * 1000) as f64),
+                    observed_at_ms: Some(at), unscoped_wall: true,
+                    last_error: Some("model capacity".into()), ..Default::default()
+                }).unwrap();
+            }
+        };
+        report(now, 10);
+        let assert_generation = || {
+            let clocks = store.fence_rechecks().unwrap();
+            let route = clocks.iter().find(|o| o.kind == "route" && o.model.as_deref() == Some("new")).unwrap();
+            assert_eq!(route.evidence_at, now, "a direct new-row refusal must retain its own stamp");
+            assert_eq!(route.next_recheck_at, now + 10_000);
+            store.store.with_conn(|conn| {
+                let unscoped: bool = conn.query_row("SELECT wall_unscoped FROM model_route_state WHERE route_key='p/new'", [], |row| row.get(0))?;
+                assert!(unscoped, "the model refusal must not inherit the provider's scope");
+                Ok(())
+            }).unwrap();
+        };
+        assert_generation();
+        report(now - 50, 3600);
+        assert_generation();
+    }
+
+    #[test]
     fn below_raised_threshold_failure_keeps_the_managed_fence_generation() {
         use prefrontal_routing_core::{
             DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome,

@@ -85,8 +85,10 @@ UPDATE model_route_state SET
  failure_observed_at=CASE WHEN failure_backoff_until IS NOT NULL OR consecutive_terminal_failures>0 THEN COALESCE(last_error_at,updated_at) END;
 UPDATE provider_cooldown_state SET wall_observed_at=COALESCE(last_error_at,updated_at)
  WHERE cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL;
+-- Explicit model refusal evidence must not acquire the provider's older provenance.
 CREATE TRIGGER model_route_state_inherit_fence_scope AFTER INSERT ON model_route_state
-WHEN EXISTS (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=NEW.provider_id
+WHEN NEW.wall_observed_at IS NULL
+ AND EXISTS (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=NEW.provider_id
  AND COALESCE(p.cooldown_until,0)>=COALESCE(NEW.cooldown_until,0)
  AND COALESCE(p.quota_exhausted_until,0)>=COALESCE(NEW.quota_exhausted_until,0))
 BEGIN
