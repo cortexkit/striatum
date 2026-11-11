@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use super::eligibility::age_band;
 use super::types::{
     AllocatorPolicy, EpochMs, Fence, FenceScope, GeneralWindow, ModelFamily, QuotaReading,
-    ResetTime, ScopedList,
+    ScopedList,
 };
 use super::AgeBand;
 
@@ -376,21 +376,8 @@ pub fn block_end(
     now: EpochMs,
     policy: &AllocatorPolicy,
 ) -> Option<BlockEnd> {
-    match fence.reset {
-        ResetTime::At(reset) => {
-            if now > reset {
-                return Some(BlockEnd::ResetPassed);
-            }
-        }
-        ResetTime::Missing | ResetTime::Unparsable => {
-            let retry_at = fence
-                .retry_hint_ms
-                .unwrap_or(fence.observed_at_ms + policy.unknown_reset_retry_ms);
-            if now >= retry_at {
-                return Some(BlockEnd::RetryDue);
-            }
-        }
-    }
+    // Reset dates schedule a trial, not evidence of recovery. Only a later,
+    // fresh reading with reserve-aware headroom can retire quota evidence.
     let reading = later_fresh_reading(fence, reading, now, policy)?;
     let windows = reported_windows(reading, policy);
     let lifted = match &fence.pool {
@@ -408,6 +395,26 @@ pub fn block_end(
         }
     };
     lifted.then_some(BlockEnd::Reading)
+}
+
+/// Current reserve pressure that speaks for this fence's pools. Headroom in
+/// an unrelated pool is neither proof of recovery nor a reason to stop probes.
+pub fn binding_pressure(
+    fence: &Fence,
+    reading: Option<&QuotaReading>,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> bool {
+    let Some(reading) = reading.filter(|reading| fresh_for_recovery(reading, now, policy)) else {
+        return false;
+    };
+    reported_windows(reading, policy).iter().any(|window| {
+        !window.above_reserve
+            && fence
+                .pool
+                .as_ref()
+                .is_none_or(|key| key.matched_by(&window.key))
+    })
 }
 
 /// The recovery set of a whole-account block after a later fresh reading
@@ -474,7 +481,7 @@ impl AllowedAccountClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::accounts::{ConfirmationSource, ScopedWindow};
+    use crate::accounts::{ConfirmationSource, ResetTime, ScopedWindow};
 
     const NOW: EpochMs = 1_790_683_200_000;
     const MINUTE: i64 = 60_000;
@@ -525,6 +532,77 @@ mod tests {
 
     fn ends(fence: &Fence, reading: &QuotaReading) -> Option<BlockEnd> {
         block_end(fence, Some(reading), NOW, &AllocatorPolicy::default())
+    }
+
+    #[test]
+    fn quota_fence_has_no_fixed_end_without_headroom() {
+        for reset in [
+            ResetTime::Missing,
+            ResetTime::Unparsable,
+            ResetTime::At(NOW - 1),
+        ] {
+            let fence = block(None, reset);
+            assert_eq!(
+                block_end(
+                    &fence,
+                    None,
+                    NOW + 30 * 24 * HOUR,
+                    &AllocatorPolicy::default()
+                ),
+                None
+            );
+        }
+        let fence = block(None, ResetTime::At(NOW + 30 * 24 * HOUR));
+        assert_eq!(
+            ends(
+                &fence,
+                &reading(NOW, &[(None, 300, 0.0), (None, 10080, 0.0)])
+            ),
+            Some(BlockEnd::Reading)
+        );
+        let policy = AllocatorPolicy {
+            reserve_seven_day: 5.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            block_end(
+                &fence,
+                Some(&reading(NOW, &[(None, 300, 0.0), (None, 10080, 96.0)])),
+                NOW,
+                &policy
+            ),
+            None,
+            "weekly reserve remains binding"
+        );
+    }
+
+    #[test]
+    fn binding_pressure_names_the_fenced_pool_and_preserves_its_reserve() {
+        let fence = block(
+            Some(key(Some(10080), PoolScope::EveryModel, Some("missing"))),
+            ResetTime::Missing,
+        );
+        let policy = AllocatorPolicy {
+            reserve_seven_day: 5.0,
+            ..Default::default()
+        };
+        for used in [0.0, 100.0] {
+            let other = reading(NOW, &[(Some("other"), 10080, used)]);
+            assert!(!binding_pressure(&fence, Some(&other), NOW, &policy));
+            assert_eq!(block_end(&fence, Some(&other), NOW, &policy), None);
+        }
+        assert!(binding_pressure(
+            &fence,
+            Some(&reading(NOW, &[(Some("missing"), 10080, 96.0)])),
+            NOW,
+            &policy
+        ));
+        assert!(!binding_pressure(
+            &fence,
+            Some(&reading(NOW, &[(Some("missing"), 10080, 0.0)])),
+            NOW,
+            &policy
+        ));
     }
 
     #[test]
@@ -686,22 +764,16 @@ mod tests {
     }
 
     #[test]
-    fn a_known_reset_ends_the_block_and_an_unknown_one_retries() {
+    fn reset_and_retry_dates_do_not_retire_quota_evidence() {
         let policy = AllocatorPolicy::default();
         let reset = NOW + 10 * MINUTE;
         let known = block(None, ResetTime::At(reset));
         assert_eq!(block_end(&known, None, reset, &policy), None);
-        assert_eq!(
-            block_end(&known, None, reset + 1000, &policy),
-            Some(BlockEnd::ResetPassed)
-        );
+        assert_eq!(block_end(&known, None, reset + 1000, &policy), None);
         let unknown = block(None, ResetTime::Missing);
-        let six_hours = unknown.observed_at_ms + 6 * HOUR;
-        assert_eq!(block_end(&unknown, None, six_hours - 1, &policy), None);
-        assert_eq!(
-            block_end(&unknown, None, six_hours, &policy),
-            Some(BlockEnd::RetryDue)
-        );
+        let check = unknown.observed_at_ms + 15 * MINUTE;
+        assert_eq!(block_end(&unknown, None, check - 1, &policy), None);
+        assert_eq!(block_end(&unknown, None, check, &policy), None);
         let mut hinted = unknown.clone();
         hinted.retry_hint_ms = Some(unknown.observed_at_ms + 30 * MINUTE);
         assert_eq!(
@@ -715,7 +787,7 @@ mod tests {
         );
         assert_eq!(
             block_end(&hinted, None, unknown.observed_at_ms + 30 * MINUTE, &policy),
-            Some(BlockEnd::RetryDue)
+            None
         );
     }
 

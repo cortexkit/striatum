@@ -424,12 +424,12 @@ fn credential_fences(
             }
             let hint = if billing {
                 format!(
-                    "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Routing also admits one probe request on it every 6h.",
+                    "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Non-quota refusals permit one probe after at most 1h; quota holds recheck every 15m without a fresh reading.",
                     fence.credential_id
                 )
             } else {
                 format!(
-                    "The provider refused this credential ({}). Check the account's entitlement and client requirements, or lift the fence by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Routing also admits one probe request on it every 6 hours.",
+                    "The provider refused this credential ({}). Check the account's entitlement and client requirements, or lift the fence by hand with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Routing also admits one probe request on it every 1h.",
                     fence.code, fence.credential_id
                 )
             };

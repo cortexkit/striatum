@@ -5,11 +5,13 @@ use prefrontal_routing_core::{route_state_store::CredentialRefusal, RouteOutcome
 
 #[derive(Default)]
 pub struct V1ReportEffects {
+    pub quota_scope: Option<crate::QuotaSuccessScope>,
     pub route_fence: Option<AccountRouteFence>,
+    pub non_quota_route_fence: Option<AccountRouteFence>,
     pub eligibility: Option<AccountEligibilityFact>,
     pub credential_refusal: Option<(CredentialRefusal, Option<String>)>,
     pub size_refusal: Option<AccountSizeRefusal>,
-    pub clear_size: Option<(String, String, String, u32)>,
+    pub non_quota_size_refusal: Option<AccountSizeRefusal>,
     pub lift_credential: Option<(String, String)>,
 }
 
@@ -71,7 +73,36 @@ impl SqliteRouteStateStore {
             if first {
                 let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
+                let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
                 apply_account_effects(&account, effects, now)?;
+                if outcome==RouteOutcome::Completed {
+                    if let Some((provider,credential))=&effects.lift_credential {
+                        let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                        let identity=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok());
+                        if identity.as_ref().and_then(|identity|identity.credential_id.as_deref()).is_none_or(|id|id==credential) {
+                            account.heal_authorized_probe(decision_id,provider,&model,now).map_err(sql_error)?;
+                            let account_id=identity.as_ref().map_or(credential.as_str(),|identity|identity.account_ref.as_str());
+                            let size=account.size_admission_for_model_decision(decision_id,provider,credential,&model).map_err(sql_error)?;
+                            account.heal_serving_fences_in_scope(provider,account_id,credential,&model,size.map(|(class,_)|class),size.map_or(admitted_at,|(_,at)|at),now,effects.quota_scope.as_ref()).map_err(sql_error)?;
+                        }
+                    } else {
+                        let (provider,model,identity):(Option<String>,Option<String>,Option<String>)=tx.query_row(
+                            "SELECT selected_provider_id,selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",
+                            [decision_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+                        let pinned=identity.and_then(|raw|serde_json::from_str::<prefrontal_routing_core::route_state_store::ProviderOutcome>(&raw).ok()).and_then(|identity|identity.credential_id);
+                        if let (None,Some(provider),Some(model))=(pinned,provider,model) {
+                            account.heal_authorized_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
+                        }
+                    }
+                }
+                if prefrontal_routing_core::fence_lifetimes::probe_is_inconclusive(outcome,error) {
+                    let (provider,model):(Option<String>,Option<String>)=tx.query_row(
+                        "SELECT selected_provider_id,selected_model_id FROM model_route_decisions WHERE id=?1",
+                        [decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                    if let (Some(provider),Some(model))=(provider,model) {
+                        account.release_inconclusive_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
+                    }
+                }
                 reconcile(&account).map_err(sql_error)?;
                 if failed {
                     tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL",
@@ -96,6 +127,65 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    pub fn record_non_quota_size_refusal(
+        &self,
+        fact: &AccountSizeRefusal,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        self.conn.execute("INSERT INTO account_non_quota_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
+            ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
+            WHERE excluded.observed_at>=account_non_quota_size_refusal.observed_at",
+            params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map_err(err)?;
+        crate::fence_rechecks::register(
+            self.conn,
+            "non_quota_size",
+            &serde_json::json!([
+                fact.provider,
+                fact.credential_id,
+                fact.model,
+                fact.size_class
+            ])
+            .to_string(),
+        )
+        .map_err(err)
+    }
+    pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        self.record_account_route_backoff(fence, "billing")
+    }
+    pub(crate) fn record_account_route_backoff(
+        &self,
+        fence: &AccountRouteFence,
+        kind: &str,
+    ) -> RouteStateResult<()> {
+        self.conn.execute("INSERT INTO account_non_quota_route_fence VALUES (?1,?2,?3,?4,?5,?6,?6,?7)
+            ON CONFLICT(provider,credential_id,model,wall_kind) DO UPDATE SET until_ms=excluded.until_ms,
+            last_reported_at=MAX(account_non_quota_route_fence.last_reported_at,excluded.last_reported_at),decision_id=excluded.decision_id",
+            params![fence.provider,fence.credential_id,fence.model,fence.until_ms.min(fence.recorded_at.saturating_add(3_600_000)),fence.decision_id,fence.recorded_at,kind]).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE fence_recheck SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
+                params![
+                    if kind == "transient" {
+                        "transient_route"
+                    } else {
+                        "non_quota_route"
+                    },
+                    serde_json::json!([fence.provider, fence.credential_id, fence.model])
+                        .to_string()
+                ],
+            )
+            .map_err(err)?;
+        crate::fence_rechecks::register(
+            self.conn,
+            if kind == "transient" {
+                "transient_route"
+            } else {
+                "non_quota_route"
+            },
+            &serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string(),
+        )
+        .map_err(err)
+    }
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
         &self,
@@ -139,10 +229,10 @@ impl AccountTx<'_> {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
     }
 
-    pub fn report_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
-        let mut statement=self.conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class='quota' AND until_ms>?1 ORDER BY provider,credential_id,model").map_err(err)?;
+    pub fn report_route_fences(&self, _now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
+        let mut statement=self.conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class='quota' ORDER BY provider,credential_id,model").map_err(err)?;
         let rows = statement
-            .query_map([now], |r| {
+            .query_map([], |r| {
                 Ok(AccountRouteFence {
                     provider: r.get(0)?,
                     credential_id: r.get(1)?,
@@ -174,16 +264,20 @@ fn apply_account_effects(
     now: i64,
 ) -> rusqlite::Result<()> {
     let conn = tx.conn;
+    if let Some(fence) = &effects.non_quota_route_fence {
+        tx.record_non_quota_route_fence(fence).map_err(sql_error)?;
+    }
     if let Some(fence) = &effects.route_fence {
         conn.execute(
             "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class)
              VALUES (?1,?2,?3,?4,?5,?6,?6,'quota') ON CONFLICT(provider,credential_id,model) DO UPDATE SET
-             until_ms=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at OR account_route_fence.wall_class='transient'
-               THEN excluded.until_ms ELSE MAX(account_route_fence.until_ms,excluded.until_ms) END,
+             until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at)
+               THEN excluded.until_ms ELSE account_route_fence.until_ms END,
              wall_class='quota', recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at),
              last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
             params![fence.provider, fence.credential_id, fence.model, fence.until_ms, fence.decision_id, fence.recorded_at],
         )?;
+        conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;
     }
     if let Some(fact) = &effects.eligibility {
         tx.record_eligibility(fact).map_err(sql_error)?;
@@ -196,6 +290,14 @@ fn apply_account_effects(
              listing_fingerprint=COALESCE(credential_entitlement_fences.listing_fingerprint,excluded.listing_fingerprint)",
             params![refusal.provider_id, refusal.credential_id, refusal.code, fingerprint, now],
         )?;
+        if crate::fence_rechecks::enabled(conn)? {
+            conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+            crate::fence_rechecks::register(
+                conn,
+                "credential",
+                &serde_json::json!([refusal.provider_id, refusal.credential_id]).to_string(),
+            )?;
+        }
     }
     if let Some(fact) = &effects.size_refusal {
         conn.execute("INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
@@ -203,26 +305,9 @@ fn apply_account_effects(
             WHERE excluded.observed_at>=account_size_refusal.observed_at",
             params![fact.provider, fact.credential_id, fact.model, fact.size_class, fact.expires_at, fact.observed_at])?;
     }
-    if let Some((provider, credential, model, class)) = &effects.clear_size {
-        conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
-            params![provider, credential, model, class, now])?;
-    }
-    if let Some((provider, credential)) = &effects.lift_credential {
-        let fences = tx.active_pool_fences(provider).map_err(sql_error)?;
-        let prefix = format!(
-            "credential-quota:{}:",
-            serde_json::json!([provider, credential])
-        );
-        for fence in fences {
-            if fence.evidence.fence_id.starts_with(&prefix) {
-                tx.clear_fence(&fence.evidence.fence_id, now, "run_succeeded")
-                    .map_err(sql_error)?;
-            }
-        }
-        conn.execute(
-            "DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2",
-            params![provider, credential],
-        )?;
+    if let Some(fact) = &effects.non_quota_size_refusal {
+        tx.record_non_quota_size_refusal(fact, now)
+            .map_err(sql_error)?;
     }
     Ok(())
 }

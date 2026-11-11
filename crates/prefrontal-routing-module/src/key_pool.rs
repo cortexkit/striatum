@@ -96,6 +96,7 @@ impl PoolGrant {
 }
 
 pub struct PoolCtx<'a> {
+    pub config: Option<&'a crate::config_overrides::LiveConfig>,
     pub store: &'a SqliteRouteStateStore,
     pub credentials: &'a SharedBrocaCredentials,
     /// Each provider with no catalog rows that resolved to a catalog provider.
@@ -187,22 +188,106 @@ pub fn acquire(
     // fenced until its vault listing changes: only the pool's other keys are leased.
     let fences = crate::credential_fences::live(ctx.store, ctx.credentials)
         .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+    let clocks = ctx
+        .store
+        .fence_rechecks()
+        .map_err(|error| refusal("store_error", error.to_string()))?;
+    let classes = ctx
+        .config
+        .map(|config| {
+            crate::account_selection::ClassContext::load(
+                ctx.store,
+                ctx.credentials,
+                std::sync::Arc::new(config.clone()),
+                crate::ACCOUNT_QUOTA.get(),
+                ctx.now_ms,
+            )
+        })
+        .transpose()
+        .map_err(|error| refusal("store_error", error))?;
+    let mut recovered = Vec::new();
+    let accounts = classes
+        .as_ref()
+        .map(|classes| classes.probe_accounts())
+        .unwrap_or_default();
     let (refused, keys): (Vec<_>, Vec<_>) = keys.into_iter().partition(|key| {
-        fences
-            .iter()
-            .any(|fence| fence.provider_id == provider && fence.credential_id == key.credential_id)
+        if let Some(classes) = &classes {
+            let account = accounts
+                .get(&key.credential_id)
+                .map_or(key.workspace.as_str(), String::as_str);
+            if !classes.pool_fences_allow(&[provider, &target], model, account, &key.credential_id)
+            {
+                return true;
+            }
+            recovered.extend(classes.recovered_pool_origins(
+                provider,
+                model,
+                account,
+                &key.credential_id,
+            ));
+            recovered.extend(classes.recovered_pool_origins(
+                &target,
+                model,
+                account,
+                &key.credential_id,
+            ));
+            return false;
+        }
+        fences.iter().any(|fence| {
+            fence.provider_id == provider
+                && fence.credential_id == key.credential_id
+                && clocks.iter().any(|clock| {
+                    clock.kind == "credential"
+                        && clock.provider == provider
+                        && clock.credential_id.as_deref() == Some(&key.credential_id)
+                        && clock.due_at() > ctx.now_ms
+                })
+        })
     });
     let refused: Vec<PoolBlockedKey> = refused
         .into_iter()
         .map(|key| PoolBlockedKey {
             reason: crate::credential_fences::rejection_reason(
                 &fences,
-                provider,
+                fences
+                    .iter()
+                    .find(|fence| {
+                        fence.credential_id == key.credential_id
+                            && (fence.provider_id == provider || fence.provider_id == target)
+                    })
+                    .map_or(provider, |fence| fence.provider_id.as_str()),
                 std::slice::from_ref(&key.credential_id),
             )
             .into(),
+            reset_at_ms: classes
+                .as_ref()
+                .and_then(|classes| {
+                    classes.pool_recheck_hint(
+                        &[provider, &target],
+                        model,
+                        accounts
+                            .get(&key.credential_id)
+                            .map_or(key.workspace.as_str(), String::as_str),
+                        &key.credential_id,
+                    )
+                })
+                .or_else(|| {
+                    clocks
+                        .iter()
+                        .filter(|clock| {
+                            [provider, target.as_str()].contains(&clock.provider.as_str())
+                                && clock.applies(
+                                    &clock.provider,
+                                    &key.workspace,
+                                    &key.credential_id,
+                                    model,
+                                )
+                        })
+                        .map(|clock| clock.due_at())
+                        .filter(|at| *at > ctx.now_ms)
+                        .max()
+                }),
             credential_id: key.credential_id,
-            reset_at_ms: None,
         })
         .collect();
     if keys.is_empty() && !refused.is_empty() {
@@ -210,14 +295,20 @@ pub fn acquire(
     }
     let outcome = ctx
         .store
-        .pool_acquire(&PoolAcquire {
-            provider,
-            session_id: session,
-            keys: &keys,
-            now_ms: ctx.now_ms,
-            lease_ms: LEASE_MS,
-            affinity_idle_ms: AFFINITY_IDLE_MS,
-        })
+        .pool_acquire_for_route(
+            &PoolAcquire {
+                provider,
+                session_id: session,
+                keys: &keys,
+                now_ms: ctx.now_ms,
+                lease_ms: LEASE_MS,
+                affinity_idle_ms: AFFINITY_IDLE_MS,
+            },
+            &[provider, &target],
+            model,
+            &recovered,
+            &accounts,
+        )
         .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
     let lease = match outcome {
         PoolAcquireOutcome::Leased(lease) => lease,

@@ -306,7 +306,11 @@ impl<'a> Allocator<'a> {
         self.state.principal_exclusions.iter().any(|exclusion| {
             exclusion.principal == self.request.principal
                 && exclusion.credential_id == credential_id
-                && self.now - exclusion.recorded_at_ms < self.policy.principal_exclusion_max_ms
+                && self.now - exclusion.recorded_at_ms
+                    < self
+                        .policy
+                        .principal_exclusion_max_ms
+                        .min(crate::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS)
                 && self
                     .state
                     .roster
@@ -321,10 +325,9 @@ impl<'a> Allocator<'a> {
     }
 
     /// Blocks on this account that restrict the requested model, newest
-    /// first. A block stops restricting once [`block_end`] says it ended: its
-    /// known reset passed, its retry time came, or a fresh reading observed
-    /// after it shows headroom on its pool (design, "Blocks are driven by
-    /// evidence").
+    /// first. Only newer fresh headroom retires evidence. For a due probe, the
+    /// module omits its own fence from allocation and atomically advances its
+    /// recheck clock at admission, leaving the stored evidence in place.
     fn fences_for(&self, account_id: &str) -> Vec<&'a Fence> {
         if self.using_credits(account_id) {
             return Vec::new();
@@ -391,13 +394,26 @@ impl<'a> Allocator<'a> {
                         .collect(),
                 });
             } else {
-                let usable: Vec<&CredentialRecord> = allowed
+                let mut usable: Vec<&CredentialRecord> = allowed
                     .into_iter()
                     .filter(|record| !record.needs_reauth)
                     .collect();
                 if usable.is_empty() {
                     reasons.push(ExclusionReason::ReauthRequired);
                 } else {
+                    if usable.iter().any(|record| {
+                        !self
+                            .context
+                            .credential_probe_notes
+                            .contains_key(&record.credential_id)
+                    }) {
+                        usable.retain(|record| {
+                            !self
+                                .context
+                                .credential_probe_notes
+                                .contains_key(&record.credential_id)
+                        });
+                    }
                     credential_id = Self::bind_record(&usable);
                 }
             }
@@ -1100,6 +1116,19 @@ impl<'a> Allocator<'a> {
             }
             let (code, retry) = self.no_candidate(&survivors);
             return refuse(self.explanation, code, retry);
+        }
+        // Prefer a healthy offered identity, but only after runner-candidate
+        // filtering. An unavailable sibling must not hide the selected probe.
+        if eligible.iter().any(|eval| {
+            eval.hard.credential_id.as_ref().is_some_and(|credential| {
+                !self.context.credential_probe_notes.contains_key(credential)
+            })
+        }) {
+            eligible.retain(|eval| {
+                eval.hard.credential_id.as_ref().is_none_or(|credential| {
+                    !self.context.credential_probe_notes.contains_key(credential)
+                })
+            });
         }
         if eligible.len() > 1 {
             if let Some(parent) = &self.context.parent_account_id {

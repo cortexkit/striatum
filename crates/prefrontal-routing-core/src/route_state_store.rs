@@ -124,6 +124,10 @@ impl RouteWallClass {
 /// increment flags add to the persisted counters. Mirrors the TS `RouteStateUpdate`.
 #[derive(Debug, Clone, Default)]
 pub struct RouteStateUpdate {
+    /// Internal receipt clock supplied by the module; never a wire field.
+    pub observed_at_ms: Option<i64>,
+    /// An explicit identity-free cooldown, not an account error copied onto a route.
+    pub unscoped_wall: bool,
     pub cooldown_until: Option<f64>,
     pub quota_exhausted_until: Option<f64>,
     pub wall_class: Option<RouteWallClass>,

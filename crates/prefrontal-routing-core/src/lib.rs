@@ -17,6 +17,7 @@ pub mod billing;
 pub mod break_glass;
 pub mod canonical_scores;
 pub mod failure_backoff;
+pub mod fence_lifetimes;
 pub mod key_pool;
 pub mod launch_policy;
 pub mod model_facts;

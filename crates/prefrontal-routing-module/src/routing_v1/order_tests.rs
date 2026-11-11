@@ -726,15 +726,14 @@ async fn a_v1_mason_runs_the_consumer_variant_the_older_select_chose() {
 }
 
 #[tokio::test]
-async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select_wires() {
+async fn legacy_provider_reset_evidence_schedules_checks_on_both_select_wires() {
     use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
     let now = 1_793_149_650_000;
     let _clock = crate::InjectedClock::set(now as u64);
     for v1 in [true, false] {
-        // Readable resets stand as reported, even beyond a week. Missing or
-        // unreadable account resets retain a finite recheck; a late report does
-        // not reopen its already-passed window, and an ordinary interruption is
-        // not evidence that the account ran out.
+        // Readable reset dates remain evidence, even after the date passes.
+        // Missing/unreadable dates remain unknown, never an invented expiry.
+        // An ordinary interruption without a reset is not quota evidence.
         for (reset, expected_until, sibling, account_exhausted) in [
             (
                 Some(now + 5 * 86_400_000),
@@ -742,9 +741,9 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                 false,
                 true,
             ),
-            (Some(now - 6_000), None, false, true),
-            (Some(i64::MAX), Some(now + 8 * 86_400_000), false, true),
-            (None, Some(now + 8 * 86_400_000), false, true),
+            (Some(now - 6_000), Some(now - 6_000), false, true),
+            (Some(i64::MAX), Some(0), false, true),
+            (None, Some(0), false, true),
             (
                 Some(now + 20 * 86_400_000),
                 Some(now + 20 * 86_400_000),
@@ -869,10 +868,7 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                 assert_eq!(no_alternative.0, FrameType::Error, "{}", no_alternative.1);
                 assert_eq!(no_alternative.1["code"], "no_route");
                 assert_eq!(no_alternative.1["detail"]["reason"], "accounts_blocked");
-                assert_eq!(
-                    no_alternative.1["detail"]["reset_at_ms"],
-                    expected_until.unwrap(),
-                );
+                assert_eq!(no_alternative.1["detail"]["reset_at_ms"], now + 15 * 60_000,);
             } else {
                 assert_eq!(route_of(&pinned), CHEAP);
                 assert_eq!(legacy_route(&legacy_pin), CHEAP);
@@ -883,14 +879,15 @@ async fn legacy_provider_reset_fences_serving_api_key_until_reset_on_both_select
                 assert_eq!(fences[0].credential_id, "apikey:cheap-provider");
                 assert_eq!(fences[0].model, "model-a");
                 assert_eq!(fences[0].until_ms, expected_until);
-                assert!(harness
+                assert!(!harness
                     .store()
                     .account_route_fences(fences[0].until_ms)
                     .unwrap()
                     .is_empty());
                 assert_eq!(
                     route_of(&route.call("route.select", &select("mason")).await),
-                    CHEAP
+                    expected,
+                    "reading a future diagnostic time cannot expire quota evidence"
                 );
             } else {
                 assert!(fences.is_empty());

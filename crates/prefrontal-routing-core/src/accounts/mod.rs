@@ -37,8 +37,8 @@ pub use policy::{
     input_size_class, AccountStrategy, AllocationContext, CreditReading, PoolFloor, SpendReading,
 };
 pub use pools::{
-    block_end, grown_recovery_set, recovery_set_from, validate_pool_name, AllowedAccountClass,
-    BlockEnd, PoolKey, PoolScope, PoolWindowReading, POOL_NAME_MAX_LEN,
+    block_end, fresh_for_recovery, grown_recovery_set, recovery_set_from, validate_pool_name,
+    AllowedAccountClass, BlockEnd, PoolKey, PoolScope, PoolWindowReading, POOL_NAME_MAX_LEN,
 };
 pub use types::{
     AccountRef, AccountRequest, AccountView, AdmissionDemand, AdmissionState, AllocatorPolicy,

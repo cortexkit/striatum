@@ -154,7 +154,9 @@ pub(super) fn persistent_effects(harness: &Harness) -> Value {
                         "updated_at"
                         | "consecutive_terminal_failures"
                         | "failure_count"
-                        | "quota_error_count" => value == 0,
+                        | "quota_error_count"
+                        | "wall_unscoped" => value == 0,
+                        "wall_observed_at" | "failure_observed_at" => value.is_null() || value == 0,
                         _ => value.is_null(),
                     })
             });
@@ -315,6 +317,7 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
             assert_eq!(removed, 1, "retain the historical text-operation probe");
         }
         apply_report_outcome_difference(&mut expected);
+        apply_fence_lifetime_difference(&mut expected);
         project_additive_shape_members(&mut observed);
         project_additive_shape_members(&mut expected);
         if file == "availability" {
@@ -325,6 +328,50 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
             "routing replay differs: {file}: {}",
             first_difference("$", &observed, &expected)
         );
+    }
+}
+
+/// Keep captured requests and replies frozen, while declaring the changed
+/// default diagnostic policy values. Actual admission timing is covered by
+/// independent quota and per-kind atomic-probe regressions.
+fn apply_fence_lifetime_difference(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            if fields.get("name").and_then(Value::as_str) == Some("failed-future-reset") {
+                // This capture reports reset evidence against fresh headroom.
+                // It now belongs to the independent non-quota table, covered
+                // by account-class regressions, not the old quota-only table.
+                for step in fields
+                    .get_mut("steps")
+                    .and_then(Value::as_array_mut)
+                    .into_iter()
+                    .flatten()
+                {
+                    if step["method"] == "route.report" {
+                        step["state"]["account_route_fence"] = json!([]);
+                    }
+                }
+            }
+            if let Some(Value::Object(policies)) = fields.get_mut("account_policies") {
+                for policy in policies.values_mut() {
+                    if policy["principal_exclusion_max_ms"] == json!(86_400_000) {
+                        policy["principal_exclusion_max_ms"] = json!(3_600_000);
+                    }
+                    if policy["unknown_reset_retry_ms"] == json!(21_600_000) {
+                        policy["unknown_reset_retry_ms"] = json!(900_000);
+                    }
+                }
+            }
+            for value in fields.values_mut() {
+                apply_fence_lifetime_difference(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                apply_fence_lifetime_difference(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -422,6 +469,58 @@ fn project_additive_shape_members(value: &mut Value) {
     match value {
         Value::Array(values) => values.iter_mut().for_each(project_additive_shape_members),
         Value::Object(object) => {
+            // Retry clocks and scoped success proofs are internal persistence,
+            // checked by per-kind migration and admission tests. Do not rewrite
+            // historical recordings merely to add their table/column census.
+            for table in [
+                "fence_recheck",
+                "fence_recheck_route_clear",
+                "fence_success_pool",
+                "fence_probe_authorization",
+                "fence_retired_origin",
+                "account_non_quota_route_fence",
+                "account_non_quota_size_refusal",
+            ] {
+                object.remove(table);
+            }
+            for (table, columns) in [
+                (
+                    "model_route_state",
+                    &["wall_observed_at", "failure_observed_at", "wall_unscoped"][..],
+                ),
+                (
+                    "provider_cooldown_state",
+                    &["wall_observed_at", "wall_unscoped"][..],
+                ),
+                (
+                    "pool_key_state",
+                    &["wall_observed_at", "cooldown_observed_at"][..],
+                ),
+                ("pool_key_lease", &["fence_probe"][..]),
+                (
+                    "account_admission",
+                    &["input_size_class", "model_decision_id"][..],
+                ),
+            ] {
+                if let Some(rows) = object.get_mut(table).and_then(Value::as_array_mut) {
+                    for row in rows {
+                        if let Some(row) = row.as_object_mut() {
+                            for column in columns {
+                                row.remove(*column);
+                            }
+                        }
+                    }
+                }
+            }
+            // Transient route evidence moved to its independent kind so it
+            // cannot overwrite quota evidence. Per-kind admission tests cover
+            // that store; retain quota rows in this frozen state comparison.
+            if let Some(rows) = object
+                .get_mut("account_route_fence")
+                .and_then(Value::as_array_mut)
+            {
+                rows.retain(|row| row["wall_class"] != "transient");
+            }
             // Delivery identities are additive persistence, checked by the
             // tests for usage deduplication and crash recovery, not the pre-add snapshot.
             object.remove("routing_v1_report_delivery");

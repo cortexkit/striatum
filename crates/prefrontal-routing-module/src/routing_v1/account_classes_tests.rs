@@ -31,6 +31,7 @@ async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
             "synthetic/model",
             &prefrontal_routing_core::RouteStateUpdate {
                 cooldown_until: Some((NOW + 1_800_000) as f64),
+                observed_at_ms: Some(NOW as i64),
                 wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
                 ..Default::default()
             },
@@ -58,6 +59,7 @@ async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
             &prefrontal_routing_core::RouteStateUpdate {
                 cooldown_until: Some((NOW + 1_800_000) as f64),
                 quota_exhausted_until: Some((NOW + 1_800_000) as f64),
+                observed_at_ms: Some(NOW as i64),
                 wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
                 last_error: Some("quota exhausted".into()),
                 ..Default::default()
@@ -201,12 +203,24 @@ async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_accoun
     let mut request = account_request("synthetic", "all-transient-last-resort");
     request["decision_id"] = selected.1["result"]["decision_id"].clone();
     let admitted = runner.call("route.account_for", &request).await;
-    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
-    assert!(
-        admitted.1["result"]["account"]["credential_id"].is_string(),
-        "{}",
+    assert_eq!(
+        admitted.0,
+        FrameType::Error,
+        "pending transient retries cannot be bypassed as a last resort: {}",
         admitted.1
     );
+    let _retry = crate::InjectedClock::set(NOW + 5_001);
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    request["admission_id"] = json!("all-transient-single-probe");
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
 
     harness
         .store()
@@ -214,6 +228,7 @@ async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_accoun
             "synthetic/model",
             "synthetic/model",
             &prefrontal_routing_core::RouteStateUpdate {
+                observed_at_ms: Some((NOW + 5_001) as i64),
                 cooldown_until: Some((NOW + 1_800_000) as f64),
                 quota_exhausted_until: Some((NOW + 1_800_000) as f64),
                 wall_class: Some(prefrontal_routing_core::RouteWallClass::Quota),
@@ -262,17 +277,16 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
         credential_id: "oauth:test".into(),
         code: "billing_exhausted".into(),
     };
-    let recorded = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS;
+    let recorded = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS + 1;
     crate::credential_fences::record(harness.store(), &shared, &refusal, recorded).unwrap();
     let runner = harness.bind(reserved(RUNNER), None).await;
     let blocked = runner
         .call(
             "route.account_for",
-            &account_request("synthetic", "exactly-six-hours"),
+            &account_request("synthetic", "before-one-hour"),
         )
         .await;
-    // The fence opens for one probe just after six hours. It remains an
-    // account limit, not an auth problem, until that boundary passes.
+    // One probe opens at the one-hour boundary, not one millisecond later.
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
@@ -319,7 +333,7 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
     );
     assert_eq!(
         harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
-        NOW as i64 + 1
+        recorded
     );
     let account_decision = harness
         .store()
@@ -354,19 +368,25 @@ async fn credential_probe_admission_is_single_and_completion_heals_its_credentia
         now_ms: NOW as i64 + 1,
         classes: Some(cached),
     };
-    // The probe is already claimed: the allocator has no account left and the
-    // stale roster cannot serve, which is transient unavailability.
+    // The stale roster cannot send a second probe. Revalidation must retain
+    // the winning claim's fence and retry time, not blame runner candidates.
+    let lost = crate::account_selection::handle(
+        crate::account_selection::ACCOUNT_FOR_OP,
+        &body,
+        &format!("reserved:{RUNNER}"),
+        &ctx,
+    );
     assert_eq!(
-        crate::account_selection::handle(
-            crate::account_selection::ACCOUNT_FOR_OP,
-            &body,
-            &format!("reserved:{RUNNER}"),
-            &ctx
-        )
-        .code(),
-        Some("account_selection_unavailable"),
+        lost.code(),
+        Some("account_pool_exhausted"),
         "a stale cached roster cannot reserve a second probe"
     );
+    match lost {
+        crate::account_selection::OpReply::Error { detail, .. } => {
+            assert_eq!(detail.unwrap()["reset_at_ms"], NOW + 3_600_001)
+        }
+        _ => unreachable!(),
+    }
     let completed = caller
         .call(
             "route.report",
@@ -465,7 +485,7 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(NOW + 21_600_001),
+        json!(NOW + 3_600_000),
         "{}",
         blocked.1
     );
@@ -1176,7 +1196,12 @@ async fn assert_account_unavailability_keeps_frontier(block: &str) {
     );
     match block {
         "reserve" => oauth_reading(99.0),
-        "exhausted" => exhaust_oauth(&harness, "synthetic"),
+        "exhausted" => {
+            // This control is confirmed exhaustion, not a quota refusal
+            // contradicted by the earlier healthy baseline reading.
+            oauth_reading(100.0);
+            exhaust_oauth(&harness, "synthetic");
+        }
         "refused" => {
             crate::credential_fences::record(
                 harness.store(),
@@ -1213,20 +1238,14 @@ async fn assert_account_unavailability_keeps_frontier(block: &str) {
             NOW as i64,
         )
         .unwrap();
-        let decision = classes.probe(
-            "synthetic",
-            "model",
-            false,
-            false,
-            None,
-            "frontier-regression",
-        );
+        // Structured selection preflight retains the quota cause even when
+        // temporal filtering has removed every account from the raw roster.
         assert_eq!(
-            decision.refusal().unwrap().code,
+            classes.blocked_reset("synthetic", "model", false),
             if block == "reserve" {
-                prefrontal_routing_core::accounts::RefusalCode::AccountPoolReserveLimited
+                Some(Some(NOW as i64 + 3_600_000))
             } else {
-                prefrontal_routing_core::accounts::RefusalCode::AccountPoolExhausted
+                Some(Some(NOW as i64 + 600_000))
             }
         );
     }
@@ -1243,6 +1262,22 @@ async fn assert_account_unavailability_keeps_frontier(block: &str) {
         "{block}: {}",
         blocked.1
     );
+    if block == "exhausted" {
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let admission = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "frontier-exhausted"),
+            )
+            .await;
+        assert_eq!(admission.0, FrameType::Error, "{}", admission.1);
+        assert_eq!(
+            admission.1["code"], "account_pool_exhausted",
+            "quota filtering is not an authorization failure: {}",
+            admission.1
+        );
+        assert_eq!(admission.1["detail"]["reset_at_ms"], NOW as i64 + 600_000);
+    }
     if matches!(block, "refused" | "stale") {
         let rejected = blocked.1["detail"]["rejected"].as_array().unwrap();
         let top = rejected
@@ -1490,20 +1525,37 @@ async fn report_eligibility_is_model_or_account_scoped_and_never_a_hold() {
 }
 
 #[tokio::test]
-async fn size_shaped_429_restricts_only_its_input_band_and_success_clears_it() {
+async fn size_shaped_429_restricts_only_its_band_and_only_an_admitted_size_probe_clears_it() {
+    exercise_size_probe(false).await;
+}
+
+#[tokio::test]
+async fn size_quota_refusal_contradicted_by_headroom_remains_non_quota_until_its_size_probe() {
+    exercise_size_probe(true).await;
+}
+
+async fn exercise_size_probe(contradicted: bool) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
+    if contradicted {
+        oauth_weekly_reading_at(0.0, NOW as i64 + 86_400_000, NOW as i64);
+    }
     let caller = harness.bind(reserved(OWNER), None).await;
     let runner = harness.bind(reserved(RUNNER), None).await;
     let select = json!({"consumer":"mason","requirements":{"iq":30},"pin":"synthetic/model"});
     let decision = caller.call("route.select", &select).await;
     assert_eq!(decision.0, FrameType::Response, "{}", decision.1);
-    let report=caller.call("route.report",&json!({"decision_id":decision.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":NOW+600_000})).await;
+    let report=caller.call("route.report",&json!({"decision_id":decision.1["result"]["decision_id"],"outcome":"refused","credential_id":"oauth:test","runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":NOW+10_000})).await;
     assert_eq!(report.0, FrameType::Response, "{}", report.1);
+    let origins = harness.store().fence_rechecks().unwrap();
+    let kind = if contradicted {
+        "non_quota_size"
+    } else {
+        "size"
+    };
+    assert!(origins.iter().any(|origin| origin.kind == kind));
     let mut large = account_request("synthetic", "large");
     large["initial_input_bytes"] = json!(169_000 * 4);
-    // The size refusal filtered every account in the class for this input
-    // size, so the caller may not use it.
     let blocked = runner.call("route.account_for", &large).await;
     assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
     assert_eq!(blocked.1["detail"], json!({}), "{}", blocked.1);
@@ -1513,14 +1565,58 @@ async fn size_shaped_429_restricts_only_its_input_band_and_success_clears_it() {
         &runner.call("route.account_for", &small).await,
         "oauth:test",
     );
-    let next = caller.call("route.select", &select).await;
-    assert_eq!(next.0, FrameType::Response, "{}", next.1);
+    // Unknown-size selection still serves ordinary traffic. A token count
+    // supplied later with its report is not a claimed size-class admission.
+    let unknown = caller.call("route.select", &select).await;
+    assert_eq!(unknown.0, FrameType::Response, "{}", unknown.1);
     let _later = crate::InjectedClock::set(NOW + 1);
-    let success=caller.call("route.report",&json!({"decision_id":next.1["result"]["decision_id"],"outcome":"completed","credential_id":"oauth:test","request_input_tokens":169_000})).await;
+    if contradicted {
+        oauth_weekly_reading_at(0.0, NOW as i64 + 86_400_000, NOW as i64 + 1);
+    }
+    let success=caller.call("route.report",&json!({"decision_id":unknown.1["result"]["decision_id"],"outcome":"completed","credential_id":"oauth:test","request_input_tokens":169_000})).await;
     assert_eq!(success.0, FrameType::Response, "{}", success.1);
-    large["admission_id"] = json!("large-after-success");
+    assert_eq!(
+        harness
+            .store()
+            .account_size_refusals(NOW as i64 + 1)
+            .unwrap()
+            .len(),
+        1,
+        "neither unknown-size success nor headroom clears a contradictory non-quota size wall"
+    );
+    large["admission_id"] = json!("large-still-fenced");
+    assert_eq!(
+        runner.call("route.account_for", &large).await.0,
+        FrameType::Error
+    );
+    let _due = crate::InjectedClock::set(NOW + 10_000);
+    let probe = caller.call("route.select", &select).await;
+    assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+    large["admission_id"] = json!("large-probe");
+    large["decision_id"] = probe.1["result"]["decision_id"].clone();
     assert_credential(
         &runner.call("route.account_for", &large).await,
+        "oauth:test",
+    );
+    let mut concurrent = large.clone();
+    concurrent.as_object_mut().unwrap().remove("decision_id");
+    concurrent["admission_id"] = json!("second-size-probe");
+    concurrent["conversation_key"] = json!("second-size-probe");
+    assert_eq!(
+        runner.call("route.account_for", &concurrent).await.0,
+        FrameType::Error,
+        "one size-aware request claims the class"
+    );
+    let success=caller.call("route.report",&json!({"decision_id":probe.1["result"]["decision_id"],"outcome":"completed","credential_id":"oauth:test"})).await;
+    assert_eq!(success.0, FrameType::Response, "{}", success.1);
+    assert!(harness
+        .store()
+        .account_size_refusals(NOW as i64 + 10_000)
+        .unwrap()
+        .is_empty());
+    concurrent["admission_id"] = json!("large-after-success");
+    assert_credential(
+        &runner.call("route.account_for", &concurrent).await,
         "oauth:test",
     );
 }
@@ -1938,23 +2034,23 @@ async fn paid_credit_readings_are_explicit_fresh_inputs_and_refusals_cannot_rewr
             &account_request("synthetic", "credits-refused"),
         )
         .await;
-    // A subscription billing refusal with an exhausted reading is a quota
-    // hold until that reading's reset, not an untimed billing fence.
+    // The exhausted reading keeps quota evidence binding. The retry hint is
+    // its next fifteen-minute check, not a promise that the quota resets then.
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(NOW as i64 + 3_600_000),
+        json!(NOW as i64 + 900_000),
         "{}",
         blocked.1
     );
 }
 
 /// Contract 0.5.0: a failed report with a future reset fences the decision's
-/// route on the account that served it until the reset. Before 0.5.0 such a
+/// route on the account that served it until a recheck. Before 0.5.0 such a
 /// report was only advisory and this test pinned that the same route and
 /// account were answered again; the contract now says the opposite. What still
 /// holds: the failure ends affinity, the fence is not a size refusal, and the
-/// refusals name the reset so callers wait for it.
+/// refusals name the next check so callers can retry without inventing recovery.
 #[tokio::test]
 async fn failure_reports_with_resets_fence_the_route_on_the_serving_account() {
     let _clock = crate::InjectedClock::set(NOW);
@@ -1995,7 +2091,7 @@ async fn failure_reports_with_resets_fence_the_route_on_the_serving_account() {
     );
     assert_eq!(
         second.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW + 15 * 60_000),
         "{}",
         second.1
     );
@@ -2010,7 +2106,7 @@ async fn failure_reports_with_resets_fence_the_route_on_the_serving_account() {
     );
     assert_eq!(
         after_account.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW + 15 * 60_000),
         "{}",
         after_account.1
     );
@@ -2194,7 +2290,7 @@ fn oauth_weekly_reading_at(used_percent: f64, reset_ms: i64, fetched_ms: i64) {
 }
 
 #[tokio::test]
-async fn subscription_billing_refusal_with_exhausted_reading_holds_until_reset_without_probe() {
+async fn subscription_billing_refusal_keeps_reset_evidence_but_stale_readings_allow_a_probe() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
@@ -2245,27 +2341,28 @@ async fn subscription_billing_refusal_with_exhausted_reading_holds_until_reset_w
     assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
     assert_eq!(
         blocked.1["detail"]["reset_at_ms"],
-        json!(reset),
-        "held until the reading's reset: {}",
+        json!(NOW as i64 + 900_000),
+        "the reset is evidence, while the next check is fifteen minutes away: {}",
         blocked.1
     );
     let probe_at = NOW as i64 + crate::credential_fences::FENCE_PROBE_RECHECK_MS + 1;
     let _later = crate::InjectedClock::set(probe_at as u64);
-    // The original reading is stale now; its known reset must still hold.
+    // The original reading is stale now; a distant reset cannot veto a trial.
     let still = runner
         .call(
             "route.account_for",
             &account_request("synthetic", "quota-held-after-probe-interval"),
         )
         .await;
-    assert_eq!(still.0, FrameType::Error, "{}", still.1);
-    assert_eq!(still.1["code"], "account_pool_exhausted", "{}", still.1);
-    assert_eq!(
-        still.1["detail"]["reset_at_ms"],
-        json!(reset),
-        "no probe is admitted before the reset: {}",
-        still.1
-    );
+    assert_credential(&still, "oauth:test");
+    let again = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "quota-probe-already-taken"),
+        )
+        .await;
+    assert_eq!(again.0, FrameType::Error, "{}", again.1);
+    assert_eq!(again.1["detail"]["reset_at_ms"], probe_at + 900_000);
     let evidence =
         crate::diagnostics_findings::Evidence::gather(harness.store(), probe_at, 60_000).unwrap();
     let diagnostics = crate::diagnostics_findings::report(&evidence, probe_at, 60_000);
@@ -2343,7 +2440,102 @@ async fn subscription_quota_hold_lifts_on_fresh_headroom_reading() {
 }
 
 #[tokio::test]
-async fn pay_per_token_credential_without_reading_keeps_the_six_hour_probe() {
+async fn credential_quota_reconciliation_requires_every_recorded_recovery_pool() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let reset = NOW as i64 + 3_600_000;
+    oauth_weekly_reading_at(10.0, reset, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30}}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    oauth_weekly_reading_at(100.0, reset, NOW as i64);
+    for reading in crate::ACCOUNT_QUOTA
+        .get()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .readings
+        .readings
+        .values_mut()
+    {
+        reading.entry["usage"]["secondary"] = json!({"usedPercent":100.0,"windowMinutes":300,
+            "resetsAt":crate::account_selection::rfc3339(reset)});
+    }
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],
+        "outcome":"refused","credential_id":"oauth:test","runner_code":"billing_exhausted"}),
+        )
+        .await;
+    assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
+    let held = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "two-pool-held"),
+        )
+        .await;
+    assert_eq!(held.1["code"], "account_pool_exhausted", "{}", held.1);
+    assert!(harness
+        .store()
+        .account_read(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap()
+        .iter()
+        .any(|block| block.recovery_set.len() == 2));
+    oauth_weekly_reading_at(0.0, reset, NOW as i64 + 60_000);
+    let _later = crate::InjectedClock::set(NOW + 60_000);
+    let partial = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "partial-pool-held"),
+        )
+        .await;
+    assert_eq!(
+        partial.1["code"], "account_pool_exhausted",
+        "missing pool cannot heal a linked hold: {}",
+        partial.1
+    );
+    assert!(harness
+        .store()
+        .credential_entitlement_fences()
+        .unwrap()
+        .iter()
+        .any(|f| f.credential_id == "oauth:test"));
+    let probe_at = NOW + 16 * 60_000;
+    oauth_weekly_reading_at(0.0, reset, probe_at as i64);
+    let _probe_clock = crate::InjectedClock::set(probe_at);
+    let rows = credentials.listed_credentials().to_vec();
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-pool-probe".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        probe_at,
+    );
+    harness.set_credentials(credentials);
+    let probe = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "missing-pool-probe"),
+        )
+        .await;
+    assert_eq!(
+        probe.0,
+        FrameType::Response,
+        "fresh partial headroom cannot suppress the probe: {}",
+        probe.1
+    );
+}
+
+#[tokio::test]
+async fn pay_per_token_credential_without_reading_keeps_the_one_hour_probe() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     oauth_weekly_reading_at(10.0, NOW as i64 + 3_600_000, NOW as i64);
@@ -2446,7 +2638,7 @@ async fn subscription_hold_diagnostics_names_reset_without_a_top_up_hint() {
 }
 
 #[tokio::test]
-async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroom() {
+async fn repeated_subscription_refusals_keep_reset_evidence_and_require_newer_headroom() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, credentials) = setup("synthetic", false);
     let reset = NOW as i64 + 7_200_000;
@@ -2467,7 +2659,7 @@ async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroo
         .await;
     assert_eq!(
         first.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW as i64 + 900_000),
         "{}",
         first.1
     );
@@ -2483,7 +2675,7 @@ async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroo
         .await;
     assert_eq!(
         second.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW as i64 + 60_000 + 900_000),
         "{}",
         second.1
     );
@@ -2497,7 +2689,7 @@ async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroo
     assert_eq!(older.0, FrameType::Error, "{}", older.1);
     assert_eq!(
         older.1["detail"]["reset_at_ms"],
-        json!(reset),
+        json!(NOW as i64 + 60_000 + 900_000),
         "{}",
         older.1
     );
@@ -2524,10 +2716,12 @@ async fn repeated_subscription_refusals_keep_the_reset_and_require_newer_headroo
 }
 
 #[tokio::test]
-async fn persisted_subscription_billing_fence_converts_and_lifts_at_its_known_reset() {
+async fn persisted_subscription_billing_fence_rechecks_without_expiring_at_its_reset() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, credentials) = setup("synthetic", false);
-    let reset = NOW as i64 + 7 * 24 * 60 * 60_000;
+    // Keep independent runner/vault facts fresh while exercising the reset's
+    // extra quota check before the ordinary fifteen-minute recheck.
+    let reset = NOW as i64 + 2 * 60_000;
     let shared = Arc::new(std::sync::Mutex::new(credentials));
     crate::credential_fences::record(
         harness.store(),
@@ -2537,7 +2731,7 @@ async fn persisted_subscription_billing_fence_converts_and_lifts_at_its_known_re
             credential_id: "oauth:test".into(),
             code: "billing_exhausted".into(),
         },
-        NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
+        NOW as i64,
     )
     .unwrap();
     oauth_weekly_reading_at(99.5, reset, NOW as i64);
@@ -2566,19 +2760,50 @@ async fn persisted_subscription_billing_fence_converts_and_lifts_at_its_known_re
     );
 
     let _later = crate::InjectedClock::set(reset as u64 + 1);
-    // No new reading is needed to end a hold with a known reset.
-    let _ = runner
+    // A newer refusal in a different input band must not veto the account's
+    // extra reset check for ordinary small requests, or consume that band's trial.
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute(
+            "INSERT INTO account_size_refusal VALUES ('synthetic','oauth:test','model',17,?1,?2)",
+            rusqlite::params![reset + 3_600_000, reset + 1],
+        )
+        .unwrap();
+    // The reset permits a check, not deletion of quota evidence.
+    let after = runner
         .call(
             "route.account_for",
             &account_request("synthetic", "after-known-reset"),
         )
         .await;
-    assert!(harness
+    assert_eq!(after.0, FrameType::Response, "{}", after.1);
+    let duplicate = runner
+        .call(
+            "route.account_for",
+            &account_request("synthetic", "second-reset-probe"),
+        )
+        .await;
+    assert_eq!(
+        duplicate.0,
+        FrameType::Error,
+        "a reset must admit only one probe: {}",
+        duplicate.1
+    );
+    assert!(!harness
         .store()
         .credential_entitlement_fences()
         .unwrap()
         .is_empty());
-    assert!(harness
+    assert!(
+        harness
+            .store()
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .any(|origin| origin.kind == "size" && origin.last_claimed_at.is_none()),
+        "the unrelated size fence keeps its own probe"
+    );
+    assert!(!harness
         .store()
         .account_transaction(|tx| tx.active_pool_fences("synthetic"))
         .unwrap()
@@ -2586,7 +2811,154 @@ async fn persisted_subscription_billing_fence_converts_and_lifts_at_its_known_re
 }
 
 #[tokio::test]
-async fn run_and_reading_resets_keep_the_later_time_and_headroom_lifts_both() {
+async fn quota_route_probe_claim_is_shared_by_credentials_on_the_same_account() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    let mut alias = rows
+        .iter()
+        .find(|row| row.id == "oauth:test")
+        .unwrap()
+        .clone();
+    alias.id = "oauth:alias".into();
+    rows.push(alias);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "same-account-aliases".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    harness
+        .store()
+        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "model".into(),
+            until_ms: 0,
+            decision_id: "old-refusal".into(),
+            recorded_at: NOW as i64 - 900_000,
+        })
+        .unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = account_request("synthetic", "alias-probe");
+    request["candidates"] = json!({"view_digest":"alias-only","accounts":[{"account_id":"oauth-account","credential_id":"oauth:alias"}]});
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:alias",
+    );
+    request["admission_id"] = json!("second-alias-probe");
+    request["conversation_key"] = json!("second-alias-probe");
+    let blocked = runner.call("route.account_for", &request).await;
+    assert_eq!(
+        blocked.0,
+        FrameType::Error,
+        "a sibling credential must not avoid the account's atomic claim: {}",
+        blocked.1
+    );
+    let _next = crate::InjectedClock::set(NOW + 1);
+    oauth_weekly_reading_at(0.0, NOW as i64 + 86_400_000, NOW as i64 + 1);
+    request["admission_id"] = json!("headroom-alias");
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:alias",
+    );
+    assert!(harness
+        .store()
+        .account_route_fences(NOW as i64 + 1)
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_billing_refusal_converted_without_a_reset_keeps_its_fifteen_minute_check_when_readings_disappear(
+) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    crate::credential_fences::record(
+        harness.store(),
+        &Arc::new(std::sync::Mutex::new(credentials)),
+        &CredentialRefusal {
+            provider_id: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            code: "billing_exhausted".into(),
+        },
+        NOW as i64,
+    )
+    .unwrap();
+    let mut quota = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_provider_reply(&mut quota,"test-source",&serde_json::to_vec(&json!({
+        "result":[{"provider":"test-source","apiProvider":"synthetic","account":"oauth-account","source":"vault",
+            "fetchedAt":crate::account_selection::rfc3339(NOW as i64),"usage":{"primary":{"usedPercent":99.5,"windowMinutes":10080}}}],
+        "completeProviders":["test-source"]})).unwrap(),NOW as i64).unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    assert_eq!(
+        runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "near-wall-without-reset")
+            )
+            .await
+            .0,
+        FrameType::Error
+    );
+    assert!(harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .iter()
+        .any(|origin| origin.kind == "credential" && origin.quota));
+    let holds = harness
+        .store()
+        .account_read(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap();
+    assert!(
+        !holds.is_empty(),
+        "quota holds retain their recovery pools even without a reset"
+    );
+    for hold in holds {
+        let fence: prefrontal_routing_core::accounts::Fence =
+            serde_json::from_str(&hold.evidence.fence_json).unwrap();
+        assert_eq!(
+            fence.reset,
+            prefrontal_routing_core::accounts::ResetTime::Missing,
+            "a recovery hold must not invent a fixed reset deadline"
+        );
+    }
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
+    let _later = crate::InjectedClock::set(NOW + 900_000);
+    assert_credential(
+        &runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "missing-reading-probe"),
+            )
+            .await,
+        "oauth:test",
+    );
+    assert!(harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .iter()
+        .any(|origin| origin.kind == "credential" && origin.quota));
+    assert_eq!(
+        runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "second-missing-reading-probe")
+            )
+            .await
+            .0,
+        FrameType::Error
+    );
+}
+
+#[tokio::test]
+async fn run_and_reading_resets_do_not_postpone_checks_and_headroom_lifts_both() {
     for (run_offset, reading_offset) in [(3_600_000, 7_200_000), (7_200_000, 3_600_000)] {
         let _clock = crate::InjectedClock::set(NOW);
         let (harness, _) = setup("synthetic", false);
@@ -2616,7 +2988,7 @@ async fn run_and_reading_resets_keep_the_later_time_and_headroom_lifts_both() {
         assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
         assert_eq!(
             blocked.1["detail"]["reset_at_ms"],
-            json!(NOW as i64 + 7_200_000),
+            json!(NOW as i64 + 900_000),
             "{}",
             blocked.1
         );
@@ -2712,7 +3084,7 @@ async fn client_attestation_denied_fences_the_serving_credential() {
     );
     assert_eq!(
         harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
-        probe_at as i64
+        NOW as i64
     );
 }
 
@@ -2745,7 +3117,7 @@ async fn entitlement_refusals_never_convert_to_quota_blocks() {
         assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
         assert_eq!(
             blocked.1["detail"]["reset_at_ms"],
-            json!(NOW + 21_600_001),
+            json!(NOW + 3_600_000),
             "entitlement names its probe window, not the quota reset: {}",
             blocked.1
         );
@@ -2765,10 +3137,21 @@ async fn entitlement_refusals_never_convert_to_quota_blocks() {
                 &account_request("synthetic", "entitlement-after-quota-reset"),
             )
             .await;
-        assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+        assert_credential(&blocked, "oauth:test");
         assert_eq!(
             harness.store().credential_entitlement_fences().unwrap()[0].code,
             code
+        );
+        assert_eq!(
+            runner
+                .call(
+                    "route.account_for",
+                    &account_request("synthetic", "second-entitlement-probe")
+                )
+                .await
+                .0,
+            FrameType::Error,
+            "headroom did not clear entitlement evidence; only one timed probe passed"
         );
     }
 }
@@ -2817,7 +3200,7 @@ async fn entitlement_finding_with_quota_reading_names_the_probe_and_hand_lift() 
             .find(|finding| finding["check"] == "credential_fences")
             .unwrap();
         let hint = finding["hint"].as_str().unwrap();
-        assert!(hint.contains("every 6 hours"), "{hint}");
+        assert!(hint.contains("every 1h"), "{hint}");
         assert!(
             hint.contains("route.clear_credential_fences {\"credentialId\":\"oauth:test\"}"),
             "{hint}"
@@ -3036,7 +3419,7 @@ async fn decision_owner_backoff_requires_the_admission_to_have_carried_its_decis
             .account_read(|tx| tx.observation_backoffs(NOW as i64))
             .unwrap()[0]
             .2,
-        (NOW + 24 * 60 * 60_000) as i64
+        (NOW + 60 * 60_000) as i64
     );
 }
 
@@ -3322,6 +3705,265 @@ async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() 
     );
 }
 
+fn credit_xai_fixture() -> (Arc<Harness>, BrocaCredentials) {
+    let (harness, mut credentials) = setup("xai", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.retain(|row| row.id == "oauth:test");
+    rows[0].id = "oauth:xai".into();
+    rows[0].account_id = Some("xai-account".into());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-credit".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+    credit_xai_reading(Some(0.0), NOW as i64);
+    (harness, credentials)
+}
+
+fn credit_xai_reading(used: Option<f64>, at: i64) {
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    if let Some(used) = used {
+        crate::account_quota::apply_provider_reply(&mut state, "grok", &serde_json::to_vec(&json!({
+            "result":[{"provider":"grok","apiProvider":"xai","account":"xai-account",
+                "credentialRef":"oauth:xai","source":"vault","fetchedAt":crate::account_selection::rfc3339(at),
+                "usage":{"primary":{"usedPercent":used,"windowMinutes":10080}}}],
+            "completeProviders":["grok"]
+        })).unwrap(), at).unwrap();
+    }
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+}
+
+#[tokio::test]
+async fn xai_credit_window_is_a_billing_wall_until_one_probe_and_matching_success() {
+    for (used, retry) in [
+        (Some(0.0), None),
+        (Some(100.0), None),
+        (None, None),
+        (Some(0.0), Some(45_000)),
+    ] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let (harness, mut credentials) = credit_xai_fixture();
+        let owner = harness.bind(reserved(OWNER), None).await;
+        let selected = owner
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+            )
+            .await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        assert_eq!(
+            selected.1["result"]["route"]["provider"], "xai",
+            "{}",
+            selected.1
+        );
+        assert_eq!(
+            selected.1["result"]["route"]["model"], "model",
+            "{}",
+            selected.1
+        );
+        let runner = harness
+            .bind(
+                reserved(selected.1["result"]["runner"]["module"].as_str().unwrap()),
+                None,
+            )
+            .await;
+        let mut request = account_request("xai", "credit-send");
+        request["decision_id"] = selected.1["result"]["decision_id"].clone();
+        assert_credential(
+            &runner.call("route.account_for", &request).await,
+            "oauth:xai",
+        );
+
+        let receipt = NOW + 600_000;
+        let _refusal = crate::InjectedClock::set(receipt);
+        credit_xai_reading(used, receipt as i64);
+        let mut refusal = json!({"event_id":"credit-refusal","kind":"account_limit_exhausted",
+            "admission_id":"credit-send","served_account_id":"xai-account","credential_id":"oauth:xai",
+            "limit_window":"credit","observed_at_ms":receipt});
+        if let Some(retry) = retry {
+            refusal["retry_at_ms"] = json!(receipt + retry);
+        }
+        let observed = runner.call("route.account_observe", &refusal).await;
+        assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+        let deadline = receipt + retry.unwrap_or(3_600_000);
+        let fences = harness
+            .store()
+            .non_quota_account_route_fences(receipt as i64)
+            .unwrap();
+        assert_eq!(
+            fences.len(),
+            1,
+            "credit is billing even with exhausted or missing quota: {observed:?}"
+        );
+        assert_eq!(fences[0].until_ms, deadline as i64);
+        assert!(harness
+            .store()
+            .account_route_fences(receipt as i64)
+            .unwrap()
+            .is_empty());
+        assert!(harness
+            .store()
+            .account_read(|tx| tx.active_pool_fences("xai"))
+            .unwrap()
+            .is_empty());
+
+        let _fresh = crate::InjectedClock::set(receipt + 1);
+        credit_xai_reading(Some(0.0), receipt as i64 + 1);
+        let blocked = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-still-held"),
+            )
+            .await;
+        assert_eq!(
+            blocked.1["code"], "account_pool_exhausted",
+            "fresh zero quota cannot repay credit: {}",
+            blocked.1
+        );
+        assert_eq!(blocked.1["detail"]["reset_at_ms"], deadline);
+        let _before = crate::InjectedClock::set(deadline - 1);
+        assert_eq!(
+            runner
+                .call(
+                    "route.account_for",
+                    &account_request("xai", "credit-before-probe")
+                )
+                .await
+                .0,
+            FrameType::Error
+        );
+
+        let _due = crate::InjectedClock::set(deadline);
+        credit_xai_reading(Some(0.0), deadline as i64);
+        let rows = credentials.listed_credentials().to_vec();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "xai-credit".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            deadline,
+        );
+        harness.set_credentials(credentials.clone());
+        let probe = owner
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+            )
+            .await;
+        assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+        let reserved = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-reserved-elsewhere"),
+            )
+            .await;
+        assert_eq!(
+            reserved.0,
+            FrameType::Error,
+            "the selected probe is reserved: {}",
+            reserved.1
+        );
+        assert_eq!(
+            reserved.1["code"], "account_pool_exhausted",
+            "a probe reservation is a timed fence, not a missing runner candidate: {}",
+            reserved.1
+        );
+        let reserved_until = reserved.1["detail"]["reset_at_ms"].as_u64().unwrap();
+        assert!(
+            (deadline + 1..=deadline + 3_600_000).contains(&reserved_until),
+            "{}",
+            reserved.1
+        );
+        let mut admitted = account_request("xai", "credit-probe");
+        admitted["decision_id"] = probe.1["result"]["decision_id"].clone();
+        let other_probe = account_request("xai", "credit-other-probe");
+        let (won, lost) = tokio::join!(
+            runner.call("route.account_for", &admitted),
+            runner.call("route.account_for", &other_probe)
+        );
+        assert_credential(&won, "oauth:xai");
+        assert_eq!(lost.0, FrameType::Error, "only one probe: {}", lost.1);
+        let retry_at = lost.1["detail"]["reset_at_ms"].as_u64().unwrap();
+        assert!(
+            (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
+            "{}",
+            lost.1
+        );
+        let after_claim = runner
+            .call(
+                "route.account_for",
+                &account_request("xai", "credit-after-claim"),
+            )
+            .await;
+        assert_eq!(after_claim.1["detail"]["reset_at_ms"], deadline + 3_600_000);
+        assert_eq!(
+            harness
+                .store()
+                .non_quota_account_route_fences(deadline as i64)
+                .unwrap()
+                .len(),
+            1,
+            "a probe permission is not recovery"
+        );
+        let completed = owner
+            .call(
+                "route.report",
+                &json!({"decision_id":probe.1["result"]["decision_id"],
+            "outcome":"completed","credential_id":"oauth:xai"}),
+            )
+            .await;
+        assert_eq!(completed.0, FrameType::Response, "{}", completed.1);
+        assert!(harness
+            .store()
+            .non_quota_account_route_fences(deadline as i64)
+            .unwrap()
+            .is_empty());
+        assert_credential(
+            &runner
+                .call(
+                    "route.account_for",
+                    &account_request("xai", "credit-recovered"),
+                )
+                .await,
+            "oauth:xai",
+        );
+    }
+}
+
+#[tokio::test]
+async fn credit_window_is_not_an_undeclared_v1_report_extension() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = credit_xai_fixture();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let reply = owner
+        .call(
+            "route.report",
+            &json!({"decision_id":selected.1["result"]["decision_id"],
+        "outcome":"failed","runner_code":"account_limit_exhausted","credential_id":"oauth:xai",
+        "limit_window":"credit"}),
+        )
+        .await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "invalid_request");
+    assert!(harness
+        .store()
+        .non_quota_account_route_fences(NOW as i64)
+        .unwrap()
+        .is_empty());
+}
+
 fn stale_xai_fixture(used: f64) -> Arc<Harness> {
     let (harness, mut credentials) = setup("xai", false);
     let mut fact = crate::tests::fact("xai", "grok-4.7");
@@ -3527,6 +4169,6 @@ async fn stale_api_billing_probe_passes_its_route_fence_once_even_with_spend_rea
     );
     assert_eq!(
         harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms,
-        NOW as i64
+        old
     );
 }

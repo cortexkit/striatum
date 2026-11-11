@@ -1230,7 +1230,14 @@ pub(super) async fn handle_select_request(
         return handle_record_usage(frame, writer, store).await;
     }
     if envelope.method == ROUTE_RECORD_COOLDOWN_OP {
-        return handle_record_cooldown(frame, writer, store).await;
+        return handle_record_cooldown(
+            frame,
+            writer,
+            store,
+            broca_credentials,
+            operator_config_path,
+        )
+        .await;
     }
     if envelope.method == ROUTE_CLEAR_FAILURE_BACKOFF_OP {
         return handle_clear_failure_backoff(frame, writer, store).await;
@@ -1325,6 +1332,7 @@ pub(super) async fn handle_select_request(
             &envelope.method,
             &frame.body,
             &key_pool::PoolCtx {
+                config: Some(&live_config),
                 store: store.as_ref(),
                 credentials: broca_credentials,
                 catalog_targets: &catalog_targets,
@@ -2241,6 +2249,7 @@ pub(super) async fn handle_select_request(
                             selected.prompt_params.variant.as_deref(),
                             classes.as_ref(),
                             priced_per_token,
+                            None,
                         )
                         .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
                     )
@@ -2312,12 +2321,15 @@ pub(super) async fn handle_select_request(
                     remember_provider_identity(store, &decision_id, &selected, broca_credentials)?;
                 }
                 if let Some(classes) = &classes {
-                    classes.bind_selected_probe(
-                        &selected.model.provider_id,
-                        &selected.model.model_id,
-                        priced_per_token,
-                        &decision_id,
-                    );
+                    classes
+                        .bind_selected_probe(
+                            store,
+                            &selected.model.provider_id,
+                            &selected.model.model_id,
+                            priced_per_token,
+                            &decision_id,
+                        )
+                        .map_err(|error| ModuleError::Message(error.to_string()))?;
                 }
                 add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 let finish_started = Instant::now();
@@ -2338,6 +2350,9 @@ pub(super) async fn handle_select_request(
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
+                        store
+                            .bind_fence_probe_owner(&grant.lease_id, &decision_id)
+                            .map_err(|error| ModuleError::Message(error.to_string()))?;
                         result["poolLease"] = grant.lease_json();
                     }
                 }
@@ -2345,6 +2360,23 @@ pub(super) async fn handle_select_request(
                     result["runner"] = host_runner(&params, &selected);
                 }
                 if !deferred_runner_pin {
+                    if pin_harness != Some(substrate_policy::Harness::Broca) {
+                        if let Some(classes) = classes.as_ref() {
+                            if let Err((code, message)) = classes.claim_launch_credential(
+                                store,
+                                &selected.model.provider_id,
+                                &selected.model.model_id,
+                                priced_per_token,
+                                false,
+                                Some(&decision_id),
+                            ) {
+                                return send_route_error(
+                                    writer, ver, channel, epoch, corr, &code, &message,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     complete_legacy_selection(&mut result, &selected, &facts, &module);
                     record_legacy_tier(
                         &mut result,
@@ -2636,12 +2668,15 @@ pub(super) async fn handle_select_request(
             match recorded {
                 Ok(decision_id) => {
                     if let Some(classes) = &classes {
-                        classes.bind_selected_probe(
-                            &selected.model.provider_id,
-                            &selected.model.model_id,
-                            priced_per_token,
-                            &decision_id,
-                        );
+                        classes
+                            .bind_selected_probe(
+                                store,
+                                &selected.model.provider_id,
+                                &selected.model.model_id,
+                                priced_per_token,
+                                &decision_id,
+                            )
+                            .map_err(|error| ModuleError::Message(error.to_string()))?;
                     }
                     if selected_harness == Some(substrate_policy::Harness::Broca) {
                         // The decision row has committed, so the selection stands
@@ -2721,6 +2756,7 @@ pub(super) async fn handle_select_request(
                             selected.prompt_params.variant.as_deref(),
                             classes.as_ref(),
                             priced_per_token,
+                            Some(&decision_id),
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
                             Err((code, message)) => {
@@ -2732,6 +2768,23 @@ pub(super) async fn handle_select_request(
                         }
                     }
                     add_stage_ms(&timing.runner_ms, runner_started.elapsed());
+                    if selected_harness != Some(substrate_policy::Harness::Broca) {
+                        if let Some(classes) = classes.as_ref() {
+                            if let Err((code, message)) = classes.claim_launch_credential(
+                                store,
+                                &selected.model.provider_id,
+                                &selected.model.model_id,
+                                priced_per_token,
+                                false,
+                                Some(&decision_id),
+                            ) {
+                                return send_route_error(
+                                    writer, ver, channel, epoch, corr, &code, &message,
+                                )
+                                .await;
+                            }
+                        }
+                    }
                     complete_legacy_selection(&mut result, &selected, &facts, &module);
                     record_legacy_tier(
                         &mut result,
@@ -2971,6 +3024,7 @@ fn runner_for_route(
     variant: Option<&str>,
     classes: Option<&account_selection::ClassContext>,
     priced_per_token: bool,
+    owner: Option<&str>,
 ) -> Result<
     (
         prefrontal_routing_core::runner::RunnerModel,
@@ -2979,14 +3033,21 @@ fn runner_for_route(
     (String, String),
 > {
     if !needs_runner_pin(catalog_targets, provider) {
-        if let Some(classes) =
-            classes.filter(|classes| classes.needs_credential_pin(provider, model))
-        {
-            let id = classes.launch_credential(provider, model, priced_per_token)?;
-            if let Some(runner) =
-                prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
-            {
-                return Ok((runner, None));
+        if let Some(classes) = classes {
+            let id = classes.claim_launch_credential(
+                store,
+                provider,
+                model,
+                priced_per_token,
+                true,
+                owner,
+            )?;
+            if classes.needs_credential_pin(provider, model) {
+                if let Some(runner) =
+                    prefrontal_routing_core::runner::RunnerModel::pinned(&id, model, variant)
+                {
+                    return Ok((runner, None));
+                }
             }
         }
         return Ok((
@@ -2996,6 +3057,7 @@ fn runner_for_route(
     }
     let grant = key_pool::acquire(
         &key_pool::PoolCtx {
+            config: classes.map(|classes| classes.fence_config()),
             store,
             credentials,
             catalog_targets,
@@ -3007,6 +3069,11 @@ fn runner_for_route(
         session,
     )
     .map_err(|refusal| (refusal.code, refusal.message))?;
+    if let Some(owner) = owner {
+        store
+            .bind_fence_probe_owner(&grant.lease_id, owner)
+            .map_err(|error| ("store_error".into(), error.to_string()))?;
+    }
     Ok((grant.runner.clone(), Some(grant)))
 }
 
@@ -3264,8 +3331,21 @@ async fn handle_select_panel(
         &registry,
         false,
     );
-    classes.apply_eligibility(&mut prepared.snapshot, &prepared.facts, false, false);
-    classes.apply_legacy_route_fences(&mut prepared.snapshot, &prepared.facts, false, false);
+    // Broca seats acquire their pool lease below. Defer those account gates so
+    // a refused lease records the exact blocked keys before panel reselection.
+    let defer_pool_pin = is_broca_substrate(params.substrate.as_deref());
+    classes.apply_eligibility(
+        &mut prepared.snapshot,
+        &prepared.facts,
+        false,
+        defer_pool_pin,
+    );
+    classes.apply_legacy_route_fences(
+        &mut prepared.snapshot,
+        &prepared.facts,
+        false,
+        defer_pool_pin,
+    );
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
     let resolved_policy = resolve_routing_policy_with_catalog_targets(
         params.available_models.iter().cloned(),
@@ -3494,6 +3574,7 @@ async fn handle_select_panel(
                 let session = format!("{session_root}#seat{slot}");
                 match key_pool::acquire(
                     &key_pool::PoolCtx {
+                        config: Some(&live_config),
                         store: store.as_ref(),
                         credentials: broca_credentials,
                         catalog_targets: &catalog_targets,

@@ -261,13 +261,13 @@ async fn broca_fresh_billing_fence_skips_the_route_on_both_select_surfaces() {
         }
         assert_eq!(
             refused.1["detail"]["reset_at_ms"],
-            FENCE_NOW + crate::credential_fences::FENCE_PROBE_RECHECK_MS as u64 + 1
+            FENCE_NOW + crate::credential_fences::FENCE_PROBE_RECHECK_MS as u64
         );
     }
 }
 
 #[tokio::test]
-async fn broca_selected_six_hour_probe_admits_only_once_on_both_surfaces() {
+async fn broca_selected_one_hour_probe_admits_only_once_on_both_surfaces() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     for legacy in [false, true] {
         let harness = broca_fence_harness();
@@ -324,7 +324,12 @@ async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
         let refused = runner.call("route.account_for", &unbound).await;
         assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
         assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
-        assert_eq!(refused.1["detail"]["reset_at_ms"], FENCE_NOW + 120_000);
+        // V1 selection reserves a model decision before send authorization;
+        // legacy selection also authorizes launch and claims the durable hour.
+        assert_eq!(
+            refused.1["detail"]["reset_at_ms"],
+            FENCE_NOW + if legacy { 3_600_000 } else { 120_000 }
+        );
 
         let request = broca_account_request(
             &selected[0].1["result"]["decision_id"],

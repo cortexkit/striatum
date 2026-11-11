@@ -752,15 +752,36 @@ fn record_cooldown_update(
     store: &prefrontal_routing_store::SqliteRouteStateStore,
     params: &RecordCooldownParams,
 ) -> prefrontal_routing_core::RouteStateResult<()> {
-    if params.wall_class == Some(RouteWallClass::Transient) {
-        let Some(credential) = params
-            .credential_id
-            .as_deref()
-            .filter(|id| !id.trim().is_empty())
-        else {
-            // Missing account identity cannot justify walling every other account.
-            return Ok(());
-        };
+    // Existing machine-formatted account/key annotations take precedence over
+    // an identity-free cooldown. Never turn one account's refusal into fanout;
+    // only genuinely anonymous signals get the non-quota clock below.
+    if params.credential_id.is_none()
+        && params.last_error.as_deref().is_some_and(|error| {
+            prefrontal_routing_core::account_wall::account_scoped_error(error)
+                || prefrontal_routing_core::account_wall::credential_refusal_in(error).is_some()
+                || serde_json::from_str::<serde_json::Value>(error)
+                    .ok()
+                    .is_some_and(|value| {
+                        let provider = value.get("provider").unwrap_or(&value);
+                        provider.get("class").is_some()
+                            && provider.get("provider_code").is_some()
+                            && ["account_ref", "credential_id"].iter().any(|field| {
+                                provider
+                                    .get(field)
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|id| !id.trim().is_empty())
+                            })
+                    })
+        })
+    {
+        return Ok(());
+    }
+    if let Some(credential) = params
+        .credential_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .filter(|_| params.wall_class == Some(RouteWallClass::Transient))
+    {
         let Some(until) = params.cooldown_until else {
             return Ok(());
         };
@@ -779,6 +800,10 @@ fn record_cooldown_update(
         );
     }
     let update = prefrontal_routing_core::RouteStateUpdate {
+        observed_at_ms: Some(now_ms() as i64),
+        // No account-local typed branch handled this signal. Do not infer a
+        // subscription identity from its error text or reported quota label.
+        unscoped_wall: true,
         cooldown_until: params.cooldown_until,
         quota_exhausted_until: params.quota_exhausted_until,
         wall_class: params.wall_class,
@@ -2800,9 +2825,20 @@ struct MethodParamsBody<P> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct LegacyProviderOutcome {
+    #[serde(flatten)]
+    identity: prefrontal_routing_core::route_state_store::ProviderOutcome,
+    // Decode a caller's explicit credit window without adding any member to
+    // routing's serialized provider identity or existing replies.
+    #[serde(default, alias = "limit_window")]
+    limit_window: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SetDecisionOutcomeParams {
     #[serde(default)]
-    provider_outcome: Option<prefrontal_routing_core::route_state_store::ProviderOutcome>,
+    provider_outcome: Option<LegacyProviderOutcome>,
     // The wire field is `decisionID` (capital ID) to match what route.select RETURNS
     // (json!{ "decisionID": ... }) and what every TS caller sends: camelCase alone
     // would expect `decisionId`, the lone casing drift that broke the round-trip.
@@ -2983,7 +3019,11 @@ async fn handle_set_decision_outcome(
         )
         .await;
     };
-    let mut provider_outcome = params.provider_outcome;
+    let credit_window = params
+        .provider_outcome
+        .as_ref()
+        .is_some_and(|provider| provider.limit_window.as_deref() == Some("credit"));
+    let mut provider_outcome = params.provider_outcome.map(|provider| provider.identity);
     if let Some(provider) = provider_outcome
         .as_mut()
         .filter(|p| p.credential_id.is_none())
@@ -3016,17 +3056,42 @@ async fn handle_set_decision_outcome(
         outcome
     };
     let observed_at_ms = now_ms() as i64;
+    let quota = ACCOUNT_QUOTA
+        .get()
+        .and_then(|state| state.lock().ok().map(|state| state.clone()));
+    let fence_config = config_overrides::live_config(_routing_config_path);
+    let account_exhausted = provider_outcome.as_ref().is_some_and(|provider| {
+        provider.provider_code.as_deref() == Some("account_limit_exhausted")
+    }) || params
+        .last_error
+        .as_deref()
+        .is_some_and(|error| error.starts_with("account_limit_exhausted:"));
+    let credit_retry_at = (credit_window && account_exhausted).then(|| {
+        let cap = observed_at_ms
+            .saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
+        params
+            .retry_after_secs
+            .map(|seconds| {
+                observed_at_ms.saturating_add(
+                    i64::try_from(seconds)
+                        .unwrap_or(i64::MAX)
+                        .saturating_mul(1000),
+                )
+            })
+            .unwrap_or(cap)
+            .min(cap)
+    });
     if let Err(error) = record_provider_reset_fence(
         store,
         broca_credentials,
         &params.decision_id,
         &outcome,
         provider_outcome.as_ref(),
-        params
-            .last_error
-            .as_deref()
-            .is_some_and(|error| error.starts_with("account_limit_exhausted:")),
+        account_exhausted,
+        credit_retry_at,
         observed_at_ms,
+        quota.as_ref(),
+        Some(&fence_config),
     ) {
         return send_route_error(
             writer,
@@ -3072,19 +3137,72 @@ async fn handle_set_decision_outcome(
             match store.get_decision_by_id(&params.decision_id) {
                 Ok(Some(decision)) => {
                     if let Some(provider) = decision.selected_provider_id.as_deref() {
-                        if let Err(e) =
-                            credential_fences::lift_after_success(store, provider, credential)
+                        let frozen = store
+                            .decision_provider_identity(&params.decision_id)
+                            .map_err(|e| ModuleError::Message(e.to_string()))?;
+                        if let Some(identity) = frozen.as_ref().filter(|identity| {
+                            identity.credential_id.as_deref() == Some(credential)
+                        }) {
+                            let model = decision.selected_model_id.as_deref().unwrap_or("");
+                            let scope=prefrontal_routing_store::QuotaSuccessScope {family:fence_config.allocator_policy(provider).family_for_model(model),
+                                pool:prefrontal_routing_core::quota_extract::antigravity_pool_for_capacity(&format!("{provider}/{model}")).map(str::to_string)};
+                            store
+                                .account_transaction(|tx| {
+                                    tx.heal_authorized_probe(
+                                        &params.decision_id,
+                                        provider,
+                                        model,
+                                        observed_at_ms,
+                                    )?;
+                                    let size = tx.size_admission_for_model_decision(
+                                        &params.decision_id,
+                                        provider,
+                                        credential,
+                                        model,
+                                    )?;
+                                    tx.heal_serving_fences_in_scope(
+                                        provider,
+                                        &identity.account_ref,
+                                        credential,
+                                        model,
+                                        size.map(|(class, _)| class),
+                                        size.map_or(decision.created_at as i64, |(_, at)| at),
+                                        observed_at_ms,
+                                        Some(&scope),
+                                    )?;
+                                    credential_fences::lift_after_success_in(
+                                        tx,
+                                        provider,
+                                        credential,
+                                        observed_at_ms,
+                                        decision.created_at as i64,
+                                    )?;
+                                    Ok(())
+                                })
+                                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                        } else if frozen
+                            .as_ref()
+                            .and_then(|identity| identity.credential_id.as_deref())
+                            .is_none()
                         {
-                            return send_route_error(
-                                writer,
-                                ver,
-                                channel,
-                                epoch,
-                                corr,
-                                "store_error",
-                                &format!("set_decision_outcome: lifting credential fence: {e}"),
-                            )
-                            .await;
+                            let model = decision.selected_model_id.as_deref().unwrap_or("");
+                            store
+                                .account_transaction(|tx| {
+                                    if tx.probe_authorization_names_credential(
+                                        &params.decision_id,
+                                        credential,
+                                        model,
+                                    )? {
+                                        tx.heal_authorized_probe(
+                                            &params.decision_id,
+                                            provider,
+                                            model,
+                                            observed_at_ms,
+                                        )?;
+                                    }
+                                    Ok(())
+                                })
+                                .map_err(|e| ModuleError::Message(e.to_string()))?;
                         }
                     }
                 }
@@ -3101,6 +3219,59 @@ async fn handle_set_decision_outcome(
                     )
                     .await
                 }
+            }
+        } else if let Some(decision) = store
+            .get_decision_by_id(&params.decision_id)
+            .map_err(|error| ModuleError::Message(error.to_string()))?
+        {
+            let frozen = store
+                .decision_provider_identity(&params.decision_id)
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
+            if frozen
+                .as_ref()
+                .and_then(|identity| identity.credential_id.as_deref())
+                .is_none()
+            {
+                if let (Some(provider), Some(model)) = (
+                    decision.selected_provider_id.as_deref(),
+                    decision.selected_model_id.as_deref(),
+                ) {
+                    store
+                        .account_transaction(|tx| {
+                            tx.heal_authorized_probe(
+                                &params.decision_id,
+                                provider,
+                                model,
+                                observed_at_ms,
+                            )
+                        })
+                        .map_err(|error| ModuleError::Message(error.to_string()))?;
+                }
+            }
+        }
+    }
+    if prefrontal_routing_core::fence_lifetimes::probe_is_inconclusive(
+        outcome,
+        params.last_error.as_deref(),
+    ) {
+        if let Some(decision) = store
+            .get_decision_by_id(&params.decision_id)
+            .map_err(|error| ModuleError::Message(error.to_string()))?
+        {
+            if let (Some(provider), Some(model)) = (
+                decision.selected_provider_id.as_deref(),
+                decision.selected_model_id.as_deref(),
+            ) {
+                store
+                    .account_transaction(|tx| {
+                        tx.release_inconclusive_probe(
+                            &params.decision_id,
+                            provider,
+                            model,
+                            observed_at_ms,
+                        )
+                    })
+                    .map_err(|error| ModuleError::Message(error.to_string()))?;
             }
         }
     }
@@ -3136,7 +3307,10 @@ fn record_provider_reset_fence(
     outcome: &RouteOutcome,
     provider: Option<&prefrontal_routing_core::route_state_store::ProviderOutcome>,
     account_exhausted: bool,
+    credit_retry_at: Option<i64>,
     now: i64,
+    quota: Option<&account_quota::AccountQuotaState>,
+    config: Option<&config_overrides::LiveConfig>,
 ) -> Result<(), String> {
     if *outcome == RouteOutcome::Completed {
         return Ok(());
@@ -3144,23 +3318,21 @@ fn record_provider_reset_fence(
     let Some(provider) = provider.filter(|p| p.credential_refusal.is_none()) else {
         return Ok(());
     };
-    // Unknown refill times need a finite recheck, not an effectively permanent
-    // fence. Keep the former eight-day safety bound only for missing or unreadable
-    // resets; a readable provider date, including a monthly reset, stands as given.
-    const UNKNOWN_RESET_RECHECK_MS: i64 = 8 * 24 * 60 * 60 * 1_000;
+    // A reset is evidence for an extra check, never an expiry. Zero represents
+    // an unknown reset internally; the separate quota retry clock still runs.
     let reset = match provider.resets_at_ms {
         Some(reset)
-            if account_quota::parse_rfc3339_ms(&account_selection::rfc3339(reset)).is_some() =>
+            if (account_exhausted || reset > now)
+                && account_quota::parse_rfc3339_ms(&account_selection::rfc3339(reset))
+                    .is_some() =>
         {
-            if reset <= now {
-                return Ok(());
-            }
             reset
         }
-        Some(_) => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
-        None if account_exhausted => now.saturating_add(UNKNOWN_RESET_RECHECK_MS),
-        // Provider identity on an ordinary interruption is not quota evidence.
-        None => return Ok(()),
+        Some(_) if account_exhausted => 0,
+        None if account_exhausted => 0,
+        // An ordinary interruption carrying an old or unreadable date is not
+        // a new typed quota refusal. Never resurrect a wall from that date.
+        _ => return Ok(()),
     };
     let Some(decision) = store
         .get_decision_by_id(decision_id)
@@ -3200,18 +3372,49 @@ fn record_provider_reset_fence(
     } else {
         return Ok(());
     };
-    // Provider resets can describe monthly windows as well as weekly ones.
-    // A shorter fence would reopen the route before its account can serve again.
-    store
-        .record_account_route_fence(&prefrontal_routing_store::AccountRouteFence {
-            provider: provider_id,
-            credential_id: credential,
-            model,
-            until_ms: reset,
-            decision_id: decision_id.into(),
-            recorded_at: now,
-        })
-        .map_err(|e| e.to_string())
+    // A credit window explicitly identifies a spending wall. Without that
+    // typed window, only fresh headroom can contradict quota exhaustion.
+    // Preserve provider dates as evidence, never as fixed quota lifetimes.
+    let non_quota = credit_retry_at.is_some()
+        || quota.is_some_and(|quota| {
+            credentials.lock().ok().is_some_and(|credentials| {
+                credential_fences::quota_refusal_contradicted(
+                    quota,
+                    &credentials,
+                    &credential,
+                    now,
+                    &config
+                        .map(|config| config.allocator_policy(&provider_id))
+                        .unwrap_or_default(),
+                )
+            })
+        });
+    let fence = prefrontal_routing_store::AccountRouteFence {
+        provider: provider_id,
+        credential_id: credential,
+        model,
+        until_ms: if non_quota {
+            let cap = now
+                .saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
+            if let Some(retry) = credit_retry_at {
+                retry.min(cap)
+            } else if reset > now {
+                reset.min(cap)
+            } else {
+                cap
+            }
+        } else {
+            reset
+        },
+        decision_id: decision_id.into(),
+        recorded_at: now,
+    };
+    if non_quota {
+        store.record_billing_account_route_fence(&fence)
+    } else {
+        store.record_account_route_fence(&fence)
+    }
+    .map_err(|e| e.to_string())
 }
 
 async fn handle_record_usage(
@@ -3981,6 +4184,8 @@ async fn handle_record_cooldown(
     frame: Frame,
     writer: &mpsc::Sender<Frame>,
     store: &SharedStore,
+    credentials: &SharedBrocaCredentials,
+    config_path: &Path,
 ) -> Result<(), ModuleError> {
     let (ver, channel, epoch, corr) = (
         frame.header.ver,
@@ -4016,7 +4221,64 @@ async fn handle_record_cooldown(
         )
         .await;
     }
-    match record_cooldown_update(store.as_ref(), &params) {
+    let recorded = if matches!(
+        params.wall_class,
+        Some(RouteWallClass::Quota | RouteWallClass::Billing)
+    ) && params.credential_id.is_some()
+    {
+        let Some((provider, model)) = params.capacity_key.split_once('/') else {
+            return send_ok(writer, ver, channel, epoch, corr).await;
+        };
+        let credential = params.credential_id.as_deref().unwrap();
+        let now = now_ms() as i64;
+        let config = config_overrides::live_config(config_path);
+        let contradicted = params.wall_class == Some(RouteWallClass::Billing)
+            || ACCOUNT_QUOTA
+                .get()
+                .and_then(|quota| quota.lock().ok())
+                .is_some_and(|quota| {
+                    credentials.lock().ok().is_some_and(|credentials| {
+                        credential_fences::quota_refusal_contradicted(
+                            &quota,
+                            &credentials,
+                            credential,
+                            now,
+                            &config.allocator_policy(provider),
+                        )
+                    })
+                });
+        let fence = prefrontal_routing_store::AccountRouteFence {
+            provider: provider.into(),
+            credential_id: credential.into(),
+            model: model.into(),
+            until_ms: if contradicted {
+                let cap = now.saturating_add(
+                    prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
+                );
+                params
+                    .quota_exhausted_until
+                    .or(params.cooldown_until)
+                    .map(|at| at as i64)
+                    .filter(|at| *at > now)
+                    .map_or(cap, |at| at.min(cap))
+            } else {
+                params
+                    .quota_exhausted_until
+                    .or(params.cooldown_until)
+                    .unwrap_or(0.0) as i64
+            },
+            decision_id: String::new(),
+            recorded_at: now,
+        };
+        if contradicted {
+            store.record_billing_account_route_fence(&fence)
+        } else {
+            store.record_account_route_fence(&fence)
+        }
+    } else {
+        record_cooldown_update(store.as_ref(), &params)
+    };
+    match recorded {
         Ok(()) => send_ok(writer, ver, channel, epoch, corr).await,
         Err(e) => {
             send_route_error(
@@ -4893,7 +5155,7 @@ mod tests {
     }
 
     #[test]
-    fn record_cooldown_persists_typed_billing_and_quota_wall_classes() {
+    fn record_cooldown_keeps_billing_but_does_not_infer_unscoped_quota() {
         let rig = Rig::new("record-cooldown-wall-class");
         let store = rig.open_store();
         for (route_key, wall_class, last_error) in [
@@ -4932,10 +5194,12 @@ mod tests {
             snapshot.by_route["xai/grok-4.6"].wall_class,
             Some(RouteWallClass::Billing)
         );
-        assert_eq!(
-            snapshot.by_route["p/plain-quota"].wall_class,
-            Some(RouteWallClass::Quota)
-        );
+        assert_eq!(snapshot.by_route["p/plain-quota"].wall_class, None);
+        assert!(store
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .all(|origin| !origin.quota));
     }
 
     #[test]
@@ -5286,12 +5550,438 @@ mod tests {
             &RouteOutcome::Interrupted,
             Some(&identity),
             true,
+            None,
             now,
+            None,
+            None,
         )
         .unwrap();
         let fences = store.account_route_fences(now).unwrap();
         assert_eq!(fences.len(), 1);
         assert_eq!(fences[0].until_ms, 1_795_357_028_612);
+    }
+
+    #[test]
+    fn xai_spending_limit_with_fresh_zero_usage_is_a_non_quota_refusal() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        let now = account_quota::parse_rfc3339_ms("2026-11-10T13:57:00Z").unwrap();
+        for used in [0.0, 100.0] {
+            let rig = Rig::new("xai-contradictory-quota");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let credentials = vault_listing(&[("oauth:xai", &["xai"], Some("xai-account"))]);
+            let mut quota = account_quota::AccountQuotaState::default();
+            quota.readings.readings.insert(("xai".into(),"xai-account".into()),account_quota::StoredReading {
+                provider:"xai".into(),account_id:"xai-account".into(),received_at_ms:now-600_000,tombstoned_at_ms:None,
+                entry:json!({"provider":"xai","apiProvider":"xai","account":"xai-account","fetchedAt":"2026-11-10T13:47:00Z",
+                    "usage":{"secondary":{"usedPercent":used,"windowMinutes":10080}}}),
+            });
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_provider_id: Some("xai".into()),
+                    selected_model_id: Some("grok-4.3".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let identity = ProviderOutcome {
+                account_ref: "xai-account".into(),
+                credential_id: Some("oauth:xai".into()),
+                ..Default::default()
+            };
+            store
+                .set_decision_provider_identity(&decision, &identity)
+                .unwrap();
+            // The legacy runner typed the 403 spending-limit refusal as account
+            // exhaustion, with no reset. Classification must use the reading,
+            // not the provider's free-form personal-team-blocked message.
+            record_provider_reset_fence(
+                &store,
+                &credentials,
+                &decision,
+                &RouteOutcome::Interrupted,
+                Some(&identity),
+                true,
+                None,
+                now,
+                Some(&quota),
+                None,
+            )
+            .unwrap();
+            let quota_rows = store.account_route_fences(now).unwrap();
+            let other_rows = store.non_quota_account_route_fences(now).unwrap();
+            if used == 0.0 {
+                assert!(quota_rows.is_empty());
+                assert_eq!(other_rows.len(), 1);
+                let clocks = store.fence_rechecks().unwrap();
+                assert_eq!(clocks[0].kind, "non_quota_route");
+                assert_eq!(clocks[0].next_recheck_at, now + 3_600_000);
+                assert!(!store
+                    .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, now + 15 * 60_000))
+                    .unwrap());
+                // Another fresh zero reading does not heal the non-quota wall.
+                assert_eq!(
+                    store
+                        .non_quota_account_route_fences(now + 60_000)
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert!(store
+                    .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, now + 3_600_000))
+                    .unwrap());
+                assert!(!store
+                    .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, now + 3_600_000))
+                    .unwrap());
+            } else {
+                assert_eq!(quota_rows.len(), 1);
+                assert!(other_rows.is_empty());
+                assert_eq!(
+                    store.fence_rechecks().unwrap()[0].next_recheck_at,
+                    now + 15 * 60_000
+                );
+            }
+        }
+    }
+
+    async fn report_legacy_outcome_for_fence_test(store: &SharedStore, params: serde_json::Value) {
+        let frame = Frame::build(
+            FrameType::Request,
+            Flags::new(false, Priority::Interactive, false),
+            7,
+            1,
+            99,
+            serde_json::to_vec(&json!({"method":ROUTE_SET_DECISION_OUTCOME_OP,"params":params}))
+                .unwrap(),
+        )
+        .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        handle_set_decision_outcome(
+            frame,
+            &tx,
+            store,
+            Path::new("/nonexistent/fence-outcome.jsonc"),
+            &SharedBrocaCredentials::default(),
+        )
+        .await
+        .unwrap();
+        let ack: serde_json::Value =
+            serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+        assert_eq!(ack["result"]["ok"], true, "{ack}");
+    }
+
+    #[tokio::test]
+    async fn legacy_completed_cannot_heal_a_credential_that_did_not_serve() {
+        use prefrontal_routing_core::route_state_store::{CredentialRefusal, ProviderOutcome};
+        let rig = Rig::new("mismatched-serving-success");
+        let store: SharedStore = Arc::new(rig.open_store());
+        store
+            .record_credential_entitlement_fence(
+                &CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "B".into(),
+                    code: "billing_exhausted".into(),
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        let decision = store
+            .record_decision(&DecisionInput {
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("m".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_decision_provider_identity(
+                &decision,
+                &ProviderOutcome {
+                    account_ref: "account-A".into(),
+                    credential_id: Some("A".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        report_legacy_outcome_for_fence_test(
+            &store,
+            json!({"decisionID":decision,"outcome":"completed",
+            "providerOutcome":{"accountRef":"account-B","credentialId":"B"}}),
+        )
+        .await;
+        assert_eq!(
+            store.credential_entitlement_fences().unwrap().len(),
+            1,
+            "B did not serve the decision frozen to A"
+        );
+    }
+
+    #[tokio::test]
+    async fn anonymous_legacy_reported_credential_heals_only_its_claimed_authorization() {
+        for reported in ["claimed", "other"] {
+            let rig = Rig::new("anonymous-reported-credential");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let at = now_ms() as i64;
+            let _clock = InjectedClock::set((at + 1000) as u64);
+            store
+                .pool_wall(
+                    "p",
+                    "claimed",
+                    prefrontal_routing_store::PoolWallKind::Billing,
+                    at + 1000,
+                    "credits",
+                    at,
+                )
+                .unwrap();
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            assert!(store
+                .account_transaction(|tx| tx.grant_fence_rechecks(
+                    &origins,
+                    at + 1000,
+                    Some(&decision)
+                ))
+                .unwrap());
+            report_legacy_outcome_for_fence_test(
+                &store,
+                json!({"decisionID":decision,"outcome":"completed",
+                    "providerOutcome":{"accountRef":"account","credentialId":reported}}),
+            )
+            .await;
+            assert_eq!(store.fence_rechecks().unwrap().is_empty(), reported == "claimed",
+                "an anonymous decision may heal only when the reported credential appears in its authorization");
+        }
+    }
+
+    #[tokio::test]
+    async fn anonymous_legacy_probe_success_heals_its_actual_launch_authorization() {
+        let rig = Rig::new("anonymous-probe-success");
+        let store: SharedStore = Arc::new(rig.open_store());
+        let receipt = now_ms() as i64;
+        let _clock = InjectedClock::set((receipt + 1000) as u64);
+        store
+            .update_route_state(
+                "p/m",
+                "p/m",
+                &prefrontal_routing_core::RouteStateUpdate {
+                    cooldown_until: Some((receipt + 1000) as f64),
+                    observed_at_ms: Some(receipt - 3_599_000),
+                    unscoped_wall: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let decision = store
+            .record_decision(&DecisionInput {
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("m".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(!origins.is_empty());
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(
+                &origins,
+                receipt + 1000,
+                Some(&decision)
+            ))
+            .unwrap());
+        report_legacy_outcome_for_fence_test(
+            &store,
+            json!({"decisionID":decision,"outcome":"completed"}),
+        )
+        .await;
+        assert!(
+            store.fence_rechecks().unwrap().is_empty(),
+            "anonymous serving success must retire the route/provider origin it probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn inconclusive_legacy_probe_reopens_its_non_quota_clock_without_healing() {
+        for (outcome, error) in [
+            ("cancelled", None),
+            ("interrupted", None),
+            ("error", Some("provider_policy_refusal: request blocked")),
+            ("error", Some("request_invalid: unsupported request shape")),
+        ] {
+            let rig = Rig::new("inconclusive-probe-clock");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let receipt = now_ms() as i64;
+            let _clock = InjectedClock::set((receipt + 1000) as u64);
+            store
+                .update_route_state(
+                    "p/m",
+                    "p/m",
+                    &prefrontal_routing_core::RouteStateUpdate {
+                        cooldown_until: Some((receipt + 1000) as f64),
+                        observed_at_ms: Some(receipt - 3_599_000),
+                        unscoped_wall: true,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let decision = store
+                .record_decision(&DecisionInput {
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            assert!(store
+                .account_transaction(|tx| tx.grant_fence_rechecks(
+                    &origins,
+                    receipt + 1000,
+                    Some(&decision)
+                ))
+                .unwrap());
+            report_legacy_outcome_for_fence_test(
+                &store,
+                json!({"decisionID":decision,"outcome":outcome,"lastError":error}),
+            )
+            .await;
+            let remaining = store.fence_rechecks().unwrap();
+            assert_eq!(
+                remaining.len(),
+                1,
+                "an inconclusive probe is not successful serving"
+            );
+            assert!(
+                remaining[0].next_recheck_at <= receipt + 1000,
+                "{outcome}/{error:?} must not hold a route for another hour"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_credit_window_is_decoder_only_and_success_or_operator_clear_heals_it() {
+        use prefrontal_routing_core::route_state_store::ProviderOutcome;
+        async fn report(
+            store: &SharedStore,
+            credentials: &SharedBrocaCredentials,
+            params: serde_json::Value,
+        ) {
+            let frame = Frame::build(
+                FrameType::Request,
+                Flags::new(false, Priority::Interactive, false),
+                7,
+                1,
+                99,
+                serde_json::to_vec(
+                    &json!({"method":ROUTE_SET_DECISION_OUTCOME_OP,"params":params}),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let (tx, mut rx) = mpsc::channel(1);
+            handle_set_decision_outcome(
+                frame,
+                &tx,
+                store,
+                Path::new("/nonexistent/credit-outcome.jsonc"),
+                credentials,
+            )
+            .await
+            .unwrap();
+            let ack: serde_json::Value =
+                serde_json::from_slice(&rx.recv().await.unwrap().body).unwrap();
+            assert_eq!(ack["result"]["ok"], true, "{ack}");
+        }
+        for (member, used, retry) in [
+            ("limitWindow", 0.0, None),
+            ("limit_window", 100.0, Some(30)),
+            ("limitWindow", 100.0, Some(7200)),
+        ] {
+            let receipt = now_ms() as i64;
+            let _clock = InjectedClock::set(receipt as u64);
+            let rig = Rig::new("legacy-credit-window");
+            let store: SharedStore = Arc::new(rig.open_store());
+            let credentials = vault_listing(&[("oauth:xai", &["xai"], Some("xai-account"))]);
+            let quota =
+                ACCOUNT_QUOTA.get_or_init(|| Arc::new(std::sync::Mutex::new(Default::default())));
+            let mut state = account_quota::AccountQuotaState::default();
+            account_quota::apply_provider_reply(&mut state, "grok", &serde_json::to_vec(&json!({
+                "result":[{"provider":"grok","apiProvider":"xai","account":"xai-account","credentialRef":"oauth:xai",
+                    "fetchedAt":account_selection::rfc3339(receipt),"usage":{"primary":{"usedPercent":used,"windowMinutes":10080}}}],
+                "completeProviders":["grok"]
+            })).unwrap(), receipt).unwrap();
+            *quota.lock().unwrap() = state;
+            let input = DecisionInput {
+                selected_provider_id: Some("xai".into()),
+                selected_model_id: Some("grok-4.3".into()),
+                ..Default::default()
+            };
+            let failed = store.record_decision(&input).unwrap();
+            let identity = ProviderOutcome {
+                account_ref: "xai-account".into(),
+                credential_id: Some("oauth:xai".into()),
+                ..Default::default()
+            };
+            store
+                .set_decision_provider_identity(&failed, &identity)
+                .unwrap();
+            let mut provider = json!({"accountRef":"xai-account","credentialId":"oauth:xai","providerCode":"account_limit_exhausted"});
+            provider[member] = json!("credit");
+            let mut params =
+                json!({"decisionID":failed,"outcome":"interrupted","providerOutcome":provider});
+            if let Some(retry) = retry {
+                params["retryAfterSecs"] = json!(retry);
+            }
+            let decoded: SetDecisionOutcomeParams = serde_json::from_value(params.clone()).unwrap();
+            let decoded = decoded.provider_outcome.unwrap();
+            assert_eq!(decoded.limit_window.as_deref(), Some("credit"));
+            let emitted = serde_json::to_value(&decoded.identity).unwrap();
+            assert!(emitted.get("limitWindow").is_none() && emitted.get("limit_window").is_none());
+            report(&store, &credentials, params).await;
+            let fences = store.non_quota_account_route_fences(receipt).unwrap();
+            assert_eq!(
+                fences.len(),
+                1,
+                "credit is independent of the quota reading"
+            );
+            assert_eq!(
+                fences[0].until_ms,
+                receipt + retry.unwrap_or(3600).min(3600) * 1000
+            );
+            assert!(store.account_route_fences(receipt).unwrap().is_empty());
+            assert!(store
+                .fence_rechecks()
+                .unwrap()
+                .iter()
+                .all(|clock| !clock.quota));
+
+            if member == "limit_window" {
+                credential_fences::lift_for_operator(&store, "oauth:xai").unwrap();
+                assert!(store
+                    .non_quota_account_route_fences(receipt)
+                    .unwrap()
+                    .is_empty());
+                continue;
+            }
+
+            // A later successful execution on the same serving identity proves
+            // recovery, unlike even a freshly replenished quota allowance.
+            let recovered = store.record_decision(&input).unwrap();
+            store
+                .set_decision_provider_identity(&recovered, &identity)
+                .unwrap();
+            report(
+                &store,
+                &credentials,
+                json!({"decisionID":recovered,"outcome":"completed"}),
+            )
+            .await;
+            assert!(store
+                .non_quota_account_route_fences(receipt)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     /// Replay of a live incident: vault credential `apikey:cline-pass` was mapped to
@@ -5302,7 +5992,7 @@ mod tests {
     /// (cline-pass, apikey:cline-pass): the retry avoids every cline-pass route and the
     /// decision log names the fence; the fence survives a store reopen; a fence
     /// older than the recheck interval admits exactly one probe, then holds
-    /// again; an explicit pin is not fenced; and the fence ends when the
+    /// again; an explicit pin cannot bypass it; and the fence ends when the
     /// credential's vault listing changes.
     ///
     /// The same replay covers an empty balance: Broca ends the run as permanent
@@ -5470,14 +6160,10 @@ mod tests {
         // admission reserves and records its probe. The next selection is
         // fenced until another interval passes or an outcome
         // lifts or renews it.
-        drop(store);
-        rusqlite::Connection::open(rig.dir.join("store.db"))
-            .unwrap()
-            .execute(
-                "UPDATE credential_entitlement_fences SET observed_at_ms = 0",
-                [],
-            )
+        store
+            .touch_credential_entitlement_fence("cline-pass", "apikey:cline-pass", 0)
             .unwrap();
+        drop(store);
         store = Arc::new(rig.open_store());
         let probe = select(&store, &credentials, &request).await;
         assert_eq!(
@@ -5542,6 +6228,7 @@ mod tests {
                 rows.push(("apikey:cline-pass:sibling", &["cline-pass"][..], None));
             }
             let credentials = vault_listing(&rows);
+            let recorded = now_ms() as i64;
             let reset = now_ms() as i64 + 20 * 24 * 3_600_000;
             if fenced {
                 store
@@ -5551,7 +6238,7 @@ mod tests {
                         model: "muse-spark-1.3-contributor".into(),
                         until_ms: reset,
                         decision_id: "first-refusal".into(),
-                        recorded_at: now_ms() as i64,
+                        recorded_at: recorded,
                     })
                     .unwrap();
             }
@@ -5570,7 +6257,7 @@ mod tests {
                 assert!(body.get("result").is_none(), "{body}");
                 assert!(
                     body.to_string()
-                        .contains(&account_selection::rfc3339(reset)),
+                        .contains(&account_selection::rfc3339(recorded + 15 * 60_000)),
                     "{body}"
                 );
             } else {
@@ -5910,10 +6597,7 @@ mod tests {
             "precondition: the probe is admitted: {probe}"
         );
         let at_probe = store.credential_entitlement_fences().unwrap()[0].observed_at_ms;
-        assert!(
-            at_probe > stale,
-            "admitting the probe stamps the fence fresh"
-        );
+        assert_eq!(at_probe, stale, "a probe must not rewrite refusal evidence");
         report_refusal(
             &store,
             &credentials,
@@ -6087,7 +6771,12 @@ mod tests {
                 "credentialRefusal": {"providerId": "p", "credentialId": "c", "code": "ENTITLEMENT_ERROR", "futureField": "x"}}
         }))
         .unwrap();
-        let refusal = params.provider_outcome.unwrap().credential_refusal.unwrap();
+        let refusal = params
+            .provider_outcome
+            .unwrap()
+            .identity
+            .credential_refusal
+            .unwrap();
         assert_eq!(
             (refusal.provider_id.as_str(), refusal.credential_id.as_str()),
             ("p", "c")
@@ -6097,7 +6786,10 @@ mod tests {
             "decisionID": "d", "outcome": "error", "providerOutcome": {"accountRef": "a"}
         }))
         .unwrap();
-        assert_eq!(old.provider_outcome.unwrap().credential_refusal, None);
+        assert_eq!(
+            old.provider_outcome.unwrap().identity.credential_refusal,
+            None
+        );
     }
 
     /// A panel seat's provider reset is outcome metadata, not confirmed quota
@@ -9098,11 +9790,11 @@ mod tests {
             })
         };
         let before_select = run_route_wire_request(&store, select("before-clear")).await;
-        assert_eq!(before_select.header.ty, FrameType::Response);
-        let before_body: serde_json::Value = serde_json::from_slice(&before_select.body).unwrap();
-        assert!(before_body["result"]["selected"]["explanation"]
-            .to_string()
-            .contains("break-glass"));
+        assert_eq!(
+            before_select.header.ty,
+            FrameType::Error,
+            "break-glass scoring cannot bypass an unclaimed fence"
+        );
         let response = run_route_wire_request(
             &store,
             json!({
@@ -9113,8 +9805,14 @@ mod tests {
         assert_eq!(response.header.ty, FrameType::Response);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["result"]["routeKey"], ROUTE);
-        assert_eq!(body["result"]["clearedCooldownUntil"], until);
-        assert_eq!(body["result"]["clearedQuotaExhaustedUntil"], until);
+        assert_eq!(
+            body["result"]["clearedCooldownUntil"],
+            json!(before.cooldown_until)
+        );
+        assert_eq!(
+            body["result"]["clearedQuotaExhaustedUntil"],
+            json!(before.quota_exhausted_until)
+        );
         let after = store.build_snapshot(now_ms() as f64).unwrap().by_route[ROUTE].clone();
         assert_eq!(after.cooldown_until, None);
         assert_eq!(after.quota_exhausted_until, None);
@@ -9253,7 +9951,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_billing_walled_route_returns_no_route_and_quota_control_relaxes() {
+    async fn identity_free_billing_and_quota_labeled_walls_do_not_allow_an_early_fallback() {
         let rig = Rig::new("billing-wall-break-glass");
         let store = Arc::new(rig.open_store());
         let grok = fact("xai", "grok-4.6");
@@ -9267,6 +9965,7 @@ mod tests {
                 &prefrontal_routing_core::RouteStateUpdate {
                     cooldown_until: Some(wall_until),
                     quota_exhausted_until: Some(wall_until),
+                    observed_at_ms: Some(now_ms() as i64),
                     wall_class: Some(RouteWallClass::Billing),
                     last_error: Some(billing_error.into()),
                     ..Default::default()
@@ -9312,18 +10011,16 @@ mod tests {
                 &prefrontal_routing_core::RouteStateUpdate {
                     wall_class: Some(RouteWallClass::Quota),
                     last_error: Some("you have reached your usage limit".into()),
+                    observed_at_ms: Some(now_ms() as i64),
                     ..Default::default()
                 },
             )
             .unwrap();
-        let relaxed = select_with_store(&store, request("plain-quota-relaxed")).await;
-        assert_eq!(
-            relaxed["result"]["selected"]["routeKey"], "xai/grok-4.6",
-            "{relaxed}"
+        let blocked = select_with_store(&store, request("identity-free-quota-still-fenced")).await;
+        assert!(
+            blocked.get("result").is_none(),
+            "a quota label with no account cannot authorize an early probe: {blocked}"
         );
-        assert!(relaxed["result"]["selected"]["explanation"][0]
-            .as_str()
-            .is_some_and(|line| line.contains("break-glass")));
     }
 
     /// Replay the 2026-09-20 17:09:27 xai/grok-4.6 handout: OpenAI is
@@ -12303,15 +13000,25 @@ mod tests {
 
     #[tokio::test]
     async fn work_model_pin_quota_wall_refuses_with_reset_without_fallback() {
+        let before = now_ms();
         let (frame, _rig) = pinned_select("openai/gpt-5.5:high", true).await;
+        let after = now_ms();
         let body: serde_json::Value = serde_json::from_slice(&frame.body).unwrap();
         assert_eq!(body["code"], "quota_exhausted", "{body}");
+        let until = body["message"]
+            .as_str()
+            .unwrap()
+            .split_once("until_ms=")
+            .unwrap()
+            .1
+            .split(',')
+            .next()
+            .unwrap()
+            .parse::<f64>()
+            .unwrap();
         assert!(
-            body["message"]
-                .as_str()
-                .unwrap()
-                .contains("until 2033-05-18T03:33:20Z"),
-            "{body}"
+            (before as f64 + 3_600_000.0..=after as f64 + 3_600_000.0).contains(&until),
+            "identity-free cooldown is capped at one hour: {body}"
         );
         assert!(
             body.get("result").is_none(),
@@ -12951,7 +13658,7 @@ mod tests {
             .unwrap()
             .iter()
             .find(|cause| cause["model"] == "anthropic-platform/claude-opus-5-5")
-            .unwrap();
+            .unwrap_or_else(|| panic!("missing pooled-route rejection: {rejected}; panel: {body}"));
         assert_eq!(cause["reason"], "unavailable", "{rejected}");
         let detail = cause["detail"].as_str().unwrap();
         let pool_rejection: serde_json::Value = serde_json::from_str(detail).unwrap();
@@ -13659,6 +14366,7 @@ mod tests {
     /// refusal with no recovery time (here a caller exclusion) carries none.
     #[tokio::test]
     async fn a_pin_refused_for_a_timed_wall_names_when_it_can_be_admitted_again() {
+        let _clock = InjectedClock::set(1_800_000_000_000);
         let (_rig, store, credentials, config) = live_platform_pool("platform-pin-wall-until");
         let until = now_ms() as i64 + 2 * 3_600_000;
         let wall = live_platform_call(
@@ -13690,7 +14398,11 @@ mod tests {
             cooled["result"]["pin_rejected"], "cooldown_active",
             "{cooled}"
         );
-        assert_eq!(cooled["result"]["pin_rejected_until_ms"], until, "{cooled}");
+        assert_eq!(
+            cooled["result"]["pin_rejected_until_ms"],
+            now_ms() as i64 + 3_600_000,
+            "{cooled}"
+        );
         let excluded = live_platform_call(
             &store,
             &credentials,

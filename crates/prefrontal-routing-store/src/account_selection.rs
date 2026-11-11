@@ -29,12 +29,12 @@ pub const DECISION_MODE_SERVE: &str = "serve";
 /// The bound-kind predicates match migration 79's sparse partial index.
 pub const OBSERVATION_BACKOFFS_SQL: &str =
     "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),\
-     MAX(json_extract(e.value,'$.retry_at_ms')) \
+     MAX(MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000)) \
      FROM account_observation o,json_each(CASE WHEN o.kind='transient_backoff' AND o.bound=1 \
      AND json_valid(o.effects_json) THEN o.effects_json ELSE '[]' END) e \
      WHERE o.bound=1 AND o.kind='transient_backoff' AND o.received_at>?2 \
      AND json_extract(e.value,'$.effect')='transient_backoff' \
-     AND json_extract(e.value,'$.retry_at_ms')>?1 \
+     AND MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000)>?1 \
      GROUP BY json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id')";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,48 @@ pub enum CredentialProbeClaim {
 #[cfg(test)]
 mod account_fact_tests {
     use super::*;
+
+    #[test]
+    fn headroom_clear_preserves_a_newer_refusal_and_other_provider() {
+        let scratch = cortexkit_test_support::ScratchDir::new("headroom-evidence-order");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "headroom-evidence-order",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let fence = |provider: &str, model: &str, at| AccountRouteFence {
+            provider: provider.into(),
+            credential_id: "c".into(),
+            model: model.into(),
+            recorded_at: at,
+            until_ms: 10_000,
+            decision_id: "d".into(),
+        };
+        store
+            .record_account_route_fence(&fence("p", "old", 100))
+            .unwrap();
+        // Reproduce a new refusal committed after the recovery snapshot was
+        // read, but before its delayed cleanup acquires the writer lock.
+        store
+            .record_account_route_fence(&fence("p", "new", 300))
+            .unwrap();
+        store
+            .record_account_route_fence(&fence("other", "old", 100))
+            .unwrap();
+        store
+            .clear_account_route_fences_before("p", "c", 200)
+            .unwrap();
+        let remaining = store.account_route_fences(400).unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "a reading heals only older evidence on its provider"
+        );
+        assert!(remaining
+            .iter()
+            .any(|row| row.provider == "p" && row.model == "new"));
+        assert!(remaining.iter().any(|row| row.provider == "other"));
+    }
 
     #[test]
     fn observation_backoffs_use_only_committed_bound_effects_and_expire() {
@@ -124,6 +166,80 @@ mod account_fact_tests {
     }
 
     #[test]
+    fn credential_probe_helper_uses_the_quota_recheck_interval() {
+        quota_probe_helper_control(false);
+    }
+    #[test]
+    fn credential_probe_helper_consumes_the_extra_reset_check_once() {
+        quota_probe_helper_control(true);
+    }
+
+    fn quota_probe_helper_control(reset: bool) {
+        let scratch = cortexkit_test_support::ScratchDir::new("quota-credential-probe-helper");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "quota-credential-probe-helper",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .record_credential_entitlement_fence(
+                &prefrontal_routing_core::route_state_store::CredentialRefusal {
+                    provider_id: "p".into(),
+                    credential_id: "c".into(),
+                    code: "billing_exhausted".into(),
+                },
+                None,
+                100,
+            )
+            .unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.classify_credential_quota("p", "c", true)?;
+                Ok(())
+            })
+            .unwrap();
+        if reset {
+            store
+                .store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE fence_recheck SET reset_check_at=200 WHERE kind='credential'",
+                        [],
+                    )
+                })
+                .unwrap();
+        }
+        let at = if reset { 200 } else { 900_100 };
+        assert_eq!(
+            store
+                .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, at))
+                .unwrap(),
+            CredentialProbeClaim::Claimed
+        );
+        if reset {
+            assert_eq!(
+                store
+                    .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, at))
+                    .unwrap(),
+                CredentialProbeClaim::Blocked,
+                "the provider reset is an extra check, not a permanent due flag"
+            );
+        } else {
+            let clock = store
+                .fence_rechecks()
+                .unwrap()
+                .into_iter()
+                .find(|clock| clock.kind == "credential")
+                .unwrap();
+            assert_eq!(
+                clock.next_recheck_at,
+                at + 900_000,
+                "quota credential helpers must use 15 minutes, not the non-quota hour"
+            );
+        }
+    }
+
+    #[test]
     fn stale_credential_probe_is_claimed_once_with_a_strict_cutoff() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-credential-probe");
         let store = std::sync::Arc::new(
@@ -158,7 +274,9 @@ mod account_fact_tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     store
-                        .account_transaction(|tx| tx.claim_credential_probe("p", "c", 101, 200))
+                        .account_transaction(|tx| {
+                            tx.claim_credential_probe("p", "c", 101, 3_600_100)
+                        })
                         .unwrap()
                 })
             })
@@ -194,8 +312,8 @@ mod account_fact_tests {
             .unwrap();
         assert_eq!(
             store.credential_entitlement_fences().unwrap()[0].observed_at_ms,
-            200,
-            "a late refusal cannot rewind a reserved probe"
+            150,
+            "a probe does not overwrite the refusal's evidence time"
         );
         assert_eq!(
             store
@@ -334,7 +452,7 @@ mod account_fact_tests {
     }
 
     #[test]
-    fn size_refusals_expire_or_clear_on_later_success_in_the_same_band() {
+    fn size_quota_refusals_remain_until_recovery_in_the_same_band() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-size-clear");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "account-size-clear",
@@ -362,15 +480,16 @@ mod account_fact_tests {
             .unwrap();
         assert!(store.account_size_refusals(12).unwrap().is_empty());
         store.record_account_size_refusal(&fact).unwrap();
-        assert!(store.account_size_refusals(100).unwrap().is_empty());
-        assert!(
-            store.account_size_refusals(0).unwrap().is_empty(),
-            "expiry deletes the row"
+        assert_eq!(store.account_size_refusals(100).unwrap().len(), 1);
+        assert_eq!(
+            store.account_size_refusals(0).unwrap().len(),
+            1,
+            "a reset must not delete quota evidence"
         );
     }
 
     #[test]
-    fn route_fences_keep_the_later_reset_and_end_at_it() {
+    fn route_quota_fences_replace_reset_evidence_without_expiring() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-route-fence");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "account-route-fence",
@@ -389,15 +508,16 @@ mod account_fact_tests {
         store.record_account_route_fence(&fence(200, "d2")).unwrap();
         assert_eq!(
             store.account_route_fences(100).unwrap(),
-            vec![fence(500, "d1")],
-            "an earlier reset does not shorten a standing fence"
+            vec![fence(200, "d1")],
+            "a new reset replaces check evidence, not a fixed lifetime"
         );
         store.record_account_route_fence(&fence(900, "d3")).unwrap();
         assert_eq!(store.account_route_fences(100).unwrap()[0].until_ms, 900);
-        assert!(store.account_route_fences(900).unwrap().is_empty());
-        assert!(
-            store.account_route_fences(0).unwrap().is_empty(),
-            "the end deletes the row"
+        assert_eq!(store.account_route_fences(900).unwrap().len(), 1);
+        assert_eq!(
+            store.account_route_fences(0).unwrap().len(),
+            1,
+            "the reset never deletes quota evidence"
         );
     }
 
@@ -425,7 +545,7 @@ mod account_fact_tests {
         }
         let fences = store.account_route_fences(100).unwrap();
         assert_eq!(fences[0].recorded_at, 10);
-        assert_eq!(fences[0].until_ms, 900);
+        assert_eq!(fences[0].until_ms, 200);
         assert_eq!(fences[0].decision_id, "first");
         assert_eq!(store.account_route_fence_latest_reports().unwrap()["c"], 30);
     }
@@ -527,6 +647,57 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Clear older route evidence in the same transaction that checked its
+    /// account's pool recovery requirements.
+    pub fn clear_account_route_fences_before(
+        &self,
+        provider: &str,
+        credential: &str,
+        reading_at: i64,
+    ) -> RouteStateResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM account_route_fence
+            WHERE provider=?1 AND credential_id=?2 AND COALESCE(last_reported_at,recorded_at)<?3",
+                params![provider, credential, reading_at],
+            )
+            .map_err(err)
+    }
+
+    pub fn record_admission_probe_scope(
+        &self,
+        principal: &str,
+        id: &str,
+        size: u32,
+        decision: Option<&str>,
+    ) -> RouteStateResult<()> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        self.conn.execute("UPDATE account_admission SET input_size_class=?3,model_decision_id=?4 WHERE principal=?1 AND admission_id=?2",params![principal,id,size,decision]).map(|_|()).map_err(err)
+    }
+
+    pub fn size_admission_for_model_decision(
+        &self,
+        decision: &str,
+        provider: &str,
+        credential: &str,
+        model: &str,
+    ) -> RouteStateResult<Option<(u32, i64)>> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(None);
+        }
+        self.conn.query_row("SELECT input_size_class,committed_at FROM account_admission
+            WHERE model_decision_id=?1 AND provider=?2 AND credential_id=?3 AND model=?4 AND input_size_class IS NOT NULL
+            ORDER BY committed_at DESC LIMIT 1",params![decision,provider,credential,model],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(err)
+    }
+
+    pub fn admission_size_class(&self, principal: &str, id: &str) -> RouteStateResult<Option<u32>> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(None);
+        }
+        self.conn.query_row("SELECT input_size_class FROM account_admission WHERE principal=?1 AND admission_id=?2",params![principal,id],|row|row.get::<_,Option<u32>>(0)).optional().map(Option::flatten).map_err(err)
+    }
     pub fn decision_context(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
         self.conn
             .query_row(
@@ -620,7 +791,13 @@ impl AccountTx<'_> {
         before: i64,
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
-        let changed=self.conn.execute("UPDATE credential_entitlement_fences SET observed_at_ms=?4 WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",params![provider,credential,before,at]).map_err(err)?;
+        crate::fence_rechecks::sync(self.conn).map_err(err)?;
+        let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,
+            next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
+            WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND evidence_at<?3
+            AND MIN(next_recheck_at,COALESCE(reset_check_at,next_recheck_at))<=?4 AND cleared_at IS NULL",params![provider,credential,before,at,
+                prefrontal_routing_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS,
+                prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS]).map_err(err)?;
         if changed > 0 {
             return Ok(CredentialProbeClaim::Claimed);
         }
@@ -785,14 +962,15 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Expired refusals are removed on reads, not just ignored in memory.
-    pub fn account_size_refusals(&self, now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
+    /// Size-specific quota evidence remains until fresh headroom or success;
+    /// its reported reset is a recheck hint, not an expiry.
+    pub fn account_size_refusals(&self, _now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
-            if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_size_refusal WHERE expires_at<=?1)", [now], |row| row.get::<_, bool>(0))? {
-                conn.execute("DELETE FROM account_size_refusal WHERE expires_at<=?1", [now])?;
-            }
-            let mut statement = conn.prepare("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal")?;
+            let extra=if account_fact_table_exists(conn,"account_non_quota_size_refusal")? {
+                " UNION ALL SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_non_quota_size_refusal"
+            }else{""};
+            let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal{extra}"))?;
             let rows = statement.query_map([], |row| Ok(AccountSizeRefusal {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,size_class: row.get(3)?,expires_at: row.get(4)?,observed_at: row.get(5)?,
             }))?;
@@ -814,9 +992,8 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// Record a quota route fence. Two reports on the same route and credential
-    /// keep the later reset: each report fences until its own reset, so the
-    /// route stays closed until both have passed.
+    /// Record quota evidence; the reported reset schedules an extra check, not
+    /// an expiry. New evidence replaces the old reset without extending a hold.
     pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
         self.record_classified_account_route_fence(fence, "quota")
     }
@@ -825,7 +1002,21 @@ impl SqliteRouteStateStore {
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
-        self.record_classified_account_route_fence(fence, "transient")
+        self.account_transaction(|tx| tx.record_account_route_backoff(fence, "transient"))
+    }
+
+    pub fn record_billing_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+    ) -> RouteStateResult<()> {
+        self.account_transaction(|tx| tx.record_non_quota_route_fence(fence))
+    }
+
+    pub fn non_quota_account_route_fences(
+        &self,
+        now: i64,
+    ) -> RouteStateResult<Vec<AccountRouteFence>> {
+        self.classified_account_route_fences(now, "billing")
     }
 
     fn record_classified_account_route_fence(
@@ -835,14 +1026,11 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|conn: &Connection| {
+                let conn=conn.unchecked_transaction()?;
                 conn.execute(
                     "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
                 ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=CASE \
-                  WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.until_ms \
-                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' THEN account_route_fence.until_ms \
-                  WHEN account_route_fence.wall_class='transient' AND excluded.wall_class='quota' THEN excluded.until_ms \
-                  ELSE MAX(account_route_fence.until_ms,excluded.until_ms) END, \
+                until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at) THEN excluded.until_ms ELSE account_route_fence.until_ms END, \
                 wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
                   WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
                 recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
@@ -859,8 +1047,9 @@ impl SqliteRouteStateStore {
                         fence.recorded_at,
                         class
                     ],
-                )
-                .map(|_| ())
+                )?;
+                if crate::fence_rechecks::enabled(&conn)? {conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;}
+                conn.commit()
             })
             .map_err(err)
     }
@@ -891,8 +1080,8 @@ impl SqliteRouteStateStore {
         }).map_err(err)
     }
 
-    /// The quota route fences still standing at `now`. Ended fences of either
-    /// class are removed on reads, not just ignored in memory.
+    /// Retained quota route evidence. Provider dates schedule checks rather
+    /// than expiring rows; recovery and operator actions clear the evidence.
     pub fn account_route_fences(&self, now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.classified_account_route_fences(now, "quota")
     }
@@ -906,36 +1095,61 @@ impl SqliteRouteStateStore {
 
     fn classified_account_route_fences(
         &self,
-        now: i64,
+        _now: i64,
         class: &str,
     ) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.store.with_conn(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
-            if conn.query_row("SELECT EXISTS(SELECT 1 FROM account_route_fence WHERE until_ms<=?1)", [now], |row| row.get::<_, bool>(0))? {
-                conn.execute("DELETE FROM account_route_fence WHERE until_ms<=?1", [now])?;
-            }
-            let mut statement = conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class=?1 ORDER BY provider,credential_id,model")?;
-            let rows = statement.query_map([class], |row| Ok(AccountRouteFence {
+            let table=if class!="quota" {"account_non_quota_route_fence"} else {"account_route_fence"};
+            let filter=if class=="transient" {"WHERE wall_kind='transient'"} else if class=="billing" {"WHERE wall_kind='billing'"} else {"WHERE wall_class='quota'"};
+            let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM {table} {filter} ORDER BY provider,credential_id,model"))?;
+            let rows = statement.query_map([], |row| Ok(AccountRouteFence {
                 provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
             }))?;
             rows.collect()
         }).map_err(err)
     }
 
-    /// Lift all route-reset fences for a credential after an operator top-up.
-    pub fn clear_account_route_fences_for_credential(
+    /// Revalidate evidence ordering under the writer lock. The reading may
+    /// have been copied before another request recorded a newer refusal.
+    pub fn clear_account_route_fences_before(
+        &self,
+        provider: &str,
+        credential: &str,
+        reading_at: i64,
+    ) -> RouteStateResult<usize> {
+        self.account_transaction(|tx| {
+            tx.clear_account_route_fences_before(provider, credential, reading_at)
+        })
+    }
+
+    /// An explicit operator clear lifts quota, billing and transient route
+    /// evidence. Quota-reading reconciliation must remain quota-only.
+    pub fn clear_all_account_route_fences_for_credential(
         &self,
         credential_id: &str,
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|conn: &Connection| {
-                if !account_fact_table_exists(conn, "account_route_fence")? {
-                    return Ok(0);
+                let tx = conn.unchecked_transaction()?;
+                let mut cleared = 0;
+                for table in ["account_route_fence", "account_non_quota_route_fence"] {
+                    if account_fact_table_exists(&tx, table)? {
+                        cleared += tx.execute(
+                            &format!("DELETE FROM {table} WHERE credential_id=?1"),
+                            [credential_id],
+                        )?;
+                    }
                 }
-                conn.execute(
-                    "DELETE FROM account_route_fence WHERE credential_id=?1",
-                    [credential_id],
-                )
+                if crate::fence_rechecks::enabled(&tx)? {
+                    tx.execute(
+                        "DELETE FROM fence_recheck WHERE credential_id=?1
+                    AND kind IN ('account_route','non_quota_route','transient_route')",
+                        [credential_id],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(cleared)
             })
             .map_err(err)
     }
@@ -1797,13 +2011,19 @@ impl AccountTx<'_> {
             .map_err(err)?;
         rows.map(|row| {
             let (evidence, key, recovery) = row.map_err(err)?;
+            let healed = self.successful_quota_pools(
+                &evidence.fence_id,
+                evidence.observed_at.min(evidence.created_at),
+            )?;
+            let mut recovery_set: Vec<PoolKey> = serde_json::from_str(&recovery).map_err(err)?;
+            recovery_set.retain(|pool| !healed.contains(pool));
             Ok(AccountPoolFenceRow {
                 evidence,
                 pool_key: key
                     .map(|key| serde_json::from_str(&key))
                     .transpose()
                     .map_err(err)?,
-                recovery_set: serde_json::from_str(&recovery).map_err(err)?,
+                recovery_set,
             })
         })
         .collect()
@@ -1889,7 +2109,8 @@ impl AccountTx<'_> {
     /// Record a scoped not-found. Returns false when this admission already
     /// excluded the credential.
     pub fn insert_exclusion(&self, row: &AccountExclusionRow) -> RouteStateResult<bool> {
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "INSERT INTO account_principal_exclusion (principal, admission_id, credential_id, \
                    runner_view_digest, roster_view_digest, observation_id, recorded_at) \
@@ -1905,8 +2126,42 @@ impl AccountTx<'_> {
                     row.recorded_at,
                 ],
             )
-            .map(|changed| changed == 1)
-            .map_err(err)
+            .map_err(err)?;
+        if changed == 1 {
+            crate::fence_rechecks::register(
+                self.conn,
+                "principal",
+                &serde_json::json!([row.principal, row.admission_id, row.credential_id])
+                    .to_string(),
+            )
+            .map_err(err)?;
+        }
+        Ok(changed == 1)
+    }
+
+    pub fn insert_exclusion_with_recheck(
+        &self,
+        row: &AccountExclusionRow,
+        after_ms: i64,
+    ) -> RouteStateResult<bool> {
+        let inserted = self.insert_exclusion(row)?;
+        if inserted && crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            self.conn
+                .execute(
+                    "UPDATE fence_recheck SET next_recheck_at=MIN(next_recheck_at,?2)
+                WHERE kind='principal' AND origin_key=?1",
+                    params![
+                        serde_json::json!([row.principal, row.admission_id, row.credential_id])
+                            .to_string(),
+                        row.recorded_at.saturating_add(after_ms.clamp(
+                            0,
+                            prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS
+                        ))
+                    ],
+                )
+                .map_err(err)?;
+        }
+        Ok(inserted)
     }
 
     /// How many admissions of `principal` reported a scoped not-found for
@@ -2008,8 +2263,43 @@ impl AccountTx<'_> {
                  WHERE observation_id = ?1",
                 params![observation_id, i64::from(bound), effects_json],
             )
-            .map(|_| ())
-            .map_err(err)
+            .map_err(err)?;
+        if bound {
+            self.record_transient_observation_effects(observation_id, effects_json)?;
+        }
+        Ok(())
+    }
+
+    fn record_transient_observation_effects(
+        &self,
+        id: &str,
+        effects: &str,
+    ) -> RouteStateResult<()> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        let changed=self.conn.execute("INSERT INTO account_transient_backoff
+            SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
+                o.received_at,json_array(o.observation_id,e.key),e.value
+            FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
+            WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
+                AND json_extract(e.value,'$.effect')='transient_backoff'
+                AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
+                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
+            ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
+                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at",params![id,effects]).map_err(err)?;
+        if changed > 0 {
+            let mut statement=self.conn.prepare("SELECT json_array(provider,account_id) FROM account_transient_backoff WHERE json_extract(evidence_key,'$[0]')=?1").map_err(err)?;
+            let keys = statement
+                .query_map([id], |row| row.get::<_, String>(0))
+                .map_err(err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(err)?;
+            for key in keys {
+                crate::fence_rechecks::register(self.conn, "observation", &key).map_err(err)?;
+            }
+        }
+        Ok(())
     }
 
     /// The salt if one was ever created. A read-only caller uses this: with no
@@ -2045,8 +2335,11 @@ impl AccountTx<'_> {
                     row.received_at,
                 ],
             )
-            .map(|_| ())
-            .map_err(err)
+            .map_err(err)?;
+        if row.bound {
+            self.record_transient_observation_effects(&row.observation_id, &row.effects_json)?;
+        }
+        Ok(())
     }
 }
 
@@ -2250,10 +2543,11 @@ mod transient_fence_tests {
             store.account_route_fences(2_000).unwrap()[0].until_ms,
             10_000
         );
-        assert!(store
-            .transient_account_route_fences(2_000)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store.transient_account_route_fences(2_000).unwrap().len(),
+            1,
+            "independent transient evidence survives quota"
+        );
         assert_eq!(
             store.account_route_fence_latest_reports().unwrap()["chatgpt:openai:gmail"],
             1_000
@@ -2261,7 +2555,7 @@ mod transient_fence_tests {
         fence.recorded_at = 11_000;
         fence.until_ms = 16_000;
         store.record_transient_account_route_fence(&fence).unwrap();
-        assert!(store.account_route_fences(11_000).unwrap().is_empty());
+        assert_eq!(store.account_route_fences(11_000).unwrap().len(), 1);
         assert_eq!(
             store.transient_account_route_fences(11_000).unwrap()[0].until_ms,
             16_000
@@ -2269,14 +2563,24 @@ mod transient_fence_tests {
         fence.recorded_at = 12_000;
         fence.until_ms = 14_000;
         store.record_account_route_fence(&fence).unwrap();
-        assert!(store
-            .transient_account_route_fences(12_000)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            store.transient_account_route_fences(12_000).unwrap().len(),
+            1
+        );
         assert_eq!(
             store.account_route_fences(12_000).unwrap()[0].until_ms,
             14_000
         );
-        assert!(store.account_route_fences(14_000).unwrap().is_empty());
+        assert_eq!(store.account_route_fences(14_000).unwrap().len(), 1);
+        let clocks = store.fence_rechecks().unwrap();
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 14_000))
+            .unwrap());
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 16_000))
+            .unwrap());
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 16_000))
+            .unwrap());
     }
 }

@@ -48,6 +48,16 @@ impl SqliteRouteStateStore {
     /// The pooled, read-only transaction ends before constructing the copy.
     pub fn account_evaluation_snapshot(&self, now_ms: i64) -> RouteStateResult<Self> {
         let tables = [
+            ("model_facts", "1".to_string()),
+            ("fence_recheck", "1".to_string()),
+            ("fence_recheck_route_clear", "1".to_string()),
+            ("fence_success_pool", "1".to_string()),
+            ("account_non_quota_route_fence", "1".to_string()),
+            ("account_non_quota_size_refusal", "1".to_string()),
+            ("account_transient_backoff", "1".to_string()),
+            ("account_principal_exclusion", "1".to_string()),
+            ("model_route_state", "1".to_string()),
+            ("provider_cooldown_state", "1".to_string()),
             ("credential_entitlement_fences", "1".to_string()),
             ("account_eligibility", "1".to_string()),
             ("account_size_refusal", "1".to_string()),
@@ -74,7 +84,7 @@ impl SqliteRouteStateStore {
                 format!("released_at IS NULL AND valid_until>{now_ms}"),
             ),
         ];
-        let copied = self
+        let (copied, origin_view) = self
             .store
             .with_read(|source| {
                 let mut copied = Vec::new();
@@ -101,7 +111,14 @@ impl SqliteRouteStateStore {
                         .collect::<rusqlite::Result<Vec<_>>>()?;
                     copied.push((*table, schema, columns, rows));
                 }
-                Ok(copied)
+                let origin_view = source
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE type='view' AND name='fence_origin'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok((copied, origin_view))
             })
             .map_err(err)?;
         let store =
@@ -121,6 +138,9 @@ impl SqliteRouteStateStore {
                     for row in rows {
                         insert.execute(rusqlite::params_from_iter(row))?;
                     }
+                }
+                if let Some(view) = origin_view {
+                    tx.execute_batch(&view)?;
                 }
                 tx.commit()
             })

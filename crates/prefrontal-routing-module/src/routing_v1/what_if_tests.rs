@@ -334,12 +334,12 @@ async fn what_if_is_an_operator_only_management_query() {
 }
 
 #[tokio::test]
-async fn what_if_changes_no_rows_even_when_account_loading_heals_expired_evidence() {
+async fn what_if_changes_no_rows_even_when_account_loading_reconciles_old_evidence() {
     let (harness, _) = configured().await;
     prepare_runner_preview(&harness);
     let operator = operator(&harness).await;
     Connection::open(harness.store_path()).unwrap().execute_batch(
-        "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a','large',1,0);
+        "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
          INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
     ).unwrap();
     let before = rows(&harness);

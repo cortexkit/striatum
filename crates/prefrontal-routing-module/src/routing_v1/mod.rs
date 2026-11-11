@@ -11,7 +11,7 @@
 //! names. No request member is ever read as the caller or the scope.
 //!
 //! Credential-refusal observations block the credential for a documented
-//! re-probe horizon of six hours. A later refusal extends that horizon without
+//! recheck horizon of at most one hour. A later refusal renews that horizon without
 //! shortening an existing block. An operator can clear it early with
 //! `route.clear_cooldown`.
 

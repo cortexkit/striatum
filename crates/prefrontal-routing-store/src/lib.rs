@@ -55,7 +55,9 @@ mod diagnostics;
 mod operator_quality;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
+mod fence_rechecks;
 mod key_pool;
+pub use fence_rechecks::{FenceRecheck, QuotaSuccessScope};
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
@@ -308,7 +310,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 80] {
+fn route_state_migrations() -> [Migration; 81] {
     [
         Migration {
             version: 1,
@@ -630,10 +632,26 @@ fn route_state_migrations() -> [Migration; 80] {
             version: 81,
             statements: include_str!("../migrations/081_engine_measurements.sql"),
         },
+        Migration {
+            version: 82,
+            statements: include_str!("../migrations/082_fence_rechecks.sql"),
+        },
     ]
 }
 
 impl SqliteRouteStateStore {
+    /// Stored providers only; score aliases added to a request are not catalog
+    /// identities and must not be used to resolve credential ownership.
+    pub fn catalog_providers(&self) -> RouteStateResult<std::collections::BTreeSet<String>> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let mut statement = conn.prepare("SELECT DISTINCT provider_id FROM model_facts")?;
+                let rows = statement.query_map([], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()
+            })
+            .map_err(err)
+    }
+
     /// Clear a stored route, or every variant under a base model, atomically.
     /// A known key is used as-is; otherwise its final colon-separated suffix
     /// is parsed as a variant.
@@ -667,12 +685,17 @@ impl SqliteRouteStateStore {
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             tx.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL,wall_class=NULL,updated_at=?4 WHERE route_key=?1 OR (?2 AND capacity_key=?3)", params![route_key,base,capacity,now_ms()])?;
+            tx.execute("INSERT INTO fence_recheck_route_clear(kind,origin_key,provider,model,evidence)
+                SELECT kind,origin_key,provider,?2,evidence FROM fence_origin WHERE kind='provider' AND provider=?1
+                ON CONFLICT(kind,origin_key,provider,model) DO UPDATE SET evidence=excluded.evidence",params![provider,model])?;
             let account_fences = {
-                let mut statement = tx.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE provider=?1 AND model=?2 ORDER BY credential_id")?;
+                let mut statement = tx.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE provider=?1 AND model=?2 AND wall_class='quota'
+                    UNION ALL SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_non_quota_route_fence WHERE provider=?1 AND model=?2 ORDER BY credential_id")?;
                 let rows = statement.query_map(params![provider,model], |row| Ok(AccountRouteFence { provider:row.get(0)?,credential_id:row.get(1)?,model:row.get(2)?,until_ms:row.get(3)?,decision_id:row.get(4)?,recorded_at:row.get(5)? }))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
             tx.execute("DELETE FROM account_route_fence WHERE provider=?1 AND model=?2", params![provider,model])?;
+            tx.execute("DELETE FROM account_non_quota_route_fence WHERE provider=?1 AND model=?2",params![provider,model])?;
             // Credential walls cover every model served by the provider. An
             // operator clearing one of its routes also permits an early retry.
             tx.execute("UPDATE pool_key_state SET walled_until=NULL,wall_reason=NULL WHERE provider=?1", [&provider])?;
@@ -2413,10 +2436,11 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Renew a fence's observation clock without changing its code or listing
-    /// fingerprint. A recheck probe consumes its interval this way: admitting
-    /// the probe stamps the fence fresh, so no second probe is admitted until
-    /// another interval passes or an outcome lifts or renews it.
+    /// Replace the refusal timestamp while preserving its code and listing
+    /// fingerprint. Reschedule its next permitted retry in the same transaction;
+    /// otherwise an older replacement timestamp can look like an expired fence
+    /// imported from a store that never recorded scheduled retries.
+    /// Admitting a retry uses the separate claim operation, not this setter.
     pub fn touch_credential_entitlement_fence(
         &self,
         provider_id: &str,
@@ -2425,11 +2449,19 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
-                c.execute(
+                let tx = c.unchecked_transaction()?;
+                let changed = tx.execute(
                     "UPDATE credential_entitlement_fences SET observed_at_ms = ?3
                       WHERE provider_id = ?1 AND credential_id = ?2",
                     params![provider_id, credential_id, observed_at_ms],
-                )
+                )?;
+                fence_rechecks::register(
+                    &tx,
+                    "credential",
+                    &serde_json::json!([provider_id, credential_id]).to_string(),
+                )?;
+                tx.commit()?;
+                Ok(changed)
             })
             .map_err(err)
     }
@@ -3789,13 +3821,29 @@ impl RouteStateStore for SqliteRouteStateStore {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
+        let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
+        let mut bounded = update.clone();
+        {
+            // No account is named on this legacy provider-wide signal. Its
+            // quota class cannot establish account quota, so cap it as a
+            // non-quota fence while retaining the reported class as evidence.
+            let cap = observed_at
+                .saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS)
+                as f64;
+            bounded.cooldown_until = update.cooldown_until.map(|until| until.min(cap));
+            bounded.quota_exhausted_until =
+                update.quota_exhausted_until.map(|until| until.min(cap));
+        }
+        let update = &bounded;
         // Old callers can still send an account failure as a route cooldown.
         // Keep account evidence in the account allocator, never fan it out to
         // every model or replace an independent model wall's cause.
-        if prefrontal_routing_core::account_wall::account_scoped_wall(
-            update.last_error.as_deref(),
-            update.wall_class,
-        ) {
+        if !update.unscoped_wall
+            && prefrontal_routing_core::account_wall::account_scoped_wall(
+                update.last_error.as_deref(),
+                update.wall_class,
+            )
+        {
             return Ok(());
         }
         let provider_key = derive_provider_key(provider_key)
@@ -3816,6 +3864,19 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // row, inheritance row, and existing-route fanout therefore
                 // commit together or roll back together.
                 let tx = c.unchecked_transaction()?;
+                let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
+                let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1",[&provider_key],|row|row.get(0)).optional()?.flatten();
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
+                // Replace inherited provider evidence only. An independent
+                // model refusal keeps its own deadline and evidence generation.
+                let mut inherited=tx.prepare("SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
+                    ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
+                     (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
+                      AND COALESCE(m.wall_observed_at,m.last_error_at,m.updated_at)=COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
+                      AND m.last_error IS p.last_error
+                      AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
+                      AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))")?
+                    .query_map([&provider_key],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3839,13 +3900,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let existing = existing
                     .filter(|state| !credential_refusal_wall(state.last_error.as_deref()))
                     .unwrap_or_default();
-                let cooldown_until = max_defined(existing.cooldown_until, update.cooldown_until);
-                let quota_exhausted_until =
-                    max_defined(existing.quota_exhausted_until, update.quota_exhausted_until);
+                let cooldown_until = if new_wall {update.cooldown_until} else {existing.cooldown_until};
+                let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else {existing.quota_exhausted_until};
                 let quota_pressure = update.quota_pressure.or(existing.quota_pressure);
                 let wall_class = update.wall_class.or(existing.wall_class);
                 let (last_error, last_error_at) = match &update.last_error {
-                    Some(error) => (Some(error.clone()), Some(now_ms())),
+                    Some(error) => (Some(error.clone()), Some(observed_at)),
                     None if (update.cooldown_until.is_some()
                         || update.quota_exhausted_until.is_some())
                         && prefrontal_routing_core::account_wall::account_scoped_wall(
@@ -3853,11 +3913,11 @@ impl RouteStateStore for SqliteRouteStateStore {
                             existing.wall_class,
                         ) =>
                     {
-                        (Some("route wall (scope unknown)".into()), Some(now_ms()))
+                        (Some("route wall (scope unknown)".into()), Some(observed_at))
                     }
                     None => (existing.last_error, existing.last_error_at),
                 };
-                let updated_at = now_ms();
+                let updated_at = observed_at;
 
                 tx.execute(
                     "INSERT INTO provider_cooldown_state (
@@ -3888,7 +3948,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // catalog yet. Materialize it from the just-merged provider row
                 // before the fanout, so it cannot miss this write.
                 let (_, model_id, variant) = route_identity(&tx, route_key, None)?;
-                tx.execute(
+                let inserted=tx.execute(
                     "INSERT OR IGNORE INTO model_route_state (
                        route_key, capacity_key, provider_id, model_id, variant,
                        cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3911,19 +3971,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                     ],
                 )?;
 
-                // Merge each horizon independently. NULL incoming values preserve
-                // route-specific state, and an older provider signal never shortens
-                // a later route or provider deadline.
+                if inserted>0 {inherited.push(route_key.to_owned());}
+                let inherited=serde_json::to_string(&inherited).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                // A repeat refusal replaces the old provider generation's raw
+                // horizons, including migrated deadlines longer than one hour.
                 tx.execute(
                     "UPDATE model_route_state SET
-                       cooldown_until = CASE
-                         WHEN ?1 IS NULL THEN cooldown_until
-                         WHEN cooldown_until IS NULL OR cooldown_until < ?1 THEN ?1
-                         ELSE cooldown_until END,
-                       quota_exhausted_until = CASE
-                         WHEN ?2 IS NULL THEN quota_exhausted_until
-                         WHEN quota_exhausted_until IS NULL OR quota_exhausted_until < ?2 THEN ?2
-                         ELSE quota_exhausted_until END,
+                       cooldown_until = ?1,
+                       quota_exhausted_until = ?2,
                        quota_pressure = COALESCE(?3, quota_pressure),
                        wall_class = COALESCE(?4, wall_class),
                        failure_count = failure_count + ?5,
@@ -3931,7 +3986,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                        last_error = COALESCE(?7, last_error),
                        last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
                        updated_at = ?8
-                     WHERE provider_id = ?9",
+                      WHERE provider_id = ?9 AND route_key IN (SELECT value FROM json_each(?10))",
                     params![
                         cooldown_until,
                         quota_exhausted_until,
@@ -3942,8 +3997,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         last_error,
                         updated_at,
                         provider_key,
+                        inherited,
                     ],
                 )?;
+                if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
+                    tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
+                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))",params![provider_key,updated_at,update.unscoped_wall,inherited])?;
+                    fence_rechecks::register(&tx,"provider",&serde_json::json!([provider_key]).to_string())?;
+                }
                 tx.commit()
             })
             .map_err(err)
@@ -3955,10 +4016,25 @@ impl RouteStateStore for SqliteRouteStateStore {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
-        if prefrontal_routing_core::account_wall::account_scoped_wall(
-            update.last_error.as_deref(),
-            update.wall_class,
-        ) {
+        let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
+        let mut bounded = update.clone();
+        {
+            // Identity-free legacy cooldowns are non-quota even when their
+            // reported class says quota: no account reading can verify it.
+            let cap = observed_at
+                .saturating_add(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS)
+                as f64;
+            bounded.cooldown_until = update.cooldown_until.map(|until| until.min(cap));
+            bounded.quota_exhausted_until =
+                update.quota_exhausted_until.map(|until| until.min(cap));
+        }
+        let update = &bounded;
+        if !update.unscoped_wall
+            && prefrontal_routing_core::account_wall::account_scoped_wall(
+                update.last_error.as_deref(),
+                update.wall_class,
+            )
+        {
             return Ok(());
         }
         let provider_key = derive_provider_key(route_key)
@@ -3970,6 +4046,9 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // provider inheritance, and field merges see one consistent row.
                 let tx = c.unchecked_transaction()?;
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
+                let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
+                let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?.flatten();
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -3993,6 +4072,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         },
                     )
                     .optional()?;
+                let new_route=existing.is_none();
                 let mut ex = existing.unwrap_or_default();
                 // The route's own wall from one credential's refusal keeps its
                 // evidence (last_error) but lends no horizon to this write.
@@ -4028,14 +4108,10 @@ impl RouteStateStore for SqliteRouteStateStore {
                     provider
                 };
 
-                let cooldown_until = max_defined(
-                    max_defined(ex.cooldown_until, provider.cooldown_until),
-                    update.cooldown_until,
-                );
-                let quota_exhausted_until = max_defined(
-                    max_defined(ex.quota_exhausted_until, provider.quota_exhausted_until),
-                    update.quota_exhausted_until,
-                );
+                // A model refusal replaces its own horizon. The provider wall
+                // remains a separate origin, never a floor for this deadline.
+                let cooldown_until = if new_wall {update.cooldown_until} else if new_route {provider.cooldown_until} else {ex.cooldown_until};
+                let quota_exhausted_until = if new_wall {update.quota_exhausted_until} else if new_route {provider.quota_exhausted_until} else {ex.quota_exhausted_until};
                 let quota_pressure = update
                     .quota_pressure
                     .or(ex.quota_pressure)
@@ -4050,12 +4126,12 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let quota_error_count =
                     ex.quota_error_count + if update.increment_quota_error { 1 } else { 0 };
                 let (last_error, last_error_at) = match &update.last_error {
-                    Some(error) => (Some(error.clone()), Some(now_ms())),
+                    Some(error) => (Some(error.clone()), Some(observed_at)),
                     None if (update.cooldown_until.is_some() || update.quota_exhausted_until.is_some())
                         && prefrontal_routing_core::account_wall::account_scoped_wall(ex.last_error.as_deref(), ex.wall_class) => {
                         // A new unscoped wall must not inherit a legacy account
                         // narrative, which would falsely quarantine the new wall.
-                        (Some("route wall (scope unknown)".into()), Some(now_ms()))
+                        (Some("route wall (scope unknown)".into()), Some(observed_at))
                     }
                     None => (ex
                         .last_error
@@ -4095,10 +4171,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                         quota_error_count,
                         last_error,
                         last_error_at,
-                        now_ms(),
+                        observed_at,
                         wall_class.map(RouteWallClass::as_str),
                     ],
                 )?;
+                if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
+                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE route_key=?1",params![route_key,observed_at,update.unscoped_wall])?;
+                    fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
+                }
                 tx.commit()
             })
             .map_err(err)
@@ -4206,7 +4286,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                 if let Some(retry_after_secs) = update.outcome.retry_after_secs() {
                     let quota_exhausted_until = update
                         .observed_at_ms
-                        .saturating_add((retry_after_secs.min(i64::MAX as u64) as i64).saturating_mul(1_000))
+                        .saturating_add((retry_after_secs.min(i64::MAX as u64) as i64).saturating_mul(1_000)
+                            .min(prefrontal_routing_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS))
                         as f64;
                     let surfaced_error = update
                         .last_error
@@ -4216,23 +4297,24 @@ impl RouteStateStore for SqliteRouteStateStore {
                         "INSERT INTO model_route_state (
                            route_key, capacity_key, provider_id, model_id, variant,
                            quota_exhausted_until, failure_count, quota_error_count,
-                           last_error, last_error_at, updated_at
-                         ) VALUES (?1,?2,?3,?4,?5,?6,1,1,?7,?8,?8)
+                            last_error, last_error_at, updated_at, wall_observed_at, wall_unscoped
+                          ) VALUES (?1,?2,?3,?4,?5,?6,1,1,?7,?8,?8,?8,1)
                          ON CONFLICT(route_key) DO UPDATE SET
                            capacity_key=excluded.capacity_key,
                            provider_id=excluded.provider_id,
                            model_id=excluded.model_id,
                            variant=excluded.variant,
-                           quota_exhausted_until=CASE
-                             WHEN model_route_state.quota_exhausted_until IS NULL
-                               OR model_route_state.quota_exhausted_until < excluded.quota_exhausted_until
-                             THEN excluded.quota_exhausted_until
-                             ELSE model_route_state.quota_exhausted_until END,
+                            cooldown_until=NULL,
+                            quota_exhausted_until=excluded.quota_exhausted_until,
+                            wall_observed_at=excluded.wall_observed_at,
+                            wall_unscoped=excluded.wall_unscoped,
                            failure_count=model_route_state.failure_count + 1,
                            quota_error_count=model_route_state.quota_error_count + 1,
                            last_error=excluded.last_error,
                            last_error_at=excluded.last_error_at,
-                           updated_at=excluded.updated_at",
+                            updated_at=excluded.updated_at
+                          WHERE model_route_state.wall_observed_at IS NULL
+                            OR excluded.wall_observed_at>=model_route_state.wall_observed_at",
                         params![
                             route_key,
                             capacity_key,
@@ -4245,13 +4327,13 @@ impl RouteStateStore for SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                let existing: Option<(i64, Option<f64>, Option<String>)> = tx
+                let existing: Option<(i64, Option<f64>, Option<String>,i64)> = tx
                     .query_row(
                         "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason
+                                failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
                          FROM model_route_state WHERE route_key=?1",
                         [&route_key],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?)),
                     )
                     .optional()?;
                 let previous_failures = existing
@@ -4259,23 +4341,33 @@ impl RouteStateStore for SqliteRouteStateStore {
                     .map(|state| state.0.max(0) as u32)
                     .unwrap_or(0);
 
-                match failure_backoff_transition(
+                let transition=if existing.as_ref().is_some_and(|state|(state.0>0 || state.1.is_some()) && state.3>update.observed_at_ms) {
+                    FailureBackoffTransition::Unchanged
+                } else {failure_backoff_transition(
                     previous_failures,
                     update.outcome,
                     update.last_error.as_deref(),
                     update.observed_at_ms,
                     update.failure_backoff,
-                ) {
+                )};
+                match transition {
                     FailureBackoffTransition::Unchanged => {}
                     FailureBackoffTransition::Reset => {
+                        let admitted_at:i64=tx.query_row("SELECT COALESCE(
+                            (SELECT MAX(committed_at) FROM account_admission a WHERE a.model_decision_id=d.id
+                             AND a.provider=?2 AND a.model=?3 AND a.input_size_class IS NOT NULL),
+                            (SELECT created_at_ms FROM routing_v1_decision v WHERE v.decision_id=d.id),d.created_at)
+                            FROM model_route_decisions d WHERE d.id=?1",params![decision_id,provider_id,model_id],|row|row.get(0))?;
+                        // A late completion from an already-running request
+                        // cannot clear failure evidence recorded after it launched.
                         tx.execute(
                             "UPDATE model_route_state
                              SET consecutive_terminal_failures=0,
                                  failure_backoff_until=NULL,
                                  failure_backoff_reason=NULL,
                                  updated_at=?1
-                             WHERE route_key=?2",
-                            params![update.observed_at_ms, route_key],
+                             WHERE route_key=?2 AND COALESCE(failure_observed_at,last_error_at,updated_at)<?3",
+                            params![update.observed_at_ms, route_key,admitted_at],
                         )?;
                     }
                     FailureBackoffTransition::Failure {
@@ -4285,8 +4377,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     } => {
                         let previous_until = existing.as_ref().and_then(|state| state.1);
                         let previous_reason = existing.as_ref().and_then(|state| state.2.clone());
-                        let failure_backoff_until =
-                            max_defined(previous_until, cooldown_until.map(|value| value as f64));
+                        let failure_backoff_until = cooldown_until.map(|value| value as f64).or(previous_until);
                         let failure_backoff_reason = reason.or(previous_reason);
                         let surfaced_error = update
                             .last_error
@@ -4324,9 +4415,14 @@ impl RouteStateStore for SqliteRouteStateStore {
                                 failure_backoff_reason,
                             ],
                         )?;
+                        tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
+                        if failure_backoff_until.is_some() {
+                            fence_rechecks::register(&tx,"failure",&serde_json::json!([route_key]).to_string())?;
+                        }
                     }
                 }
 
+                fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
                 tx.commit()
             })
             .map_err(err)
@@ -4654,15 +4750,17 @@ impl RouteStateStore for SqliteRouteStateStore {
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot> {
         self.store
             .with_conn(|c: &Connection| {
+                let clock_schema=fence_rechecks::enabled(c)?;
+                let rechecks=fence_rechecks::read_effective(c)?;
                 let mut by_route: HashMap<String, RouteRuntimeState> = HashMap::new();
                 let mut by_capacity: HashMap<String, RouteRuntimeState> = HashMap::new();
 
-                let mut stmt = c.prepare(
+                let mut stmt = c.prepare(&format!(
                     "SELECT route_key, capacity_key, cooldown_until, quota_exhausted_until,
-                            quota_pressure, latency_ema_ms, success_ema,
-                            failure_backoff_until, failure_backoff_reason, last_error, wall_class
-                     FROM model_route_state",
-                )?;
+                             quota_pressure, latency_ema_ms, success_ema,
+                             failure_backoff_until, failure_backoff_reason, last_error, wall_class,{}
+                      FROM model_route_state",if clock_schema {"wall_unscoped"}else{"0"},
+                ))?;
                 let rows = stmt.query_map([], |r| {
                     Ok(StateRow {
                         route_key: r.get(0)?,
@@ -4676,6 +4774,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         failure_backoff_reason: r.get(8)?,
                         last_error: r.get(9)?,
                         wall_class: row_wall_class(r, 10)?,
+                        wall_unscoped:r.get(11)?,
                     })
                 })?;
                 for row in rows {
@@ -4691,10 +4790,31 @@ impl RouteStateStore for SqliteRouteStateStore {
                         failure_backoff_reason: row.failure_backoff_reason,
                         ..Default::default()
                     };
+                    let provider=derive_provider_key(&row.route_key).unwrap_or("");
+                    let model=row.capacity_key.strip_prefix(provider).and_then(|key|key.strip_prefix('/')).unwrap_or("");
+                    let schedule=|kinds:&[&str],raw:f64|rechecks.iter().filter(|origin| kinds.contains(&origin.kind.as_str())
+                        && ((origin.kind=="provider" && origin.applies(provider,"","",model))
+                            || origin.origin_key==serde_json::json!([row.route_key]).to_string()))
+                        .map(|origin|if origin.last_claimed_at.is_some_and(|at|at>=origin.evidence_at) {origin.due_at() as f64}else{raw.min(origin.due_at() as f64)}).reduce(f64::max).or_else(||(!clock_schema).then_some(raw));
+                    if let Some(raw)=state.cooldown_until {state.cooldown_until=schedule(&["route","provider"],raw);}
+                    if let Some(raw)=state.quota_exhausted_until {state.quota_exhausted_until=schedule(&["route","provider"],raw);}
+                    if let Some(raw)=state.failure_backoff_until {state.failure_backoff_until=schedule(&["failure"],raw);}
+                    // These legacy origins have no account identity. Preserve
+                    // the reported quota label in storage, but enforce a
+                    // non-quota retry clock rather than infer an account quota.
+                    if row.wall_unscoped && prefrontal_routing_core::account_wall::account_scoped_wall(state.last_error.as_deref(),state.wall_class) {
+                        // Older downstream readers classify that text as an
+                        // account wall. Keep it only in the original store row,
+                        // not in the effective identity-free cooldown view.
+                        state.last_error=Some("identity-free legacy cooldown".into());
+                    }
+                    if state.wall_class==Some(RouteWallClass::Quota) || (row.wall_unscoped && state.wall_class==Some(RouteWallClass::Transient)) {
+                        state.wall_class=None;
+                    }
                     // Read-side quarantine leaves the original row available for
                     // diagnosis. Its single-account horizon cannot reject another
                     // credential, including through a sibling capacity key.
-                    if prefrontal_routing_core::account_wall::account_scoped_wall(
+                    if !row.wall_unscoped && prefrontal_routing_core::account_wall::account_scoped_wall(
                         state.last_error.as_deref(),
                         state.wall_class,
                     ) {
@@ -4769,6 +4889,7 @@ struct ExistingState {
 }
 
 struct StateRow {
+    wall_unscoped: bool,
     route_key: String,
     capacity_key: String,
     cooldown_until: Option<f64>,
@@ -5097,12 +5218,16 @@ mod tests {
         );
         assert_eq!(restarted.account_serving_counts().unwrap().holds, 0);
         assert_eq!(
-            restarted.credential_entitlement_fences().unwrap()[0].code,
-            "ENTITLEMENT_ERROR"
+            restarted.credential_entitlement_fences().unwrap().len(),
+            1,
+            "credential probe eligibility is not evidence expiry"
         );
         restarted
             .store
             .with_conn(|c| {
+                let (code,due):(String,i64)=c.query_row("SELECT json_extract(evidence,'$[0]'),next_recheck_at FROM fence_recheck WHERE kind='credential'",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                assert_eq!(code,"ENTITLEMENT_ERROR","migration preserves the standing refusal evidence");
+                assert!(due<=now_ms(),"old credentials get one immediately due probe");
                 let dropped: i64 = c.query_row(
                     "SELECT COUNT(*) FROM sqlite_schema WHERE name='provider_reset_fences'",
                     [],
@@ -5229,7 +5354,9 @@ mod tests {
         .unwrap();
         insert_legacy_account_wall(&store, "anthropic/opus/medium", "quota");
         insert_legacy_account_wall(&store, "anthropic/billing", "billing");
-        let snapshot = store.build_snapshot(1791214158478.0).unwrap();
+        let now = now_ms();
+        store.store.with_conn(|conn|conn.execute("UPDATE model_route_state SET cooldown_until=?1,quota_exhausted_until=?1,updated_at=?2 WHERE route_key='anthropic/billing'",params![now+86_400_000,now-1_800_000])).unwrap();
+        let snapshot = store.build_snapshot(now as f64).unwrap();
         let scoped = &snapshot.by_route["anthropic/opus/medium"];
         assert_eq!(scoped.cooldown_until, None);
         assert_eq!(scoped.quota_exhausted_until, None);
@@ -5240,7 +5367,7 @@ mod tests {
             .contains("00000000-0000-4000-8000-0000000000a1"));
         assert_eq!(
             snapshot.by_route["anthropic/billing"].quota_exhausted_until,
-            Some(1791493229401.0)
+            Some((now + 1_800_000) as f64)
         );
         store.store.with_conn(|conn| {
             let stored:(i64,String) = conn.query_row("SELECT quota_exhausted_until,last_error FROM model_route_state WHERE route_key='anthropic/opus/medium'",[],|row| Ok((row.get(0)?,row.get(1)?)))?;
@@ -5254,17 +5381,19 @@ mod tests {
                 "anthropic/opus/high",
                 "anthropic/opus",
                 &RouteStateUpdate {
-                    quota_exhausted_until: Some(1791493229500.0),
+                    quota_exhausted_until: Some((now + 86_400_000) as f64),
                     wall_class: Some(RouteWallClass::Quota),
                     last_error: Some("provider pool exhausted".into()),
+                    observed_at_ms: Some(now),
+                    unscoped_wall: true,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            store.build_snapshot(1791214158478.0).unwrap().by_capacity["anthropic/opus"]
+            store.build_snapshot(now as f64).unwrap().by_capacity["anthropic/opus"]
                 .quota_exhausted_until,
-            Some(1791493229500.0)
+            Some((now + 3_600_000) as f64)
         );
         // A new unscoped wall must replace the old account narrative even if
         // its caller supplies no diagnostic message.
@@ -5273,15 +5402,17 @@ mod tests {
                 "anthropic/opus/medium",
                 "anthropic/opus",
                 &RouteStateUpdate {
-                    quota_exhausted_until: Some(1791493229600.0),
+                    quota_exhausted_until: Some((now + 86_400_000) as f64),
+                    observed_at_ms: Some(now + 10),
+                    unscoped_wall: true,
                     ..Default::default()
                 },
             )
             .unwrap();
         assert_eq!(
-            store.build_snapshot(1791214158478.0).unwrap().by_route["anthropic/opus/medium"]
+            store.build_snapshot(now as f64).unwrap().by_route["anthropic/opus/medium"]
                 .quota_exhausted_until,
-            Some(1791493229600.0)
+            Some((now + 3_600_010) as f64)
         );
     }
 
@@ -6869,15 +7000,20 @@ mod tests {
                         "routing_v1_report_delivery -> routing_v1_decision",
                     ]
                 );
-                // Later migrations add the fence's pool columns and (068)
-                // rekey the demand index by account; the demand query-plan
-                // test checks that index's current shape.
+                // Later migrations add pool and admission-proof columns and
+                // indexes. Their dedicated tests check those additive shapes;
+                // the history-key removal must preserve the original columns.
                 let demand_index = "account_admission index account_admission_demand ";
                 let shape: Vec<_> = rebuilt_table_shape(c)
                     .into_iter()
                     .filter(|line| {
                         !line.starts_with("account_fence column pool_key_json ")
                             && !line.starts_with("account_fence column recovery_set_json ")
+                            && !line.starts_with("account_admission column input_size_class ")
+                            && !line.starts_with("account_admission column model_decision_id ")
+                            && !line.starts_with(
+                                "account_admission index account_admission_model_decision ",
+                            )
                             && !line.starts_with(demand_index)
                     })
                     .collect();
