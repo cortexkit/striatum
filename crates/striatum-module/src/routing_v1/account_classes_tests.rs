@@ -742,6 +742,9 @@ async fn ten_default_admissions_never_spend_after_subscription_exhaustion_or_ent
     for (provider, converted_live) in [("synthetic", false), ("openai", true)] {
         for entitlement in [false, true] {
             let (harness, _) = setup(provider, converted_live);
+            // Opt automatic spending in while testing the separate account
+            // fallback fence after subscription exhaustion.
+            harness.edit_config(|config| config["providers"][provider]["pin_only"] = json!(false));
             let caller = harness.bind(reserved(OWNER), None).await;
             let codemode = caller
                 .call(

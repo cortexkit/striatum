@@ -24,7 +24,7 @@ impl HarnessRig {
         let config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &config,
-            json!({"model_routing": {"substrates": mapping, "models": {
+            json!({"providers":{"anthropic":{"pin_only":false},"opencode":{"pin_only":false}},"model_routing": {"substrates": mapping, "models": {
                 "opencode/deepseek-v4.1-flash-free": {"cost_per_mtok_out": 0},
                 "anthropic/claude-opus-5-5": {"cost_per_mtok_out": 4.5}
             }}})

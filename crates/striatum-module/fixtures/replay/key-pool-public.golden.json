@@ -175,7 +175,7 @@
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
                   "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
-                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
                 ],
@@ -1002,7 +1002,7 @@
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
                   "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
-                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
                 ],
@@ -1829,7 +1829,7 @@
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
                   "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
-                  "policy sources: operator sha256:200b7b506b1b98b463841ec25c32c5cddf06a9bae31ef73213af104418b58cf0 (0 exclude entries)",
+                  "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
                 ],

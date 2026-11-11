@@ -1,8 +1,6 @@
-//! A `routing/v1` select for codemode or flow runs only on routes priced per
-//! token: it takes the same route-local refusal the older select applies to
-//! those consumers ([`crate::select_policy::candidate_rejections`]), so a
-//! provider that publishes a subscription plan is never answered, even when
-//! it is the cheapest route and the request pins it.
+//! Explicit pay_per_token consumer settings restrict both select surfaces to
+//! metered routes. Subscription routes remain refused even when pinned; the
+//! ordinary code-mode and flow defaults do not impose this restriction.
 
 use std::sync::Arc;
 
@@ -113,6 +111,11 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "runner-one" }]);
+        // These tests exercise an explicit metered-only operator policy, not
+        // the ordinary code-mode/flow subscription defaults.
+        for consumer in ["codemode", "flow"] {
+            config["consumers"][consumer]["pay_per_token"] = json!(true);
+        }
     });
     harness
 }
@@ -490,7 +493,7 @@ async fn unknown_magic_context_consumer_is_refused() {
 }
 
 #[tokio::test]
-async fn codemode_and_flow_never_answer_a_subscription_plan_route() {
+async fn explicit_metered_consumers_never_answer_a_subscription_plan_route() {
     let harness = harness(json!({ "prices": [{ "provider_id": "plan-provider" }] }));
     harness
         .edit_config(|config| config["providers"]["plan-provider"]["subscription"] = json!(true));
@@ -540,7 +543,7 @@ async fn codemode_uses_a_known_metered_account_when_plan_membership_is_unknown()
 /// makes it cheaper than `CHEAP` once divided in. Codemode pays list price,
 /// so its select reads the facts without that subsidy and answers `CHEAP`.
 #[tokio::test]
-async fn codemode_ranks_routes_at_list_price_never_at_a_subscription_subsidy() {
+async fn explicit_metered_consumers_rank_at_list_price_without_subscription_subsidy() {
     const CHEAP: &str = "metered-a/model-a";
     const SUBSIDISED: &str = "metered-b/model-b";
     let harness = harness_of(
@@ -548,7 +551,7 @@ async fn codemode_ranks_routes_at_list_price_never_at_a_subscription_subsidy() {
         json!({ "prices": [{ "provider_id": "plan-provider" }] }),
     );
     harness.edit_config(|config| {
-        config["providers"]["metered-b"] = json!({ "subscription_multiplier": 40.0 });
+        config["providers"]["metered-b"] = json!({ "subscription_multiplier": 40.0, "pin_only": false });
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
 

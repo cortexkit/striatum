@@ -3,7 +3,7 @@ mod consumer_and_pin {
 
     #[tokio::test]
     async fn decision_stores_adequate_alternatives_in_rank_order_without_winner() {
-        let rig = PolicyRig::new(json!({}));
+        let rig = PolicyRig::new(json!({"providers":{"rank":{"pin_only":false}}}));
         for (model, cost) in [("a", 1.0), ("b", 10.0), ("c", 100.0), ("d", 1_000.0), ("e", 10_000.0), ("f", 100_000.0)] {
             let mut candidate = fact("rank", model);
             candidate.cost_per_m_tok_out = Some(cost);
@@ -35,6 +35,22 @@ mod consumer_and_pin {
             // OpenCode mapping keeps the same list authoritative for any
             // request that does name a workload.
             config["model_routing"]["substrates"] = json!({"all": {"default": "opencode"}});
+            let mut config = crate::config_convert::convert_value(config).unwrap();
+            // Historical selection-mechanics fixtures explicitly allow their
+            // metered providers and retain their metered-only consumer cases.
+            // Separate tests exercise built-in safety defaults with no settings file.
+            for provider in ["openai", "fallback"] {
+                let pin_only = &mut config["providers"][provider]["pin_only"];
+                if pin_only.is_null() {
+                    *pin_only = json!(false);
+                }
+            }
+            for consumer in ["codemode", "flow"] {
+                let metered = &mut config["consumers"][consumer]["pay_per_token"];
+                if metered.is_null() {
+                    *metered = json!(true);
+                }
+            }
             let rig = Rig::new("consumer-and-pin");
             let store = Arc::new(rig.open_store());
             let path = rig.dir.join("routing.jsonc");
@@ -166,7 +182,7 @@ mod consumer_and_pin {
     async fn vault_apikey_admits_catalog_unknown_routes_for_automatic_and_pinned_metered_selection() {
         use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
         let rig = PolicyRig::new(json!({}));
-        crate::test_config::write(&rig.path, json!({"model_routing": {"substrates": {"all": {"default": "broca"}}}}).to_string()).unwrap();
+        crate::test_config::write(&rig.path, json!({"providers":{"openai":{"pin_only":false}},"consumers":{"codemode":{"pay_per_token":true},"flow":{"pay_per_token":true}},"model_routing": {"substrates": {"all": {"default": "broca"}}}}).to_string()).unwrap();
         rig.set_auth_methods("openai", "pin", None);
         let listing = ScopedCredentialListing {
             view: "api-view".into(),
@@ -198,7 +214,7 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn codemode_is_metered_with_either_legacy_consumer_spelling_but_mason_uses_subscription() {
+    async fn codemode_with_explicit_metered_policy_accepts_either_legacy_consumer_spelling_but_mason_uses_subscription() {
         let rig = PolicyRig::new(json!({}));
         let mut subscription = fact("openai", "pin");
         subscription.scores.elo = 90.0;
@@ -218,7 +234,7 @@ mod consumer_and_pin {
     }
 
     #[tokio::test]
-    async fn flow_never_selects_unpriced_or_monthly_apikey_allowance_even_when_pinned() {
+    async fn explicit_metered_flow_rejects_unpriced_or_monthly_apikey_allowance_even_when_pinned() {
         let rig = PolicyRig::new(json!({}));
         for plane in [
             billing_plane("openai", "apikey", "upstream", None),

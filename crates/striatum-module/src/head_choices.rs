@@ -172,9 +172,8 @@ pub(crate) fn choices_for_harness(
     };
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
     let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
-    let subscription_specs = striatum_core::provider_model_spec::parse_spec_list(
-        &config.operator_policy().subscription,
-    );
+    let subscription_specs =
+        striatum_core::provider_model_spec::parse_spec_list(&config.operator_policy().subscription);
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
     for fact in &facts {
         grouped
@@ -199,9 +198,22 @@ pub(crate) fn choices_for_harness(
             continue;
         }
         let capacity = format!("{provider}/{model}");
+        let reachable_credentials: Vec<_> = credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| credential_reaches_runner(credentials, runner, fact, row))
+            .cloned()
+            .collect();
+        // A picker pin can use any covered account, regardless of temporary
+        // quota or refusal fences; use account selection's coverage rule.
+        let class = account_selection::resolve_class(
+            &reachable_credentials, fact, &providers, credentials, &subscription_specs,
+            aliases.contains_key(provider), false, false, |_| true,
+        );
         let allowed = |variant: Option<&str>, pinned: bool| {
             let route = striatum_core::make_route_key(provider, model, variant);
-            config.route_allowed("head", &route, pinned) && registry.runs(module, &route, &capacity)
+            config.route_allowed_with_default("head", &route, pinned, !class.subscription)
+                && registry.runs(module, &route, &capacity)
         };
         let published = variant_policy::published(&reasoning, &aliases, provider, model);
         let mut variants = match published {
@@ -243,25 +255,6 @@ pub(crate) fn choices_for_harness(
         // enough for the entry not to be pin-only on this runner.
         let pin_only =
             !allowed(None, false) && !variants.iter().any(|variant| allowed(Some(variant), false));
-        let reachable_credentials: Vec<_> = credentials
-            .listed_credentials()
-            .iter()
-            .filter(|row| credential_reaches_runner(credentials, runner, fact, row))
-            .cloned()
-            .collect();
-        // A picker pin can use any covered account, regardless of temporary
-        // quota or refusal fences; use account selection's coverage rule.
-        let class = account_selection::resolve_class(
-            &reachable_credentials,
-            fact,
-            &providers,
-            credentials,
-            &subscription_specs,
-            aliases.contains_key(provider),
-            false,
-            false,
-            |_| true,
-        );
         let billing = if class.subscription {
             Billing::Subscription
         } else {

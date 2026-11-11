@@ -271,6 +271,46 @@ impl LiveConfig {
     pub fn route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
         self.config.route_refusal(consumer, route, pinned).is_none()
     }
+
+    /// Metered billing needs an explicit pin unless the operator opts the
+    /// provider or route into automatic selection. Quota-backed API plans are
+    /// subscriptions; an unknown API price is not permission to spend.
+    pub(crate) fn route_allowed_on_plane(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        plane: Option<&striatum_core::billing::BillingPlane>,
+    ) -> bool {
+        let metered = plane.is_some_and(|plane| {
+            striatum_core::billing::is_api_metered_auth_method(&plane.auth_method)
+                && plane.kind != "quota_proxy"
+        });
+        self.route_allowed_with_default(consumer, route, pinned, metered)
+    }
+
+    pub(crate) fn route_allowed_with_default(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        metered: bool,
+    ) -> bool {
+        self.config
+            .route_refusal_detail_with_default(consumer, route, pinned, metered)
+            .is_none()
+    }
+
+    pub(crate) fn automatic_exclusions(&self, consumer: &str, facts: &[ModelFact]) -> Vec<String> {
+        facts
+            .iter()
+            .filter_map(|fact| {
+                let route = striatum_core::fact_to_route(fact).route_key;
+                (!self.route_allowed_on_plane(consumer, &route, false, fact.billing_plane.as_ref()))
+                    .then_some(route)
+            })
+            .collect()
+    }
 }
 
 impl RoutingConfigFile {
@@ -338,6 +378,16 @@ impl RoutingConfigFile {
         route: &str,
         pinned: bool,
     ) -> Option<(String, bool)> {
+        self.route_refusal_detail_with_default(consumer, route, pinned, false)
+    }
+
+    fn route_refusal_detail_with_default(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        default_pin_only: bool,
+    ) -> Option<(String, bool)> {
         let provider = route.split('/').next().unwrap_or(route);
         let provider_rules = self.providers.get(provider).map(|policy| &policy.rules);
         let provider_source = |field: &str| format!("providers.{provider}.{field}");
@@ -350,6 +400,7 @@ impl RoutingConfigFile {
         let mut pin_only = provider_rules
             .and_then(|rules| rules.pin_only)
             .map(|value| (provider_source("pin_only"), value));
+        let mut subscription = provider_rules.and_then(|rules| rules.subscription);
         let mut pin_only_for = provider_rules
             .and_then(|rules| rules.pin_only_for.as_ref())
             .map(|names| (provider_source("pin_only_for"), names));
@@ -371,9 +422,18 @@ impl RoutingConfigFile {
             if let Some(value) = model.rules.pin_only {
                 pin_only = Some((model_source("pin_only"), value));
             }
+            if let Some(value) = model.rules.subscription {
+                subscription = Some(value);
+            }
             if let Some(names) = &model.rules.pin_only_for {
                 pin_only_for = Some((model_source("pin_only_for"), names));
             }
+        }
+        // Flat-rate plans can use API-key authentication. An explicit
+        // subscription mark overrides the billing-derived default, but never
+        // an operator's separate pin-only rule.
+        if pin_only.is_none() && default_pin_only && subscription != Some(true) {
+            pin_only = Some(("built-in metered pin_only".into(), true));
         }
         if let Some((source, names)) = only_for {
             if !names.iter().any(|name| consumer_matches(name, consumer)) {

@@ -243,7 +243,7 @@
       "type": "object",
       "properties": {
         "below_bar": {
-          "description": "Automatic selection when no route clears the adequacy floor. Defaults to\nbest_effort; explicit model pins are admitted without quality ranking.",
+          "description": "Automatic selection when no route clears the adequacy floor. Defaults to\nrefuse for mason and its dotted descendants, best_effort for others;\nexplicit model pins are admitted without quality ranking.",
           "anyOf": [
             {
               "$ref": "#/$defs/BelowBarPolicy"
@@ -466,6 +466,7 @@
           }
         },
         "pin_only": {
+          "description": "Require a pin for this entity. Metered billing planes default to true;\nfalse opts into automatic selection, with model values overriding providers.",
           "type": [
             "boolean",
             "null"
@@ -512,6 +513,7 @@
           "maximum": 2
         },
         "subscription": {
+          "description": "Mark a flat-rate subscription, including API-key plans. True also exempts\nthis entity from built-in metered pin-only defaults, not explicit pin-only rules.",
           "type": [
             "boolean",
             "null"
@@ -1018,6 +1020,7 @@
           }
         },
         "pin_only": {
+          "description": "Require a pin for this entity. Metered billing planes default to true;\nfalse opts into automatic selection, with model values overriding providers.",
           "type": [
             "boolean",
             "null"
@@ -1054,6 +1057,7 @@
           "default": null
         },
         "subscription": {
+          "description": "Mark a flat-rate subscription, including API-key plans. True also exempts\nthis entity from built-in metered pin-only defaults, not explicit pin-only rules.",
           "type": [
             "boolean",
             "null"

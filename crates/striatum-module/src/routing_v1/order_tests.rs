@@ -318,6 +318,11 @@ async fn below_bar_policy_is_shared_by_v1_legacy_and_what_if_and_bypassed_by_pin
     let legacy = json!({"consumer": "mason", "targetAgent": "mason",
         "executor": "broca", "substrate": "broca", "requirements": {"iq": 80, "eq": 0},
         "excludeRouteKeys": ["strong-provider"]});
+    let refused = route.call("route.select", &v1).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["detail"]["reason"], "all_inadequate");
+    assert_eq!(route.call("route.select", &legacy).await.0, FrameType::Error);
+    harness.edit_config(|config| config["consumers"]["mason"]["below_bar"] = json!("best_effort"));
     let selected = route.call("route.select", &v1).await;
     assert_eq!(route_of(&selected), CHEAP);
     assert!(

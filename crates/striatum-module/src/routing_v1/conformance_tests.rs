@@ -180,6 +180,17 @@ impl Harness {
 
     /// Write `facts` to the catalog and make Broca's billing view serve them.
     pub(super) fn install_facts(&self, facts: &[ModelFact]) {
+        // These fixtures exercise selection mechanics with metered candidates.
+        // Opt their providers in explicitly; no-file safety tests remove this
+        // settings file before requesting the built-in policy.
+        self.edit_config(|config| {
+            for fact in facts {
+                let policy = &mut config["providers"][&fact.provider_id]["pin_only"];
+                if policy.is_null() {
+                    *policy = json!(false);
+                }
+            }
+        });
         for fact in facts {
             self.store.upsert_fact(fact, FactSource::Override).unwrap();
         }

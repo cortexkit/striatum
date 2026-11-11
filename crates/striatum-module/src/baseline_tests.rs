@@ -582,11 +582,43 @@ fn baseline_lists_each_slot_pin_and_an_answer_per_request() {
 
 /// Requests for which the new pass differs from the frozen baseline. Each
 /// listed request names the answer the new pass must give and one allowed cause.
-const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[(
-    "mason-excluded-model-pin",
-    r#"{"refusal_code":"pinned_route_refused","route_key":null,"runner":null,"variant":null}"#,
-    "a not_for-refused named model",
-)];
+const EQUIVALENCE_DIFFERENCES: &[(&str, &str, &str)] = &[
+    (
+        "mason-excluded-model-pin",
+        r#"{"refusal_code":"pinned_route_refused","route_key":null,"runner":null,"variant":null}"#,
+        "a not_for-refused named model",
+    ),
+    (
+        "flow-subscription-pin",
+        r#"{"refusal_code":null,"route_key":"anthropic/claude-opus-5-5","runner":"broca","variant":null}"#,
+        "flow no longer has an implicit metered-only payment restriction",
+    ),
+    (
+        "codemode-broca",
+        r#"{"refusal_code":null,"route_key":"opencode-go/deepseek-v4.1-flash","runner":"broca","variant":null}"#,
+        "code-mode may use subscriptions while unpinned metered routes are excluded by default",
+    ),
+    (
+        "flow-broca",
+        r#"{"refusal_code":null,"route_key":"opencode-go/deepseek-v4.1-flash","runner":"broca","variant":null}"#,
+        "flow may use subscriptions while unpinned metered routes are excluded by default",
+    ),
+    (
+        "mason-no-consumer",
+        r#"{"refusal_code":null,"route_key":"opencode-go/deepseek-v4.1-flash","runner":"broca","variant":null}"#,
+        "legacy automatic selection no longer spends on an unpinned metered route by default",
+    ),
+    (
+        "v1-codemode",
+        r#"{"refusal_code":null,"route_key":"opencode-go/deepseek-v4.1-flash","runner":"broca","variant":null}"#,
+        "code-mode may use subscriptions while unpinned metered routes are excluded by default",
+    ),
+    (
+        "v1-mc-dream-curate",
+        r#"{"refusal_code":null,"route_key":"opencode-go/deepseek-v4.1-flash","runner":"broca","variant":null}"#,
+        "background automatic selection no longer spends on an unpinned metered route by default",
+    ),
+];
 
 fn listed_difference(name: &str) -> Option<Value> {
     EQUIVALENCE_DIFFERENCES

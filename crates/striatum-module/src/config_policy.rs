@@ -435,11 +435,15 @@ pub struct EntityPolicy {
     pub service_tier: Option<crate::tier_settings::Tier>,
     pub only_for: Option<Vec<String>>,
     pub not_for: Option<Vec<String>>,
+    /// Require a pin for this entity. Metered billing planes default to true;
+    /// false opts into automatic selection, with model values overriding providers.
     pub pin_only: Option<bool>,
     /// Like `pin_only`, but only for these consumers and their dotted
     /// descendants: other admitted consumers still route here automatically.
     /// Lets a scarce model serve one consumer by choice and others by pin.
     pub pin_only_for: Option<Vec<String>>,
+    /// Mark a flat-rate subscription, including API-key plans. True also exempts
+    /// this entity from built-in metered pin-only defaults, not explicit pin-only rules.
     pub subscription: Option<bool>,
 }
 
@@ -541,7 +545,8 @@ pub struct ConsumerPolicy {
     pub service_tiers: Option<BTreeMap<String, crate::tier_settings::Tier>>,
     pub mode: Option<ConsumerMode>,
     /// Automatic selection when no route clears the adequacy floor. Defaults to
-    /// best_effort; explicit model pins are admitted without quality ranking.
+    /// refuse for mason and its dotted descendants, best_effort for others;
+    /// explicit model pins are admitted without quality ranking.
     pub below_bar: Option<BelowBarPolicy>,
     pub ladder: Option<Vec<String>>,
     pub variants: Option<BTreeMap<String, String>>,
@@ -588,6 +593,9 @@ pub fn resolve_consumer_policy(
     declared: &BTreeMap<String, ConsumerPolicy>,
 ) -> ConsumerPolicy {
     let mut result = serde_json::Map::new();
+    if consumer_matches("mason", consumer) {
+        result.insert("below_bar".into(), serde_json::json!("refuse"));
+    }
     let mut overlay = |entry: &ConsumerPolicy| {
         for (key, value) in serde_json::to_value(entry).unwrap().as_object().unwrap() {
             if !value.is_null() && value != &serde_json::json!({}) {

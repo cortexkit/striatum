@@ -721,7 +721,12 @@ async fn candidates(
         facts
             .iter()
             .filter(|f| {
-                !config.route_allowed(&request.consumer, &fact_to_route(f).route_key, false)
+                !config.route_allowed_on_plane(
+                    &request.consumer,
+                    &fact_to_route(f).route_key,
+                    false,
+                    f.billing_plane.as_ref(),
+                )
             })
             .map(|f| fact_to_route(f).route_key),
     );

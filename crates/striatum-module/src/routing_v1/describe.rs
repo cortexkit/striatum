@@ -6,7 +6,6 @@ use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
 
 use super::{operator_config, Deps};
-use crate::select_policy;
 
 /// The optional routing/v1 groups this provider serves, listed in
 /// `role.describe` as `capabilities` and passed to the select and account request
@@ -48,14 +47,12 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .names()
         .into_iter()
         .map(|id| ConsumerEntry {
-            // The same rule selection applies to the request class the id
-            // names: codemode and flow run only priced per token.
+            // The contract flag describes a restriction, not whether a route
+            // happens to have prices. Only explicit consumer policy sets it.
             priced_only: config
                 .consumer_policy(&id, &Default::default(), &registry.policies)
                 .pay_per_token
-                .unwrap_or_else(|| {
-                    select_policy::requires_metered(select_policy::Consumer::from_id(&id))
-                }),
+                .unwrap_or(false),
             id,
         })
         .collect();

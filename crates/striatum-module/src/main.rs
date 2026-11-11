@@ -7540,12 +7540,14 @@ mod tests {
     }
 
     fn catalog_broca_credentials(store: &SharedStore) -> SharedBrocaCredentials {
+        opt_in_fixture_providers(&test_operator_config(), &store.get_facts().unwrap());
         Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(
             &store.get_facts().unwrap(),
         )))
     }
 
     fn mapped_broca_credentials(provider: &str) -> SharedBrocaCredentials {
+        opt_in_fixture_providers(&test_operator_config(), &[fact(provider, "fixture")]);
         let credentials = empty_broca_credentials();
         credentials.lock().unwrap().apply_listing(
             &cortexkit_claustrum_client::ScopedCredentialListing {
@@ -7635,6 +7637,22 @@ mod tests {
         .await
     }
 
+    fn opt_in_fixture_providers(path: &Path, facts: &[ModelFact]) {
+        let document = std::fs::read_to_string(path).unwrap();
+        let mut config: serde_json::Value = serde_json::from_str(&document).unwrap();
+        for fact in facts {
+            let pin_only = &mut config["providers"][&fact.provider_id]["pin_only"];
+            if pin_only.is_null() {
+                *pin_only = json!(false);
+            }
+        }
+        let updated = serde_json::to_string(&config).unwrap();
+        if updated != document {
+            std::fs::write(path, updated).unwrap();
+            config_overrides::initialize_config(path).unwrap();
+        }
+    }
+
     pub(super) async fn run_route_wire_request_with_paths(
         store: &SharedStore,
         mut request: serde_json::Value,
@@ -7642,6 +7660,12 @@ mod tests {
         broca_credentials: &SharedBrocaCredentials,
     ) -> Frame {
         let fixture_config = test_operator_config();
+        // Default-path legacy fixtures use an explicit test operator policy,
+        // not fresh-install defaults. Opt their catalog providers into spending
+        // so availability/fence tests remain independent of the billing default.
+        if !operator_config_path.exists() || operator_config_path == fixture_config {
+            opt_in_fixture_providers(&fixture_config, &store.get_facts().unwrap());
+        }
         let operator_config_path = if operator_config_path.exists() {
             operator_config_path
         } else {
@@ -9393,6 +9417,9 @@ mod tests {
         for fact in facts {
             store.upsert_fact(fact, FactSource::Override).unwrap();
         }
+        if operator_config_path == test_operator_config() {
+            opt_in_fixture_providers(operator_config_path, &store.get_facts().unwrap());
+        }
         let request = json!({ "method": ROUTE_SELECT_OP, "params": params });
         let frame = Frame::build(
             FrameType::Request,
@@ -10463,6 +10490,7 @@ mod tests {
         quota_cache: QuotaCache,
         task_id: &str,
     ) -> (String, serde_json::Value) {
+        opt_in_fixture_providers(&test_operator_config(), &store.get_facts().unwrap());
         // iq 70, not lower: both fixture routes sit at the request frontier, so
         // below demand 60 both would carry the same over-qualification term,
         // which lifts them out of the effectively-free bucket where the quota
@@ -11178,7 +11206,7 @@ mod tests {
         let operator_config = rig.dir.join("striatum.jsonc");
         crate::test_config::write(
             &operator_config,
-            r#"{ "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
+            r#"{ "providers":{"anthropic":{"pin_only":false},"openai":{"pin_only":false}}, "model_routing": { "exclude": {"all": ["anthropic"]} } }"#,
         )
         .unwrap();
         std::fs::write(
@@ -11250,7 +11278,8 @@ mod tests {
             Some("excluded")
         );
 
-        // The decision records only the routing-owned policy revision.
+        // The decision records only the routing-owned policy revision: the
+        // excluded provider and the other provider's automatic-spending opt-in.
         let explanation = body["result"]["selected"]["explanation"]
             .as_array()
             .unwrap()
@@ -11261,7 +11290,7 @@ mod tests {
             .to_string();
         assert!(
             explanation.contains("operator sha256:")
-                && explanation.contains("1 exclude entries")
+                && explanation.contains("2 exclude entries")
                 && !explanation.contains("caller"),
             "unexpected policy-source line: {explanation}"
         );
@@ -11269,7 +11298,7 @@ mod tests {
         // Live edit: a new exclude list takes effect on the next selection, no restart.
         crate::test_config::write(
             &operator_config,
-            r#"{ "model_routing": { "exclude": {"all": ["openai"]} } }"#,
+            r#"{ "providers":{"anthropic":{"pin_only":false},"openai":{"pin_only":false}}, "model_routing": { "exclude": {"all": ["openai"]} } }"#,
         )
         .unwrap();
         set_config_mtime(&operator_config, 1_700_000_001);
@@ -15220,7 +15249,7 @@ mod tests {
         }
         let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[a, b])));
         let path = rig.dir.join("routing.jsonc");
-        crate::test_config::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#).unwrap();
         async fn select(
             store: &SharedStore,
             credentials: &SharedBrocaCredentials,
@@ -15263,13 +15292,13 @@ mod tests {
         assert_eq!(first["result"]["selected"]["routeKey"], "a/reader");
         crate::test_config::write(
             &path,
-            r#"{"model_routing":{"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#,
+            r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}},"model_routing":{"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#,
         )
         .unwrap();
         config_overrides::settle_live_config(&path);
         let cost_edit = select(&store, &credentials, &path).await;
         assert_eq!(cost_edit["result"]["selected"]["routeKey"], "b/reader");
-        crate::test_config::write(&path, r#"{"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
+        crate::test_config::write(&path, r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}},"model_routing":{"exclude":{"all":["b"]},"models":{"b/reader":{"cost_per_mtok_out":0.1}}}}"#).unwrap();
         config_overrides::settle_live_config(&path);
         let fenced = select(&store, &credentials, &path).await;
         assert_eq!(fenced["result"]["selected"]["routeKey"], "a/reader");
@@ -15294,7 +15323,7 @@ mod tests {
             let selected = select(&store, &credentials, &path).await;
             assert_eq!(selected["result"]["selected"], fenced["result"]["selected"]);
         }
-        crate::test_config::write(&path, "{}").unwrap();
+        crate::test_config::write(&path, r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#).unwrap();
         config_overrides::settle_live_config(&path);
         let removed = select(&store, &credentials, &path).await;
         assert_eq!(removed["result"]["selected"]["routeKey"], "a/reader");
@@ -15369,13 +15398,13 @@ mod tests {
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
         let config_path = rig.dir.join("striatum.jsonc");
-        crate::test_config::write(&config_path, r#"{"model_routing":{}}"#).unwrap();
+        crate::test_config::write(&config_path, r#"{"providers":{"p":{"pin_only":false}},"model_routing":{}}"#).unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
         assert_eq!(select(&store, &quota_cache, &config_path).await, "p/strong");
         crate::test_config::write(
             &config_path,
-            r#"{"model_routing":{"elo_overrides":{"p/weak":1900}}}"#,
+            r#"{"providers":{"p":{"pin_only":false}},"model_routing":{"elo_overrides":{"p/weak":1900}}}"#,
         )
         .unwrap();
         assert_eq!(select(&store, &quota_cache, &config_path).await, "p/weak");

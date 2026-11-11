@@ -1743,6 +1743,7 @@ impl<'a> Selection<'a> {
 
     fn pass(&self) -> select_policy::SelectionPass<'_> {
         select_policy::SelectionPass {
+            classifier: self.classifier_order.is_some(),
             consumer: self.consumer,
             target_agent: self.consumer,
             requirements: self.demand,

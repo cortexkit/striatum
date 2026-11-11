@@ -21,6 +21,10 @@ pub(super) fn consumer_models(
         credentials.catalog_targets(&facts)
     };
     striatum_core::score_alias::append_alias_rows(&mut facts, &aliases);
+    deps.broca_credentials
+        .lock()
+        .map_err(store_refusal)?
+        .price_facts(&mut facts, config.pricing());
     config.apply(&mut facts);
     let resolved = crate::resolve_routing_policy_with_catalog_targets(
         facts
@@ -51,7 +55,12 @@ pub(super) fn consumer_models(
         let mut entry = ConsumerModel::new(
             &provider,
             &model,
-            !config.route_allowed(&request.consumer, &format!("{provider}/{model}"), false),
+            !config.route_allowed_on_plane(
+                &request.consumer,
+                &format!("{provider}/{model}"),
+                false,
+                fact.billing_plane.as_ref(),
+            ),
         );
         entry.elo = fact.scores.elo.is_finite().then_some(fact.scores.elo);
         entry.eq = fact.scores.eq.is_finite().then_some(fact.scores.eq);

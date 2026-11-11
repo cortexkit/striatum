@@ -583,33 +583,38 @@ impl CredentialData {
         &self,
         quota: &crate::account_quota::AccountQuotaState,
     ) -> CredentialAccounts {
-        self.listed.iter().map(|row| {
-            if let Some(account) = &row.account_id {
-                return (row.id.clone(), Some(account.clone()));
-            }
-            let providers = credential_providers(row, &self.catalog_providers);
-            let accounts: BTreeSet<_> = quota
-                .readings
-                .readings
-                .values()
-                .filter(|reading| {
-                    reading.tombstoned_at_ms.is_none()
-                        && reading
-                            .entry
-                            .get("credentialRef")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(row.id.as_str())
-                        && reading.routing_provider().is_some_and(|provider| {
-                            providers.iter().any(|listed| listed == provider)
-                        })
-                })
-                .map(|reading| reading.account_id.clone())
-                .collect();
-            let account = if accounts.len() == 1 {
-                accounts.into_iter().next()
-            } else { None };
-            (row.id.clone(), account)
-        }).collect()
+        self.listed
+            .iter()
+            .map(|row| {
+                if let Some(account) = &row.account_id {
+                    return (row.id.clone(), Some(account.clone()));
+                }
+                let providers = credential_providers(row, &self.catalog_providers);
+                let accounts: BTreeSet<_> = quota
+                    .readings
+                    .readings
+                    .values()
+                    .filter(|reading| {
+                        reading.tombstoned_at_ms.is_none()
+                            && reading
+                                .entry
+                                .get("credentialRef")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(row.id.as_str())
+                            && reading.routing_provider().is_some_and(|provider| {
+                                providers.iter().any(|listed| listed == provider)
+                            })
+                    })
+                    .map(|reading| reading.account_id.clone())
+                    .collect();
+                let account = if accounts.len() == 1 {
+                    accounts.into_iter().next()
+                } else {
+                    None
+                };
+                (row.id.clone(), account)
+            })
+            .collect()
     }
 
     /// Only metered consumers learn vault payment methods in admission-only
@@ -617,12 +622,10 @@ impl CredentialData {
     pub(crate) fn admission_facts(
         &self,
         facts: &[ModelFact],
-        consumer: Option<crate::select_policy::Consumer>,
+        priced_per_token: bool,
         now_ms: u64,
     ) -> Vec<ModelFact> {
-        if !crate::select_policy::requires_metered(consumer)
-            || self.fallback_reason(now_ms).is_some()
-        {
+        if !priced_per_token || self.fallback_reason(now_ms).is_some() {
             return facts.to_vec();
         }
         let mut methods_by_provider: std::collections::HashMap<_, BTreeSet<_>> =
@@ -1240,17 +1243,19 @@ mod tests {
         facts: &[ModelFact],
         consumer: crate::select_policy::Consumer,
     ) -> std::collections::HashMap<String, String> {
-        crate::select_policy::candidate_rejections(
-            &cache.admission_facts(facts, Some(consumer), 1),
+        crate::select_policy::candidate_rejections_priced(
+            &cache.admission_facts(facts, true, 1),
             Some(consumer),
+            true,
             None,
             cache.subscription_plan_providers().as_ref(),
+            None,
         )
     }
 
     #[test]
     fn active_apikey_mapping_admits_metered_routes_without_changing_catalog_policy() {
-        let consumer = Some(crate::select_policy::Consumer::Codemode);
+        let consumer = true;
         let mut row = credential("oauth:misleading", &["mapped"]);
         row.credential_type = "apikey".into();
         row.auth_method = Some("apikey".into());
@@ -1322,7 +1327,7 @@ mod tests {
 
     #[test]
     fn inactive_unmapped_and_unknown_credentials_do_not_supply_apikey_auth() {
-        let consumer = Some(crate::select_policy::Consumer::Codemode);
+        let consumer = true;
         let mut inactive = credential("apikey:inactive", &["mapped"]);
         inactive.credential_type = "apikey".into();
         inactive.state = "dead".into();
@@ -1388,8 +1393,8 @@ mod tests {
             Some(Consumer::Lab),
             None,
         ] {
-            let with_vault = cache.admission_facts(&facts, consumer, 1);
-            let without_vault = absent.admission_facts(&facts, consumer, 1);
+            let with_vault = cache.admission_facts(&facts, false, 1);
+            let without_vault = absent.admission_facts(&facts, false, 1);
             assert_eq!(with_vault, facts, "{consumer:?}");
             assert_eq!(with_vault, without_vault, "{consumer:?}");
             for allowed in [None, Some(allowed_providers.as_slice())] {

@@ -343,7 +343,8 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
         converted["models"]["p/blocked"]["not_for"],
         json!(["mason"])
     );
-    assert_eq!(converted["consumers"]["codemode"]["pay_per_token"], true);
+    assert!(converted["consumers"]["codemode"]["pay_per_token"].is_null());
+    assert!(converted["consumers"]["flow"]["pay_per_token"].is_null());
     assert!(converted.get("score_alias").is_none());
     assert!(converted.get("pins").is_none());
     let in_memory = parse_config(&converted.to_string()).unwrap();
@@ -586,4 +587,110 @@ fn config_convert_refuses_a_pin_the_converted_exclusions_would_refuse() {
             && error.contains(r#"not_for lists "athena""#),
         "{error}"
     );
+}
+
+#[test]
+fn metered_defaults_follow_billing_planes_and_explicit_entity_overrides() {
+    use striatum_core::billing::{BillingPlane, BillingRate};
+    let route = "new-provider/model";
+    let mut plane = BillingPlane {
+        provider_id: "new-provider".into(),
+        auth_method: "apikey".into(),
+        kind: "upstream".into(),
+        selection_reason: "test".into(),
+        rates: BTreeMap::from([("rate.output".into(), BillingRate::Priced { rate: 1.0 })]),
+    };
+    for method in ["apikey", "gateway"] {
+        plane.auth_method = method.into();
+        for document in [json!({}), json!({"consumers":{"sidekick":{"iq":50}}})] {
+            let config = config(document);
+            for consumer in ["mason", "head", "codemode", "flow", "new.consumer"] {
+                assert!(!config.route_allowed_on_plane(consumer, route, false, Some(&plane)));
+                assert!(config.route_allowed_on_plane(consumer, route, true, Some(&plane)));
+            }
+        }
+    }
+    // Missing rate evidence cannot silently opt an API key into spending.
+    plane.rates.clear();
+    assert!(!config(json!({})).route_allowed_on_plane("head", route, false, Some(&plane)));
+    for document in [
+        json!({"providers":{"new-provider":{"pin_only":false}}}),
+        json!({"providers":{"new-provider":{"pin_only":true}},"models":{"new-provider/model":{"pin_only":false}}}),
+    ] {
+        assert!(config(document).route_allowed_on_plane("head", route, false, Some(&plane)));
+    }
+    let restricted = config(
+        json!({"providers":{"new-provider":{"pin_only":false}}, "models":{"new-provider/model":{"pin_only":true,"not_for":["mason"]}}}),
+    );
+    assert!(!restricted.route_allowed_on_plane("head", route, false, Some(&plane)));
+    assert!(restricted.route_allowed_on_plane("head", route, true, Some(&plane)));
+    assert!(!restricted.route_allowed_on_plane("mason", route, true, Some(&plane)));
+    for (method, kind) in [
+        ("oauth", "quota_proxy"),
+        ("chatgpt", "quota_proxy"),
+        ("apikey", "quota_proxy"),
+    ] {
+        plane.auth_method = method.into();
+        plane.kind = kind.into();
+        assert!(config(json!({})).route_allowed_on_plane("codemode", route, false, Some(&plane)));
+    }
+}
+
+#[test]
+fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
+    use crate::config_policy::BelowBarPolicy::{BestEffort, Refuse};
+    let defaults = config(json!({}));
+    for consumer in ["mason", "mason.review.deep"] {
+        assert_eq!(
+            defaults
+                .consumer_policy(consumer, &Default::default(), &BTreeMap::new())
+                .below_bar,
+            Some(Refuse)
+        );
+    }
+    for consumer in ["sidekick", "codemode", "flow", "masonry", "head"] {
+        assert_eq!(
+            defaults
+                .consumer_policy(consumer, &Default::default(), &BTreeMap::new())
+                .below_bar
+                .unwrap_or_default(),
+            BestEffort
+        );
+    }
+    let overrides = config(
+        json!({"consumers":{"mason":{"below_bar":"best_effort"},"mason.strict":{"below_bar":"refuse"}}}),
+    );
+    assert_eq!(
+        overrides
+            .consumer_policy("mason.review", &Default::default(), &BTreeMap::new())
+            .below_bar,
+        Some(BestEffort)
+    );
+    assert_eq!(
+        overrides
+            .consumer_policy("mason.strict.child", &Default::default(), &BTreeMap::new())
+            .below_bar,
+        Some(Refuse)
+    );
+}
+
+#[test]
+fn explicit_subscription_marks_keep_kimi_review_and_grok_automatic() {
+    use striatum_core::billing::BillingPlane;
+    let mut plane = BillingPlane {
+        provider_id: String::new(), auth_method: "apikey".into(), kind: "upstream".into(),
+        selection_reason: "flat-rate plan using an API key".into(), rates: BTreeMap::new(),
+    };
+    let plans = config(json!({
+        "providers": {"kimi-for-coding":{"subscription":true}, "kimi-code-plan-global":{"subscription":true}, "xai":{"subscription":true}, "other":{"subscription":false}},
+        "models": {"xai/metered":{"subscription":false}, "other/plan":{"subscription":true}, "xai/manual":{"pin_only":true}}
+    }));
+    for (consumer, route) in [("athena.review", "kimi-code-plan-global/k3.1-pro"), ("athena.review", "kimi-for-coding/kimi-k3"), ("head", "xai/grok-4.7"), ("flow", "other/plan")] {
+        plane.provider_id = route.split('/').next().unwrap().into();
+        assert!(plans.route_allowed_on_plane(consumer, route, false, Some(&plane)), "{consumer}: {route}");
+    }
+    assert!(!plans.route_allowed_on_plane("head", "xai/metered", false, Some(&plane)));
+    assert!(!plans.route_allowed_on_plane("head", "xai/manual", false, Some(&plane)));
+    let parent_false = config(json!({"providers":{"xai":{"subscription":false}}}));
+    assert!(!parent_false.route_allowed_on_plane("head", "xai/grok-4.7", false, Some(&plane)));
 }

@@ -25,6 +25,7 @@ pub(crate) struct SelectionPass<'a> {
     pub consumer_exclude: &'a [String],
     pub subscription_keys: &'a std::collections::HashSet<String>,
     pub priced_per_token: bool,
+    pub classifier: bool,
     pub rejections: &'a HashMap<String, String>,
     pub config: &'a RoutingConfig,
     pub slots: Option<&'a ConcurrencySlots>,
@@ -37,7 +38,7 @@ pub(crate) struct SelectionPass<'a> {
 impl<'a> SelectionPass<'a> {
     pub fn routing_config(&self) -> RoutingConfig {
         let policy = self.operator_config.consumer_policy(
-            self.consumer,
+            if self.consumer.is_empty() { self.target_agent } else { self.consumer },
             &crate::config_policy::ConsumerPolicy::default(),
             &std::collections::BTreeMap::new(),
         );
@@ -55,6 +56,13 @@ impl<'a> SelectionPass<'a> {
     ) -> SelectModelRouteInput<'a> {
         let subscription_keys = self.subscription_keys.clone();
         let priced_per_token = self.priced_per_token;
+        let mut operator_exclude_keys = self.operator_exclude.to_vec();
+        if !self.classifier {
+            operator_exclude_keys.extend(
+                self.operator_config
+                    .automatic_exclusions(self.consumer, self.facts),
+            );
+        }
         SelectModelRouteInput {
             target_agent: self.target_agent.to_owned(),
             target_is_head: self.operator_config.is_head_agent(self.target_agent),
@@ -63,7 +71,7 @@ impl<'a> SelectionPass<'a> {
             facts: self.facts.to_vec(),
             runtime_snapshot: Some(snapshot),
             exclude_route_keys: self.exclude.to_vec(),
-            operator_exclude_keys: self.operator_exclude.to_vec(),
+            operator_exclude_keys,
             required_capabilities: self.required_capabilities,
             is_subscription_route: Some(Box::new(move |route| {
                 subscription_covered(priced_per_token, &subscription_keys, route)
@@ -389,12 +397,10 @@ pub(crate) fn prepare_candidates(
             }
             let mut admission_facts = guard.as_ref().map_or_else(
                 || facts.to_vec(),
-                |guard| guard.admission_facts(facts, consumer, snapshot.now as u64),
+                |guard| guard.admission_facts(facts, priced_per_token, snapshot.now as u64),
             );
-            // A consumer priced per token by its flag, rather than by the
-            // historical request class, still needs the vault's payment
-            // methods on the admission copy. Merging again is harmless when
-            // the class already injected them.
+            // Explicit payment-class policy needs the vault's payment methods
+            // on the admission copy, without changing catalog facts.
             if priced_per_token {
                 admission_facts = with_vault_methods(&admission_facts, rows);
             }
@@ -487,13 +493,9 @@ pub(crate) fn explain_dotted_exclusions(
     result
 }
 
-pub(crate) fn requires_metered(consumer: Option<Consumer>) -> bool {
-    matches!(consumer, Some(Consumer::Codemode | Consumer::Flow))
-}
-
 /// Whether this selection runs priced per token. An explicit
 /// `pay_per_token` on the consumer is the authority; the consumer's name does
-/// not imply a payment class. Conversion writes flags for the old classes.
+/// not imply a payment class.
 pub(crate) fn priced_per_token(
     policy: &crate::config_policy::ConsumerPolicy,
     _consumer: Option<Consumer>,
@@ -657,14 +659,14 @@ pub(crate) fn candidate_rejections(
     candidate_rejections_priced(
         facts,
         consumer,
-        requires_metered(consumer),
+        false,
         allowed_providers,
         subscription_plan_providers,
         None,
     )
 }
 
-fn candidate_rejections_priced(
+pub(crate) fn candidate_rejections_priced(
     facts: &[ModelFact],
     consumer: Option<Consumer>,
     priced_per_token: bool,
@@ -680,14 +682,14 @@ fn candidate_rejections_priced(
             {
                 Some(format!("allowed_providers filter denies provider {}", fact.provider_id))
             } else if priced_per_token
-                && !(fact.auth_methods.as_ref().is_some_and(|methods| methods.iter().any(|method| method == "apikey"))
+                && !(fact.auth_methods.as_ref().is_some_and(|methods| methods.iter().any(|method| striatum_core::billing::is_api_metered_auth_method(method)))
                     && fact.billing_plane.as_ref().is_some_and(|plane| plane.is_api_metered())
                     && metered_accounts.map_or_else(
                         || subscription_plan_providers.is_some_and(|providers| !providers.contains(&fact.provider_id)),
                         |routes| routes.contains(&fact_to_route(fact).route_key)))
             {
                 Some(format!(
-                    "consumer {} requires a priced-per-token account, known apikey auth methods and a metered billing plane with a known output price",
+                    "consumer {} requires a priced-per-token account, known metered auth methods and a metered billing plane with a known output price",
                     crate::variant_policy::consumer_group(consumer).unwrap_or("pay_per_token")
                 ))
             } else {

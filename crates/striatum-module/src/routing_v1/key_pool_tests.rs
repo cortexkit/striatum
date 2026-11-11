@@ -220,6 +220,7 @@ fn harness_with_pool_keys(
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "zeta-runner" }]);
+        config["providers"][POOL]["pin_only"] = json!(false);
     });
     harness
 }

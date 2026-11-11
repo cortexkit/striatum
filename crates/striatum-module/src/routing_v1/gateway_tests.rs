@@ -62,7 +62,7 @@ fn gateway_is_not_an_implicit_fallback_for_an_exhausted_subscription() {
 }
 
 #[test]
-fn private_context_account_class_rejects_gateway_credentials() {
+fn explicit_metered_account_class_accepts_gateways_but_not_subscriptions() {
     let facts = crate::tests::fact("anthropic", "claude");
     let catalog = ["anthropic".into()].into();
     let rows: Vec<_> = ["oauth", "gateway", "apikey"]
@@ -94,8 +94,14 @@ fn private_context_account_class_rejects_gateway_credentials() {
         |_| true,
     );
     assert!(!private.subscription);
-    assert_eq!(private.rows.len(), 1);
-    assert_eq!(private.rows[0].auth_method.as_deref(), Some("apikey"));
+    assert_eq!(
+        private
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        ["gateway", "apikey"]
+    );
     let gateway_only = crate::account_selection::resolve_class(
         &rows[1..2],
         &facts,
@@ -107,11 +113,11 @@ fn private_context_account_class_rejects_gateway_credentials() {
         true,
         |_| true,
     );
-    assert!(gateway_only.rows.is_empty());
+    assert_eq!(gateway_only.rows.len(), 1);
 }
 
 #[test]
-fn private_context_policy_rejects_gateway_despite_metered_billing() {
+fn ordinary_consumers_do_not_reject_gateway_billing() {
     use crate::select_policy::{candidate_rejections, Consumer};
 
     let no_subscription_plans = Default::default();
@@ -133,11 +139,7 @@ fn private_context_policy_rejects_gateway_despite_metered_billing() {
                 None,
                 Some(&no_subscription_plans),
             );
-            if method == "gateway" {
-                assert!(rejected["anthropic/claude"].contains("known apikey auth methods"));
-            } else {
-                assert!(rejected.is_empty());
-            }
+            assert!(rejected.is_empty());
         }
     }
 }
@@ -320,44 +322,29 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
 }
 
 #[tokio::test]
-async fn private_context_consumers_never_select_a_declared_gateway() {
+async fn codemode_and_flow_accept_pinned_or_operator_opted_in_gateways() {
     let harness = fixture();
-    // Exercise the privacy filter even when operator policy permits automatic
-    // gateway selection and the runner declares anthropic.messages/gateway.
-    harness.edit_config(|config| config["providers"][GATEWAY]["pin_only"] = json!(false));
     let caller = harness.bind(reserved("example-consumer"), None).await;
     for consumer in ["codemode", "flow"] {
-        for pinned in [false, true] {
-            let mut request = json!({
-                "consumer":consumer, "requirements":{"iq":0}, "detail":true,
-                "runners":[RUNNER], "harness":"claude-code"
-            });
-            if pinned {
-                request["pin"] = json!(GATEWAY_ROUTE);
-            }
-            let refused = caller.call("route.select", &request).await;
-            assert_eq!(refused.0, FrameType::Error, "{consumer}: {refused:?}");
-            assert_eq!(
-                refused.1["code"],
-                if pinned {
-                    "pin_unavailable"
-                } else {
-                    "no_route"
-                },
-                "{refused:?}"
-            );
-            if pinned {
-                assert_eq!(
-                    refused.1["detail"]["reason"], "not_available",
-                    "{refused:?}"
-                );
-            } else {
-                assert!(
-                    refused.1.to_string().contains("no_eligible_account"),
-                    "{refused:?}"
-                );
-            }
-        }
+        let request = json!({
+            "consumer":consumer, "requirements":{"iq":0}, "detail":true,
+            "runners":[RUNNER], "harness":"claude-code"
+        });
+        let refused = caller.call("route.select", &request).await;
+        assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+        let mut pinned = request.clone();
+        pinned["pin"] = json!(GATEWAY_ROUTE);
+        let selected = caller.call("route.select", &pinned).await;
+        assert_eq!(selected.0, FrameType::Response, "{consumer}: {selected:?}");
+        assert_eq!(selected.1["result"]["route"]["provider"], GATEWAY);
+    }
+    harness.edit_config(|config| config["providers"][GATEWAY]["pin_only"] = json!(false));
+    for consumer in ["codemode", "flow"] {
+        let selected = caller.call("route.select", &json!({
+            "consumer":consumer, "requirements":{"iq":0}, "runners":[RUNNER], "harness":"claude-code"
+        })).await;
+        assert_eq!(selected.0, FrameType::Response, "{consumer}: {selected:?}");
+        assert_eq!(selected.1["result"]["route"]["provider"], GATEWAY);
     }
 }
 

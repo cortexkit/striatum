@@ -268,9 +268,11 @@ pub(crate) fn resolve_class<'a>(
             .into_iter()
             .filter(|row| {
                 covered(row) == subscription
-                    // Private-context consumers require the provider's own API,
-                    // not merely metered billing through an intermediary.
-                    && (!priced_per_token || row.auth_method.as_deref() == Some("apikey"))
+                    && (!priced_per_token
+                        || row
+                            .auth_method
+                            .as_deref()
+                            .is_some_and(striatum_core::billing::is_api_metered_auth_method))
             })
             .collect(),
         subscription,

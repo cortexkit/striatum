@@ -2052,6 +2052,7 @@ pub(super) async fn handle_select_request(
         consumer_exclude: &consumer_exclude,
         subscription_keys: &subscription_keys,
         priced_per_token,
+        classifier: false,
         rejections: &mapped_availability.rejected,
         config: &routing_config,
         slots: concurrency_slots.as_ref(),
