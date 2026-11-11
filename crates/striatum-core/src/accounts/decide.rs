@@ -1038,7 +1038,8 @@ impl<'a> Allocator<'a> {
             eval.eligible() || (floor_fallback && eval.eligible_below_broca_floor())
         };
 
-        // Scoring (steps 5-7) for every admissible account.
+        // Score every admissible account (cold placement steps 5-7 in the
+        // prefrontal repository's docs/designs/account-selection.md).
         let direct_opus = self.explanation.direct_opus;
         for eval in evals.iter_mut().filter(|eval| admissible(eval)) {
             let quota = eval.quota.as_ref().expect("admissible has quota");
