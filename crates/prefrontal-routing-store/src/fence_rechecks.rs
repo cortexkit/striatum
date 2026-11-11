@@ -2112,6 +2112,96 @@ mod tests {
     }
 
     #[test]
+    fn an_older_completed_decision_cannot_reset_a_newer_failure_backoff() {
+        use prefrontal_routing_core::{
+            DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome,
+            RouteStateStore,
+        };
+        let scratch = cortexkit_test_support::ScratchDir::new("failure-reset-evidence-age");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "failure-reset-evidence-age",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let decision = |at| {
+            let id = store
+                .record_decision(&DecisionInput {
+                    selected_route_key: Some("p/m".into()),
+                    selected_provider_id: Some("p".into()),
+                    selected_model_id: Some("m".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .store
+                .with_conn(|conn| {
+                    conn.execute(
+                        "UPDATE model_route_decisions SET created_at=?2 WHERE id=?1",
+                        params![id, at],
+                    )
+                })
+                .unwrap();
+            id
+        };
+        let old_success = decision(10);
+        let failure = decision(20);
+        store
+            .set_decision_outcome(
+                &failure,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: RouteOutcome::Error,
+                    last_error: Some("server_error".into()),
+                    observed_at_ms: 30,
+                    failure_backoff: FailureBackoffConfig {
+                        consecutive_terminal_failure_threshold: 1,
+                    },
+                },
+            )
+            .unwrap();
+        let before: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        assert_eq!(before, (1, Some(600_030.0)));
+        store
+            .set_decision_outcome(
+                &old_success,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: RouteOutcome::Completed,
+                    last_error: None,
+                    observed_at_ms: 40,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+        let after: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        assert_eq!(after,before,"an in-flight success admitted before the refusal cannot erase its newer failure evidence");
+        assert!(store
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .any(|fence| fence.kind == "failure" && fence.evidence_at == 30));
+        let new_success = decision(31);
+        store
+            .set_decision_outcome(
+                &new_success,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: RouteOutcome::Completed,
+                    last_error: None,
+                    observed_at_ms: 50,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+        let healed: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        assert_eq!(
+            healed,
+            (0, None),
+            "a success admitted after the refusal still resets the streak and fence"
+        );
+    }
+
+    #[test]
     fn migration_82_converts_quota_now_and_caps_non_quota_once() {
         let scratch = cortexkit_test_support::ScratchDir::new("fence-migration");
         let descriptor = crate::dev_descriptor(

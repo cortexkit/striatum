@@ -4351,14 +4351,21 @@ impl RouteStateStore for SqliteRouteStateStore {
                 match transition {
                     FailureBackoffTransition::Unchanged => {}
                     FailureBackoffTransition::Reset => {
+                        let admitted_at:i64=tx.query_row("SELECT COALESCE(
+                            (SELECT MAX(committed_at) FROM account_admission a WHERE a.model_decision_id=d.id
+                             AND a.provider=?2 AND a.model=?3 AND a.input_size_class IS NOT NULL),
+                            (SELECT created_at_ms FROM routing_v1_decision v WHERE v.decision_id=d.id),d.created_at)
+                            FROM model_route_decisions d WHERE d.id=?1",params![decision_id,provider_id,model_id],|row|row.get(0))?;
+                        // A late completion from an already-running request
+                        // cannot clear failure evidence recorded after it launched.
                         tx.execute(
                             "UPDATE model_route_state
                              SET consecutive_terminal_failures=0,
                                  failure_backoff_until=NULL,
                                  failure_backoff_reason=NULL,
                                  updated_at=?1
-                             WHERE route_key=?2",
-                            params![update.observed_at_ms, route_key],
+                             WHERE route_key=?2 AND COALESCE(failure_observed_at,last_error_at,updated_at)<?3",
+                            params![update.observed_at_ms, route_key,admitted_at],
                         )?;
                     }
                     FailureBackoffTransition::Failure {
@@ -4406,8 +4413,8 @@ impl RouteStateStore for SqliteRouteStateStore {
                                 failure_backoff_reason,
                             ],
                         )?;
+                        tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
                         if cooldown_until.is_some() {
-                            tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
                             fence_rechecks::register(&tx,"failure",&serde_json::json!([route_key]).to_string())?;
                         }
                     }
