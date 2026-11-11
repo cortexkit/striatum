@@ -372,7 +372,7 @@ pub fn evaluate_quota(
             w.window_minutes,
             now,
         );
-        // The Broca floor was introduced as a wall (prefrontal
+        // The Broca floor was introduced as a wall (the prefrontal repository's
         // docs/designs/account-selection.md, "New-session rule" step 4): a
         // Broca run is frozen to its account and core ends it at the first
         // `account_limit_exhausted`, so it cannot move between requests the
