@@ -361,3 +361,46 @@ async fn codemode_and_flow_default_to_subscriptions_and_metered_pins() {
         .iter()
         .any(|entry| entry["id"] == "codemode" && entry["priced_only"] == true));
 }
+
+#[tokio::test]
+async fn absent_settings_keeps_remote_media_engines_automatic() {
+    use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
+    let harness = Harness::new("zero-config-media");
+    let path = harness.dir.join("never-loaded-striatum.jsonc");
+    *harness.config_path.lock().unwrap() = path.clone();
+    assert!(!path.exists());
+    // Media engines have no subscription alternative or pin operation. The
+    // LLM-only spend fence must not disable an installed phone transcription path.
+    crate::routing_v1::consumers::replace_catalog(&json!([
+        {"module_id":"colliculus","nonce_verified":true,"role_declarations":{
+            "routing/v1":{"consumers":[{"name":"phone.media"}]},
+            "media-provider/v1":{"engines":[{"kind":"transcribe","provider":"openai",
+                "model":"gpt-transcribe","local":false,"formats":["audio/wav"],
+                "languages":["en"],"latency_class":"interactive"}]}
+        }}
+    ]));
+    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    credentials.apply_listing(&ScopedCredentialListing {
+        view: "zero-config-media".into(),
+        credentials: vec![ListedCredential {
+            id: "phone-transcription-key".into(), categories: vec!["media-provider".into()],
+            credential_type: "apikey".into(), auth_method: Some("apikey".into()),
+            state: "active".into(), provider_ids: vec!["openai".into()], ..Default::default()
+        }],
+        grant_tuples: vec![ListedGrant {
+            selector_kind: "category".into(), selector: "media-provider".into(), operation: "list".into()
+        }],
+        ..Default::default()
+    }, crate::now_ms());
+    harness.set_credentials(credentials);
+    let caller = harness.bind(reserved("colliculus"), None).await;
+    let selected = caller.call("route.select_engine", &json!({
+        "consumer":"phone.media", "kind":"transcribe", "requirements":{}, "privacy":"remote_allowed"
+    })).await;
+    assert_eq!(selected.0, FrameType::Response, "{selected:?}");
+    assert_eq!(selected.1["result"]["engine"]["provider"], "openai");
+    assert_eq!(selected.1["result"]["engine"]["model"], "gpt-transcribe");
+    assert!(harness.operator_config().v1_runners().is_empty());
+    assert!(harness.operator_config().operator_policy().exclude.is_empty());
+    assert!(!path.exists(), "media selection must not create routing settings");
+}

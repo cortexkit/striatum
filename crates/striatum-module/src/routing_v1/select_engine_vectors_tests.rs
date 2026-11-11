@@ -83,7 +83,6 @@ fn credentials(rows: Vec<ListedCredential>, granted: bool, listed_at: i64) -> Br
 
 fn fixture() -> Arc<Harness> {
     let harness = Harness::new("select-engine-vectors");
-    harness.edit_config(|config| config["providers"][PROVIDER]["pin_only"] = json!(false));
     super::consumers::replace_catalog(&json!([
         {"module_id":"fixture-media","nonce_verified":true,
             "role_declarations":{"media-provider/v1":{"engines":KINDS.map(engine)}}},

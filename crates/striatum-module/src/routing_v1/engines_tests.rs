@@ -21,9 +21,6 @@ fn setup(engines: Vec<Value>) -> Arc<Harness> {
     let harness = Harness::new("engines");
     harness.edit_config(|config| {
         config["consumers"] = json!({"colliculus":{"owner":"colliculus","pay_per_token":true,"context_tokens":999999}});
-        for engine in &engines {
-            config["providers"][engine["provider"].as_str().unwrap()]["pin_only"] = json!(false);
-        }
     });
     super::consumers::replace_catalog(&json!([
         {"module_id":"colliculus","nonce_verified":true,"role_declarations":{"media-provider/v1":{"engines":engines}}},
@@ -96,8 +93,6 @@ async fn daemon_catalog_round_trip_selects_both_colliculus_transcription_engines
     let harness = Harness::new("daemon-catalog-engines");
     harness.edit_config(|config| {
         config["consumers"] = json!({"media.smoke":{"pay_per_token":true}});
-        config["providers"]["openai"]["pin_only"] = json!(false);
-        config["providers"]["google"]["pin_only"] = json!(false);
     });
     super::consumers::replace_catalog(&modules);
     let mut credential = key("opaque-transcription");
@@ -577,17 +572,40 @@ async fn engine_admission_binding_expiry_and_replay_use_the_shared_allocator() {
 }
 
 #[tokio::test]
-async fn remote_engines_require_operator_spending_opt_in_but_local_engines_do_not() {
+async fn remote_engines_are_automatic_without_llm_spending_opt_in() {
     let harness = setup(vec![engine("remote", false)]);
     harness.edit_config(|config| config["providers"] = json!({}));
     let route = harness.bind(reserved("colliculus"), None).await;
-    let refused = route.call("route.select_engine", &request()).await;
-    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
-    assert_eq!(refused.1["code"], "no_engine");
-    harness.edit_config(|config| config["providers"]["media-vendor"]["pin_only"] = json!(false));
     assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
-    harness.edit_config(|config| config["providers"] = json!({}));
+    harness.edit_config(|config| config["providers"]["media-vendor"]["pin_only"] = json!(true));
     let mut local_request = request();
     local_request["caller_local"] = json!([engine("local", true)]);
     assert_eq!(selected(&route, &local_request).await["engine"]["model"], "local");
+}
+
+#[tokio::test]
+async fn remote_engine_operator_rules_still_restrict_automatic_selection() {
+    let harness = setup(vec![engine("remote", false)]);
+    let route = harness.bind(reserved("colliculus"), None).await;
+    for rules in [json!({"pin_only":true}), json!({"not_for":["colliculus"]})] {
+        harness.edit_config(|config| config["providers"]["media-vendor"] = rules);
+        let refused = route.call("route.select_engine", &request()).await;
+        assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+        assert_eq!(refused.1["code"], "no_engine");
+    }
+    harness.edit_config(|config| {
+        config["providers"]["media-vendor"] = json!({"pin_only":true});
+        config["models"]["media-vendor/remote"] = json!({"pin_only":false});
+    });
+    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
+    // The old exclude grammar converts to explicit entity rules, which still
+    // restrict engines even though the LLM-only billing default does not.
+    let excluded = crate::config_convert::convert_value(json!({"model_routing":{"exclude":{"all":["media-vendor"]}}})).unwrap();
+    harness.edit_config(|config| {
+        config["providers"] = excluded["providers"].clone();
+        config["models"] = json!({});
+    });
+    let refused = route.call("route.select_engine", &request()).await;
+    assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+    assert_eq!(refused.1["code"], "no_engine");
 }

@@ -140,11 +140,9 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
                 || state.credential_refusal.is_some();
         }
         if !candidate.engine.local && candidate.engine.kind == request.kind {
-            // Remote engines currently admit only media-provider API keys,
-            // never subscription accounts. The engine contract has no pin, so
-            // automatic spending requires an operator pin_only:false opt-in.
-            candidate.fenced |=
-                !config.route_allowed_with_default(&request.consumer, &key, false, true);
+            // Media engines have no subscription alternative or pin operation.
+            // Apply explicit operator rules, not the LLM-only metered default.
+            candidate.fenced |= !config.route_allowed(&request.consumer, &key, false);
             candidate.fenced |= !accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
                 .map_err(store_refusal)?;
