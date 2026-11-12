@@ -546,6 +546,7 @@ async fn select_at_tier(
     );
     let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
+        catalog_snapshot,
         now,
         mut facts,
         mut snapshot,
@@ -571,10 +572,11 @@ async fn select_at_tier(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &catalog_targets,
     };
-    let mut priced = crate::select::price_selection_inputs_with_probes(
+    let mut priced = crate::select::price_selection_inputs_with_catalog(
         &mut facts,
         quota_signal_json,
         &sources,
+        Some(&catalog_snapshot),
         evaluation.map_or(deps.store, |view| view.account_store),
         deps.broca_credentials,
         true,

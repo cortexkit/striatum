@@ -283,74 +283,111 @@ impl Registry {
                 let statically_reachable_models: BTreeSet<_> = facts
                     .iter()
                     .filter(|fact| {
+                        let indexed = source.config.map(|config| {
+                            crate::serving_index::ServingIndex::runner_fact(
+                                config,
+                                credentials,
+                                fact,
+                                &catalog,
+                            )
+                        });
+                        let serving_rows: Vec<_> = indexed.as_ref().map_or_else(
+                            || {
+                                credentials
+                                    .listed_credentials()
+                                    .iter()
+                                    .filter(|row| {
+                                        credential_serves_fact(row, fact, &catalog, credentials)
+                                    })
+                                    .map(|row| (row, None))
+                                    .collect()
+                            },
+                            |entry| {
+                                entry
+                                    .runner
+                                    .iter()
+                                    .map(|row| {
+                                        (&credentials.listed_credentials()[row.index], Some(row))
+                                    })
+                                    .collect()
+                            },
+                        );
                         !needs_vault
-                            || credentials.listed_credentials().iter().any(|row| {
-                                credential_serves_fact(row, fact, &catalog, credentials)
-                                    && declaration.is_none_or(|declaration| {
-                                        declaration
-                                            .standing_limits
-                                            .as_ref()
-                                            .and_then(|limits| limits.explicit_providers.as_ref())
-                                            .is_none_or(|providers| {
-                                                providers.contains(&fact.provider_id)
-                                            })
-                                            && {
-                                                let method =
-                                                    row.auth_method.as_deref().unwrap_or("");
-                                                if fact.billing_plane.as_ref().is_some_and(
-                                                    |plane| plane.auth_method != method,
-                                                ) {
+                            || serving_rows.into_iter().any(|(row, indexed_row)| {
+                                declaration.is_none_or(|declaration| {
+                                    declaration
+                                        .standing_limits
+                                        .as_ref()
+                                        .and_then(|limits| limits.explicit_providers.as_ref())
+                                        .is_none_or(|providers| {
+                                            providers.contains(&fact.provider_id)
+                                        })
+                                        && {
+                                            let method = row.auth_method.as_deref().unwrap_or("");
+                                            if fact
+                                                .billing_plane
+                                                .as_ref()
+                                                .is_some_and(|plane| plane.auth_method != method)
+                                            {
+                                                return false;
+                                            }
+                                            let Some(api) = indexed_row.map_or_else(
+                                                || credentials.wire_api(fact, method),
+                                                |row| row.wire_api.as_deref(),
+                                            ) else {
+                                                unverified_wire_models.insert(format!(
+                                                    "{}/{}",
+                                                    fact.provider_id, fact.model_id
+                                                ));
+                                                return false;
+                                            };
+                                            declaration.pairs.iter().any(|pair| {
+                                                if !known_pair(pair)
+                                                    || api != pair.wire_api
+                                                    || row.auth_method.as_ref()
+                                                        != Some(&pair.auth_method)
+                                                {
                                                     return false;
                                                 }
-                                                let Some(api) = credentials.wire_api(fact, method)
-                                                else {
-                                                    unverified_wire_models.insert(format!(
+                                                // The narrowed declaration restricts pair
+                                                // membership; the original pair still determines
+                                                // whether an endpoint is required.
+                                                let admitted = wire_declaration
+                                                    .unwrap_or(declaration)
+                                                    .admits_pair_row(
+                                                        pair,
+                                                        indexed_row.map_or_else(
+                                                            || {
+                                                                credentials.row_serves_wire_api(
+                                                                    fact, method,
+                                                                )
+                                                            },
+                                                            |row| row.has_endpoint,
+                                                        ),
+                                                    );
+                                                if !admitted {
+                                                    missing_wire_api_models.insert(format!(
                                                         "{}/{}",
                                                         fact.provider_id, fact.model_id
                                                     ));
-                                                    return false;
-                                                };
-                                                declaration.pairs.iter().any(|pair| {
-                                                    if !known_pair(pair)
-                                                        || api != pair.wire_api
-                                                        || row.auth_method.as_ref()
-                                                            != Some(&pair.auth_method)
-                                                    {
-                                                        return false;
-                                                    }
-                                                    // Harness limits narrow pair membership, not
-                                                    // the original runner pair's endpoint requirement.
-                                                    let admitted = wire_declaration
-                                                        .unwrap_or(declaration)
-                                                        .admits_pair_row(
-                                                            pair,
-                                                            credentials
-                                                                .row_serves_wire_api(fact, method),
-                                                        );
-                                                    if !admitted {
-                                                        missing_wire_api_models.insert(format!(
-                                                            "{}/{}",
-                                                            fact.provider_id, fact.model_id
-                                                        ));
-                                                    }
-                                                    admitted
-                                                })
-                                            }
-                                    })
-                                    && {
-                                        let offers = can_offer_account(
-                                            &policy.module,
-                                            follows_account_choice,
-                                            row,
-                                        );
-                                        if !offers {
-                                            no_account_models.insert(format!(
-                                                "{}/{}",
-                                                fact.provider_id, fact.model_id
-                                            ));
+                                                }
+                                                admitted
+                                            })
                                         }
-                                        offers
+                                }) && {
+                                    let offers = can_offer_account(
+                                        &policy.module,
+                                        follows_account_choice,
+                                        row,
+                                    );
+                                    if !offers {
+                                        no_account_models.insert(format!(
+                                            "{}/{}",
+                                            fact.provider_id, fact.model_id
+                                        ));
                                     }
+                                    offers
+                                }
                             })
                     })
                     .map(|fact| format!("{}/{}", fact.provider_id, fact.model_id))

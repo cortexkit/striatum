@@ -32,37 +32,79 @@ pub struct BrocaCredentials {
 
 impl BrocaCredentials {
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
-        Arc::make_mut(&mut self.inner).apply_listing(listing, at_ms)
+        std::ops::DerefMut::deref_mut(self).apply_listing(listing, at_ms)
     }
 
-    pub(crate) fn publish_billing_catalog(&mut self, catalog: crate::fusiform_catalog::PlaneCatalog) {
-        Arc::make_mut(&mut self.inner).publish_billing_catalog(catalog);
+    pub(crate) fn publish_billing_catalog(
+        &mut self,
+        catalog: crate::fusiform_catalog::PlaneCatalog,
+    ) {
+        std::ops::DerefMut::deref_mut(self).publish_billing_catalog(catalog);
     }
 
     /// Retain an immutable request view without copying catalog pages. Pollers
     /// copy on write, so a request never holds the credentials lock across I/O.
     pub(crate) fn snapshot(&self) -> Self {
-        Self { inner: Arc::clone(&self.inner) }
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn api_test_credentials(facts: &[ModelFact]) -> Self {
-        Self { inner: Arc::new(CredentialData::api_test_credentials(facts)) }
+        Self {
+            inner: Arc::new(CredentialData::api_test_credentials(facts)),
+        }
     }
 }
 
 impl std::ops::Deref for BrocaCredentials {
     type Target = CredentialData;
-    fn deref(&self) -> &Self::Target { &self.inner }
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl std::ops::DerefMut for BrocaCredentials {
-    fn deref_mut(&mut self) -> &mut Self::Target { Arc::make_mut(&mut self.inner) }
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let data = Arc::make_mut(&mut self.inner);
+        if let Some(current) = data.serving_revision.current.take() {
+            data.serving_revision.previous = Some(current);
+        }
+        data
+    }
+}
+
+#[derive(Clone, Default)]
+struct ServingRevision {
+    previous: Option<Arc<ServingInputs>>,
+    current: std::sync::OnceLock<Arc<ServingInputs>>,
+}
+
+impl std::fmt::Debug for ServingRevision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Populating a derived cache is not a change to the credential snapshot.
+        f.write_str("ServingRevision")
+    }
+}
+
+#[derive(Debug)]
+struct ServingInputs {
+    generation: u64,
+    view: Option<String>,
+    listed: Vec<ListedCredential>,
+    declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    billing: crate::fusiform_catalog::PlaneCatalog,
+    wire_apis: BTreeMap<String, String>,
+    wire_api_models: BTreeSet<String>,
+    priced_targets: BTreeMap<String, String>,
+    routed_accounts: BTreeMap<String, Vec<String>>,
 }
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct CredentialData {
+    serving_revision: ServingRevision,
     view: Option<String>,
     reached_at_ms: Option<u64>,
     providers: HashSet<String>,
@@ -237,6 +279,40 @@ pub(crate) async fn wait_for_billing_catalog(
 }
 
 impl CredentialData {
+    /// Compare published values, not poll times or repeated publication of equal
+    /// values. Each copy-on-write snapshot retains its own revision even when a
+    /// newer snapshot is published.
+    pub(crate) fn serving_generation(&self) -> u64 {
+        self.serving_revision
+            .current
+            .get_or_init(|| {
+                if let Some(old) = self.serving_revision.previous.as_ref().filter(|old| {
+                    old.view == self.view
+                        && old.listed == self.listed
+                        && old.declarations == self.runner_declarations
+                        && old.billing == self.billing_catalog
+                        && old.wire_apis == self.wire_apis
+                        && old.wire_api_models == self.wire_api_models
+                        && old.priced_targets == self.priced_targets
+                        && old.routed_accounts == self.runner_routed_accounts
+                }) {
+                    return Arc::clone(old);
+                }
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                Arc::new(ServingInputs {
+                    generation: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    view: self.view.clone(),
+                    listed: self.listed.clone(),
+                    declarations: self.runner_declarations.clone(),
+                    billing: self.billing_catalog.clone(),
+                    wire_apis: self.wire_apis.clone(),
+                    wire_api_models: self.wire_api_models.clone(),
+                    priced_targets: self.priced_targets.clone(),
+                    routed_accounts: self.runner_routed_accounts.clone(),
+                })
+            })
+            .generation
+    }
     /// Known wire families require a runner's wire/auth pair. Missing wire or
     /// declaration snapshots retain provider/allowlist reachability so discovery
     /// gaps do not withdraw rows. Endpoint requirements remain runner-specific:
@@ -1009,6 +1085,68 @@ impl CredentialData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn serving_generation_compares_values_and_preserves_old_snapshots() {
+        let mut credentials = super::BrocaCredentials::api_test_credentials(&facts());
+        let original = credentials.snapshot();
+        let initial = credentials.serving_generation();
+        assert_eq!(initial, original.serving_generation());
+        let listing = cortexkit_claustrum_client::ScopedCredentialListing {
+            view: credentials.view.clone().unwrap(),
+            credentials: credentials.listed_credentials().to_vec(),
+            ..Default::default()
+        };
+        credentials.apply_listing(&listing, 999);
+        assert_eq!(
+            initial,
+            credentials.serving_generation(),
+            "reached_at_ms is not serving data"
+        );
+        let catalog = credentials.billing_catalog.clone();
+        credentials.publish_billing_catalog(catalog);
+        assert_eq!(initial, credentials.serving_generation());
+        let declarations = credentials.runner_declarations.clone();
+        credentials.runner_declarations = declarations;
+        assert_eq!(initial, credentials.serving_generation());
+        credentials.refresh_serving_methods(&Default::default(), &facts(), 999, &[]);
+        let refreshed = credentials.serving_generation();
+        credentials.refresh_serving_methods(&Default::default(), &facts(), 1000, &[]);
+        assert_eq!(refreshed, credentials.serving_generation());
+        let mut previous = refreshed;
+        macro_rules! changes {
+            ($change:expr) => {{
+                $change;
+                let next = credentials.serving_generation();
+                assert_ne!(previous, next);
+                previous = next;
+            }};
+        }
+        changes!(credentials.view = Some("different-view".into()));
+        changes!(credentials.listed[0].state = "disabled".into());
+        changes!(credentials
+            .wire_apis
+            .insert("provider/model".into(), "messages".into()));
+        changes!(credentials.wire_api_models.insert("provider/model".into()));
+        changes!(credentials
+            .priced_targets
+            .insert("pool".into(), "provider".into()));
+        changes!(credentials
+            .runner_routed_accounts
+            .insert("runner".into(), vec!["oauth".into()]));
+        changes!(credentials.billing_catalog = Default::default());
+        let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
+            "runner": {"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
+        })).unwrap().unwrap();
+        changes!(credentials
+            .runner_declarations
+            .insert("generation-runner".into(), declaration));
+        assert_ne!(previous, initial);
+        assert_eq!(
+            original.serving_generation(),
+            initial,
+            "an old request keeps its own generation"
+        );
+    }
     #[test]
     fn api_key_provider_mapping_uses_active_metadata_and_expires() {
         let mut explicit = credential("opaque-key", &["opencode-go", "another-provider"]);

@@ -17,6 +17,7 @@
 mod account_quota;
 mod account_refusal_log;
 mod account_selection;
+mod serving_index;
 mod background;
 #[cfg(test)]
 mod baseline_tests;

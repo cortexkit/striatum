@@ -76,6 +76,9 @@ pub(crate) struct RequestFixture {
 }
 
 impl RequestFixture {
+    pub(crate) fn edit_config(&self, edit: impl FnOnce(&mut Value)) {
+        self.harness.edit_config(edit);
+    }
     pub(crate) fn store(&self) -> &crate::SharedStore {
         self.harness.store()
     }
@@ -301,6 +304,7 @@ pub(crate) fn representative_fixture(counts: FixtureCounts) -> RequestFixture {
 
 #[derive(Default)]
 struct Samples {
+    index_builds: [u64; 3],
     cpu: i64,
     wall: Vec<u128>,
     queue_ns: u64,
@@ -322,6 +326,7 @@ struct Before {
 }
 impl Before {
     fn new(store: &striatum_store::SqliteRouteStateStore) -> Self {
+        crate::account_selection::take_index_build_counts();
         Self {
             cpu: cpu_us(),
             started: Instant::now(),
@@ -332,6 +337,13 @@ impl Before {
         }
     }
     fn finish(self, store: &striatum_store::SqliteRouteStateStore, samples: &mut Samples) {
+        for (total, count) in samples
+            .index_builds
+            .iter_mut()
+            .zip(crate::account_selection::take_index_build_counts())
+        {
+            *total += count;
+        }
         samples.wall.push(self.started.elapsed().as_micros());
         samples.cpu += cpu_us() - self.cpu;
         let stages = store.stage_timing();
@@ -356,6 +368,12 @@ impl Samples {
             self.cpu as f64 / n, percentile(50), percentile(99), self.queue_ns as f64 / n / 1_000.0,
             self.sql_ns as f64 / n / 1_000.0, self.commit_ns as f64 / n / 1_000.0,
             self.serialization_ns as f64 / n / 1_000.0, self.commits as f64 / n, self.acquisitions as f64 / n);
+        println!(
+            "{name} dynamic_index_builds/op blocks={:.3} readings={:.3} rechecks={:.3}",
+            self.index_builds[0] as f64 / n,
+            self.index_builds[1] as f64 / n,
+            self.index_builds[2] as f64 / n
+        );
     }
 }
 
@@ -671,6 +689,56 @@ fn request_fixture_builders_preserve_named_counts_and_pool_targets() {
     }
     assert!(FixtureCounts::parse("catalog_facts=1").is_err());
     assert!(FixtureCounts::parse("subscription_rules=1 exclusion_rules=2 runner_route_rules=3 catalog_facts=4 listed_credentials=5 unexpected=6").is_err());
+}
+
+#[tokio::test]
+#[ignore = "release picker CPU report: cargo test --release head_choices_request_cpu -- --ignored --nocapture"]
+async fn head_choices_request_cpu() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let parameters =
+        std::env::var("STRIATUM_CPU_REPRESENTATIVE").expect("supply all five live counts");
+    let counts = FixtureCounts::parse(&parameters).unwrap();
+    for production in [true, false] {
+        let fixture = if production {
+            production_fixture()
+        } else {
+            representative_fixture(counts)
+        };
+        super::conformance_tests::install_head_snapshot(&fixture.harness);
+        let route = fixture
+            .harness
+            .bind(reserved(fixture::CONSUMER), None)
+            .await;
+        let params = json!({"runner_module": fixture.catalog.runners[0].module});
+        call(
+            &fixture,
+            &route,
+            "route.head_choices",
+            params.clone(),
+            &mut Samples::default(),
+        )
+        .await;
+        let mut samples = Samples::default();
+        for _ in 0..30 {
+            call(
+                &fixture,
+                &route,
+                "route.head_choices",
+                params.clone(),
+                &mut samples,
+            )
+            .await;
+        }
+        println!(
+            "head_choices fixture={} counts={parameters}",
+            if production {
+                "production-sized"
+            } else {
+                "live representative baseline (STRIATUM_CPU_BASELINE=1)"
+            }
+        );
+        samples.print("head_choices");
+    }
 }
 
 #[tokio::test]

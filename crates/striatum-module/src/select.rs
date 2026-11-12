@@ -495,6 +495,7 @@ fn resolve_select_request_with_catalog_targets(
 }
 
 pub(super) struct PreparedSelectionInputs {
+    pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
     pub(super) now: f64,
     pub(super) facts: Vec<ModelFact>,
     pub(super) snapshot: ModelRouteStateSnapshot,
@@ -644,8 +645,8 @@ pub(super) fn prepare_selection_inputs(
     model_pools: &[striatum_core::quota_extract::ModelPool],
 ) -> Result<PreparedSelectionInputs, String> {
     let now = now_ms() as f64;
-    let facts = store
-        .get_facts_with_observed_speed(now, pricing)
+    let (catalog_snapshot, facts) = store
+        .get_facts_with_observed_speed_and_generation(now, pricing)
         .map_err(|e| format!("reading facts from route-state store: {e}"))?;
     let mut snapshot = store
         .build_snapshot(now)
@@ -698,6 +699,7 @@ pub(super) fn prepare_selection_inputs(
     let quota_note =
         stale_age_ms.map(|age_ms| stale_quota_note(age_ms, quota_last_error.as_deref()));
     Ok(PreparedSelectionInputs {
+        catalog_snapshot,
         now,
         facts,
         snapshot,
@@ -772,14 +774,48 @@ pub(super) fn price_selection_inputs_with_probes(
     priced_per_token: bool,
     reserve_probes: bool,
 ) -> Result<PricedSelection, ModuleError> {
+    price_selection_inputs_with_catalog(
+        facts,
+        quota_signal_json,
+        sources,
+        None,
+        store,
+        broca_credentials,
+        credentialed,
+        priced_per_token,
+        reserve_probes,
+    )
+}
+
+pub(super) fn price_selection_inputs_with_catalog(
+    facts: &mut Vec<ModelFact>,
+    quota_signal_json: String,
+    sources: &SelectionPolicySources<'_>,
+    catalog_snapshot: Option<&striatum_store::CatalogFactsSnapshot>,
+    store: &SharedStore,
+    broca_credentials: &SharedBrocaCredentials,
+    credentialed: bool,
+    priced_per_token: bool,
+    reserve_probes: bool,
+) -> Result<PricedSelection, ModuleError> {
     let mut classes = if credentialed {
+        let snapshot;
+        let catalog_snapshot = if let Some(snapshot) = catalog_snapshot {
+            snapshot
+        } else {
+            snapshot = store
+                .get_facts_with_generation()
+                .map_err(|e| ModuleError::Message(e.to_string()))?;
+            &snapshot
+        };
         Some(
-            account_selection::ClassContext::read(
+            account_selection::ClassContext::read_with_catalog(
                 store,
                 broca_credentials,
                 Arc::clone(sources.operator_config),
                 ACCOUNT_QUOTA.get(),
                 facts.clone(),
+                catalog_snapshot,
                 now_ms() as i64,
             )
             .map_err(ModuleError::Message)?,
@@ -1606,6 +1642,7 @@ pub(super) async fn handle_select_request(
     );
     timing.add_snapshot_closure(snapshot_started.elapsed());
     let PreparedSelectionInputs {
+        catalog_snapshot,
         now,
         mut facts,
         mut snapshot,
@@ -1641,7 +1678,7 @@ pub(super) async fn handle_select_request(
         entitlement_fences,
         subscription_plan_providers,
         mut classes,
-    } = price_selection_inputs(
+    } = price_selection_inputs_with_catalog(
         &mut facts,
         quota_signal_json,
         &SelectionPolicySources {
@@ -1650,10 +1687,12 @@ pub(super) async fn handle_select_request(
             operator_config_path,
             catalog_targets: &catalog_targets,
         },
+        Some(&catalog_snapshot),
         store,
         broca_credentials,
         !host_run,
         priced_per_token,
+        true,
     )?;
     if let Some(credential) = &params.continuation_credential_id {
         if let Some(classes) = &mut classes {
@@ -3295,12 +3334,13 @@ async fn handle_select_panel(
         } else {
             select_policy::Consumer::Athena
         };
-    let mut classes = account_selection::ClassContext::read(
+    let mut classes = account_selection::ClassContext::read_with_catalog(
         store,
         broca_credentials,
         live_config.clone(),
         ACCOUNT_QUOTA.get(),
         prepared.facts.clone(),
+        &prepared.catalog_snapshot,
         now_ms() as i64,
     )
     .map_err(ModuleError::Message)?;
