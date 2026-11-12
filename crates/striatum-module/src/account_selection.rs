@@ -472,14 +472,19 @@ impl ClassContext {
     /// and release it. A hold this context has seen therefore stays in force
     /// for the context's life. The empty-roster refusal then names the hold
     /// that emptied the roster, and its end as the retry time, instead of
-    /// finding no cause and answering `account_not_authorized`.
+    /// finding no cause and answering `account_not_authorized`. A remembered
+    /// hold still ends at its expiry, as a live one would.
     fn probe_reserved_until(&self, provider: &str, credential: &str) -> Option<i64> {
         let key = (
             provider.to_owned(),
             credential.to_owned(),
             self.probe_owner.clone(),
         );
-        if let Some(until) = self.probe_holds().get(&key) {
+        if let Some(until) = self
+            .probe_holds()
+            .get(&key)
+            .filter(|until| **until > self.now_ms)
+        {
             return Some(*until);
         }
         let until = probe_reservations::blocked_until(
@@ -489,7 +494,8 @@ impl ClassContext {
             self.probe_owner.as_deref(),
             self.now_ms,
         )?;
-        Some(*self.probe_holds().entry(key).or_insert(until))
+        self.probe_holds().insert(key, until);
+        Some(until)
     }
 
     /// Record a hold that refused this context's probe claim, so a later
