@@ -532,7 +532,58 @@ impl SqliteRouteStateStore {
     }
 }
 
+// Start from the sparse authorization table, then look up each admission by
+// its primary key instead of scanning the admission history on every request.
+const EXPIRED_ADMISSION_PROBES: &str = "SELECT DISTINCT a.principal,a.admission_id,p.owner
+    FROM fence_probe_authorization p JOIN account_admission a
+      ON a.principal=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[1]')
+      AND a.admission_id=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[2]')
+    WHERE p.owner=json_array('account_admission',a.principal,a.admission_id)
+      AND a.state IN ('reserved','expired') AND a.started_at IS NULL
+      AND a.admission_valid_until<=?1";
+
 impl AccountTx<'_> {
+    /// Preview cleanup without acquiring a writer. The write path checks again
+    /// because a runner may start the admission after this snapshot is read.
+    pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(false);
+        }
+        self.conn
+            .query_row(&format!("SELECT EXISTS({EXPIRED_ADMISSION_PROBES})"), [now], |row| row.get(0))
+            .map_err(err)
+    }
+
+    /// An unstarted admission sent nothing, so it has not used its probe. The
+    /// quota interval limits real sends after a provider refused a request, not
+    /// reservations; releasing an unused probe restores that budget without
+    /// adding a send.
+    pub fn release_expired_admission_probes(&self, now: i64) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        let expired = self.conn.prepare(EXPIRED_ADMISSION_PROBES).map_err(err)?
+            .query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+            .map_err(err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
+        if expired.is_empty() {
+            return Ok(());
+        }
+        sync(self.conn).map_err(err)?;
+        for (principal, admission, owner) in expired {
+            // Reopen only the authorized evidence and claim generation. The
+            // fence stays in place, and an older expiry cannot undo a new probe.
+            self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL
+                WHERE r.cleared_at IS NULL AND EXISTS (
+                    SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
+                      AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
+                      AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
+                params![owner,now]).map_err(err)?;
+            self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+            self.mark_admission_expired(&principal, &admission)?;
+        }
+        Ok(())
+    }
+
     /// Anonymous decisions may report a credential discovered only at launch.
     /// Accept it only when the owner's recorded probe authorization names the
     /// credential for the active fence evidence.
@@ -924,6 +975,64 @@ impl AccountTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_admission_probe_cannot_reopen_newer_evidence_or_claim_generation() {
+        for newer_evidence in [false, true] {
+            let scratch = cortexkit_test_support::ScratchDir::new("expired-probe-generation");
+            let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "expired-probe-generation", scratch.path().join("store.db").to_string_lossy(),
+            )).unwrap();
+            let fence = crate::AccountRouteFence {
+                provider:"p".into(), credential_id:"c".into(), model:"m".into(),
+                until_ms:1000, recorded_at:100, decision_id:"d".into(),
+            };
+            store.record_billing_account_route_fence(&fence).unwrap();
+            let origins = store.fence_rechecks().unwrap();
+            let owner = serde_json::json!(["account_admission","p","a"]).to_string();
+            store.account_transaction(|tx| {
+                tx.insert_pin(&crate::AccountPinRow {
+                    pin_id:"pin".into(), principal:"p".into(), conversation_hash:"".into(),
+                    provider:"p".into(), pin_generation:1, affinity_model:"m".into(),
+                    account_id:"acct".into(), credential_id:"c".into(), pin_mode:"run_frozen".into(),
+                    previous_pin_id:None, decision_id:"d".into(), created_at:1000,
+                })?;
+                tx.conn.execute("INSERT INTO account_admission
+                    (principal,admission_id,request_fingerprint,request_mode,decision_id,conversation_hash,
+                    provider,model,account_id,credential_id,pin_id,pin_generation,state,charged,
+                    request_bytes,request_bytes_estimated,committed_at,admission_valid_until,
+                    lease_valid_until,reply_json,started_late)
+                    VALUES ('p','a','','admit','d','','p','m','acct','c','pin',1,'reserved',1,
+                    1,0,1000,61000,121000,'{}',0)", []).map_err(err)?;
+                assert!(tx.claim_fence_rechecks_for_authorized_admission(&origins,1000,None,&owner)?);
+                Ok(())
+            }).unwrap();
+            let now = 3_601_001;
+            if newer_evidence {
+                store.record_billing_account_route_fence(&crate::AccountRouteFence {
+                    recorded_at:now, until_ms:now + 100_000, ..fence
+                }).unwrap();
+            } else {
+                let origins = store.fence_rechecks().unwrap();
+                assert!(store.account_transaction(|tx| tx.grant_fence_rechecks(
+                    &origins,now,Some("new-owner"),
+                )).unwrap());
+            }
+            let before = store.fence_rechecks().unwrap().remove(0);
+            store.account_transaction(|tx| {
+                assert!(tx.has_expired_admission_probes(now)?);
+                tx.release_expired_admission_probes(now)?;
+                assert!(!tx.has_expired_admission_probes(now)?);
+                Ok(())
+            }).unwrap();
+            let after = store.fence_rechecks().unwrap().remove(0);
+            assert_eq!(after.next_recheck_at, before.next_recheck_at);
+            assert_eq!(after.last_claimed_at, before.last_claimed_at);
+            assert_eq!(after.claim_owner, before.claim_owner);
+            assert_eq!(after.evidence, before.evidence);
+            assert_eq!(after.evidence_at, before.evidence_at);
+        }
+    }
 
     #[test]
     fn successful_probe_heals_only_its_authorized_empty_and_named_generations() {

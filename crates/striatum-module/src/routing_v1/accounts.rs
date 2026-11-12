@@ -718,6 +718,7 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 "decision_id",
                 "exclusions",
                 "reset_at_ms",
+                "eligible_accounts_not_offered",
             ] {
                 if let Some(value) = detail.get(key) {
                     refusal.detail.insert(key.into(), value.clone());

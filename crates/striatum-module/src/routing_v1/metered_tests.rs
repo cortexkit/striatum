@@ -353,6 +353,72 @@ async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
 }
 
 #[tokio::test]
+async fn broca_unstarted_probe_admission_expires_after_one_minute() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    for quota in [false, true] {
+        let _now = crate::InjectedClock::set(FENCE_NOW);
+        let harness = broca_fence_harness();
+        fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+        if quota {
+            harness.store().account_transaction(|tx| {
+                tx.classify_credential_quota("inception", "apikey:inception", true)
+            }).unwrap();
+        }
+        let runner = harness.bind(reserved("broca"), None).await;
+        let first = broca_account_request(&Value::Null, "abandoned", false);
+        let admitted = runner.call("route.account_for", &first).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe");
+
+        let _before_expiry = crate::InjectedClock::set(FENCE_NOW + 59_999);
+        let waiting = broca_account_request(&Value::Null, "too-soon", false);
+        let refused = runner.call("route.account_for", &waiting).await;
+        assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+        assert_eq!(refused.1["code"], "account_pool_exhausted");
+
+        let _after_expiry = crate::InjectedClock::set(FENCE_NOW + 61_000);
+        let a = broca_account_request(&Value::Null, "replacement-a", false);
+        let b = broca_account_request(&Value::Null, "replacement-b", false);
+        let (a, b) = tokio::join!(
+            runner.call("route.account_for", &a),
+            runner.call("route.account_for", &b),
+        );
+        let replies = [a, b];
+        assert_eq!(replies.iter().filter(|r| r.0 == FrameType::Response).count(), 1,
+            "one replacement must take the unused probe, quota={quota}: {replies:?}");
+        let admitted = replies.iter().find(|r| r.0 == FrameType::Response).unwrap();
+        assert_eq!(admitted.1["result"]["account"]["credential_id"], "apikey:inception");
+        assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe");
+        let refused = replies.iter().find(|r| r.0 == FrameType::Error).unwrap();
+        assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+        assert!(!harness.store().fence_rechecks().unwrap().is_empty(),
+            "expiry releases the claim, not the underlying refusal");
+    }
+}
+
+#[tokio::test]
+async fn broca_started_probe_admission_keeps_its_hold_after_one_minute() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let request = broca_account_request(&Value::Null, "started-probe", false);
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    let started = runner.call("route.account_observe", &json!({
+        "kind":"admission_started", "event_id":"start-probe", "admission_id":"started-probe",
+        "run_id":"probe-run", "served_account_id":"apikey:inception",
+    })).await;
+    assert_eq!(started.0, FrameType::Response, "{}", started.1);
+    let _later = crate::InjectedClock::set(FENCE_NOW + 61_000);
+    let request = broca_account_request(&Value::Null, "started-replacement", false);
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted");
+    assert_eq!(refused.1["detail"]["reset_at_ms"], FENCE_NOW + 3_600_000);
+}
+
+#[tokio::test]
 async fn broca_abandoned_probe_selection_expires_after_two_minutes() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = broca_fence_harness();
