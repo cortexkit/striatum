@@ -1,7 +1,8 @@
 #!/bin/sh
 # Offline compaction of the routing store: VACUUM INTO a new file, verify it,
 # then swap it in. Run it only with the striatum module stopped, and outside
-# Engram's nightly capture (10:45-12:00 UTC). This script never starts,
+# the nightly capture by Engram, CortexKit's backup module, which reads
+# store.db live between 10:45 and 12:00 UTC. This script never starts,
 # stops or reconfigures a module.
 #
 # Why: the retention pass deletes old rows and compacts old decision detail in

@@ -10,7 +10,9 @@
 //!
 //! The compact `score_json` keeps every member of the full one except the
 //! candidate list, which it narrows to the picked route, the routes that also
-//! cleared the quality gate (`alsoAdequate`) and a panel's members. So the
+//! cleared the quality gate (`alsoAdequate`) and, for a panel decision (one
+//! that picks several models at once), the route keys its `explanation_json`
+//! lists under `members`. So the
 //! paths readers use keep resolving on a compacted row: `alsoAdequate`, the
 //! picked route's `metrics` (its fit), `objective` (cost, quota, selection
 //! cost and `taskPricing` with its `valueMultiplier`), `adequacy` and
