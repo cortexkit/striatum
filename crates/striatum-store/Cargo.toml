@@ -11,7 +11,7 @@ cortexkit-store = { workspace = true }
 cortexkit-store-types = { workspace = true }
 # Same rusqlite (bundled) cortexkit-store uses, so the Connection types match.
 # Naming params!/Row directly keeps the row mapping readable.
-rusqlite = { workspace = true, features = ["bundled"] }
+rusqlite = { workspace = true, features = ["bundled", "hooks"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }

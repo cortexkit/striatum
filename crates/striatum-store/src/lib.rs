@@ -81,7 +81,7 @@ pub use diagnostics::{
 };
 pub use engine_measurements::{EngineEvaluation, EngineSpeedSample, ENGINE_SPEED_SAMPLE_LIMIT};
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
-pub use reasoning_catalog::{read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
+pub use reasoning_catalog::{read_counts_offline, read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
 pub use retention::{AffinityRetentionBatch, V1DecisionRetentionBatch};
 pub use routing_v1::{V1Decision, V1Recorded};
 pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
@@ -717,7 +717,7 @@ impl SqliteRouteStateStore {
             // operator clearing one of its routes also permits an early retry.
             tx.execute("UPDATE pool_key_state SET walled_until=NULL,wall_reason=NULL WHERE provider=?1", [&provider])?;
             tx.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND code='credential_refused'", [&provider])?;
-            tx.commit()?;
+            crate::evaluation_snapshot::timed_commit(tx)?;
             Ok(Some(ClearedRouteCooldowns {route_key, routes, account_fences}))
         }).map_err(err)
     }
@@ -1147,6 +1147,9 @@ pub struct SqliteRouteStateStore {
 }
 
 mod evaluation_snapshot;
+#[cfg(any(test, feature = "test-support"))]
+pub use evaluation_snapshot::record_stage_timing_for_test;
+pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
 /// `model_facts` writes (bumped by the temporary triggers that
@@ -1440,7 +1443,7 @@ impl SqliteRouteStateStore {
             tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
         }
         Ok(Self::from_inner(
-            evaluation_snapshot::ConnectionStore::Live(store),
+            evaluation_snapshot::ConnectionStore::live(store),
         ))
     }
 
@@ -1654,7 +1657,7 @@ impl SqliteRouteStateStore {
                        )",
                     [],
                 )?;
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(unserved)
             })
             .map_err(err)
@@ -1716,7 +1719,7 @@ impl SqliteRouteStateStore {
         self.share_canonical_scores(&mut facts, &canonical_ids);
         operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
         let facts: Vec<_> = facts.into_iter().zip(present).collect();
-        if let Some(tx) = tx { tx.commit()?; }
+        if let Some(tx) = tx { crate::evaluation_snapshot::timed_commit(tx)?; }
         if let Some(key) = key.filter(|_| cacheable) {
             *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
         }
@@ -2151,7 +2154,7 @@ impl SqliteRouteStateStore {
                        updated_at = excluded.updated_at",
                     params![cursor.catalog_version, cursor.resolved_at_ms, now_ms()],
                 )?;
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -2327,7 +2330,7 @@ impl SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -2531,7 +2534,7 @@ impl SqliteRouteStateStore {
                     "credential",
                     &serde_json::json!([provider_id, credential_id]).to_string(),
                 )?;
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(changed)
             })
             .map_err(err)
@@ -3608,7 +3611,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // A fresh INSERT fires the model_facts insert trigger, which creates
                 // the route's state row with any live provider wall and its cause.
                 // An update leaves the existing state row alone.
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -3682,7 +3685,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     )
                     .optional()?;
                 let Some(sources) = sources else {
-                    tx.commit()?;
+                    crate::evaluation_snapshot::timed_commit(tx)?;
                     return Ok(Vec::new());
                 };
                 let candidates = [
@@ -3732,7 +3735,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         should_clear(CatalogFactField::SupportsToolUse),
                     ],
                 )?;
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(cleared)
             })
             .map_err(err)
@@ -3827,7 +3830,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let tx = write_transaction(c)?;
                 tx.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -3843,7 +3846,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
                     [route_key],
                 )?;
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -3950,7 +3953,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let tx = write_transaction(c)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
                 let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1",[&provider_key],|row|row.get(0)).optional()?.flatten();
-                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return crate::evaluation_snapshot::timed_commit(tx);}
                 // Replace inherited provider evidence only. An independent
                 // model refusal keeps its own deadline and evidence generation.
                 let mut inherited=tx.prepare("SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
@@ -4089,7 +4092,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))",params![provider_key,updated_at,update.unscoped_wall,inherited])?;
                     fence_rechecks::register(&tx,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -4135,7 +4138,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
                 let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?.flatten();
-                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return tx.commit();}
+                if new_wall && prior_at.is_some_and(|at|at>observed_at) {return crate::evaluation_snapshot::timed_commit(tx);}
                 let existing = tx
                     .query_row(
                         "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
@@ -4266,7 +4269,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE route_key=?1",params![route_key,observed_at,update.unscoped_wall])?;
                     fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
                 }
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -4343,7 +4346,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 // Outcome delivery is soft and may be retried after a lost ack. The first
                 // terminal write owns the counter transition; a replay must not count twice.
                 if prior_outcome.is_some() {
-                    tx.commit()?;
+                    crate::evaluation_snapshot::timed_commit(tx)?;
                     return Ok(());
                 }
 
@@ -4361,7 +4364,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 )?;
 
                 let Some(route_key) = route_key else {
-                    tx.commit()?;
+                    crate::evaluation_snapshot::timed_commit(tx)?;
                     return Ok(());
                 };
                 let (provider_id, model_id, variant) = route_identity(
@@ -4510,7 +4513,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                 }
 
                 fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -4548,7 +4551,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         params![now_ms(), route_key],
                     )?;
                 }
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(prior)
             })
             .map_err(err)
@@ -4619,7 +4622,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                        WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
                     params![created_before_ms, i64::try_from(limit).unwrap_or(i64::MAX)],
                 )?;
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(panels + decisions)
             })
             .map_err(err)
@@ -4672,7 +4675,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         ])?;
                     }
                 }
-                transaction.commit()?;
+                crate::evaluation_snapshot::timed_commit(transaction)?;
                 Ok(inserted)
             })
             .map_err(err)
@@ -6810,7 +6813,7 @@ mod tests {
                         fail_ledger_row(&tx, &id, recent, Some("refused"))?;
                     }
                 }
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .unwrap();
         let (copy_rows, copy_steps) = vm_steps_during(&store, || {
@@ -7232,7 +7235,7 @@ mod tests {
                         fail_ledger_row(&tx, &id, HEAD_NOW - 60_000, Some("refused"))?;
                     }
                 }
-                tx.commit()
+                crate::evaluation_snapshot::timed_commit(tx)
             })
             .unwrap();
 

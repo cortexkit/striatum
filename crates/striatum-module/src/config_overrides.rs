@@ -87,6 +87,25 @@ impl LiveConfig {
             .anchor_version()
     }
 
+    /// Count prepared rule-list entries without returning rule or provider names.
+    pub(crate) fn rule_counts(&self) -> (usize, usize, usize) {
+        let exclusions = serde_json::to_value(&self.config.model_routing.exclude).unwrap();
+        (
+            self.config.model_routing.subscription.len(),
+            exclusions
+                .as_object()
+                .unwrap()
+                .values()
+                .map(|entries| entries.as_array().unwrap().len())
+                .sum(),
+            self.config
+                .runners
+                .iter()
+                .map(|runner| runner.routes.as_ref().map_or(0, Vec::len))
+                .sum(),
+        )
+    }
+
     pub(crate) fn service_tier(
         &self,
         consumer: &str,
@@ -277,6 +296,25 @@ pub fn default_store_path() -> Option<PathBuf> {
 pub fn check_config_offline(path: &Path, store_path: Option<&Path>) -> Result<String, String> {
     initialize_config(path)?;
     let active = live_config_at(path, Instant::now())?;
+    let report = check_catalog_offline(&active, store_path)?;
+    let (facts, roster) = store_path
+        .map(striatum_store::read_counts_offline)
+        .unwrap_or_else(|| {
+            (
+                Err("no routing store path".into()),
+                Err("no routing store path".into()),
+            )
+        });
+    let count = |value: Result<u64, String>| match value {
+        Ok(value) => value.to_string(),
+        Err(reason) => format!("unavailable ({reason})"),
+    };
+    let (subscription_count, exclusion_count, runner_count) = active.rule_counts();
+    Ok(format!("{report}\nsubscription_rules={}\nexclusion_rules={exclusion_count}\nrunner_route_rules={runner_count}\ncatalog_facts={}\nvault_roster_credentials={}",
+        subscription_count, count(facts), count(roster)))
+}
+
+fn check_catalog_offline(active: &LiveConfig, store_path: Option<&Path>) -> Result<String, String> {
     if active.config.model_routing.variants.is_empty() {
         return Ok("catalog check: no model_routing.variants to check".into());
     }

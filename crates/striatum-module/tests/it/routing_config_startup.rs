@@ -138,3 +138,52 @@ fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
         assert!(!message.contains("missing-connection-file"), "{message}");
     }
 }
+
+#[test]
+fn check_config_binary_prints_five_anonymous_count_lines_offline() {
+    let home = Home::new();
+    let primary = home.config_dir(true).join("striatum.jsonc");
+    test_config::write_raw(
+        &primary,
+        r#"{
+        "providers":{"private-provider":{"subscription":true,"pin_only":false}},
+        "runners":[{"module":"private-runner","routes":["private-provider"]}]
+    }"#,
+    )
+    .unwrap();
+    let binary =
+        cortexkit_test_support::stage_test_binary(Path::new(env!("CARGO_BIN_EXE_ck-striatum")));
+    let run = |data: Option<&Path>| {
+        let mut command = cortexkit_test_support::fenced_command(&binary, &home.0);
+        command
+            .env("XDG_CONFIG_HOME", home.0.join("xdg"))
+            .env_remove("HOME")
+            .env_remove("XDG_DATA_HOME")
+            .arg("--check-config");
+        if let Some(path) = data {
+            command.env("XDG_DATA_HOME", path);
+        }
+        let output = command.output().unwrap();
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        text.lines()
+            .filter(|line| line.contains('='))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let data = home.0.join("data");
+    for counts in [run(None), run(Some(&data))] {
+        assert_eq!(counts.len(), 5, "{counts:?}");
+        assert_eq!(
+            &counts[..3],
+            [
+                "subscription_rules=1",
+                "exclusion_rules=1",
+                "runner_route_rules=1"
+            ]
+        );
+        assert!(counts[3].starts_with("catalog_facts=unavailable ("));
+        assert!(counts[4].starts_with("vault_roster_credentials=unavailable ("));
+        assert!(!counts.join("\n").contains("private"));
+    }
+}

@@ -687,3 +687,110 @@ pub(super) async fn run(
 #[cfg(test)]
 #[path = "quota_events_tests.rs"]
 mod tests;
+
+// The request CPU bench depends on this adapter to measure the real ingestion path.
+#[cfg(test)]
+pub(crate) mod bench {
+    use super::*;
+    use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig, InMemoryStreamCursor};
+    use cortexkit_bus_trait::{DurableOwner, Headers, Stream};
+
+    struct Source {
+        replies: HashMap<String, Vec<u8>>,
+        snapshots: usize,
+    }
+    impl SampleSource for Source {
+        async fn fetch(&mut self, key: &str) -> Result<Vec<u8>, String> {
+            self.replies
+                .get(key)
+                .cloned()
+                .ok_or_else(|| "event_not_found".into())
+        }
+        async fn snapshot(&mut self) -> Result<Vec<u8>, String> {
+            self.snapshots += 1;
+            // With no matching reading in the snapshot, ingestion applies
+            // both the full reply and the epoch-start event's body.
+            Ok(br#"{"result":[]}"#.to_vec())
+        }
+    }
+
+    pub(crate) struct QuotaBurst {
+        live: LiveQuota,
+        source: Source,
+        cursor: InMemoryStreamCursor,
+        sequence: SequenceState,
+        events: usize,
+    }
+    impl QuotaBurst {
+        pub(crate) async fn new(store: SharedStore, events: usize) -> Self {
+            let owner = DurableOwner::Module("striatum");
+            let bus = InMemoryBus::new(InMemoryConfig::default().with_durable(owner));
+            let mut source = Source {
+                replies: HashMap::new(),
+                snapshots: 0,
+            };
+            for seq in 1..=events {
+                let body = json!({"provider":"codex","account":"cpu-burst","apiProvider":"cpu-provider-0",
+                    "fetchedAt": crate::account_selection::rfc3339(crate::now_ms() as i64 + seq as i64 * 1_000),
+                    "usage":{"primary":{"usedPercent":seq % 90,"windowMinutes":300}},
+                    "epoch":"cpu-epoch","seq":seq});
+                let key = ContentDigest::of_bytes(
+                    &serde_json::to_vec(&BTreeMap::from([
+                        ("provider", json!("codex")),
+                        ("account", json!("cpu-burst")),
+                        ("epoch", json!("cpu-epoch")),
+                        ("seq", json!(seq)),
+                    ]))
+                    .unwrap(),
+                )
+                .to_string();
+                let digest = ContentDigest::of_bytes(&serde_json::to_vec(&body).unwrap());
+                let headers = Headers::from([
+                    ("kind".into(), "quota_sampled".into()),
+                    ("provider".into(), "codex".into()),
+                    ("account".into(), "cpu-burst".into()),
+                    ("epoch".into(), "cpu-epoch".into()),
+                    ("seq".into(), seq.to_string()),
+                ]);
+                let _ = bus
+                    .publish("cpu.quota", &key, digest, headers)
+                    .await
+                    .unwrap();
+                source.replies.insert(
+                    key.clone(),
+                    serde_json::to_vec(&json!({"result":{
+                    "event_name":"quota_sampled","event_key":key,"digest":digest.to_string(),
+                    "body":body,"published_at":1}}))
+                    .unwrap(),
+                );
+            }
+            Self {
+                live: LiveQuota {
+                    cache: Default::default(),
+                    accounts: Default::default(),
+                    store,
+                    snapshot_baseline: Default::default(),
+                },
+                source,
+                cursor: bus.consumer(owner).await.unwrap(),
+                sequence: Default::default(),
+                events: 0,
+            }
+        }
+        pub(crate) async fn next(&mut self) {
+            consume_one(
+                &mut self.cursor,
+                &mut self.source,
+                &self.live,
+                &mut self.sequence,
+                "cpu.quota",
+            )
+            .await
+            .unwrap();
+            self.events += 1;
+        }
+        pub(crate) fn applied_bodies(&self) -> usize {
+            self.events + self.source.snapshots
+        }
+    }
+}

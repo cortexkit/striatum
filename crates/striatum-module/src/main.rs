@@ -42,6 +42,7 @@ mod quota_consumer;
 mod quota_events;
 mod retention;
 mod routing_v1;
+mod stage_timing;
 mod runtime_lag;
 mod select;
 mod select_policy;
