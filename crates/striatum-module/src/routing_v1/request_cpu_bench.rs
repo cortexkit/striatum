@@ -93,7 +93,7 @@ impl RequestFixture {
 // Include the blocking request workers, not only the async caller's thread.
 // Both OS interfaces report process CPU at 10 ms resolution; aggregate enough
 // operations to make that quantization small relative to the measured work.
-fn cpu_us() -> i64 {
+pub(crate) fn cpu_us() -> i64 {
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string("/proc/self/stat").unwrap();

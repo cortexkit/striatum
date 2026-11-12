@@ -5,6 +5,7 @@
 
 use crate::model_facts::{BasketDimension, ModelFact};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const IQ_BUCKET_WIDTH: u8 = 10;
 pub const MIN_TASKS: usize = 20;
@@ -200,6 +201,123 @@ fn summarize_rated(mut tasks: Vec<&RatedTask<'_>>) -> Option<ProfileStats> {
     Some(ProfileStats { tokens, task_count })
 }
 
+#[derive(Hash, PartialEq, Eq)]
+enum Population<'a> {
+    Own(&'a str, &'a str, Option<&'a str>, u8),
+    FamilyTier(&'a str, Option<&'a str>, &'static str, u8),
+    FamilyBucket(&'a str, Option<&'a str>, u8),
+    Family(&'a str, Option<&'a str>),
+    FleetBucket(&'a str, u8),
+    Fleet(&'a str),
+}
+
+/// Summarize each shared population once, rather than rating and sorting the
+/// entire history again for every candidate and IQ bucket in a refresh.
+pub struct TaskProfileIndex<'a> {
+    stats: HashMap<Population<'a>, ProfileStats>,
+}
+
+impl<'a> TaskProfileIndex<'a> {
+    pub fn new(tasks: &'a [ClosedTask<'a>]) -> Self {
+        let rated = rated(tasks);
+        let mut populations: HashMap<Population<'a>, Vec<&RatedTask<'_>>> = HashMap::new();
+        for rated in &rated {
+            let task = rated.task;
+            let workload = task.workload;
+            let bucket = task.iq_bucket;
+            let mut add = |key| populations.entry(key).or_default().push(rated);
+            add(Population::Own(
+                workload,
+                &task.model.model_id,
+                task.model.variant.as_deref(),
+                bucket,
+            ));
+            add(Population::FleetBucket(workload, bucket));
+            add(Population::Fleet(workload));
+            {
+                let family = task.model.grand_family_id();
+                add(Population::FamilyBucket(workload, family, bucket));
+                add(Population::Family(workload, family));
+                if let Some(tier) = model_tier(&task.model.model_id) {
+                    add(Population::FamilyTier(workload, family, tier, bucket));
+                }
+            }
+        }
+        Self {
+            stats: populations
+                .into_iter()
+                .filter_map(|(key, tasks)| summarize_rated(tasks).map(|stats| (key, stats)))
+                .collect(),
+        }
+    }
+
+    /// Resolve the same fallback chain as `compute_profile`, using summaries
+    /// priced at the rates of the models that ran the tasks, not the candidate's rates.
+    pub fn compute_profile(
+        &self,
+        candidate: &ModelFact,
+        workload: &str,
+        bucket: u8,
+    ) -> Option<TaskProfile> {
+        let get = |key| self.stats.get(&key).copied();
+        let supported =
+            |stats: Option<ProfileStats>| stats.filter(|stats| stats.task_count >= MIN_TASKS);
+        let own = get(Population::Own(
+            workload,
+            &candidate.model_id,
+            candidate.variant.as_deref(),
+            bucket,
+        ));
+        if let Some(stats) = supported(own) {
+            return Some(served(stats, ProfileLevel::OwnCell, own));
+        }
+        {
+            let family = candidate.grand_family_id();
+            if let Some(tier) = model_tier(&candidate.model_id) {
+                if let Some(stats) =
+                    supported(get(Population::FamilyTier(workload, family, tier, bucket)))
+                {
+                    return Some(served(stats, ProfileLevel::SameFamilyTier, own));
+                }
+            }
+            if let Some(stats) = supported(get(Population::FamilyBucket(workload, family, bucket)))
+            {
+                return Some(served(stats, ProfileLevel::SameFamily, own));
+            }
+            if let (Some(family), Some(bucket), Some(all)) = (
+                supported(get(Population::Family(workload, family))),
+                supported(get(Population::FleetBucket(workload, bucket))),
+                supported(get(Population::Fleet(workload))),
+            ) {
+                let ratio =
+                    bucket.tokens.zip(
+                        all.tokens,
+                        |bucket, all| {
+                            if all == 0.0 {
+                                1.0
+                            } else {
+                                bucket / all
+                            }
+                        },
+                    );
+                let tokens = family.tokens.zip(ratio, |family, ratio| family * ratio);
+                if tokens.is_valid() {
+                    return Some(served(
+                        ProfileStats { tokens, ..family },
+                        ProfileLevel::ScaledFamily,
+                        own,
+                    ));
+                }
+            }
+        }
+        if let Some(stats) = supported(get(Population::FleetBucket(workload, bucket))) {
+            return Some(served(stats, ProfileLevel::FleetBucket, own));
+        }
+        supported(get(Population::Fleet(workload)))
+            .map(|stats| served(stats, ProfileLevel::FleetWorkload, own))
+    }
+}
+
 /// Pool individual tasks, rank at their own rates, and trim the most costly
 /// `floor(0.05 * n)` tasks.
 /// Invalid totals or unknown rates for observed dimensions cannot be ranked and
@@ -306,6 +424,105 @@ pub fn compute_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batched_refresh_matches_full_recompute_over_randomized_history_edits() {
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            seed
+        };
+        let mut facts: Vec<_> = (0..24)
+            .map(|i| {
+                let mut fact = model(
+                    &format!("model-{}-{}", i / 2, ["sol", "luna", "unknown"][i % 3]),
+                    [Some("gpt"), Some("claude"), None, Some("other")][i % 4],
+                    (i % 5) as f64,
+                );
+                fact.provider_id = format!("provider-{}", i % 2);
+                fact.variant = (i % 3 != 0).then(|| format!("effort-{}", i % 2));
+                fact
+            })
+            .collect();
+        let workloads = ["mason", "sidekick", "alfonso", "unseen"];
+        let mut history = Vec::new();
+        for _ in 0..600 {
+            history.push((
+                next() as usize % facts.len(),
+                next() as usize % 3,
+                (next() % 11) as u8,
+                TokenVector {
+                    fresh_input: (next() % 100) as f64,
+                    cached_read: (next() % 50) as f64,
+                    cache_write: (next() % 20) as f64,
+                    output_excluding_reasoning: (next() % 100) as f64,
+                    reasoning: (next() % 10) as f64,
+                },
+            ));
+        }
+        for model in 0..facts.len() {
+            for n in 0..25 {
+                history.push((model, model % 3, 7, tokens(n as f64)));
+            }
+        }
+        let holdouts = [
+            model("unseen-sol", Some("gpt"), 2.0),
+            model("unseen", Some("gpt"), 1.0),
+            model("alien", Some("alien"), 3.0),
+        ];
+        let mut levels_seen = [false; 6];
+        for refresh in 0..12 {
+            // Removals represent expiry or reopening; replacements represent
+            // newly closed tasks, changed totals, and changed classification.
+            history.drain(..17);
+            for _ in 0..19 {
+                history.push((
+                    next() as usize % facts.len(),
+                    next() as usize % 3,
+                    (next() % 11) as u8,
+                    tokens((next() % 80) as f64),
+                ));
+            }
+            history[0].3.fresh_input = f64::NAN;
+            history[1].3.reasoning = -1.0;
+            facts[refresh].input_rate = Some((next() % 10) as f64);
+            facts[refresh].family = Some(format!("changed-{}", refresh % 2));
+            let tasks: Vec<_> = history
+                .iter()
+                .map(|(model, workload, bucket, tokens)| ClosedTask {
+                    model: &facts[*model],
+                    workload: workloads[*workload],
+                    iq_bucket: *bucket,
+                    tokens: *tokens,
+                })
+                .collect();
+            let index = TaskProfileIndex::new(&tasks);
+            for workload in workloads {
+                for bucket in 0..=10 {
+                    for candidate in facts.iter().chain(&holdouts) {
+                        let full = compute_profile(&tasks, candidate, workload, bucket);
+                        let batched = index.compute_profile(candidate, workload, bucket);
+                        assert_eq!(
+                            batched, full,
+                            "refresh={refresh} {workload}/{bucket} {}",
+                            candidate.model_id
+                        );
+                        if let Some(profile) = &batched {
+                            levels_seen[profile.level as usize] = true;
+                        }
+                        assert_eq!(
+                            batched.map(|p| p.tokens.list_cost(candidate)),
+                            full.map(|p| p.tokens.list_cost(candidate))
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            levels_seen.into_iter().all(|seen| seen),
+            "every fallback level must be exercised"
+        );
+    }
 
     fn model(id: &str, family: Option<&str>, rate: f64) -> ModelFact {
         serde_json::from_value(serde_json::json!({

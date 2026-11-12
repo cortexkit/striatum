@@ -58,6 +58,7 @@ mod speed_sample_tests;
 pub mod backup;
 mod diagnostics;
 mod operator_quality;
+mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
@@ -1898,55 +1899,6 @@ impl SqliteRouteStateStore {
                 )?;
                 let routes = statement.query_map([], |row| row.get(0))?;
                 routes.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
-    }
-
-    /// List every absent route before pruning unpicked non-overrides whose last
-    /// selection is older than 30 days. Decision history is deliberately kept.
-    pub fn prune_unserved_unpicked_facts(&self) -> RouteStateResult<Vec<String>> {
-        self.store
-            .with_conn(|connection: &Connection| {
-                let tx = write_transaction(connection)?;
-                let mut statement = tx.prepare(
-                    "SELECT route_key FROM model_facts
-                     WHERE fusiform_present = 0 ORDER BY route_key",
-                )?;
-                let unserved = statement
-                    .query_map([], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
-                drop(statement);
-                tx.execute(
-                    "DELETE FROM model_route_state
-                     WHERE route_key IN (
-                       SELECT route_key FROM model_facts
-                       WHERE fusiform_present = 0
-                         AND source <> 'override'
-                         AND NOT EXISTS (
-                           SELECT 1 FROM model_route_decisions
-                           WHERE model_route_decisions.selected_route_key = model_facts.route_key
-                             AND model_route_decisions.created_at >=
-                               CAST(strftime('%s', 'now') AS INTEGER) * 1000
-                               - 30 * 24 * 60 * 60 * 1000
-                         )
-                     )",
-                    [],
-                )?;
-                tx.execute(
-                    "DELETE FROM model_facts
-                     WHERE fusiform_present = 0
-                       AND source <> 'override'
-                       AND NOT EXISTS (
-                         SELECT 1 FROM model_route_decisions
-                         WHERE model_route_decisions.selected_route_key = model_facts.route_key
-                           AND model_route_decisions.created_at >=
-                             CAST(strftime('%s', 'now') AS INTEGER) * 1000
-                             - 30 * 24 * 60 * 60 * 1000
-                       )",
-                    [],
-                )?;
-                crate::evaluation_snapshot::timed_commit(tx)?;
-                Ok(unserved)
             })
             .map_err(err)
     }
