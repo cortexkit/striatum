@@ -469,7 +469,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -1246,7 +1246,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -2048,7 +2048,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -2825,7 +2825,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -3627,7 +3627,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -4404,7 +4404,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -5206,7 +5206,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -5983,7 +5983,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -6785,7 +6785,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -7562,7 +7562,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -8364,7 +8364,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -9141,7 +9141,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -9943,7 +9943,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -10720,7 +10720,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -11522,7 +11522,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -12299,7 +12299,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -13101,7 +13101,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -13893,7 +13893,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -14695,7 +14695,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -15476,7 +15476,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -16278,7 +16278,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -17070,7 +17070,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -17872,7 +17872,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -18666,7 +18666,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -19468,7 +19468,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -20245,7 +20245,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -21037,7 +21037,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -21839,7 +21839,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -22616,7 +22616,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -23410,7 +23410,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -27262,7 +27262,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -28855,7 +28855,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -30443,7 +30443,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -31332,7 +31332,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -31706,7 +31706,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -32080,7 +32080,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -32450,7 +32450,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -32818,7 +32818,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -33943,7 +33943,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -34722,7 +34722,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -36500,7 +36500,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -37273,7 +37273,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -38068,7 +38068,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -38826,7 +38826,7 @@
           },
           "reply": {
             "result": {
-              "anchorVersion": 6,
+              "anchorVersion": 5,
               "catalogFingerprint": "6d44b9223a879429",
               "createdAtMs": 1800000000000,
               "decisionID": "dec_000000000000",
@@ -39443,7 +39443,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -40617,7 +40617,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -42055,7 +42055,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -43122,7 +43122,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,
@@ -43406,7 +43406,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "6d44b9223a879429",
                 "consumer": "athena",
                 "created_at": 1800000000000,

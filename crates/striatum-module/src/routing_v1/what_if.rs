@@ -220,7 +220,8 @@ pub(super) async fn what_if_with_profile_lookup(
         results.push(row);
     }
     let mut result =
-        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms});
+        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms,
+            "anchor_version": live.scoring_anchor_version()});
     if !panels.is_empty() {
         let dry = super::panels::DryRun {
             live_config: live.clone(),

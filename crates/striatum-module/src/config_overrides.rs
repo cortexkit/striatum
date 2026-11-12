@@ -77,6 +77,16 @@ pub(crate) struct PricingPatch {
 }
 
 impl LiveConfig {
+    pub(crate) fn scoring_anchor_version(&self) -> u32 {
+        self.config
+            .model_routing
+            .overqualification
+            .resolve()
+            .expect("validated config")
+            .mode
+            .anchor_version()
+    }
+
     pub(crate) fn service_tier(
         &self,
         consumer: &str,

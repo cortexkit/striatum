@@ -7,8 +7,9 @@
 
 use crate::model_facts::ModelScores;
 
-/// Bump when persisted decision scoring semantics change.
-pub const ANCHOR_VERSION: u32 = 6;
+/// Persisted scoring anchor for the default additive formula. Keep the legacy
+/// anchor while that formula is the default; opt-in formulas carry their own.
+pub const ANCHOR_VERSION: u32 = 5;
 
 pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 
@@ -29,6 +30,17 @@ pub enum OverqualificationMode {
     #[default]
     Additive,
     CostScaled,
+}
+
+impl OverqualificationMode {
+    /// Identify the formula used to interpret a persisted score, not its price
+    /// inputs. Banked quota changes pressure, but leaves score semantics intact.
+    pub const fn anchor_version(self) -> u32 {
+        match self {
+            Self::Additive => ANCHOR_VERSION,
+            Self::CostScaled => 6,
+        }
+    }
 }
 
 /// Additive mode retains the configurable legacy term. Cost-scaled mode uses

@@ -475,6 +475,48 @@ async fn what_if_reports_the_same_estimated_task_dollars_as_live_selection() {
 }
 
 #[tokio::test]
+async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() {
+    for (settings, anchor) in [
+        (json!({}), 5),
+        (json!({"providers":{"example-subscription":{"banked_resets":"capacity"}}}), 5),
+        (json!({"overqualification":{"mode":"cost_scaled"}}), 6),
+    ] {
+        let (harness, consumer) = configured().await;
+        harness.edit_config(|config| {
+            if let Some(overqualification) = settings.get("overqualification") {
+                config["overqualification"] = overqualification.clone();
+            }
+            if settings.get("providers").is_some() {
+                config["providers"]["example-subscription"]["banked_resets"] = json!("capacity");
+            }
+        });
+        for (request, id_field) in [
+            (json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}), "decision_id"),
+            (json!({"targetAgent":"mason","requirements":{"iq":50,"eq":50},"availableModels":["example-provider/model-a"]}), "decisionID"),
+        ] {
+            let (ty, reply) = consumer.call("route.select", &request).await;
+            assert_eq!(ty, FrameType::Response, "{reply}");
+            let decision = harness.store().get_decision_by_id(
+                reply["result"][id_field].as_str().unwrap(),
+            ).unwrap().unwrap();
+            assert_eq!(decision.anchor_version, anchor, "{settings}: {reply}");
+        }
+        let operator = operator(&harness).await;
+        let before = rows(&harness);
+        assert_eq!(evaluate(&operator, json!({"iqs":[50]})).await["anchor_version"], anchor);
+        for (mode, expected) in [("additive",5),("cost_scaled",6)] {
+            let preview = evaluate(&operator, json!({"iqs":[50],"pricing_patch":{"overqualification":mode}})).await;
+            assert_eq!(preview["anchor_version"], expected);
+        }
+        assert_eq!(
+            before,
+            rows(&harness),
+            "preview anchors must not write decisions"
+        );
+    }
+}
+
+#[tokio::test]
 async fn what_if_patch_replaces_only_named_fields_and_never_publishes_settings() {
     let (harness, _) = configured().await;
     harness.edit_config(|config| {

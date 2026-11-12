@@ -510,6 +510,7 @@ pub(super) struct PreparedSelectionInputs {
 pub(super) struct DecisionProvenance {
     pub(super) quota_signal_json: String,
     pub(super) policy_revision: String,
+    pub(super) anchor_version: u32,
 }
 
 impl DecisionProvenance {
@@ -797,6 +798,7 @@ pub(super) fn price_selection_inputs_with_probes(
     let provenance = DecisionProvenance {
         quota_signal_json,
         policy_revision: outcome.policy_revision,
+        anchor_version: outcome.routing_config.overqualification.mode.anchor_version(),
     };
     // Borrowed rows are added after the live overlays so they carry the target's
     // current quality data, and before pricing so they get their own plane.
@@ -3275,6 +3277,7 @@ async fn handle_select_panel(
     let provenance = DecisionProvenance {
         quota_signal_json: prepared.quota_signal_json.clone(),
         policy_revision,
+        anchor_version: routing_config.overqualification.mode.anchor_version(),
     };
     // Providers with no catalog rows borrow their catalog provider's rows;
     // the operator's subscription coverage, never the caller's
@@ -3977,7 +3980,7 @@ pub(super) fn panel_decision_input(
         explanation_json: Some(serde_json::to_string(&explanation).unwrap_or_else(|_| "{}".into())),
         quota_signal_json: Some(provenance.quota_signal_json.clone()),
         policy_revision: Some(provenance.policy_revision.clone()),
-        anchor_version: ANCHOR_VERSION,
+        anchor_version: provenance.anchor_version,
     }
 }
 
@@ -3994,6 +3997,7 @@ pub(super) fn decision_input_for(
     let requirements_json = serde_json::to_string(requirements).unwrap_or_else(|_| "null".into());
     let quota_signal_json = provenance.map(|value| value.quota_signal_json.clone());
     let policy_revision = provenance.map(|value| value.policy_revision.clone());
+    let anchor_version = provenance.map_or(ANCHOR_VERSION, |value| value.anchor_version);
     let consumer = variant_policy::consumer_group(
         params
             .consumer
@@ -4040,7 +4044,7 @@ pub(super) fn decision_input_for(
             ),
             quota_signal_json,
             policy_revision,
-            anchor_version: ANCHOR_VERSION,
+            anchor_version,
         },
         None => {
             let failure = no_route.expect("a refusal decision must preserve its routing failure");
@@ -4095,7 +4099,7 @@ pub(super) fn decision_input_for(
                 ),
                 quota_signal_json,
                 policy_revision,
-                anchor_version: ANCHOR_VERSION,
+                anchor_version,
             }
         }
     }

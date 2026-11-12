@@ -611,7 +611,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "core",
                 "created_at": 1800000000000,
@@ -3913,7 +3913,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "core",
                 "created_at": 1800000000000,
@@ -6781,7 +6781,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "core",
                 "created_at": 1800000000000,
@@ -9404,7 +9404,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "mc_summary",
                 "created_at": 1800000000000,
@@ -9739,7 +9739,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "mc_summary",
                 "created_at": 1800000000000,
@@ -10045,7 +10045,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "mc_summary",
                 "created_at": 1800000000000,
@@ -10334,7 +10334,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "mc_summary",
                 "created_at": 1800000000000,
@@ -11135,7 +11135,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "b2d26ae4b48b4be6",
                 "consumer": "mc_summary",
                 "created_at": 1800000000000,
@@ -14121,7 +14121,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "1f0dd66127a37ff3",
                 "consumer": "mason",
                 "created_at": 1800000000000,
@@ -15027,7 +15027,7 @@
               {
                 "allowed_account_class": "not_pay_per_token",
                 "allowed_providers_json": null,
-                "anchor_version": 6,
+                "anchor_version": 5,
                 "catalog_fingerprint": "1f0dd66127a37ff3",
                 "consumer": "mason",
                 "created_at": 1800000000000,

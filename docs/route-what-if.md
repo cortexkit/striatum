@@ -142,7 +142,7 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 
 ## Result
 
-The management response's `result` contains `consumer`, `results`, `snapshot_ms`
+The management response's `result` contains `consumer`, `results`, `anchor_version`, `snapshot_ms`
 and `elapsed_ms`, plus `head_choices` when requested (the unchanged
 `route.head_choices` response shape) and `panels` when `panel` is supplied. Each
 `results` row contains:
@@ -163,6 +163,12 @@ and `elapsed_ms`, plus `head_choices` when requested (the unchanged
   "excluded": [{"route": "provider/other-model", "reason": "below_floor"}]
 }
 ```
+
+`anchor_version` identifies the evaluation's scoring formula: `5` for additive
+(including the default) and `6` for cost-scaled, whether selected by persistent
+settings or this call's `pricing_patch`. It describes both the sweep and panels;
+no decision is written. A banked-reset patch changes the pressure input rather
+than score semantics, so it does not change the anchor by itself.
 
 Numbers above are illustrative. `fit` is the scorer's metric audit, with no
 entry for a zero-demand metric. `adequate` includes every policy-allowed,
