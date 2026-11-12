@@ -916,6 +916,7 @@ impl ClassContext {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn read(
         store: &SqliteRouteStateStore,
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
@@ -1877,6 +1878,7 @@ impl ClassContext {
         rows
     }
 
+    #[cfg(test)]
     fn usable(
         &self,
         row: &cortexkit_claustrum_client::ListedCredential,
@@ -2203,15 +2205,28 @@ impl ClassContext {
     /// failures remain in force; this view is used only for retry diagnostics.
     pub(crate) fn recovery_reset(&self, provider: &str, model: &str, priced: bool) -> Option<i64> {
         let mut recovered = self.clone();
-        recovered.refusals.retain(|refusal| {
-            !self.rechecks.iter().any(|origin| {
-                origin.quota
-                    && origin.kind == "credential"
-                    && origin.provider == refusal.provider_id
-                    && origin.credential_id.as_deref() == Some(refusal.credential_id.as_str())
-            })
-        });
-        recovered.rechecks.retain(|origin| !origin.quota);
+        recovered.replace_refusals(
+            self.refusals
+                .iter()
+                .filter(|refusal| {
+                    !self.rechecks.iter().any(|origin| {
+                        origin.quota
+                            && origin.kind == "credential"
+                            && origin.provider == refusal.provider_id
+                            && origin.credential_id.as_deref()
+                                == Some(refusal.credential_id.as_str())
+                    })
+                })
+                .cloned()
+                .collect(),
+        );
+        recovered.replace_rechecks(
+            self.rechecks
+                .iter()
+                .filter(|origin| !origin.quota)
+                .cloned()
+                .collect(),
+        );
         recovered.blocked_reset(provider, model, priced).flatten()
     }
 

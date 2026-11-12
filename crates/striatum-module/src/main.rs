@@ -80,10 +80,12 @@ use select::{
 };
 use select::{
     apply_variant_policy, decision_input_for, handle_select_request, policy_sources_line,
-    prepare_selection_inputs, price_selection_inputs, provider_auth_types,
-    remember_provider_identity, warn_ignored_caller_policy_once, DecisionProvenance,
-    PreparedSelectionInputs, SelectParams, SelectionPolicySources,
+    prepare_selection_inputs, provider_auth_types, remember_provider_identity,
+    warn_ignored_caller_policy_once, DecisionProvenance, PreparedSelectionInputs, SelectParams,
+    SelectionPolicySources,
 };
+#[cfg(test)]
+use select::price_selection_inputs;
 
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;

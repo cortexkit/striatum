@@ -735,12 +735,9 @@ pub(super) struct PricedSelection {
     pub(super) classes: Option<account_selection::ClassContext>,
 }
 
-/// Apply one selection's configuration to the facts and snapshot that
-/// [`prepare_selection_inputs`] read: the live overlays, the rows borrowed by
-/// providers with no catalog rows, Broca's billing-plane prices, the
-/// credential entitlement fences. Every route selection runs this same sequence, so a
-/// route fenced for one caller's selection is fenced for every other.
-#[allow(clippy::too_many_arguments)]
+/// Test shorthand for [`price_selection_inputs_with_catalog`]: reads a fresh
+/// catalog snapshot and reserves probes, as a live selection does.
+#[cfg(test)]
 pub(super) fn price_selection_inputs(
     facts: &mut Vec<ModelFact>,
     quota_signal_json: String,
@@ -749,30 +746,6 @@ pub(super) fn price_selection_inputs(
     broca_credentials: &SharedBrocaCredentials,
     credentialed: bool,
     priced_per_token: bool,
-) -> Result<PricedSelection, ModuleError> {
-    price_selection_inputs_with_probes(
-        facts,
-        quota_signal_json,
-        sources,
-        store,
-        broca_credentials,
-        credentialed,
-        priced_per_token,
-        true,
-    )
-}
-
-/// Evaluation passes an isolated account store and skips probe reservations:
-/// it never holds a credential's next retry of a previous provider refusal.
-pub(super) fn price_selection_inputs_with_probes(
-    facts: &mut Vec<ModelFact>,
-    quota_signal_json: String,
-    sources: &SelectionPolicySources<'_>,
-    store: &SharedStore,
-    broca_credentials: &SharedBrocaCredentials,
-    credentialed: bool,
-    priced_per_token: bool,
-    reserve_probes: bool,
 ) -> Result<PricedSelection, ModuleError> {
     price_selection_inputs_with_catalog(
         facts,
@@ -783,10 +756,22 @@ pub(super) fn price_selection_inputs_with_probes(
         broca_credentials,
         credentialed,
         priced_per_token,
-        reserve_probes,
+        true,
     )
 }
 
+/// Apply one selection's configuration to the facts and snapshot that
+/// [`prepare_selection_inputs`] read: the live overlays, the rows borrowed by
+/// providers with no catalog rows, the rates each credential kind is billed at
+/// (Fusiform's `BillingPlane` rows), the
+/// credential entitlement fences. Every route selection runs this same sequence, so a
+/// route fenced for one caller's selection is fenced for every other.
+///
+/// `catalog_snapshot` is the catalog view the facts were read from, so the
+/// account indexes are keyed to that same view; `None` reads a fresh one.
+/// Evaluation passes an isolated account store and `reserve_probes: false`:
+/// it never holds a credential's next retry of a previous provider refusal.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn price_selection_inputs_with_catalog(
     facts: &mut Vec<ModelFact>,
     quota_signal_json: String,
