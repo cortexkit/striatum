@@ -228,7 +228,11 @@ struct RequestIndexes {
     blocks: std::sync::OnceLock<BlockIndex>,
     readings: std::sync::OnceLock<ReadingIndex>,
     rechecks: std::sync::OnceLock<RecheckIndex>,
+    probe_holds: std::sync::Mutex<std::collections::HashMap<ProbeHoldKey, i64>>,
 }
+
+/// Provider, credential and the context's probe owner.
+type ProbeHoldKey = (String, String, Option<String>);
 
 #[cfg(test)]
 static INDEX_BUILDS: [std::sync::atomic::AtomicU64; 3] =
@@ -458,6 +462,56 @@ impl ClassContext {
             .unwrap();
         *due.entry(key)
             .or_insert_with(|| self.origin_due(origin, account, model))
+    }
+
+    /// When another owner's probe reservation blocks this credential.
+    ///
+    /// A reservation can vanish while a request is still running: its holder
+    /// may claim the probe, which replaces the reservation with a stored claim
+    /// this context's snapshot cannot see, or a selection may finish scoring
+    /// and release it. A hold this context has seen therefore stays in force
+    /// for the context's life. The empty-roster refusal then names the hold
+    /// that emptied the roster, and its end as the retry time, instead of
+    /// finding no cause and answering `account_not_authorized`.
+    fn probe_reserved_until(&self, provider: &str, credential: &str) -> Option<i64> {
+        let key = (
+            provider.to_owned(),
+            credential.to_owned(),
+            self.probe_owner.clone(),
+        );
+        if let Some(until) = self.probe_holds().get(&key) {
+            return Some(*until);
+        }
+        let until = probe_reservations::blocked_until(
+            &self.probe_scope,
+            provider,
+            credential,
+            self.probe_owner.as_deref(),
+            self.now_ms,
+        )?;
+        Some(*self.probe_holds().entry(key).or_insert(until))
+    }
+
+    /// Record a hold that refused this context's probe claim, so a later
+    /// empty-roster refusal in the same request still sees it.
+    fn note_probe_reserved(&self, provider: &str, credential: &str, until: i64) {
+        self.probe_holds().insert(
+            (
+                provider.to_owned(),
+                credential.to_owned(),
+                self.probe_owner.clone(),
+            ),
+            until,
+        );
+    }
+
+    fn probe_holds(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ProbeHoldKey, i64>> {
+        self.indexes
+            .probe_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -1589,14 +1643,9 @@ impl ClassContext {
                 ) && !self.indexed_origin_due(origin, self.account_id(row), &fact.model_id)
             })
             && (!self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
-                || probe_reservations::blocked_until(
-                    &self.probe_scope,
-                    &fact.provider_id,
-                    &row.id,
-                    self.probe_owner.as_deref(),
-                    self.now_ms,
-                )
-                .is_none())
+                || self
+                    .probe_reserved_until(&fact.provider_id, &row.id)
+                    .is_none())
             && self.tier_accounts.as_ref().is_none_or(|accounts| {
                 accounts
                     .get(&format!("{}/{}", fact.provider_id, fact.model_id))
@@ -5239,15 +5288,7 @@ fn empty_roster_refusal(
     for row in &rows {
         if let Some(until) = classes
             .probe_eligible(provider, model, &row.id)
-            .then(|| {
-                probe_reservations::blocked_until(
-                    &classes.probe_scope,
-                    provider,
-                    &row.id,
-                    classes.probe_owner.as_deref(),
-                    now,
-                )
-            })
+            .then(|| classes.probe_reserved_until(provider, &row.id))
             .flatten()
         {
             let until = classes
@@ -6005,30 +6046,29 @@ fn serve(
                 claim,
             )?
         } else {
-            Some(claim()?)
+            probe_reservations::ProbeClaim::Store(claim()?)
         };
-        let Some(claimed) = claimed else {
-            reserved_probe = true;
-            if let Some(until) = ctx.classes.as_ref().and_then(|classes| {
-                probe_reservations::blocked_until(
-                    &classes.probe_scope,
-                    provider,
-                    &credential,
-                    classes.probe_owner.as_deref(),
-                    now,
-                )
-            }) {
-                lost_probe_fences.insert(admission.account_id.clone(), until);
-            }
-            inputs.credential_probe_notes.remove(&credential);
-            if let Some(roster) = &mut state.roster {
-                for account in &mut roster.accounts {
-                    account
-                        .credentials
-                        .retain(|record| record.credential_id != credential);
+        let claimed = match claimed {
+            probe_reservations::ProbeClaim::Store(claimed) => claimed,
+            probe_reservations::ProbeClaim::ReservedUntil(until) => {
+                reserved_probe = true;
+                // Use the hold that refused this claim, not a second look:
+                // its holder may claim the probe and drop the hold before an
+                // empty roster is explained below.
+                if let Some(classes) = &ctx.classes {
+                    classes.note_probe_reserved(provider, &credential, until);
                 }
+                lost_probe_fences.insert(admission.account_id.clone(), until);
+                inputs.credential_probe_notes.remove(&credential);
+                if let Some(roster) = &mut state.roster {
+                    for account in &mut roster.accounts {
+                        account
+                            .credentials
+                            .retain(|record| record.credential_id != credential);
+                    }
+                }
+                continue;
             }
-            continue;
         };
         match claimed {
             striatum_store::CredentialProbeClaim::Claimed => break decision,

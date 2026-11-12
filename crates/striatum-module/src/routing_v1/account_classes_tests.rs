@@ -4067,8 +4067,8 @@ async fn a_probe_claimed_between_roster_and_refusal_still_answers_a_timed_wait()
     let observed = runner.call("route.account_observe", &refusal).await;
     assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
 
-    // At the fence's deadline one probe is due, and selection binds its
-    // reservation to the probe decision.
+    // An hour after the credit refusal its route fence is due for one
+    // probe, and selection binds that probe's reservation to its decision.
     let deadline = receipt + 3_600_000;
     let _due = crate::InjectedClock::set(deadline);
     credit_xai_reading(Some(0.0), deadline as i64);

@@ -103,6 +103,14 @@ impl Drop for Selection {
     }
 }
 
+/// What a probe claim found: another owner's reservation, which refuses the
+/// claim without asking the store, or the store's answer.
+pub(super) enum ProbeClaim {
+    /// Another owner's live reservation holds the probe until this time.
+    ReservedUntil(i64),
+    Store(striatum_store::CredentialProbeClaim),
+}
+
 pub(super) fn claim(
     scope: &Weak<Mutex<BrocaCredentials>>,
     provider: &str,
@@ -112,18 +120,16 @@ pub(super) fn claim(
     claim: impl FnOnce() -> striatum_core::route_state_store::RouteStateResult<
         striatum_store::CredentialProbeClaim,
     >,
-) -> striatum_core::route_state_store::RouteStateResult<
-    Option<striatum_store::CredentialProbeClaim>,
-> {
+) -> striatum_core::route_state_store::RouteStateResult<ProbeClaim> {
     let mut reservations = live(now);
-    if reservations.iter().any(|entry| {
+    if let Some(holder) = reservations.iter().find(|entry| {
         entry.scope.ptr_eq(scope)
             && entry.provider == provider
             && entry.credential == credential
             && Some(entry.owner.as_str()) != owner
             && Some(entry.selection_owner.as_str()) != owner
     }) {
-        return Ok(None);
+        return Ok(ProbeClaim::ReservedUntil(holder.expires_at));
     }
     let claimed = claim()?;
     if matches!(
@@ -136,5 +142,5 @@ pub(super) fn claim(
                 || entry.credential != credential
         });
     }
-    Ok(Some(claimed))
+    Ok(ProbeClaim::Store(claimed))
 }
