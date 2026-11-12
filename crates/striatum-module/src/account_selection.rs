@@ -2826,6 +2826,8 @@ fn conversation_hash(salt: &str, principal: &str, conversation_key: &str) -> Str
 ///   without it hashes exactly as it did before the member existed.
 /// - `service_tier`: in when present; changing the requested service tier is a
 ///   different admission. Omission preserves existing fingerprints.
+/// - `warm_credential`: in when present; changing the first-admission hint
+///   changes identity, while omission preserves existing fingerprints.
 /// Unknown fields are ignored by parsing, so quota hints, digests and timestamps
 /// outside this schema cannot change identity either.
 ///
@@ -2855,6 +2857,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         parent_conversation_key: Option<&'a str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        warm_credential: Option<&'a str>,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -2875,6 +2879,7 @@ fn fingerprint(params: &AccountForParams) -> String {
         pool: params.pool.as_deref(),
         parent_conversation_key: params.parent_conversation_key.as_deref(),
         service_tier: params.service_tier,
+        warm_credential: params.warm_credential.as_deref(),
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -4302,6 +4307,8 @@ struct AccountForParams {
     #[serde(default)]
     preferred_existing_account: Option<AccountRefParams>,
     #[serde(default)]
+    warm_credential: Option<String>,
+    #[serde(default)]
     hold_wait_max_s: Option<u64>,
     /// The quota pool the requested model draws on, as the runner names it;
     /// absent means the account is one pool.
@@ -4403,6 +4410,14 @@ impl AccountForParams {
                 self.preferred_existing_account
                     .as_ref()
                     .and_then(AccountRefParams::to_ref)
+                    // An explicit pin remains routing policy, not a warming
+                    // preference. Both one-time hints use the allocator's
+                    // import checks rather than pretending to be a live pin.
+                    .or_else(|| {
+                        (self.mode == RequestMode::Admit && self.requested_account.is_none())
+                            .then(|| self.warm_credential.clone().map(AccountRef::CredentialId))
+                            .flatten()
+                    })
             } else {
                 None
             },
@@ -6257,6 +6272,16 @@ fn serve(
     }
     let decision_id = new_id("acd");
     let mut context = json!({ "roster": roster.context });
+    if let Some(credential) = &params.warm_credential {
+        let result = if affinity_row.is_some() {
+            json!({"kind":"ignored", "reason":"existing_affinity"})
+        } else if params.requested_account.is_some() {
+            json!({"kind":"ignored", "reason":"explicit_pin"})
+        } else {
+            wire(&decision.explanation.import)
+        };
+        context["warm_credential"] = json!({"credential_id":credential, "result":result});
+    }
     if ctx
         .classes
         .as_ref()
