@@ -115,6 +115,11 @@
         "$ref": "#/$defs/QuotaModelPoolConfig"
       }
     },
+    "retention": {
+      "description": "How long the routing store keeps each history table.",
+      "$ref": "#/$defs/RetentionSection",
+      "default": {}
+    },
     "runners": {
       "type": "array",
       "default": [],
@@ -1098,6 +1103,66 @@
         "eq",
         "cost"
       ]
+    },
+    "RetentionSection": {
+      "description": "How long the routing store keeps each history table, in whole days, and\nhow many decisions keep full scoring detail. The retention pass rereads\nthis block every minute. A value that is not a whole number keeps its\ndefault and one below its minimum is raised to it, each with a warning, so\na bad value here never rejects the rest of the file.",
+      "type": "object",
+      "properties": {
+        "account_observation_days": {
+          "description": "Runner observation log. Default 7, minimum 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1
+        },
+        "account_selection_days": {
+          "description": "Served account-selection history, after each row's last activity.\nDefault 30, minimum 7.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 7
+        },
+        "model_route_decisions_days": {
+          "description": "Route decision ledger, as the compact record. Default 30, minimum 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1
+        },
+        "model_route_decisions_full_detail_days": {
+          "description": "Full per-candidate scoring and quota signals of a decision, before\nthey are compacted. Default 2, minimum 1.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1
+        },
+        "model_route_decisions_full_detail_sample_one_in": {
+          "description": "One decision in this many, chosen by a hash of its id, keeps full\ndetail for the whole decision window. Default 20; 0 keeps none.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "model_route_usage_days": {
+          "description": "Per-message usage. Default 30, minimum 7.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 7
+        }
+      }
     },
     "RunnerPolicy": {
       "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",

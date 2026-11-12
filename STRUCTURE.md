@@ -10,7 +10,8 @@ crates/
 docs/specs/model-routing.md    routing policy specification
 test-vectors/route-*/          reply samples routing publishes for its consumers
 scripts/                       source checks and rust-test-gate.sh
-script/                        deploy, signing and offline store-move scripts
+scripts/experiments/           offline studies over a read-only store (calibration replay)
+script/                        deploy, signing, offline store-move and compaction scripts
 .cargo/                        SQLite build flag and the macOS test-binary signer
 .config/nextest.toml           test timeouts and real-daemon test limits
 ```

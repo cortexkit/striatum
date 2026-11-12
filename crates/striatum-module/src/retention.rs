@@ -22,8 +22,37 @@
 //!   send id, the decision list and per-task reads walk recent rows, and the
 //!   health sentinel scans the last day. `model_route_parent_failures`, its
 //!   per-head failure copy, follows the same window.
+//! - The scoring detail inside a decision (`score_json`'s full candidate list
+//!   and `quota_signal_json`'s per-capacity signals) is kept for
+//!   `model_route_decisions_full_detail_days`, then compacted in place (see
+//!   the store's `decision_detail.rs`). The compact record keeps what readers
+//!   use for the whole decision window: the picked route's fit and pricing
+//!   (`objective.taskPricing.valueMultiplier` among them), `alsoAdequate` with
+//!   those routes' candidate rows, `rejected_json`, the explanation and
+//!   `policy_revision`. One decision in
+//!   `model_route_decisions_full_detail_sample_one_in`, chosen by a hash of
+//!   its id, keeps full detail for the whole window for offline calibration.
 //! - `model_route_usage`: observed speed and class token profiles read a
 //!   trailing seven-day window, so the usage window never goes below that.
+//! - routing/v1 replay records (`routing_v1_decision` with its
+//!   `routing_v1_report` and `routing_v1_report_delivery`, and
+//!   `routing_v1_admission`): a decision is current for ten minutes and a
+//!   re-sent report or admission comes within minutes, so they are kept for
+//!   [`V1_REPLAY_WINDOW_MS`] (a week) and longer while a live run still needs
+//!   them. `routing_v1_affinity` follows the same window.
+//! - `account_continue`: kept while its run is live, then for
+//!   [`CONTINUATION_WINDOW_MS`] after the run finished or the offer lapsed.
+//! - `model_route_speed_samples`: observed speed reads the newest twenty
+//!   samples of the last seven days; older samples are cut to the newest
+//!   [`SPEED_SAMPLES_KEPT_PAST_WINDOW`] per route and served population, and
+//!   none outlives [`SPEED_SAMPLE_CAP_MS`].
+//! - `routing_call_count`: rows idle for [`ROUTING_CALL_COUNT_WINDOW_MS`] go,
+//!   and the call window's start moves up with them.
+//! - `fence_retired_origin`: an archive nothing reads back; kept for
+//!   [`RETIRED_FENCE_ORIGIN_WINDOW_MS`].
+//! - `routing_unscored_admissible_models`: diagnostics read sightings within
+//!   their scan window; kept for the decision window after the last sighting.
+//! - `quota_reading_log`: kept for `READING_LOG_RETENTION_DAYS` (three).
 //!
 //! The windows come from the `retention` block of the routing file, re-read
 //! every pass. Deleting rows frees pages inside the database file for reuse;
@@ -54,6 +83,21 @@ pub const RETENTION_MAX_BATCHES_PER_TABLE: usize = 16;
 /// second a minute on average, in short slices, and that backlog clears in
 /// about three and a half hours.
 pub const SHADOW_PURGE_MAX_BATCHES: usize = 32;
+/// Decisions one compaction batch walks. Each compacted decision is read
+/// whole, parsed and rewritten while the batch holds the writer. Measured on
+/// live-sized rows (177 KB of scoring, 17 KB of quota signals; the ignored
+/// `measure_strip_batch_writer_hold` test in the store, release build, warm
+/// page cache), a batch held the writer for a median of about 1.2 ms per row
+/// plus 1 ms: 9.7 ms for 8 rows, 18 ms for 16, 37 ms for 32. Eight rows keep a
+/// batch near 10 ms, leaving room under a 20 ms budget for pages read cold
+/// from a large store.
+pub const DETAIL_STRIP_BATCH_ROWS: usize = 8;
+/// Most compaction batches one pass runs. With eight rows a batch a pass
+/// (one a minute) compacts about 500 decisions, where serving records about
+/// three a minute (4,300 a day on a busy install), so a first deployment's
+/// backlog of about 175,000 decisions drains in about six hours. With the pause between batches a pass spends about two seconds
+/// a minute on it, in slices of about 10 ms.
+pub const DETAIL_STRIP_MAX_BATCHES: usize = 64;
 /// Pause between batches so request handlers waiting for the store's single
 /// connection get it between deletes.
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(25);
@@ -68,6 +112,28 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 /// rows (18 MB), where the week the observation log keeps is about 520 MB.
 pub const OBSERVATION_EVENT_KEY_WINDOW_MS: i64 = 6 * HOUR_MS;
 
+/// How long routing/v1 decision bindings, report records and admission
+/// replay records are kept. A decision is current routing for ten minutes, a
+/// reservation must start within a minute, and runners re-send a report or an
+/// admission within minutes of the first; a week covers a frozen run that
+/// reports days later, with margin. Rows a live run still names are kept past
+/// it.
+pub const V1_REPLAY_WINDOW_MS: i64 = 7 * DAY_MS;
+/// How long a continuation answer outlives the end of its run (the run's
+/// finish, or the offer's release or deadline).
+pub const CONTINUATION_WINDOW_MS: i64 = 7 * DAY_MS;
+/// The oldest a generation-speed sample may be.
+pub const SPEED_SAMPLE_CAP_MS: i64 = 30 * DAY_MS;
+/// Samples kept per route and served population once they are older than the
+/// seven-day observed-speed window: as many as one observed-speed read uses.
+pub const SPEED_SAMPLES_KEPT_PAST_WINDOW: usize =
+    striatum_core::route_state_store::OBSERVED_SPEED_SAMPLE_LIMIT as usize;
+/// How long a call-count row stays after its last call. Handler retirement
+/// asks for fourteen quiet days, so thirty leaves margin.
+pub const ROUTING_CALL_COUNT_WINDOW_MS: i64 = 30 * DAY_MS;
+/// How long an archived, retired fence origin is kept.
+pub const RETIRED_FENCE_ORIGIN_WINDOW_MS: i64 = 30 * DAY_MS;
+
 /// How long each log keeps its rows. Every value is a whole number of the
 /// unit in its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +143,12 @@ pub struct RetentionWindows {
     pub account_selection_days: u64,
     pub account_observation_days: u64,
     pub model_route_decisions_days: u64,
+    /// How long a decision keeps its full scoring detail before it is
+    /// compacted.
+    pub model_route_decisions_full_detail_days: u64,
+    /// One decision in this many keeps full scoring detail for the whole
+    /// decision window. Zero keeps none; one keeps all.
+    pub model_route_decisions_full_detail_sample_one_in: u64,
     pub model_route_usage_days: u64,
 }
 
@@ -86,6 +158,8 @@ impl Default for RetentionWindows {
             account_selection_days: 30,
             account_observation_days: 7,
             model_route_decisions_days: 30,
+            model_route_decisions_full_detail_days: 2,
+            model_route_decisions_full_detail_sample_one_in: 20,
             model_route_usage_days: 30,
         }
     }
@@ -99,7 +173,7 @@ struct WindowKey {
     field: fn(&mut RetentionWindows) -> &mut u64,
 }
 
-const WINDOW_KEYS: [WindowKey; 4] = [
+const WINDOW_KEYS: [WindowKey; 6] = [
     WindowKey {
         // A frozen run can report its finish days after its admission, and a
         // conversation stays pinned for seven idle days; a week is the floor.
@@ -116,6 +190,18 @@ const WINDOW_KEYS: [WindowKey; 4] = [
         key: "model_route_decisions_days",
         minimum: 1,
         field: |w| &mut w.model_route_decisions_days,
+    },
+    WindowKey {
+        // Core prices a run from the picked route's task pricing minutes after
+        // the decision, and the compact record keeps that; one day is the floor.
+        key: "model_route_decisions_full_detail_days",
+        minimum: 1,
+        field: |w| &mut w.model_route_decisions_full_detail_days,
+    },
+    WindowKey {
+        key: "model_route_decisions_full_detail_sample_one_in",
+        minimum: 0,
+        field: |w| &mut w.model_route_decisions_full_detail_sample_one_in,
     },
     WindowKey {
         // Observed speed and class token profiles average the last seven days
@@ -221,6 +307,24 @@ pub struct RetentionPassReport {
     /// Per-head failure copies whose decision is past the decision window.
     pub parent_failures: usize,
     pub route_usage: usize,
+    /// Decisions whose scoring detail was compacted.
+    pub decision_details_stripped: usize,
+    /// Decisions past the full-detail window passed over at full detail
+    /// because they are in the sample.
+    pub decision_details_sampled: usize,
+    pub v1_decisions: usize,
+    /// Report records deleted with their decision, or as orphans.
+    pub v1_reports: usize,
+    /// Per-delivery report records deleted with their decision, or as orphans.
+    pub v1_report_deliveries: usize,
+    pub v1_admissions: usize,
+    pub v1_affinities: usize,
+    pub account_continuations: usize,
+    pub speed_samples: usize,
+    pub routing_call_counts: usize,
+    pub retired_fence_origins: usize,
+    pub unscored_admissible_models: usize,
+    pub quota_readings: usize,
     /// Batches run across all tables.
     pub batches: usize,
     /// False when some table used its whole batch budget and may have more
@@ -241,6 +345,18 @@ impl RetentionPassReport {
             + self.route_decisions
             + self.parent_failures
             + self.route_usage
+            + self.decision_details_stripped
+            + self.v1_decisions
+            + self.v1_reports
+            + self.v1_report_deliveries
+            + self.v1_admissions
+            + self.v1_affinities
+            + self.account_continuations
+            + self.speed_samples
+            + self.routing_call_counts
+            + self.retired_fence_origins
+            + self.unscored_admissible_models
+            + self.quota_readings
     }
 }
 
@@ -249,6 +365,12 @@ impl RetentionPassReport {
 #[derive(Debug, Clone, Copy)]
 pub struct PassBudget {
     pub batch_rows: usize,
+    /// Decisions one compaction batch walks. Each decision it compacts is
+    /// read whole (about 150 KB) and rewritten, so its batches are smaller
+    /// than the delete batches.
+    pub detail_batch_rows: usize,
+    /// Most compaction batches one pass runs.
+    pub max_detail_batches: usize,
     pub max_batches_per_table: usize,
     pub max_shadow_purge_batches: usize,
     pub pause: Duration,
@@ -258,6 +380,8 @@ impl Default for PassBudget {
     fn default() -> Self {
         Self {
             batch_rows: RETENTION_BATCH_ROWS,
+            detail_batch_rows: DETAIL_STRIP_BATCH_ROWS,
+            max_detail_batches: DETAIL_STRIP_MAX_BATCHES,
             max_batches_per_table: RETENTION_MAX_BATCHES_PER_TABLE,
             max_shadow_purge_batches: SHADOW_PURGE_MAX_BATCHES,
             pause: RETENTION_BATCH_PAUSE,
@@ -274,6 +398,26 @@ fn drain(
     budget: &PassBudget,
     max_batches: usize,
     batches_so_far: &mut usize,
+    batch: impl FnMut() -> Result<(usize, usize), String>,
+) -> (usize, bool) {
+    drain_batches(
+        table,
+        budget.batch_rows,
+        budget,
+        max_batches,
+        batches_so_far,
+        batch,
+    )
+}
+
+/// [`drain`] for a table whose batches hold `batch_rows` rows rather than the
+/// budget's delete batch size.
+fn drain_batches(
+    table: &str,
+    batch_rows: usize,
+    budget: &PassBudget,
+    max_batches: usize,
+    batches_so_far: &mut usize,
     mut batch: impl FnMut() -> Result<(usize, usize), String>,
 ) -> (usize, bool) {
     let mut deleted = 0;
@@ -285,7 +429,7 @@ fn drain(
         match batch() {
             Ok((removed, examined)) => {
                 deleted += removed;
-                if examined < budget.batch_rows {
+                if examined < batch_rows {
                     return (deleted, true);
                 }
             }
@@ -390,6 +534,107 @@ pub fn run_retention_pass(
     let (usage, usage_drained) = drain("model_route_usage", budget, per_table, batches, || {
         counted(store.prune_route_usage(usage_before, rows))
     });
+    let full_detail_before = before(
+        now_ms,
+        window_ms(windows.model_route_decisions_full_detail_days, DAY_MS),
+    );
+    let mut details_sampled = 0;
+    let (details_stripped, details_drained) = drain_batches(
+        "model_route_decisions (detail)",
+        budget.detail_batch_rows,
+        budget,
+        budget.max_detail_batches,
+        batches,
+        || {
+            store
+                .strip_decision_detail(
+                    full_detail_before,
+                    windows.model_route_decisions_full_detail_sample_one_in,
+                    budget.detail_batch_rows,
+                    now_ms,
+                )
+                .map(|batch| {
+                    details_sampled += batch.sampled;
+                    (batch.stripped, batch.examined)
+                })
+                .map_err(|error| error.0)
+        },
+    );
+    // Continuations go before the v1 decisions they name, so one pass can
+    // retire a finished run's whole lineage.
+    let continuation_before = before(now_ms, CONTINUATION_WINDOW_MS);
+    let (continuations, continuations_drained) =
+        drain("account_continue", budget, per_table, batches, || {
+            counted(store.prune_account_continuations(continuation_before, rows))
+        });
+    let replay_before = before(now_ms, V1_REPLAY_WINDOW_MS);
+    let (mut v1_reports, mut v1_report_deliveries) = (0, 0);
+    let (v1_decisions, v1_decisions_drained) =
+        drain("routing_v1_decision", budget, per_table, batches, || {
+            store
+                .prune_v1_decisions(replay_before, rows)
+                .map(|batch| {
+                    v1_reports += batch.reports;
+                    v1_report_deliveries += batch.deliveries;
+                    (batch.decisions, batch.decisions)
+                })
+                .map_err(|error| error.0)
+        });
+    let (orphan_reports, orphan_reports_drained) =
+        drain("routing_v1_report", budget, per_table, batches, || {
+            counted(store.prune_orphan_v1_reports(replay_before, rows))
+        });
+    let (orphan_deliveries, orphan_deliveries_drained) = drain(
+        "routing_v1_report_delivery",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_orphan_v1_report_deliveries(replay_before, rows)),
+    );
+    let (v1_admissions, v1_admissions_drained) =
+        drain("routing_v1_admission", budget, per_table, batches, || {
+            counted(store.prune_v1_admissions(replay_before, rows))
+        });
+    let (v1_affinities, v1_affinities_drained) =
+        drain("routing_v1_affinity", budget, per_table, batches, || {
+            counted(store.prune_v1_affinities(replay_before, rows))
+        });
+    let speed_window_start = before(
+        now_ms,
+        striatum_core::route_state_store::OBSERVED_SPEED_WINDOW_MS as i64,
+    );
+    let speed_cap_before = before(now_ms, SPEED_SAMPLE_CAP_MS);
+    let (speed_samples, speed_samples_drained) =
+        drain("model_route_speed_samples", budget, per_table, batches, || {
+            counted(store.prune_speed_samples(
+                speed_window_start,
+                speed_cap_before,
+                SPEED_SAMPLES_KEPT_PAST_WINDOW,
+                rows,
+            ))
+        });
+    let calls_before = before(now_ms, ROUTING_CALL_COUNT_WINDOW_MS);
+    let (call_counts, call_counts_drained) =
+        drain("routing_call_count", budget, per_table, batches, || {
+            counted(store.prune_routing_call_counts(calls_before, rows))
+        });
+    let retired_before = before(now_ms, RETIRED_FENCE_ORIGIN_WINDOW_MS);
+    let (retired_origins, retired_origins_drained) =
+        drain("fence_retired_origin", budget, per_table, batches, || {
+            counted(store.prune_retired_fence_origins(retired_before, rows))
+        });
+    let (unscored, unscored_drained) = drain(
+        "routing_unscored_admissible_models",
+        budget,
+        per_table,
+        batches,
+        || counted(store.prune_unscored_admissible_models(decided_before, rows)),
+    );
+    let readings_before = striatum_core::quota_poll::reading_log_retention_cutoff(now_ms);
+    let (quota_readings, quota_readings_drained) =
+        drain("quota_reading_log", budget, per_table, batches, || {
+            counted(store.prune_quota_reading_log(readings_before, rows))
+        });
     report.shadow_decisions = shadow;
     report.account_admissions = admissions;
     report.account_holds = holds;
@@ -401,6 +646,19 @@ pub fn run_retention_pass(
     report.route_decisions = route_decisions;
     report.parent_failures = parent_failures;
     report.route_usage = usage;
+    report.decision_details_stripped = details_stripped;
+    report.decision_details_sampled = details_sampled;
+    report.account_continuations = continuations;
+    report.v1_decisions = v1_decisions;
+    report.v1_reports = v1_reports + orphan_reports;
+    report.v1_report_deliveries = v1_report_deliveries + orphan_deliveries;
+    report.v1_admissions = v1_admissions;
+    report.v1_affinities = v1_affinities;
+    report.speed_samples = speed_samples;
+    report.routing_call_counts = call_counts;
+    report.retired_fence_origins = retired_origins;
+    report.unscored_admissible_models = unscored;
+    report.quota_readings = quota_readings;
     report.drained = shadow_drained
         && admissions_drained
         && holds_drained
@@ -410,7 +668,19 @@ pub fn run_retention_pass(
         && observation_events_drained
         && route_decisions_drained
         && parent_failures_drained
-        && usage_drained;
+        && usage_drained
+        && details_drained
+        && continuations_drained
+        && v1_decisions_drained
+        && orphan_reports_drained
+        && orphan_deliveries_drained
+        && v1_admissions_drained
+        && v1_affinities_drained
+        && speed_samples_drained
+        && call_counts_drained
+        && retired_origins_drained
+        && unscored_drained
+        && quota_readings_drained;
     report
 }
 
@@ -454,6 +724,19 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
                         route_decisions = report.route_decisions,
                         parent_failures = report.parent_failures,
                         route_usage = report.route_usage,
+                        decision_details_stripped = report.decision_details_stripped,
+                        decision_details_sampled = report.decision_details_sampled,
+                        account_continuations = report.account_continuations,
+                        v1_decisions = report.v1_decisions,
+                        v1_reports = report.v1_reports,
+                        v1_report_deliveries = report.v1_report_deliveries,
+                        v1_admissions = report.v1_admissions,
+                        v1_affinities = report.v1_affinities,
+                        speed_samples = report.speed_samples,
+                        routing_call_counts = report.routing_call_counts,
+                        retired_fence_origins = report.retired_fence_origins,
+                        unscored_admissible_models = report.unscored_admissible_models,
+                        quota_readings = report.quota_readings,
                         batches = report.batches,
                         drained = report.drained,
                         "routing retention pass"
@@ -483,6 +766,8 @@ mod tests {
                 account_selection_days: 30,
                 account_observation_days: 7,
                 model_route_decisions_days: 30,
+                model_route_decisions_full_detail_days: 2,
+                model_route_decisions_full_detail_sample_one_in: 20,
                 model_route_usage_days: 30,
             }
         );
@@ -495,6 +780,8 @@ mod tests {
             "account_selection_days": 3,
             "account_observation_days": "seven",
             "model_route_decisions_days": 45,
+            "model_route_decisions_full_detail_days": 0,
+            "model_route_decisions_full_detail_sample_one_in": 50,
             "model_route_usage_days": 3,
             "account_decision_days": 9,
         });
@@ -507,11 +794,15 @@ mod tests {
                 // Not a number: the default stays.
                 account_observation_days: 7,
                 model_route_decisions_days: 45,
+                // Core prices runs from the compact record, but a day of full
+                // detail is the floor.
+                model_route_decisions_full_detail_days: 1,
+                model_route_decisions_full_detail_sample_one_in: 50,
                 // Usage readers average seven days, so seven is the floor.
                 model_route_usage_days: 7,
             }
         );
-        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
         assert!(warnings
             .iter()
             .any(|warning| warning.contains("account_decision_days is not a known key")));
@@ -605,6 +896,8 @@ mod tests {
             .unwrap();
         let budget = PassBudget {
             batch_rows: 4,
+            detail_batch_rows: 4,
+            max_detail_batches: 1,
             max_batches_per_table: 1,
             max_shadow_purge_batches: 3,
             pause: Duration::ZERO,
@@ -697,5 +990,519 @@ mod tests {
         assert_eq!(young[0].outcome_at, NOW - HOUR_MS);
         // The observation itself is still in its week-long log.
         assert!(seven_hours.is_some());
+    }
+
+    /// A scratch store for one test. Returns the directory to delete, the
+    /// database path for raw seeding, and the open store.
+    fn scratch_store(name: &str) -> (std::path::PathBuf, std::path::PathBuf, SqliteRouteStateStore) {
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("striatum-retention-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.db");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "striatum",
+            path.to_string_lossy().into_owned(),
+        ))
+        .expect("open store");
+        (dir, path, store)
+    }
+
+    /// A raw connection for seeding rows whose referenced account history the
+    /// test leaves out, so it does not enforce foreign keys.
+    fn seeding_connection(path: &std::path::Path) -> rusqlite::Connection {
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection.pragma_update(None, "foreign_keys", false).unwrap();
+        connection
+    }
+
+    fn no_pause() -> PassBudget {
+        PassBudget {
+            pause: Duration::ZERO,
+            ..PassBudget::default()
+        }
+    }
+
+    fn count(path: &std::path::Path, sql: &str) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// Decision ids in or out of the default 1-in-20 full-detail sample.
+    fn decision_ids(sampled: bool, wanted: usize) -> Vec<String> {
+        let one_in = RetentionWindows::default().model_route_decisions_full_detail_sample_one_in;
+        (0..)
+            .map(|index| format!("dec-{index}"))
+            .filter(|id| striatum_store::in_full_detail_sample(id, one_in) == sampled)
+            .take(wanted)
+            .collect()
+    }
+
+    fn full_score() -> serde_json::Value {
+        // Not eligible, so recording it adds no unscored-model sightings.
+        let candidate = |route: &str| json!({"routeKey": route, "model": route, "elo": 1.0,
+            "eq": 1.0, "eloSource": "curated", "eqSource": "curated", "eligible": false});
+        json!({
+            "candidates": [candidate("p/pick"), candidate("q/also"), candidate("r/other"),
+                candidate("s/other")],
+            "adequacy": 1.0,
+            "selectionCost": 0.3,
+            "metrics": {"elo": {"fact": 1300.0, "target": 1250.0}},
+            "objective": {"cost": 0.3, "taskPricing": {"valueMultiplier": 6.0}},
+            "alsoAdequate": ["q/also"],
+            "pricingMode": "basket",
+        })
+    }
+
+    /// Record `id` as a decision created at `created_at`, with full detail.
+    fn record_decision_at(
+        store: &SqliteRouteStateStore,
+        path: &std::path::Path,
+        id: &str,
+        created_at: i64,
+    ) {
+        store
+            .record_decision(&striatum_core::route_state_store::DecisionInput {
+                decision_id: Some(id.into()),
+                decision_kind: "single".into(),
+                target_agent: "mason".into(),
+                requirements_json: r#"{"iq":70}"#.into(),
+                selected_route_key: Some("p/pick".into()),
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("pick".into()),
+                score_json: full_score().to_string(),
+                rejected_json: r#"[{"routeKey":"t/walled","reason":"quota_exhausted"}]"#.into(),
+                explanation_json: Some(r#"["cost-primary"]"#.into()),
+                quota_signal_json: Some(
+                    r#"{"state":"present","signals":[{"capacityKey":"p","pressure":0.2}]}"#.into(),
+                ),
+                policy_revision: Some("policy-1".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute(
+                "UPDATE model_route_decisions SET created_at = ?1 WHERE id = ?2",
+                rusqlite::params![created_at, id],
+            )
+            .unwrap();
+    }
+
+    /// Past the two-day window a decision keeps its compact record, and a
+    /// sampled decision keeps full detail until the decision window deletes it.
+    #[test]
+    fn a_pass_compacts_scoring_detail_after_two_days_except_for_the_sample() {
+        let (dir, path, store) = scratch_store("detail");
+        let plain = decision_ids(false, 3);
+        let sampled = decision_ids(true, 2);
+        record_decision_at(&store, &path, &plain[0], NOW - 3 * DAY_MS);
+        record_decision_at(&store, &path, &plain[1], NOW - 29 * DAY_MS);
+        record_decision_at(&store, &path, &plain[2], NOW - DAY_MS);
+        record_decision_at(&store, &path, &sampled[0], NOW - 3 * DAY_MS);
+        record_decision_at(&store, &path, &sampled[1], NOW - 29 * DAY_MS);
+
+        // Diagnostics read the adequate set and rejections back over up to a
+        // week; compaction must not change what they see.
+        let diagnostics_before = store
+            .diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100)
+            .unwrap();
+        assert_eq!(diagnostics_before.len(), 5);
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(
+            store.diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100).unwrap(),
+            diagnostics_before
+        );
+        assert_eq!(report.decision_details_stripped, 2);
+        assert_eq!(report.decision_details_sampled, 2);
+        assert!(report.drained);
+        for id in &plain[..2] {
+            let row = store.get_decision_by_id(id).unwrap().unwrap();
+            assert_eq!(row.detail_stripped_at, Some(NOW), "{id}");
+            let score: serde_json::Value = serde_json::from_str(&row.score_json).unwrap();
+            assert_eq!(score["alsoAdequate"], json!(["q/also"]));
+            assert_eq!(score["objective"]["taskPricing"]["valueMultiplier"], 6.0);
+            assert_eq!(score["metrics"], full_score()["metrics"]);
+            assert_eq!(score["candidates"].as_array().unwrap().len(), 2);
+            assert_eq!(score["candidatesOmitted"], 2);
+            let quota: serde_json::Value =
+                serde_json::from_str(row.quota_signal_json.as_deref().unwrap()).unwrap();
+            assert_eq!(quota, json!({"state": "present", "signalsOmitted": 1}));
+            // The compact record keeps everything else as recorded.
+            assert_eq!(row.rejected_json, r#"[{"routeKey":"t/walled","reason":"quota_exhausted"}]"#);
+            assert_eq!(row.explanation_json.as_deref(), Some(r#"["cost-primary"]"#));
+            assert_eq!(row.policy_revision.as_deref(), Some("policy-1"));
+            assert_eq!(row.requirements_json, r#"{"iq":70}"#);
+        }
+        for id in [&plain[2], &sampled[0], &sampled[1]] {
+            let row = store.get_decision_by_id(id).unwrap().unwrap();
+            assert_eq!(row.detail_stripped_at, None, "{id}");
+            let score: serde_json::Value = serde_json::from_str(&row.score_json).unwrap();
+            assert_eq!(score, full_score(), "{id}");
+        }
+
+        // Two days later the young decision is compacted too; the sampled
+        // decisions stay full until the thirty-day window deletes the older.
+        let later = NOW + 2 * DAY_MS;
+        let report = run_retention_pass(&store, &RetentionWindows::default(), later, &no_pause());
+        assert_eq!(report.decision_details_stripped, 1);
+        assert_eq!(report.route_decisions, 2, "the 29-day-old pair is past 30 days");
+        assert!(store.get_decision_by_id(&sampled[1]).unwrap().is_none());
+        let sample = store.get_decision_by_id(&sampled[0]).unwrap().unwrap();
+        assert_eq!(sample.detail_stripped_at, None);
+        assert_eq!(
+            store.get_decision_by_id(&plain[2]).unwrap().unwrap().detail_stripped_at,
+            Some(later)
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Compaction walks at most its batch size per batch and its batch budget
+    /// per pass, passes sampled decisions without stopping, and the next pass
+    /// continues where the last stopped. Delete batches keep their own bound.
+    #[test]
+    fn retention_batches_respect_their_bounds() {
+        let (dir, path, store) = scratch_store("bounds");
+        let sampled = decision_ids(true, 1);
+        let plain = decision_ids(false, 4);
+        record_decision_at(&store, &path, &sampled[0], NOW - 3 * DAY_MS);
+        for (index, id) in plain.iter().enumerate() {
+            record_decision_at(&store, &path, id, NOW - 3 * DAY_MS + 1 + index as i64);
+        }
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        for index in 0..5 {
+            connection
+                .execute(
+                    "INSERT INTO quota_reading_log (account_key, window_key, observed_at, \
+                       used_percent, is_stale) VALUES ('a/b', 'w', ?1, 10.0, 0)",
+                    [NOW - 4 * DAY_MS + index],
+                )
+                .unwrap();
+        }
+        let budget = PassBudget {
+            batch_rows: 2,
+            detail_batch_rows: 2,
+            max_detail_batches: 1,
+            max_batches_per_table: 1,
+            max_shadow_purge_batches: 1,
+            pause: Duration::ZERO,
+        };
+        let windows = RetentionWindows::default();
+        let passes: Vec<(usize, usize, usize, bool)> = (0..3)
+            .map(|_| {
+                let report = run_retention_pass(&store, &windows, NOW, &budget);
+                (
+                    report.decision_details_stripped,
+                    report.decision_details_sampled,
+                    report.quota_readings,
+                    report.drained,
+                )
+            })
+            .collect();
+        assert_eq!(
+            passes,
+            [(1, 1, 2, false), (2, 0, 2, false), (1, 0, 1, true)]
+        );
+        assert_eq!(
+            count(&path, "SELECT COUNT(*) FROM model_route_decisions WHERE detail_stripped_at IS NULL"),
+            1
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn insert_admission(
+        connection: &rusqlite::Connection,
+        admission_id: &str,
+        state: &str,
+        model_decision_id: Option<&str>,
+        times: (i64, Option<i64>, Option<i64>),
+    ) {
+        let (committed_at, finished_at, released_at) = times;
+        connection
+            .execute(
+                "INSERT INTO account_admission (principal, admission_id, request_fingerprint, \
+                   request_mode, decision_id, conversation_hash, provider, model, account_id, \
+                   credential_id, pin_id, pin_generation, state, charged, request_bytes, \
+                   request_bytes_estimated, committed_at, admission_valid_until, \
+                   lease_valid_until, reply_json, run_id, started_at, finished_at, released_at, \
+                   model_decision_id) \
+                 VALUES ('runner', ?1, 'fp', 'admit', 'acct-dec', 'conv', 'p', 'pick', 'acct', \
+                   'cred', 'pin', 1, ?2, 0, 0, 0, ?3, ?3, ?3, '{}', 'run', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    admission_id,
+                    state,
+                    committed_at,
+                    finished_at,
+                    released_at,
+                    model_decision_id
+                ],
+            )
+            .unwrap();
+    }
+
+    /// routing/v1 replay records go a week after their decision, with their
+    /// reports, unless a live run still names the decision or admission.
+    #[test]
+    fn a_pass_prunes_v1_replay_records_but_keeps_what_a_live_run_names() {
+        let (dir, path, store) = scratch_store("v1");
+        let connection = seeding_connection(&path);
+        let old = NOW - 8 * DAY_MS;
+        let recent = NOW - DAY_MS;
+        for (id, created_at) in [
+            ("old-plain", old),
+            ("old-live-admission", old),
+            ("old-continued", old),
+            ("old-previous", old),
+            ("recent", recent),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO routing_v1_decision (decision_id, principal, consumer, provider, \
+                       model, runner_module, created_at_ms, expires_at_ms) \
+                     VALUES (?1, 'runner', 'mason', 'p', 'pick', 'broca', ?2, ?2 + 600000)",
+                    rusqlite::params![id, created_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO routing_v1_report (decision_id, report_id, body_json, \
+                       answer_json, created_at_ms) VALUES (?1, 'r', '{}', '{}', ?2)",
+                    rusqlite::params![id, created_at],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO routing_v1_report_delivery (decision_id, delivery_key, \
+                       report_id, body_json, answer_json, created_at_ms) \
+                     VALUES (?1, 'outcome', 'r', '{}', '{}', ?2)",
+                    rusqlite::params![id, created_at],
+                )
+                .unwrap();
+        }
+        // A report and delivery whose decision binding is already gone.
+        connection
+            .execute_batch(&format!(
+                "INSERT INTO routing_v1_report VALUES ('gone', 'r', '{{}}', '{{}}', {old}); \
+                 INSERT INTO routing_v1_report_delivery VALUES \
+                   ('gone', 'usage', 'r', '{{}}', '{{}}', {old});"
+            ))
+            .unwrap();
+        // A run still in flight on one decision, and a live continuation
+        // linking two others.
+        insert_admission(&connection, "live", "started", Some("old-live-admission"), (old, None, None));
+        insert_admission(&connection, "live-original", "started", None, (old, None, None));
+        connection
+            .execute(
+                "INSERT INTO account_continue (principal, selection_id, request_json, \
+                   answer_json, run_id, admission_id, previous_decision_id, decision_id, \
+                   reservation_id, valid_until_ms, used_at_ms) \
+                 VALUES ('runner', 'sel', '{}', '{}', 'run', 'live-original', 'old-previous', \
+                   'old-continued', 'reservation', ?1, ?1)",
+                [old],
+            )
+            .unwrap();
+        for (admission_id, body, created_at) in [
+            ("live", r#"{"decision_id":"other"}"#, old),
+            ("other", r#"{"decision_id":"old-live-admission"}"#, old),
+            ("finished", r#"{"decision_id":"old-plain"}"#, old),
+            ("fresh", r#"{"decision_id":"recent"}"#, recent),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO routing_v1_admission (principal, admission_id, body_json, \
+                       answer_json, created_at_ms) VALUES ('runner', ?1, ?2, '{}', ?3)",
+                    rusqlite::params![admission_id, body, created_at],
+                )
+                .unwrap();
+        }
+        for (affinity, decision, updated_at) in [("stale", "old-plain", old), ("warm", "recent", recent)] {
+            connection
+                .execute(
+                    "INSERT INTO routing_v1_affinity (principal, consumer, affinity, \
+                       decision_id, updated_at_ms) VALUES ('runner', 'mason', ?1, ?2, ?3)",
+                    rusqlite::params![affinity, decision, updated_at],
+                )
+                .unwrap();
+        }
+
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.v1_decisions, 1);
+        assert_eq!(report.v1_reports, 2, "old-plain's report and the orphan");
+        assert_eq!(report.v1_report_deliveries, 2);
+        assert_eq!(report.v1_admissions, 1);
+        assert_eq!(report.v1_affinities, 1);
+        assert_eq!(report.account_continuations, 0, "its run is live");
+        let left = |table: &str, key: &str| -> Vec<String> {
+            let mut statement = connection
+                .prepare(&format!("SELECT {key} FROM {table} ORDER BY {key}"))
+                .unwrap();
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap();
+            rows.collect::<rusqlite::Result<_>>().unwrap()
+        };
+        let kept = ["old-continued", "old-live-admission", "old-previous", "recent"];
+        assert_eq!(left("routing_v1_decision", "decision_id"), kept);
+        assert_eq!(left("routing_v1_report", "decision_id"), kept);
+        assert_eq!(left("routing_v1_report_delivery", "decision_id"), kept);
+        assert_eq!(left("routing_v1_admission", "admission_id"), ["fresh", "live", "other"]);
+        assert_eq!(left("routing_v1_affinity", "affinity"), ["warm"]);
+
+        // Once the runs finish and a week passes, the rest goes too.
+        connection
+            .execute_batch(&format!(
+                "UPDATE account_admission SET state = 'finished', finished_at = {old}"
+            ))
+            .unwrap();
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.account_continuations, 1);
+        assert_eq!(report.v1_decisions, 3);
+        assert_eq!(report.v1_admissions, 2);
+        assert_eq!(left("routing_v1_decision", "decision_id"), ["recent"]);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A continuation answer goes a week after its run finished or its offer
+    /// lapsed, never while its run is live.
+    #[test]
+    fn a_pass_prunes_continuations_only_after_their_run_is_over() {
+        let (dir, path, store) = scratch_store("continue");
+        let connection = seeding_connection(&path);
+        let old = NOW - 8 * DAY_MS;
+        let recent = NOW - DAY_MS;
+        insert_admission(&connection, "finished-long-ago", "finished", None, (old, Some(old), None));
+        insert_admission(&connection, "running", "started", None, (old, None, None));
+        insert_admission(&connection, "finished-yesterday", "finished", None, (old, Some(recent), None));
+        for (selection, admission, valid_until, released_at) in [
+            ("released-offer", "finished-long-ago", Some(old), Some(old)),
+            ("hold", "finished-long-ago", None, None),
+            ("live-run", "running", Some(old), Some(old)),
+            ("run-just-finished", "finished-yesterday", Some(old), Some(old)),
+            ("admission-pruned", "gone", Some(old), None),
+            ("released-yesterday", "finished-long-ago", Some(old), Some(recent)),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO account_continue (principal, selection_id, request_json, \
+                       answer_json, run_id, admission_id, previous_decision_id, decision_id, \
+                       reservation_id, valid_until_ms, released_at_ms) \
+                     VALUES ('runner', ?1, '{}', '{}', 'run', ?2, 'previous', \
+                       CASE WHEN ?3 IS NULL THEN NULL ELSE 'next-' || ?1 END, \
+                       CASE WHEN ?3 IS NULL THEN NULL ELSE 'reservation-' || ?1 END, ?3, ?4)",
+                    rusqlite::params![selection, admission, valid_until, released_at],
+                )
+                .unwrap();
+        }
+
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.account_continuations, 3);
+        let mut statement = connection
+            .prepare("SELECT selection_id FROM account_continue ORDER BY selection_id")
+            .unwrap();
+        let left: Vec<String> = statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, ["live-run", "released-yesterday", "run-just-finished"]);
+        drop(statement);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Speed samples, call counts, retired fence origins, unscored-model
+    /// sightings and quota readings each go at their own window, and nothing
+    /// a reader still uses goes with them.
+    #[test]
+    fn a_pass_bounds_the_other_growing_tables_at_their_windows() {
+        let (dir, path, store) = scratch_store("growing");
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let mut sample = 0;
+        let mut insert_sample = |route: &str, observed_at: i64| {
+            sample += 1;
+            connection
+                .execute(
+                    "INSERT INTO model_route_speed_samples (id, route_key, provider_id, \
+                       model_id, output_tokens, duration_ms, observed_at, \
+                       population_service_tier, population_speed) \
+                     VALUES (?1, ?2, 'p', 'm', 2000, 4000, ?3, 'standard', 'standard')",
+                    rusqlite::params![format!("sample-{sample}"), route, observed_at],
+                )
+                .unwrap();
+        };
+        // A busy route: 5 samples inside the seven-day read window and 25
+        // past it, of which the 15 newest stay, so the route keeps its newest
+        // 20.
+        for index in 0..25 {
+            insert_sample("p/busy", NOW - 8 * DAY_MS - index * HOUR_MS);
+        }
+        for index in 0..5 {
+            insert_sample("p/busy", NOW - DAY_MS - index);
+        }
+        // A quiet route: two old samples stay, one past the 30-day cap goes.
+        insert_sample("p/quiet", NOW - 10 * DAY_MS);
+        insert_sample("p/quiet", NOW - 11 * DAY_MS);
+        insert_sample("p/quiet", NOW - 31 * DAY_MS);
+        connection
+            .execute_batch(&format!(
+                "UPDATE routing_call_window SET started_at_ms = {start};
+                 INSERT INTO routing_call_count VALUES ('route.old', 's', 'p', 3, {idle});
+                 INSERT INTO routing_call_count VALUES ('route.select', 's', 'p', 9, {recent});
+                 INSERT INTO fence_retired_origin VALUES ('route', '[\"x/old\"]', 'e', 0, {idle});
+                 INSERT INTO fence_retired_origin VALUES ('route', '[\"x/new\"]', 'e', 0, {recent});
+                 INSERT INTO routing_unscored_admissible_models VALUES ('m/old', 0, {idle});
+                 INSERT INTO routing_unscored_admissible_models VALUES ('m/new', 0, {recent});
+                 INSERT INTO quota_reading_log (account_key, window_key, observed_at, used_percent, is_stale)
+                   VALUES ('a/b', 'w', {four_days}, 10.0, 0), ('a/b', 'w', {two_days}, 20.0, 0);",
+                start = NOW - 100 * DAY_MS,
+                idle = NOW - 31 * DAY_MS,
+                recent = NOW - DAY_MS,
+                four_days = NOW - 4 * DAY_MS,
+                two_days = NOW - 2 * DAY_MS,
+            ))
+            .unwrap();
+
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.speed_samples, 11);
+        assert_eq!(report.routing_call_counts, 1);
+        assert_eq!(report.retired_fence_origins, 1);
+        assert_eq!(report.unscored_admissible_models, 1);
+        assert_eq!(report.quota_readings, 1);
+        assert!(report.drained);
+        assert_eq!(
+            count(&path, "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/busy'"),
+            20
+        );
+        assert_eq!(
+            count(&path, "SELECT MIN(observed_at) FROM model_route_speed_samples WHERE route_key = 'p/busy'"),
+            NOW - 8 * DAY_MS - 14 * HOUR_MS
+        );
+        assert_eq!(
+            count(&path, "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/quiet'"),
+            2
+        );
+        // The observed-speed read still finds its five samples in the window.
+        assert!(store.get_observed_speed("p/busy", NOW as f64).unwrap().is_some());
+        assert_eq!(
+            count(&path, "SELECT started_at_ms FROM routing_call_window"),
+            NOW - ROUTING_CALL_COUNT_WINDOW_MS
+        );
+        assert_eq!(count(&path, "SELECT calls FROM routing_call_count"), 9);
+        assert_eq!(
+            count(&path, "SELECT retired_at FROM fence_retired_origin"),
+            NOW - DAY_MS
+        );
+        assert_eq!(count(&path, "SELECT COUNT(*) FROM routing_unscored_admissible_models"), 1);
+        assert_eq!(
+            count(&path, "SELECT observed_at FROM quota_reading_log"),
+            NOW - 2 * DAY_MS
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

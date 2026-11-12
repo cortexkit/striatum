@@ -649,9 +649,9 @@ fn write_quota_readings(
         ));
     }
     if joined {
-        // Retention is a poll boundary, not an account boundary. Append every
-        // account in one transaction instead of one fsync per account.
-        store.prune_quota_readings(observed_at).map_err(|e| e.to_string())?;
+        // Append every account in one transaction instead of one fsync per
+        // account. Old readings are deleted by the retention pass, in bounded
+        // batches, not on this path.
         store.append_quota_readings(&rows).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -3769,6 +3769,13 @@ async fn handle_route_explain(
             "rejections": recorded_json(&decision.rejected_json),
         },
         "quotaSignalSnapshot": recorded_optional_json(decision.quota_signal_json.as_deref()),
+        // Past the full-detail window the score keeps only the picked and
+        // adequate candidates and the quota snapshot only its header; every
+        // other member is as recorded. `strippedAtMs` says when that happened.
+        "detailRetention": {
+            "detail": if decision.detail_stripped_at.is_some() { "compact" } else { "full" },
+            "strippedAtMs": decision.detail_stripped_at,
+        },
         "catalogFingerprint": decision.catalog_fingerprint,
         "policyRevision": decision.policy_revision,
         "anchorVersion": decision.anchor_version,
@@ -11563,6 +11570,111 @@ mod tests {
             "ses-explain"
         );
         assert_eq!(body["result"]["provenance"]["targetAgent"], "mason");
+    }
+
+    #[tokio::test]
+    async fn route_explain_serves_core_fields_from_a_compacted_decision() {
+        let rig = Rig::new("route-explain-compacted");
+        let store = Arc::new(rig.open_store());
+        let candidate = |route: &str| {
+            json!({"routeKey": route, "model": route, "elo": 1300.0, "eq": 1200.0,
+                "eloSource": "curated", "eqSource": "curated", "eligible": true})
+        };
+        let mut candidates: Vec<serde_json::Value> = (0..200)
+            .map(|index| candidate(&format!("p/other-{index:03}")))
+            .collect();
+        candidates.extend([candidate("p/selected"), candidate("q/adequate")]);
+        let objective = json!({
+            "cost": 0.25, "quota": 0.0, "speedScore": 0.5, "selectionCost": 0.25,
+            "taskPricing": {"profile": null, "tokens": null, "priceUnit": "mtok_output",
+                "listCostUsd": 2.0, "valueMultiplier": 6.0, "valueSource": "operator",
+                "pressure": 0.1, "finalCostUsd": 12.0, "normalizedCost": 0.25,
+                "omittedDimensions": [], "unpricedDimensions": []},
+        });
+        let metrics = json!({"elo": {"fact": 1300.0, "target": 1250.0}});
+        let score = json!({
+            "candidates": candidates,
+            "adequacy": 1.0,
+            "rawAdequacy": 1.04,
+            "selectionCost": 0.25,
+            "metrics": metrics,
+            "objective": objective,
+            "alsoAdequate": ["q/adequate"],
+            "pricingMode": "output_only",
+        });
+        let rejections = json!([{ "routeKey": "p/walled", "reason": "quota_exhausted" }]);
+        store
+            .record_decision(&DecisionInput {
+                decision_id: Some("dec-compacted".into()),
+                decision_kind: "single".into(),
+                target_agent: "mason".into(),
+                requirements_json: r#"{"iq":80,"eq":20}"#.into(),
+                selected_route_key: Some("p/selected".into()),
+                selected_provider_id: Some("p".into()),
+                selected_model_id: Some("selected".into()),
+                score_json: serde_json::to_string(&score).unwrap(),
+                rejected_json: serde_json::to_string(&rejections).unwrap(),
+                explanation_json: Some(r#"["cost-primary"]"#.into()),
+                quota_signal_json: Some(
+                    r#"{"state":"present","signals":[{"capacityKey":"p","pressure":0.1}]}"#
+                        .into(),
+                ),
+                policy_revision: Some("policy-compacted".into()),
+                anchor_version: ANCHOR_VERSION,
+                ..Default::default()
+            })
+            .unwrap();
+        async fn explain(store: &SharedStore) -> serde_json::Value {
+            let response = run_route_wire_request(
+                store,
+                json!({
+                    "method": ROUTE_EXPLAIN_OP,
+                    "params": { "decisionID": "dec-compacted" },
+                }),
+            )
+            .await;
+            assert_eq!(response.header.ty, FrameType::Response);
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone()
+        }
+        let full = explain(&store).await;
+        assert_eq!(full["detailRetention"], json!({"detail": "full", "strippedAtMs": null}));
+        assert_eq!(full["why"]["score"], score);
+
+        // The full-detail window has passed and the decision is not sampled.
+        let batch = store
+            .strip_decision_detail(i64::MAX, 0, 16, 1_234)
+            .unwrap();
+        assert_eq!(batch.stripped, 1);
+        let compact = explain(&store).await;
+        assert_eq!(
+            compact["detailRetention"],
+            json!({"detail": "compact", "strippedAtMs": 1_234})
+        );
+        // What core reads: the adequate set and policy revision for its work
+        // view, and the selected route's value multiplier for its prices.
+        assert_eq!(
+            compact.pointer("/why/score/alsoAdequate"),
+            Some(&json!(["q/adequate"]))
+        );
+        assert_eq!(compact["policyRevision"], "policy-compacted");
+        assert_eq!(
+            compact.pointer("/why/score/objective/taskPricing/valueMultiplier"),
+            Some(&json!(6.0))
+        );
+        assert_eq!(compact["why"]["score"]["objective"], objective);
+        assert_eq!(compact["why"]["score"]["metrics"], metrics);
+        assert_eq!(
+            compact["why"]["score"]["candidates"],
+            json!([candidate("p/selected"), candidate("q/adequate")])
+        );
+        assert_eq!(compact["why"]["score"]["candidatesOmitted"], 200);
+        assert_eq!(compact["why"]["rejections"], rejections);
+        assert_eq!(compact["why"]["explanation"], json!(["cost-primary"]));
+        assert_eq!(
+            compact["quotaSignalSnapshot"],
+            json!({"state": "present", "signalsOmitted": 1})
+        );
+        assert_eq!(compact["selectedRoute"]["routeKey"], "p/selected");
     }
 
     #[tokio::test]

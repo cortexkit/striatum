@@ -57,6 +57,12 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     (
+        "model_route_decision_detail_cursor",
+        "one row saying how far decision-detail compaction has walked the ledger; restored \
+         empty, compaction walks the whole ledger again, re-reading every compacted \
+         decision once before it reaches new ones",
+    ),
+    (
         "routing_v1_report_delivery",
         "first-delivery answers and per-run usage identities prevent counting retries twice",
     ),

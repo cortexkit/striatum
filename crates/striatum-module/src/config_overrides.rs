@@ -950,6 +950,9 @@ struct RoutingConfigFile {
     quota_model_pools: Vec<QuotaModelPoolConfig>,
     #[serde(default)]
     catalog: CatalogSection,
+    /// How long the routing store keeps each history table.
+    #[serde(default)]
+    retention: RetentionSection,
     #[serde(default)]
     accounts: crate::config_policy::ProviderAccountsPolicy,
 }
@@ -1186,6 +1189,42 @@ struct CatalogSection {
     #[serde(default)]
     #[schemars(range(min = 1))]
     poll_ms: Option<u64>,
+}
+
+/// How long the routing store keeps each history table, in whole days, and
+/// how many decisions keep full scoring detail. The retention pass rereads
+/// this block every minute. A value that is not a whole number keeps its
+/// default and one below its minimum is raised to it, each with a warning, so
+/// a bad value here never rejects the rest of the file.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+struct RetentionSection {
+    /// Served account-selection history, after each row's last activity.
+    /// Default 30, minimum 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>", range(min = 7))]
+    account_selection_days: Option<serde_json::Value>,
+    /// Runner observation log. Default 7, minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>", range(min = 1))]
+    account_observation_days: Option<serde_json::Value>,
+    /// Route decision ledger, as the compact record. Default 30, minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>", range(min = 1))]
+    model_route_decisions_days: Option<serde_json::Value>,
+    /// Full per-candidate scoring and quota signals of a decision, before
+    /// they are compacted. Default 2, minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>", range(min = 1))]
+    model_route_decisions_full_detail_days: Option<serde_json::Value>,
+    /// One decision in this many, chosen by a hash of its id, keeps full
+    /// detail for the whole decision window. Default 20; 0 keeps none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>")]
+    model_route_decisions_full_detail_sample_one_in: Option<serde_json::Value>,
+    /// Per-message usage. Default 30, minimum 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<u64>", range(min = 7))]
+    model_route_usage_days: Option<serde_json::Value>,
 }
 
 /// Operator config for `striatum_core::ModelNaming`, the model-id

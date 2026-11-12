@@ -480,6 +480,8 @@ fn project_additive_shape_members(value: &mut Value) {
                 "fence_retired_origin",
                 "account_non_quota_route_fence",
                 "account_non_quota_size_refusal",
+                // Compaction's scan position, covered by the retention tests.
+                "model_route_decision_detail_cursor",
             ] {
                 object.remove(table);
             }
@@ -501,6 +503,8 @@ fn project_additive_shape_members(value: &mut Value) {
                     "account_admission",
                     &["input_size_class", "model_decision_id"][..],
                 ),
+                // When retention compacted the row; recordings predate it.
+                ("model_route_decisions", &["detail_stripped_at"][..]),
             ] {
                 if let Some(rows) = object.get_mut(table).and_then(Value::as_array_mut) {
                     for row in rows {
@@ -524,6 +528,9 @@ fn project_additive_shape_members(value: &mut Value) {
             // Delivery identities are additive persistence, checked by the
             // tests for usage deduplication and crash recovery, not the pre-add snapshot.
             object.remove("routing_v1_report_delivery");
+            // route.explain's added record of whether a decision still holds
+            // full scoring detail; covered by the explain and retention tests.
+            object.remove("detailRetention");
             // Decision rows record quota signals after account eligibility, so a
             // model the account allocator found unavailable for that request
             // appears in the list as exhausted, and

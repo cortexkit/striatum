@@ -60,6 +60,23 @@ live store. A tar archive must be restored separately; `--verify-full` accepts
 only a recorded clone directory. `--dry-run` previews either mode without
 opening SQLite or writing files (the move preview still checks module status).
 
+### Compacting the store
+
+The retention pass deletes old rows and compacts old decisions' scoring detail
+in place, which frees pages inside `store.db` but never shrinks the file.
+`script/compact-store.sh` rebuilds it offline: with `striatum` stopped and
+outside the nightly backup capture by Engram, CortexKit's backup module, which
+reads `store.db` live between 10:45 and 12:00 UTC (the script refuses that
+window, so a capture never sees a half-swapped store),
+it checkpoints the WAL, runs `VACUUM INTO` a sibling file, checks the copy
+(`quick_check`, an empty `foreign_key_check`, the same schema, `user_version`
+and row counts, a smaller `page_count`), puts it in WAL mode, and swaps it in by
+rename. The previous file stays beside it as `store.db.pre-compact-TIMESTAMP`
+with the restore command printed. `--dry-run` previews the steps without opening
+SQLite; `--store-dir` and `--ck` point it at a copy and a stub for rehearsal.
+Let the retention pass finish its backlog first: on the first deployment it
+compacts about 500 decisions a minute.
+
 ```sh
 sh script/deploy-module.sh routing
 ```
