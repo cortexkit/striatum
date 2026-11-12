@@ -616,7 +616,7 @@
       ]
     },
     "OverqualificationSection": {
-      "description": "Additive mode (default) preserves the tunable cost term. Cost-scaled mode\nmultiplies selection cost by the fixed core curve, bounded to 1..4; custom\nthreshold/doubling/base values are refused in that mode.",
+      "description": "Additive mode (default) preserves the tunable cost term. Cost-scaled mode\nmultiplies selection cost by the fixed core curve, bounded to 1..20; custom\nthreshold/doubling/base values are refused in that mode.",
       "type": "object",
       "properties": {
         "base": {

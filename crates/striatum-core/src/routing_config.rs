@@ -21,9 +21,16 @@ pub const DEFAULT_OVERQUALIFICATION_THRESHOLD: f64 = 40.0;
 pub const DEFAULT_OVERQUALIFICATION_DOUBLING: f64 = 10.0;
 /// Additive cost surcharge: at threshold + doubling the surcharge is `base`.
 pub const DEFAULT_OVERQUALIFICATION_BASE: f64 = 0.05;
-/// Keep overqualification a soft preference: a four-times cheaper route can
-/// still win at any surplus, before economic tie bands and the fit guard.
-pub const MAX_OVERQUALIFICATION_FACTOR: f64 = 4.0;
+/// Leave cost-scaled routes unpenalized through 25 surplus points (model IQ
+/// minus requested IQ, on the 0..100 demand scale).
+pub const COST_SCALED_OVERQUALIFICATION_THRESHOLD: f64 = 25.0;
+/// Measure excess capability in five-point surplus steps for cost scaling.
+pub const COST_SCALED_OVERQUALIFICATION_STEP: f64 = 5.0;
+/// Grow the cost-scaled factor by 1.5 per step to penalize excess capability.
+pub const COST_SCALED_OVERQUALIFICATION_GROWTH: f64 = 1.5;
+/// Cap the preference so a route at least 20 times cheaper can still win at
+/// any surplus.
+pub const MAX_COST_SCALED_OVERQUALIFICATION_FACTOR: f64 = 20.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum OverqualificationMode {
@@ -38,14 +45,14 @@ impl OverqualificationMode {
     pub const fn anchor_version(self) -> u32 {
         match self {
             Self::Additive => ANCHOR_VERSION,
-            Self::CostScaled => 6,
+            Self::CostScaled => 7,
         }
     }
 }
 
 /// Additive mode retains the configurable legacy term. Cost-scaled mode uses
-/// the fixed default curve as a fraction of economic cost, capped at 3 so a
-/// sufficiently cheaper high-capability route can still win.
+/// a fixed curve as a fraction of economic cost, with the factor capped at 20
+/// so a sufficiently cheaper high-capability route can still win.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverqualificationConfig {
     pub mode: OverqualificationMode,
@@ -83,9 +90,16 @@ impl OverqualificationConfig {
     /// an invalid configuration, so a bad value can never inflate every price.
     pub fn term(&self, surplus: f64) -> f64 {
         if self.mode == OverqualificationMode::CostScaled {
-            return DEFAULT_OVERQUALIFICATION
-                .term(surplus)
-                .min(MAX_OVERQUALIFICATION_FACTOR - 1.0);
+            if !surplus.is_finite() || surplus <= COST_SCALED_OVERQUALIFICATION_THRESHOLD {
+                return 0.0;
+            }
+            return COST_SCALED_OVERQUALIFICATION_GROWTH
+                .powf(
+                    (surplus - COST_SCALED_OVERQUALIFICATION_THRESHOLD)
+                        / COST_SCALED_OVERQUALIFICATION_STEP,
+                )
+                .min(MAX_COST_SCALED_OVERQUALIFICATION_FACTOR)
+                - 1.0;
         }
         if !self.is_valid() || self.base == 0.0 || !surplus.is_finite() || surplus <= self.threshold
         {
@@ -277,11 +291,47 @@ mod tests {
         let mut previous = 0.0;
         for surplus in 0..=200 {
             let term = config.term(surplus as f64);
-            assert!(term >= previous && term <= 3.0);
+            assert!(term >= previous && term <= 19.0);
             previous = term;
         }
-        assert_eq!(config.term(f64::MAX), 3.0);
+        assert_eq!(config.term(f64::MAX), 19.0);
         assert_eq!(off.term(f64::MAX), 0.0);
+    }
+
+    #[test]
+    fn cost_scaled_overqualification_curve_values() {
+        let config = OverqualificationConfig {
+            mode: OverqualificationMode::CostScaled,
+            ..DEFAULT_OVERQUALIFICATION
+        };
+        for (surplus, factor) in [
+            (0.0, 1.0),
+            (25.0, 1.0),
+            (30.0, 1.5),
+            (35.0, 2.25),
+            (50.0, 7.59375),
+            (62.0, 20.0),
+            (100.0, 20.0),
+        ] {
+            assert!(
+                (1.0 + config.term(surplus) - factor).abs() < 1e-12,
+                "surplus {surplus}: expected factor {factor}"
+            );
+        }
+        for surplus in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(config.term(surplus), 0.0);
+        }
+    }
+
+    #[test]
+    fn cost_scaled_overqualification_cap_starts_between_61_and_62_surplus() {
+        let config = OverqualificationConfig {
+            mode: OverqualificationMode::CostScaled,
+            ..DEFAULT_OVERQUALIFICATION
+        };
+        // 1.5^((surplus - 25) / 5) reaches 20 at about 61.942 surplus.
+        assert!(1.0 + config.term(61.94) < 20.0);
+        assert_eq!(1.0 + config.term(61.95), 20.0);
     }
 
     #[test]

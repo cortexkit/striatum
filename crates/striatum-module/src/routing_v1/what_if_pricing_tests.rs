@@ -178,7 +178,7 @@ async fn what_if_pricing_patch_reproduces_cost_scaled_after_table_without_live_w
             .unwrap();
         for (index, row) in after["results"].as_array().unwrap().iter().enumerate() {
             let expected =
-                if (consumer == "mason" && index < 4) || (consumer == "sidekick" && index == 0) {
+                if index < 6 && (consumer == "mason" || index > 0) {
                     "google/antigravity-gemini-3.8-flash"
                 } else {
                     "anthropic/claude-opus-5-5"

@@ -479,7 +479,7 @@ async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() 
     for (settings, anchor) in [
         (json!({}), 5),
         (json!({"providers":{"example-subscription":{"banked_resets":"capacity"}}}), 5),
-        (json!({"overqualification":{"mode":"cost_scaled"}}), 6),
+        (json!({"overqualification":{"mode":"cost_scaled"}}), 7),
     ] {
         let (harness, consumer) = configured().await;
         harness.edit_config(|config| {
@@ -504,7 +504,7 @@ async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() 
         let operator = operator(&harness).await;
         let before = rows(&harness);
         assert_eq!(evaluate(&operator, json!({"iqs":[50]})).await["anchor_version"], anchor);
-        for (mode, expected) in [("additive",5),("cost_scaled",6)] {
+        for (mode, expected) in [("additive",5),("cost_scaled",7)] {
             let preview = evaluate(&operator, json!({"iqs":[50],"pricing_patch":{"overqualification":mode}})).await;
             assert_eq!(preview["anchor_version"], expected);
         }
