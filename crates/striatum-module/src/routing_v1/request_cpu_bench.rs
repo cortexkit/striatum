@@ -553,6 +553,10 @@ fn request_fixture_builders_preserve_named_counts_and_pool_targets() {
 
 #[tokio::test]
 async fn slow_account_calls_emit_one_anonymous_line_per_operation() {
+    assert_eq!(
+        crate::stage_timing::SLOW_ACCOUNT_CALL,
+        std::time::Duration::from_millis(250)
+    );
     let _clock = crate::InjectedClock::set(FIXTURE_NOW);
     let fixture = representative_fixture(FixtureCounts::smoke());
     let runner = fixture
@@ -620,6 +624,99 @@ async fn slow_account_calls_emit_one_anonymous_line_per_operation() {
         assert_eq!(line.lines().count(), 1);
     }
     assert!(lines[0].contains("mode=\"admit\""));
+}
+
+#[tokio::test]
+async fn interleaved_account_calls_log_only_their_own_stage_times() {
+    use crate::stage_timing::{AccountProbe, ACCOUNT_PROBE, LOG_LINES, SLOW_ACCOUNT_CALL};
+    use striatum_store::StoreStageTiming;
+    use tokio::sync::oneshot;
+
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = representative_fixture(FixtureCounts::smoke());
+    let runner = fixture
+        .harness
+        .bind(reserved(&fixture.catalog.runners[0].module), None)
+        .await;
+    let (a_reached, a_wait) = oneshot::channel();
+    let (b_reached, b_wait) = oneshot::channel();
+    let (a_resume, a_paused) = oneshot::channel();
+    let (b_resume, b_paused) = oneshot::channel();
+    let (a_expected, a_stages) = oneshot::channel();
+    let (b_expected, b_stages) = oneshot::channel();
+    let (a_done, a_finished) = oneshot::channel();
+    LOG_LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    let a = async {
+        ACCOUNT_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(AccountProbe {
+                injected: StoreStageTiming {
+                    writer_queue_ns: 10_000_000,
+                    sql_ns: 20_000_000,
+                    commit_ns: 30_000_000,
+                },
+                reached: a_reached,
+                resume: a_paused,
+                expected: a_expected,
+            })
+        });
+        let params = json!({"provider":"cpu-provider-0","model":"model-0","admission_id":"interleaved-a","conversation_key":"interleaved-a"});
+        let (ty, body) = fixture
+            .harness
+            .finish_dispatched(runner.request_frame("route.account_for", &params))
+            .await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+        a_done.send(()).unwrap();
+    };
+    let b = async {
+        a_wait.await.unwrap();
+        ACCOUNT_PROBE.with(|probe| {
+            *probe.borrow_mut() = Some(AccountProbe {
+                injected: StoreStageTiming {
+                    writer_queue_ns: 100_000_000,
+                    sql_ns: 200_000_000,
+                    commit_ns: 300_000_000,
+                },
+                reached: b_reached,
+                resume: b_paused,
+                expected: b_expected,
+            })
+        });
+        let params = json!({"provider":"cpu-provider-0","model":"model-0","admission_id":"interleaved-b","conversation_key":"interleaved-b"});
+        let (ty, body) = fixture
+            .harness
+            .finish_dispatched(runner.request_frame("route.account_for", &params))
+            .await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+    };
+    let schedule = async {
+        b_wait.await.unwrap();
+        tokio::time::sleep(SLOW_ACCOUNT_CALL + std::time::Duration::from_millis(50)).await;
+        a_resume.send(()).unwrap();
+        a_finished.await.unwrap();
+        b_resume.send(()).unwrap();
+    };
+    // Both futures run on one runtime thread. Each yields with different store
+    // timings pending, so thread-total deltas necessarily include another call.
+    tokio::join!(a, b, schedule);
+    let lines = LOG_LINES.with(|lines| lines.borrow_mut().take().unwrap());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    for (line, expected) in lines
+        .iter()
+        .zip([a_stages.await.unwrap(), b_stages.await.unwrap()])
+    {
+        for (field, ns) in [
+            ("writer_queue_wait_ms", expected.writer_queue_ns),
+            ("sql_ms", expected.sql_ns),
+            ("commit_ms", expected.commit_ns),
+        ] {
+            let field = format!("{field}={:.3}", ns as f64 / 1_000_000.0);
+            assert!(
+                line.split_whitespace().any(|part| part == field),
+                "expected {field}; {line}"
+            );
+        }
+        assert!(line.contains("serialization_ms="), "{line}");
+    }
 }
 
 #[tokio::test]

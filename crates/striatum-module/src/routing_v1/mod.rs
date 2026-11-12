@@ -219,6 +219,7 @@ pub(crate) async fn serve(
     let caller = Caller::for_route(channel, route_epoch);
     let mut operation = String::new();
     let mut call_params = Value::Null;
+    let mut call_stages = striatum_store::StoreStageTiming::default();
     let reply = match serde_json::from_slice::<Value>(&frame.body) {
         Ok(request) => {
             let method = request
@@ -235,7 +236,45 @@ pub(crate) async fn serve(
                 crate::stage_timing::ACCOUNT_DELAY
                     .with(|delay| std::thread::sleep(delay.replace(std::time::Duration::ZERO)));
             }
-            let reply = answer(&method, &params, &caller, deps).await;
+            let call = async {
+                #[cfg(test)]
+                let probe =
+                    crate::stage_timing::ACCOUNT_PROBE.with(|probe| probe.borrow_mut().take());
+                #[cfg(test)]
+                let probe = match probe {
+                    Some(probe) => Some(probe.pause().await),
+                    None => None,
+                };
+                #[cfg(test)]
+                let before = probe.as_ref().map(|_| deps.store.stage_timing());
+                let reply = answer(&method, &params, &caller, deps).await;
+                #[cfg(test)]
+                if let (Some((injected, expected)), Some(before)) = (probe, before) {
+                    // Account handlers are synchronous. These store-wide deltas
+                    // cover only the uninterrupted handler, not the injected await.
+                    let after = deps.store.stage_timing();
+                    expected
+                        .send(striatum_store::StoreStageTiming {
+                            writer_queue_ns: injected.writer_queue_ns + after.writer_queue_ns
+                                - before.writer_queue_ns,
+                            sql_ns: injected.sql_ns + after.sql_ns - before.sql_ns,
+                            commit_ns: injected.commit_ns + after.commit_ns - before.commit_ns,
+                        })
+                        .unwrap();
+                }
+                reply
+            };
+            // The dispatcher already runs inside the route handler's blocking
+            // wrapper; neither account handler spawns additional store work.
+            let (reply, stages) = if matches!(
+                method.as_str(),
+                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
+            ) {
+                striatum_store::scope_stage_timing(call).await
+            } else {
+                (call.await, striatum_store::StoreStageTiming::default())
+            };
+            call_stages = stages;
             operation = method;
             call_params = params;
             reply
@@ -268,7 +307,6 @@ pub(crate) async fn serve(
         ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
     ) && total > crate::stage_timing::SLOW_ACCOUNT_CALL
     {
-        let stages = striatum_store::SqliteRouteStateStore::thread_stage_timing();
         let provider = accounts::slow_call_provider(&operation, &call_params, &caller, deps);
         timing.emit(
             total,
@@ -277,7 +315,7 @@ pub(crate) async fn serve(
             &provider,
             &caller.principal,
             serialization,
-            stages,
+            call_stages,
         );
     }
     let reply = Frame::build_with_version(

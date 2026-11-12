@@ -34,6 +34,70 @@ thread_local! {
     static COMMIT_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     static COMMIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static THREAD_TIMING: std::cell::Cell<StoreStageTiming> = const { std::cell::Cell::new(StoreStageTiming { writer_queue_ns: 0, sql_ns: 0, commit_ns: 0 }) };
+    static CALL_TIMING: std::cell::Cell<Option<StoreStageTiming>> = const { std::cell::Cell::new(None) };
+}
+
+fn record_stage_timing(delta: StoreStageTiming) {
+    let add = |mut timing: StoreStageTiming| {
+        timing.writer_queue_ns += delta.writer_queue_ns;
+        timing.sql_ns += delta.sql_ns;
+        timing.commit_ns += delta.commit_ns;
+        timing
+    };
+    THREAD_TIMING.with(|timing| timing.set(add(timing.get())));
+    CALL_TIMING.with(|timing| timing.set(timing.get().map(add)));
+}
+
+struct CallTimingGuard {
+    previous: Option<StoreStageTiming>,
+    finished: bool,
+}
+
+impl CallTimingGuard {
+    fn enter(timing: StoreStageTiming) -> Self {
+        Self {
+            previous: CALL_TIMING.with(|current| current.replace(Some(timing))),
+            finished: false,
+        }
+    }
+
+    fn finish(mut self) -> StoreStageTiming {
+        let timing = CALL_TIMING.with(|current| current.replace(self.previous));
+        self.finished = true;
+        timing.expect("call timing is installed during its future's poll")
+    }
+}
+
+impl Drop for CallTimingGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            CALL_TIMING.with(|current| current.set(self.previous));
+        }
+    }
+}
+
+/// Accumulate only store work polled by this future, even if it yields or moves
+/// between runtime threads. Restore the previous scope before returning Pending
+/// or Ready, and on panic, so another request cannot inherit the accumulator.
+/// Work spawned onto another task or blocking thread needs its own scope.
+pub async fn scope_stage_timing<F: std::future::Future>(
+    future: F,
+) -> (F::Output, StoreStageTiming) {
+    let mut future = std::pin::pin!(future);
+    let mut timing = StoreStageTiming::default();
+    let result = std::future::poll_fn(|cx| {
+        let scope = CallTimingGuard::enter(timing);
+        let result = future.as_mut().poll(cx);
+        timing = scope.finish();
+        result
+    })
+    .await;
+    (result, timing)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn record_stage_timing_for_test(timing: StoreStageTiming) {
+    record_stage_timing(timing);
 }
 
 fn finish_commit_timing() {
@@ -117,12 +181,10 @@ impl ConnectionStore {
                 self.metrics.pending_commits.swap(0, Ordering::Relaxed),
                 Ordering::Relaxed,
             );
-            THREAD_TIMING.with(|timing| {
-                let mut value = timing.get();
-                value.writer_queue_ns += queue;
-                value.sql_ns += sql;
-                value.commit_ns += commit;
-                timing.set(value);
+            record_stage_timing(StoreStageTiming {
+                writer_queue_ns: queue,
+                sql_ns: sql,
+                commit_ns: commit,
             });
             result
         };
@@ -145,10 +207,9 @@ impl ConnectionStore {
                 let result = f(conn);
                 let sql = start.elapsed().as_nanos() as u64;
                 self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
-                THREAD_TIMING.with(|timing| {
-                    let mut value = timing.get();
-                    value.sql_ns += sql;
-                    timing.set(value);
+                record_stage_timing(StoreStageTiming {
+                    sql_ns: sql,
+                    ..Default::default()
                 });
                 result
             }),
@@ -173,7 +234,7 @@ impl SqliteRouteStateStore {
         }
     }
 
-    /// Thread-local totals for synchronous account calls, excluding other callers.
+    /// Thread-local totals for synchronous measurements without an intervening await.
     pub fn thread_stage_timing() -> StoreStageTiming {
         THREAD_TIMING.with(|timing| timing.get())
     }

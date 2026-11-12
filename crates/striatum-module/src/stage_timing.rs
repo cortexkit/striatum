@@ -2,10 +2,10 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use striatum_store::{SqliteRouteStateStore, StoreStageTiming};
+use striatum_store::StoreStageTiming;
 
-/// Match the existing slow route.select log: strictly more than one second.
-pub(crate) const SLOW_ACCOUNT_CALL: Duration = Duration::from_millis(1_000);
+/// Expose calls approaching account clients' deadlines without logging fast calls.
+pub(crate) const SLOW_ACCOUNT_CALL: Duration = Duration::from_millis(250);
 static SERIALIZATION_NS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -21,14 +21,12 @@ pub(crate) fn record_serialization(start: Instant) -> Duration {
 
 pub(crate) struct AccountCallTiming {
     started: Instant,
-    before: StoreStageTiming,
 }
 
 impl AccountCallTiming {
     pub(crate) fn new() -> Self {
         Self {
             started: Instant::now(),
-            before: SqliteRouteStateStore::thread_stage_timing(),
         }
     }
 
@@ -44,12 +42,12 @@ impl AccountCallTiming {
         provider: &str,
         principal: &str,
         serialization: Duration,
-        after: StoreStageTiming,
+        stages: StoreStageTiming,
     ) {
         if total <= SLOW_ACCOUNT_CALL {
             return;
         }
-        let ms = |after: u64, before: u64| after.saturating_sub(before) as f64 / 1_000_000.0;
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
         // JSON-quoted labels keep even invalid request values on one log line.
         let mode = if operation == "route.account_for" {
             format!(" mode={}", serde_json::to_string(mode).unwrap())
@@ -57,8 +55,8 @@ impl AccountCallTiming {
             String::new()
         };
         let line = format!("[routing] slow {operation} total_ms={} writer_queue_wait_ms={:.3} sql_ms={:.3} commit_ms={:.3} serialization_ms={:.3} operation={operation}{mode} provider={} principal={}",
-            total.as_millis(), ms(after.writer_queue_ns, self.before.writer_queue_ns),
-            ms(after.sql_ns, self.before.sql_ns), ms(after.commit_ns, self.before.commit_ns),
+            total.as_millis(), ms(stages.writer_queue_ns),
+            ms(stages.sql_ns), ms(stages.commit_ns),
             serialization.as_secs_f64() * 1_000.0,
             serde_json::to_string(provider).unwrap(), serde_json::to_string(principal).unwrap());
         #[cfg(test)]
@@ -75,4 +73,28 @@ impl AccountCallTiming {
 thread_local! {
     pub(crate) static ACCOUNT_DELAY: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
     pub(crate) static LOG_LINES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    pub(crate) static ACCOUNT_PROBE: std::cell::RefCell<Option<AccountProbe>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct AccountProbe {
+    pub injected: StoreStageTiming,
+    pub reached: tokio::sync::oneshot::Sender<()>,
+    pub resume: tokio::sync::oneshot::Receiver<()>,
+    pub expected: tokio::sync::oneshot::Sender<StoreStageTiming>,
+}
+
+#[cfg(test)]
+impl AccountProbe {
+    pub(crate) async fn pause(
+        self,
+    ) -> (
+        StoreStageTiming,
+        tokio::sync::oneshot::Sender<StoreStageTiming>,
+    ) {
+        striatum_store::record_stage_timing_for_test(self.injected);
+        self.reached.send(()).unwrap();
+        self.resume.await.unwrap();
+        (self.injected, self.expected)
+    }
 }

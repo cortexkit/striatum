@@ -1147,7 +1147,9 @@ pub struct SqliteRouteStateStore {
 }
 
 mod evaluation_snapshot;
-pub use evaluation_snapshot::StoreStageTiming;
+#[cfg(any(test, feature = "test-support"))]
+pub use evaluation_snapshot::record_stage_timing_for_test;
+pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
 /// `model_facts` writes (bumped by the temporary triggers that
