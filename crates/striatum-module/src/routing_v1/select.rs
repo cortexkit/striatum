@@ -17,19 +17,19 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal};
+use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode};
 use cortexkit_role_routing::select::{
     parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerAuth,
     RunnerRef, SelectAnswer, SelectRequest, ToolsRequirement, EXPLANATION_MAX_CHARS,
 };
+use serde_json::{json, Value};
 use striatum_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
     SelectedModelRoute,
 };
 use striatum_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
-use striatum_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
+use striatum_core::{fact_to_route, ModelFact, ModelRequirements, RouteStateStore, RoutingConfig};
 use striatum_store::V1Decision;
-use serde_json::{json, Value};
 
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
 use crate::config_policy::RunnerPolicy;
@@ -111,8 +111,17 @@ pub(super) async fn panel_seat(
     params: &Value,
     caller: &Caller,
     deps: &Deps<'_>,
+    shared: &RequestInputs,
 ) -> Result<Value, Refusal> {
-    select_kind(params, caller, deps, true).await
+    select_with_profile_lookup_kind(
+        params,
+        caller,
+        deps,
+        &live_profile_lookup,
+        true,
+        Some(shared),
+    )
+    .await
 }
 
 async fn select_kind(
@@ -121,7 +130,8 @@ async fn select_kind(
     deps: &Deps<'_>,
     panel_seat: bool,
 ) -> Result<Value, Refusal> {
-    select_with_profile_lookup_kind(params, caller, deps, &live_profile_lookup, panel_seat).await
+    select_with_profile_lookup_kind(params, caller, deps, &live_profile_lookup, panel_seat, None)
+        .await
 }
 
 pub(super) fn live_profile_lookup(
@@ -168,6 +178,19 @@ pub(super) async fn evaluate(
     view: &Evaluation<'_>,
     profile_lookup: &ProfileLookup,
 ) -> Result<Value, Refusal> {
+    let shared = RequestInputs::read(deps, Some(view))?;
+    evaluate_with_inputs(params, caller, deps, view, profile_lookup, &shared).await
+}
+
+pub(super) async fn evaluate_with_inputs(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    view: &Evaluation<'_>,
+    profile_lookup: &ProfileLookup,
+    shared: &RequestInputs,
+) -> Result<Value, Refusal> {
+    let mut inputs = prepare_selection(params, caller, deps, shared, Some(view)).await?;
     select_at_tier(
         params,
         caller,
@@ -179,17 +202,20 @@ pub(super) async fn evaluate(
         &crate::tier_settings::Layers::new(None, None),
         false,
         Some(view),
+        shared,
+        &mut inputs,
     )
     .await
 }
 
+#[cfg(test)]
 pub(super) async fn select_with_profile_lookup(
     params: &serde_json::Value,
     caller: &Caller,
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
 ) -> Result<Value, Refusal> {
-    select_with_profile_lookup_kind(params, caller, deps, profile_lookup, false).await
+    select_with_profile_lookup_kind(params, caller, deps, profile_lookup, false, None).await
 }
 
 async fn select_with_profile_lookup_kind(
@@ -198,6 +224,7 @@ async fn select_with_profile_lookup_kind(
     deps: &Deps<'_>,
     profile_lookup: &ProfileLookup,
     panel_seat: bool,
+    shared: Option<&RequestInputs>,
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     if super::shapes::NEW_SELECT
@@ -254,16 +281,30 @@ async fn select_with_profile_lookup_kind(
             None,
         )
     };
-    let mut result = select_with_tier_fallback(
-        params,
-        caller,
-        deps,
-        profile_lookup,
-        &request,
-        &settings_layers,
-        project_settings,
-        panel_seat,
-    )
+    let mut result = async {
+        let owned;
+        let shared = match shared {
+            Some(shared) => shared,
+            None => {
+                owned = RequestInputs::read(deps, None)?;
+                &owned
+            }
+        };
+        let mut inputs = prepare_selection(params, caller, deps, shared, None).await?;
+        select_with_tier_fallback(
+            params,
+            caller,
+            deps,
+            profile_lookup,
+            &request,
+            &settings_layers,
+            project_settings,
+            panel_seat,
+            shared,
+            &mut inputs,
+        )
+        .await
+    }
     .await;
     if let (Err(refusal), Some(slot)) = (&mut result, &request.pin_slot) {
         if refusal.code.as_str() == "pin_unavailable" {
@@ -273,15 +314,13 @@ async fn select_with_profile_lookup_kind(
     if let Err(refusal) = &result {
         if (request.pin.is_some() || request.pin_slot.is_some())
             && request.pin_fallback != Some(PinFallback::Route)
-            && matches!(
-                refusal.code.as_str(),
-                "no_route"
-                    | "pin_unavailable"
-                    | "accounts_blocked"
-                    | "account_hold"
-                    | "auth_required"
-                    | "provider_requires_runner_pin"
-            )
+            && (matches!(
+                refusal.code,
+                RefusalCode::NoRoute
+                    | RefusalCode::PinUnavailable
+                    | RefusalCode::AccountHold
+                    | RefusalCode::AuthRequired
+            ) || refusal.code.as_str() == "provider_requires_runner_pin")
         {
             // Record the final refusal, not unsuccessful probes of higher tiers.
             // Hard pins bypass scoring, which normally writes the refusal decision.
@@ -300,6 +339,8 @@ async fn select_with_tier_fallback(
     settings_layers: &crate::tier_settings::Layers,
     project_settings: Option<cortexkit_role_routing::select::ProjectSettings>,
     panel_seat: bool,
+    shared: &RequestInputs,
+    inputs: &mut SelectionInputs,
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
     let mut trace = TierTrace {
@@ -318,6 +359,8 @@ async fn select_with_tier_fallback(
             settings_layers,
             panel_seat,
             None,
+            shared,
+            inputs,
         )
         .await;
     };
@@ -355,6 +398,8 @@ async fn select_with_tier_fallback(
                     settings_layers,
                     panel_seat,
                     None,
+                    shared,
+                    inputs,
                 )
                 .await
                 {
@@ -383,18 +428,19 @@ async fn select_with_tier_fallback(
             settings_layers,
             panel_seat,
             None,
+            shared,
+            inputs,
         )
         .await
         {
             Ok(answer) => return Ok(answer),
             Err(error)
                 if matches!(
-                    error.code.as_str(),
-                    "no_route"
-                        | "pin_unavailable"
-                        | "accounts_blocked"
-                        | "account_hold"
-                        | "auth_required"
+                    error.code,
+                    RefusalCode::NoRoute
+                        | RefusalCode::PinUnavailable
+                        | RefusalCode::AccountHold
+                        | RefusalCode::AuthRequired
                 ) =>
             {
                 trace.record_failure(tier, &error);
@@ -421,8 +467,8 @@ impl TierTrace {
         refusal: &Refusal,
     ) {
         if matches!(
-            refusal.code.as_str(),
-            "accounts_blocked" | "account_hold" | "auth_required"
+            refusal.code,
+            RefusalCode::AccountHold | RefusalCode::AuthRequired
         ) {
             self.rejections
                 .push(json!({"check": "account", "refusal_code": refusal.code}));
@@ -472,19 +518,158 @@ fn record_pinned_refusal(
     }
 }
 
-async fn select_at_tier(
+/// Catalog/configuration data shared by a tier fallback or all seats of a panel.
+/// Account evidence and route state are deliberately not retained here: an
+/// earlier seat can consume a probe or add an in-flight request.
+pub(super) struct RequestInputs {
+    pub(super) live_config: std::sync::Arc<config_overrides::LiveConfig>,
+    pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
+    catalog_snapshot: striatum_store::CatalogFactsSnapshot,
+    facts: Vec<ModelFact>,
+    pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
+}
+
+impl RequestInputs {
+    pub(super) fn read(
+        deps: &Deps<'_>,
+        evaluation: Option<&Evaluation<'_>>,
+    ) -> Result<Self, Refusal> {
+        let live_config = evaluation.map_or_else(
+            || config_overrides::live_config(deps.routing_config_path),
+            |view| view.live_config.clone(),
+        );
+        let operator_config = evaluation.map_or_else(
+            || operator_config(deps),
+            |view| view.operator_config.clone(),
+        );
+        Self::read_with_config(deps, live_config, operator_config)
+    }
+
+    pub(super) fn read_with_config(
+        deps: &Deps<'_>,
+        live_config: std::sync::Arc<config_overrides::LiveConfig>,
+        operator_config: std::sync::Arc<config_overrides::LiveConfig>,
+    ) -> Result<Self, Refusal> {
+        let (catalog_snapshot, facts) = deps
+            .store
+            .get_facts_with_observed_speed_and_generation(now_ms() as f64, live_config.pricing())
+            .map_err(store_refusal)?;
+        let catalog_targets = deps
+            .broca_credentials
+            .lock()
+            .map(|credentials| credentials.catalog_targets(&facts))
+            .unwrap_or_default();
+        #[cfg(test)]
+        count_input_build(&operator_config, 0);
+        Ok(Self {
+            live_config,
+            operator_config,
+            catalog_snapshot,
+            facts,
+            catalog_targets,
+        })
+    }
+
+    pub(super) fn prepare(
+        &self,
+        deps: &Deps<'_>,
+    ) -> Result<crate::PreparedSelectionInputs, Refusal> {
+        let now = now_ms() as f64;
+        // Read after the previous seat's admission, before this seat reserves
+        // its own probes. Only the immutable catalog is shared between seats.
+        let mut snapshot = deps.store.build_snapshot(now).map_err(store_refusal)?;
+        let (
+            windows,
+            available,
+            refreshed_at_ms,
+            retained_degraded_count,
+            last_error,
+            restored_from_ms,
+        ) = match deps.quota_cache.lock() {
+            Ok(cache) => (
+                cache.windows.clone(),
+                cache.available,
+                cache.refreshed_at_ms,
+                cache.retained_degraded_since_ms.len(),
+                cache.last_error.clone(),
+                cache.restored_from_ms,
+            ),
+            Err(_) => (Vec::new(), false, 0, 0, Some("cache poisoned".into()), None),
+        };
+        let stale_age_ms = (!windows.is_empty())
+            .then(|| crate::stale_quota_age_ms(refreshed_at_ms, now as u64))
+            .flatten();
+        if stale_age_ms.is_none() {
+            striatum_core::merge_quota_overlay(
+                &mut snapshot,
+                &windows,
+                &self.facts,
+                self.live_config.quota_model_pools_ref(),
+            );
+        }
+        crate::subscription_economics::overlay(
+            &mut snapshot,
+            &self.facts,
+            now as i64,
+            self.live_config.pricing(),
+        );
+        let quota_signal_json = crate::select::quota_signal_json(
+            &snapshot,
+            &crate::select::QuotaSignalView {
+                windows: &windows,
+                available,
+                refreshed_at_ms,
+                retained_degraded_count,
+                last_error: last_error.as_deref(),
+                restored_from_ms,
+                stale_age_ms,
+            },
+        );
+        Ok(crate::PreparedSelectionInputs {
+            catalog_snapshot: self.catalog_snapshot.clone(),
+            now,
+            facts: self.facts.clone(),
+            snapshot,
+            quota_signal_json,
+            quota_note: stale_age_ms.map(|age| crate::stale_quota_note(age, last_error.as_deref())),
+        })
+    }
+}
+
+#[cfg(test)]
+static INPUT_BUILDS: std::sync::Mutex<std::collections::BTreeMap<usize, [usize; 3]>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stage: usize) {
+    INPUT_BUILDS
+        .lock()
+        .unwrap()
+        .entry(std::sync::Arc::as_ptr(config) as usize)
+        .or_default()[stage] += 1;
+}
+
+/// A single selection owns the probe reservation in this pristine baseline.
+/// Every tier attempt clones it before applying tier or sticky-account filters.
+struct SelectionInputs {
+    request: SelectRequest,
+    now: f64,
+    facts: Vec<ModelFact>,
+    snapshot: ModelRouteStateSnapshot,
+    priced: crate::select::PricedSelection,
+    registry: super::runners::Registry,
+    runners: Vec<RunnerPolicy>,
+    consumer_policy: crate::config_policy::ConsumerPolicy,
+    priced_per_token: bool,
+}
+
+async fn prepare_selection(
     params: &Value,
     caller: &Caller,
     deps: &Deps<'_>,
-    profile_lookup: &ProfileLookup,
-    service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
-    sticky_credential: Option<&str>,
-    tier_trace: &mut TierTrace,
-    tier_settings: &crate::tier_settings::Layers,
-    panel_seat: bool,
+    shared: &RequestInputs,
     evaluation: Option<&Evaluation<'_>>,
-) -> Result<Value, Refusal> {
-    tier_trace.rejections.clear();
+) -> Result<SelectionInputs, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     // An omitted task_ref is valid, but a present value must be a string.
     // Reject null rather than letting the optional-string parser treat it as omitted.
@@ -504,14 +689,8 @@ async fn select_at_tier(
         &crate::tier_settings::without_context(params),
         super::describe::CAPABILITIES,
     )?;
-    let live_config = evaluation.map_or_else(
-        || config_overrides::live_config(deps.routing_config_path),
-        |view| view.live_config.clone(),
-    );
-    let operator_config = evaluation.map_or_else(
-        || operator_config(deps),
-        |view| view.operator_config.clone(),
-    );
+    let live_config = &shared.live_config;
+    let operator_config = &shared.operator_config;
     let consumer = request.consumer.clone();
     let consumers = super::consumers::effective(&operator_config);
     if evaluation.is_none() {
@@ -531,7 +710,6 @@ async fn select_at_tier(
         ));
     }
 
-    let operator_policy = operator_config.operator_policy_ref();
     // Payment class comes only from the resolved consumer policy, not from the
     // consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
@@ -549,30 +727,18 @@ async fn select_at_tier(
         catalog_snapshot,
         now,
         mut facts,
-        mut snapshot,
+        snapshot,
         quota_signal_json,
         quota_note: _,
-    } = crate::prepare_selection_inputs(
-        deps.quota_cache,
-        deps.store,
-        live_config.pricing(),
-        live_config.quota_model_pools_ref(),
-    )
-    .map_err(store_refusal)?;
-    // Providers with no catalog rows of their own, each resolved to the
-    // catalog provider whose rows it borrows, read once for this selection.
-    let catalog_targets = deps
-        .broca_credentials
-        .lock()
-        .map(|credentials| credentials.catalog_targets(&facts))
-        .unwrap_or_default();
+    } = shared.prepare(deps)?;
+    let catalog_targets = &shared.catalog_targets;
     let sources = SelectionPolicySources {
         live_config: &live_config,
         operator_config: &operator_config,
         operator_config_path: deps.operator_config_path,
         catalog_targets: &catalog_targets,
     };
-    let mut priced = crate::select::price_selection_inputs_with_catalog(
+    let priced = crate::select::price_selection_inputs_with_catalog(
         &mut facts,
         quota_signal_json,
         &sources,
@@ -665,6 +831,74 @@ async fn select_at_tier(
     if runners.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
+    #[cfg(test)]
+    count_input_build(&shared.operator_config, 1);
+    Ok(SelectionInputs {
+        request,
+        now,
+        facts,
+        snapshot,
+        priced,
+        registry,
+        runners,
+        consumer_policy,
+        priced_per_token,
+    })
+}
+
+async fn select_at_tier(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+    service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    sticky_credential: Option<&str>,
+    tier_trace: &mut TierTrace,
+    tier_settings: &crate::tier_settings::Layers,
+    panel_seat: bool,
+    evaluation: Option<&Evaluation<'_>>,
+    shared: &RequestInputs,
+    inputs: &mut SelectionInputs,
+) -> Result<Value, Refusal> {
+    #[cfg(test)]
+    count_input_build(&shared.operator_config, 2);
+    tier_trace.rejections.clear();
+    let live_config = &shared.live_config;
+    let operator_config = &shared.operator_config;
+    let catalog_targets = &shared.catalog_targets;
+    let sources = SelectionPolicySources {
+        live_config,
+        operator_config,
+        operator_config_path: deps.operator_config_path,
+        catalog_targets,
+    };
+    let request = &inputs.request;
+    let consumer = request.consumer.clone();
+    let consumer_policy = &inputs.consumer_policy;
+    let operator_policy = operator_config.operator_policy_ref();
+    let legacy_consumer = select_policy::Consumer::from_id(&consumer);
+    let priced_per_token = inputs.priced_per_token;
+    let now = inputs.now;
+    let mut facts = inputs.facts.clone();
+    let mut snapshot = inputs.snapshot.clone();
+    let registry = &inputs.registry;
+    let runners = &inputs.runners;
+    // Start from pre-tier facts and account evidence, never the affinity
+    // attempt's tier-filtered account lists or sticky credential.
+    let mut priced = crate::select::PricedSelection {
+        routing_config: inputs.priced.routing_config.clone(),
+        provenance: inputs.priced.provenance.clone(),
+        entitlement_fences: inputs.priced.entitlement_fences.clone(),
+        subscription_plan_providers: inputs.priced.subscription_plan_providers.clone(),
+        // A single-attempt selection can use the original context, including
+        // its already-built indexes. Only tier retries need a pristine clone.
+        classes: if service_tier.is_none() {
+            inputs.priced.classes.take()
+        } else {
+            inputs.priced.classes.clone()
+        },
+    };
+    let classifier = consumer == "classifier";
     let tier_consumer = request
         .settings
         .as_ref()
@@ -797,8 +1031,7 @@ async fn select_at_tier(
             unverified.then(|| {
                 (
                     route.route_key,
-                    striatum_core::model_router::REASON_RUNNER_WIRE_FAMILY_UNVERIFIED
-                        .into(),
+                    striatum_core::model_router::REASON_RUNNER_WIRE_FAMILY_UNVERIFIED.into(),
                 )
             })
         })
@@ -1715,14 +1948,18 @@ impl<'a> Selection<'a> {
                     .recovery_available
                     .iter()
                     .filter(|key| {
-                        self.sources.operator_config.route_allowed(self.consumer, key, false)
+                        self.sources
+                            .operator_config
+                            .route_allowed(self.consumer, key, false)
                             && (!self.account_blocks.contains_key(*key)
                                 || account_resets.contains_key(*key))
                     })
                     .cloned()
                     .collect();
                 recovery_available.extend(account_resets.keys().cloned());
-                let recovery_input = self.pass().input(&recovery_available, self.scoring_snapshot());
+                let recovery_input = self
+                    .pass()
+                    .input(&recovery_available, self.scoring_snapshot());
                 (error.earliest_reset, error.earliest_reset_route) =
                     striatum_core::model_router::earliest_admissible_recovery(
                         &recovery_input,
@@ -2125,8 +2362,9 @@ fn pin_reason(
         }
         "credential_unentitled" => (PinUnavailableReason::CredentialUnentitled, None),
         "credential_billing_exhausted" => (PinUnavailableReason::CredentialBillingExhausted, None),
-        reason if reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:") =>
-            (PinUnavailableReason::parse(reason), None),
+        reason if reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:") => {
+            (PinUnavailableReason::parse(reason), None)
+        }
         "cooldown_active" => (
             PinUnavailableReason::Cooldown,
             deadline(|state| state.cooldown_until),
@@ -2206,7 +2444,7 @@ fn clamp_sentence(sentence: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        conformance_tests::{install_catalog, Harness},
+        conformance_tests::{install_catalog, reserved, Harness},
         dispatch_tests::configured,
     };
     use super::*;
@@ -2236,6 +2474,220 @@ mod tests {
     }
 
     const RECOVERY_NOW: u64 = 1_800_000_000_000;
+
+    fn take_input_builds(harness: &Harness) -> [usize; 3] {
+        INPUT_BUILDS
+            .lock()
+            .unwrap()
+            .remove(&(std::sync::Arc::as_ptr(&harness.operator_config()) as usize))
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn tier_fallback_builds_inputs_once_and_preserves_both_fixture_picks() {
+        use super::super::request_cpu_bench::{
+            production_fixture, representative_fixture, FixtureCounts,
+        };
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        for fixture in [
+            production_fixture(),
+            representative_fixture(FixtureCounts {
+                subscription_rules: 10,
+                exclusion_rules: 103,
+                runner_route_rules: 0,
+                catalog_facts: 836,
+                listed_credentials: 39,
+            }),
+        ] {
+            let route = fixture
+                .harness
+                .bind(reserved(fixture::CONSUMER), None)
+                .await;
+            let request = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"pin":"cpu-provider-0/model-0"});
+            let before = route.call("route.select", &request).await;
+            assert_eq!(before.0, subc_protocol::FrameType::Response, "{before:?}");
+            let mut fallback = request;
+            fallback["service_tier"] = json!("ultrafast");
+            take_input_builds(&fixture.harness);
+            let after = route.call("route.select", &fallback).await;
+            assert_eq!(after.0, subc_protocol::FrameType::Response, "{after:?}");
+            assert!(!after.1["result"]["route"].is_null());
+            assert!(!after.1["result"]["runner"].is_null());
+            assert_eq!(after.1["result"]["route"], before.1["result"]["route"]);
+            assert_eq!(after.1["result"]["runner"], before.1["result"]["runner"]);
+            assert_eq!(after.1["result"]["service_tier_chosen"], "standard");
+            assert_eq!(take_input_builds(&fixture.harness), [1, 1, 3]);
+        }
+    }
+
+    #[tokio::test]
+    async fn affinity_sticky_failure_retries_same_tier_with_another_credential() {
+        use crate::broca_credentials::BrocaCredentials;
+        use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let harness = Harness::new("shared-tier-affinity");
+        let model = "gpt-6.1-sol";
+        let mut fact = crate::tests::fact("openai", model);
+        fact.auth_methods = Some(vec!["oauth".into()]);
+        harness.install_facts(&[fact.clone()]);
+        let served: Value = serde_json::from_str(include_str!(
+            "../../fixtures/service-tier-v1/fusiform-served-payloads.json"
+        ))
+        .unwrap();
+        let wires = [(format!("openai/{model}"), "openai.responses".into())]
+            .into_iter()
+            .collect();
+        let mut credentials = BrocaCredentials::default();
+        let mut rows: Vec<_> = (0..2)
+            .map(|i| ListedCredential {
+                id: format!("oauth:{i}"),
+                account_id: Some(format!("account-{i}")),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec!["openai".into()],
+                serves: vec!["openai".into()],
+                credential_type: "oauth".into(),
+                auth_method: Some("oauth".into()),
+                plan_tier: Some("pro_200".into()),
+                ..Default::default()
+            })
+            .collect();
+        // Start with only one account so the persisted affinity has an
+        // unambiguous credential, then make only the other account fast-eligible.
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "first".into(),
+                credentials: rows[..1].to_vec(),
+                ..Default::default()
+            },
+            RECOVERY_NOW,
+        );
+        credentials.publish_billing_catalog(
+            crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact])
+                .with_test_catalog(
+                    &serde_json::to_vec(
+                        &served["catalog.get — provider default endpoint"]["response"],
+                    )
+                    .unwrap(),
+                )
+                .with_wire_apis(&wires),
+        );
+        credentials.wire_apis = wires;
+        credentials.publish_plan_prices(&served["plan.prices — every curated row"]["response"]);
+        credentials.runner_declarations.insert("tier-runner".into(), super::super::runners::parse_declaration(&json!({"runner":{
+            "pairs":[{"wire_api":"openai.responses","auth_method":"oauth"}],"follows_account_choice":true
+        }})).unwrap().unwrap());
+        credentials.runner_service_tiers.insert("tier-runner".into(), super::super::runners::service_tiers_from_describe(&json!({
+            "capabilities":["service_tier"],"service_tiers":{"openai.responses":{"levels":["fast"],"served":"reported"}}
+        })).unwrap());
+        harness.set_credentials(credentials.clone());
+        harness.edit_config(|config| {
+            config["runners"] = json!([{"module":"tier-runner","via_vault":true}]);
+            config["providers"]["openai"]["subscription"] = json!(true);
+            config["consumers"] = json!({"mason":{"owner":"tier-owner","mode":"demand"}});
+        });
+        let route = harness.bind(reserved("tier-owner"), None).await;
+        let request = json!({"consumer":"mason","requirements":{"iq":30},"service_tier":"fast","affinity":"conversation"});
+        let first = route.call("route.select", &request).await;
+        assert_eq!(first.0, subc_protocol::FrameType::Response, "{first:?}");
+        let first_id = first.1["result"]["decision_id"].as_str().unwrap();
+        assert_eq!(
+            harness
+                .store()
+                .decision_provider_identity(first_id)
+                .unwrap()
+                .unwrap()
+                .credential_id
+                .as_deref(),
+            Some("oauth:0")
+        );
+        rows[0].plan_tier = Some("unknown".into());
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: "second".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            RECOVERY_NOW,
+        );
+        harness.set_credentials(credentials);
+        take_input_builds(&harness);
+        let second = route.call("route.select", &request).await;
+        assert_eq!(second.0, subc_protocol::FrameType::Response, "{second:?}");
+        assert_eq!(second.1["result"]["service_tier_chosen"], "fast");
+        assert_eq!(second.1["result"]["route"], first.1["result"]["route"]);
+        let id = second.1["result"]["decision_id"].as_str().unwrap();
+        let (_, accounts) = harness.store().decision_service_tier(id).unwrap().unwrap();
+        assert_eq!(accounts, vec!["oauth:1".to_owned()]);
+        assert_eq!(take_input_builds(&harness), [1, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn panel_builds_catalog_once_but_each_seat_owns_its_probe() {
+        use super::super::conformance_tests::install_panel_families;
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let harness = Harness::new("shared-panel-probes");
+        let mut catalog = fixture::catalog();
+        // Two different families use the same subscription account. A due
+        // provider fence permits exactly one decision to own its recovery probe.
+        catalog
+            .models
+            .retain(|model| model.provider == fixture::SUBSCRIPTION_PROVIDER);
+        assert_eq!(catalog.models.len(), 2);
+        for (i, model) in catalog.models.iter_mut().enumerate() {
+            model.family = Some(format!("family-{i}"));
+        }
+        catalog.accounts.truncate(1);
+        install_catalog(&harness, &catalog);
+        install_panel_families(&harness, &catalog);
+        harness.edit_config(|config| {
+            config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":0});
+            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+        });
+        let route = harness.bind(reserved("prefrontal-core"), None).await;
+        let routes: Vec<_> = catalog
+            .models
+            .iter()
+            .map(|model| model.route_key())
+            .collect();
+        let request = json!({"class":"audit","consumer":fixture::SUMMARY,"seed":"fixed","available_routes":routes});
+        take_input_builds(&harness);
+        let baseline = route.call("route.select_panel", &request).await;
+        assert_eq!(
+            baseline.0,
+            subc_protocol::FrameType::Response,
+            "{baseline:?}"
+        );
+        assert_eq!(baseline.1["result"]["seats"].as_array().unwrap().len(), 2);
+        assert_eq!(take_input_builds(&harness), [1, 2, 2]);
+        crate::credential_fences::record(
+            harness.store(),
+            &harness.credentials(),
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                credential_id: catalog.accounts[0].credential_id.clone(),
+                code: "billing_exhausted".into(),
+            },
+            RECOVERY_NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
+        )
+        .unwrap();
+        take_input_builds(&harness);
+        let probe = route.call("route.select_panel", &request).await;
+        assert_eq!(probe.0, subc_protocol::FrameType::Response, "{probe:?}");
+        let seats = probe.1["result"]["seats"].as_array().unwrap();
+        assert_eq!(
+            seats.len(),
+            1,
+            "only one seat can own the due probe: {probe:?}"
+        );
+        assert!(!seats[0]["answer"]["route"].is_null());
+        assert_eq!(
+            seats[0]["answer"]["route"],
+            baseline.1["result"]["seats"][0]["answer"]["route"]
+        );
+        assert_eq!(take_input_builds(&harness), [1, 2, 2]);
+    }
+
     const ACCOUNT_RESET: u64 = RECOVERY_NOW + 600_000;
     const DISTANT_WALL: u64 = RECOVERY_NOW + 864_000_000;
     const ACCOUNT_ROUTE: &str = "example-subscription/model-c";
@@ -2626,8 +3078,7 @@ mod tests {
             for reset in [Some(1_800_000_600_000_i64), None] {
                 let refusal = pool_select_refusal(
                     key_pool::PoolRefusal {
-                        code: striatum_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED
-                            .into(),
+                        code: striatum_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED.into(),
                         message: "private message is not a retry protocol".into(),
                         detail: Some(json!({"earliestResetAtMs":reset})),
                     },

@@ -4,9 +4,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use cortexkit_role_routing::{errors::Refusal, panel::*, select::SelectAnswer};
-use striatum_core::{fact_to_route, panel as scoring};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use striatum_core::{fact_to_route, panel as scoring};
 
 use super::{operator_config, store_refusal, Caller, Deps};
 
@@ -188,7 +188,9 @@ async fn seat_panel(
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
 ) -> Result<(scoring::SelectedPanel, Vec<Seat>, Option<PanelShortfall>), Refusal> {
-    let (panel, _, mut rejected) = candidates(request, &[], &[], caller, deps, dry).await?;
+    let shared = panel_inputs(deps, dry)?;
+    let (panel, _, mut rejected) =
+        candidates(request, &[], &[], caller, deps, dry, &shared).await?;
     let mut seats = Vec::new();
     let mut families = HashSet::new();
     for member in &panel.members {
@@ -208,12 +210,12 @@ async fn seat_panel(
         let slot = scored.map_or(seats.len() as u64, |seat| seat.slot as u64);
         let top = policy.top_k as u64;
         let admission = match dry {
-            None => admit_seat(request, member, slot, top, caller, deps)
+            None => admit_seat(request, member, slot, top, caller, deps, &shared)
                 .await?
                 .map(Seat::Live),
             Some(dry) => {
                 let rank = scored.and_then(|seat| seat.rank);
-                evaluate_seat(request, member, slot, top, rank, caller, deps, dry)
+                evaluate_seat(request, member, slot, top, rank, caller, deps, dry, &shared)
                     .await?
                     .map(Seat::Evaluated)
             }
@@ -350,8 +352,11 @@ fn seat_rejection(
     refusal: &Refusal,
 ) -> Option<PanelRejectedCandidate> {
     if !matches!(
-        refusal.code.as_str(),
-        "no_route" | "pin_unavailable" | "accounts_blocked" | "account_hold" | "auth_required"
+        refusal.code,
+        cortexkit_role_routing::errors::RefusalCode::NoRoute
+            | cortexkit_role_routing::errors::RefusalCode::PinUnavailable
+            | cortexkit_role_routing::errors::RefusalCode::AccountHold
+            | cortexkit_role_routing::errors::RefusalCode::AuthRequired
     ) {
         return None;
     }
@@ -376,9 +381,10 @@ async fn admit_seat(
     top: u64,
     caller: &Caller,
     deps: &Deps<'_>,
+    shared: &super::select::RequestInputs,
 ) -> Result<SeatAdmission, Refusal> {
     let (select, route) = seat_select(request, member)?;
-    let answer = match super::select::panel_seat(&select, caller, deps).await {
+    let answer = match super::select::panel_seat(&select, caller, deps, shared).await {
         Ok(answer) => serde_json::from_value::<SelectAnswer>(answer).map_err(store_refusal)?,
         Err(refusal) => {
             return seat_rejection(&route, &refusal)
@@ -408,6 +414,7 @@ async fn evaluate_seat(
     caller: &Caller,
     deps: &Deps<'_>,
     dry: &DryRun<'_>,
+    shared: &super::select::RequestInputs,
 ) -> Result<SeatAdmission<EvaluatedSeat>, Refusal> {
     let (select, route) = seat_select(request, member)?;
     // The seat request's requirements are the inert `iq: 0`; the evaluation's
@@ -420,15 +427,23 @@ async fn evaluate_seat(
         eq: None,
         evidence: Mutex::new(Default::default()),
     };
-    let answer =
-        match super::select::evaluate(&select, caller, deps, &view, dry.profile_lookup).await {
-            Ok(answer) => answer,
-            Err(refusal) => {
-                return seat_rejection(&route, &refusal)
-                    .map(SeatAdmission::Rejected)
-                    .ok_or(refusal)
-            }
-        };
+    let answer = match super::select::evaluate_with_inputs(
+        &select,
+        caller,
+        deps,
+        &view,
+        dry.profile_lookup,
+        shared,
+    )
+    .await
+    {
+        Ok(answer) => answer,
+        Err(refusal) => {
+            return seat_rejection(&route, &refusal)
+                .map(SeatAdmission::Rejected)
+                .ok_or(refusal)
+        }
+    };
     Ok(SeatAdmission::Seated(EvaluatedSeat {
         slot,
         phase: seat_phase(slot, top),
@@ -473,8 +488,17 @@ async fn replace(
         .filter(|s| s.slot != slot)
         .map(|s| family(s.family.as_deref()))
         .collect();
-    let (panel, package_blocked, mut rejected) =
-        candidates(&state.request, &exclude, &families, caller, deps, None).await?;
+    let shared = panel_inputs(deps, None)?;
+    let (panel, package_blocked, mut rejected) = candidates(
+        &state.request,
+        &exclude,
+        &families,
+        caller,
+        deps,
+        None,
+        &shared,
+    )
+    .await?;
     let mut answer = PanelReplacement::unseated(
         id,
         slot,
@@ -492,6 +516,7 @@ async fn replace(
             state.answer.policy.top,
             caller,
             deps,
+            &shared,
         )
         .await?
         {
@@ -522,6 +547,20 @@ async fn replace(
     serde_json::to_value(answer).map_err(store_refusal)
 }
 
+fn panel_inputs(
+    deps: &Deps<'_>,
+    dry: Option<&DryRun<'_>>,
+) -> Result<super::select::RequestInputs, Refusal> {
+    super::select::RequestInputs::read_with_config(
+        deps,
+        dry.map_or_else(
+            || crate::config_overrides::live_config(deps.routing_config_path),
+            |dry| dry.live_config.clone(),
+        ),
+        dry.map_or_else(|| operator_config(deps), |dry| dry.operator_config.clone()),
+    )
+}
+
 async fn candidates(
     request: &SelectPanelRequest,
     extra_exclude: &[String],
@@ -529,27 +568,15 @@ async fn candidates(
     caller: &Caller,
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
+    shared: &super::select::RequestInputs,
 ) -> Result<(scoring::SelectedPanel, bool, Vec<PanelRejectedCandidate>), Refusal> {
-    let config = dry.map_or_else(|| operator_config(deps), |dry| dry.operator_config.clone());
-    let live = dry.map_or_else(
-        || crate::config_overrides::live_config(deps.routing_config_path),
-        |dry| dry.live_config.clone(),
-    );
+    let config = &shared.operator_config;
+    let live = &shared.live_config;
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
     let layers = settings(request, caller, deps).await?;
-    let mut prepared = crate::prepare_selection_inputs(
-        deps.quota_cache,
-        deps.store,
-        live.pricing(),
-        live.quota_model_pools_ref(),
-    )
-    .map_err(store_refusal)?;
-    let aliases = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .catalog_targets(&prepared.facts);
+    let mut prepared = shared.prepare(deps)?;
+    let aliases = &shared.catalog_targets;
     let consumers = super::consumers::effective(&config);
     let policy =
         config.consumer_policy(&request.consumer, &Default::default(), &consumers.policies);
@@ -632,7 +659,8 @@ async fn candidates(
     let mut rejected = Vec::new();
     facts.retain(|fact| {
         let route = fact_to_route(fact);
-        if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(fact, false) {
+        if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(fact, false)
+        {
             rejected.push(PanelRejectedCandidate::new(route.route_key, reason));
             return false;
         }
