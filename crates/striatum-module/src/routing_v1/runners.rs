@@ -5,13 +5,9 @@ use std::collections::BTreeSet;
 pub(crate) use cortexkit_role_routing::declarations::RunnerDeclaration;
 use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
 use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
-use striatum_core::RouteStateStore;
-use striatum_core::{
-    make_route_key,
-    provider_model_spec::{parse_spec_list, resolve_spec},
-    ModelFact,
-};
 use serde::Serialize;
+use striatum_core::RouteStateStore;
+use striatum_core::{make_route_key, provider_model_spec::CompiledSpecs, ModelFact};
 
 use crate::{
     broca_credentials::{credential_serves_fact, BrocaCredentials},
@@ -45,7 +41,7 @@ pub(crate) struct EffectiveRunner {
     #[serde(skip)]
     wire_declaration: Option<RunnerDeclaration>,
     #[serde(skip)]
-    route_policy: Option<Vec<String>>,
+    route_policy: Option<std::sync::Arc<CompiledSpecs>>,
     #[serde(skip)]
     reachable_models: BTreeSet<String>,
     #[serde(skip)]
@@ -113,6 +109,30 @@ pub(crate) struct Registry {
     pub entries: Vec<EffectiveRunner>,
 }
 
+pub(crate) struct RunnerPolicies<'a> {
+    policies: Vec<RunnerPolicy>,
+    config: Option<&'a crate::config_overrides::LiveConfig>,
+}
+
+impl<'a> From<&'a crate::config_overrides::LiveConfig> for RunnerPolicies<'a> {
+    fn from(config: &'a crate::config_overrides::LiveConfig) -> Self {
+        Self {
+            policies: config.v1_runners(),
+            config: Some(config),
+        }
+    }
+}
+
+impl From<Vec<RunnerPolicy>> for RunnerPolicies<'_> {
+    fn from(policies: Vec<RunnerPolicy>) -> Self {
+        // Compatibility source compiles per call; request paths must pass their LiveConfig.
+        Self {
+            policies,
+            config: None,
+        }
+    }
+}
+
 impl Registry {
     pub(crate) fn classifier(
         module: &str,
@@ -169,40 +189,40 @@ impl Registry {
         }
     }
 
-    pub(crate) fn build(
-        policies: Vec<RunnerPolicy>,
+    pub(crate) fn build<'a>(
+        policies: impl Into<RunnerPolicies<'a>>,
         credentials: &BrocaCredentials,
         facts: &[ModelFact],
         now_ms: u64,
     ) -> Self {
-        Self::build_resolved(policies, credentials, facts, now_ms, None, false)
+        Self::build_resolved(policies.into(), credentials, facts, now_ms, None, false)
     }
 
-    pub(crate) fn build_for_harness(
-        policies: Vec<RunnerPolicy>,
+    pub(crate) fn build_for_harness<'a>(
+        policies: impl Into<RunnerPolicies<'a>>,
         credentials: &BrocaCredentials,
         facts: &[ModelFact],
         now_ms: u64,
         harness: Option<&str>,
     ) -> Self {
-        Self::build_resolved(policies, credentials, facts, now_ms, harness, false)
+        Self::build_resolved(policies.into(), credentials, facts, now_ms, harness, false)
     }
 
     /// Session selection resolves defaults; a picker without a harness instead
     /// uses build() or build_for_harness(None) to keep every model allowed by
     /// the runner's top-level pairs and provider limits.
-    pub(crate) fn build_for_selection(
-        policies: Vec<RunnerPolicy>,
+    pub(crate) fn build_for_selection<'a>(
+        policies: impl Into<RunnerPolicies<'a>>,
         credentials: &BrocaCredentials,
         facts: &[ModelFact],
         now_ms: u64,
         harness: Option<&str>,
     ) -> Self {
-        Self::build_resolved(policies, credentials, facts, now_ms, harness, true)
+        Self::build_resolved(policies.into(), credentials, facts, now_ms, harness, true)
     }
 
     fn build_resolved(
-        policies: Vec<RunnerPolicy>,
+        source: RunnerPolicies<'_>,
         credentials: &BrocaCredentials,
         facts: &[ModelFact],
         now_ms: u64,
@@ -213,7 +233,8 @@ impl Registry {
             .iter()
             .map(|fact| fact.provider_id.clone())
             .collect::<BTreeSet<_>>();
-        let entries = policies
+        let entries = source
+            .policies
             .into_iter()
             .map(|mut policy| {
                 let wire_declaration = credentials.runner_declarations.get(&policy.module);
@@ -346,7 +367,15 @@ impl Registry {
                 missing_wire_api_models
                     .retain(|model| !statically_reachable_models.contains(model));
                 no_account_models.retain(|model| !statically_reachable_models.contains(model));
-                let route_policy = policy.routes.clone();
+                let route_policy = source.config.map_or_else(
+                    || {
+                        policy
+                            .routes
+                            .as_ref()
+                            .map(|routes| std::sync::Arc::new(CompiledSpecs::compile(routes)))
+                    },
+                    |config| config.runner_routes(&policy.module).cloned(),
+                );
                 let routes = facts
                     .iter()
                     .filter(|fact| {
@@ -357,9 +386,9 @@ impl Registry {
                         );
                         reachable_models
                             .contains(&format!("{}/{}", fact.provider_id, fact.model_id))
-                            && route_policy.as_ref().is_none_or(|specs| {
-                                resolve_spec(&parse_spec_list(specs), &key, false)
-                            })
+                            && route_policy
+                                .as_ref()
+                                .is_none_or(|specs| specs.resolve(&key, false))
                     })
                     .map(|fact| {
                         make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
@@ -425,7 +454,7 @@ impl Registry {
                 && runner
                     .route_policy
                     .as_ref()
-                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+                    .is_none_or(|specs| specs.resolve(route, false))
         })
     }
 
@@ -435,7 +464,7 @@ impl Registry {
                 && runner
                     .route_policy
                     .as_ref()
-                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+                    .is_none_or(|specs| specs.resolve(route, false))
         })
     }
 
@@ -445,7 +474,7 @@ impl Registry {
                 && runner
                     .route_policy
                     .as_ref()
-                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+                    .is_none_or(|specs| specs.resolve(route, false))
         })
     }
 
@@ -455,7 +484,7 @@ impl Registry {
                 && runner
                     .route_policy
                     .as_ref()
-                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+                    .is_none_or(|specs| specs.resolve(route, false))
         })
     }
 
@@ -465,7 +494,7 @@ impl Registry {
                 && runner
                     .route_policy
                     .as_ref()
-                    .is_none_or(|specs| resolve_spec(&parse_spec_list(specs), route, false))
+                    .is_none_or(|specs| specs.resolve(route, false))
         })
     }
 }
@@ -478,13 +507,141 @@ pub(crate) fn effective(deps: &super::Deps<'_>) -> Registry {
             let targets = credentials.catalog_targets(&facts);
             striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
             Registry::build(
-                super::operator_config(deps).v1_runners(),
+                super::operator_config(deps).as_ref(),
                 &credentials,
                 &facts,
                 crate::now_ms(),
             )
         })
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod compiled_registry_tests {
+    use super::*;
+    use crate::routing_v1::request_cpu_bench::{self as bench, FixtureCounts};
+
+    #[test]
+    fn snapshot_runner_tables_equal_vec_source_on_live_fixture_and_harnesses() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        let fixture = bench::representative_fixture(FixtureCounts {
+            subscription_rules: 10,
+            exclusion_rules: 103,
+            runner_route_rules: 0,
+            catalog_facts: 836,
+            listed_credentials: 39,
+        });
+        for with_rules in [false, true] {
+            if with_rules {
+                fixture.harness.edit_config(|config| {
+                    config["runners"][0]["routes"] = serde_json::json!([
+                        "cpu-provider-0/model-0",
+                        "cpu-provider-0/model-0/variant",
+                        "cpu-provider-0",
+                        "cpu-provider-1",
+                        "cpu-provider-1/model-1",
+                    ]);
+                });
+            }
+            let config = fixture.operator_config();
+            let shared = fixture.credentials();
+            let credentials = shared.lock().unwrap();
+            let facts = fixture.store().get_facts().unwrap();
+            let harnesses: BTreeSet<_> = credentials
+                .runner_declarations
+                .values()
+                .flat_map(|runner| runner.harnesses.iter().flatten().cloned())
+                .chain(["default".into(), "alternate".into()])
+                .collect();
+            for harness in
+                std::iter::once(None).chain(harnesses.iter().map(|harness| Some(harness.as_str())))
+            {
+                for selection in [false, true] {
+                    let from_config = if selection {
+                        Registry::build_for_selection(
+                            config.as_ref(),
+                            &credentials,
+                            &facts,
+                            bench::FIXTURE_NOW,
+                            harness,
+                        )
+                    } else {
+                        Registry::build_for_harness(
+                            config.as_ref(),
+                            &credentials,
+                            &facts,
+                            bench::FIXTURE_NOW,
+                            harness,
+                        )
+                    };
+                    let from_vec = if selection {
+                        Registry::build_for_selection(
+                            config.v1_runners(),
+                            &credentials,
+                            &facts,
+                            bench::FIXTURE_NOW,
+                            harness,
+                        )
+                    } else {
+                        Registry::build_for_harness(
+                            config.v1_runners(),
+                            &credentials,
+                            &facts,
+                            bench::FIXTURE_NOW,
+                            harness,
+                        )
+                    };
+                    assert_eq!(
+                        serde_json::to_value(&from_config.entries).unwrap(),
+                        serde_json::to_value(&from_vec.entries).unwrap()
+                    );
+                    for policy in config.v1_runners() {
+                        for fact in &facts {
+                            let capacity = format!("{}/{}", fact.provider_id, fact.model_id);
+                            for route in [capacity.clone(), format!("{capacity}/variant/extra")] {
+                                assert_eq!(
+                                    from_config.runs(&policy.module, &route, &capacity),
+                                    from_vec.runs(&policy.module, &route, &capacity)
+                                );
+                                assert_eq!(
+                                    from_config.can_run(&policy.module, &route, &capacity),
+                                    from_vec.can_run(&policy.module, &route, &capacity)
+                                );
+                                assert_eq!(
+                                    from_config.no_runner_account(
+                                        &policy.module,
+                                        &route,
+                                        &capacity
+                                    ),
+                                    from_vec.no_runner_account(&policy.module, &route, &capacity)
+                                );
+                                assert_eq!(
+                                    from_config.wire_family_unverified(
+                                        &policy.module,
+                                        &route,
+                                        &capacity
+                                    ),
+                                    from_vec.wire_family_unverified(
+                                        &policy.module,
+                                        &route,
+                                        &capacity
+                                    )
+                                );
+                                assert_eq!(
+                                    from_config.requires_wire_api(
+                                        &policy.module,
+                                        &route,
+                                        &capacity
+                                    ),
+                                    from_vec.requires_wire_api(&policy.module, &route, &capacity)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Read runner facts with the shared routing role declaration validator.
@@ -540,24 +697,37 @@ fn report_unknown_pair_tokens_once(module: &str, declaration: &RunnerDeclaration
 pub(crate) fn declarations_from_catalog(
     modules: &serde_json::Value,
 ) -> std::collections::BTreeMap<String, RunnerDeclaration> {
-    modules.as_array().into_iter().flatten().filter_map(|entry| {
-        if entry.get("nonce_verified").and_then(serde_json::Value::as_bool) != Some(true) {
-            return None;
-        }
-        let module = entry.get("module_id")?.as_str()?;
-        let slot = entry.get("role_declarations")?.get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)?;
-        match parse_declaration(slot) {
-            Ok(Some(declaration)) => {
-                report_unknown_pair_tokens_once(module, &declaration);
-                Some((module.to_owned(), declaration))
+    modules
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            if entry
+                .get("nonce_verified")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                return None;
             }
-            Ok(None) => None,
-            Err(error) => {
-                crate::warn_operator(format!("[striatum] ignored invalid runner declaration from {module}: {error}"));
-                None
+            let module = entry.get("module_id")?.as_str()?;
+            let slot = entry
+                .get("role_declarations")?
+                .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)?;
+            match parse_declaration(slot) {
+                Ok(Some(declaration)) => {
+                    report_unknown_pair_tokens_once(module, &declaration);
+                    Some((module.to_owned(), declaration))
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    crate::warn_operator(format!(
+                        "[striatum] ignored invalid runner declaration from {module}: {error}"
+                    ));
+                    None
+                }
             }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 pub(crate) fn service_tiers_from_describe(

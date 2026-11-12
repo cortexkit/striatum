@@ -239,6 +239,31 @@ pub(crate) fn select_in_order(
 /// supplied by the runner adapter; host reachability is the host's own list.
 /// Permanent credential refusals are not quota walls and cannot produce a hold.
 #[allow(clippy::too_many_arguments)]
+pub(crate) trait PolicySource {
+    fn compiled_policy(
+        &self,
+    ) -> std::borrow::Cow<'_, striatum_core::launch_policy::CompiledRoutingPolicy>;
+}
+
+impl PolicySource for crate::config_overrides::LiveConfig {
+    fn compiled_policy(
+        &self,
+    ) -> std::borrow::Cow<'_, striatum_core::launch_policy::CompiledRoutingPolicy> {
+        std::borrow::Cow::Borrowed(self.compiled_routing_policy())
+    }
+}
+
+impl PolicySource for striatum_core::launch_policy::ModelRoutingPolicyInput {
+    fn compiled_policy(
+        &self,
+    ) -> std::borrow::Cow<'_, striatum_core::launch_policy::CompiledRoutingPolicy> {
+        // Compatibility wrapper compiles per call; request paths must pass their LiveConfig.
+        std::borrow::Cow::Owned(
+            striatum_core::launch_policy::CompiledRoutingPolicy::compile(self.clone()),
+        )
+    }
+}
+
 pub(crate) fn prepare_candidates(
     facts: &[ModelFact],
     snapshot: &mut striatum_core::ModelRouteStateSnapshot,
@@ -250,14 +275,13 @@ pub(crate) fn prepare_candidates(
     priced_per_token: bool,
     allowed_providers: Option<&[String]>,
     subscription_plan_providers: Option<&std::collections::HashSet<String>>,
-    policy: &striatum_core::launch_policy::ModelRoutingPolicyInput,
+    policy: &impl PolicySource,
     catalog_targets: &std::collections::BTreeMap<String, String>,
     classes: Option<&crate::account_selection::ClassContext>,
 ) -> Candidates {
     use striatum_core::model_router::CredentialRefusalMark;
-    use striatum_core::provider_model_spec::{parse_spec_list, resolve_spec};
-
-    let specs = parse_spec_list(&policy.subscription);
+    let policy = policy.compiled_policy();
+    let specs = &policy.subscription;
     let mut subscription_keys = std::collections::HashSet::new();
     let filters;
     match source {
@@ -266,8 +290,7 @@ pub(crate) fn prepare_candidates(
             // even when routing has no credentials or account sets of its own.
             for fact in facts {
                 let route = fact_to_route(fact);
-                if resolve_spec(
-                    &specs,
+                if specs.resolve(
                     &route.route_key,
                     auth_types
                         .get(&fact.provider_id)
@@ -337,19 +360,22 @@ pub(crate) fn prepare_candidates(
                         .or_default()
                         .statically_routable = Some(false);
                 }
-                let resolved = classes.map(|classes| classes.class(fact, priced_per_token));
-                let fallback = crate::account_selection::resolve_class(
-                    rows,
-                    fact,
-                    &catalog_providers,
-                    credential_data,
-                    &specs,
-                    catalog_targets.contains_key(&fact.provider_id),
-                    priced_per_token,
-                    false,
-                    |_| true,
+                let resolved = classes.map_or_else(
+                    || {
+                        crate::account_selection::resolve_class(
+                            rows,
+                            fact,
+                            &catalog_providers,
+                            credential_data,
+                            specs,
+                            catalog_targets.contains_key(&fact.provider_id),
+                            priced_per_token,
+                            false,
+                            |_| true,
+                        )
+                    },
+                    |classes| classes.class(fact, priced_per_token),
                 );
-                let resolved = resolved.as_ref().unwrap_or(&fallback);
                 if priced_per_token && !resolved.rows.is_empty() && !resolved.subscription {
                     metered_accounts.insert(route.route_key.clone());
                 }

@@ -105,6 +105,175 @@ pub fn resolve_spec(specs: &[ParsedSpec], key: &str, base: bool) -> bool {
     result
 }
 
+/// Provider rules resolved without reparsing or scanning unrelated rules.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledSpecs {
+    by_provider: std::collections::HashMap<Box<str>, ProviderSpecs>,
+}
+
+/// Lets callers using parsed lists share an interface with precompiled rules.
+pub trait SpecResolver {
+    fn resolve(&self, key: &str, base: bool) -> bool;
+}
+
+impl SpecResolver for CompiledSpecs {
+    fn resolve(&self, key: &str, base: bool) -> bool {
+        CompiledSpecs::resolve(self, key, base)
+    }
+}
+
+impl SpecResolver for [ParsedSpec] {
+    fn resolve(&self, key: &str, base: bool) -> bool {
+        resolve_spec(self, key, base)
+    }
+}
+
+impl<const N: usize> SpecResolver for [ParsedSpec; N] {
+    fn resolve(&self, key: &str, base: bool) -> bool {
+        resolve_spec(self, key, base)
+    }
+}
+
+impl SpecResolver for Vec<ParsedSpec> {
+    fn resolve(&self, key: &str, base: bool) -> bool {
+        resolve_spec(self, key, base)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ProviderSpecs {
+    provider_level: Option<bool>,
+    models: std::collections::HashMap<Box<str>, (usize, bool)>,
+}
+
+impl CompiledSpecs {
+    pub fn compile(entries: &[String]) -> Self {
+        let mut compiled = Self::default();
+        for (index, spec) in entries
+            .iter()
+            .filter_map(|entry| parse_spec(entry))
+            .enumerate()
+        {
+            let provider = compiled
+                .by_provider
+                .entry(spec.provider.into())
+                .or_default();
+            match spec.model {
+                Some(model) => {
+                    provider.models.insert(model.into(), (index, !spec.negated));
+                }
+                None => provider.provider_level = Some(!spec.negated),
+            }
+        }
+        compiled
+    }
+
+    /// Model rules outrank provider rules, even a later provider rule. Among
+    /// matching model prefixes, list order wins rather than prefix length.
+    pub fn override_for(&self, key: &str) -> Option<bool> {
+        let (provider, model) = key
+            .split_once('/')
+            .map_or((key, None), |(p, m)| (p, Some(m)));
+        let rules = self.by_provider.get(provider)?;
+        let mut best = None;
+        if let Some(model) = model {
+            for end in model
+                .match_indices('/')
+                .map(|(index, _)| index)
+                .chain(std::iter::once(model.len()))
+            {
+                if let Some(&(index, value)) = rules.models.get(&model[..end]) {
+                    if best.is_none_or(|(previous, _)| index > previous) {
+                        best = Some((index, value));
+                    }
+                }
+            }
+        }
+        best.map(|(_, value)| value).or(rules.provider_level)
+    }
+
+    pub fn resolve(&self, key: &str, base: bool) -> bool {
+        self.override_for(key).unwrap_or(base)
+    }
+}
+
+#[cfg(test)]
+mod compiled_tests {
+    use super::*;
+
+    #[test]
+    fn compiled_specs_match_reference_for_subscription_exclusion_and_runner_rules() {
+        // Every generated case includes the troublesome shapes; random extras
+        // vary their order and signs without relying on chance to cover them.
+        let mut random = 0x5eed_u64;
+        let mut next = || {
+            random ^= random << 13;
+            random ^= random >> 7;
+            random ^= random << 17;
+            random
+        };
+        for case in 0..1024 {
+            for rule_kind in ["subscription", "exclusion", "runner"] {
+                let mut entries = vec![
+                    "p/m".into(),
+                    "-p/m".into(),
+                    "p/m/child".into(),
+                    "-p/m/child/deep".into(),
+                    "p".into(),
+                    "-p".into(),
+                    "".into(),
+                    "   ".into(),
+                    "/m".into(),
+                    "p/".into(),
+                    "- /m".into(),
+                    "- p/".into(),
+                ];
+                let choices = [
+                    "p",
+                    "p/m",
+                    "p/m/child",
+                    "p/m/v/high",
+                    "q",
+                    "q/a",
+                    "q/a//b",
+                    "-",
+                    "p//",
+                    " p/m ",
+                ];
+                for _ in 0..next() % 40 {
+                    let body = choices[next() as usize % choices.len()];
+                    entries.push(format!("{}{body}", if next() & 1 == 0 { "-" } else { "" }));
+                }
+                let compiled = CompiledSpecs::compile(&entries);
+                let reference = parse_spec_list(&entries);
+                for key in [
+                    "p",
+                    "p/",
+                    "p/m",
+                    "p/m/child",
+                    "p/m/child/deep",
+                    "p/m/child/deep/v/extra",
+                    "p/m/v/high",
+                    "p/m2",
+                    "q/a//b/v",
+                    "q/a/z",
+                    "absent/m/v/extra",
+                    "",
+                    "/m",
+                ] {
+                    for base in [false, true] {
+                        assert_eq!(
+                            compiled.resolve(key, base),
+                            resolve_spec(&reference, key, base),
+                            "{rule_kind} case {case}: {key:?}, base {base}: {entries:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The two exclusion lists a selection applies, deliberately kept apart.
 ///
 /// `operator` is the standing fence the machine's owner wrote in the user-global
@@ -157,24 +326,24 @@ pub enum ExclusionSource {
 /// Both exclusion lists parsed once for a selection pass.
 #[derive(Debug, Clone, Default)]
 pub struct ExclusionSpecs {
-    operator: Vec<ParsedSpec>,
-    operator_group: Vec<ParsedSpec>,
-    caller: Vec<ParsedSpec>,
+    operator: CompiledSpecs,
+    operator_group: CompiledSpecs,
+    caller: CompiledSpecs,
 }
 
 impl ExclusionSpecs {
     pub fn parse(policy: ExclusionPolicy<'_>) -> Self {
         Self {
-            operator: parse_spec_list(policy.operator),
-            operator_group: Vec::new(),
-            caller: parse_spec_list(policy.caller),
+            operator: CompiledSpecs::compile(policy.operator),
+            operator_group: CompiledSpecs::default(),
+            caller: CompiledSpecs::compile(policy.caller),
         }
     }
 
     /// Resolve the consumer's exclusion list separately from the machine-wide
     /// list so negations in one cannot cancel exclusions in the other.
     pub fn with_operator_group(mut self, group: &[String]) -> Self {
-        self.operator_group = parse_spec_list(group);
+        self.operator_group = CompiledSpecs::compile(group);
         self
     }
 
@@ -182,12 +351,10 @@ impl ExclusionSpecs {
     /// first so a route that both lists name is reported as the standing policy
     /// decision it is, not as one attempt's local exclusion.
     pub fn source_for(&self, key: &str) -> Option<ExclusionSource> {
-        if resolve_spec(&self.operator, key, false)
-            || resolve_spec(&self.operator_group, key, false)
-        {
+        if self.operator.resolve(key, false) || self.operator_group.resolve(key, false) {
             return Some(ExclusionSource::Operator);
         }
-        if resolve_spec(&self.caller, key, false) {
+        if self.caller.resolve(key, false) {
             return Some(ExclusionSource::Caller);
         }
         None

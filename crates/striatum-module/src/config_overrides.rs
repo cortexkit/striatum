@@ -44,11 +44,84 @@ mod new_shape_tests;
 /// A complete, validated document held for the lifetime of one selection. Model
 /// overrides are overlays, not store writes: withdrawing one exposes stored facts
 /// again, and a request cannot observe a partially applied edit.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct LiveConfig {
     config: RoutingConfigFile,
     document: Option<String>,
     pricing: RoutePricing,
+    compiled: Arc<CompiledPolicy>,
+    revision: String,
+}
+
+#[derive(Debug)]
+struct CompiledPolicy {
+    routing: striatum_core::launch_policy::CompiledRoutingPolicy,
+    allocator_default: Arc<striatum_core::accounts::AllocatorPolicy>,
+    allocators: BTreeMap<String, Arc<striatum_core::accounts::AllocatorPolicy>>,
+    model_pools: Vec<striatum_core::quota_extract::ModelPool>,
+    runner_routes: BTreeMap<String, Arc<striatum_core::provider_model_spec::CompiledSpecs>>,
+    metered_fallback: std::collections::BTreeSet<String>,
+}
+
+impl CompiledPolicy {
+    fn compile(config: &RoutingConfigFile) -> Self {
+        let model_pools: Vec<_> = config
+            .quota_model_pools
+            .iter()
+            .map(|entry| striatum_core::quota_extract::ModelPool {
+                model_prefix: entry.model_prefix.clone(),
+                pool: entry.pool.clone(),
+            })
+            .collect();
+        let allocator = |provider| {
+            let mut policy = allocator_policy_from(&config.accounts, provider)
+                .expect("account policies are validated before publishing the config");
+            policy.model_pools = model_pools.clone();
+            Arc::new(policy)
+        };
+        Self {
+            routing: striatum_core::launch_policy::CompiledRoutingPolicy::compile(
+                ModelRoutingPolicyInput {
+                    exclude: clean_spec_entries(config.model_routing.exclude.all.clone()),
+                    subscription: clean_spec_entries(config.model_routing.subscription.clone()),
+                    score_alias: BTreeMap::new(),
+                },
+            ),
+            allocator_default: allocator(None),
+            allocators: config
+                .providers
+                .iter()
+                .map(|(id, provider)| (id.clone(), allocator(Some(&provider.accounts))))
+                .collect(),
+            runner_routes: config
+                .runners
+                .iter()
+                .filter_map(|runner| {
+                    runner.routes.as_ref().map(|routes| {
+                        (
+                            runner.module.clone(),
+                            Arc::new(striatum_core::provider_model_spec::CompiledSpecs::compile(
+                                routes,
+                            )),
+                        )
+                    })
+                })
+                .collect(),
+            metered_fallback: config
+                .providers
+                .iter()
+                .filter(|(_, provider)| provider.accounts.metered_fallback)
+                .map(|(id, _)| id.clone())
+                .collect(),
+            model_pools,
+        }
+    }
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self::new(RoutingConfigFile::default(), None)
+    }
 }
 
 /// The deliberately narrow, call-local policy overlay accepted by `route.what_if`.
@@ -145,6 +218,11 @@ impl LiveConfig {
             .map(|(provider, _)| provider.clone())
             .collect();
         Self {
+            compiled: Arc::new(CompiledPolicy::compile(&config)),
+            revision: document
+                .as_deref()
+                .map(policy_revision)
+                .unwrap_or_else(default_policy_revision),
             config,
             document,
             pricing,
@@ -172,7 +250,7 @@ fn route_pricing(section: &ModelRoutingSection) -> RoutePricing {
     pricing
 }
 
-type FileStamp = Option<(SystemTime, u64)>;
+type FileStamp = Option<(SystemTime, u64, String)>;
 
 struct LiveConfigCache {
     stamp: FileStamp,
@@ -354,11 +432,15 @@ pub(crate) fn settle_live_config(path: &Path) -> Arc<LiveConfig> {
 }
 
 fn file_stamp(path: &Path) -> Result<FileStamp, String> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(Some((
-            metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            metadata.len(),
-        ))),
+    match std::fs::read_to_string(path) {
+        Ok(document) => {
+            let metadata = std::fs::metadata(path).map_err(|error| error.to_string())?;
+            Ok(Some((
+                metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                metadata.len(),
+                policy_revision(&document),
+            )))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(format!("reading {}: {error}", path.display())),
     }
@@ -491,6 +573,13 @@ fn live_config_at_with_reporter(
         }
     };
     if let Some(cache) = caches.get_mut(path) {
+        if stamp.as_ref().is_some_and(|(_, _, revision)| {
+            cache.active.document.is_some() && *revision == cache.active.revision
+        }) {
+            cache.stamp = stamp;
+            cache.pending = None;
+            return Ok(Arc::clone(&cache.active));
+        }
         if cache.stamp == stamp {
             cache.pending = None;
             return Ok(Arc::clone(&cache.active));
@@ -501,19 +590,22 @@ fn live_config_at_with_reporter(
                     && now.saturating_duration_since(*since) >= RELOAD_DEBOUNCE => {}
             Some((pending, _)) if *pending == stamp => return Ok(Arc::clone(&cache.active)),
             _ => {
-                cache.pending = Some((stamp, now));
+                cache.pending = Some((stamp.clone(), now));
                 return Ok(Arc::clone(&cache.active));
             }
         }
     }
+    let previous = caches.get(path).map(|cache| Arc::clone(&cache.active));
+    let previously_present = previous
+        .as_ref()
+        .is_some_and(|active| active.document.is_some());
+    // Parsing and building lookup tables must not hold the publication lock.
+    drop(caches);
     let next = (|| {
         let document = match std::fs::read_to_string(path) {
             Ok(document) => Some(document),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if caches
-                    .get(path)
-                    .is_some_and(|cache| cache.active.document.is_some())
-                {
+                if previously_present {
                     return Err("missing".to_owned());
                 }
                 None
@@ -528,6 +620,22 @@ fn live_config_at_with_reporter(
         check_variants_against_catalog(path, &config)?;
         Ok(LiveConfig::new(config, document))
     })();
+    let mut caches = live_configs().lock().unwrap();
+    if let Some(cache) = caches.get(path) {
+        if previous
+            .as_ref()
+            .is_none_or(|old| !Arc::ptr_eq(old, &cache.active))
+        {
+            return Ok(Arc::clone(&cache.active));
+        }
+    }
+    // Do not publish a document that changed while its tables were being built.
+    if file_stamp(path).ok().as_ref() != Some(&stamp) {
+        if let Some(cache) = caches.get(path) {
+            return Ok(Arc::clone(&cache.active));
+        }
+        return Err("config changed while loading; retry".into());
+    }
     let active = match next {
         Ok(config) => Arc::new(config),
         Err(error) => {
@@ -726,19 +834,28 @@ impl LiveConfig {
     }
 
     pub fn policy_revision(&self) -> String {
-        self.document
-            .as_deref()
-            .map(policy_revision)
-            .unwrap_or_else(default_policy_revision)
+        self.revision.clone()
     }
 
     pub fn operator_policy(&self) -> ModelRoutingPolicyInput {
-        let section = &self.config.model_routing;
-        ModelRoutingPolicyInput {
-            exclude: clean_spec_entries(section.exclude.all.clone()),
-            subscription: clean_spec_entries(section.subscription.clone()),
-            score_alias: BTreeMap::new(),
-        }
+        self.operator_policy_ref().clone()
+    }
+
+    pub fn operator_policy_ref(&self) -> &ModelRoutingPolicyInput {
+        &self.compiled.routing.input
+    }
+
+    pub(crate) fn compiled_routing_policy(
+        &self,
+    ) -> &striatum_core::launch_policy::CompiledRoutingPolicy {
+        &self.compiled.routing
+    }
+
+    pub(crate) fn runner_routes(
+        &self,
+        module: &str,
+    ) -> Option<&Arc<striatum_core::provider_model_spec::CompiledSpecs>> {
+        self.compiled.runner_routes.get(module)
     }
 
     pub fn min_band(&self) -> Option<f64> {
@@ -753,10 +870,7 @@ impl LiveConfig {
     }
 
     pub(crate) fn metered_fallback(&self, provider: &str) -> bool {
-        self.config
-            .providers
-            .get(provider)
-            .is_some_and(|policy| policy.accounts.metered_fallback)
+        self.compiled.metered_fallback.contains(provider)
     }
 
     /// The `routing/v1` consumer ids, in id order.
@@ -934,6 +1048,57 @@ pub async fn config_refresh_loop(path: PathBuf, catalog_wake: Arc<tokio::sync::N
 #[cfg(test)]
 mod live_snapshot_tests {
     use super::*;
+
+    #[test]
+    fn compiled_policy_is_snapshot_owned_and_revision_detects_same_stamp_edits() {
+        let scratch = cortexkit_test_support::ScratchDir::new("compiled-policy-revision");
+        let path = scratch.path().join("routing.jsonc");
+        crate::test_config::write(&path, r#"{"model_routing":{"subscription":["aaaa"]}}"#).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let now = Instant::now();
+        let old = live_config_at(&path, now).unwrap();
+        assert!(old
+            .compiled_routing_policy()
+            .subscription
+            .resolve("aaaa/model/v", false));
+        assert!(std::ptr::eq(
+            old.operator_policy_ref(),
+            old.operator_policy_ref()
+        ));
+        assert!(std::ptr::eq(
+            old.allocator_policy_ref("unconfigured"),
+            old.allocator_policy_ref("another")
+        ));
+        assert!(std::ptr::eq(
+            old.quota_model_pools_ref(),
+            old.quota_model_pools_ref()
+        ));
+        assert!(Arc::ptr_eq(&old, &live_config_at(&path, now).unwrap()));
+
+        crate::test_config::write(&path, r#"{"model_routing":{"subscription":["bbbb"]}}"#).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+        assert_eq!(metadata.len(), std::fs::metadata(&path).unwrap().len());
+        assert!(Arc::ptr_eq(&old, &live_config_at(&path, now).unwrap()));
+        let published = live_config_at(&path, now + RELOAD_DEBOUNCE).unwrap();
+        assert!(!Arc::ptr_eq(&old, &published));
+        assert!(published
+            .compiled_routing_policy()
+            .subscription
+            .resolve("bbbb/model/v", false));
+        assert!(!published
+            .compiled_routing_policy()
+            .subscription
+            .resolve("aaaa/model/v", false));
+        assert!(old
+            .compiled_routing_policy()
+            .subscription
+            .resolve("aaaa/model/v", false));
+    }
 
     #[test]
     fn changed_config_is_debounced_and_in_flight_snapshot_stays_immutable() {
@@ -1155,17 +1320,12 @@ impl LiveConfig {
         )
     }
     /// The configured model-specific quota pools.
-    pub(crate) fn quota_model_pools(
-        &self,
-    ) -> Vec<striatum_core::quota_extract::ModelPool> {
-        self.config
-            .quota_model_pools
-            .iter()
-            .map(|entry| striatum_core::quota_extract::ModelPool {
-                model_prefix: entry.model_prefix.clone(),
-                pool: entry.pool.clone(),
-            })
-            .collect()
+    pub(crate) fn quota_model_pools(&self) -> Vec<striatum_core::quota_extract::ModelPool> {
+        self.quota_model_pools_ref().to_vec()
+    }
+
+    pub(crate) fn quota_model_pools_ref(&self) -> &[striatum_core::quota_extract::ModelPool] {
+        &self.compiled.model_pools
     }
 
     /// Whether `agent` is a head under `head_agents`.
@@ -1186,16 +1346,17 @@ impl LiveConfig {
         &self,
         provider: &str,
     ) -> striatum_core::accounts::AllocatorPolicy {
-        let mut policy = allocator_policy_from(
-            &self.config.accounts,
-            self.config
-                .providers
-                .get(provider)
-                .map(|provider| &provider.accounts),
-        )
-        .expect("account policies are validated before publishing the config");
-        policy.model_pools = self.quota_model_pools();
-        policy
+        self.allocator_policy_ref(provider).clone()
+    }
+
+    pub(crate) fn allocator_policy_ref(
+        &self,
+        provider: &str,
+    ) -> &striatum_core::accounts::AllocatorPolicy {
+        self.compiled
+            .allocators
+            .get(provider)
+            .unwrap_or(&self.compiled.allocator_default)
     }
 }
 
