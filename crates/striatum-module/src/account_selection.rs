@@ -2163,6 +2163,21 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
+        self.blocked_reset_with_policy(
+            provider,
+            model,
+            priced,
+            self.config.allocator_policy_ref(provider).clone(),
+        )
+    }
+
+    fn blocked_reset_with_policy(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        policy: AllocatorPolicy,
+    ) -> Option<Option<i64>> {
         // An empty roster may have lost accounts to route or credential
         // fences. Reuse admission's classification so only a dated account
         // limit, not missing credentials or policy exclusions, supplies a reset.
@@ -2180,7 +2195,15 @@ impl ClassContext {
                 }
             }
         }
-        let blocked = self.probe(provider, model, priced, false, None, "blocked-preflight");
+        let blocked = self.probe_with_policy(
+            provider,
+            model,
+            priced,
+            false,
+            None,
+            "blocked-preflight",
+            policy.clone(),
+        );
         if !blocked.refusal().is_some_and(|refusal| {
             matches!(
                 refusal.code,
@@ -2194,7 +2217,7 @@ impl ClassContext {
             &blocked,
             roster.roster.as_ref(),
             self.fences.get(provider).map_or(&[], Vec::as_slice),
-            &self.config.allocator_policy(provider),
+            &policy,
             model,
             self.now_ms,
         );
@@ -2205,6 +2228,16 @@ impl ClassContext {
     /// removed every account from eligibility. Permanent credential and policy
     /// failures remain in force; this view is used only for retry diagnostics.
     pub(crate) fn recovery_reset(&self, provider: &str, model: &str, priced: bool) -> Option<i64> {
+        self.recovery_reset_with_keep_free(provider, model, priced, 0.0)
+    }
+
+    pub(crate) fn recovery_reset_with_keep_free(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        keep_free: f64,
+    ) -> Option<i64> {
         let mut recovered = self.clone();
         recovered.replace_refusals(
             self.refusals
@@ -2228,7 +2261,14 @@ impl ClassContext {
                 .cloned()
                 .collect(),
         );
-        recovered.blocked_reset(provider, model, priced).flatten()
+        // Core's worker keep-free margin can exceed the allocator's reserve.
+        // Apply it only to this recovery probe, so a weekly reset that frees
+        // that margin is diagnosed without changing account admission policy.
+        let mut policy = self.config.allocator_policy_ref(provider).clone();
+        policy.reserve_seven_day = policy.reserve_seven_day.max(keep_free);
+        recovered
+            .blocked_reset_with_policy(provider, model, priced, policy)
+            .flatten()
     }
 
     #[allow(clippy::too_many_arguments)]

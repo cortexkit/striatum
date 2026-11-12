@@ -2439,6 +2439,88 @@ fn oauth_weekly_reading_at(used_percent: f64, reset_ms: i64, fetched_ms: i64) {
 }
 
 #[tokio::test]
+async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let weekly_reset = NOW + 86_400_000;
+    harness.edit_config(|config| {
+        config["model_routing"]["keep_free_percent"] = json!({"synthetic":20});
+    });
+    let mut quota = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_provider_reply(
+        &mut quota,
+        "test-source",
+        &serde_json::to_vec(&json!({"result":[
+            {"provider":"test-source","apiProvider":"synthetic","account":"oauth-account","source":"vault",
+                "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+                "usage":{
+                    "primary":{"usedPercent":0.0,"windowMinutes":300,
+                        "resetsAt":crate::account_selection::rfc3339((NOW + 60_000) as i64)},
+                    "secondary":{"usedPercent":95.0,"windowMinutes":10080,
+                        "resetsAt":crate::account_selection::rfc3339(weekly_reset as i64)}}},
+            {"provider":"test-source","apiProvider":"synthetic","account":"apikey-account","source":"vault",
+                "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+                "usage":{"primary":{"usedPercent":100.0,"windowMinutes":10080,
+                    "resetsAt":crate::account_selection::rfc3339((NOW + 30_000) as i64)}}}
+        ],"completeProviders":["test-source"]})).unwrap(),
+        NOW as i64,
+    ).unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let what_if = operator.call("route.what_if", &json!({"consumer":"mason","iqs":[0]})).await;
+    assert_eq!(what_if.0, FrameType::Response, "{what_if:?}");
+    assert!(what_if.1.to_string().contains("subscription_reserve"), "{what_if:?}");
+
+    let caller = harness.bind(reserved(OWNER), None).await;
+    for variant in ["xhigh", "max"] {
+        let pin = format!("synthetic/model:{variant}");
+        let reply = caller.call("route.select", &json!({"consumer":"mason","pin":pin,
+            "requirements":{"iq":100},"hold_wait_max_s":0})).await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
+        assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
+        assert_eq!(refusal.detail["reason"], "quota_exhausted", "{refusal:?}");
+        assert_eq!(refusal.wait_until_ms(), Some(weekly_reset), "{refusal:?}");
+        assert!(refusal.message.contains("subscription_reserve"), "{refusal:?}");
+    }
+}
+
+#[tokio::test]
+async fn pin_availability_timed_account_block_names_its_recovery() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let mut listing = credentials.listed_credentials().to_vec();
+    listing.retain(|row| row.id == "oauth:test");
+    credentials.apply_listing(&ScopedCredentialListing {
+        view:"only-subscription-account".into(), credentials:listing, ..Default::default()
+    }, NOW);
+    harness.set_credentials(credentials);
+    let reset = NOW + 600_000;
+    oauth_weekly_reading_at(10.0, reset as i64, NOW as i64);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let selected = caller.call("route.select", &json!({"consumer":"mason",
+        "requirements":{"iq":30}})).await;
+    assert_eq!(selected.0, FrameType::Response, "{selected:?}");
+    oauth_weekly_reading_at(100.0, reset as i64, NOW as i64);
+    let reported = caller.call("route.report", &json!({
+        "decision_id":selected.1["result"]["decision_id"], "outcome":"refused",
+        "credential_id":"oauth:test", "runner_code":"billing_exhausted"
+    })).await;
+    assert_eq!(reported.0, FrameType::Response, "{reported:?}");
+    let blocks = harness.store().account_transaction(|tx| tx.active_pool_fences("synthetic")).unwrap();
+    assert_eq!(blocks.len(), 1);
+    let block: Fence = serde_json::from_str(&blocks[0].evidence.fence_json).unwrap();
+    assert_eq!(block.reset, ResetTime::At(reset as i64));
+    let reply = caller.call("route.select", &json!({"consumer":"mason","pin":"synthetic/model",
+        "requirements":{"iq":30},"hold_wait_max_s":0})).await;
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
+    assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
+    assert_eq!(refusal.detail["reason"], "quota_exhausted", "{refusal:?}");
+    assert_eq!(refusal.wait_until_ms(), Some(reset), "{refusal:?}");
+}
+
+#[tokio::test]
 async fn subscription_billing_refusal_keeps_reset_evidence_but_stale_readings_allow_a_probe() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);

@@ -1584,3 +1584,26 @@ async fn broca_missing_provider_account_is_rejected_on_both_select_surfaces_desp
         );
     }
 }
+
+#[tokio::test]
+async fn pin_availability_unknown_cause_is_untimed_and_keeps_its_detail() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = Harness::new("pin-no-runner-account");
+    let facts = vec![fact("xai", "grok-4.7", Some(&["oauth"]))];
+    harness.install_facts(&facts);
+    harness.edit_config(|config| config["runners"] = json!([{"module":"broca", "via_vault":true}]));
+    let mut missing = row(&["xai"], &[], Some("oauth"));
+    missing.id = "oauth:xai".into();
+    missing.account_id = None;
+    harness.set_credentials(credentials(&facts, missing, NOW));
+    let caller = harness.bind(reserved("example-consumer"), None).await;
+    let reply = caller.call("route.select", &json!({"consumer":"mason","pin":"xai/grok-4.7",
+        "requirements":{"iq":0}})).await;
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
+    assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
+    assert_eq!(refusal.detail["reason"], "not_available", "{refusal:?}");
+    assert_eq!(refusal.wait_until_ms(), None, "{refusal:?}");
+    assert!(!refusal.detail.contains_key("reset_at_ms"), "{refusal:?}");
+    assert!(refusal.message.contains("no_runner_account"), "{refusal:?}");
+}

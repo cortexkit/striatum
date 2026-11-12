@@ -293,7 +293,25 @@ pub(crate) fn select_with_availability(
         .get_or_insert(0.0);
     let mut selected =
         select_model_route_with_availability(input, config, slots, &[], availability_rejections)
-            .map_err(|error| refuse(error.reason.as_str(), error.message))?;
+            .map_err(|error| {
+                // The scorer can reject an admitted pin for subscription reserve.
+                // Its summary code alone cannot tell the caller what must recover.
+                let message = error.rejected.first().map_or_else(
+                    || error.message.clone(),
+                    |rejected| {
+                        format!(
+                            "{pin}: {}{}",
+                            rejected.reason,
+                            rejected
+                                .detail
+                                .as_ref()
+                                .map(|detail| format!(" ({detail})"))
+                                .unwrap_or_default()
+                        )
+                    },
+                );
+                refuse(error.reason.as_str(), message)
+            })?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;
     selected.score.metrics = adequacy.metrics;
