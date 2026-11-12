@@ -339,6 +339,88 @@ async fn reachability_uses_declared_pairs_and_vault_fallback() {
 }
 
 #[tokio::test]
+async fn head_choices_hide_pool_only_score_aliases_on_every_runner() {
+    let (harness, mut credentials) = fixture();
+    let facts = harness.store().get_facts().unwrap();
+    let mut rows = credentials.listed_credentials().to_vec();
+    for row in &mut rows {
+        row.account_id = Some(format!("{}-provider-account", row.id));
+    }
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "head-choices-provider-accounts".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        crate::now_ms(),
+    );
+    credentials.runner_declarations.insert("broca".into(), super::runners::parse_declaration(
+        &json!({"runner":{"pairs":[
+            {"wire_api":WIRE,"auth_method":"oauth"},
+            {"wire_api":WIRE,"auth_method":"apikey"},
+            {"wire_api":"anthropic.messages","auth_method":"oauth"},
+            {"wire_api":"anthropic.messages","auth_method":"apikey"}
+        ],"follows_account_choice":true}})
+    ).unwrap().unwrap());
+    harness.edit_config(|config| {
+        config["runners"].as_array_mut().unwrap().push(json!({
+            "module":"broca", "via_vault":true
+        }));
+    });
+    credentials.refresh_serving_methods(&Default::default(), &facts, crate::now_ms() as i64, &[]);
+    harness.set_credentials(credentials.clone());
+    let mut before = Vec::new();
+    for runner in [
+        "broca", LEGACY, RUNNER, NO_TIERS, API_KEY_RUNNER,
+        "policy-runner", "pin-runner", "anthropic-wire-support",
+    ] {
+        before.push((runner, query(&harness, runner).await));
+    }
+    assert_eq!(
+        ids(&before[0].1),
+        ["anthropic/claude", "openai/a-head", "openai/pinned"]
+    );
+
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.push(ListedCredential {
+        id: "anthropic-platform-key".into(),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        provider_ids: vec!["anthropic-platform".into()],
+        serves: vec!["anthropic".into()],
+        credential_type: "apikey".into(),
+        auth_method: Some("apikey".into()),
+        ..Default::default()
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "head-choices-with-api-pool".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        crate::now_ms(),
+    );
+    credentials.refresh_serving_methods(&Default::default(), &facts, crate::now_ms() as i64, &[]);
+    let aliases = credentials.catalog_targets(&facts);
+    assert_eq!(
+        aliases.get("anthropic-platform").map(String::as_str),
+        Some("anthropic")
+    );
+    assert!(!aliases.contains_key("anthropic"));
+    assert!(!aliases.contains_key("openai"));
+    harness.set_credentials(credentials);
+
+    for (runner, expected) in before {
+        let reply = query(&harness, runner).await;
+        assert!(
+            ids(&reply).iter().all(|id| !id.starts_with("anthropic-platform/")),
+            "{runner}: {reply}"
+        );
+        assert_eq!(reply, expected, "non-pool choices changed for {runner}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_and_non_starting_runners_have_no_choices() {
     let (harness, mut credentials) = fixture();
     credentials

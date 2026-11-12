@@ -183,6 +183,11 @@ pub(crate) fn choices_for_harness(
     }
     let mut models = Vec::new();
     for ((provider, model), mut rows) in grouped {
+        // Resolved score aliases have no catalog rows of their own. They name
+        // account pools, not providers a runner can name in a model plan.
+        if aliases.contains_key(provider) {
+            continue;
+        }
         // Match pin resolution's preference for the unqualified fact row.
         rows.sort_by(|a, b| a.variant.cmp(&b.variant));
         let fact = rows[0];
