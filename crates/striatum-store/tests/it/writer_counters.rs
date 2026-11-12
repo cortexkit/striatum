@@ -37,10 +37,16 @@ fn writer_counters_cover_pool_autocommit_and_deferred_read() {
     assert_eq!(store.writer_commit_count_for_test() - commits, 2);
     assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 2);
 
-    assert!(store
-        .account_read(|tx| tx.admission("test-principal", "not-admitted"))
-        .unwrap()
-        .is_none());
+    store
+        .with_writer_for_test(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let count: i64 = tx.query_row("SELECT COUNT(*) FROM account_admission", [], |row| {
+                row.get(0)
+            })?;
+            assert_eq!(count, 0);
+            tx.commit()
+        })
+        .unwrap();
     assert_eq!(store.writer_commit_count_for_test() - commits, 2);
     assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 3);
 }

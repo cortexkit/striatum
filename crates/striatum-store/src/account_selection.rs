@@ -612,7 +612,7 @@ impl SqliteRouteStateStore {
         decision_id: &str,
     ) -> RouteStateResult<Option<(Option<String>, String)>> {
         self.store
-            .with_conn(|conn: &Connection| {
+            .with_read(|conn: &Connection| {
                 conn.query_row(
                     "SELECT service_tier_requested, service_tier_chosen FROM account_decision
                  WHERE decision_id=?1 AND service_tier_chosen IS NOT NULL",
@@ -929,7 +929,7 @@ impl SqliteRouteStateStore {
     }
 
     pub fn account_eligibility(&self) -> RouteStateResult<Vec<AccountEligibilityFact>> {
-        self.store.with_conn(|conn: &Connection| {
+        self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(Vec::new()); }
             let mut statement = conn.prepare("SELECT provider,credential_id,model,listing_fingerprint,code,observed_at FROM account_eligibility ORDER BY provider,credential_id,model")?;
             let rows = statement.query_map([], |row| Ok(AccountEligibilityFact {
@@ -965,7 +965,7 @@ impl SqliteRouteStateStore {
     /// Size-specific quota evidence remains until fresh headroom or success;
     /// its reported reset is a recheck hint, not an expiry.
     pub fn account_size_refusals(&self, _now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
-        self.store.with_conn(|conn: &Connection| {
+        self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
             let extra=if account_fact_table_exists(conn,"account_non_quota_size_refusal")? {
                 " UNION ALL SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_non_quota_size_refusal"
@@ -1072,7 +1072,7 @@ impl SqliteRouteStateStore {
     pub fn account_route_fence_latest_reports(
         &self,
     ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
-        self.store.with_conn(|conn: &Connection| {
+        self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(std::collections::BTreeMap::new()); }
             let mut statement = conn.prepare("SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at)) FROM account_route_fence GROUP BY credential_id")?;
             let rows = statement.query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?;
@@ -1098,7 +1098,7 @@ impl SqliteRouteStateStore {
         _now: i64,
         class: &str,
     ) -> RouteStateResult<Vec<AccountRouteFence>> {
-        self.store.with_conn(|conn: &Connection| {
+        self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
             let table=if class!="quota" {"account_non_quota_route_fence"} else {"account_route_fence"};
             let filter=if class=="transient" {"WHERE wall_kind='transient'"} else if class=="billing" {"WHERE wall_kind='billing'"} else {"WHERE wall_class='quota'"};
@@ -2366,11 +2366,22 @@ impl SqliteRouteStateStore {
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
         self.store
-            .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-                let result = f(&AccountTx { conn: &tx });
+            .with_read(|conn: &Connection| {
+                // A pooled reader already has a snapshot; a bare connection
+                // needs a deferred transaction.
+                let tx = if conn.is_autocommit() {
+                    Some(Transaction::new_unchecked(
+                        conn,
+                        TransactionBehavior::Deferred,
+                    )?)
+                } else {
+                    None
+                };
+                let result = f(&AccountTx { conn });
                 if result.is_ok() {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    if let Some(tx) = tx {
+                        crate::evaluation_snapshot::timed_commit(tx)?;
+                    }
                 }
                 Ok(result)
             })
@@ -2404,7 +2415,7 @@ impl SqliteRouteStateStore {
         limit: usize,
     ) -> RouteStateResult<Vec<AccountDecisionRecord>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(&format!(
                     "SELECT {DECISION_COLUMNS} FROM account_decision WHERE mode = ?1 \
                      ORDER BY created_at DESC, rowid DESC LIMIT ?2"
@@ -2424,7 +2435,7 @@ impl SqliteRouteStateStore {
         decision_id: &str,
     ) -> RouteStateResult<Option<AccountDecisionRecord>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     &format!(
                         "SELECT {DECISION_COLUMNS} FROM account_decision WHERE decision_id = ?1"
@@ -2441,7 +2452,7 @@ impl SqliteRouteStateStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn account_serving_counts(&self) -> RouteStateResult<AccountServingCounts> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let count = |table: &str| -> rusqlite::Result<i64> {
                     c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                         row.get(0)
