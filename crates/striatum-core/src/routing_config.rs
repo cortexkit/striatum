@@ -8,7 +8,7 @@
 use crate::model_facts::ModelScores;
 
 /// Bump when persisted decision scoring semantics change.
-pub const ANCHOR_VERSION: u32 = 5;
+pub const ANCHOR_VERSION: u32 = 6;
 
 pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 
@@ -18,20 +18,20 @@ pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 pub const DEFAULT_OVERQUALIFICATION_THRESHOLD: f64 = 40.0;
 /// Surplus points beyond the threshold over which the term (plus `base`) doubles.
 pub const DEFAULT_OVERQUALIFICATION_DOUBLING: f64 = 10.0;
-/// Scale of the term in selection-cost units: at threshold + doubling the term
-/// equals `base`.
+/// Fractional cost surcharge: at threshold + doubling the surcharge is `base`.
 pub const DEFAULT_OVERQUALIFICATION_BASE: f64 = 0.05;
+/// Keep overqualification a soft preference: a four-times cheaper route can
+/// still win at any surplus, before economic tie bands and the fit guard.
+pub const MAX_OVERQUALIFICATION_FACTOR: f64 = 4.0;
 
-/// Additive selection-cost term that keeps low-demand work off routes far above
-/// the demand. Demand is a floor and cost is primary, so a subsidised flagship
-/// priced inside the effectively-free bucket used to win low-demand work on a
-/// speed tie-break; a multiplier would vanish exactly there because those
-/// routes cost almost nothing, so the term is added instead.
+/// Fractional selection-cost surcharge for routes far above the demand. Scaling
+/// the economic cost keeps the preference meaningful as quota pressure rises;
+/// the cap leaves sufficiently cheaper high-capability routes competitive.
 ///
 /// `term = 0` when `surplus <= threshold`, else
-/// `base * (2^((surplus - threshold) / doubling) - 1)`.
-/// The defaults come from a seven-day replay of recorded decisions
-/// (reports/2026-10-02-overqualification-replay.md).
+/// `min(3, base * (2^((surplus - threshold) / doubling) - 1))`.
+/// Selection multiplies cost plus quota by `1 + term`. The threshold and curve
+/// keep their existing values; the surcharge is a fraction of selection cost.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverqualificationConfig {
     pub threshold: f64,
@@ -66,10 +66,12 @@ impl OverqualificationConfig {
     /// The term for a route `surplus` demand points above the request. Zero for
     /// an invalid configuration, so a bad value can never inflate every price.
     pub fn term(&self, surplus: f64) -> f64 {
-        if !self.is_valid() || !surplus.is_finite() || surplus <= self.threshold {
+        if !self.is_valid() || self.base == 0.0 || !surplus.is_finite() || surplus <= self.threshold
+        {
             return 0.0;
         }
-        self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0)
+        (self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0))
+            .min(MAX_OVERQUALIFICATION_FACTOR - 1.0)
     }
 }
 
@@ -96,9 +98,8 @@ pub const DEFAULT_ROUTING_CONFIG: RoutingConfig = RoutingConfig {
 /// The default configuration with the over-qualification term switched off, for
 /// tests of orderings the term is not about. Their fixtures put every route at
 /// the request frontier and ask for a low demand, so every route carries the
-/// same large term; that term lifts all of them out of the effectively-free
-/// bucket and the bucket-only keys (abundance, adequacy) those tests exercise
-/// would never be reached.
+/// same surcharge, which can lift them out of the effectively-free bucket and
+/// bypass the bucket-only keys (abundance, adequacy) those tests exercise.
 #[cfg(test)]
 pub(crate) const ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION: RoutingConfig = RoutingConfig {
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
@@ -248,6 +249,14 @@ mod tests {
             ..config
         };
         assert_eq!(broken.term(70.0), 0.0);
+        let mut previous = 0.0;
+        for surplus in 0..=200 {
+            let term = config.term(surplus as f64);
+            assert!(term >= previous && term <= 3.0);
+            previous = term;
+        }
+        assert_eq!(config.term(f64::MAX), 3.0);
+        assert_eq!(off.term(f64::MAX), 0.0);
     }
 
     #[test]

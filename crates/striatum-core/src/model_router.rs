@@ -1731,15 +1731,16 @@ fn apply_overqualification(
     if term <= 0.0 {
         return;
     }
-    objective.overqualification = term;
-    objective.selection_cost += term;
-    // Right after the cost line, the term it adds to.
+    let surcharge = objective.selection_cost * term;
+    objective.overqualification = surcharge;
+    objective.selection_cost += surcharge;
+    // Keep the multiplier beside the economic cost it scales.
     let at = notes.len().min(1);
     notes.insert(
         at,
         format!(
-            "overqualified +{term:.2} (surplus {surplus:.0} over {:.0})",
-            requirements.iq
+            "overqualified x{:.3} (+{surcharge:.2}; surplus {surplus:.0} over {:.0})",
+            1.0 + term, requirements.iq
         ),
     );
 }

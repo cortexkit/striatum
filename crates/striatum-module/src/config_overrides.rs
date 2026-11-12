@@ -1421,7 +1421,8 @@ impl Default for ModelRoutingSection {
 
 /// `overqualification`: `term = 0` while a route's surplus over
 /// the iq demand (both on the 0..100 demand scale) is at most `threshold`, else
-/// `base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.
+/// `min(3, base * (2^((surplus - threshold) / doubling) - 1))`.
+/// Selection cost is multiplied by `1 + term` (bounded to 1..4).
 /// `base: 0` switches the term off.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields)]

@@ -166,15 +166,14 @@
                 "explanation": [
                   "route pool-provider/model-pool for agent mason",
                   "elo: need 30/100 (bar 1312), have 2000 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "clears bar: adequacy 1.00, selection cost 0.02",
                   "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
-                  "overqualified +0.35 (surplus 70 over 30)",
+                  "overqualified x1.350 (+0.01; surplus 70 over 30)",
                   "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
-                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
                   "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
@@ -838,9 +837,9 @@
                   },
                   "objective": {
                     "cost": 0.016666666666666666,
-                    "overqualification": 0.35000000000000003,
+                    "overqualification": 0.005833333333333334,
                     "quota": 0.0,
-                    "selectionCost": 0.3666666666666667,
+                    "selectionCost": 0.0225,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 0.5,
@@ -859,7 +858,7 @@
                   "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.3666666666666667
+                  "selectionCost": 0.0225
                 }
               },
               "variantSelection": {
@@ -993,15 +992,14 @@
                 "explanation": [
                   "route pool-provider/model-pool for agent mason",
                   "elo: need 30/100 (bar 1312), have 2000 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "clears bar: adequacy 1.00, selection cost 0.02",
                   "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
-                  "overqualified +0.35 (surplus 70 over 30)",
+                  "overqualified x1.350 (+0.01; surplus 70 over 30)",
                   "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
-                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
                   "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
@@ -1665,9 +1663,9 @@
                   },
                   "objective": {
                     "cost": 0.016666666666666666,
-                    "overqualification": 0.35000000000000003,
+                    "overqualification": 0.005833333333333334,
                     "quota": 0.0,
-                    "selectionCost": 0.3666666666666667,
+                    "selectionCost": 0.0225,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 0.5,
@@ -1686,7 +1684,7 @@
                   "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.3666666666666667
+                  "selectionCost": 0.0225
                 }
               },
               "variantSelection": {
@@ -1820,15 +1818,14 @@
                 "explanation": [
                   "route pool-provider/model-pool for agent mason",
                   "elo: need 30/100 (bar 1312), have 2000 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.37",
+                  "clears bar: adequacy 1.00, selection cost 0.02",
                   "cost +0.02 (output $/Mtok: effective $0.5/Mtok, list $0.5/Mtok, metered)",
-                  "overqualified +0.35 (surplus 70 over 30)",
+                  "overqualified x1.350 (+0.01; surplus 70 over 30)",
                   "billing plane: pool-vendor/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route pool-provider/model-pool: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":0.5,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":0.5,\"normalizedCost\":0.016666666666666666,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "route catalog-provider/model-a: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
                   "pricing: output-only for the whole shortlist (catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector)",
-                  "overqualification guard: kept pool-provider/model-pool (adequacy 1.00); the term would have picked catalog-provider/model-a, which fits the demand less well (adequacy 0.99)",
                   "policy sources: operator sha256:c60d39bf2ba1c137b9578694ba24f9b85e8759981659da9fd78561aa6b3357e7 (3 exclude entries)",
                   "workload: none",
                   "availability: broca (2 served catalog routes on providers Broca holds a credential for)"
@@ -2492,9 +2489,9 @@
                   },
                   "objective": {
                     "cost": 0.016666666666666666,
-                    "overqualification": 0.35000000000000003,
+                    "overqualification": 0.005833333333333334,
                     "quota": 0.0,
-                    "selectionCost": 0.3666666666666667,
+                    "selectionCost": 0.0225,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 0.5,
@@ -2513,7 +2510,7 @@
                   "pricingFallback": "catalog-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.3666666666666667
+                  "selectionCost": 0.0225
                 }
               },
               "variantSelection": {
