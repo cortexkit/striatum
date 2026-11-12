@@ -1442,7 +1442,7 @@ impl SqliteRouteStateStore {
     /// a TEMP write counter with that connection's `data_version`. Moving facts
     /// to the read pool must also give this key a new source.
     pub fn get_facts_with_generation(&self) -> RouteStateResult<CatalogFactsSnapshot> {
-        let (generation, facts) = self.read_resolved_facts_with_generation()?;
+        let (generation, facts) = self.read_resolved_facts()?;
         let generation = generation.ok_or_else(|| err("catalog generation unavailable"))?;
         let providers = facts
             .iter()
@@ -1900,12 +1900,11 @@ impl SqliteRouteStateStore {
     /// sibling. A row is routable when `fusiform_present` is 1, when the flag is
     /// still NULL (an older row before its first full sync), or when `source` is
     /// an operator `override`. The bool carries that final routing decision.
-    fn read_resolved_facts(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
-        self.read_resolved_facts_with_generation()
-            .map(|(_, facts)| facts)
+    fn read_resolved_fact_rows(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
+        self.read_resolved_facts().map(|(_, facts)| facts)
     }
 
-    fn read_resolved_facts_with_generation(
+    fn read_resolved_facts(
         &self,
     ) -> RouteStateResult<(Option<CatalogFingerprintKey>, Vec<(ModelFact, bool)>)> {
         self.store.with_conn(|c: &Connection| {
@@ -2698,7 +2697,7 @@ impl SqliteRouteStateStore {
     /// route the upstream marks deprecated will never be offered.
     pub fn list_unscored_rows(&self) -> RouteStateResult<Vec<UnscoredRow>> {
         let mut rows = self
-            .read_resolved_facts()?
+            .read_resolved_fact_rows()?
             .into_iter()
             .filter(|(fact, present)| {
                 *present
@@ -4090,7 +4089,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         // canonical id). `get_fact_by_route_key` stays the raw row, so a write
         // that merges over it never persists a borrowed score as the route's own.
         Ok(self
-            .read_resolved_facts()?
+            .read_resolved_fact_rows()?
             .into_iter()
             .filter_map(|(fact, present)| present.then_some(fact))
             .collect())
