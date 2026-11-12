@@ -4915,11 +4915,13 @@ async fn s4b_replay(legacy: bool) -> Vec<S4bReplayStep> {
     struct ResetLegacy;
     impl Drop for ResetLegacy {
         fn drop(&mut self) {
-            crate::account_selection::LEGACY_CONTEXT_REPAIRS.with(|mode| mode.set(false));
+            crate::account_selection::LEGACY_CONTEXT_REPAIRS
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
     }
     let _reset = ResetLegacy;
-    crate::account_selection::LEGACY_CONTEXT_REPAIRS.with(|mode| mode.set(legacy));
+    crate::account_selection::LEGACY_CONTEXT_REPAIRS
+        .store(legacy, std::sync::atomic::Ordering::SeqCst);
     let (harness, mut credentials) = setup("synthetic", false);
     let caller = harness.bind(reserved(OWNER), None).await;
     let runner = harness.bind(reserved(RUNNER), None).await;
@@ -5002,8 +5004,19 @@ async fn s4b_selection_reserving_a_probe_keeps_its_commit_count() {
     for legacy in [true, false] {
         let _replay = striatum_store::replay::Inputs::new(NOW as i64).install();
         let (harness, _) = setup("synthetic", false);
-        s4b_route(&harness, NOW as i64 - 7_200_000, NOW as i64 - 1_000);
-        crate::account_selection::LEGACY_CONTEXT_REPAIRS.with(|mode| mode.set(legacy));
+        crate::credential_fences::record(
+            harness.store(),
+            &harness.credentials(),
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            NOW as i64 - 7_200_000,
+        )
+        .unwrap();
+        crate::account_selection::LEGACY_CONTEXT_REPAIRS
+            .store(legacy, std::sync::atomic::Ordering::SeqCst);
         let caller = harness.bind(reserved(OWNER), None).await;
         let commits = harness.store().writer_commit_count_for_test();
         let selected = caller
@@ -5012,7 +5025,8 @@ async fn s4b_selection_reserving_a_probe_keeps_its_commit_count() {
                 &json!({"consumer":"mason","requirements":{"iq":30}}),
             )
             .await;
-        crate::account_selection::LEGACY_CONTEXT_REPAIRS.with(|mode| mode.set(false));
+        crate::account_selection::LEGACY_CONTEXT_REPAIRS
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
         counts.push(harness.store().writer_commit_count_for_test() - commits);
         let runner = harness.bind(reserved(RUNNER), None).await;

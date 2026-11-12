@@ -523,9 +523,14 @@ impl ClassContext {
 
 mod probe_reservations;
 
+// Replay tests compare old and new context repairs, including endpoint work
+// dispatched to blocking threads, so the test switch must be shared.
+#[cfg(test)]
+pub(crate) static LEGACY_CONTEXT_REPAIRS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
-    pub(crate) static LEGACY_CONTEXT_REPAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static CONTEXT_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -1074,7 +1079,7 @@ impl ClassContext {
             let read_states = || store.pool_key_states(provider, now_ms);
             #[cfg(test)]
             let read_states = || {
-                if LEGACY_CONTEXT_REPAIRS.with(|legacy| legacy.get()) {
+                if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
                     store.legacy_pool_key_states_for_test(provider, now_ms)
                 } else {
                     read_states()
@@ -3540,7 +3545,7 @@ pub(crate) fn repair_route_fences(
     after_read: impl FnOnce(),
 ) -> Result<(), String> {
     #[cfg(test)]
-    if LEGACY_CONTEXT_REPAIRS.with(|legacy| legacy.get()) {
+    if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
         return legacy_route_fence_repair(store, account_ids, quota, config, now_ms);
     }
     let recoveries = store
