@@ -172,7 +172,8 @@
                 "select_task_ref",
                 "service_tier",
                 "service_tier_settings",
-                "account_continue"
+                "account_continue",
+                "account_warm_credential"
               ],
               "consumers": [
                 {
