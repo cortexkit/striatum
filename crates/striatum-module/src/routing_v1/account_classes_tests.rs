@@ -20,6 +20,112 @@ const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
+fn assert_configured_runner_caller_without_writer(harness: &Harness, frame: &subc_protocol::Frame) {
+    let path = harness.store_path().with_extension("caller.jsonc");
+    let config = crate::config_convert::convert_value(json!({
+        "runners": [{"module": RUNNER, "via_vault": true}]
+    }))
+    .unwrap();
+    crate::test_config::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let credentials = harness.credentials();
+    let quota_cache = Default::default();
+    let caller = super::Caller::for_route(frame.header.channel, frame.header.epoch);
+    let acquisitions = harness.store().writer_acquisition_count_for_test();
+    assert_eq!(
+        super::accounts::admission_runner(
+            &caller,
+            &super::Deps {
+                quota_cache: &quota_cache,
+                store: harness.store(),
+                routing_config_path: &path,
+                operator_config_path: &path,
+                broca_credentials: &credentials,
+            }
+        )
+        .as_deref(),
+        Some(RUNNER)
+    );
+    assert_eq!(
+        harness.store().writer_acquisition_count_for_test(),
+        acquisitions
+    );
+}
+
+#[tokio::test]
+async fn configured_runner_store_failure_keeps_account_operation_error_codes() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let request = account_request("synthetic", "store-unavailable");
+    let malformed = runner.call("route.account_observe", &json!({})).await;
+    assert_eq!(malformed.1["code"], "invalid_request", "{}", malformed.1);
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute_batch("DROP TABLE model_facts")
+        .unwrap();
+    assert_configured_runner_caller_without_writer(
+        &harness,
+        &runner.request_frame("route.account_for", &request),
+    );
+    let unavailable = runner.call("route.account_for", &request).await;
+    assert_eq!(unavailable.0, FrameType::Error);
+    assert_eq!(
+        unavailable.1["code"], "account_selection_unavailable",
+        "{}",
+        unavailable.1
+    );
+    let malformed_after = runner.call("route.account_observe", &json!({})).await;
+    assert_eq!(malformed_after, malformed);
+    let observe = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"store-unavailable", "kind":"run_finished",
+                "admission_id":"missing", "run_id":"run"
+            }),
+        )
+        .await;
+    assert_eq!(observe.0, FrameType::Error);
+    assert_eq!(observe.1["code"], "store_error", "{}", observe.1);
+}
+
+#[tokio::test]
+async fn configured_runner_poisoned_credentials_reaches_its_account_operation() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let credentials = harness.credentials();
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = credentials.lock().unwrap();
+        panic!("poison the credentials snapshot");
+    }))
+    .is_err());
+    let request = account_request("synthetic", "credentials-unavailable");
+    assert_configured_runner_caller_without_writer(
+        &harness,
+        &runner.request_frame("route.account_for", &request),
+    );
+    let unavailable = runner.call("route.account_for", &request).await;
+    assert_eq!(unavailable.0, FrameType::Error);
+    assert_eq!(
+        unavailable.1["code"], "account_selection_unavailable",
+        "{}",
+        unavailable.1
+    );
+    let observe = runner
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":"credentials-unavailable", "kind":"run_finished",
+                "admission_id":"missing", "run_id":"run"
+            }),
+        )
+        .await;
+    assert_eq!(observe.0, FrameType::Error);
+    assert_eq!(observe.1["code"], "store_error", "{}", observe.1);
+}
+
+
 #[tokio::test]
 async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
     let _clock = crate::InjectedClock::set(NOW);

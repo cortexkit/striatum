@@ -6,6 +6,7 @@ mod key_pool;
 mod observation_event_query_plan;
 mod observed_speed_query_plan;
 mod quota_reading_log;
+mod reads_off_writer;
 mod retention;
 mod route_state_store;
 mod wal_checkpoints;

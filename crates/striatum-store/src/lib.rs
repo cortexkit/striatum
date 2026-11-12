@@ -1155,6 +1155,9 @@ pub struct SqliteRouteStateStore {
     /// Resolved capabilities and operator grades share the catalog fingerprint's
     /// write tracking. Unrelated writes on this connection do not invalidate it.
     resolved_facts: Mutex<Option<(CatalogFingerprintKey, Vec<(ModelFact, bool)>)>>,
+    /// Inventory metadata shares the catalog-change key and keeps withdrawn
+    /// rows, but does not apply operator grades used only for selection.
+    catalog_facts: Mutex<Option<(CatalogFingerprintKey, Vec<CatalogFact>)>>,
     #[cfg(any(test, feature = "test-support"))]
     account_write_transactions: AtomicU64,
 }
@@ -1685,6 +1688,7 @@ impl SqliteRouteStateStore {
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
             resolved_facts: Mutex::new(None),
+            catalog_facts: Mutex::new(None),
             catalog_cache_identity: AtomicU64::new(next_catalog_cache_identity()),
             #[cfg(any(test, feature = "test-support"))]
             account_write_transactions: AtomicU64::new(0),
@@ -1751,6 +1755,7 @@ impl SqliteRouteStateStore {
     /// A failed install is only logged; the next read tries again.
     fn reinstall_catalog_change_tracking(&self, connection: &Connection, cause: &rusqlite::Error) {
         *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.catalog_facts.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self
             .catalog_fingerprint
             .lock()
@@ -1785,9 +1790,24 @@ impl SqliteRouteStateStore {
     /// only needs capabilities, while read-only inventory consumers must not infer
     /// policy state from a missing capability or a filtered result.
     pub fn get_catalog_facts(&self) -> RouteStateResult<Vec<CatalogFact>> {
+        self.cached_catalog_inventory(|| {})
+    }
+
+    fn cached_catalog_inventory(
+        &self,
+        after_load: impl FnOnce(),
+    ) -> RouteStateResult<Vec<CatalogFact>> {
+        let key = self.catalog_inventory_key()?;
+        {
+            let mut cache = self.catalog_facts.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some((_, rows)) = cache.as_ref().filter(|(cached, _)| Some(*cached) == key) {
+                return Ok(rows.clone());
+            }
+            *cache = None;
+        }
         let mut rows = self
             .store
-            .with_conn(|connection: &Connection| {
+            .with_read(|connection| {
                 let mut statement =
                     connection.prepare("SELECT * FROM model_facts ORDER BY route_key")?;
                 let rows = statement.query_map([], |row| {
@@ -1812,8 +1832,8 @@ impl SqliteRouteStateStore {
                 rows.collect::<rusqlite::Result<Vec<_>>>()
             })
             .map_err(err)?;
-        // The inventory shows the Elo/EQ routing actually uses, and names the
-        // route a shared score came from.
+        // Inventory keeps the shared model scores but not the operator grades
+        // that are overlaid only for selection.
         let canonical_ids = rows
             .iter()
             .map(|row| row.canonical_id.clone())
@@ -1824,7 +1844,45 @@ impl SqliteRouteStateStore {
             row.fact = fact;
             row.score_borrowed_from = borrowed;
         }
+        after_load();
+        // The writer is released during the load. A concurrently published
+        // catalog makes this request's view uncacheable, not invalid to return.
+        let current_key = self.catalog_inventory_key()?;
+        if let Some(key) = key.filter(|candidate| Some(*candidate) == current_key) {
+            *self.catalog_facts.lock().unwrap_or_else(|p| p.into_inner()) =
+                Some((key, rows.clone()));
+        }
         Ok(rows)
+    }
+
+    fn catalog_inventory_key(&self) -> RouteStateResult<Option<CatalogFingerprintKey>> {
+        self.store
+            .with_conn(
+                |connection| match read_catalog_fingerprint_key(connection) {
+                    Ok(key) => Ok(connection.is_autocommit().then_some(key)),
+                    Err(cause) => {
+                        self.reinstall_catalog_change_tracking(connection, &cause);
+                        Ok(None)
+                    }
+                },
+            )
+            .map_err(err)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn get_catalog_facts_with_load_hook_for_test(
+        &self,
+        after_load: impl FnOnce(),
+    ) -> RouteStateResult<Vec<CatalogFact>> {
+        self.cached_catalog_inventory(after_load)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn catalog_inventory_is_cached_for_test(&self) -> bool {
+        self.catalog_facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
     }
 
     /// Override score rows that Fusiform does not currently list. Operator
@@ -2449,7 +2507,7 @@ impl SqliteRouteStateStore {
     /// first accepted poll was ever recorded.
     pub fn quota_snapshot(&self) -> RouteStateResult<Option<PersistedQuotaSnapshot>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT windows_json, observed_at FROM quota_snapshot WHERE singleton = 1",
                     [],
@@ -2486,7 +2544,7 @@ impl SqliteRouteStateStore {
     /// Every stored per-account quota reading, tombstoned ones included.
     pub fn account_quota_readings(&self) -> RouteStateResult<Vec<PersistedAccountReading>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(
                     "SELECT provider, account_id, entry_json, fetched_at, received_at, tombstoned_at
                      FROM account_quota_reading ORDER BY provider, account_id",
@@ -2511,7 +2569,7 @@ impl SqliteRouteStateStore {
         &self,
     ) -> RouteStateResult<Vec<PersistedProviderCompleteness>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(
                     "SELECT provider, last_polled_at, last_poll_complete, last_complete_at
                      FROM account_quota_completeness ORDER BY provider",
@@ -2632,7 +2690,7 @@ impl SqliteRouteStateStore {
     /// The last vault roster routing persisted, or `None` before the first listing.
     pub fn account_vault_roster(&self) -> RouteStateResult<Option<PersistedVaultRoster>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT view, roster_json, fetched_at FROM account_vault_roster WHERE singleton = 1",
                     [],
@@ -2783,7 +2841,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>>
     {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut stmt = c.prepare(
                     "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
                      FROM credential_entitlement_fences ORDER BY provider_id, credential_id",
@@ -2952,7 +3010,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<Option<striatum_core::route_state_store::ProviderOutcome>> {
         let json: Option<String> = self
             .store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT provider_identity_json FROM model_route_decisions WHERE id=?1",
                     [decision_id],
@@ -3053,7 +3111,7 @@ impl SqliteRouteStateStore {
     ) -> RouteStateResult<Option<striatum_core::accounts::AllowedAccountClass>> {
         let value: Option<String> = self
             .store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 c.query_row(
                     "SELECT allowed_account_class FROM model_route_decisions WHERE id=?1",
                     [decision_id],
@@ -4934,7 +4992,7 @@ impl RouteStateStore for SqliteRouteStateStore {
 
     fn get_quota_readings(&self, account_key: &str) -> RouteStateResult<Vec<QuotaReadingLogRow>> {
         self.store
-            .with_conn(|connection: &Connection| {
+            .with_read(|connection: &Connection| {
                 let mut statement = connection.prepare(
                     "SELECT account_key, window_key, observed_at, used_percent,
                             raw_used_percent, resets_at, window_minutes,

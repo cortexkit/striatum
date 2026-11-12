@@ -104,11 +104,10 @@ impl FenceRecheck {
 }
 
 pub(crate) fn enabled(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.query_row(
+    conn.prepare_cached(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='fence_recheck')",
-        [],
-        |row| row.get(0),
-    )
+    )?
+    .query_row([], |row| row.get(0))
 }
 
 pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
