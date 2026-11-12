@@ -30,7 +30,8 @@ mod tests {
         (scratch, store)
     }
 
-    // Keep the previous statements as an independent deletion and lock oracle.
+    // Keep the old pruning statements as an independent reference for which rows
+    // are deleted and how long the writer is held.
     pub(super) fn old_prune(connection: &Connection) -> rusqlite::Result<Vec<String>> {
         old_prune_after_begin(connection, || {})
     }
