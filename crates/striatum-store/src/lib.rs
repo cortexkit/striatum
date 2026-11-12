@@ -2300,9 +2300,55 @@ impl SqliteRouteStateStore {
         readings: &[PersistedAccountReading],
         completeness: &[PersistedProviderCompleteness],
     ) -> RouteStateResult<()> {
+        self.apply_quota_delta(&[], readings, completeness)
+            .map(|_| ())
+    }
+
+    /// Atomically write quota-reading log rows and the account poll from an event
+    /// body or full `usage.get` reply. The quota consumer acknowledges an event
+    /// only after both are durable. Poll-completeness flags and removed-account
+    /// markers travel with the readings so partial polls cannot erase siblings
+    /// on restart. Log pruning remains a separate background retention operation.
+    pub fn apply_quota_delta(
+        &self,
+        rows: &[QuotaReadingLogRow],
+        readings: &[PersistedAccountReading],
+        completeness: &[PersistedProviderCompleteness],
+    ) -> RouteStateResult<usize> {
         self.store
             .with_conn(|c: &Connection| {
                 let tx = write_transaction(c)?;
+                let mut inserted = 0;
+                {
+                    let mut statement = tx.prepare(
+                        "INSERT OR IGNORE INTO quota_reading_log
+                           (account_key, window_key, observed_at, used_percent,
+                            raw_used_percent, resets_at, window_minutes,
+                            banked_credit_count, fetched_at, is_stale,
+                            stale_since, stale_class)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    )?;
+                    for row in rows {
+                        if row.account_key.is_empty()
+                            || row.window_key.is_empty()
+                            || row.observed_at < 0
+                            || !row.used_percent.is_finite()
+                            || row.raw_used_percent.is_some_and(|value| !value.is_finite())
+                        {
+                            continue;
+                        }
+                        let (is_stale, stale_since, stale_class) = match row.stale.as_ref() {
+                            Some(stale) => (1_i64, stale.since.as_deref(), stale.class.as_deref()),
+                            None => (0_i64, None, None),
+                        };
+                        inserted += statement.execute(params![
+                            row.account_key, row.window_key, row.observed_at,
+                            row.used_percent, row.raw_used_percent, row.resets_at,
+                            row.window_minutes, row.banked_credit_count, row.fetched_at,
+                            is_stale, stale_since, stale_class,
+                        ])?;
+                    }
+                }
                 for reading in readings {
                     tx.execute(
                         "INSERT INTO account_quota_reading
@@ -2340,7 +2386,8 @@ impl SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                crate::evaluation_snapshot::timed_commit(tx)
+                crate::evaluation_snapshot::timed_commit(tx)?;
+                Ok(inserted)
             })
             .map_err(err)
     }
@@ -4642,53 +4689,10 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.record_usage_delivery_with_decision(obs, None)
     }
     fn append_quota_readings(&self, rows: &[QuotaReadingLogRow]) -> RouteStateResult<usize> {
-        if rows.is_empty() { return Ok(0); }
-        self.store
-            .with_conn(|connection: &Connection| {
-                let transaction = write_transaction(connection)?;
-                let mut inserted = 0;
-                {
-                    let mut statement = transaction.prepare(
-                        "INSERT OR IGNORE INTO quota_reading_log
-                           (account_key, window_key, observed_at, used_percent,
-                            raw_used_percent, resets_at, window_minutes,
-                            banked_credit_count, fetched_at, is_stale,
-                            stale_since, stale_class)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    )?;
-                    for row in rows {
-                        if row.account_key.is_empty()
-                            || row.window_key.is_empty()
-                            || row.observed_at < 0
-                            || !row.used_percent.is_finite()
-                            || row.raw_used_percent.is_some_and(|value| !value.is_finite())
-                        {
-                            continue;
-                        }
-                        let (is_stale, stale_since, stale_class) = match row.stale.as_ref() {
-                            Some(stale) => (1_i64, stale.since.as_deref(), stale.class.as_deref()),
-                            None => (0_i64, None, None),
-                        };
-                        inserted += statement.execute(params![
-                            row.account_key,
-                            row.window_key,
-                            row.observed_at,
-                            row.used_percent,
-                            row.raw_used_percent,
-                            row.resets_at,
-                            row.window_minutes,
-                            row.banked_credit_count,
-                            row.fetched_at,
-                            is_stale,
-                            stale_since,
-                            stale_class,
-                        ])?;
-                    }
-                }
-                crate::evaluation_snapshot::timed_commit(transaction)?;
-                Ok(inserted)
-            })
-            .map_err(err)
+        if rows.is_empty() {
+            return Ok(0);
+        }
+        self.apply_quota_delta(rows, &[], &[])
     }
 
     fn get_quota_readings(&self, account_key: &str) -> RouteStateResult<Vec<QuotaReadingLogRow>> {

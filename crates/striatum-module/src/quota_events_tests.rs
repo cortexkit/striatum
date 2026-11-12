@@ -2,12 +2,12 @@ use super::*;
 use cortexkit_bus_inmemory::{InMemoryBus, InMemoryConfig, InMemoryStreamCursor};
 use cortexkit_bus_trait::{BusResult, DurableOwner, Headers, Stream, StreamDelivery};
 use cortexkit_test_support::ScratchDir;
-use striatum_core::RouteStateStore as _;
-use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+use striatum_core::RouteStateStore as _;
+use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
 const SUBJECT: &str = "ck.box_test.event.insula.quota_sampled.v1";
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
@@ -154,6 +154,7 @@ struct Cursor {
     inner: InMemoryStreamCursor,
     live: LiveQuota,
     acks: usize,
+    naks: usize,
     deliveries: Vec<u64>,
 }
 
@@ -163,6 +164,7 @@ impl Cursor {
             inner: bus.consumer(OWNER).await.unwrap(),
             live: live.clone(),
             acks: 0,
+            naks: 0,
             deliveries: vec![],
         }
     }
@@ -179,15 +181,28 @@ impl StreamCursor for Cursor {
     }
     async fn ack(&mut self) -> BusResult<()> {
         assert!(
-            self.live.store.quota_snapshot().unwrap().is_some(),
-            "ack precedes the store write"
+            !self.live.store.account_quota_readings().unwrap().is_empty(),
+            "ack precedes the write-through account poll"
         );
+        assert!(
+            self.live.cache.lock().unwrap().available,
+            "ack precedes cache publication"
+        );
+        assert!(!self
+            .live
+            .accounts
+            .lock()
+            .unwrap()
+            .readings
+            .readings
+            .is_empty());
         self.inner.ack().await?;
         self.acks += 1;
         Ok(())
     }
     async fn nak(&mut self, delay: Duration) -> BusResult<()> {
         assert_eq!(delay, REDELIVERY_DELAY);
+        self.naks += 1;
         // Keep the backend's real settlement behavior but make retries immediate in tests.
         self.inner.nak(Duration::ZERO).await
     }
@@ -239,11 +254,503 @@ async fn publish(bus: &InMemoryBus, source: &mut Source, body: &str) -> String {
 }
 
 fn used(live: &LiveQuota) -> f64 {
-    let snapshot = live.store.quota_snapshot().unwrap().unwrap();
-    let entries: Value = serde_json::from_str(&snapshot.windows_json).unwrap();
-    entries[0]["usage"]["primary"]["usedPercent"]
+    let rows = live.store.account_quota_readings().unwrap();
+    let entry: Value = serde_json::from_str(&rows[0].entry_json).unwrap();
+    entry["usage"]["primary"]["usedPercent"].as_f64().unwrap()
+}
+
+fn snapshot_used(live: &LiveQuota) -> f64 {
+    let row = live.store.quota_snapshot().unwrap().unwrap();
+    let windows: Value = serde_json::from_str(&row.windows_json).unwrap();
+    windows[0]["usage"]["primary"]["usedPercent"]
         .as_f64()
         .unwrap()
+}
+
+async fn flush(live: &LiveQuota) -> Result<(), String> {
+    flush_snapshot(Arc::clone(&live.cache), Arc::clone(&live.store)).await
+}
+
+#[tokio::test]
+async fn burst_commits_once_per_applied_body_including_epoch_start_reply() {
+    let (_scratch, live) = fixture();
+    // Load catalogue facts before sampling the writer counter so this measures
+    // quota ingestion rather than the first catalogue lookup's bookkeeping.
+    live.store.get_facts().unwrap();
+    let bus = bus();
+    let mut source = Source {
+        snapshot: br#"{"result":[]}"#.to_vec(),
+        ..Default::default()
+    };
+    for seq in 1..=30 {
+        publish(&bus, &mut source, &body("epoch", seq, seq)).await;
+    }
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut state = SequenceState::default();
+    let before = live.store.writer_commit_count_for_test();
+    for _ in 0..30 {
+        consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+            .await
+            .unwrap();
+    }
+    let applied_bodies = 30 + source.snapshots;
+    assert_eq!(source.snapshots, 1);
+    assert_eq!(cursor.acks, 30);
+    assert_eq!(
+        live.store.writer_commit_count_for_test() - before,
+        applied_bodies as u64
+    );
+    assert!(live.store.quota_snapshot().unwrap().is_none());
+    flush(&live).await.unwrap();
+    assert_eq!(
+        live.store.writer_commit_count_for_test() - before,
+        applied_bodies as u64 + 1
+    );
+    flush(&live).await.unwrap();
+    assert_eq!(
+        live.store.writer_commit_count_for_test() - before,
+        applied_bodies as u64 + 1
+    );
+}
+
+#[tokio::test]
+async fn two_events_share_one_minute_flush_and_a_lone_event_needs_no_successor() {
+    assert_eq!(SNAPSHOT_FLUSH_INTERVAL, Duration::from_secs(60));
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let sample = body("epoch", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    publish(&bus, &mut source, &body("epoch", 2, 20)).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let mut state = SequenceState::default();
+    for _ in 0..2 {
+        consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+            .await
+            .unwrap();
+    }
+    assert!(live.store.quota_snapshot().unwrap().is_none());
+    let before = live.store.writer_commit_count_for_test();
+    // Exercise the production timer with a shortened minute, not an event-driven flush.
+    let timer = tokio::spawn(flush_snapshot_loop(
+        Arc::clone(&live.cache),
+        Arc::clone(&live.store),
+        Duration::from_millis(20),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while live.store.quota_snapshot().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(snapshot_used(&live), 20.0);
+    assert_eq!(live.store.writer_commit_count_for_test() - before, 1);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        live.store.writer_commit_count_for_test() - before,
+        1,
+        "unchanged ticks must not commit"
+    );
+
+    publish(&bus, &mut source, &body("epoch", 3, 30)).await;
+    consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while snapshot_used(&live) != 30.0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timer.abort();
+    let _ = timer.await;
+    assert_eq!(cursor.acks, 3);
+    assert_eq!(
+        live.store.writer_commit_count_for_test() - before,
+        3,
+        "one new body and one timed flush"
+    );
+}
+
+#[tokio::test]
+async fn failed_snapshot_flush_keeps_acked_readings_and_retries() {
+    let (scratch, live) = fixture();
+    let bus = bus();
+    let sample = body("epoch", 1, 70);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    let db = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_snapshot BEFORE INSERT ON quota_snapshot BEGIN SELECT RAISE(FAIL, 'flush refused'); END;").unwrap();
+    assert!(flush(&live).await.is_err());
+    assert_eq!(cursor.acks, 1);
+    assert_eq!(used(&live), 70.0);
+    assert!(live.store.quota_snapshot().unwrap().is_none());
+    db.execute_batch("DROP TRIGGER reject_snapshot;").unwrap();
+    flush(&live).await.unwrap();
+    assert_eq!(snapshot_used(&live), 70.0);
+}
+
+#[tokio::test]
+async fn a_snapshot_waiting_for_the_writer_does_not_block_quota_cache_reads() {
+    static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn wait_for_writer(_: i32) -> bool {
+        BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1));
+        true
+    }
+    let (scratch, live) = fixture();
+    live.store_body(snapshot_body(&body("epoch", 1, 70)), false)
+        .await
+        .unwrap();
+    live.store
+        .set_busy_handler_for_test(Some(wait_for_writer))
+        .unwrap();
+    let writer = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let flush_live = live.clone();
+    let flushing = tokio::spawn(async move { flush(&flush_live).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while BUSY_CALLS.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let read_cache = Arc::clone(&live.cache);
+    let mut reading =
+        tokio::task::spawn_blocking(move || read_cache.lock().unwrap().windows.clone());
+    let read_without_writer_release =
+        tokio::time::timeout(Duration::from_millis(250), &mut reading).await;
+    // Always release the database writer before asserting, even if the reader
+    // was blocked, so a failed regression cannot leave a blocking job behind.
+    writer.execute_batch("ROLLBACK;").unwrap();
+    flushing.await.unwrap().unwrap();
+    live.store.set_busy_handler_for_test(None).unwrap();
+    let read_without_writer_release = read_without_writer_release.map(|result| result.unwrap());
+    if read_without_writer_release.is_err() {
+        reading.await.unwrap();
+    }
+    assert!(
+        read_without_writer_release.is_ok(),
+        "a quota-cache read waited for the snapshot's SQLite writer acquisition"
+    );
+    assert_eq!(read_without_writer_release.unwrap().len(), 1);
+    assert_eq!(snapshot_used(&live), 70.0);
+}
+
+#[tokio::test]
+async fn a_late_timer_snapshot_cannot_overwrite_the_final_flush() {
+    let (_scratch, live) = fixture();
+    // Use identical poll times so timestamp ordering cannot mask a generation bug.
+    let _clock = crate::InjectedClock::set(1_000_000);
+    live.store_body(snapshot_body(&body("epoch", 1, 10)), false)
+        .await
+        .unwrap();
+    let delayed_timer = snapshot_for_flush(&live.cache).unwrap().unwrap();
+    let timer_generation = delayed_timer.generation;
+    live.store_body(snapshot_body(&body("epoch", 2, 70)), false)
+        .await
+        .unwrap();
+    assert!(
+        live.cache
+            .lock()
+            .unwrap()
+            .snapshot_persistence
+            .publication_generation
+            > timer_generation
+    );
+    finish_clean_exit(
+        crate::background::BackgroundLoops::default(),
+        Arc::clone(&live.cache),
+        Arc::clone(&live.store),
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot_used(&live), 70.0);
+    let committed = live.store.writer_commit_count_for_test();
+    // Resume the timer's captured work only after the final flush completed.
+    write_pending_snapshot(delayed_timer, Arc::clone(&live.store))
+        .await
+        .unwrap();
+    assert_eq!(snapshot_used(&live), 70.0);
+    assert_eq!(live.store.writer_commit_count_for_test(), committed);
+}
+
+#[tokio::test]
+async fn crash_after_ack_restores_current_accounts_and_old_cache_until_full_poll() {
+    let (scratch, live) = fixture();
+    live.store(&snapshot_body(&body("old", 1, 10)), false)
+        .unwrap();
+    flush(&live).await.unwrap();
+    let bus = bus();
+    let sample = body("epoch", 1, 70);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(cursor.acks, 1);
+    assert_eq!(used(&live), 70.0);
+    assert_eq!(snapshot_used(&live), 10.0);
+    drop(cursor);
+    drop(live); // Crash: deliberately skip the clean-exit flush.
+
+    let store = Arc::new(
+        SqliteRouteStateStore::open(&dev_descriptor(
+            "striatum",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap(),
+    );
+    let cache = crate::restore_quota_cache(&store);
+    assert!(!cache.available);
+    assert!(cache.restored_from_ms.is_some());
+    assert_eq!(
+        cache.windows[0]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        10.0
+    );
+    let accounts = account_quota::restore_account_state(&store);
+    assert_eq!(accounts.restored_readings, 1);
+    let live = LiveQuota {
+        store,
+        cache: Arc::new(Mutex::new(cache)),
+        accounts: Arc::new(Mutex::new(accounts)),
+        snapshot_baseline: Default::default(),
+    };
+    assert_eq!(used(&live), 70.0);
+    let reboot_bus = self::bus();
+    let mut source = Source {
+        snapshot_error: Some("offline".into()),
+        snapshot: snapshot_body(&body("epoch", 2, 90)),
+        ..Default::default()
+    };
+    publish(&reboot_bus, &mut source, &body("epoch", 2, 80)).await;
+    let mut cursor = Cursor::new(&reboot_bus, &live).await;
+    let mut state = SequenceState::default();
+    assert!(matches!(
+        consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT).await,
+        Err(ConsumeError::Rejected(_))
+    ));
+    assert_eq!((cursor.acks, cursor.naks), (0, 1));
+    assert!(state.epoch.is_none());
+    assert_eq!(used(&live), 70.0, "no event body may precede the full poll");
+    assert!(live.cache.lock().unwrap().restored_from_ms.is_some());
+    consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)
+        .await
+        .unwrap();
+    assert_eq!(source.snapshots, 2);
+    assert_eq!(cursor.acks, 1);
+    assert_eq!(used(&live), 90.0, "the full reply covers the older event");
+    let cache = live.cache.lock().unwrap();
+    assert!(cache.available);
+    assert!(cache.restored_from_ms.is_none());
+    assert_eq!(
+        cache.windows[0]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        90.0
+    );
+}
+
+#[tokio::test]
+async fn full_replies_persist_completeness_and_tombstones_in_the_delta() {
+    let (_scratch, live) = fixture();
+    let work: Value = serde_json::from_str(&body("epoch", 1, 10)).unwrap();
+    let mut sibling = work.clone();
+    sibling["account"] = json!("sibling");
+    live.store_body(
+        serde_json::to_vec(
+            &json!({"result":[work.clone(), sibling], "completeProviders":["codex"]}),
+        )
+        .unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    live.store_body(br#"{"result":[]}"#.to_vec(), false)
+        .await
+        .unwrap();
+    assert!(live
+        .store
+        .account_quota_readings()
+        .unwrap()
+        .iter()
+        .all(|row| row.tombstoned_at.is_none()));
+    live.store_body(
+        serde_json::to_vec(&json!({"result":[work], "completeProviders":["codex"]})).unwrap(),
+        false,
+    )
+    .await
+    .unwrap();
+    let restored = account_quota::restore_account_state(&live.store);
+    assert!(
+        restored.readings.readings[&("codex".into(), "sibling".into())]
+            .tombstoned_at_ms
+            .is_some()
+    );
+    assert!(restored.readings.readings[&("codex".into(), "work".into())]
+        .tombstoned_at_ms
+        .is_none());
+    assert!(restored.readings.completeness["codex"].last_poll_complete);
+    assert!(live.store.quota_snapshot().unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clean_exit_drains_a_mid_poll_publication_before_the_final_flush() {
+    use std::{future::Future, task::Poll};
+    let (_scratch, live) = fixture();
+    let mut loops = crate::background::BackgroundLoops::default();
+    let (mid_poll_tx, mid_poll_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let acknowledgements = Arc::new(AtomicUsize::new(0));
+    let task_live = live.clone();
+    let task_acks = Arc::clone(&acknowledgements);
+    loops.spawn("quota events", async move {
+        let worker_live = task_live.clone();
+        let committed = tokio::task::spawn_blocking(move || {
+            worker_live.commit_body(&snapshot_body(&body("epoch", 1, 70)), false)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        mid_poll_tx.send(()).unwrap();
+        // Hold this task inside one synchronous poll while shutdown aborts it.
+        // Its already-committed publication and ACK finish before cancellation.
+        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        task_live.publish(committed).unwrap();
+        task_acks.fetch_add(1, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    });
+    mid_poll_rx.await.unwrap();
+    let finish = finish_clean_exit(loops, Arc::clone(&live.cache), Arc::clone(&live.store));
+    tokio::pin!(finish);
+    std::future::poll_fn(|cx| {
+        assert!(finish.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    })
+    .await;
+    release_tx.send(()).unwrap();
+    finish.await.unwrap();
+    assert_eq!(acknowledgements.load(Ordering::SeqCst), 1);
+    assert_eq!(snapshot_used(&live), 70.0);
+    assert_eq!(
+        live.cache.lock().unwrap().windows[0]
+            .usage
+            .as_ref()
+            .unwrap()
+            .primary
+            .as_ref()
+            .unwrap()
+            .used_percent,
+        70.0
+    );
+    let before = live.store.writer_commit_count_for_test();
+    tokio::task::yield_now().await;
+    flush(&live).await.unwrap();
+    assert_eq!(
+        live.store.writer_commit_count_for_test(),
+        before,
+        "no publication follows the drained task's final flush"
+    );
+}
+
+#[tokio::test]
+async fn clean_eof_and_goodbye_flush_the_last_published_cache() {
+    use subc_protocol::{Frame, FrameType};
+    for goodbye in [false, true] {
+        let (_scratch, live) = fixture();
+        live.store_body(snapshot_body(&body("epoch", 1, 42)), false)
+            .await
+            .unwrap();
+        let mut loops = crate::background::BackgroundLoops::default();
+        loops.spawn("quota events", std::future::pending());
+        let (mut peer, mut reader) = tokio::io::duplex(1024);
+        if goodbye {
+            subc_transport::write_frame(
+                &mut peer,
+                &Frame::build(
+                    FrameType::Goodbye,
+                    crate::control_flags(),
+                    0,
+                    0,
+                    0,
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        }
+        drop(peer);
+        let frame = crate::background::next_frame_or_loop_stop(&mut reader, &mut loops)
+            .await
+            .unwrap();
+        if let Some(frame) = frame {
+            let (writer, _replies) = tokio::sync::mpsc::channel(1);
+            assert!(!crate::handle_frame(
+                frame,
+                &writer,
+                &live.cache,
+                &live.store,
+                &mut crate::RouteEpochs::new(),
+                &Arc::new(Mutex::new(None)),
+                std::path::Path::new("unused-routing"),
+                std::path::Path::new("unused-operator"),
+                &Arc::new(Mutex::new(crate::BrocaCredentials::default())),
+                &Arc::new(Mutex::new(crate::CatalogReachHealth::new(60_000)))
+            )
+            .await
+            .unwrap());
+            assert!(goodbye);
+        } else {
+            assert!(!goodbye);
+        }
+        assert!(live.store.quota_snapshot().unwrap().is_none());
+        finish_clean_exit(loops, Arc::clone(&live.cache), Arc::clone(&live.store))
+            .await
+            .unwrap();
+        assert_eq!(snapshot_used(&live), 42.0);
+    }
 }
 
 #[tokio::test]
@@ -546,7 +1053,7 @@ async fn store_failure_leaves_message_unacked_and_cursor_uncommitted() {
     };
     publish(&bus, &mut source, &sample).await;
     let db = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
-    db.execute_batch("CREATE TRIGGER reject_quota_write BEFORE INSERT ON quota_snapshot BEGIN SELECT RAISE(FAIL, 'write refused'); END;").unwrap();
+    db.execute_batch("CREATE TRIGGER reject_quota_write BEFORE INSERT ON account_quota_reading BEGIN SELECT RAISE(FAIL, 'write refused'); END;").unwrap();
     let mut cursor = Cursor::new(&bus, &live).await;
     let mut state = SequenceState::default();
     assert!(matches!(
@@ -555,7 +1062,16 @@ async fn store_failure_leaves_message_unacked_and_cursor_uncommitted() {
     ));
     assert_eq!(cursor.acks, 0);
     assert!(state.sequences.is_empty());
+    assert_eq!(cursor.naks, 1);
     assert!(live.cache.lock().unwrap().windows.is_empty());
+    assert!(live.accounts.lock().unwrap().readings.readings.is_empty());
+    assert!(
+        live.store
+            .get_quota_readings("openai/work")
+            .unwrap()
+            .is_empty(),
+        "the earlier log append must roll back with the failed account write"
+    );
     db.execute_batch("DROP TRIGGER reject_quota_write;")
         .unwrap();
     consume_one(&mut cursor, &mut source, &live, &mut state, SUBJECT)

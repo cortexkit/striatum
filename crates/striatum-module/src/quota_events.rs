@@ -68,10 +68,31 @@ struct LiveQuota {
     snapshot_baseline: Arc<Mutex<HashMap<AccountKey, crate::ProviderUsage>>>,
 }
 
+struct CommittedQuota {
+    cache: crate::QuotaCache,
+    readings: account_quota::AccountReadings,
+    baseline: Option<Vec<(AccountKey, crate::ProviderUsage)>>,
+}
+
+/// Generations belong to one live cache, not the persisted snapshot format.
+/// Only flush workers take `written_generation`; request readers never do.
+#[derive(Clone, Default)]
+pub(super) struct SnapshotPersistence {
+    publication_generation: u64,
+    written_generation: Arc<Mutex<u64>>,
+}
+
+struct PendingSnapshot {
+    windows: Vec<crate::ProviderUsage>,
+    observed_at_ms: u64,
+    generation: u64,
+    written_generation: Arc<Mutex<u64>>,
+}
+
 impl LiveQuota {
-    /// Event bodies and usage.get snapshots share the reading-log, account, and
-    /// quota-snapshot stores. Publish cached readings only after those writes succeed.
-    fn store(&self, body: &[u8], incremental: bool) -> Result<(), String> {
+    /// Both event bodies and full replies commit their reading log and account
+    /// poll together. The periodically flushed quota cache is only a boot bridge.
+    fn commit_body(&self, body: &[u8], incremental: bool) -> Result<CommittedQuota, String> {
         let envelope: Value = serde_json::from_slice(body).map_err(|e| e.to_string())?;
         let windows = crate::quota_consumer::decode_usage_result(&envelope["result"])
             .map_err(|e| e.to_string())?;
@@ -88,7 +109,10 @@ impl LiveQuota {
             .clone();
         // Usage merges only readings; the independently refreshed vault roster
         // need not be copied or restored by an Insula event.
-        let mut accounts = account_quota::AccountQuotaState { readings, ..Default::default() };
+        let mut accounts = account_quota::AccountQuotaState {
+            readings,
+            ..Default::default()
+        };
         let at_ms = crate::now_ms();
         // A single account event cannot replace the entire restored snapshot.
         if incremental {
@@ -96,30 +120,76 @@ impl LiveQuota {
         }
         let (rows, completeness) =
             account_quota::apply_usage_reply(&mut accounts, body, at_ms as i64)?;
-        crate::write_quota_readings(self.store.as_ref(), &windows, at_ms)?;
-        let baseline = (!incremental).then(|| windows.iter().map(|entry| {
-            ((entry.provider.clone(), entry.account.clone()), entry.clone())
-        }).collect::<Vec<_>>());
+        let log_rows = crate::quota_reading_rows(self.store.as_ref(), &windows, at_ms)?;
+        let baseline = (!incremental).then(|| {
+            windows
+                .iter()
+                .map(|entry| {
+                    (
+                        (entry.provider.clone(), entry.account.clone()),
+                        entry.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         crate::apply_quota_refresh(&mut cache, windows, at_ms);
         self.store
-            .put_account_quota_poll(&rows, &completeness)
+            .apply_quota_delta(&log_rows, &rows, &completeness)
             .map_err(|e| e.to_string())?;
-        crate::write_quota_snapshot(self.store.as_ref(), &cache.windows, at_ms)?;
-        *self.cache.lock().map_err(|_| "quota cache poisoned")? = cache;
+        Ok(CommittedQuota {
+            cache,
+            readings: accounts.readings,
+            baseline,
+        })
+    }
+
+    fn publish(&self, committed: CommittedQuota) -> Result<(), String> {
+        let mut cache = self.cache.lock().map_err(|_| "quota cache poisoned")?;
         let mut guard = self.accounts.lock().map_err(|_| "account cache poisoned")?;
+        let mut baseline = self
+            .snapshot_baseline
+            .lock()
+            .map_err(|_| "quota baseline poisoned")?;
+        // Delivery health can change while the blocking store job is running.
+        let consumer = cache.consumer.clone();
+        let mut persistence = cache.snapshot_persistence.clone();
+        persistence.publication_generation = persistence
+            .publication_generation
+            .checked_add(1)
+            .ok_or("quota publication generation exhausted")?;
+        *cache = committed.cache;
+        cache.consumer = consumer;
+        cache.snapshot_persistence = persistence;
         // Roster refresh has its own writer; do not overwrite its concurrent result.
-        guard.readings = accounts.readings;
+        guard.readings = committed.readings;
         guard.last_insula_error = None;
-        if let Some(entries) = baseline {
-            let mut baseline = self
-                .snapshot_baseline
-                .lock()
-                .map_err(|_| "quota baseline poisoned")?;
+        if let Some(entries) = committed.baseline {
             for (key, entry) in entries {
                 baseline.insert(key, entry);
             }
         }
         Ok(())
+    }
+
+    async fn store_body(&self, body: Vec<u8>, incremental: bool) -> Result<(), String> {
+        let live = self.clone();
+        #[cfg(test)]
+        let test_thread = crate::TestThreadState::capture();
+        let committed = tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            let _test_thread = test_thread.install();
+            live.commit_body(&body, incremental)
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        // Publish on the consumer task, not in the detached blocking job. A
+        // clean shutdown aborts delivery before taking its final cache snapshot.
+        self.publish(committed)
+    }
+
+    #[cfg(test)]
+    fn store(&self, body: &[u8], incremental: bool) -> Result<(), String> {
+        self.publish(self.commit_body(body, incremental)?)
     }
 
     /// A recovery snapshot may already be ahead of the durable's backlog. Until
@@ -140,7 +210,7 @@ impl LiveQuota {
         Ok(matches)
     }
 
-    fn store_sample(&self, mut body: Value) -> Result<(), String> {
+    fn sample_body(&self, mut body: Value) -> Result<Vec<u8>, String> {
         // Notices deliberately omit display metadata; retain it from the last inventory.
         if let (Some(provider), Some(account)) =
             (body["provider"].as_str(), body["account"].as_str())
@@ -158,10 +228,12 @@ impl LiveQuota {
                 body["accountInfo"] = info;
             }
         }
-        self.store(
-            &serde_json::to_vec(&json!({"result": [body]})).map_err(|e| e.to_string())?,
-            true,
-        )
+        serde_json::to_vec(&json!({"result": [body]})).map_err(|e| e.to_string())
+    }
+
+    #[cfg(test)]
+    fn store_sample(&self, body: Value) -> Result<(), String> {
+        self.store(&self.sample_body(body)?, true)
     }
 
     fn attached(&self, attached: bool, error: Option<String>) {
@@ -534,12 +606,12 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 cursor.in_progress().await.map_err(|e| e.to_string())?;
                 // A snapshot read after this event includes at least its observation;
                 // applying the earlier body afterwards could roll that snapshot back.
-                live.store(&source.snapshot().await?, false)?;
+                live.store_body(source.snapshot().await?, false).await?;
                 if live.covered_by_snapshot(&body)?.is_none() {
-                    live.store_sample(body)?;
+                    live.store_body(live.sample_body(body)?, true).await?;
                 }
             } else if covered.is_none() {
-                live.store_sample(body)?;
+                live.store_body(live.sample_body(body)?, true).await?;
             }
             state.commit(sample);
         }
@@ -562,7 +634,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
 
 async fn snapshot<S: SampleSource>(source: &mut S, live: &LiveQuota) -> bool {
     let result = match source.snapshot().await {
-        Ok(body) => live.store(&body, false),
+        Ok(body) => live.store_body(body, false).await,
         Err(error) => Err(error),
     };
     if let Err(error) = result {
@@ -607,6 +679,77 @@ async fn update_lag(bus: &quota_bus::AttachedBus, live: &LiveQuota) -> Result<()
     Ok(())
 }
 
+const SNAPSHOT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Persist only a changed, live cache. The row's timestamp and JSON remain the
+/// existing snapshot format; account readings are already durable at each ACK.
+pub(super) async fn flush_snapshot(
+    cache: SharedQuotaCache,
+    store: SharedStore,
+) -> Result<(), String> {
+    let Some(snapshot) = snapshot_for_flush(&cache)? else {
+        return Ok(());
+    };
+    write_pending_snapshot(snapshot, store).await
+}
+
+fn snapshot_for_flush(cache: &SharedQuotaCache) -> Result<Option<PendingSnapshot>, String> {
+    let cache = cache.lock().map_err(|_| "quota cache poisoned")?;
+    if cache.refreshed_at_ms == 0 || cache.restored_from_ms.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(PendingSnapshot {
+        windows: cache.windows.clone(),
+        observed_at_ms: cache.refreshed_at_ms,
+        generation: cache.snapshot_persistence.publication_generation,
+        written_generation: Arc::clone(&cache.snapshot_persistence.written_generation),
+    }))
+}
+
+async fn write_pending_snapshot(
+    snapshot: PendingSnapshot,
+    store: SharedStore,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        // A timer's blocking job can outlive its task. Serialize only flushes,
+        // skipping an old capture if a newer final flush has already succeeded.
+        // Neither the cache lock nor any lock taken by request readers is held.
+        let mut written = snapshot
+            .written_generation
+            .lock()
+            .map_err(|_| "quota flush poisoned")?;
+        if snapshot.generation <= *written {
+            return Ok(());
+        }
+        crate::write_quota_snapshot(&store, &snapshot.windows, snapshot.observed_at_ms)?;
+        *written = snapshot.generation;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+async fn flush_snapshot_loop(cache: SharedQuotaCache, store: SharedStore, interval: Duration) {
+    loop {
+        // Sleep after each completed attempt: even a slow flush cannot make the
+        // next attempt issue another snapshot commit less than a minute later.
+        tokio::time::sleep(interval).await;
+        if let Err(error) = flush_snapshot(Arc::clone(&cache), Arc::clone(&store)).await {
+            tracing::warn!(error, "quota snapshot not persisted; will retry");
+        }
+    }
+}
+
+pub(super) async fn finish_clean_exit(
+    loops: crate::background::BackgroundLoops,
+    cache: SharedQuotaCache,
+    store: SharedStore,
+) -> Result<SharedStore, String> {
+    loops.shutdown().await;
+    flush_snapshot(cache, Arc::clone(&store)).await?;
+    Ok(store)
+}
+
 pub(super) async fn run(
     connection_file: PathBuf,
     cache: SharedQuotaCache,
@@ -622,6 +765,15 @@ pub(super) async fn run(
     let project_root =
         std::env::temp_dir().join(format!("{}-quota-consumer", crate::DEFAULT_MODULE_ID));
     let _ = std::fs::create_dir_all(&project_root);
+    // Keep the flush timer polling even while delivery waits for a notice or a
+    // usage.get reply. Neither side cancels an in-flight delivery at each tick.
+    tokio::select! {
+        _ = flush_snapshot_loop(Arc::clone(&live.cache), Arc::clone(&live.store), SNAPSHOT_FLUSH_INTERVAL) => {},
+        _ = delivery_loop(connection_file, &live, project_root) => {},
+    }
+}
+
+async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota, project_root: PathBuf) {
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
