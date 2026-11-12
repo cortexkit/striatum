@@ -954,6 +954,9 @@ async fn broca_foreign_candidates_keep_unavailable_with_exclusions() {
     assert_eq!(fields["provider"], "openai");
     assert_eq!(fields["model"], "gpt-6.1-sol");
     assert_eq!(fields["hold_wait_max_s"], 300);
+    assert_eq!(fields["offered_candidate_credential_ids"], json!([
+        "oauth:anthropic:example-a", "oauth:anthropic:example-b",
+    ]));
     for field in [
         "decision_id_present",
         "candidates_present",

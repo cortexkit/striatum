@@ -1017,6 +1017,14 @@ impl ClassContext {
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
         if store
+            .account_read(|tx| tx.has_expired_admission_probes(now_ms))
+            .map_err(|error| error.to_string())?
+        {
+            store
+                .account_transaction(|tx| tx.release_expired_admission_probes(now_ms))
+                .map_err(|error| error.to_string())?;
+        }
+        if store
             .account_read(|tx| tx.has_expired_continuations(now_ms))
             .map_err(|error| error.to_string())?
         {
@@ -5230,6 +5238,24 @@ fn route_fence_refusal(
     let retry_after_s = u64::try_from(until.saturating_sub(now))
         .unwrap_or(0)
         .div_ceil(1000);
+    let mut detail = json!({
+        "code": "account_pool_exhausted",
+        "retry_after_s": retry_after_s,
+        "decision_id": null,
+        "exclusions": [],
+        "reset_at_ms": until,
+    });
+    let unoffered: Vec<_> = roster.roster.iter().flat_map(|roster| &roster.accounts)
+        .filter(|view| !wanted(&view.account_id)).collect();
+    if !unoffered.is_empty() {
+        // The retry belongs to the offered accounts, not the whole route.
+        // Public vault ids explain which eligible alternatives the runner left out.
+        let credentials: BTreeSet<_> = unoffered.iter().flat_map(|view| &view.credentials)
+            .map(|credential| &credential.credential_id).collect();
+        detail["eligible_accounts_not_offered"] = json!({
+            "count": unoffered.len(), "credential_ids": credentials,
+        });
+    }
     Some(OpReply::typed(
         "account_pool_exhausted",
         format!(
@@ -5238,13 +5264,7 @@ fn route_fence_refusal(
             params.model,
             rfc3339(until)
         ),
-        json!({
-            "code": "account_pool_exhausted",
-            "retry_after_s": retry_after_s,
-            "decision_id": null,
-            "exclusions": [],
-            "reset_at_ms": until,
-        }),
+        detail,
     ))
 }
 

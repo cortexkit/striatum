@@ -45,6 +45,7 @@ impl LogLimiter {
 struct Trace {
     reason: &'static str,
     exclusions: Option<String>,
+    eligible_accounts_not_offered: Option<Value>,
 }
 
 thread_local! {
@@ -102,6 +103,7 @@ pub(crate) fn allocator_refusal(detail: &Value) {
     }
     TRACE.with(|trace| {
         if let Some(trace) = trace.borrow_mut().as_mut() {
+            trace.eligible_accounts_not_offered = detail.get("eligible_accounts_not_offered").cloned();
             if !summary.is_empty() {
                 trace.exclusions = Some(summary);
             }
@@ -182,9 +184,9 @@ pub(crate) fn emit(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .admit(principal, reason, crate::now_ms() as i64);
     let Some(suppressed) = suppressed else { return };
-    // Select individual scalar metadata and presence flags, never serialize
-    // request objects, error messages, headers or credential material.
-    let fields = json!({
+    // Select metadata and public vault ids, never serialize request objects,
+    // error messages, headers or credential material.
+    let mut fields = json!({
         "op":op, "principal":principal, "code":code, "reason":reason,
         "provider":params["provider"].as_str(), "model":params["model"].as_str(),
         "admission_id":params["admission_id"].as_str(), "mode":params["mode"].as_str(),
@@ -194,6 +196,16 @@ pub(crate) fn emit(
         "conversation_key_present":params.get("conversation_key").is_some(),
         "hold_wait_max_s":params["hold_wait_max_s"].as_u64(),
         "exclusions":exclusions, "suppressed":suppressed,
+    });
+    if let Some(accounts) = params["candidates"]["accounts"].as_array() {
+        fields["offered_candidate_credential_ids"] = json!(accounts.iter()
+            .filter_map(|account| account["credential_id"].as_str()).collect::<Vec<_>>());
+    }
+    TRACE.with(|trace| {
+        if let Some(detail) = trace.borrow().as_ref()
+            .and_then(|trace| trace.eligible_accounts_not_offered.as_ref()) {
+            fields["eligible_accounts_not_offered"] = detail.clone();
+        }
     });
     crate::warn_operator(format!("routing refused an account call: {fields}"));
 }

@@ -506,6 +506,55 @@ async fn route_fence_is_exhausted_with_its_reset_on_both_entrypoints() {
         serde_json::from_value(refused.1.clone()).unwrap();
     assert_eq!(refusal.wait_until_ms(), Some(NOW + 15 * 60_000));
     assert_eq!(refusal.code, RefusalCode::AccountPoolExhausted);
+    assert_eq!(serde_json::to_vec(&refused.1).unwrap(), serde_json::to_vec(&json!({
+        "code":"account_pool_exhausted",
+        "message":format!("a failed report closed synthetic/model on every account this request may use until {}",
+            account_selection::rfc3339((NOW + 15 * 60_000) as i64)),
+        "detail":{"code":"account_pool_exhausted","retry_after_s":900,"decision_id":null,
+            "exclusions":[],"reset_at_ms":NOW + 15 * 60_000},
+    })).unwrap(), "without an unoffered sibling the refusal bytes stay unchanged");
+}
+
+#[tokio::test]
+async fn route_fence_names_eligible_accounts_outside_the_offered_set() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    let mut sibling = rows.iter().find(|row| row.id == "oauth:test").unwrap().clone();
+    sibling.id = "oauth:unoffered".into();
+    sibling.account_id = Some("unoffered-account".into());
+    rows.push(sibling);
+    credentials.apply_listing(&cortexkit_claustrum_client::ScopedCredentialListing {
+        view:"unoffered-sibling".into(), credentials:rows, ..Default::default()
+    }, NOW);
+    harness.set_credentials(credentials);
+    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
+        provider:"synthetic".into(), credential_id:"oauth:test".into(), model:"model".into(),
+        until_ms:(NOW + 86_400_000) as i64, decision_id:"offered-wall".into(), recorded_at:NOW as i64,
+    }).unwrap();
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = v1_request("synthetic", "offered-wall");
+    request["candidates"] = json!({"view_digest":"offered-only", "accounts":[
+        {"account_id":"oauth-account","credential_id":"oauth:test"}
+    ]});
+    crate::take_operator_warnings();
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted");
+    assert_eq!(refused.1["detail"]["reset_at_ms"], NOW + 900_000,
+        "the retry still belongs to the offered account");
+    let diagnostic = json!({"count":1,"credential_ids":["oauth:unoffered"]});
+    assert_eq!(refused.1["detail"]["eligible_accounts_not_offered"], diagnostic);
+    let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(refused.1).unwrap();
+    let typed: cortexkit_role_routing::errors::ResetDetail = refusal.detail_as().unwrap();
+    assert_eq!(typed.reset_at_ms, Some(NOW + 900_000));
+    assert_eq!(refusal.wait_until_ms(), Some(NOW + 900_000));
+    let lines = crate::take_operator_warnings();
+    let fields: Value = serde_json::from_str(lines.iter().find_map(|line|
+        line.strip_prefix("routing refused an account call: ")).expect("refusal log")).unwrap();
+    assert_eq!(fields["eligible_accounts_not_offered"], diagnostic);
+    assert_eq!(fields["offered_candidate_credential_ids"], json!(["oauth:test"]));
+    assert_eq!(fields["reason"], "route_fence");
 }
 
 #[test]
