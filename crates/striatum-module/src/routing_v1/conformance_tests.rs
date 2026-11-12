@@ -46,6 +46,7 @@ static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod continuation_tests;
 mod zero_config_tests;
+mod warm_credential_tests;
 
 /// The provider id the account allocator's quota readings are filed under
 /// for the kit's subscription accounts; any id other than the routing
@@ -1355,6 +1356,7 @@ const NOT_APPLICABLE: &[&str] = &[
     "undeclared_observe_retry_at_ms_refused",
     "undeclared_observe_provider_code_refused",
     "account_for_tier_undeclared",
+    "warm_credential_undeclared_refused",
     "continue_undeclared_group_refuses_mode",
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",
@@ -1389,6 +1391,12 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "harness_limits_invalid_falls_back",
         "runner_requires_wire_api",
         "runner_gateway_credential",
+        "warm_credential_fresh_honoured",
+        "warm_credential_hard_filter_ignored",
+        "warm_credential_unknown_ignored",
+        "warm_credential_existing_affinity",
+        "warm_credential_admission_conflict",
+        "warm_credential_non_admit_refused",
     ] {
         assert_eq!(
             report.outcome(check),

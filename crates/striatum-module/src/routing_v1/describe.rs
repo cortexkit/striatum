@@ -39,6 +39,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "service_tier",
     "service_tier_settings",
     cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE,
+    cortexkit_role_routing::capabilities::ACCOUNT_WARM_CREDENTIAL,
     ACCOUNT_CONTINUE_RESUME,
 ];
 

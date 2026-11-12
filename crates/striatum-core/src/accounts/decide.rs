@@ -819,8 +819,8 @@ impl<'a> Allocator<'a> {
     // ---- import --------------------------------------------------------
 
     /// A `preferred_existing_account` hint is treated as affinity only when the
-    /// account passes the hard filters and step 3; otherwise it is ignored and
-    /// the rejection recorded. `Err` hands the allocator back for cold work;
+    /// account passes the cold hard filters and quota checks; otherwise it is
+    /// ignored and the rejection recorded. `Err` hands the allocator back for cold work;
     /// it is moved once per decision, so its size does not matter.
     #[allow(clippy::result_large_err)]
     fn import(mut self, preferred: &AccountRef) -> Result<Decision, Self> {
@@ -838,7 +838,14 @@ impl<'a> Allocator<'a> {
         let hard = self.hard_filters(view, only_credential.as_deref());
         let mut reasons = hard.reasons.clone();
         if reasons.is_empty() {
-            reasons.extend(self.evaluate_quota(view).unknown);
+            // A caller's local account is only a preference, not an established
+            // routing affinity. It must leave the same reserve and cold-session
+            // headroom as a fresh placement before it can become a pin.
+            let quota = self.evaluate_quota(view);
+            if !quota.eligible() {
+                reasons.extend(quota.unknown);
+                reasons.extend(quota.reserve);
+            }
         }
         let Some(credential_id) = hard.credential_id.filter(|_| reasons.is_empty()) else {
             self.explanation.import = Some(ImportNote::Rejected {
