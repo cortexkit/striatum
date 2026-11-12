@@ -68,16 +68,16 @@ fn overqualification_cost_scaled_slightly_cheaper_flagship_loses_to_adequate_mod
 
 #[test]
 fn overqualification_cost_scaled_much_cheaper_flagship_still_wins_with_scaled_price() {
-    let selected = cost_pair(20.0, 10.0);
+    let selected = cost_pair(5.0, 10.0);
     assert_eq!(selected.route_key, "far/flagship");
-    // Surplus 90: 1 + .05 * (2^5 - 1) = 2.55, so cost 20 becomes 51.
-    assert!((selected.score.selection_cost - 51.0).abs() < 1e-10);
-    assert!((selected.score.objective.overqualification - 31.0).abs() < 1e-10);
+    // Surplus 90 hits the 20x cap, so cost 5 becomes 100 and still beats 110.
+    assert!((selected.score.selection_cost - 100.0).abs() < 1e-10);
+    assert!((selected.score.objective.overqualification - 95.0).abs() < 1e-10);
 }
 
 #[test]
 fn overqualification_cost_scaled_threshold_leaves_high_tier_work_unchanged() {
-    for iq in [60.0, 70.0, 80.0, 90.0, 100.0] {
+    for iq in [75.0, 80.0, 90.0, 100.0] {
         let selected = cost_pair(100.0, iq);
         assert_eq!(selected.route_key, "far/flagship");
         assert_eq!(selected.score.objective.overqualification, 0.0);
@@ -187,7 +187,11 @@ fn replay(config: &RoutingConfig) -> Vec<serde_json::Value> {
         )
         .unwrap();
         assert!(selected.score.adequacy >= 0.95);
-        if iq >= 60.0 {
+        let unpenalized_iq = match config.overqualification.mode {
+            striatum_core::routing_config::OverqualificationMode::Additive => 60.0,
+            striatum_core::routing_config::OverqualificationMode::CostScaled => 75.0,
+        };
+        if iq >= unpenalized_iq {
             assert_eq!(selected.score.objective.overqualification, 0.0);
         }
         records.push(json!({

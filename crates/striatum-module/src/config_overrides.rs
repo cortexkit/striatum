@@ -1644,7 +1644,7 @@ impl Default for ModelRoutingSection {
 }
 
 /// Additive mode (default) preserves the tunable cost term. Cost-scaled mode
-/// multiplies selection cost by the fixed core curve, bounded to 1..4; custom
+/// multiplies selection cost by the fixed core curve, bounded to 1..20; custom
 /// threshold/doubling/base values are refused in that mode.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields)]

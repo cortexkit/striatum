@@ -165,7 +165,7 @@ and `elapsed_ms`, plus `head_choices` when requested (the unchanged
 ```
 
 `anchor_version` identifies the evaluation's scoring formula: `5` for additive
-(including the default) and `6` for cost-scaled, whether selected by persistent
+(including the default) and `7` for cost-scaled, whether selected by persistent
 settings or this call's `pricing_patch`. It describes both the sweep and panels;
 no decision is written. A banked-reset patch changes the pressure input rather
 than score semantics, so it does not change the anchor by itself.
