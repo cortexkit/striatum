@@ -74,6 +74,21 @@ struct CommittedQuota {
     baseline: Option<Vec<(AccountKey, crate::ProviderUsage)>>,
 }
 
+/// Generations belong to one live cache, not the persisted snapshot format.
+/// Only flush workers take `written_generation`; request readers never do.
+#[derive(Clone, Default)]
+pub(super) struct SnapshotPersistence {
+    publication_generation: u64,
+    written_generation: Arc<Mutex<u64>>,
+}
+
+struct PendingSnapshot {
+    windows: Vec<crate::ProviderUsage>,
+    observed_at_ms: u64,
+    generation: u64,
+    written_generation: Arc<Mutex<u64>>,
+}
+
 impl LiveQuota {
     /// Both event bodies and full replies commit their reading log and account
     /// poll together. The periodically flushed quota cache is only a boot bridge.
@@ -137,8 +152,14 @@ impl LiveQuota {
             .map_err(|_| "quota baseline poisoned")?;
         // Delivery health can change while the blocking store job is running.
         let consumer = cache.consumer.clone();
+        let mut persistence = cache.snapshot_persistence.clone();
+        persistence.publication_generation = persistence
+            .publication_generation
+            .checked_add(1)
+            .ok_or("quota publication generation exhausted")?;
         *cache = committed.cache;
         cache.consumer = consumer;
+        cache.snapshot_persistence = persistence;
         // Roster refresh has its own writer; do not overwrite its concurrent result.
         guard.readings = committed.readings;
         guard.last_insula_error = None;
@@ -666,22 +687,43 @@ pub(super) async fn flush_snapshot(
     cache: SharedQuotaCache,
     store: SharedStore,
 ) -> Result<(), String> {
+    let Some(snapshot) = snapshot_for_flush(&cache)? else {
+        return Ok(());
+    };
+    write_pending_snapshot(snapshot, store).await
+}
+
+fn snapshot_for_flush(cache: &SharedQuotaCache) -> Result<Option<PendingSnapshot>, String> {
+    let cache = cache.lock().map_err(|_| "quota cache poisoned")?;
+    if cache.refreshed_at_ms == 0 || cache.restored_from_ms.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(PendingSnapshot {
+        windows: cache.windows.clone(),
+        observed_at_ms: cache.refreshed_at_ms,
+        generation: cache.snapshot_persistence.publication_generation,
+        written_generation: Arc::clone(&cache.snapshot_persistence.written_generation),
+    }))
+}
+
+async fn write_pending_snapshot(
+    snapshot: PendingSnapshot,
+    store: SharedStore,
+) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        // Serialize timer and final flushes with publication. A timer's blocking
-        // job may outlive its aborted task; it must not overwrite the final row
-        // with an older cache captured before shutdown.
-        let cache = cache.lock().map_err(|_| "quota cache poisoned")?;
-        if cache.refreshed_at_ms == 0 || cache.restored_from_ms.is_some() {
+        // A timer's blocking job can outlive its task. Serialize only flushes,
+        // skipping an old capture if a newer final flush has already succeeded.
+        // Neither the cache lock nor any lock taken by request readers is held.
+        let mut written = snapshot
+            .written_generation
+            .lock()
+            .map_err(|_| "quota flush poisoned")?;
+        if snapshot.generation <= *written {
             return Ok(());
         }
-        let json = serde_json::to_string(&cache.windows).map_err(|e| e.to_string())?;
-        let previous = store.quota_snapshot().map_err(|e| e.to_string())?;
-        if previous.is_some_and(|row| {
-            row.windows_json == json && row.observed_at == cache.refreshed_at_ms as i64
-        }) {
-            return Ok(());
-        }
-        crate::write_quota_snapshot(&store, &cache.windows, cache.refreshed_at_ms)
+        crate::write_quota_snapshot(&store, &snapshot.windows, snapshot.observed_at_ms)?;
+        *written = snapshot.generation;
+        Ok(())
     })
     .await
     .map_err(|e| e.to_string())?

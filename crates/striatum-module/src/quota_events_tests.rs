@@ -409,6 +409,92 @@ async fn failed_snapshot_flush_keeps_acked_readings_and_retries() {
 }
 
 #[tokio::test]
+async fn a_snapshot_waiting_for_the_writer_does_not_block_quota_cache_reads() {
+    static BUSY_CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn wait_for_writer(_: i32) -> bool {
+        BUSY_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(1));
+        true
+    }
+    let (scratch, live) = fixture();
+    live.store_body(snapshot_body(&body("epoch", 1, 70)), false)
+        .await
+        .unwrap();
+    live.store
+        .set_busy_handler_for_test(Some(wait_for_writer))
+        .unwrap();
+    let writer = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let flush_live = live.clone();
+    let flushing = tokio::spawn(async move { flush(&flush_live).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while BUSY_CALLS.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let read_cache = Arc::clone(&live.cache);
+    let mut reading =
+        tokio::task::spawn_blocking(move || read_cache.lock().unwrap().windows.clone());
+    let read_without_writer_release =
+        tokio::time::timeout(Duration::from_millis(250), &mut reading).await;
+    // Always release the database writer before asserting, even if the reader
+    // was blocked, so a failed regression cannot leave a blocking job behind.
+    writer.execute_batch("ROLLBACK;").unwrap();
+    flushing.await.unwrap().unwrap();
+    live.store.set_busy_handler_for_test(None).unwrap();
+    let read_without_writer_release = read_without_writer_release.map(|result| result.unwrap());
+    if read_without_writer_release.is_err() {
+        reading.await.unwrap();
+    }
+    assert!(
+        read_without_writer_release.is_ok(),
+        "a quota-cache read waited for the snapshot's SQLite writer acquisition"
+    );
+    assert_eq!(read_without_writer_release.unwrap().len(), 1);
+    assert_eq!(snapshot_used(&live), 70.0);
+}
+
+#[tokio::test]
+async fn a_late_timer_snapshot_cannot_overwrite_the_final_flush() {
+    let (_scratch, live) = fixture();
+    // Use identical poll times so timestamp ordering cannot mask a generation bug.
+    let _clock = crate::InjectedClock::set(1_000_000);
+    live.store_body(snapshot_body(&body("epoch", 1, 10)), false)
+        .await
+        .unwrap();
+    let delayed_timer = snapshot_for_flush(&live.cache).unwrap().unwrap();
+    let timer_generation = delayed_timer.generation;
+    live.store_body(snapshot_body(&body("epoch", 2, 70)), false)
+        .await
+        .unwrap();
+    assert!(
+        live.cache
+            .lock()
+            .unwrap()
+            .snapshot_persistence
+            .publication_generation
+            > timer_generation
+    );
+    finish_clean_exit(
+        crate::background::BackgroundLoops::default(),
+        Arc::clone(&live.cache),
+        Arc::clone(&live.store),
+    )
+    .await
+    .unwrap();
+    assert_eq!(snapshot_used(&live), 70.0);
+    let committed = live.store.writer_commit_count_for_test();
+    // Resume the timer's captured work only after the final flush completed.
+    write_pending_snapshot(delayed_timer, Arc::clone(&live.store))
+        .await
+        .unwrap();
+    assert_eq!(snapshot_used(&live), 70.0);
+    assert_eq!(live.store.writer_commit_count_for_test(), committed);
+}
+
+#[tokio::test]
 async fn crash_after_ack_restores_current_accounts_and_old_cache_until_full_poll() {
     let (scratch, live) = fixture();
     live.store(&snapshot_body(&body("old", 1, 10)), false)

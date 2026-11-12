@@ -222,6 +222,7 @@ struct QuotaCache {
     /// successful poll, which replaces the restored windows wholesale.
     restored_from_ms: Option<u64>,
     consumer: quota_events::ConsumerHealth,
+    snapshot_persistence: quota_events::SnapshotPersistence,
 }
 
 type SharedQuotaCache = Arc<Mutex<QuotaCache>>;
@@ -747,6 +748,7 @@ fn restore_quota_cache(store: &SqliteRouteStateStore) -> QuotaCache {
         retained_degraded_since_ms: HashMap::new(),
         restored_from_ms: Some(observed_at_ms),
         consumer: Default::default(),
+        snapshot_persistence: Default::default(),
     }
 }
 
