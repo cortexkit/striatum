@@ -251,10 +251,10 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
     let harness = fixture();
     let consumer = harness.bind(reserved("example-consumer"), None).await;
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
-    for (module, harness_name) in [
-        ("broca", "broca"),
-        (RUNNER, "claude-code"),
-        (RUNNER, "direct-api"),
+    for (module, harness_name, expected) in [
+        ("broca", "broca", None),
+        (RUNNER, "claude-code", Some(GATEWAY_ROUTE)),
+        (RUNNER, "direct-api", None),
     ] {
         let (ty, choices) = operator
             .call(
@@ -265,9 +265,23 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
             )
             .await;
         assert_eq!(ty, FrameType::Response, "{choices}");
-        // These routing-only account pools borrow Anthropic's catalog rows;
-        // neither pool provider can be named in a runner's model plan.
-        assert_eq!(choices["result"]["models"], json!([]), "{choices}");
+        let models = choices["result"]["models"].as_array().unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(models.len(), 1, "{choices}");
+            assert_eq!(
+                format!(
+                    "{}/{}",
+                    models[0]["provider"].as_str().unwrap(),
+                    models[0]["model"].as_str().unwrap()
+                ),
+                expected
+            );
+            assert_eq!(models[0]["billing"], "per_token", "{choices}");
+            assert_eq!(models[0]["pin_only"], true, "{choices}");
+        } else {
+            // API-key pools are not model-plan provider ids, unlike gateways.
+            assert!(models.is_empty(), "{choices}");
+        }
 
         let (ty, preview) = operator
             .call(
@@ -310,6 +324,41 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
         "consumer":"mason", "requirements":{"iq":0}, "runners":[RUNNER], "harness":"claude-code"
     })).await;
     assert_eq!(automatic.0, FrameType::Error, "{automatic:?}");
+}
+
+#[tokio::test]
+async fn head_choices_show_gateway_pool_but_hide_api_key_pool_on_mixed_runner() {
+    let harness = fixture();
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let (ty, choices) = operator
+        .call("route.head_choices", &json!({"runner_module":RUNNER}))
+        .await;
+    assert_eq!(ty, FrameType::Response, "{choices}");
+    let models = choices["result"]["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1, "{choices}");
+    assert_eq!(models[0]["provider"], GATEWAY, "{choices}");
+    assert_eq!(models[0]["model"], "claude", "{choices}");
+    assert_eq!(models[0]["billing"], "per_token", "{choices}");
+    assert_eq!(models[0]["pin_only"], true, "{choices}");
+}
+
+#[tokio::test]
+async fn head_choices_hide_gateway_pool_without_a_runner_declaration() {
+    let harness = fixture();
+    harness.edit_config(|config| {
+        config["runners"].as_array_mut().unwrap().push(json!({
+            "module":"legacy-gateway", "via_vault":true
+        }));
+    });
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let (ty, choices) = operator
+        .call(
+            "route.head_choices",
+            &json!({"runner_module":"legacy-gateway"}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{choices}");
+    assert_eq!(choices["result"]["models"], json!([]), "{choices}");
 }
 
 #[tokio::test]

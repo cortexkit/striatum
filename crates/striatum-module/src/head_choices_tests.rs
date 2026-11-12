@@ -339,7 +339,7 @@ async fn reachability_uses_declared_pairs_and_vault_fallback() {
 }
 
 #[tokio::test]
-async fn head_choices_hide_pool_only_score_aliases_on_every_runner() {
+async fn head_choices_hide_api_key_pool_aliases_on_every_runner() {
     let (harness, mut credentials) = fixture();
     let facts = harness.store().get_facts().unwrap();
     let mut rows = credentials.listed_credentials().to_vec();
