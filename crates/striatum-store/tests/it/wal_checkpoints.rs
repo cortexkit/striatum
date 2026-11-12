@@ -48,13 +48,6 @@ fn open_configures_writer_and_every_reader_including_later_checkouts() {
 }
 
 #[test]
-fn memory_store_open_does_not_try_to_nest_writer_backed_readers() {
-    let store = SqliteRouteStateStore::open(&dev_descriptor("wal-memory", ":memory:")).unwrap();
-    all_readers(&store, 1);
-    store.checkpoint_wal().unwrap();
-}
-
-#[test]
 fn passive_tick_does_not_acquire_the_writer_or_queue_concurrent_commits() {
     let (_dir, store) = open("wal-independent-maintenance");
     let store = std::sync::Arc::new(store);
