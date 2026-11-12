@@ -694,3 +694,22 @@ fn explicit_subscription_marks_keep_kimi_review_and_grok_automatic() {
     let parent_false = config(json!({"providers":{"xai":{"subscription":false}}}));
     assert!(!parent_false.route_allowed_on_plane("head", "xai/grok-4.7", false, Some(&plane)));
 }
+#[test]
+fn banked_reset_pricing_is_provider_scoped_and_defaults_to_emergency() {
+    for (setting, capacity) in [
+        ("", false),
+        (r#", "banked_resets":"emergency""#, false),
+        (r#", "banked_resets":"capacity""#, true),
+    ] {
+        let document =
+            format!(r#"{{"providers":{{"openai":{{"keep_free_percent":5{setting}}}}}}}"#);
+        let config = parse_config(&document).unwrap();
+        let live = LiveConfig::new(config, Some(document));
+        assert_eq!(
+            live.pricing().banked_resets_capacity.contains("openai"),
+            capacity
+        );
+        assert!(!live.pricing().banked_resets_capacity.contains("anthropic"));
+    }
+    assert!(parse_config(r#"{"providers":{"openai":{"banked_resets":"automatic"}}}"#).is_err());
+}

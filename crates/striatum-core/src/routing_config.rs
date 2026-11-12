@@ -7,7 +7,8 @@
 
 use crate::model_facts::ModelScores;
 
-/// Bump when persisted decision scoring semantics change.
+/// Persisted scoring anchor for the default additive formula. Keep the legacy
+/// anchor while that formula is the default; opt-in formulas carry their own.
 pub const ANCHOR_VERSION: u32 = 5;
 
 pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
@@ -18,28 +19,43 @@ pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 pub const DEFAULT_OVERQUALIFICATION_THRESHOLD: f64 = 40.0;
 /// Surplus points beyond the threshold over which the term (plus `base`) doubles.
 pub const DEFAULT_OVERQUALIFICATION_DOUBLING: f64 = 10.0;
-/// Scale of the term in selection-cost units: at threshold + doubling the term
-/// equals `base`.
+/// Additive cost surcharge: at threshold + doubling the surcharge is `base`.
 pub const DEFAULT_OVERQUALIFICATION_BASE: f64 = 0.05;
+/// Keep overqualification a soft preference: a four-times cheaper route can
+/// still win at any surplus, before economic tie bands and the fit guard.
+pub const MAX_OVERQUALIFICATION_FACTOR: f64 = 4.0;
 
-/// Additive selection-cost term that keeps low-demand work off routes far above
-/// the demand. Demand is a floor and cost is primary, so a subsidised flagship
-/// priced inside the effectively-free bucket used to win low-demand work on a
-/// speed tie-break; a multiplier would vanish exactly there because those
-/// routes cost almost nothing, so the term is added instead.
-///
-/// `term = 0` when `surplus <= threshold`, else
-/// `base * (2^((surplus - threshold) / doubling) - 1)`.
-/// The defaults come from a seven-day replay of recorded decisions
-/// (reports/2026-10-02-overqualification-replay.md).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OverqualificationMode {
+    #[default]
+    Additive,
+    CostScaled,
+}
+
+impl OverqualificationMode {
+    /// Identify the formula used to interpret a persisted score, not its price
+    /// inputs. Banked quota changes pressure, but leaves score semantics intact.
+    pub const fn anchor_version(self) -> u32 {
+        match self {
+            Self::Additive => ANCHOR_VERSION,
+            Self::CostScaled => 6,
+        }
+    }
+}
+
+/// Additive mode retains the configurable legacy term. Cost-scaled mode uses
+/// the fixed default curve as a fraction of economic cost, capped at 3 so a
+/// sufficiently cheaper high-capability route can still win.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverqualificationConfig {
+    pub mode: OverqualificationMode,
     pub threshold: f64,
     pub doubling: f64,
     pub base: f64,
 }
 
 pub const DEFAULT_OVERQUALIFICATION: OverqualificationConfig = OverqualificationConfig {
+    mode: OverqualificationMode::Additive,
     threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
     doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
     base: DEFAULT_OVERQUALIFICATION_BASE,
@@ -66,7 +82,13 @@ impl OverqualificationConfig {
     /// The term for a route `surplus` demand points above the request. Zero for
     /// an invalid configuration, so a bad value can never inflate every price.
     pub fn term(&self, surplus: f64) -> f64 {
-        if !self.is_valid() || !surplus.is_finite() || surplus <= self.threshold {
+        if self.mode == OverqualificationMode::CostScaled {
+            return DEFAULT_OVERQUALIFICATION
+                .term(surplus)
+                .min(MAX_OVERQUALIFICATION_FACTOR - 1.0);
+        }
+        if !self.is_valid() || self.base == 0.0 || !surplus.is_finite() || surplus <= self.threshold
+        {
             return 0.0;
         }
         self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0)
@@ -96,14 +118,14 @@ pub const DEFAULT_ROUTING_CONFIG: RoutingConfig = RoutingConfig {
 /// The default configuration with the over-qualification term switched off, for
 /// tests of orderings the term is not about. Their fixtures put every route at
 /// the request frontier and ask for a low demand, so every route carries the
-/// same large term; that term lifts all of them out of the effectively-free
-/// bucket and the bucket-only keys (abundance, adequacy) those tests exercise
-/// would never be reached.
+/// same surcharge, which can lift them out of the effectively-free bucket and
+/// bypass the bucket-only keys (abundance, adequacy) those tests exercise.
 #[cfg(test)]
 pub(crate) const ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION: RoutingConfig = RoutingConfig {
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
     allow_best_effort: true,
     overqualification: OverqualificationConfig {
+        mode: OverqualificationMode::Additive,
         threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
         doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
         base: 0.0,
@@ -248,6 +270,18 @@ mod tests {
             ..config
         };
         assert_eq!(broken.term(70.0), 0.0);
+        let config = OverqualificationConfig {
+            mode: OverqualificationMode::CostScaled,
+            ..config
+        };
+        let mut previous = 0.0;
+        for surplus in 0..=200 {
+            let term = config.term(surplus as f64);
+            assert!(term >= previous && term <= 3.0);
+            previous = term;
+        }
+        assert_eq!(config.term(f64::MAX), 3.0);
+        assert_eq!(off.term(f64::MAX), 0.0);
     }
 
     #[test]

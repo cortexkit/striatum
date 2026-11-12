@@ -111,6 +111,18 @@ only narrow the runner's admitted pairs.
 * `head_choices`: optional object with required `runner_module` and optional
   `harness`, as in `route.head_choices`. Requests the same picker response under
   the call's policy and runner declaration overrides, alongside the IQ sweep.
+* `pricing_patch`: optional object with only `overqualification` and
+  `banked_resets`. `overqualification` is the mode string `"additive"` or
+  `"cost_scaled"`; `banked_resets` maps provider ids to `"emergency"` or
+  `"capacity"`. Omitted members retain the live setting. Unknown members,
+  invalid provider ids and unknown modes are refused before snapshotting.
+  This patch applies only to the evaluation's cloned settings, for both IQ
+  sweeps and panel dry runs, against the same isolated account snapshot. It
+  records no decisions, admissions or usage and changes neither live settings
+  files nor the live settings cache. A mode-only `cost_scaled` preview uses
+  the fixed core curve even if live additive settings have custom tuning;
+  it does not reinterpret those tuning values. Persistent settings combining
+  `cost_scaled` with tuning members are refused instead.
 * `panel`: optional object `{class, package_tokens?, runners?, seed?}` that
   dry-runs `route.select_panel` for `consumer` (see [Panel dry run](#panel-dry-run)).
   `class` is one class name or a list of 1–16 names; each is seated separately.
@@ -119,7 +131,8 @@ only narrow the runner's admitted pairs.
   same error `route.select_panel` returns. `runners` defaults to `[runner]` when
   the top-level `runner` is given. Unknown members are rejected.
 
-Consumer policy, global exclusions, configured service tiers, grades, pricing,
+Consumer policy, global exclusions, configured service tiers, grades, pricing
+(except the explicit request-local `pricing_patch`),
 runner availability and account eligibility all remain in force. As with
 `route.select`, an operator-configured consumer IQ/EQ overrides request demand;
 the returned `bar` is the effective demand bar, not an independently calculated
@@ -129,7 +142,7 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 
 ## Result
 
-The management response's `result` contains `consumer`, `results`, `snapshot_ms`
+The management response's `result` contains `consumer`, `results`, `anchor_version`, `snapshot_ms`
 and `elapsed_ms`, plus `head_choices` when requested (the unchanged
 `route.head_choices` response shape) and `panels` when `panel` is supplied. Each
 `results` row contains:
@@ -150,6 +163,12 @@ and `elapsed_ms`, plus `head_choices` when requested (the unchanged
   "excluded": [{"route": "provider/other-model", "reason": "below_floor"}]
 }
 ```
+
+`anchor_version` identifies the evaluation's scoring formula: `5` for additive
+(including the default) and `6` for cost-scaled, whether selected by persistent
+settings or this call's `pricing_patch`. It describes both the sweep and panels;
+no decision is written. A banked-reset patch changes the pressure input rather
+than score semantics, so it does not change the anchor by itself.
 
 Numbers above are illustrative. `fit` is the scorer's metric audit, with no
 entry for a zero-demand metric. `adequate` includes every policy-allowed,
@@ -272,3 +291,27 @@ lock, creates no lease file, reserves no probe, and never copies anything back.
 measures the whole call so the operator can check latency against the production
 database's current account-evidence volume. Separate
 calls may see different live quota, catalog or configuration refreshes.
+
+## Compare dormant pricing
+
+Both changes are dormant by default: `overqualification.mode` is `"additive"`
+and `providers.<id>.banked_resets` is `"emergency"`. To compare live inputs
+without switching live picks, send an ordinary sweep, then the same request
+with the following patch (each call takes its own isolated snapshot):
+
+```json
+{
+  "consumer": "mason",
+  "iqs": [10,20,30,40,50,60,70,80,90,100],
+  "pricing_patch": {
+    "overqualification": "cost_scaled",
+    "banked_resets": {"openai": "capacity"}
+  }
+}
+```
+
+Use `"sidekick"` for the second consumer. Compare picks and estimated task
+costs, keeping in mind that separate calls can see newly refreshed live quota.
+A banked capacity preview only changes pressure pricing: an account already
+at its live quota wall is still unavailable until its owner applies a reset.
+No saved reset is applied by this operation.

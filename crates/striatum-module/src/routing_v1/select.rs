@@ -460,7 +460,8 @@ fn record_pinned_refusal(
             "pin": request.pin,
             "correlation_id": request.correlation_id,
         }).to_string()),
-        anchor_version: striatum_core::ANCHOR_VERSION,
+        anchor_version: crate::config_overrides::live_config(deps.routing_config_path)
+            .scoring_anchor_version(),
         ..Default::default()
     };
     if let Err(error) =

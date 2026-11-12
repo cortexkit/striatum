@@ -657,6 +657,7 @@ fn reserved_headroom_panel_cause_publishes_structured_reset_without_prose_timest
         short_windows: vec![],
         banked_resets: 0,
         banked_expires_at_ms: None,
+        banked_credit_expiries_ms: Vec::new(),
         prepaid_credits: false,
     };
     let mut input = panel_input(

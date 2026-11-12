@@ -455,8 +455,19 @@ pub struct ProviderPolicy {
     pub prompt_cache: Option<bool>,
     pub subscription_multiplier: Option<f64>,
     pub keep_free_percent: Option<f64>,
+    /// Saved-reset pricing: emergency credits one near the wall; capacity counts
+    /// every unexpired reset as a full quota window. Neither applies a reset.
+    pub banked_resets: BankedResets,
     pub models: Option<Vec<String>>,
     pub accounts: ProviderAccountsPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BankedResets {
+    #[default]
+    Emergency,
+    Capacity,
 }
 
 /// Per-provider account controls. Metered fallback requires explicit opt-in.

@@ -1731,16 +1731,31 @@ fn apply_overqualification(
     if term <= 0.0 {
         return;
     }
-    objective.overqualification = term;
-    objective.selection_cost += term;
-    // Right after the cost line, the term it adds to.
+    let cost_scaled =
+        config.overqualification.mode == crate::routing_config::OverqualificationMode::CostScaled;
+    let surcharge = if cost_scaled {
+        objective.selection_cost * term
+    } else {
+        term
+    };
+    objective.overqualification = surcharge;
+    objective.selection_cost += surcharge;
+    // Keep the multiplier beside the economic cost it scales.
     let at = notes.len().min(1);
     notes.insert(
         at,
-        format!(
-            "overqualified +{term:.2} (surplus {surplus:.0} over {:.0})",
-            requirements.iq
-        ),
+        if cost_scaled {
+            format!(
+                "overqualified x{:.3} (+{surcharge:.2}; surplus {surplus:.0} over {:.0})",
+                1.0 + term,
+                requirements.iq
+            )
+        } else {
+            format!(
+                "overqualified +{term:.2} (surplus {surplus:.0} over {:.0})",
+                requirements.iq
+            )
+        },
     );
 }
 
@@ -3229,6 +3244,7 @@ mod task_profile_pricing_tests {
                         short_windows: Vec::new(),
                         banked_resets: 0,
                         banked_expires_at_ms: None,
+                        banked_credit_expiries_ms: Vec::new(),
                         prepaid_credits: false,
                     }],
                 }],

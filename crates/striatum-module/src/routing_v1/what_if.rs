@@ -7,9 +7,9 @@ use cortexkit_role_routing::errors::Refusal;
 use cortexkit_role_routing::panel::{
     parse_select_panel_request_serving, PanelPhase, SelectPanelRequest,
 };
-use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder, PanelOrder};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder, PanelOrder};
 
 use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
 
@@ -21,6 +21,7 @@ struct Params {
     eq: Option<f64>,
     runner: Option<String>,
     policy_patch: Option<PolicyPatch>,
+    pricing_patch: Option<crate::config_overrides::PricingPatch>,
     runner_declarations: Option<BTreeMap<String, Value>>,
     head_choices: Option<Value>,
     panel: Option<PanelParams>,
@@ -124,14 +125,19 @@ pub(super) async fn what_if_with_profile_lookup(
     let live = crate::config_overrides::live_config(deps.routing_config_path);
     let operator = operator_config(deps);
     let patch = params.policy_patch.unwrap_or_default();
+    let pricing = params.pricing_patch.unwrap_or_default();
     let live = Arc::new(
         live.with_model_policy_patch(&patch.models)
-            .map_err(|error| Refusal::invalid_request("policy_patch", error))?,
+            .map_err(|error| Refusal::invalid_request("policy_patch", error))?
+            .with_pricing_patch(&pricing)
+            .map_err(|error| Refusal::invalid_request("pricing_patch", error))?,
     );
     let operator = Arc::new(
         operator
             .with_model_policy_patch(&patch.models)
-            .map_err(|error| Refusal::invalid_request("policy_patch", error))?,
+            .map_err(|error| Refusal::invalid_request("policy_patch", error))?
+            .with_pricing_patch(&pricing)
+            .map_err(|error| Refusal::invalid_request("pricing_patch", error))?,
     );
     if !super::consumers::effective(&operator).knows(&params.consumer) {
         return Err(Refusal::invalid_request(
@@ -214,7 +220,8 @@ pub(super) async fn what_if_with_profile_lookup(
         results.push(row);
     }
     let mut result =
-        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms});
+        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms,
+            "anchor_version": live.scoring_anchor_version()});
     if !panels.is_empty() {
         let dry = super::panels::DryRun {
             live_config: live.clone(),

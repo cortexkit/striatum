@@ -190,6 +190,36 @@ impl RoutingConfigFile {
 }
 
 impl LiveConfig {
+    /// Clone settings for one evaluation. A pricing experiment never publishes
+    /// the clone into the live cache or writes the operator's settings file.
+    pub(crate) fn with_pricing_patch(&self, patch: &super::PricingPatch) -> Result<Self, String> {
+        let mut patched = self.clone();
+        if let Some(mode) = patch.overqualification {
+            let section = &mut patched.config.model_routing.overqualification;
+            section.mode = mode;
+            // A mode-only preview chooses the fixed cost-scaled curve without
+            // reinterpreting any legacy additive tuning in the live settings.
+            if mode == super::OverqualificationMode::CostScaled {
+                section.threshold = None;
+                section.doubling = None;
+                section.base = None;
+            }
+            section.resolve()?;
+        }
+        for (id, mode) in patch.banked_resets.iter().flatten() {
+            if id.is_empty() || id.chars().any(char::is_whitespace) || id.contains('/') {
+                return Err(format!("invalid provider id {id:?}"));
+            }
+            patched
+                .config
+                .providers
+                .entry(id.clone())
+                .or_default()
+                .banked_resets = *mode;
+        }
+        Ok(Self::new(patched.config, patched.document))
+    }
+
     pub(crate) fn with_model_policy_patch(
         &self,
         models: &std::collections::BTreeMap<String, super::ModelPolicyPatch>,

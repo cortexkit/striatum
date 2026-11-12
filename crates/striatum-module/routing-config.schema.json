@@ -93,6 +93,7 @@
       "default": {
         "base": null,
         "doubling": null,
+        "mode": "additive",
         "threshold": null
       }
     },
@@ -194,6 +195,13 @@
       "additionalProperties": false,
       "required": [
         "remaining_percent"
+      ]
+    },
+    "BankedResets": {
+      "type": "string",
+      "enum": [
+        "emergency",
+        "capacity"
       ]
     },
     "BasicFamilyConfig": {
@@ -600,8 +608,15 @@
         }
       ]
     },
+    "OverqualificationMode": {
+      "type": "string",
+      "enum": [
+        "additive",
+        "cost_scaled"
+      ]
+    },
     "OverqualificationSection": {
-      "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.\n`base: 0` switches the term off.",
+      "description": "Additive mode (default) preserves the tunable cost term. Cost-scaled mode\nmultiplies selection cost by the fixed core curve, bounded to 1..4; custom\nthreshold/doubling/base values are refused in that mode.",
       "type": "object",
       "properties": {
         "base": {
@@ -619,6 +634,10 @@
           ],
           "format": "double",
           "exclusiveMinimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/OverqualificationMode",
+          "default": "additive"
         },
         "threshold": {
           "type": [
@@ -985,6 +1004,11 @@
             "strategy": null,
             "unknown_reset_retry": null
           }
+        },
+        "banked_resets": {
+          "description": "Saved-reset pricing: emergency credits one near the wall; capacity counts\nevery unexpired reset as a full quota window. Neither applies a reset.",
+          "$ref": "#/$defs/BankedResets",
+          "default": "emergency"
         },
         "keep_free_percent": {
           "type": [

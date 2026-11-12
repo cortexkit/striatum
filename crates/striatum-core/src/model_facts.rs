@@ -45,6 +45,8 @@ pub struct RoutePricing {
     /// Percentage of each provider's subscription quota kept free, keyed by
     /// provider. A provider with no entry keeps nothing free.
     pub keep_free_percent: HashMap<String, f64>,
+    /// Providers whose banked resets count as full windows in pressure pricing.
+    pub banked_resets_capacity: std::collections::HashSet<String>,
 }
 
 impl RoutePricing {

@@ -1,0 +1,34 @@
+{
+  "provenance": "Synthetic ledger-shaped request sweep; fleet scores/rate cards from model_router live-band and 2 Oct fixtures, not a fresh production export. Quota and per-task token vectors are explicit scenario inputs.",
+  "models": [
+    {"provider":"anthropic","model":"claude-opus-5-5","elo":1960,"speed":120,"output":20,"input":4,"cache_read":0.2,"multiplier":38.1,"used":[93,95,96],"task_scale":1},
+    {"provider":"openai","model":"gpt-6.1-sol","elo":1884,"speed":80,"output":10,"input":2,"cache_read":0.1,"multiplier":18.7,"used":[100,95,96],"task_scale":1},
+    {"provider":"google","model":"antigravity-gemini-3.8-flash","elo":1710,"speed":60,"output":2.5,"input":0.5,"cache_read":0.05,"multiplier":3,"used":[92.33],"task_scale":{"mason":1,"sidekick":2}}
+  ],
+  "task_tokens": {
+    "mason":{"freshInput":150000,"cachedRead":10000000,"outputExcludingReasoning":40000,"reasoning":60000},
+    "sidekick":{"freshInput":10000,"cachedRead":200000,"outputExcludingReasoning":5000,"reasoning":3000}
+  },
+  "decisions": [
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":10,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":20,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":30,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":40,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":50,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":60,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":70,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":80,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":90,"eq":0}},
+    {"consumer":"mason","target_agent":"mason","requirements_json":{"iq":100,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":10,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":20,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":30,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":40,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":50,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":60,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":70,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":80,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":90,"eq":0}},
+    {"consumer":"sidekick","target_agent":"sidekick","requirements_json":{"iq":100,"eq":0}}
+  ]
+}

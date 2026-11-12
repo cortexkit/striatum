@@ -20,6 +20,8 @@ pub struct SubscriptionPool {
     pub plans: Vec<SubscriptionPlan>,
     /// False while another available subscription plan has live, unreserved quota.
     pub allow_banked: bool,
+    /// Count saved windows in pricing only; account admission still uses live quota.
+    pub banked_as_capacity: bool,
     pub now_ms: i64,
 }
 
@@ -43,6 +45,8 @@ pub struct QuotaAccount {
     pub short_windows: Vec<QuotaConstraint>,
     pub banked_resets: u32,
     pub banked_expires_at_ms: Option<i64>,
+    /// Individual expiries, when the producer supplies the saved-credit list.
+    pub banked_credit_expiries_ms: Vec<i64>,
     /// The account holds a spendable prepaid-credits balance, which the
     /// provider draws once the plan's limit is reached. Such an account keeps
     /// serving with no weekly headroom, so it never leaves the pool walled.
@@ -167,8 +171,20 @@ impl SubscriptionPlan {
                 banked_applied = 1;
             }
         }
+        (
+            Some(points),
+            pressure.max(self.short_pressure()),
+            banked_applied,
+        )
+    }
+
+    fn short_pressure(&self) -> f64 {
         let mut short_pools = std::collections::BTreeMap::<i64, (f64, f64, usize)>::new();
-        for account in &live {
+        for account in self
+            .accounts
+            .iter()
+            .filter(|a| !a.short_walled && a.weekly_used < 100.0)
+        {
             for window in &account.short_windows {
                 let pool = short_pools.entry(window.window_minutes).or_default();
                 pool.0 += window.remaining_points;
@@ -176,11 +192,51 @@ impl SubscriptionPlan {
                 pool.2 += 1;
             }
         }
-        let short = short_pools
+        short_pools
             .values()
             .map(|(points, time, count)| plan_pressure(*time, points / (*count as f64 * 100.0)))
-            .fold(0.0, f64::max);
-        (Some(points), pressure.max(short), banked_applied)
+            .fold(0.0, f64::max)
+    }
+
+    fn capacity_pressure(&self, keep_free: f64, head: bool, now_ms: i64) -> (f64, u32) {
+        let margin = if head { 0.0 } else { keep_free };
+        let mut points = 0.0;
+        let mut banked = 0;
+        let mut time: f64 = 0.0;
+        for account in &self.accounts {
+            time = time.max(account.weekly_remaining_fraction);
+            if !account.short_walled && account.weekly_used < 100.0 {
+                points += (100.0 - account.weekly_used - margin).max(0.0);
+            }
+            let listed = account
+                .banked_credit_expiries_ms
+                .len()
+                .min(account.banked_resets as usize);
+            let unlisted = account.banked_resets - listed as u32;
+            let count = account
+                .banked_credit_expiries_ms
+                .iter()
+                .take(listed)
+                .filter(|expiry| **expiry > now_ms)
+                .count() as u32
+                + if account
+                    .banked_expires_at_ms
+                    .is_none_or(|expiry| expiry > now_ms)
+                {
+                    unlisted
+                } else {
+                    0
+                };
+            banked += count;
+            points += count as f64 * (100.0 - margin).max(0.0);
+        }
+        // A saved reset adds a whole window to both sides of the share. It is
+        // not spendable live quota and cannot change admission or plan weights.
+        let capacity = self.accounts.len() as f64 * 100.0 + banked as f64 * 100.0;
+        (
+            plan_pressure(time, points / capacity.max(100.0)).max(self.short_pressure()),
+            banked,
+        )
     }
 
     pub fn has_free_headroom(&self, keep_free: f64, head: bool, now_ms: i64) -> bool {
@@ -271,12 +327,18 @@ impl SubscriptionPool {
             .iter()
             .enumerate()
             .map(|(index, plan)| {
-                plan.budget(
+                let budget = plan.budget(
                     keep_free,
                     head,
                     self.banked_for(index, keep_free, head),
                     self.now_ms,
-                )
+                );
+                if self.banked_as_capacity && !plan.accounts.is_empty() {
+                    let (pressure, banked) = plan.capacity_pressure(keep_free, head, self.now_ms);
+                    (budget.0, pressure, banked)
+                } else {
+                    budget
+                }
             })
             .collect();
         let total_points: f64 = budgets.iter().filter_map(|b| b.0).sum();
@@ -552,6 +614,7 @@ mod tests {
                 short_windows: Vec::new(),
                 banked_resets: 3,
                 banked_expires_at_ms: Some(10_000),
+                banked_credit_expiries_ms: Vec::new(),
                 prepaid_credits: false,
             }],
         }
@@ -571,6 +634,71 @@ mod tests {
         assert_eq!(p.budget(0.0, false, true, 10_001).2, 0);
     }
 
+    #[test]
+    fn banked_capacity_prices_every_unexpired_window_without_changing_admission() {
+        let mut pro = plan(100.0);
+        pro.accounts.push(plan(95.0).accounts.remove(0));
+        let mut higher = plan(96.0);
+        higher.tier = Some("pro_500".into());
+        higher.plan = Some("openai/pro_500".into());
+        let mut pool = SubscriptionPool {
+            plans: vec![pro, higher],
+            allow_banked: true,
+            now_ms: 1,
+            ..Default::default()
+        };
+        for account in pool.plans.iter_mut().flat_map(|p| &mut p.accounts) {
+            account.banked_resets = 2;
+            account.banked_credit_expiries_ms = vec![10_000, 20_000];
+        }
+        let emergency = pool.price(1.0, None, 0.0, false).unwrap();
+        assert_eq!(emergency.plan_pressure, 312.5);
+        assert_eq!(emergency.banked_resets_applied, 0);
+        let available = pool.available(0.0, false);
+        pool.banked_as_capacity = true;
+        let capacity = pool.price(1.0, None, 0.0, false).unwrap();
+        assert!((capacity.plan_pressure - 1.081_314_878_892_733_4).abs() < 1e-12);
+        assert_eq!(capacity.banked_resets_applied, 2);
+        assert_eq!(capacity.available_points, emergency.available_points);
+        assert_eq!(capacity.plan_values, emergency.plan_values);
+        assert_eq!(pool.available(0.0, false), available);
+        pool.now_ms = 10_000;
+        let partial = pool.price(1.0, None, 0.0, false).unwrap();
+        assert_eq!(partial.banked_resets_applied, 1);
+        assert!((partial.plan_pressure - 1.849_112_426_035_502_7).abs() < 1e-12);
+        pool.now_ms = 20_000;
+        assert_eq!(pool.price(1.0, None, 0.0, false).unwrap(), emergency);
+
+        // A pricing-only setting cannot open a route with no serving account.
+        pool.allow_banked = false;
+        pool.now_ms = 1;
+        for account in pool.plans.iter_mut().flat_map(|p| &mut p.accounts) {
+            account.weekly_used = 100.0;
+        }
+        assert!(!pool.available(0.0, false));
+        assert!(pool.price(1.0, None, 0.0, false).is_none());
+    }
+
+    #[test]
+    fn banked_capacity_retains_reserve_and_short_window_pressure() {
+        let mut p = plan(95.0);
+        p.accounts[0].short_windows.push(QuotaConstraint {
+            window_minutes: 300,
+            remaining_points: 10.0,
+            remaining_fraction: 0.5,
+        });
+        let (pressure, banked) = p.capacity_pressure(0.0, false, 1);
+        assert!((pressure - 50.0).abs() < 1e-12);
+        assert_eq!(banked, 3);
+        p.accounts[0].short_windows.clear();
+        assert_eq!(p.capacity_pressure(100.0, false, 1).0, 1_000_000.0);
+        assert!(p.capacity_pressure(20.0, false, 1).0 > p.capacity_pressure(0.0, false, 1).0);
+        assert_eq!(
+            p.capacity_pressure(20.0, true, 1),
+            p.capacity_pressure(0.0, false, 1)
+        );
+    }
+
     /// Live on 2026-10-30 after 14:20Z: every Codex account sat at its weekly
     /// limit while two held prepaid credits, and the keep-free check refused
     /// every worker before the account allocator, which spends credits, ran.
@@ -586,6 +714,7 @@ mod tests {
                 p
             }],
             allow_banked: true,
+            banked_as_capacity: false,
             now_ms: 1,
         };
         assert!(!pool(false).available(5.0, false));

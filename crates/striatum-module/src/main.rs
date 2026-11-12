@@ -12847,6 +12847,7 @@ mod tests {
         let provenance = DecisionProvenance {
             quota_signal_json: r#"{"state":"none","reason":"quota signal: none"}"#.into(),
             policy_revision: "test-policy".into(),
+            anchor_version: ANCHOR_VERSION,
         };
         let decision = panel_decision_input(
             &params,
@@ -12906,6 +12907,7 @@ mod tests {
             &DecisionProvenance {
                 quota_signal_json: "{}".into(),
                 policy_revision: "test-policy".into(),
+                anchor_version: ANCHOR_VERSION,
             },
             "policy sources: test",
         );

@@ -61,7 +61,32 @@ pub(crate) struct ModelPolicyPatch {
     pub only_for: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OverqualificationMode {
+    #[default]
+    Additive,
+    CostScaled,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PricingPatch {
+    pub overqualification: Option<OverqualificationMode>,
+    pub banked_resets: Option<BTreeMap<String, crate::config_policy::BankedResets>>,
+}
+
 impl LiveConfig {
+    pub(crate) fn scoring_anchor_version(&self) -> u32 {
+        self.config
+            .model_routing
+            .overqualification
+            .resolve()
+            .expect("validated config")
+            .mode
+            .anchor_version()
+    }
+
     pub(crate) fn service_tier(
         &self,
         consumer: &str,
@@ -91,7 +116,15 @@ impl LiveConfig {
         )
     }
     fn new(config: RoutingConfigFile, document: Option<String>) -> Self {
-        let pricing = route_pricing(&config.model_routing);
+        let mut pricing = route_pricing(&config.model_routing);
+        pricing.banked_resets_capacity = config
+            .providers
+            .iter()
+            .filter(|(_, policy)| {
+                policy.banked_resets == crate::config_policy::BankedResets::Capacity
+            })
+            .map(|(provider, _)| provider.clone())
+            .collect();
         Self {
             config,
             document,
@@ -1411,13 +1444,14 @@ impl Default for ModelRoutingSection {
     }
 }
 
-/// `overqualification`: `term = 0` while a route's surplus over
-/// the iq demand (both on the 0..100 demand scale) is at most `threshold`, else
-/// `base * (2^((surplus - threshold) / doubling) - 1)`, added to selection cost.
-/// `base: 0` switches the term off.
+/// Additive mode (default) preserves the tunable cost term. Cost-scaled mode
+/// multiplies selection cost by the fixed core curve, bounded to 1..4; custom
+/// threshold/doubling/base values are refused in that mode.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct OverqualificationSection {
+    #[serde(default)]
+    mode: OverqualificationMode,
     #[schemars(range(min = 0))]
     threshold: Option<f64>,
     #[schemars(transform = positive_number)]
@@ -1428,7 +1462,20 @@ struct OverqualificationSection {
 
 impl OverqualificationSection {
     fn resolve(self) -> Result<OverqualificationConfig, String> {
+        if self.mode == OverqualificationMode::CostScaled
+            && (self.threshold.is_some() || self.doubling.is_some() || self.base.is_some())
+        {
+            return Err("overqualification.mode cost_scaled uses a fixed curve; threshold, doubling and base are allowed only in additive mode".into());
+        }
         let config = OverqualificationConfig {
+            mode: match self.mode {
+                OverqualificationMode::Additive => {
+                    striatum_core::routing_config::OverqualificationMode::Additive
+                }
+                OverqualificationMode::CostScaled => {
+                    striatum_core::routing_config::OverqualificationMode::CostScaled
+                }
+            },
             threshold: self
                 .threshold
                 .unwrap_or(DEFAULT_OVERQUALIFICATION.threshold),
@@ -3023,6 +3070,10 @@ mod overqualification_config_tests {
         assert_eq!(DEFAULT_OVERQUALIFICATION.threshold, 40.0);
         assert_eq!(DEFAULT_OVERQUALIFICATION.doubling, 10.0);
         assert_eq!(DEFAULT_OVERQUALIFICATION.base, 0.05);
+        assert_eq!(
+            DEFAULT_OVERQUALIFICATION.mode,
+            striatum_core::routing_config::OverqualificationMode::Additive
+        );
     }
 
     #[test]
@@ -3057,6 +3108,27 @@ mod overqualification_config_tests {
             .is_err(),
             "a misspelt field is refused, not silently ignored"
         );
+    }
+
+    #[test]
+    fn overqualification_mode_defaults_to_additive_and_cost_scaled_refuses_tuning() {
+        let config = parse_config(r#"{"overqualification":{"mode":"cost_scaled"}}"#).unwrap();
+        assert_eq!(
+            config
+                .model_routing
+                .overqualification
+                .resolve()
+                .unwrap()
+                .mode,
+            striatum_core::routing_config::OverqualificationMode::CostScaled
+        );
+        for field in ["threshold", "doubling", "base"] {
+            let document = serde_json::json!({"overqualification":{"mode":"cost_scaled",field:10}})
+                .to_string();
+            let error = parse_config(&document).unwrap_err();
+            assert!(error.contains("allowed only in additive mode"), "{error}");
+        }
+        assert!(parse_config(r#"{"overqualification":{"mode":"other"}}"#).is_err());
     }
 }
 
