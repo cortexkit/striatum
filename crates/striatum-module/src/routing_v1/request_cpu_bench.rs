@@ -515,6 +515,87 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     {
         samples.print(name);
     }
+    if std::env::var_os("STRIATUM_CPU_WAL_TICKS").is_some() {
+        println!(
+            "reader_cache_cost added_us/checkout=0 added_us/request=0 configuration=open_only"
+        );
+        // Maintenance follows the unchanged request mix and is timed separately,
+        // so opting in cannot attribute a checkpoint to a request's commit.
+        for kind in ["passive", "over_cap_truncate"] {
+            if kind == "over_cap_truncate" {
+                let payload = "x".repeat(striatum_store::WAL_SIZE_CAP_BYTES as usize + 4096);
+                harness
+                    .store()
+                    .put_quota_snapshot(&payload, FIXTURE_NOW as i64)
+                    .unwrap();
+            }
+            let before = harness.store().stage_timing();
+            let acquisitions = harness.store().writer_acquisition_count_for_test();
+            let started = Instant::now();
+            harness.store().checkpoint_wal().unwrap();
+            let checkpoint_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+            let after = harness.store().stage_timing();
+            println!("wal_tick kind={kind} connection=maintenance checkpoint_us={checkpoint_us:.3} checkpoint_writer_acquisitions={} writer_queue_wait_us={:.3} writer_hold_us={:.3} commit_us={:.3} cap_bytes={} reader_cache_kib={} truncate_wait_bound_ms={}",
+                harness.store().writer_acquisition_count_for_test() - acquisitions,
+                (after.writer_queue_ns - before.writer_queue_ns) as f64 / 1000.0,
+                (after.sql_ns - before.sql_ns + after.commit_ns - before.commit_ns) as f64 / 1000.0,
+                (after.commit_ns - before.commit_ns) as f64 / 1000.0,
+                striatum_store::WAL_SIZE_CAP_BYTES, striatum_store::READER_CACHE_SIZE_KIB,
+                striatum_store::WAL_TRUNCATE_WAIT_BOUND.as_millis());
+        }
+        // Compare a writer-held passive checkpoint with independent maintenance
+        // under concurrent commits. This diagnostic runs after the request mix.
+        for connection in ["writer_reference", "maintenance"] {
+            let payload = "x".repeat(striatum_store::WAL_SIZE_CAP_BYTES as usize + 4096);
+            harness.store().put_quota_snapshot(&payload, 0).unwrap();
+            harness.store().checkpoint_wal().unwrap();
+            harness
+                .store()
+                .put_quota_snapshot(&"y".repeat(1024 * 1024), 1)
+                .unwrap();
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let ready = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let writer = scope.spawn(|| {
+                    // One commit precedes the tick, and further commits compete
+                    // with it until it finishes. Thread-local timers exclude the
+                    // reference checkpoint's own writer acquisition.
+                    harness.store().put_quota_snapshot("{}", 0).unwrap();
+                    ready.wait();
+                    let before = striatum_store::SqliteRouteStateStore::thread_stage_timing();
+                    let mut n = 0;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        harness.store().put_quota_snapshot("{}", n + 1).unwrap();
+                        n += 1;
+                    }
+                    let after = striatum_store::SqliteRouteStateStore::thread_stage_timing();
+                    (
+                        n,
+                        after.writer_queue_ns - before.writer_queue_ns,
+                        after.commit_ns - before.commit_ns,
+                    )
+                });
+                ready.wait();
+                let started = Instant::now();
+                if connection == "writer_reference" {
+                    harness
+                        .store()
+                        .with_writer_for_test(|conn| {
+                            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")
+                        })
+                        .unwrap();
+                } else {
+                    harness.store().checkpoint_wal().unwrap();
+                }
+                let checkpoint_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let (commits, queue_ns, commit_ns) = writer.join().unwrap();
+                println!("wal_tick_concurrent connection={connection} checkpoint_us={checkpoint_us:.3} writer_commits={commits} writer_queue_wait_us/commit={:.3} commit_us/commit={:.3}",
+                    queue_ns as f64 / commits.max(1) as f64 / 1000.0,
+                    commit_ns as f64 / commits.max(1) as f64 / 1000.0);
+            });
+        }
+    }
 }
 
 #[tokio::test]
