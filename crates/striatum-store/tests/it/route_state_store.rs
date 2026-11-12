@@ -4596,5 +4596,5 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
     drop(reopened);
     let error = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 82).err().unwrap();
     assert!(error.to_string().contains("store_ahead"));
-    assert!(error.to_string().contains("83"));
+    assert!(error.to_string().contains("84"));
 }
