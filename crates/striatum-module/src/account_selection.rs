@@ -1818,7 +1818,24 @@ impl ClassContext {
             model,
             self.now_ms,
         );
-        Some(reset.map(|reset| fenced.values().copied().fold(reset, i64::min)))
+        Some(reset.into_iter().chain(fenced.values().copied()).min())
+    }
+
+    /// Read dated account recovery even when a quota recheck has temporarily
+    /// removed every account from eligibility. Permanent credential and policy
+    /// failures remain in force; this view is used only for retry diagnostics.
+    pub(crate) fn recovery_reset(&self, provider: &str, model: &str, priced: bool) -> Option<i64> {
+        let mut recovered = self.clone();
+        recovered.refusals.retain(|refusal| {
+            !self.rechecks.iter().any(|origin| {
+                origin.quota
+                    && origin.kind == "credential"
+                    && origin.provider == refusal.provider_id
+                    && origin.credential_id.as_deref() == Some(refusal.credential_id.as_str())
+            })
+        });
+        recovered.rechecks.retain(|origin| !origin.quota);
+        recovered.blocked_reset(provider, model, priced).flatten()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4919,75 +4936,81 @@ fn pool_recovery_reset(
     let family = policy.family_for_model(model);
     let mut releases = Vec::new();
     for note in &decision.explanation.accounts {
-        let account = roster
-            .accounts
-            .iter()
-            .find(|a| a.account_id == note.account_id)?;
-        let mut resets = Vec::new();
-        let window_reset = |window: ApplicableWindow| -> Option<i64> {
-            let quota = account.quota.as_ref()?;
-            let general = match window {
-                ApplicableWindow::FiveHour => GeneralWindow::FiveHour,
-                ApplicableWindow::SevenDay => GeneralWindow::SevenDay,
-                ApplicableWindow::Reported(minutes) => GeneralWindow::Reported(minutes),
-                ApplicableWindow::FamilyScope => {
-                    let ScopedList::Listed(windows) = &quota.scoped else {
-                        return None;
-                    };
-                    return windows
-                        .iter()
-                        .filter(|window| policy.family_for_scope(window) == Some(family))
-                        .map(|window| window.resets_at.at_ms())
-                        .collect::<Option<Vec<_>>>()?
-                        .into_iter()
-                        .max();
-                }
+        let release = (|| {
+            let account = roster
+                .accounts
+                .iter()
+                .find(|a| a.account_id == note.account_id)?;
+            let mut resets = Vec::new();
+            let window_reset = |window: ApplicableWindow| -> Option<i64> {
+                let quota = account.quota.as_ref()?;
+                let general = match window {
+                    ApplicableWindow::FiveHour => GeneralWindow::FiveHour,
+                    ApplicableWindow::SevenDay => GeneralWindow::SevenDay,
+                    ApplicableWindow::Reported(minutes) => GeneralWindow::Reported(minutes),
+                    ApplicableWindow::FamilyScope => {
+                        let ScopedList::Listed(windows) = &quota.scoped else {
+                            return None;
+                        };
+                        return windows
+                            .iter()
+                            .filter(|window| policy.family_for_scope(window) == Some(family))
+                            .map(|window| window.resets_at.at_ms())
+                            .collect::<Option<Vec<_>>>()?
+                            .into_iter()
+                            .max();
+                    }
+                };
+                quota.window(general)?.resets_at.at_ms()
             };
-            quota.window(general)?.resets_at.at_ms()
-        };
-        for reason in &note.exclusions {
-            match reason {
-                ExclusionReason::BelowReserve { windows } => {
-                    for window in windows {
-                        resets.push(window_reset(*window)?);
+            for reason in &note.exclusions {
+                match reason {
+                    ExclusionReason::BelowReserve { windows } => {
+                        for window in windows {
+                            resets.push(window_reset(*window)?);
+                        }
                     }
-                }
-                ExclusionReason::BelowBrocaFloor { window, .. } => {
-                    resets.push(window_reset((*window).into())?);
-                }
-                ExclusionReason::ScopeExhausted { .. } => {
-                    resets.push(window_reset(ApplicableWindow::FamilyScope)?);
-                }
-                ExclusionReason::ConfirmedFence { pool } => {
-                    let matching: Vec<_> = fences
-                        .iter()
-                        .filter(|fence| {
-                            fence.account_id == account.account_id
-                                && fence.pool == *pool
-                                && fence.applies_to(
-                                    model,
-                                    family,
-                                    request_pool(None, &account.routing_provider, model).as_deref(),
-                                )
-                        })
-                        .collect();
-                    if matching.is_empty() {
-                        return None;
+                    ExclusionReason::BelowBrocaFloor { window, .. } => {
+                        resets.push(window_reset((*window).into())?);
                     }
-                    for fence in matching {
-                        resets.push(fence.reset.at_ms()?);
+                    ExclusionReason::ScopeExhausted { .. } => {
+                        resets.push(window_reset(ApplicableWindow::FamilyScope)?);
                     }
+                    ExclusionReason::ConfirmedFence { pool } => {
+                        let matching: Vec<_> = fences
+                            .iter()
+                            .filter(|fence| {
+                                fence.account_id == account.account_id
+                                    && fence.pool == *pool
+                                    && fence.applies_to(
+                                        model,
+                                        family,
+                                        request_pool(None, &account.routing_provider, model)
+                                            .as_deref(),
+                                    )
+                            })
+                            .collect();
+                        if matching.is_empty() {
+                            return None;
+                        }
+                        for fence in matching {
+                            resets.push(fence.reset.at_ms()?);
+                        }
+                    }
+                    // Missing evidence and permanent eligibility failures do not
+                    // promise a recovery time.
+                    _ => return None,
                 }
-                // Missing evidence and permanent eligibility failures do not
-                // promise a recovery time.
-                _ => return None,
             }
+            let release = resets.into_iter().max()?;
+            if release <= now {
+                return None;
+            }
+            Some(release)
+        })();
+        if let Some(release) = release {
+            releases.push(release);
         }
-        let release = resets.into_iter().max()?;
-        if release <= now {
-            return None;
-        }
-        releases.push(release);
     }
     releases.into_iter().min()
 }

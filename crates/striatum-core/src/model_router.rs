@@ -532,8 +532,8 @@ pub struct NoRouteError {
     /// For a quality refusal: the highest-adequacy survivor, so the caller can
     /// surface which route was closest to the required floor or sanity band.
     pub best_rejected: Option<RejectedCandidate>,
-    /// Earliest quota/cooldown wall expiry across blocked candidates (millisecond
-    /// epoch). This is not a promise that other admission fences will clear then.
+    /// Earliest known recovery of a route that otherwise passes this request's
+    /// admission and adequacy gates (millisecond epoch).
     pub earliest_reset: Option<f64>,
     pub earliest_reset_route: Option<String>,
     /// Routes that clear the quality gate despite their admission fence, with
@@ -592,7 +592,9 @@ impl NoRouteError {
     /// exclusion can still prevent selection after a quota/cooldown wall expires.
     pub fn refusal_message(&self) -> String {
         if self.reason != RouteFailureReason::QuotaOrCooldownExhausted {
-            return self.message.clone();
+            let mut message = self.message.clone();
+            self.append_recovery(&mut message);
+            return message;
         }
         let groups = self
             .blocking_causes()
@@ -634,13 +636,17 @@ impl NoRouteError {
             })
             .collect::<Vec<_>>();
         let mut message = self.message.clone();
-        if let (Some(until), Some(route)) = (self.earliest_reset, &self.earliest_reset_route) {
-            message.push_str(&format!(". Earliest route wall expiry: {route} (until_ms={until:.0}); other fences may remain."));
-        }
+        self.append_recovery(&mut message);
         if !groups.is_empty() {
             message.push_str(&format!(" {}.", groups.join("; ")));
         }
         message
+    }
+
+    fn append_recovery(&self, message: &mut String) {
+        if let (Some(until), Some(route)) = (self.earliest_reset, &self.earliest_reset_route) {
+            message.push_str(&format!(". Earliest route wall expiry: {route} (until_ms={until:.0}); other fences may remain."));
+        }
     }
 }
 
@@ -1972,8 +1978,13 @@ fn admit_and_price_shortlist(
     }
 
     if admissible.is_empty() {
-        let (earliest_reset, earliest_reset_route) =
-            earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
+        let (earliest_reset, earliest_reset_route) = earliest_admissible_recovery(
+            input,
+            config,
+            operator_group,
+            availability_rejections,
+            &HashMap::new(),
+        );
         return Err(NoRouteError {
             candidates: candidate_quality_scores(&input.facts, &admissible),
             reason: classify_empty_admission(&rejected),
@@ -2019,8 +2030,13 @@ fn admit_and_price_shortlist(
             route_key: a.route.route_key.clone(),
             adequacy: a.adequacy.adequacy,
         });
-        let (earliest_reset, earliest_reset_route) =
-            earliest_reset_for_rejections(&input.facts, input.runtime_snapshot.as_ref(), &rejected);
+        let (earliest_reset, earliest_reset_route) = earliest_admissible_recovery(
+            input,
+            config,
+            operator_group,
+            availability_rejections,
+            &HashMap::new(),
+        );
 
         let message = if refuse_below_bar {
             let unavailable = rejected
@@ -2669,47 +2685,95 @@ fn adequate_blockers(
         .collect()
 }
 
-fn earliest_reset_for_rejections(
-    facts: &[ModelFact],
-    snapshot: Option<&ModelRouteStateSnapshot>,
-    rejected: &[RejectedRoute],
+/// Diagnose retry timing without changing admission, rejection evidence or picks.
+/// Account resets must come only from accounts permitted to serve this request,
+/// including its subscription-versus-metered policy. They lift account availability,
+/// never structural or operator fences.
+pub fn earliest_admissible_recovery(
+    input: &SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
+    account_resets: &HashMap<String, f64>,
 ) -> (Option<f64>, Option<String>) {
-    let blocked: HashSet<&str> = rejected
+    let Some(snapshot) = input.runtime_snapshot.as_ref() else {
+        return (None, None);
+    };
+    let mut recovered = snapshot.clone();
+    for state in recovered
+        .by_route
+        .values_mut()
+        .chain(recovered.by_capacity.values_mut())
+    {
+        state.cooldown_until = None;
+        state.quota_exhausted_until = None;
+        state.provider_reset_until = None;
+        state.failure_backoff_until = None;
+    }
+    let mut deadlines = HashMap::new();
+    for fact in &input.facts {
+        let route = fact_to_route(fact);
+        let account_reset = account_resets
+            .get(&route.route_key)
+            .copied()
+            .filter(|reset| reset.is_finite() && *reset > snapshot.now);
+        let wall = route_wall_until(snapshot, &route.route_key, &route.capacity_key);
+        if let Some(reset) = latest_deadline(wall, account_reset) {
+            deadlines.insert(route.route_key.clone(), reset);
+        }
+        if account_reset.is_some() {
+            for state in [
+                recovered.by_route.get_mut(&route.route_key),
+                recovered.by_capacity.get_mut(&route.capacity_key),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if state
+                    .credential_refusal
+                    .as_ref()
+                    .is_some_and(|mark| mark.reason == "no_eligible_account")
+                {
+                    state.credential_refusal = None;
+                }
+                // The dated account recovery also releases the quota reserve that
+                // excluded those accounts; no unrelated reserve is relaxed.
+                state.subscription_pool = None;
+            }
+        }
+    }
+    let admission = admit_routes_with_availability(
+        &input.facts,
+        Some(&recovered),
+        ExclusionPolicy {
+            operator: &input.operator_exclude_keys,
+            caller: &input.exclude_route_keys,
+        },
+        operator_group,
+        input.required_capabilities,
+        &input.available_models,
+        &input.requirements,
+        config,
+        availability_rejections,
+    );
+    let earliest = admission
+        .admitted
         .iter()
-        .filter(|rejection| {
-            matches!(
-                rejection.reason.as_str(),
-                "quota_exhausted" | "cooldown_active" | "backoff_active"
-            )
+        .filter(|candidate| candidate.adequacy.clears_adequacy_floor())
+        .filter(|candidate| {
+            !subscription_route_covered(&candidate.route, input.is_subscription_route.as_deref())
+                || subscription_budget_available(&candidate.runtime, input.target_is_head)
         })
-        .map(|rejection| rejection.route_key.as_str())
-        .collect();
-    let candidates = facts
-        .iter()
-        .map(fact_to_route)
-        .filter(|route| blocked.contains(route.route_key.as_str()))
-        .map(|route| crate::break_glass::BreakGlassCandidate {
-            route_key: route.route_key,
-            capacity_key: route.capacity_key,
+        .filter_map(|candidate| {
+            deadlines
+                .get(&candidate.route.route_key)
+                .map(|reset| (*reset, candidate.route.route_key.clone()))
         })
-        .collect::<Vec<_>>();
-    let earliest = snapshot.and_then(|snapshot| {
-        crate::break_glass::earliest_reset_among_candidates(snapshot, &candidates)
-    });
-    let route = snapshot.and_then(|snapshot| {
-        candidates
-            .iter()
-            .filter(|candidate| {
-                earliest.is_some()
-                    && crate::break_glass::earliest_reset_among_candidates(
-                        snapshot,
-                        std::slice::from_ref(*candidate),
-                    ) == earliest
-            })
-            .map(|candidate| candidate.route_key.clone())
-            .min()
-    });
-    (earliest, route)
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    match earliest {
+        Some((reset, route)) => (Some(reset), Some(route)),
+        None => (None, None),
+    }
 }
 
 fn classify_empty_admission(rejected: &[RejectedRoute]) -> RouteFailureReason {
