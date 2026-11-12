@@ -5,6 +5,10 @@ use striatum_core::{route_state_store::CredentialRefusal, RouteOutcome};
 
 #[derive(Default)]
 pub struct V1ReportEffects {
+    /// Explicit serving credential from the report, before identity fallback.
+    pub reported_credential: Option<String>,
+    /// Rejected and unknown outcomes do not settle a decision's probe.
+    pub preserve_probe: bool,
     pub quota_scope: Option<crate::QuotaSuccessScope>,
     pub route_fence: Option<AccountRouteFence>,
     pub non_quota_route_fence: Option<AccountRouteFence>,
@@ -74,8 +78,10 @@ impl SqliteRouteStateStore {
                 let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
                 let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
-                apply_account_effects(&account, effects, now)?;
-                if outcome==RouteOutcome::Completed {
+                let settle = account.probe_report_matches(
+                    decision_id, effects.reported_credential.as_deref(), effects.preserve_probe).map_err(sql_error)?;
+                if settle { apply_account_effects(&account, effects, now)?; }
+                if settle && outcome==RouteOutcome::Completed {
                     if let Some((provider,credential))=&effects.lift_credential {
                         let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
                         let identity=identity.and_then(|raw|serde_json::from_str::<striatum_core::route_state_store::ProviderOutcome>(&raw).ok());
@@ -95,7 +101,10 @@ impl SqliteRouteStateStore {
                         }
                     }
                 }
-                if striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error) {
+                if settle && failed {
+                    account.fail_authorized_probe(decision_id, now,
+                        striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error)).map_err(sql_error)?;
+                } else if settle && striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error) {
                     let (provider,model):(Option<String>,Option<String>)=tx.query_row(
                         "SELECT selected_provider_id,selected_model_id FROM model_route_decisions WHERE id=?1",
                         [decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
@@ -103,7 +112,7 @@ impl SqliteRouteStateStore {
                         account.release_inconclusive_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
                     }
                 }
-                reconcile(&account).map_err(sql_error)?;
+                if settle { reconcile(&account).map_err(sql_error)?; }
                 if failed {
                     tx.execute("UPDATE routing_v1_affinity SET ended_at_ms=?2 WHERE decision_id=?1 AND ended_at_ms IS NULL",
                         params![decision_id, now])?;

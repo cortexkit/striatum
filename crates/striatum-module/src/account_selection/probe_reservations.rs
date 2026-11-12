@@ -9,7 +9,6 @@ struct Reservation {
     provider: String,
     credential: String,
     owner: String,
-    selection_owner: String,
     expires_at: i64,
 }
 
@@ -40,14 +39,13 @@ pub(super) fn blocked_until(
                 && entry.provider == provider
                 && entry.credential == credential
                 && Some(entry.owner.as_str()) != owner
-                && Some(entry.selection_owner.as_str()) != owner
         })
         .map(|entry| entry.expires_at)
 }
 
-/// Selection holds prospective probes while scoring, then binds only the
-/// chosen credential to its decision. Dropping the scoring view releases the
-/// other holds, including all holds when selection fails.
+/// Selection holds prospective probes while scoring. A durable decision claim
+/// replaces the chosen credential's hold. Dropping the scoring view releases
+/// the other holds, including all holds when selection fails.
 pub(super) struct Selection {
     scope: Weak<Mutex<BrocaCredentials>>,
     pub owner: String,
@@ -73,7 +71,6 @@ impl Selection {
                     provider,
                     credential,
                     owner: owner.clone(),
-                    selection_owner: owner.clone(),
                     expires_at: now.saturating_add(TTL_MS),
                 });
             }
@@ -81,16 +78,13 @@ impl Selection {
         Self { scope, owner }
     }
 
-    pub fn bind(&self, provider: &str, credential: &str, decision: &str, now: i64) {
-        if let Some(entry) = live(now).iter_mut().find(|entry| {
-            entry.scope.ptr_eq(&self.scope)
+    pub fn release_selected(&self, provider: &str, credential: &str, now: i64) {
+        live(now).retain(|entry| {
+            !(entry.scope.ptr_eq(&self.scope)
                 && entry.provider == provider
                 && entry.credential == credential
-                && entry.owner == self.owner
-        }) {
-            entry.owner = decision.to_owned();
-            entry.expires_at = now.saturating_add(TTL_MS);
-        }
+                && entry.owner == self.owner)
+        });
     }
 }
 
@@ -127,7 +121,6 @@ pub(super) fn claim(
             && entry.provider == provider
             && entry.credential == credential
             && Some(entry.owner.as_str()) != owner
-            && Some(entry.selection_owner.as_str()) != owner
     }) {
         return Ok(ProbeClaim::ReservedUntil(holder.expires_at));
     }
