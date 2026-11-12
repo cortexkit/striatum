@@ -542,7 +542,7 @@ async fn candidates(
         deps.quota_cache,
         deps.store,
         live.pricing(),
-        &live.quota_model_pools(),
+        live.quota_model_pools_ref(),
     )
     .map_err(store_refusal)?;
     let aliases = deps
@@ -579,7 +579,7 @@ async fn candidates(
     let registry = {
         let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
         super::runners::Registry::build_for_selection(
-            config.v1_runners(),
+            config.as_ref(),
             &credentials,
             &prepared.facts,
             super::now_ms(),
@@ -715,8 +715,11 @@ async fn candidates(
             class_consumer
         };
     let group = config.consumer_exclusions(group_consumer);
-    let mut operator_exclude =
-        crate::panel_policy::operator_exclusions(&facts, &config.operator_policy().exclude, &group);
+    let mut operator_exclude = crate::panel_policy::operator_exclusions(
+        &facts,
+        &config.operator_policy_ref().exclude,
+        &group,
+    );
     operator_exclude.extend(
         facts
             .iter()
@@ -733,12 +736,13 @@ async fn candidates(
     let mut exclude = request.exclude.clone().unwrap_or_default();
     exclude.extend_from_slice(extra_exclude);
     let available: Vec<_> = facts.iter().map(|f| fact_to_route(f).route_key).collect();
-    let resolved = crate::resolve_routing_policy_with_catalog_targets(
+    let resolved = striatum_core::launch_policy::resolve_compiled_routing_policy(
         available.iter().cloned(),
-        &config.operator_policy(),
+        config.compiled_routing_policy(),
         &Default::default(),
         &crate::provider_auth_types(None),
         &aliases,
+        true,
     );
     let subscription: HashSet<_> = resolved.subscription_keys.into_iter().collect();
     let context = scoring::PanelSelectionContext {

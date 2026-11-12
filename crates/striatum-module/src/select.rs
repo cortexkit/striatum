@@ -406,7 +406,7 @@ pub(super) fn resolve_select_request(
 /// through the vault; they are never subscription-covered.
 fn resolve_select_request_with_catalog_targets(
     params: &SelectParams,
-    operator_policy: &ModelRoutingPolicyInput,
+    operator_policy: &impl select_policy::PolicySource,
     catalog_targets: &std::collections::BTreeMap<String, String>,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
@@ -447,16 +447,14 @@ fn resolve_select_request_with_catalog_targets(
     // `model=`) keeps operator-excluded routes in the available set: `exclude`
     // keeps a route out of automatic choice only. An admission pin's automatic
     // fallback still applies the operator's exclusions during admission.
-    let mut availability_policy = operator_policy.clone();
-    if params.pin.is_some() || params.model_pin.is_some() {
-        availability_policy.exclude.clear();
-    }
-    let policy = resolve_routing_policy_with_catalog_targets(
+    let availability_policy = operator_policy.compiled_policy();
+    let policy = striatum_core::launch_policy::resolve_compiled_routing_policy(
         params.available_models.iter().cloned(),
         &availability_policy,
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref()),
         catalog_targets,
+        params.pin.is_none() && params.model_pin.is_none(),
     );
     let uses_host_availability = (params.executor.is_some() || params.is_host_run())
         && !is_broca_substrate(params.substrate.as_deref());
@@ -711,7 +709,7 @@ pub(super) fn prepare_selection_inputs(
 /// The configuration documents one selection reads, resolved once for it.
 pub(super) struct SelectionPolicySources<'a> {
     pub(super) live_config: &'a config_overrides::LiveConfig,
-    pub(super) operator_config: &'a config_overrides::LiveConfig,
+    pub(super) operator_config: &'a Arc<config_overrides::LiveConfig>,
     pub(super) operator_config_path: &'a Path,
     /// Each provider with no catalog rows that resolved to a catalog provider
     /// through its credentials' `serves` vendor
@@ -779,7 +777,7 @@ pub(super) fn price_selection_inputs_with_probes(
             account_selection::ClassContext::read(
                 store,
                 broca_credentials,
-                Arc::new(sources.operator_config.clone()),
+                Arc::clone(sources.operator_config),
                 ACCOUNT_QUOTA.get(),
                 facts.clone(),
                 now_ms() as i64,
@@ -1176,7 +1174,7 @@ pub(super) async fn handle_select_request(
             &request["params"],
             || {
                 let policy = striatum_core::accounts::AllocatorPolicy {
-                    model_pools: live_config.quota_model_pools(),
+                    model_pools: live_config.quota_model_pools_ref().to_vec(),
                     ..Default::default()
                 };
                 // The contract has no `store_error` or `internal_error` for
@@ -1492,7 +1490,7 @@ pub(super) async fn handle_select_request(
     } else {
         config_overrides::live_config(operator_config_path)
     };
-    let operator_policy = operator_config.operator_policy();
+    let operator_policy = operator_config.operator_policy_ref();
     timing.add_live_config_check(live_config_started.elapsed());
     let snapshot_started = Instant::now();
     let stored_facts = match store.get_facts() {
@@ -1559,7 +1557,7 @@ pub(super) async fn handle_select_request(
     let resolve_started = Instant::now();
     let mut resolved_request = match resolve_select_request_with_catalog_targets(
         &params,
-        &operator_policy,
+        operator_config.as_ref(),
         &catalog_targets,
     ) {
         Ok(resolved) => {
@@ -1604,7 +1602,7 @@ pub(super) async fn handle_select_request(
         quota_cache,
         store,
         live_config.pricing(),
-        &live_config.quota_model_pools(),
+        live_config.quota_model_pools_ref(),
     );
     timing.add_snapshot_closure(snapshot_started.elapsed());
     let PreparedSelectionInputs {
@@ -1755,7 +1753,7 @@ pub(super) async fn handle_select_request(
         .lock()
         .map(|credentials| {
             routing_v1::runners::Registry::build_for_harness(
-                operator_config.v1_runners(),
+                operator_config.as_ref(),
                 &credentials,
                 &facts,
                 snapshot.now as u64,
@@ -1829,7 +1827,7 @@ pub(super) async fn handle_select_request(
         priced_per_token,
         params.allowed_providers.as_deref(),
         subscription_plan_providers.as_ref(),
-        &operator_policy,
+        operator_config.as_ref(),
         &catalog_targets,
         classes.as_ref(),
     );
@@ -2210,7 +2208,7 @@ pub(super) async fn handle_select_request(
         });
         let selection = selection.and_then(|(selected, variant_choice)| {
             let policy = striatum_core::accounts::AllocatorPolicy {
-                model_pools: live_config.quota_model_pools(),
+                model_pools: live_config.quota_model_pools_ref().to_vec(),
                 ..Default::default()
             };
             let ctx = account_selection::Ctx {
@@ -3233,7 +3231,7 @@ async fn handle_select_panel(
     } else {
         config_overrides::live_config(operator_config_path)
     };
-    let operator_policy = operator_config.operator_policy();
+    let operator_policy = operator_config.operator_policy_ref();
     let params = match serde_json::from_slice::<SelectPanelBody>(&frame.body) {
         Ok(body) => body.params,
         Err(e) => {
@@ -3265,7 +3263,7 @@ async fn handle_select_panel(
         quota_cache,
         store,
         live_config.pricing(),
-        &live_config.quota_model_pools(),
+        live_config.quota_model_pools_ref(),
     ) {
         Ok(prepared) => prepared,
         Err(e) => {
@@ -3310,7 +3308,7 @@ async fn handle_select_panel(
         .lock()
         .map(|credentials| {
             routing_v1::runners::Registry::build(
-                operator_config.v1_runners(),
+                operator_config.as_ref(),
                 &credentials,
                 &prepared.facts,
                 now_ms(),
@@ -3352,15 +3350,13 @@ async fn handle_select_panel(
         defer_pool_pin,
     );
     warn_ignored_caller_policy_once(!params.subscription_keys.is_empty());
-    let resolved_policy = resolve_routing_policy_with_catalog_targets(
+    let resolved_policy = striatum_core::launch_policy::resolve_compiled_routing_policy(
         params.available_models.iter().cloned(),
-        &ModelRoutingPolicyInput {
-            subscription: operator_policy.subscription.clone(),
-            ..ModelRoutingPolicyInput::default()
-        },
+        operator_config.compiled_routing_policy(),
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(None),
         &catalog_targets,
+        false,
     );
     let subscription_keys: HashSet<String> =
         resolved_policy.subscription_keys.into_iter().collect();
@@ -3386,7 +3382,7 @@ async fn handle_select_panel(
         if let Ok(credentials) = broca_credentials.lock() {
             let served = credentials.statically_served_routes(&prepared.facts);
             let registry = routing_v1::runners::Registry::build(
-                operator_config.v1_runners(),
+                operator_config.as_ref(),
                 &credentials,
                 &prepared.facts,
                 prepared.now as u64,

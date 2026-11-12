@@ -531,7 +531,7 @@ async fn select_at_tier(
         ));
     }
 
-    let operator_policy = operator_config.operator_policy();
+    let operator_policy = operator_config.operator_policy_ref();
     // Payment class comes only from the resolved consumer policy, not from the
     // consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
@@ -555,7 +555,7 @@ async fn select_at_tier(
         deps.quota_cache,
         deps.store,
         live_config.pricing(),
-        &live_config.quota_model_pools(),
+        live_config.quota_model_pools_ref(),
     )
     .map_err(store_refusal)?;
     // Providers with no catalog rows of their own, each resolved to the
@@ -610,7 +610,7 @@ async fn select_at_tier(
                     .unwrap_or_default();
             }
             super::runners::Registry::build_for_selection(
-                operator_config.v1_runners(),
+                operator_config.as_ref(),
                 &credentials,
                 &facts,
                 now as u64,
@@ -892,7 +892,7 @@ async fn select_at_tier(
         priced_per_token,
         None,
         priced.subscription_plan_providers.as_ref(),
-        &operator_policy,
+        operator_config.as_ref(),
         &catalog_targets,
         priced.classes.as_ref(),
     );
@@ -1326,7 +1326,7 @@ async fn select_at_tier(
     // Selection chooses the route; account_for enforces its hold. Preserve the
     // effective wait cap so later policy edits cannot widen this decision.
     let max_hold_s = operator_config
-        .allocator_policy(&selected.model.provider_id)
+        .allocator_policy_ref(&selected.model.provider_id)
         .max_hold_s;
     let hold_cap = request
         .hold_wait_max_s
@@ -1970,7 +1970,7 @@ impl<'a> Selection<'a> {
         let policy = self
             .sources
             .operator_config
-            .allocator_policy(&selected.model.provider_id);
+            .allocator_policy_ref(&selected.model.provider_id);
         if let Some(classes) = self.classes {
             let wait_limit = self
                 .hold_wait_max_s

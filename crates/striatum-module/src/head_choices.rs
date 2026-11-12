@@ -148,7 +148,7 @@ pub(crate) fn choices_for_harness(
     striatum_core::score_alias::append_alias_rows(&mut facts, &aliases);
     config.apply(&mut facts);
     let registry = routing_v1::runners::Registry::build_for_harness(
-        config.v1_runners(),
+        config,
         credentials,
         &facts,
         now_ms(),
@@ -172,8 +172,7 @@ pub(crate) fn choices_for_harness(
     };
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
     let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
-    let subscription_specs =
-        striatum_core::provider_model_spec::parse_spec_list(&config.operator_policy().subscription);
+    let subscription_specs = &config.compiled_routing_policy().subscription;
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
     for fact in &facts {
         grouped
@@ -190,10 +189,9 @@ pub(crate) fn choices_for_harness(
             || fact.is_deprecated_upstream()
             || fact.score_provenance == striatum_core::ScoreProvenance::Unscored
             || fact.supports_tool_use != Some(true)
-            || !credentials
-                .listed_credentials()
-                .iter()
-                .any(|row| broca_credentials::credential_serves_fact(row, fact, &providers, credentials))
+            || !credentials.listed_credentials().iter().any(|row| {
+                broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
+            })
         {
             continue;
         }
@@ -221,8 +219,15 @@ pub(crate) fn choices_for_harness(
         // A picker pin can use any covered account, regardless of temporary
         // quota or refusal fences; use account selection's coverage rule.
         let class = account_selection::resolve_class(
-            &reachable_credentials, fact, &providers, credentials, &subscription_specs,
-            aliases.contains_key(provider), false, false, |_| true,
+            &reachable_credentials,
+            fact,
+            &providers,
+            credentials,
+            subscription_specs,
+            aliases.contains_key(provider),
+            false,
+            false,
+            |_| true,
         );
         let allowed = |variant: Option<&str>, pinned: bool| {
             let route = striatum_core::make_route_key(provider, model, variant);

@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::model_facts::ModelRequirements;
 use crate::model_router::RequiredCapabilities;
-use crate::provider_model_spec::{
-    filter_excluded_keys_with_policy, parse_spec_list, resolve_spec, ExclusionPolicy,
-};
+use crate::provider_model_spec::CompiledSpecs;
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -122,6 +120,24 @@ pub struct ModelRoutingPolicyInput {
     pub score_alias: BTreeMap<String, String>,
 }
 
+/// Immutable rule tables and their wire/explanation strings, built together.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledRoutingPolicy {
+    pub input: ModelRoutingPolicyInput,
+    pub exclusion: CompiledSpecs,
+    pub subscription: CompiledSpecs,
+}
+
+impl CompiledRoutingPolicy {
+    pub fn compile(input: ModelRoutingPolicyInput) -> Self {
+        Self {
+            exclusion: CompiledSpecs::compile(&input.exclude),
+            subscription: CompiledSpecs::compile(&input.subscription),
+            input,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedRoutingPolicy {
@@ -145,6 +161,7 @@ pub fn resolve_routing_policy(
     caller: &ModelRoutingPolicyInput,
     provider_auth_types: &HashMap<String, String>,
 ) -> ResolvedRoutingPolicy {
+    // Compatibility wrapper compiles per call; request paths must use the compiled resolver.
     resolve_routing_policy_with_catalog_targets(
         available_models,
         operator,
@@ -168,21 +185,41 @@ pub fn resolve_routing_policy_with_catalog_targets(
     provider_auth_types: &HashMap<String, String>,
     catalog_targets: &BTreeMap<String, String>,
 ) -> ResolvedRoutingPolicy {
+    // Compatibility wrapper compiles per call; request paths must use the compiled resolver.
+    resolve_compiled_routing_policy(
+        available_models,
+        &CompiledRoutingPolicy::compile(operator.clone()),
+        caller,
+        provider_auth_types,
+        catalog_targets,
+        true,
+    )
+}
+
+pub fn resolve_compiled_routing_policy(
+    available_models: impl IntoIterator<Item = String>,
+    operator: &CompiledRoutingPolicy,
+    caller: &ModelRoutingPolicyInput,
+    provider_auth_types: &HashMap<String, String>,
+    catalog_targets: &BTreeMap<String, String>,
+    apply_operator_exclusion: bool,
+) -> ResolvedRoutingPolicy {
     let connected: HashSet<String> = available_models.into_iter().collect();
     let connected_model_count = connected.len();
-    let filtered = filter_excluded_keys_with_policy(
-        &connected,
-        ExclusionPolicy {
-            operator: &operator.exclude,
-            caller: &caller.exclude,
-        },
-    );
+    let caller_exclusion = CompiledSpecs::compile(&caller.exclude);
+    let filtered = connected.into_iter().filter(|key| {
+        !(apply_operator_exclusion && operator.exclusion.resolve(key, false))
+            && !caller_exclusion.resolve(key, false)
+    });
 
     // Subscription specs are additive rather than a fence, so caller entries
     // follow the operator's and refine them for this call.
-    let mut subscription_specs = operator.subscription.clone();
-    subscription_specs.extend(caller.subscription.iter().cloned());
-    let subscription_specs = parse_spec_list(&subscription_specs);
+    let combined = (!caller.subscription.is_empty()).then(|| {
+        let mut entries = operator.input.subscription.clone();
+        entries.extend(caller.subscription.iter().cloned());
+        CompiledSpecs::compile(&entries)
+    });
+    let subscription_specs = combined.as_ref().unwrap_or(&operator.subscription);
 
     let mut available_models = filtered.into_iter().collect::<Vec<_>>();
     available_models.sort();
@@ -199,7 +236,7 @@ pub fn resolve_routing_policy_with_catalog_targets(
             let oauth = provider_auth_types
                 .get(provider)
                 .is_some_and(|kind| kind == "oauth");
-            resolve_spec(&subscription_specs, key, oauth)
+            subscription_specs.resolve(key, oauth)
         })
         .cloned()
         .collect();

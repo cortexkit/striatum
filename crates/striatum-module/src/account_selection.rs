@@ -173,6 +173,9 @@ impl Ctx<'_> {
 /// One immutable vault/config/catalog view shared by selection and allocation.
 #[derive(Clone)]
 pub(crate) struct ClassContext {
+    // Clones share predicate-validated entries, never references into a clone's
+    // credential vector. Every hit rechecks the resolver's effective inputs.
+    class_memo: std::sync::Arc<std::sync::Mutex<ClassMemo>>,
     rechecks: Vec<striatum_store::FenceRecheck>,
     account_ids: crate::broca_credentials::CredentialAccounts,
     pub credentials: crate::broca_credentials::BrocaCredentials,
@@ -195,6 +198,28 @@ pub(crate) struct ClassContext {
     probe_scope: std::sync::Weak<std::sync::Mutex<crate::broca_credentials::BrocaCredentials>>,
     probe_owner: Option<String>,
     selection_probes: Option<std::sync::Arc<probe_reservations::Selection>>,
+}
+
+type ClassMemo = std::collections::HashMap<
+    String,
+    std::collections::HashMap<String, [Option<ClassMemoEntry>; 4]>,
+>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ClassRowInputs {
+    serving: bool,
+    covered: bool,
+    metered: bool,
+    usable: bool,
+}
+
+struct ClassMemoEntry {
+    key: String,
+    inputs: Vec<ClassRowInputs>,
+    rows: Vec<usize>,
+    subscription: bool,
+    #[cfg(test)]
+    misses: usize,
 }
 
 mod probe_reservations;
@@ -231,7 +256,7 @@ pub(crate) fn resolve_class<'a>(
     fact: &striatum_core::ModelFact,
     catalog: &BTreeSet<String>,
     credentials: &crate::broca_credentials::CredentialData,
-    specs: &[striatum_core::provider_model_spec::ParsedSpec],
+    specs: &(impl striatum_core::provider_model_spec::SpecResolver + ?Sized),
     borrowed: bool,
     priced_per_token: bool,
     metered_fallback: bool,
@@ -240,15 +265,12 @@ pub(crate) fn resolve_class<'a>(
     let key = format!("{}/{}", fact.provider_id, fact.model_id);
     let serving: Vec<_> = rows
         .iter()
-        .filter(|row| crate::broca_credentials::credential_serves_fact(row, fact, catalog, credentials))
+        .filter(|row| {
+            crate::broca_credentials::credential_serves_fact(row, fact, catalog, credentials)
+        })
         .collect();
     let covered = |row: &&cortexkit_claustrum_client::ListedCredential| {
-        !borrowed
-            && striatum_core::provider_model_spec::resolve_spec(
-                specs,
-                &key,
-                row.credential_type == "oauth",
-            )
+        !borrowed && specs.resolve(&key, row.credential_type == "oauth")
     };
     let has_subscription = serving.iter().any(covered);
     let can_fallback = metered_fallback
@@ -920,6 +942,7 @@ impl ClassContext {
             .map_err(|error| error.to_string())?;
         let rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
         let mut context = Self {
+            class_memo: Default::default(),
             rechecks,
             account_ids,
             credentials,
@@ -1040,24 +1063,11 @@ impl ClassContext {
         fact: &striatum_core::ModelFact,
         priced_per_token: bool,
     ) -> RouteClass<'_> {
-        if self.media_route {
-            return RouteClass {
-                rows: self
-                    .credentials
-                    .listed_credentials()
-                    .iter()
-                    .filter(|row| media_credential_serves(row, &fact.provider_id))
-                    .collect(),
-                subscription: false,
-            };
-        }
-        let specs = striatum_core::provider_model_spec::parse_spec_list(
-            &self.config.operator_policy().subscription,
-        );
-        let mut restricted = fact.clone();
+        let specs = &self.config.compiled_routing_policy().subscription;
+        let mut restricted = std::borrow::Cow::Borrowed(fact);
         if let Some(credential) = &self.continuation_credential {
             let method = self.method(credential);
-            restricted.auth_methods = Some(
+            restricted.to_mut().auth_methods = Some(
                 if method != "unknown"
                     && fact
                         .auth_methods
@@ -1070,18 +1080,116 @@ impl ClassContext {
                 },
             );
         }
-        let fact = &restricted;
-        resolve_class(
-            self.credentials.listed_credentials(),
-            fact,
-            &self.catalog,
-            &self.credentials,
-            &specs,
-            self.targets.contains_key(&fact.provider_id),
-            priced_per_token,
-            self.config.metered_fallback(&fact.provider_id),
-            |row| self.usable(row, fact),
-        )
+        let fact = restricted.as_ref();
+        let rows = self.credentials.listed_credentials();
+        let borrowed = self.targets.contains_key(&fact.provider_id);
+        let fallback = self.config.metered_fallback(&fact.provider_id);
+        let slot = usize::from(priced_per_token) + 2 * usize::from(self.media_route);
+        let mut memo = self.class_memo.lock().unwrap();
+        let cached = memo
+            .get(fact.provider_id.as_str())
+            .and_then(|models| models.get(fact.model_id.as_str()))
+            .and_then(|slots| slots[slot].as_ref());
+        let new_key;
+        let key = match cached {
+            Some(entry) => entry.key.as_str(),
+            None => {
+                new_key = format!("{}/{}", fact.provider_id, fact.model_id);
+                &new_key
+            }
+        };
+        let coverage = (!self.media_route && !borrowed)
+            .then(|| specs.override_for(key))
+            .flatten();
+        // Check current usability inputs directly: quota, probes, tiers and
+        // continuation restrictions can all change usability.
+        // No temporary key or predicate vector is allocated on a memo hit.
+        let inputs = |row: &cortexkit_claustrum_client::ListedCredential| {
+            let serving = if self.media_route {
+                media_credential_serves(row, &fact.provider_id)
+            } else {
+                crate::broca_credentials::credential_serves_fact(
+                    row,
+                    fact,
+                    &self.catalog,
+                    &self.credentials,
+                )
+            };
+            ClassRowInputs {
+                serving,
+                covered: !self.media_route
+                    && !borrowed
+                    && coverage.unwrap_or(row.credential_type == "oauth"),
+                metered: row
+                    .auth_method
+                    .as_deref()
+                    .is_some_and(striatum_core::billing::is_api_metered_auth_method),
+                usable: !self.media_route && fallback && serving && self.usable(row, fact),
+            }
+        };
+        if let Some(entry) = cached.filter(|entry| {
+            entry.inputs.len() == rows.len()
+                && rows
+                    .iter()
+                    .zip(&entry.inputs)
+                    .all(|(row, expected)| inputs(row) == *expected)
+        }) {
+            return RouteClass {
+                rows: entry.rows.iter().map(|&index| &rows[index]).collect(),
+                subscription: entry.subscription,
+            };
+        }
+        let row_inputs: Vec<_> = rows.iter().map(inputs).collect();
+        let resolved = if self.media_route {
+            RouteClass {
+                rows: rows
+                    .iter()
+                    .zip(&row_inputs)
+                    .filter(|(_, input)| input.serving)
+                    .map(|(row, _)| row)
+                    .collect(),
+                subscription: false,
+            }
+        } else {
+            resolve_class(
+                rows,
+                fact,
+                &self.catalog,
+                &self.credentials,
+                specs,
+                borrowed,
+                priced_per_token,
+                fallback,
+                |row| {
+                    row_inputs[rows
+                        .iter()
+                        .position(|candidate| std::ptr::eq(candidate, row))
+                        .unwrap()]
+                    .usable
+                },
+            )
+        };
+        let entry = ClassMemoEntry {
+            key: key.to_owned(),
+            inputs: row_inputs,
+            rows: resolved
+                .rows
+                .iter()
+                .map(|row| {
+                    rows.iter()
+                        .position(|candidate| std::ptr::eq(candidate, *row))
+                        .unwrap()
+                })
+                .collect(),
+            subscription: resolved.subscription,
+            #[cfg(test)]
+            misses: cached.map_or(1, |entry| entry.misses + 1),
+        };
+        memo.entry(fact.provider_id.clone())
+            .or_default()
+            .entry(fact.model_id.clone())
+            .or_insert_with(|| std::array::from_fn(|_| None))[slot] = Some(entry);
+        resolved
     }
 
     pub(crate) fn revalidate_credential(&mut self, credential: &str) {
@@ -1270,7 +1378,7 @@ impl ClassContext {
                             && fence.applies_to(
                                 model,
                                 self.config
-                                    .allocator_policy(provider)
+                                    .allocator_policy_ref(provider)
                                     .family_for_model(model),
                                 request_pool(None, provider, model).as_deref(),
                             )
@@ -1516,17 +1624,11 @@ impl ClassContext {
         if !self.eligible(row, fact) {
             return false;
         }
-        let specs = striatum_core::provider_model_spec::parse_spec_list(
-            &self.config.operator_policy().subscription,
-        );
+        let specs = &self.config.compiled_routing_policy().subscription;
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
         let covered = |row: &cortexkit_claustrum_client::ListedCredential| {
             !self.targets.contains_key(&fact.provider_id)
-                && striatum_core::provider_model_spec::resolve_spec(
-                    &specs,
-                    &key,
-                    row.credential_type == "oauth",
-                )
+                && specs.resolve(&key, row.credential_type == "oauth")
         };
         let rows = self
             .credentials
@@ -1536,7 +1638,12 @@ impl ClassContext {
                 (!only || other.id == row.id)
                     && covered(other) == covered(row)
                     && self.eligible(other, fact)
-                    && crate::broca_credentials::credential_serves_fact(other, fact, &self.catalog, &self.credentials)
+                    && crate::broca_credentials::credential_serves_fact(
+                        other,
+                        fact,
+                        &self.catalog,
+                        &self.credentials,
+                    )
             })
             .collect();
         let roster = self.roster(
@@ -1555,7 +1662,7 @@ impl ClassContext {
                     principal_exclusions: Vec::new(),
                     admissions: Vec::new(),
                     operator_override: None,
-                    policy: self.config.allocator_policy(&fact.provider_id),
+                    policy: self.config.allocator_policy_ref(&fact.provider_id).clone(),
                 },
                 self.now_ms,
                 &self.allocation_context(&fact.provider_id, &fact.model_id),
@@ -1769,7 +1876,7 @@ impl ClassContext {
             hold_ok,
             wait,
             conversation,
-            self.config.allocator_policy(provider),
+            self.config.allocator_policy_ref(provider).clone(),
         )
     }
 
@@ -4335,7 +4442,7 @@ fn prepare_roster(
                 };
                 let registry = ctx.classes.as_ref().map(|classes| {
                     crate::routing_v1::runners::Registry::build(
-                        classes.config.v1_runners(),
+                        classes.config.as_ref(),
                         &classes.credentials,
                         &classes.facts,
                         classes.now_ms.max(0) as u64,
@@ -4528,7 +4635,7 @@ fn prepare_service_tier(
             .filter(|runner| runner.module == parsed.caller.runner)
             .collect();
         let registry = crate::routing_v1::runners::Registry::build(
-            classes.config.v1_runners(),
+            classes.config.as_ref(),
             &classes.credentials,
             &classes.facts,
             classes.now_ms.max(0) as u64,
@@ -6942,6 +7049,276 @@ fn synthetic_request(provider: &str, model: &str, key: String) -> AccountRequest
 
 pub fn now_ms() -> i64 {
     crate::now_ms() as i64
+}
+
+#[cfg(test)]
+mod compiled_class_tests {
+    use super::*;
+    use crate::routing_v1::request_cpu_bench::{self as bench, FixtureCounts};
+
+    fn live_counts() -> FixtureCounts {
+        FixtureCounts {
+            subscription_rules: 10,
+            exclusion_rules: 103,
+            runner_route_rules: 0,
+            catalog_facts: 836,
+            listed_credentials: 39,
+        }
+    }
+
+    // The pre-compilation class path: parsed lists, a cloned fact, and no memo.
+    fn reference<'a>(
+        context: &'a ClassContext,
+        fact: &striatum_core::ModelFact,
+        priced: bool,
+    ) -> RouteClass<'a> {
+        if context.media_route {
+            return RouteClass {
+                rows: context
+                    .credentials
+                    .listed_credentials()
+                    .iter()
+                    .filter(|row| media_credential_serves(row, &fact.provider_id))
+                    .collect(),
+                subscription: false,
+            };
+        }
+        let specs = striatum_core::provider_model_spec::parse_spec_list(
+            &context.config.operator_policy_ref().subscription,
+        );
+        let mut restricted = fact.clone();
+        if let Some(credential) = &context.continuation_credential {
+            let method = context.method(credential);
+            restricted.auth_methods = Some(
+                if method != "unknown"
+                    && fact
+                        .auth_methods
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.iter().any(|allowed| allowed == method))
+                {
+                    vec![method.into()]
+                } else {
+                    Vec::new()
+                },
+            );
+        }
+        resolve_class(
+            context.credentials.listed_credentials(),
+            &restricted,
+            &context.catalog,
+            &context.credentials,
+            &specs,
+            context.targets.contains_key(&fact.provider_id),
+            priced,
+            context.config.metered_fallback(&fact.provider_id),
+            |row| context.usable(row, &restricted),
+        )
+    }
+
+    fn answer(class: RouteClass<'_>) -> (bool, Vec<String>) {
+        (
+            class.subscription,
+            class.rows.iter().map(|row| row.id.clone()).collect(),
+        )
+    }
+
+    fn assert_reference(context: &ClassContext, fact: &striatum_core::ModelFact) {
+        for priced in [false, true] {
+            assert_eq!(
+                answer(context.class(fact, priced)),
+                answer(reference(context, fact, priced)),
+                "{}/{} priced={priced}",
+                fact.provider_id,
+                fact.model_id
+            );
+        }
+    }
+
+    #[test]
+    fn compiled_class_equals_old_class_for_every_fact_and_payment_on_both_s0_fixtures() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        for production in [true, false] {
+            let fixture = if production {
+                bench::production_fixture()
+            } else {
+                bench::representative_fixture(live_counts())
+            };
+            let config = fixture.operator_config();
+            let context = ClassContext::load(
+                fixture.store(),
+                &fixture.credentials(),
+                config.clone(),
+                crate::ACCOUNT_QUOTA.get(),
+                bench::FIXTURE_NOW as i64,
+            )
+            .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&config, &context.config));
+            for fact in &context.facts {
+                assert_reference(&context, fact);
+                assert_reference(&context, fact);
+                let memo = context.class_memo.lock().unwrap();
+                for entry in &memo[&fact.provider_id][&fact.model_id][..2] {
+                    assert_eq!(
+                        entry.as_ref().unwrap().misses,
+                        1,
+                        "repeated class calls must share the memo"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn class_memo_revalidates_mutable_restrictions_and_clone_inputs() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        let fixture = bench::representative_fixture(live_counts());
+        let mut context = ClassContext::load(
+            fixture.store(),
+            &fixture.credentials(),
+            fixture.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            bench::FIXTURE_NOW as i64,
+        )
+        .unwrap();
+        let mut fact = context
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == "cpu-provider-0")
+            .unwrap()
+            .clone();
+        fact.auth_methods = None;
+        let scratch = cortexkit_test_support::ScratchDir::new("compiled-class-memo");
+        let path = scratch.path().join("routing.json");
+        std::fs::write(
+            &path,
+            r#"{"providers":{"cpu-provider-0":{"accounts":{"metered_fallback":true}}}}"#,
+        )
+        .unwrap();
+        crate::config_overrides::initialize_config(&path).unwrap();
+        context.config = crate::config_overrides::live_config(&path);
+        let mut rows = context.credentials.listed_credentials().to_vec();
+        let mut api = rows
+            .iter()
+            .find(|row| row.provider_ids.contains(&fact.provider_id))
+            .unwrap()
+            .clone();
+        api.id = "apikey:memo".into();
+        api.credential_type = "api_key".into();
+        api.auth_method = Some("apikey".into());
+        api.account_id = None;
+        rows.push(api.clone());
+        context.credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "memo".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            bench::FIXTURE_NOW,
+        );
+        context.credentials.runner_declarations.clear();
+        context.refusals.clear();
+        context.rechecks.clear();
+        context.fences.clear();
+        context.quota = Default::default();
+        assert_reference(&context, &fact);
+        let baseline = answer(context.class(&fact, false));
+        assert!(baseline.0);
+
+        let mut tier = context.clone();
+        tier.tier_accounts = Some(BTreeMap::from([(
+            format!("{}/{}", fact.provider_id, fact.model_id),
+            vec![api.id.clone()],
+        )]));
+        assert_reference(&tier, &fact);
+        assert!(
+            !tier.class(&fact, false).subscription,
+            "a tier excluding OAuth must use the metered fallback"
+        );
+        assert_reference(&context, &fact);
+        assert_eq!(
+            answer(context.class(&fact, false)),
+            baseline,
+            "a clone's restrictions must not poison the original memo"
+        );
+
+        let mut continuation = context.clone();
+        continuation.revalidate_credential(&api.id);
+        assert_reference(&continuation, &fact);
+        assert!(!continuation.class(&fact, false).subscription);
+        continuation.revalidate_credential("missing-credential");
+        assert_reference(&continuation, &fact);
+        assert!(continuation.class(&fact, false).rows.is_empty());
+
+        let mut media = context.clone();
+        media.for_engine(&fact.provider_id, &fact.model_id).unwrap();
+        assert_reference(&media, &fact);
+        assert!(!media.class(&fact, false).subscription);
+
+        let mut probing = context.clone();
+        let oauth: Vec<_> = probing
+            .credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| {
+                row.provider_ids.contains(&fact.provider_id) && row.credential_type == "oauth"
+            })
+            .map(|row| row.id.clone())
+            .collect();
+        probing.rechecks = oauth
+            .iter()
+            .map(|id| striatum_store::FenceRecheck {
+                evidence: id.clone(),
+                kind: "credential".into(),
+                origin_key: id.clone(),
+                provider: fact.provider_id.clone(),
+                account_id: None,
+                credential_id: Some(id.clone()),
+                model: None,
+                size_class: None,
+                principal: None,
+                admission_id: None,
+                evidence_at: probing.now_ms - 1,
+                quota: false,
+                classified: true,
+                next_recheck_at: probing.now_ms - 1,
+                reset_check_at: None,
+                last_claimed_at: None,
+                claim_owner: None,
+                cleared_models: Vec::new(),
+            })
+            .collect();
+        assert_reference(&probing, &fact);
+        let hold = probe_reservations::Selection::new(
+            &fixture.credentials(),
+            oauth
+                .iter()
+                .map(|id| (fact.provider_id.clone(), id.clone()))
+                .collect(),
+            probing.now_ms,
+        );
+        assert_reference(&probing, &fact);
+        assert!(
+            !probing.class(&fact, false).subscription,
+            "another request's probe hold must invalidate usability"
+        );
+        probing.probe_owner = Some(hold.owner.clone());
+        assert_reference(&probing, &fact);
+        assert!(probing.class(&fact, false).subscription);
+        probing.selection_probes = Some(std::sync::Arc::new(hold));
+        probing.probe_owner = None;
+        probing.now_ms += 120_001;
+        assert_reference(&probing, &fact);
+        assert!(
+            probing.class(&fact, false).subscription,
+            "expired holds cannot survive in the memo"
+        );
+
+        let mut denied = fact.clone();
+        denied.auth_methods = Some(Vec::new());
+        assert_reference(&context, &denied);
+        assert!(context.class(&denied, false).rows.is_empty());
+        assert_reference(&context, &fact);
+    }
 }
 
 #[cfg(test)]
