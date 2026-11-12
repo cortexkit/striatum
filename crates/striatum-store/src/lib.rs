@@ -319,7 +319,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 83] {
+fn route_state_migrations() -> [Migration; 84] {
     [
         Migration {
             version: 1,
@@ -652,6 +652,10 @@ fn route_state_migrations() -> [Migration; 83] {
         Migration {
             version: 84,
             statements: include_str!("../migrations/084_history_retention.sql"),
+        },
+        Migration {
+            version: 85,
+            statements: include_str!("../migrations/085_observation_principal_event.sql"),
         },
     ]
 }
