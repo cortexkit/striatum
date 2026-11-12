@@ -131,6 +131,10 @@ pub(super) fn start(
     // rows from the routing file's `retention` block.
     let mut loops = BackgroundLoops::default();
     loops.spawn(
+        "WAL checkpoints",
+        checkpoint_loop(Arc::clone(store), std::time::Duration::from_secs(15)),
+    );
+    loops.spawn(
         "routing call counts",
         flush_call_counts_loop(Arc::clone(store), std::time::Duration::from_secs(30)),
     );
@@ -248,6 +252,20 @@ pub(super) fn start(
     })
 }
 
+async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        let store = Arc::clone(&store);
+        match tokio::task::spawn_blocking(move || store.checkpoint_wal()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "WAL checkpoint failed; retrying next tick"),
+            Err(error) => tracing::warn!(%error, "WAL checkpoint worker failed"),
+        }
+    }
+}
+
 async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -260,6 +278,35 @@ async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_timer_truncates_an_over_cap_wal() {
+        let dir = cortexkit_test_support::ScratchDir::new("wal-checkpoint-timer");
+        let store = Arc::new(
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "wal-timer",
+                dir.join("store.db").to_string_lossy().into_owned(),
+            ))
+            .unwrap(),
+        );
+        let payload = "x".repeat(striatum_store::WAL_SIZE_CAP_BYTES as usize + 4096);
+        store.put_quota_snapshot(&payload, 0).unwrap();
+        let bytes = || std::fs::metadata(dir.join("store.db-wal")).unwrap().len();
+        assert!(bytes() > striatum_store::WAL_SIZE_CAP_BYTES);
+        let timer = tokio::spawn(checkpoint_loop(
+            Arc::clone(&store),
+            std::time::Duration::from_millis(10),
+        ));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while bytes() > striatum_store::WAL_SIZE_CAP_BYTES {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        timer.abort();
+        let _ = timer.await;
+        result.unwrap();
+    }
 
     #[tokio::test]
     async fn call_counts_flush_on_the_timer_and_at_clean_shutdown() {

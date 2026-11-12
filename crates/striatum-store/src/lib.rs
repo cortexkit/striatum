@@ -660,6 +660,13 @@ fn route_state_migrations() -> [Migration; 84] {
     ]
 }
 
+/// Trigger truncation when the allocated WAL exceeds 16 MiB.
+pub const WAL_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
+/// SQLite negative cache sizes are KiB, allowing up to 8 MiB per pooled reader.
+pub const READER_CACHE_SIZE_KIB: i64 = -8192;
+/// Maximum SQLite busy wait for a truncating checkpoint; retry on the next tick.
+pub const WAL_TRUNCATE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
+
 impl SqliteRouteStateStore {
     /// Stored providers only; score aliases added to a request are not catalog
     /// identities and must not be used to resolve credential ownership.
@@ -1124,6 +1131,7 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
     store: evaluation_snapshot::ConnectionStore,
+    maintenance: Option<Mutex<Connection>>,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
     /// window, recomputed from the whole population on every route selection
@@ -1350,9 +1358,63 @@ impl SqliteRouteStateStore {
         Self::open_with_migrations(descriptor, &route_state_migrations())
     }
 
-    /// Replace the writer's timed busy wait with a test-controlled lock handshake.
+    /// Run WAL maintenance on a dedicated connection, never on the request writer.
+    /// A busy reader leaves frames for the next tick instead of delaying requests.
+    pub fn checkpoint_wal(&self) -> RouteStateResult<()> {
+        let Some(maintenance) = &self.maintenance else {
+            return Ok(());
+        };
+        let conn = maintenance.lock().unwrap_or_else(|p| p.into_inner());
+        (|| -> rusqlite::Result<()> {
+            let log: i64 =
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))?;
+            if log < 0 {
+                return Ok(());
+            }
+            let page_size: u64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
+            // A fully backfilled WAL may still occupy its allocated file size.
+            let path = conn.path().unwrap_or_default();
+            let bytes = std::fs::metadata(format!("{path}-wal"))
+                .map(|m| m.len())
+                .unwrap_or_else(|_| (log as u64) * (page_size + 24) + 32);
+            if bytes > WAL_SIZE_CAP_BYTES {
+                let _busy: i64 =
+                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+            }
+            Ok(())
+        })()
+        .map_err(err)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
-    pub fn set_busy_handler_for_test(&self, handler: Option<fn(i32) -> bool>) -> RouteStateResult<()> {
+    pub fn with_writer_for_test<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        self.store.with_conn(f).map_err(err)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_reader_for_test<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        self.store.with_read(f).map_err(err)
+    }
+
+    /// Replace writer and maintenance waits with a test-controlled lock handshake.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_busy_handler_for_test(
+        &self,
+        handler: Option<fn(i32) -> bool>,
+    ) -> RouteStateResult<()> {
+        if let Some(maintenance) = &self.maintenance {
+            maintenance
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .busy_handler(handler)
+                .map_err(err)?;
+        }
         self.store
             .with_conn(|connection| connection.busy_handler(handler))
             .map_err(err)
@@ -1452,13 +1514,64 @@ impl SqliteRouteStateStore {
         if let Err(error) = store.with_conn(install_catalog_change_tracking) {
             tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
         }
-        Ok(Self::from_inner(
-            evaluation_snapshot::ConnectionStore::live(store),
-        ))
+        store
+            .with_conn(|conn| {
+                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                conn.pragma_update(None, "synchronous", "NORMAL")
+            })
+            .map_err(err)?;
+        // Hold each checkout until the next is configured, filling the lazy pool.
+        // Move this to cortexkit-store 0.4's open_sqlite_with_init hook when upgrading,
+        // so replacements after failed rollbacks get the larger cache too. A rare
+        // replacement keeps SQLite's default cache; configuring every checkout is
+        // more expensive than the larger cache can save.
+        fn prewarm(store: &SqliteStore, count: usize) -> Result<(), cortexkit_store::StoreError> {
+            if count == 0 {
+                return Ok(());
+            }
+            let mut nested = Ok(());
+            store.with_read(|conn| {
+                conn.pragma_update(None, "cache_size", READER_CACHE_SIZE_KIB)?;
+                nested = prewarm(store, count - 1);
+                Ok(())
+            })?;
+            nested
+        }
+        let memory = matches!(&descriptor.backend, StorageBackend::Sqlite { path }
+            if path.is_empty() || path == ":memory:" || path == "file::memory:" || path.starts_with("file::memory:?"));
+        prewarm(
+            &store,
+            if memory {
+                1
+            } else {
+                cortexkit_store::SqliteOpenOptions::default().read_pool_size
+            },
+        )
+        .map_err(err)?;
+        let mut result = Self::from_inner(evaluation_snapshot::ConnectionStore::live(store));
+        if !memory {
+            let StorageBackend::Sqlite { path } = &descriptor.backend else {
+                unreachable!()
+            };
+            let maintenance = Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )
+            .map_err(err)?;
+            maintenance
+                .busy_timeout(WAL_TRUNCATE_WAIT_BOUND)
+                .map_err(err)?;
+            maintenance
+                .pragma_update(None, "synchronous", "NORMAL")
+                .map_err(err)?;
+            result.maintenance = Some(Mutex::new(maintenance));
+        }
+        Ok(result)
     }
 
     fn from_inner(store: evaluation_snapshot::ConnectionStore) -> Self {
         Self {
+            maintenance: None,
             store,
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
