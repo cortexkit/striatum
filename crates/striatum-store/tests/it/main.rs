@@ -3,6 +3,7 @@ mod account_selection;
 mod backup_exclusion;
 mod canonical_scores;
 mod key_pool;
+mod observation_event_query_plan;
 mod observed_speed_query_plan;
 mod quota_reading_log;
 mod retention;

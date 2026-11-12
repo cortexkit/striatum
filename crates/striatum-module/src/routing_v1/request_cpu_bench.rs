@@ -4,6 +4,11 @@
 //! parameters named by `FixtureCounts`. With no parameters, only the explicitly
 //! labelled smoke fixture runs beside production. Set `STRIATUM_CPU_BASELINE=1`
 //! only with operator-supplied counts, never to promote a worker's smoke run.
+//! `STRIATUM_CPU_OBSERVATION_HISTORY=N` seeds N prior rows in each observation
+//! table before timing (default 0). Two principals and four runners model shared
+//! history; half the rows belong to the measured runner's principal. The compact
+//! event table is intentionally as large as the log, a conservative stress case
+//! rather than a claim about the live retention ratio.
 
 use super::conformance_tests::{install_catalog, reserved, Harness, Route};
 use cortexkit_role_routing_conformance::{fixture, Catalog};
@@ -378,6 +383,42 @@ async fn call(
 
 async fn measure(fixture: RequestFixture, batches: usize) {
     let harness = &fixture.harness;
+    let history_rows: usize = std::env::var("STRIATUM_CPU_OBSERVATION_HISTORY")
+        .map(|n| n.parse().expect("observation history must be a row count"))
+        .unwrap_or(0);
+    if history_rows > 0 {
+        let principal = format!(
+            "reserved:{}",
+            fixture.catalog.runners[0]
+                .module
+                .trim_start_matches("reserved:")
+        );
+        harness
+            .store()
+            .account_transaction(|tx| {
+                for i in 0..history_rows {
+                    tx.insert_observation(&striatum_store::AccountObservationRow {
+                        observation_id: format!("history-{i}"),
+                        principal: if i % 2 == 0 {
+                            principal.clone()
+                        } else {
+                            "reserved:history-other".into()
+                        },
+                        runner: format!("history-runner-{}", i % 4),
+                        event_id: format!("history-event-{i}"),
+                        kind: "advisory".into(),
+                        admission_id: None,
+                        bound: false,
+                        observation_json: "{}".into(),
+                        effects_json: "[]".into(),
+                        received_at: FIXTURE_NOW as i64 - 1,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        println!("observation_history_rows={history_rows} per_table; two principals, four runners (stress fixture)");
+    }
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;
     let runner = harness
         .bind(reserved(&fixture.catalog.runners[0].module), None)

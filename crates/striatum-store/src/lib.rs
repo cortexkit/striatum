@@ -319,7 +319,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 83] {
+fn route_state_migrations() -> [Migration; 84] {
     [
         Migration {
             version: 1,
@@ -652,6 +652,10 @@ fn route_state_migrations() -> [Migration; 83] {
         Migration {
             version: 84,
             statements: include_str!("../migrations/084_history_retention.sql"),
+        },
+        Migration {
+            version: 85,
+            statements: include_str!("../migrations/085_observation_principal_event.sql"),
         },
     ]
 }
@@ -1352,6 +1356,12 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|connection| connection.busy_handler(handler))
             .map_err(err)
+    }
+
+    /// Newest registered migration, for upgrade-test version expectations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn latest_migration_version_for_test() -> u32 {
+        route_state_migrations().last().unwrap().version
     }
 
     /// Build an older on-disk schema for upgrade tests that exercise live callers.
