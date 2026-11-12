@@ -2097,9 +2097,34 @@ impl<'a> Selection<'a> {
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
         let snapshot = self.snapshot.clone();
-        let refused = |reason: &str| {
-            let (reason, reset) = pin_reason(reason, &snapshot, &pin_key, &pin_capacity, self.now);
-            Refusal::pin_unavailable(pin, reason, reset)
+        let refused = |code: &str, message: String| {
+            let (mut reason, mut reset) =
+                pin_reason(code, &snapshot, &pin_key, &pin_capacity, self.now);
+            let unknown = reason == PinUnavailableReason::NotAvailable;
+            if (unknown
+                && matches!(
+                    code,
+                    "not_available" | "no_eligible_account" | "no_available_model"
+                ))
+                || code == "credential_billing_exhausted"
+            {
+                reset = self.pin_account_recovery(
+                    &pin_key,
+                    &pin_capacity,
+                    variant.as_deref(),
+                    available,
+                );
+                if reset.is_some() {
+                    reason = PinUnavailableReason::QuotaExhausted;
+                }
+            }
+            let mut refusal = Refusal::pin_unavailable(pin, reason, reset);
+            if unknown {
+                // Availability's specific cause lives in the private refusal's
+                // message, not its generic code. Keep it even without a retry time.
+                refusal.message = message;
+            }
+            refusal
         };
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
         let mut selected = work_model_pin::select_with_availability(
@@ -2111,7 +2136,7 @@ impl<'a> Selection<'a> {
             self.sources.catalog_targets,
             self.rejections,
         )
-        .map_err(|refusal| refused(&refusal.code))?;
+        .map_err(|refusal| refused(&refusal.code, refusal.message))?;
         // Hard pin admission remains shared with legacy selection. Reprice only
         // the admitted route, retaining its real demand's profile bucket.
         let mut input = self.pass().input(available, snapshot.clone());
@@ -2148,7 +2173,7 @@ impl<'a> Selection<'a> {
             .min_context = Some(0.0);
         let mut priced = self
             .score_input(input, &[], variant.as_deref())
-            .map_err(|error| refused(error.reason.as_str()))?;
+            .map_err(|error| refused(error.reason.as_str(), error.refusal_message()))?;
         priced.score.adequacy = selected.score.adequacy;
         priced.score.raw_adequacy = selected.score.raw_adequacy;
         priced.score.metrics = selected.score.metrics;
@@ -2175,6 +2200,101 @@ impl<'a> Selection<'a> {
             }
         }
         Ok(selected)
+    }
+
+    fn pin_account_recovery(
+        &self,
+        pin_key: &str,
+        pin_capacity: &str,
+        variant: Option<&str>,
+        available: &HashSet<String>,
+    ) -> Option<u64> {
+        if ![pin_key, pin_capacity]
+            .iter()
+            .any(|key| available.contains(*key) || self.runtime_unavailable.contains(*key))
+        {
+            return None;
+        }
+        let mut fact = self
+            .facts
+            .iter()
+            .find(|fact| fact_to_route(fact).route_key == pin_key)
+            .or_else(|| {
+                self.facts
+                    .iter()
+                    .find(|fact| fact_to_route(fact).capacity_key == pin_capacity)
+            })?
+            .clone();
+        if let Some(variant) = variant {
+            fact.variant = Some(variant.into());
+        }
+        let mut input = self.pass().input(available, self.snapshot.clone());
+        let keep_free = [
+            self.snapshot.by_route.get(pin_key),
+            self.snapshot.by_capacity.get(pin_capacity),
+        ]
+        .into_iter()
+        .flatten()
+        .find_map(|state| state.subscription_pool.as_ref())
+        .filter(|pool| !pool.available(pool.keep_free_percent, input.target_is_head))
+        .map_or(0.0, |pool| {
+            if input.target_is_head {
+                0.0
+            } else {
+                pool.keep_free_percent
+            }
+        });
+        let account_reset = self.classes.and_then(|classes| {
+            classes.recovery_reset_with_keep_free(
+                &fact.provider_id,
+                &fact.model_id,
+                self.priced_per_token,
+                keep_free,
+            )
+        });
+        let reset =
+            account_reset.or_else(|| self.account_blocks.get(pin_key).copied().flatten())?;
+        if account_reset.is_some() {
+            let snapshot = input.runtime_snapshot.as_mut()?;
+            for state in [
+                snapshot.by_route.get_mut(pin_key),
+                snapshot.by_capacity.get_mut(pin_capacity),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                // Only dated quota recovery from the permitted account class
+                // can lift a billing refusal here; permanent refusals remain.
+                if state
+                    .credential_refusal
+                    .as_ref()
+                    .is_some_and(|mark| mark.reason == "credential_billing_exhausted")
+                {
+                    state.credential_refusal = None;
+                }
+            }
+        }
+        input.facts = vec![fact];
+        input.available_models.insert(pin_key.into());
+        input.operator_exclude_keys.clear();
+        // A pin bypasses quality ranking, but its recovery must still pass hard
+        // admission. Narrowing to the pinned fact prevents an unrelated route's
+        // earlier reset from becoming a promise that this pin can be served.
+        input.requirements = ModelRequirements { iq: 0.0, eq: 0.0 };
+        input
+            .required_capabilities
+            .get_or_insert_with(Default::default)
+            .min_context
+            .get_or_insert(0.0);
+        let account_resets = HashMap::from([(pin_key.into(), reset as f64)]);
+        let (reset, _) = striatum_core::model_router::earliest_admissible_recovery(
+            &input,
+            &self.pass().routing_config(),
+            &[],
+            self.rejections,
+            &account_resets,
+        );
+        reset.map(|reset| reset as u64)
     }
 
     /// The first `prefer` entry, in list order, that would itself be an
