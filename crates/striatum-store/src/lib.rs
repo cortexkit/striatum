@@ -1130,6 +1130,7 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// The sqlite-backed route-state store. Opening acquires the single-writer lease
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
+    catalog_cache_identity: AtomicU64,
     store: evaluation_snapshot::ConnectionStore,
     maintenance: Option<Mutex<Connection>>,
     call_counts: call_counts::RoutingCallBuffer,
@@ -1170,9 +1171,22 @@ pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
 /// While both are unchanged, `model_facts` holds what it held when the
 /// fingerprint was computed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CatalogFingerprintKey {
+pub struct CatalogFingerprintKey {
+    store_identity: u64,
     facts_writes: i64,
     data_version: i64,
+}
+
+#[derive(Clone)]
+pub struct CatalogFactsSnapshot {
+    pub generation: CatalogFingerprintKey,
+    pub facts: Vec<ModelFact>,
+    pub providers: BTreeSet<String>,
+}
+
+fn next_catalog_cache_identity() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone)]
@@ -1188,6 +1202,7 @@ fn read_catalog_fingerprint_key(
     connection: &Connection,
 ) -> rusqlite::Result<CatalogFingerprintKey> {
     Ok(CatalogFingerprintKey {
+        store_identity: 0,
         facts_writes: connection.query_row(
             "SELECT writes FROM temp.catalog_facts_writes WHERE singleton = 1",
             [],
@@ -1351,6 +1366,97 @@ pub struct CanonicalGapRow {
 }
 
 impl SqliteRouteStateStore {
+    fn overlay_observed_speed(
+        &self,
+        facts: Vec<ModelFact>,
+        now: f64,
+        pricing: &striatum_core::RoutePricing,
+    ) -> RouteStateResult<Vec<ModelFact>> {
+        let ephemeral_vector = self.get_class_vector("ephemeral", now)?;
+        // Multiple catalog facts can resolve to the same prompt-default variant.
+        // Deduplicating here prevents repeated seeks without consulting usage for keys.
+        let observed_route_keys = facts
+            .iter()
+            .map(observed_route_key_for_fact)
+            .collect::<BTreeSet<_>>();
+        let observed_speeds = self.get_observed_speeds(&observed_route_keys, now)?;
+        // A route with too few samples has NO speed, which is not the same as being
+        // slow - but `scores.speed` carries 0.0 for both, and 0.0 is the worst value
+        // the tie-break can hold. That tie-break decides the whole effectively-free
+        // bucket, so an unmeasured route loses every comparison it enters, and
+        // winning one is the only way it is ever run and measured. A model could
+        // therefore never earn its own speed (live: 231 of 291 catalog rows sit at
+        // 0.0, among them routes with the best elo on their price tier).
+        //
+        // Standing in for the unknown with the MEDIAN of what is measured breaks the
+        // deadlock without inventing an advantage: a new route enters as ordinary
+        // rather than as worst, gets picked when its price and quality justify it,
+        // and replaces the stand-in with its own observation after the sample floor.
+        // Falling back to the catalog number first keeps a hand-seeded speed
+        // authoritative over a fleet median.
+        let median_observed_speed = median_of(observed_speeds.values().copied());
+        let mut overlaid = Vec::with_capacity(facts.len());
+        for mut fact in facts {
+            fact.class_vector = ephemeral_vector.clone();
+            fact.class_vector_is_overlay = ephemeral_vector.is_some();
+            let observed_route_key = observed_route_key_for_fact(&fact);
+            if let Some(speed) = observed_speeds.get(&observed_route_key) {
+                fact.scores.speed = *speed;
+            } else if fact.scores.speed <= 0.0 {
+                if let Some(median) = median_observed_speed {
+                    fact.scores.speed = median;
+                    fact.speed_is_fleet_median = true;
+                }
+            }
+            let route_key = striatum_core::make_route_key(
+                &fact.provider_id,
+                &fact.model_id,
+                fact.variant.as_deref(),
+            );
+            if let Some(multiplier) = pricing.speed_multiplier(&route_key) {
+                fact.scores.speed *= multiplier;
+                fact.speed_multiplier = Some(multiplier);
+            }
+            // Subscription subsidy is overlaid rather than persisted, so the
+            // objective can price the route at list ÷ multiplier.
+            if let Some(multiplier) = pricing.subscription_multiplier(&route_key) {
+                fact.subscription_multiplier = Some(multiplier);
+            }
+            overlaid.push(fact);
+        }
+        Ok(overlaid)
+    }
+
+    pub fn get_facts_with_observed_speed_and_generation(
+        &self,
+        now: f64,
+        pricing: &striatum_core::RoutePricing,
+    ) -> RouteStateResult<(CatalogFactsSnapshot, Vec<ModelFact>)> {
+        let snapshot = self.get_facts_with_generation()?;
+        let facts = self.overlay_observed_speed(snapshot.facts.clone(), now, pricing)?;
+        Ok((snapshot, facts))
+    }
+
+    /// Facts and the generation of exactly that view, in one writer acquisition.
+    /// The generation is meaningful only on the writer connection: it combines
+    /// a TEMP write counter with that connection's `data_version`. Moving facts
+    /// to the read pool must also give this key a new source.
+    pub fn get_facts_with_generation(&self) -> RouteStateResult<CatalogFactsSnapshot> {
+        let (generation, facts) = self.read_resolved_facts_with_generation()?;
+        let generation = generation.ok_or_else(|| err("catalog generation unavailable"))?;
+        let providers = facts
+            .iter()
+            .map(|(fact, _)| fact.provider_id.clone())
+            .collect();
+        Ok(CatalogFactsSnapshot {
+            generation,
+            providers,
+            facts: facts
+                .into_iter()
+                .filter_map(|(fact, present)| present.then_some(fact))
+                .collect(),
+        })
+    }
     /// Open from a resolved descriptor, applying migrations. The single-writer
     /// lease location is derived by the lib from the descriptor's db path (one
     /// lease per database, by construction), so there is no lease-dir to pass.
@@ -1579,6 +1685,7 @@ impl SqliteRouteStateStore {
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
             resolved_facts: Mutex::new(None),
+            catalog_cache_identity: AtomicU64::new(next_catalog_cache_identity()),
             #[cfg(any(test, feature = "test-support"))]
             account_write_transactions: AtomicU64::new(0),
         }
@@ -1794,7 +1901,15 @@ impl SqliteRouteStateStore {
     /// still NULL (an older row before its first full sync), or when `source` is
     /// an operator `override`. The bool carries that final routing decision.
     fn read_resolved_facts(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
+        self.read_resolved_facts_with_generation()
+            .map(|(_, facts)| facts)
+    }
+
+    fn read_resolved_facts_with_generation(
+        &self,
+    ) -> RouteStateResult<(Option<CatalogFingerprintKey>, Vec<(ModelFact, bool)>)> {
         self.store.with_conn(|c: &Connection| {
+            loop {
             // Never reuse or publish a transaction-local view. The TEMP counter
             // counts model-fact and operator-grade writes, including uncommitted
             // ones. Rollback restores that count; different later writes could
@@ -1810,7 +1925,9 @@ impl SqliteRouteStateStore {
             if cacheable {
                 let cache = self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some((_, facts)) = cache.as_ref().filter(|(cached, _)| Some(*cached) == key) {
-                    return Ok(facts.clone());
+                    let mut generation = key.unwrap();
+                    generation.store_identity = self.catalog_cache_identity.load(Ordering::Relaxed);
+                    return Ok((Some(generation), facts.clone()));
                 }
             }
             // Keep catalog rows and their operator-grade overlay in one SQLite
@@ -1843,10 +1960,18 @@ impl SqliteRouteStateStore {
         operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
         let facts: Vec<_> = facts.into_iter().zip(present).collect();
         if let Some(tx) = tx { crate::evaluation_snapshot::timed_commit(tx)?; }
+        if cacheable && read_catalog_fingerprint_key(c).ok() != key {
+            continue;
+        }
         if let Some(key) = key.filter(|_| cacheable) {
             *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
         }
-        Ok(facts)
+        let generation = key.map(|mut key| {
+            key.store_identity = if cacheable { self.catalog_cache_identity.load(Ordering::Relaxed) } else { next_catalog_cache_identity() };
+            key
+        });
+        return Ok((generation, facts));
+            }
         }).map_err(err)
     }
 
@@ -4909,60 +5034,7 @@ impl RouteStateStore for SqliteRouteStateStore {
         now: f64,
         pricing: &striatum_core::RoutePricing,
     ) -> RouteStateResult<Vec<ModelFact>> {
-        let facts = self.get_facts()?;
-        let ephemeral_vector = self.get_class_vector("ephemeral", now)?;
-        // Multiple catalog facts can resolve to the same prompt-default variant.
-        // Deduplicating here prevents repeated seeks without consulting usage for keys.
-        let observed_route_keys = facts
-            .iter()
-            .map(observed_route_key_for_fact)
-            .collect::<BTreeSet<_>>();
-        let observed_speeds = self.get_observed_speeds(&observed_route_keys, now)?;
-        // A route with too few samples has NO speed, which is not the same as being
-        // slow - but `scores.speed` carries 0.0 for both, and 0.0 is the worst value
-        // the tie-break can hold. That tie-break decides the whole effectively-free
-        // bucket, so an unmeasured route loses every comparison it enters, and
-        // winning one is the only way it is ever run and measured. A model could
-        // therefore never earn its own speed (live: 231 of 291 catalog rows sit at
-        // 0.0, among them routes with the best elo on their price tier).
-        //
-        // Standing in for the unknown with the MEDIAN of what is measured breaks the
-        // deadlock without inventing an advantage: a new route enters as ordinary
-        // rather than as worst, gets picked when its price and quality justify it,
-        // and replaces the stand-in with its own observation after the sample floor.
-        // Falling back to the catalog number first keeps a hand-seeded speed
-        // authoritative over a fleet median.
-        let median_observed_speed = median_of(observed_speeds.values().copied());
-        let mut overlaid = Vec::with_capacity(facts.len());
-        for mut fact in facts {
-            fact.class_vector = ephemeral_vector.clone();
-            fact.class_vector_is_overlay = ephemeral_vector.is_some();
-            let observed_route_key = observed_route_key_for_fact(&fact);
-            if let Some(speed) = observed_speeds.get(&observed_route_key) {
-                fact.scores.speed = *speed;
-            } else if fact.scores.speed <= 0.0 {
-                if let Some(median) = median_observed_speed {
-                    fact.scores.speed = median;
-                    fact.speed_is_fleet_median = true;
-                }
-            }
-            let route_key = striatum_core::make_route_key(
-                &fact.provider_id,
-                &fact.model_id,
-                fact.variant.as_deref(),
-            );
-            if let Some(multiplier) = pricing.speed_multiplier(&route_key) {
-                fact.scores.speed *= multiplier;
-                fact.speed_multiplier = Some(multiplier);
-            }
-            // Subscription subsidy is overlaid rather than persisted, so the
-            // objective can price the route at list ÷ multiplier.
-            if let Some(multiplier) = pricing.subscription_multiplier(&route_key) {
-                fact.subscription_multiplier = Some(multiplier);
-            }
-            overlaid.push(fact);
-        }
-        Ok(overlaid)
+        self.overlay_observed_speed(self.get_facts()?, now, pricing)
     }
 
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot> {

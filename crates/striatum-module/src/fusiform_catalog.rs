@@ -580,7 +580,7 @@ fn base_rates_after(
 }
 
 /// Published atomically by the catalog poller, read without I/O by selection.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PlaneCatalog {
     version: Option<i64>,
     base: BTreeMap<String, ModelRates>,

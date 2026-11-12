@@ -102,12 +102,13 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
                 .map(|(index, engine)| EngineCandidate::caller_local(index, engine)),
         );
     }
-    let mut accounts = crate::account_selection::ClassContext::read(
+    let mut accounts = crate::account_selection::ClassContext::read_with_catalog(
         deps.store,
         deps.broca_credentials,
         config.clone(),
         crate::ACCOUNT_QUOTA.get(),
         inputs.facts,
+        &inputs.catalog_snapshot,
         now as i64,
     )
     .map_err(store_refusal)?;

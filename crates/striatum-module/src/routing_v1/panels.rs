@@ -565,10 +565,11 @@ async fn candidates(
     };
     // A dry run reads accounts from its disposable snapshot and reserves no
     // probe, exactly as select's evaluation path does.
-    let mut priced = crate::select::price_selection_inputs_with_probes(
+    let mut priced = crate::select::price_selection_inputs_with_catalog(
         &mut prepared.facts,
         prepared.quota_signal_json.clone(),
         &sources,
+        Some(&prepared.catalog_snapshot),
         dry.map_or(deps.store, |dry| dry.account_store),
         deps.broca_credentials,
         true,

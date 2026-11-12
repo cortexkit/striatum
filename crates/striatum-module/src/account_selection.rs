@@ -173,6 +173,8 @@ impl Ctx<'_> {
 /// One immutable vault/config/catalog view shared by selection and allocation.
 #[derive(Clone)]
 pub(crate) struct ClassContext {
+    serving_index: std::sync::Arc<crate::serving_index::ServingIndex>,
+    indexes: RequestIndexes,
     // Clones share predicate-validated entries, never references into a clone's
     // credential vector. Every hit rechecks the resolver's effective inputs.
     class_memo: std::sync::Arc<std::sync::Mutex<ClassMemo>>,
@@ -214,12 +216,249 @@ struct ClassRowInputs {
 }
 
 struct ClassMemoEntry {
-    key: String,
     inputs: Vec<ClassRowInputs>,
     rows: Vec<usize>,
     subscription: bool,
     #[cfg(test)]
     misses: usize,
+}
+
+#[derive(Default)]
+struct RequestIndexes {
+    blocks: std::sync::OnceLock<BlockIndex>,
+    readings: std::sync::OnceLock<ReadingIndex>,
+    rechecks: std::sync::OnceLock<RecheckIndex>,
+}
+
+#[cfg(test)]
+static INDEX_BUILDS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(test)]
+pub(crate) fn take_index_build_counts() -> [u64; 3] {
+    std::array::from_fn(|index| INDEX_BUILDS[index].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+#[cfg(test)]
+fn count_index_build(index: usize) {
+    INDEX_BUILDS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl Clone for RequestIndexes {
+    fn clone(&self) -> Self {
+        // Clones share the structural ServingIndex, but not the dynamic cells:
+        // each clone can reserve a different probe and read newer refusal and
+        // fence evidence without changing the original context's answers.
+        Self::default()
+    }
+}
+
+#[derive(Default)]
+struct BlockIndex {
+    eligibility: BTreeMap<(String, String), Vec<usize>>,
+    refusals: BTreeSet<(String, String)>,
+}
+
+struct ReadingRecord {
+    reading: account_quota::StoredReading,
+    decoded: Option<AccountEntry>,
+    fetched: Option<i64>,
+}
+
+#[derive(Default)]
+struct ReadingIndex {
+    accounts: BTreeMap<String, Vec<ReadingRecord>>,
+    quota_signal: BTreeSet<String>,
+}
+
+type RecheckScopes =
+    BTreeMap<String, BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<usize>>>>>;
+type DueKey = (usize, String, String, i64, Option<String>, usize);
+
+#[derive(Default)]
+struct RecheckIndex {
+    scopes: RecheckScopes,
+    due: std::sync::Mutex<std::collections::HashMap<DueKey, bool>>,
+}
+
+impl ClassContext {
+    fn replace_rechecks(&mut self, rechecks: Vec<striatum_store::FenceRecheck>) {
+        self.rechecks = rechecks;
+        self.indexes.rechecks.take();
+    }
+
+    fn replace_fences(&mut self, fences: BTreeMap<String, Vec<Fence>>) {
+        self.fences = fences;
+        self.indexes.rechecks.take();
+    }
+
+    fn replace_refusals(
+        &mut self,
+        refusals: Vec<striatum_core::route_state_store::CredentialEntitlementFence>,
+    ) {
+        self.refusals = refusals;
+        self.indexes.blocks.take();
+    }
+
+    fn block_index(&self) -> &BlockIndex {
+        self.indexes.blocks.get_or_init(|| {
+            #[cfg(test)]
+            count_index_build(0);
+            let mut index = BlockIndex::default();
+            for (i, fact) in self.eligibility.iter().enumerate() {
+                index
+                    .eligibility
+                    .entry((fact.provider.clone(), fact.credential_id.clone()))
+                    .or_default()
+                    .push(i);
+            }
+            index.refusals.extend(
+                self.refusals
+                    .iter()
+                    .map(|f| (f.provider_id.clone(), f.credential_id.clone())),
+            );
+            index
+        })
+    }
+
+    fn reading_index(&self) -> &ReadingIndex {
+        self.indexes.readings.get_or_init(|| {
+            #[cfg(test)]
+            count_index_build(1);
+            let mut index = ReadingIndex::default();
+            for reading in self
+                .quota
+                .readings
+                .readings
+                .values()
+                .filter(|r| r.tombstoned_at_ms.is_none())
+            {
+                let decoded: Option<AccountEntry> =
+                    serde_json::from_value(reading.entry.clone()).ok();
+                let fetched = reading
+                    .entry
+                    .get("fetchedAt")
+                    .and_then(Value::as_str)
+                    .and_then(account_quota::parse_rfc3339_ms);
+                index
+                    .accounts
+                    .entry(reading.account_id.clone())
+                    .or_default()
+                    .push(ReadingRecord {
+                        reading: reading.clone(),
+                        decoded,
+                        fetched,
+                    });
+            }
+            index.quota_signal.extend(
+                index
+                    .accounts
+                    .keys()
+                    .filter(|account| {
+                        crate::credential_fences::has_quota_signal_for_account(&self.quota, account)
+                    })
+                    .cloned(),
+            );
+            index
+        })
+    }
+
+    fn indexed_origins<'a>(
+        &'a self,
+        provider: &str,
+        account: &str,
+        credential: &str,
+        model: &str,
+    ) -> impl Iterator<Item = &'a striatum_store::FenceRecheck> {
+        let index = self.indexes.rechecks.get_or_init(|| {
+            #[cfg(test)]
+            count_index_build(2);
+            let mut index = RecheckIndex::default();
+            for (i, origin) in self.rechecks.iter().enumerate() {
+                let mapped = origin
+                    .credential_id
+                    .as_deref()
+                    .filter(|_| {
+                        origin.quota
+                            || matches!(
+                                origin.kind.as_str(),
+                                "account_route" | "non_quota_route" | "transient_route"
+                            )
+                    })
+                    .and_then(|id| {
+                        crate::credential_fences::credential_account_id(&self.account_ids, id)
+                    });
+                let (account, credential) = if let Some(account) = mapped {
+                    (account, String::new())
+                } else {
+                    (
+                        origin.account_id.clone().unwrap_or_default(),
+                        origin.credential_id.clone().unwrap_or_default(),
+                    )
+                };
+                index
+                    .scopes
+                    .entry(origin.provider.clone())
+                    .or_default()
+                    .entry(account)
+                    .or_default()
+                    .entry(credential)
+                    .or_default()
+                    .entry(origin.model.clone().unwrap_or_default())
+                    .or_default()
+                    .push(i);
+            }
+            index
+        });
+        let mut positions = Vec::new();
+        for p in std::iter::once("").chain((!provider.is_empty()).then_some(provider)) {
+            let Some(accounts) = index.scopes.get(p) else {
+                continue;
+            };
+            for a in std::iter::once("").chain((!account.is_empty()).then_some(account)) {
+                let Some(credentials) = accounts.get(a) else {
+                    continue;
+                };
+                for c in std::iter::once("").chain((!credential.is_empty()).then_some(credential)) {
+                    let Some(models) = credentials.get(c) else {
+                        continue;
+                    };
+                    for m in std::iter::once("").chain((!model.is_empty()).then_some(model)) {
+                        if let Some(rows) = models.get(m) {
+                            positions.extend(rows.iter().copied());
+                        }
+                    }
+                }
+            }
+        }
+        positions.into_iter().map(|i| &self.rechecks[i])
+    }
+
+    fn indexed_origin_due(
+        &self,
+        origin: &striatum_store::FenceRecheck,
+        account: &str,
+        model: &str,
+    ) -> bool {
+        let key = (
+            origin as *const _ as usize,
+            account.to_owned(),
+            model.to_owned(),
+            self.now_ms,
+            self.probe_owner.clone(),
+            std::sync::Arc::as_ptr(&self.config) as usize,
+        );
+        let mut due = self
+            .indexes
+            .rechecks
+            .get()
+            .expect("origins indexed before due lookup")
+            .due
+            .lock()
+            .unwrap();
+        *due.entry(key)
+            .or_insert_with(|| self.origin_due(origin, account, model))
+    }
 }
 
 mod probe_reservations;
@@ -663,9 +902,18 @@ impl ClassContext {
         accounts: Option<&SharedAccountQuota>,
         now_ms: i64,
     ) -> Result<Self, String> {
-        use striatum_core::RouteStateStore;
-        let facts = store.get_facts().map_err(|error| error.to_string())?;
-        Self::read(store, credentials, config, accounts, facts, now_ms)
+        let snapshot = store
+            .get_facts_with_generation()
+            .map_err(|error| error.to_string())?;
+        Self::read_with_catalog(
+            store,
+            credentials,
+            config,
+            accounts,
+            snapshot.facts.clone(),
+            &snapshot,
+            now_ms,
+        )
     }
 
     pub(crate) fn read(
@@ -673,7 +921,30 @@ impl ClassContext {
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
         config: std::sync::Arc<crate::config_overrides::LiveConfig>,
         accounts: Option<&SharedAccountQuota>,
+        facts: Vec<striatum_core::ModelFact>,
+        now_ms: i64,
+    ) -> Result<Self, String> {
+        let snapshot = store
+            .get_facts_with_generation()
+            .map_err(|error| error.to_string())?;
+        Self::read_with_catalog(
+            store,
+            credentials,
+            config,
+            accounts,
+            facts,
+            &snapshot,
+            now_ms,
+        )
+    }
+
+    pub(crate) fn read_with_catalog(
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+        config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+        accounts: Option<&SharedAccountQuota>,
         mut facts: Vec<striatum_core::ModelFact>,
+        catalog_snapshot: &striatum_store::CatalogFactsSnapshot,
         now_ms: i64,
     ) -> Result<Self, String> {
         #[cfg(test)]
@@ -942,6 +1213,12 @@ impl ClassContext {
             .map_err(|error| error.to_string())?;
         let rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
         let mut context = Self {
+            serving_index: crate::serving_index::ServingIndex::get(
+                &config,
+                &credentials,
+                catalog_snapshot,
+            ),
+            indexes: Default::default(),
             class_memo: Default::default(),
             rechecks,
             account_ids,
@@ -988,13 +1265,15 @@ impl ClassContext {
                     for id in &recovered {
                         tx.clear_fence(id, now_ms, "fresh_headroom")?;
                     }
-                    for (provider, fences) in &mut context.fences {
+                    let mut fences = context.fences.clone();
+                    for (provider, fences) in &mut fences {
                         *fences = load_fences(tx, provider)?;
                     }
+                    context.replace_fences(fences);
                     Ok(())
                 })
                 .map_err(|error| error.to_string())?;
-            context.rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
+            context.replace_rechecks(store.fence_rechecks().map_err(|error| error.to_string())?);
         }
         Ok(context)
     }
@@ -1021,7 +1300,7 @@ impl ClassContext {
         // A direct admission can claim a probe between the first store read
         // and reservation. Read after taking the hold so its renewed fence
         // cannot remain probe-eligible in this scoring snapshot.
-        self.refusals = refresh_credential_quota_holds(
+        self.replace_refusals(refresh_credential_quota_holds(
             store,
             &self.account_ids,
             &self.quota,
@@ -1029,8 +1308,8 @@ impl ClassContext {
             crate::credential_fences::live(store, credentials)?,
             &self.route_fences,
             self.now_ms,
-        )?;
-        self.rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
+        )?);
+        self.replace_rechecks(store.fence_rechecks().map_err(|error| error.to_string())?);
         Ok(())
     }
 
@@ -1063,125 +1342,113 @@ impl ClassContext {
         fact: &striatum_core::ModelFact,
         priced_per_token: bool,
     ) -> RouteClass<'_> {
-        let specs = &self.config.compiled_routing_policy().subscription;
-        let mut restricted = std::borrow::Cow::Borrowed(fact);
-        if let Some(credential) = &self.continuation_credential {
-            let method = self.method(credential);
-            restricted.to_mut().auth_methods = Some(
-                if method != "unknown"
-                    && fact
-                        .auth_methods
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.iter().any(|allowed| allowed == method))
-                {
-                    vec![method.into()]
-                } else {
-                    Vec::new()
-                },
-            );
-        }
-        let fact = restricted.as_ref();
         let rows = self.credentials.listed_credentials();
-        let borrowed = self.targets.contains_key(&fact.provider_id);
+        let entry = self.serving_index.fact(
+            &self.config,
+            &self.credentials,
+            fact,
+            &self.catalog,
+            &self.targets,
+        );
+        let continuation = self
+            .continuation_credential
+            .as_deref()
+            .map(|id| self.method(id));
+        let allowed = |index: usize| {
+            continuation.is_none_or(|method| {
+                method != "unknown" && rows[index].auth_method.as_deref() == Some(method)
+            })
+        };
+        let serving: Vec<_> = entry
+            .selection
+            .iter()
+            .filter(|row| allowed(row.index))
+            .collect();
         let fallback = self.config.metered_fallback(&fact.provider_id);
+        let usable = |row: &crate::serving_index::ServingRow| {
+            if !self.eligible(&rows[row.index], fact) {
+                return false;
+            }
+            let siblings = serving
+                .iter()
+                .filter(|other| other.covered == row.covered)
+                .map(|other| &rows[other.index])
+                .filter(|other| self.eligible(other, fact))
+                .map(|other| self.view(other, fact))
+                .collect();
+            matches!(
+                striatum_core::accounts::decide_with_context(
+                    &synthetic_request(&fact.provider_id, &fact.model_id, "class-preflight".into()),
+                    &AllocatorState {
+                        roster: Some(self.roster(siblings)), affinity: None,
+                        fences: self.probe_fences(&fact.provider_id, &fact.model_id, self.fences.get(&fact.provider_id).cloned().unwrap_or_default()),
+                        principal_exclusions: Vec::new(), admissions: Vec::new(), operator_override: None,
+                        policy: self.config.allocator_policy_ref(&fact.provider_id).clone(),
+                    }, self.now_ms, &self.allocation_context(&fact.provider_id, &fact.model_id),
+                ).outcome,
+                Outcome::Admit(admission) if admission.account_id == self.account_id(&rows[row.index])
+            )
+        };
+        let mut inputs: Vec<_> = rows
+            .iter()
+            .map(|row| ClassRowInputs {
+                serving: self.media_route && media_credential_serves(row, &fact.provider_id),
+                covered: false,
+                metered: false,
+                usable: false,
+            })
+            .collect();
+        if !self.media_route {
+            for row in &serving {
+                inputs[row.index] = ClassRowInputs {
+                    serving: true,
+                    covered: row.covered,
+                    metered: row.metered,
+                    usable: fallback && usable(row),
+                };
+            }
+        }
         let slot = usize::from(priced_per_token) + 2 * usize::from(self.media_route);
         let mut memo = self.class_memo.lock().unwrap();
         let cached = memo
             .get(fact.provider_id.as_str())
             .and_then(|models| models.get(fact.model_id.as_str()))
             .and_then(|slots| slots[slot].as_ref());
-        let new_key;
-        let key = match cached {
-            Some(entry) => entry.key.as_str(),
-            None => {
-                new_key = format!("{}/{}", fact.provider_id, fact.model_id);
-                &new_key
-            }
-        };
-        let coverage = (!self.media_route && !borrowed)
-            .then(|| specs.override_for(key))
-            .flatten();
-        // Check current usability inputs directly: quota, probes, tiers and
-        // continuation restrictions can all change usability.
-        // No temporary key or predicate vector is allocated on a memo hit.
-        let inputs = |row: &cortexkit_claustrum_client::ListedCredential| {
-            let serving = if self.media_route {
-                media_credential_serves(row, &fact.provider_id)
-            } else {
-                crate::broca_credentials::credential_serves_fact(
-                    row,
-                    fact,
-                    &self.catalog,
-                    &self.credentials,
-                )
-            };
-            ClassRowInputs {
-                serving,
-                covered: !self.media_route
-                    && !borrowed
-                    && coverage.unwrap_or(row.credential_type == "oauth"),
-                metered: row
-                    .auth_method
-                    .as_deref()
-                    .is_some_and(striatum_core::billing::is_api_metered_auth_method),
-                usable: !self.media_route && fallback && serving && self.usable(row, fact),
-            }
-        };
-        if let Some(entry) = cached.filter(|entry| {
-            entry.inputs.len() == rows.len()
-                && rows
-                    .iter()
-                    .zip(&entry.inputs)
-                    .all(|(row, expected)| inputs(row) == *expected)
-        }) {
+        if let Some(entry) = cached.filter(|entry| entry.inputs == inputs) {
             return RouteClass {
-                rows: entry.rows.iter().map(|&index| &rows[index]).collect(),
+                rows: entry.rows.iter().map(|&i| &rows[i]).collect(),
                 subscription: entry.subscription,
             };
         }
-        let row_inputs: Vec<_> = rows.iter().map(inputs).collect();
-        let resolved = if self.media_route {
-            RouteClass {
-                rows: rows
+        let can_fallback = fallback
+            && inputs
+                .iter()
+                .any(|row| row.serving && !row.covered && row.usable);
+        let subscription = !self.media_route
+            && !priced_per_token
+            && inputs.iter().any(|row| row.serving && row.covered)
+            && (!can_fallback
+                || inputs
                     .iter()
-                    .zip(&row_inputs)
-                    .filter(|(_, input)| input.serving)
-                    .map(|(row, _)| row)
-                    .collect(),
-                subscription: false,
-            }
-        } else {
-            resolve_class(
-                rows,
-                fact,
-                &self.catalog,
-                &self.credentials,
-                specs,
-                borrowed,
-                priced_per_token,
-                fallback,
-                |row| {
-                    row_inputs[rows
-                        .iter()
-                        .position(|candidate| std::ptr::eq(candidate, row))
-                        .unwrap()]
-                    .usable
-                },
-            )
+                    .any(|row| row.serving && row.covered && row.usable));
+        let indices: Vec<_> = inputs
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                row.serving
+                    && (self.media_route
+                        || (row.covered == subscription && (!priced_per_token || row.metered)))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let resolved = RouteClass {
+            rows: indices.iter().map(|&i| &rows[i]).collect(),
+            subscription,
         };
         let entry = ClassMemoEntry {
-            key: key.to_owned(),
-            inputs: row_inputs,
-            rows: resolved
-                .rows
-                .iter()
-                .map(|row| {
-                    rows.iter()
-                        .position(|candidate| std::ptr::eq(candidate, *row))
-                        .unwrap()
-                })
-                .collect(),
-            subscription: resolved.subscription,
+            inputs,
+            rows: indices,
+            subscription,
             #[cfg(test)]
             misses: cached.map_or(1, |entry| entry.misses + 1),
         };
@@ -1205,31 +1472,24 @@ impl ClassContext {
         let capacity = format!("{}/{}", fact.provider_id, fact.model_id);
         let model_pools = self.config.quota_model_pools();
         let reading = self
-            .quota
-            .readings
-            .readings
-            .values()
+            .reading_index()
+            .accounts
+            .get(&account_id)
+            .into_iter()
+            .flatten()
             .filter(|reading| {
-                reading.account_id == account_id
-                    && reading.tombstoned_at_ms.is_none()
-                    && reading.routing_provider().is_some_and(|vendor| {
-                        vendor == fact.provider_id
-                            || self
-                                .targets
-                                .get(&fact.provider_id)
-                                .is_some_and(|target| target == vendor)
-                    })
+                reading.reading.routing_provider().is_some_and(|vendor| {
+                    vendor == fact.provider_id
+                        || self
+                            .targets
+                            .get(&fact.provider_id)
+                            .is_some_and(|target| target == vendor)
+                })
             })
-            .max_by_key(|reading| {
-                reading
-                    .entry
-                    .get("fetchedAt")
-                    .and_then(Value::as_str)
-                    .and_then(account_quota::parse_rfc3339_ms)
-            });
+            .max_by_key(|reading| reading.fetched);
         let usage = reading
-            .and_then(|reading| serde_json::from_value::<AccountEntry>(reading.entry.clone()).ok())
-            .and_then(|entry| entry.usage);
+            .and_then(|reading| reading.decoded.as_ref())
+            .and_then(|entry| entry.usage.as_ref());
         let pooled = usage
             .as_ref()
             .and_then(|usage| usage.extra_rate_windows.as_ref())
@@ -1267,25 +1527,25 @@ impl ClassContext {
             model_reach,
             quota: reading
                 .filter(|_| {
-                    !self.rechecks.iter().any(|origin| {
-                        origin.quota
-                            && self.origin_applies(
-                                origin,
-                                &fact.provider_id,
-                                &account_id,
-                                &row.id,
-                                &fact.model_id,
-                            )
-                            && self.origin_due(origin, &account_id, &fact.model_id)
-                    })
+                    !self
+                        .indexed_origins(&fact.provider_id, &account_id, &row.id, &fact.model_id)
+                        .any(|origin| {
+                            origin.quota
+                                && self.origin_applies(
+                                    origin,
+                                    &fact.provider_id,
+                                    &account_id,
+                                    &row.id,
+                                    &fact.model_id,
+                                )
+                                && self.indexed_origin_due(origin, &account_id, &fact.model_id)
+                        })
                 })
-                .filter(|_| {
-                    crate::credential_fences::has_quota_signal_for_account(&self.quota, &account_id)
-                })
+                .filter(|_| self.reading_index().quota_signal.contains(&account_id))
                 .and_then(|reading| {
-                    quota_reading_for_model(
-                        &reading.entry,
-                        &reading.account_id,
+                    quota_reading_from_entry(
+                        reading.decoded.as_ref()?,
+                        &reading.reading.account_id,
                         Some(&capacity),
                         &model_pools,
                     )
@@ -1301,62 +1561,72 @@ impl ClassContext {
         // Keep account quota in the allocator's roster, not its entitlement
         // filter. A scheduled probe temporarily bypasses that quota restriction;
         // admission must still claim the attempt before sending.
-        !self.rechecks.iter().any(|origin| {
-            !matches!(
-                origin.kind.as_str(),
-                "account"
-                    | "account_route"
-                    | "non_quota_route"
-                    | "transient_route"
-                    | "observation"
-                    | "route"
-                    | "provider"
-                    | "failure"
-            ) && self.origin_applies(
-                origin,
+        !self
+            .indexed_origins(
                 &fact.provider_id,
                 self.account_id(row),
                 &row.id,
                 &fact.model_id,
-            ) && !self.origin_due(
-                origin,
-                self.account_id(row),
-                &fact.model_id,
             )
-        }) && (!self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
-            || probe_reservations::blocked_until(
-                &self.probe_scope,
-                &fact.provider_id,
-                &row.id,
-                self.probe_owner.as_deref(),
-                self.now_ms,
-            )
-            .is_none())
+            .any(|origin| {
+                !matches!(
+                    origin.kind.as_str(),
+                    "account"
+                        | "account_route"
+                        | "non_quota_route"
+                        | "transient_route"
+                        | "observation"
+                        | "route"
+                        | "provider"
+                        | "failure"
+                ) && self.origin_applies(
+                    origin,
+                    &fact.provider_id,
+                    self.account_id(row),
+                    &row.id,
+                    &fact.model_id,
+                ) && !self.indexed_origin_due(origin, self.account_id(row), &fact.model_id)
+            })
+            && (!self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
+                || probe_reservations::blocked_until(
+                    &self.probe_scope,
+                    &fact.provider_id,
+                    &row.id,
+                    self.probe_owner.as_deref(),
+                    self.now_ms,
+                )
+                .is_none())
             && self.tier_accounts.as_ref().is_none_or(|accounts| {
                 accounts
                     .get(&format!("{}/{}", fact.provider_id, fact.model_id))
                     .is_some_and(|ids| ids.contains(&row.id))
             })
-            && !self.eligibility.iter().any(|fact_| {
-                fact_.provider == fact.provider_id
-                    && fact_.credential_id == row.id
-                    && (fact_.model.is_empty() || fact_.model == fact.model_id)
-            })
-            && !self.refusals.iter().any(|fence| {
-                fence.provider_id == fact.provider_id
-                    && fence.credential_id == row.id
-                    && !self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
-            })
+            && !self
+                .block_index()
+                .eligibility
+                .get(&(fact.provider_id.clone(), row.id.clone()))
+                .into_iter()
+                .flatten()
+                .any(|&i| {
+                    let fact_ = &self.eligibility[i];
+                    fact_.model.is_empty() || fact_.model == fact.model_id
+                })
+            && (!self
+                .block_index()
+                .refusals
+                .contains(&(fact.provider_id.clone(), row.id.clone()))
+                || self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id))
     }
 
     fn probe_eligible(&self, provider: &str, model: &str, credential: &str) -> bool {
         let account =
             crate::credential_fences::credential_account_id(&self.account_ids, credential)
                 .unwrap_or_else(|| credential.into());
-        self.rechecks.iter().any(|origin| {
-            self.origin_applies(origin, provider, &account, credential, model)
-                && self.origin_due(origin, &account, model)
-        })
+        self.indexed_origins(provider, &account, credential, model)
+            .any(|origin| {
+                self.origin_applies(origin, provider, &account, credential, model)
+                    && self.indexed_origin_due(origin, &account, model)
+            })
     }
 
     fn origin_applies(
@@ -2245,15 +2515,11 @@ impl ClassContext {
     ) -> striatum_core::accounts::AllocationContext {
         let mut context = striatum_core::accounts::AllocationContext::default();
         for row in self.credentials.listed_credentials().iter().filter(|row| {
-            self.rechecks.iter().any(|origin| {
-                self.origin_applies(
-                    origin,
-                    provider,
-                    self.account_id(row),
-                    &row.id,
-                    model,
-                ) && self.origin_due(origin, self.account_id(row), model)
-            })
+            self.indexed_origins(provider, self.account_id(row), &row.id, model)
+                .any(|origin| {
+                    self.origin_applies(origin, provider, self.account_id(row), &row.id, model)
+                        && self.indexed_origin_due(origin, self.account_id(row), model)
+                })
         }) {
             context.credential_probe_notes.insert(
                 row.id.clone(),
@@ -2265,27 +2531,28 @@ impl ClassContext {
             .iter()
             .find(|fact| fact.provider_id == provider && fact.model_id == model);
         if let Some(fact) = class {
-            for row in self.credentials.listed_credentials().iter().filter(|row| {
-                crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog, &self.credentials)
-            }) {
+            let serving = self.serving_index.fact(
+                &self.config,
+                &self.credentials,
+                fact,
+                &self.catalog,
+                &self.targets,
+            );
+            for row in serving
+                .selection
+                .iter()
+                .map(|row| &self.credentials.listed_credentials()[row.index])
+            {
                 let account = self.account_id(row);
                 if let Some(reading) = self
-                    .quota
-                    .readings
-                    .readings
-                    .values()
-                    .filter(|reading| {
-                        reading.account_id == account && reading.tombstoned_at_ms.is_none()
-                    })
-                    .max_by_key(|reading| {
-                        reading
-                            .entry
-                            .get("fetchedAt")
-                            .and_then(Value::as_str)
-                            .and_then(account_quota::parse_rfc3339_ms)
-                    })
+                    .reading_index()
+                    .accounts
+                    .get(account)
+                    .into_iter()
+                    .flatten()
+                    .max_by_key(|reading| reading.fetched)
                 {
-                    add_spend_inputs(&mut context, account, &reading.entry);
+                    add_spend_inputs(&mut context, account, &reading.reading.entry);
                 }
             }
         }
@@ -7094,6 +7361,600 @@ pub fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+mod serving_index_tests {
+    use super::*;
+    use crate::routing_v1::{request_cpu_bench as bench, runners::Registry};
+    use striatum_core::route_state_store::RouteStateStore;
+
+    // These linear readers intentionally do not use any request-local indexes.
+    // They preserve the exemption that lets a blocked credential run its due
+    // recovery probe, as well as the other pre-index predicates.
+    fn old_probe(c: &ClassContext, provider: &str, model: &str, credential: &str) -> bool {
+        let account = crate::credential_fences::credential_account_id(&c.account_ids, credential)
+            .unwrap_or_else(|| credential.into());
+        c.rechecks.iter().any(|o| {
+            c.origin_applies(o, provider, &account, credential, model)
+                && c.origin_due(o, &account, model)
+        })
+    }
+
+    fn old_eligible(
+        c: &ClassContext,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        f: &striatum_core::ModelFact,
+    ) -> bool {
+        !c.rechecks.iter().any(|o| {
+            !matches!(
+                o.kind.as_str(),
+                "account"
+                    | "account_route"
+                    | "non_quota_route"
+                    | "transient_route"
+                    | "observation"
+                    | "route"
+                    | "provider"
+                    | "failure"
+            ) && c.origin_applies(o, &f.provider_id, c.account_id(row), &row.id, &f.model_id)
+                && !c.origin_due(o, c.account_id(row), &f.model_id)
+        }) && (!old_probe(c, &f.provider_id, &f.model_id, &row.id)
+            || probe_reservations::blocked_until(
+                &c.probe_scope,
+                &f.provider_id,
+                &row.id,
+                c.probe_owner.as_deref(),
+                c.now_ms,
+            )
+            .is_none())
+            && c.tier_accounts.as_ref().is_none_or(|a| {
+                a.get(&format!("{}/{}", f.provider_id, f.model_id))
+                    .is_some_and(|ids| ids.contains(&row.id))
+            })
+            && !c.eligibility.iter().any(|e| {
+                e.provider == f.provider_id
+                    && e.credential_id == row.id
+                    && (e.model.is_empty() || e.model == f.model_id)
+            })
+            && !c.refusals.iter().any(|e| {
+                e.provider_id == f.provider_id
+                    && e.credential_id == row.id
+                    && !old_probe(c, &f.provider_id, &f.model_id, &row.id)
+            })
+    }
+
+    fn old_view(
+        c: &ClassContext,
+        row: &cortexkit_claustrum_client::ListedCredential,
+        f: &striatum_core::ModelFact,
+    ) -> AccountView {
+        let account = c.account_id(row);
+        let capacity = format!("{}/{}", f.provider_id, f.model_id);
+        let pools = c.config.quota_model_pools();
+        let reading = c
+            .quota
+            .readings
+            .readings
+            .values()
+            .filter(|r| {
+                r.account_id == account
+                    && r.tombstoned_at_ms.is_none()
+                    && r.routing_provider().is_some_and(|p| {
+                        p == f.provider_id || c.targets.get(&f.provider_id).is_some_and(|t| t == p)
+                    })
+            })
+            .max_by_key(|r| {
+                r.entry
+                    .get("fetchedAt")
+                    .and_then(Value::as_str)
+                    .and_then(account_quota::parse_rfc3339_ms)
+            });
+        let usage = reading
+            .and_then(|r| serde_json::from_value::<AccountEntry>(r.entry.clone()).ok())
+            .and_then(|e| e.usage);
+        let pooled = usage
+            .as_ref()
+            .and_then(|u| u.extra_rate_windows.as_ref())
+            .into_iter()
+            .flatten()
+            .any(striatum_core::quota_extract::is_account_pool_window);
+        let model_reach = if pooled {
+            ModelReach::Only(
+                usage
+                    .as_ref()
+                    .filter(|u| {
+                        !striatum_core::quota_extract::account_rate_windows(
+                            u,
+                            Some(&capacity),
+                            &pools,
+                        )
+                        .is_empty()
+                    })
+                    .map(|_| f.model_id.clone())
+                    .into_iter()
+                    .collect(),
+            )
+        } else {
+            ModelReach::All
+        };
+        AccountView {
+            account_id: account.into(),
+            routing_provider: f.provider_id.clone(),
+            refresh_adapter: row.refresh_adapter.clone().unwrap_or_default(),
+            credentials: vec![CredentialRecord {
+                credential_id: row.id.clone(),
+                default_record: is_default_record(&row.id),
+                needs_reauth: false,
+            }],
+            model_reach,
+            quota: reading
+                .filter(|_| {
+                    !c.rechecks.iter().any(|o| {
+                        o.quota
+                            && c.origin_applies(o, &f.provider_id, account, &row.id, &f.model_id)
+                            && c.origin_due(o, account, &f.model_id)
+                    })
+                })
+                .filter(|_| {
+                    crate::credential_fences::has_quota_signal_for_account(&c.quota, account)
+                })
+                .and_then(|r| quota_reading_for_model(&r.entry, account, Some(&capacity), &pools)),
+        }
+    }
+
+    fn old_allocation(
+        c: &ClassContext,
+        provider: &str,
+        model: &str,
+    ) -> striatum_core::accounts::AllocationContext {
+        let mut result = striatum_core::accounts::AllocationContext::default();
+        for row in c.credentials.listed_credentials() {
+            if c.rechecks.iter().any(|o| {
+                c.origin_applies(o, provider, c.account_id(row), &row.id, model)
+                    && c.origin_due(o, c.account_id(row), model)
+            }) {
+                result.credential_probe_notes.insert(
+                    row.id.clone(),
+                    crate::credential_fences::probe_note(provider, &row.id),
+                );
+            }
+        }
+        if let Some(fact) = c
+            .facts
+            .iter()
+            .find(|f| f.provider_id == provider && f.model_id == model)
+        {
+            for row in c.credentials.listed_credentials().iter().filter(|r| {
+                crate::broca_credentials::credential_serves_fact(
+                    r,
+                    fact,
+                    &c.catalog,
+                    &c.credentials,
+                )
+            }) {
+                let account = c.account_id(row);
+                if let Some(reading) = c
+                    .quota
+                    .readings
+                    .readings
+                    .values()
+                    .filter(|r| r.account_id == account && r.tombstoned_at_ms.is_none())
+                    .max_by_key(|r| {
+                        r.entry
+                            .get("fetchedAt")
+                            .and_then(Value::as_str)
+                            .and_then(account_quota::parse_rfc3339_ms)
+                    })
+                {
+                    add_spend_inputs(&mut result, account, &reading.entry);
+                }
+            }
+        }
+        result
+    }
+
+    fn old_class<'a>(
+        c: &'a ClassContext,
+        fact: &striatum_core::ModelFact,
+        priced: bool,
+    ) -> RouteClass<'a> {
+        let mut f = fact.clone();
+        if let Some(id) = &c.continuation_credential {
+            let method = c.method(id);
+            f.auth_methods = Some(
+                if method != "unknown"
+                    && fact
+                        .auth_methods
+                        .as_ref()
+                        .is_none_or(|a| a.iter().any(|m| m == method))
+                {
+                    vec![method.into()]
+                } else {
+                    Vec::new()
+                },
+            );
+        }
+        let specs = striatum_core::provider_model_spec::parse_spec_list(
+            &c.config.operator_policy_ref().subscription,
+        );
+        resolve_class(
+            c.credentials.listed_credentials(),
+            &f,
+            &c.catalog,
+            &c.credentials,
+            &specs,
+            c.targets.contains_key(&f.provider_id),
+            priced,
+            c.config.metered_fallback(&f.provider_id),
+            |row| {
+                if !old_eligible(c, row, &f) {
+                    return false;
+                }
+                let key = format!("{}/{}", f.provider_id, f.model_id);
+                let covered = |r: &cortexkit_claustrum_client::ListedCredential| {
+                    !c.targets.contains_key(&f.provider_id)
+                        && striatum_core::provider_model_spec::resolve_spec(
+                            &specs,
+                            &key,
+                            r.credential_type == "oauth",
+                        )
+                };
+                let siblings = c
+                    .credentials
+                    .listed_credentials()
+                    .iter()
+                    .filter(|r| {
+                        covered(r) == covered(row)
+                            && old_eligible(c, r, &f)
+                            && crate::broca_credentials::credential_serves_fact(
+                                r,
+                                &f,
+                                &c.catalog,
+                                &c.credentials,
+                            )
+                    })
+                    .map(|r| old_view(c, r, &f))
+                    .collect();
+                matches!(striatum_core::accounts::decide_with_context(&synthetic_request(&f.provider_id, &f.model_id, "class-preflight".into()), &AllocatorState {
+                roster: Some(c.roster(siblings)), affinity: None,
+                fences: c.probe_fences(&f.provider_id, &f.model_id, c.fences.get(&f.provider_id).cloned().unwrap_or_default()),
+                principal_exclusions: Vec::new(), admissions: Vec::new(), operator_override: None, policy: c.config.allocator_policy_ref(&f.provider_id).clone(),
+            }, c.now_ms, &old_allocation(c, &f.provider_id, &f.model_id)).outcome, Outcome::Admit(a) if a.account_id == c.account_id(row))
+            },
+        )
+    }
+
+    fn answer(class: RouteClass<'_>) -> (bool, Vec<String>) {
+        (
+            class.subscription,
+            class.rows.into_iter().map(|r| r.id.clone()).collect(),
+        )
+    }
+
+    fn context(f: &bench::RequestFixture) -> ClassContext {
+        ClassContext::load(
+            f.store(),
+            &f.credentials(),
+            f.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            bench::FIXTURE_NOW as i64,
+        )
+        .unwrap()
+    }
+
+    fn counts() -> bench::FixtureCounts {
+        bench::FixtureCounts {
+            subscription_rules: 10,
+            exclusion_rules: 103,
+            runner_route_rules: 0,
+            catalog_facts: 836,
+            listed_credentials: 39,
+        }
+    }
+
+    fn assert_differential(base: &ClassContext) {
+        for due in [false, true] {
+            for continuation in [false, true] {
+                let mut c = base.clone();
+                if continuation {
+                    c.revalidate_credential(&c.credentials.listed_credentials()[0].id.clone());
+                }
+                let origins = c
+                    .credentials
+                    .listed_credentials()
+                    .iter()
+                    .flat_map(|row| {
+                        row.provider_ids
+                            .iter()
+                            .map(|provider| striatum_store::FenceRecheck {
+                                evidence: row.id.clone(),
+                                kind: "credential".into(),
+                                origin_key: row.id.clone(),
+                                provider: provider.clone(),
+                                account_id: None,
+                                credential_id: Some(row.id.clone()),
+                                model: None,
+                                size_class: None,
+                                principal: None,
+                                admission_id: None,
+                                evidence_at: c.now_ms - 2,
+                                quota: false,
+                                classified: true,
+                                next_recheck_at: c.now_ms + if due { -1 } else { 60_000 },
+                                reset_check_at: None,
+                                last_claimed_at: None,
+                                claim_owner: None,
+                                cleared_models: Vec::new(),
+                            })
+                    })
+                    .collect();
+                c.replace_rechecks(origins);
+                for priced in [false, true] {
+                    let mut facts = c.facts.clone();
+                    c.credentials.price_facts(&mut facts, c.config.pricing());
+                    for fact in &mut facts {
+                        let old = old_class(&c, fact, priced);
+                        let new = c.class(fact, priced);
+                        assert_eq!(answer(new), answer(old), "before class pricing due={due} continuation={continuation} priced={priced}");
+                        if let Some(method) = old_class(&c, fact, priced)
+                            .rows
+                            .first()
+                            .and_then(|r| r.auth_method.as_deref())
+                        {
+                            c.credentials
+                                .price_for_method(fact, method, c.config.pricing());
+                        }
+                        assert!(
+                            fact.billing_plane.is_some(),
+                            "both payment classes must use selection pricing"
+                        );
+                        assert_eq!(
+                            answer(c.class(fact, priced)),
+                            answer(old_class(&c, fact, priced)),
+                            "after class pricing {}/{}",
+                            fact.provider_id,
+                            fact.model_id
+                        );
+                        for row in c.credentials.listed_credentials().iter().filter(|row| {
+                            crate::broca_credentials::credential_serves_fact(
+                                row,
+                                fact,
+                                &c.catalog,
+                                &c.credentials,
+                            )
+                        }) {
+                            assert_eq!(
+                                c.eligible(row, fact),
+                                old_eligible(&c, row, fact),
+                                "eligible {}",
+                                row.id
+                            );
+                            assert_eq!(
+                                serde_json::to_value(c.view(row, fact)).unwrap(),
+                                serde_json::to_value(old_view(&c, row, fact)).unwrap(),
+                                "view {}",
+                                row.id
+                            );
+                        }
+                    }
+                    for now in [c.now_ms as u64, c.now_ms as u64 + 1_000_000] {
+                        for harness in [None, Some("default")] {
+                            let new = Registry::build_for_harness(
+                                c.config.as_ref(),
+                                &c.credentials,
+                                &facts,
+                                now,
+                                harness,
+                            );
+                            let old = Registry::build_for_harness(
+                                c.config.v1_runners(),
+                                &c.credentials,
+                                &facts,
+                                now,
+                                harness,
+                            );
+                            assert_eq!(
+                                serde_json::to_value(&new.entries).unwrap(),
+                                serde_json::to_value(&old.entries).unwrap()
+                            );
+                            for runner in &new.entries {
+                                for fact in &facts {
+                                    let route = striatum_core::make_route_key(
+                                        &fact.provider_id,
+                                        &fact.model_id,
+                                        fact.variant.as_deref(),
+                                    );
+                                    let capacity =
+                                        format!("{}/{}", fact.provider_id, fact.model_id);
+                                    assert_eq!(
+                                        new.runs(&runner.policy.module, &route, &capacity),
+                                        old.runs(&runner.policy.module, &route, &capacity)
+                                    );
+                                    assert_eq!(
+                                        new.can_run(&runner.policy.module, &route, &capacity),
+                                        old.can_run(&runner.policy.module, &route, &capacity)
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn serving_index_differential_all_facts_payments_probes_and_continuations() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        let production = bench::production_fixture();
+        assert_differential(&context(&production));
+        drop(production);
+        let fixture = bench::representative_fixture(counts());
+        let mut previous = context(&fixture);
+        assert!(previous.facts.iter().any(|f| f.provider_id == "cpu-pool-0"));
+        assert!(!previous.catalog.contains("cpu-pool-0"));
+        assert_differential(&previous);
+        let unchanged = context(&fixture);
+        assert!(std::sync::Arc::ptr_eq(
+            &previous.serving_index,
+            &unchanged.serving_index
+        ));
+        let patched = std::sync::Arc::new((*previous.config).clone());
+        let isolated = crate::serving_index::ServingIndex::get(
+            &patched,
+            &previous.credentials,
+            &fixture.store().get_facts_with_generation().unwrap(),
+        );
+        assert!(!std::sync::Arc::ptr_eq(&previous.serving_index, &isolated));
+
+        for change in 0..6 {
+            match change {
+                0 => fixture.edit_config(|config| {
+                    config["models"]["cpu-provider-0/model-0"]["subscription"] = json!(false)
+                }),
+                1 => {
+                    let mut fact = fixture.store().get_facts().unwrap()[0].clone();
+                    fact.auth_methods = Some(vec!["apikey".into()]);
+                    fixture.store().with_writer_for_test(|connection| {
+                        connection.execute("UPDATE model_facts SET auth_methods_json=?1 WHERE provider_id=?2 AND model_id=?3",
+                            rusqlite::params![serde_json::to_string(&fact.auth_methods).unwrap(), fact.provider_id, fact.model_id])
+                    }).unwrap();
+                }
+                2 => {
+                    let shared = fixture.credentials();
+                    let mut credentials = shared.lock().unwrap();
+                    let mut rows = credentials.listed_credentials().to_vec();
+                    rows[0].state = "disabled".into();
+                    credentials.apply_listing(
+                        &cortexkit_claustrum_client::ScopedCredentialListing {
+                            view: "changed-listing".into(),
+                            credentials: rows,
+                            ..Default::default()
+                        },
+                        bench::FIXTURE_NOW,
+                    );
+                }
+                3 => {
+                    let shared = fixture.credentials();
+                    let mut credentials = shared.lock().unwrap();
+                    for declaration in credentials.runner_declarations.values_mut() {
+                        declaration.pairs.retain(|p| p.auth_method != "oauth");
+                    }
+                }
+                4 => fixture
+                    .credentials()
+                    .lock()
+                    .unwrap()
+                    .publish_billing_catalog(Default::default()),
+                5 => {
+                    let shared = fixture.credentials();
+                    let mut credentials = shared.lock().unwrap();
+                    // An alias borrows model rows from a catalog provider only
+                    // while it has no catalog rows of its own. Supplying its
+                    // rows therefore removes that target without a vault change.
+                    credentials.refresh_serving_methods(
+                        &Default::default(),
+                        &previous.facts,
+                        bench::FIXTURE_NOW as i64,
+                        &[],
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let next = context(&fixture);
+            assert!(
+                !std::sync::Arc::ptr_eq(&previous.serving_index, &next.serving_index),
+                "changed input {change} reused a stale index"
+            );
+            assert_differential(&next);
+            previous = next;
+        }
+        let shared = fixture.credentials();
+        {
+            let mut credentials = shared.lock().unwrap();
+            let listing = cortexkit_claustrum_client::ScopedCredentialListing {
+                view: credentials.listing_version().unwrap().0.into(),
+                credentials: credentials.listed_credentials().to_vec(),
+                ..Default::default()
+            };
+            credentials.apply_listing(&listing, bench::FIXTURE_NOW + 1);
+            let declarations = credentials.runner_declarations.clone();
+            credentials.runner_declarations = declarations;
+            let billing = credentials.billing_catalog.clone();
+            credentials.publish_billing_catalog(billing);
+            credentials.refresh_serving_methods(
+                &Default::default(),
+                &previous.facts,
+                bench::FIXTURE_NOW as i64 + 1,
+                &[],
+            );
+        }
+        assert!(
+            std::sync::Arc::ptr_eq(&previous.serving_index, &context(&fixture).serving_index),
+            "equal refreshes must share the index"
+        );
+    }
+
+    #[test]
+    fn dynamic_indexes_are_lazy_once_and_probe_reservation_replaces_rechecks() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        let fixture = bench::representative_fixture(counts());
+        let mut c = context(&fixture);
+        take_index_build_counts();
+        let clone = c.clone();
+        assert_eq!(take_index_build_counts(), [0; 3]);
+        assert!(clone.indexes.blocks.get().is_none());
+        let row = c.credentials.listed_credentials()[0].clone();
+        let fact = c
+            .facts
+            .iter()
+            .find(|f| row.provider_ids.contains(&f.provider_id))
+            .unwrap()
+            .clone();
+        let origin = striatum_store::FenceRecheck {
+            evidence: "test-only-old-snapshot".into(),
+            kind: "credential".into(),
+            origin_key: row.id.clone(),
+            provider: fact.provider_id.clone(),
+            account_id: None,
+            credential_id: Some(row.id.clone()),
+            model: None,
+            size_class: None,
+            principal: None,
+            admission_id: None,
+            evidence_at: c.now_ms - 2,
+            quota: false,
+            classified: true,
+            next_recheck_at: c.now_ms - 1,
+            reset_check_at: None,
+            last_claimed_at: None,
+            claim_owner: None,
+            cleared_models: Vec::new(),
+        };
+        c.replace_rechecks(vec![origin]);
+        for _ in 0..2 {
+            assert!(c.probe_eligible(&fact.provider_id, &fact.model_id, &row.id));
+            c.eligible(&row, &fact);
+            c.view(&row, &fact);
+        }
+        assert_eq!(take_index_build_counts(), [1, 1, 1]);
+        c.reserve_selection_probes(fixture.store(), &fixture.credentials())
+            .unwrap();
+        assert!(
+            c.indexes.rechecks.get().is_none(),
+            "replacement and invalidation are one operation"
+        );
+        assert!(!c
+            .rechecks
+            .iter()
+            .any(|o| o.evidence == "test-only-old-snapshot"));
+        assert_eq!(
+            c.probe_eligible(&fact.provider_id, &fact.model_id, &row.id),
+            old_probe(&c, &fact.provider_id, &fact.model_id, &row.id)
+        );
+        assert_eq!(take_index_build_counts()[2], 1);
+    }
+}
+
+#[cfg(test)]
 mod compiled_class_tests {
     use super::*;
     use crate::routing_v1::request_cpu_bench::{self as bench, FixtureCounts};
@@ -7258,9 +8119,9 @@ mod compiled_class_tests {
             bench::FIXTURE_NOW,
         );
         context.credentials.runner_declarations.clear();
-        context.refusals.clear();
-        context.rechecks.clear();
-        context.fences.clear();
+        context.replace_refusals(Vec::new());
+        context.replace_rechecks(Vec::new());
+        context.replace_fences(BTreeMap::new());
         context.quota = Default::default();
         assert_reference(&context, &fact);
         let baseline = answer(context.class(&fact, false));
@@ -7306,29 +8167,31 @@ mod compiled_class_tests {
             })
             .map(|row| row.id.clone())
             .collect();
-        probing.rechecks = oauth
-            .iter()
-            .map(|id| striatum_store::FenceRecheck {
-                evidence: id.clone(),
-                kind: "credential".into(),
-                origin_key: id.clone(),
-                provider: fact.provider_id.clone(),
-                account_id: None,
-                credential_id: Some(id.clone()),
-                model: None,
-                size_class: None,
-                principal: None,
-                admission_id: None,
-                evidence_at: probing.now_ms - 1,
-                quota: false,
-                classified: true,
-                next_recheck_at: probing.now_ms - 1,
-                reset_check_at: None,
-                last_claimed_at: None,
-                claim_owner: None,
-                cleared_models: Vec::new(),
-            })
-            .collect();
+        probing.replace_rechecks(
+            oauth
+                .iter()
+                .map(|id| striatum_store::FenceRecheck {
+                    evidence: id.clone(),
+                    kind: "credential".into(),
+                    origin_key: id.clone(),
+                    provider: fact.provider_id.clone(),
+                    account_id: None,
+                    credential_id: Some(id.clone()),
+                    model: None,
+                    size_class: None,
+                    principal: None,
+                    admission_id: None,
+                    evidence_at: probing.now_ms - 1,
+                    quota: false,
+                    classified: true,
+                    next_recheck_at: probing.now_ms - 1,
+                    reset_check_at: None,
+                    last_claimed_at: None,
+                    claim_owner: None,
+                    cleared_models: Vec::new(),
+                })
+                .collect(),
+        );
         assert_reference(&probing, &fact);
         let hold = probe_reservations::Selection::new(
             &fixture.credentials(),
@@ -7383,8 +8246,8 @@ mod tests {
 
     use crate::account_quota::{apply_provider_reply, apply_roster_listing};
     use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
-    use striatum_store::dev_descriptor;
     use std::sync::{Arc, Mutex};
+    use striatum_store::dev_descriptor;
 
     /// The fixed test clock, 2026-09-29T12:00:00Z.
     const NOW: i64 = 1_790_683_200_000;
