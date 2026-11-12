@@ -184,8 +184,8 @@ pub(crate) fn emit(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .admit(principal, reason, crate::now_ms() as i64);
     let Some(suppressed) = suppressed else { return };
-    // Select metadata and public vault ids, never serialize request objects,
-    // error messages, headers or credential material.
+    // Select metadata and credential ids (vault row names, not secrets); never
+    // serialize request objects, error messages, headers or credential material.
     let mut fields = json!({
         "op":op, "principal":principal, "code":code, "reason":reason,
         "provider":params["provider"].as_str(), "model":params["model"].as_str(),

@@ -2261,7 +2261,8 @@ impl ClassContext {
                 .cloned()
                 .collect(),
         );
-        // Core's worker keep-free margin can exceed the allocator's reserve.
+        // The settings keep-free margin for workers (`keep_free_percent`) can
+        // exceed the allocator's own reserve.
         // Apply it only to this recovery probe, so a weekly reset that frees
         // that margin is diagnosed without changing account admission policy.
         let mut policy = self.config.allocator_policy_ref(provider).clone();
@@ -5289,7 +5290,8 @@ fn route_fence_refusal(
         .filter(|view| !wanted(&view.account_id)).collect();
     if !unoffered.is_empty() {
         // The retry belongs to the offered accounts, not the whole route.
-        // Public vault ids explain which eligible alternatives the runner left out.
+        // Credential ids (vault row names, not secrets) identify which eligible
+        // accounts the runner left out of its candidates.
         let credentials: BTreeSet<_> = unoffered.iter().flat_map(|view| &view.credentials)
             .map(|credential| &credential.credential_id).collect();
         detail["eligible_accounts_not_offered"] = json!({
