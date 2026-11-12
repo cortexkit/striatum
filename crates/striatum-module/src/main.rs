@@ -635,27 +635,34 @@ fn write_quota_readings(
     fresh: &[ProviderUsage],
     observed_at_ms: u64,
 ) -> Result<(), String> {
+    let rows = quota_reading_rows(store, fresh, observed_at_ms)?;
+    store
+        .append_quota_readings(&rows)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn quota_reading_rows(
+    store: &SqliteRouteStateStore,
+    fresh: &[ProviderUsage],
+    observed_at_ms: u64,
+) -> Result<Vec<striatum_core::route_state_store::QuotaReadingLogRow>, String> {
     let facts = store.get_facts().map_err(|e| e.to_string())?;
     let observed_at = i64::try_from(observed_at_ms).map_err(|e| e.to_string())?;
     let mut rows = Vec::new();
-    let mut joined = false;
     for entry in fresh {
         let Some(join) = striatum_core::quota::quota_route_join(entry, &facts) else {
             continue;
         };
         let capacity_keys = striatum_core::quota::quota_capacity_keys(entry, &facts);
-        joined = true;
         rows.extend(striatum_core::quota_poll::reading_log_rows_for_poll(
-            entry, join.provider_id, &capacity_keys, observed_at,
+            entry,
+            join.provider_id,
+            &capacity_keys,
+            observed_at,
         ));
     }
-    if joined {
-        // Append every account in one transaction instead of one fsync per
-        // account. Old readings are deleted by the retention pass, in bounded
-        // batches, not on this path.
-        store.append_quota_readings(&rows).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    Ok(rows)
 }
 
 fn apply_quota_refresh(cache: &mut QuotaCache, fresh: Vec<ProviderUsage>, observed_at_ms: u64) {
@@ -1320,7 +1327,10 @@ where
     let mut profiles_started = false;
     loop {
         let Some(frame) = next_frame_or_loop_stop(read_half, &mut loops).await? else {
-            return Ok(store); // clean EOF: subc closed the connection.
+            // Clean EOF: stop quota publications before capturing the final cache.
+            return quota_events::finish_clean_exit(loops, Arc::clone(&quota_cache), store)
+                .await
+                .map_err(ModuleError::Message);
         };
         if !handle_frame(
             frame,
@@ -1336,7 +1346,9 @@ where
         )
         .await?
         {
-            return Ok(store);
+            return quota_events::finish_clean_exit(loops, Arc::clone(&quota_cache), store)
+                .await
+                .map_err(ModuleError::Message);
         }
         if !profiles_started && !route_epochs.is_empty() {
             // Start only after the first bind ACK is queued, never during store open.

@@ -1817,6 +1817,14 @@ pub async fn account_quota_loop(
     let project_root =
         std::env::temp_dir().join(format!("{}-account-quota", crate::DEFAULT_MODULE_ID));
     let _ = std::fs::create_dir_all(&project_root);
+    let restore_store = Arc::clone(&store);
+    let mut persisted_view =
+        tokio::task::spawn_blocking(move || restore_store.account_vault_roster())
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+            .map(|row| row.view);
     loop {
         let listing = resolver.list_scoped().await;
         if let Ok(listing) = &listing {
@@ -1845,7 +1853,7 @@ pub async fn account_quota_loop(
             Err(_) => None,
         };
         if let Some(row) = roster_row {
-            if let Err(error) = store.put_account_vault_roster(&row) {
+            if let Err(error) = persist_roster_if_changed(&store, row, &mut persisted_view).await {
                 tracing::warn!(error = %error, "vault roster not persisted");
             }
         }
@@ -1890,6 +1898,26 @@ pub async fn account_quota_loop(
     }
 }
 
+/// The listing view is the vault's digest, not its poll time. Remember only
+/// successful writes so an unchanged listing retries after a store failure.
+async fn persist_roster_if_changed(
+    store: &Arc<SqliteRouteStateStore>,
+    row: PersistedVaultRoster,
+    persisted_view: &mut Option<String>,
+) -> Result<(), String> {
+    if persisted_view.as_ref() == Some(&row.view) {
+        return Ok(());
+    }
+    let view = row.view.clone();
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || store.put_account_vault_roster(&row))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    *persisted_view = Some(view);
+    Ok(())
+}
+
 /// The status operation's reply: the report plus the loop's own health.
 pub fn status_json(state: &AccountQuotaState, now_ms: i64) -> Value {
     let report = build_report(
@@ -1912,6 +1940,64 @@ mod tests {
     use cortexkit_claustrum_client::{ListedCredential, ListedGrant};
     use serde_json::json;
     use sha2::{Digest, Sha256};
+
+    #[tokio::test]
+    async fn roster_persists_only_a_changed_digest_and_retries_failed_writes() {
+        let scratch = cortexkit_test_support::ScratchDir::new("quota-roster-digest");
+        let path = scratch.path().join("store.db");
+        let store = Arc::new(
+            SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "striatum",
+                path.to_string_lossy(),
+            ))
+            .unwrap(),
+        );
+        let mut state = AccountQuotaState::default();
+        let mut persisted = None;
+        let first = listing(&[("oauth:anthropic", "a", "email")], &[]);
+        let before = store.writer_commit_count_for_test();
+        let row = apply_roster_listing(&mut state, &first, 1).unwrap();
+        persist_roster_if_changed(&store, row, &mut persisted)
+            .await
+            .unwrap();
+        let row = apply_roster_listing(&mut state, &first, 2).unwrap();
+        persist_roster_if_changed(&store, row, &mut persisted)
+            .await
+            .unwrap();
+        assert_eq!(store.writer_commit_count_for_test() - before, 1);
+        assert_eq!(state.roster.as_ref().unwrap().fetched_at_ms, 2);
+        assert_eq!(store.account_vault_roster().unwrap().unwrap().fetched_at, 1);
+        let mut changed = first;
+        changed.view = "changed-digest".into();
+        let row = apply_roster_listing(&mut state, &changed, 3).unwrap();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_roster BEFORE INSERT ON account_vault_roster BEGIN SELECT RAISE(ROLLBACK, 'write refused'); END;").unwrap();
+        assert!(persist_roster_if_changed(&store, row, &mut persisted)
+            .await
+            .is_err());
+        assert_eq!(persisted.as_deref(), Some("view"));
+        db.execute_batch("DROP TRIGGER reject_roster;").unwrap();
+        let row = apply_roster_listing(&mut state, &changed, 4).unwrap();
+        persist_roster_if_changed(&store, row, &mut persisted)
+            .await
+            .unwrap();
+        assert_eq!(store.writer_commit_count_for_test() - before, 2);
+        assert_eq!(
+            store.account_vault_roster().unwrap().unwrap().view,
+            "changed-digest"
+        );
+        let restored_view = store.account_vault_roster().unwrap().map(|row| row.view);
+        persisted = restored_view;
+        let row = apply_roster_listing(&mut state, &changed, 5).unwrap();
+        persist_roster_if_changed(&store, row, &mut persisted)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.writer_commit_count_for_test() - before,
+            2,
+            "restarts also skip an unchanged digest"
+        );
+    }
 
     /// A live Insula reply to `usage.get {"provider":"claude"}`, captured
     /// read-only on 2026-09-30 with
