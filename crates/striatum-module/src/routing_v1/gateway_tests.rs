@@ -251,10 +251,10 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
     let harness = fixture();
     let consumer = harness.bind(reserved("example-consumer"), None).await;
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
-    for (module, harness_name, expected) in [
-        ("broca", "broca", DIRECT_ROUTE),
-        (RUNNER, "claude-code", GATEWAY_ROUTE),
-        (RUNNER, "direct-api", DIRECT_ROUTE),
+    for (module, harness_name) in [
+        ("broca", "broca"),
+        (RUNNER, "claude-code"),
+        (RUNNER, "direct-api"),
     ] {
         let (ty, choices) = operator
             .call(
@@ -265,18 +265,9 @@ async fn gateway_reach_is_runner_and_harness_local_on_select_choices_and_what_if
             )
             .await;
         assert_eq!(ty, FrameType::Response, "{choices}");
-        let models = choices["result"]["models"].as_array().unwrap();
-        assert_eq!(models.len(), 1, "{choices}");
-        assert_eq!(
-            format!(
-                "{}/{}",
-                models[0]["provider"].as_str().unwrap(),
-                models[0]["model"].as_str().unwrap()
-            ),
-            expected
-        );
-        assert_eq!(models[0]["billing"], "per_token", "{choices}");
-        assert_eq!(models[0]["pin_only"], true, "{choices}");
+        // These routing-only account pools borrow Anthropic's catalog rows;
+        // neither pool provider can be named in a runner's model plan.
+        assert_eq!(choices["result"]["models"], json!([]), "{choices}");
 
         let (ty, preview) = operator
             .call(
