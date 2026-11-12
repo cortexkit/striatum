@@ -15,8 +15,9 @@ use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
 use super::account_classes_tests::setup;
-use super::conformance_tests::reserved;
+use super::conformance_tests::{reserved, Harness};
 use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP};
+use crate::broca_credentials::BrocaCredentials;
 
 const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
@@ -32,6 +33,181 @@ fn legacy_request(provider: &str, id: &str, key: &str) -> Value {
         "conversation_key": key, "caller": {"runner": RUNNER},
         "admission_id": id, "mode": "admit",
     })
+}
+
+fn legacy_provider_reply(
+    harness: &Harness,
+    credentials: BrocaCredentials,
+    provider: &str,
+    model: &str,
+) -> OpReply {
+    let shared = Arc::new(std::sync::Mutex::new(credentials));
+    let policy = harness.operator_config().allocator_policy(provider);
+    let ctx = account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: NOW as i64,
+        classes: Some(
+            account_selection::ClassContext::load(
+                harness.store(),
+                &shared,
+                harness.operator_config(),
+                crate::ACCOUNT_QUOTA.get(),
+                NOW as i64,
+            )
+            .unwrap(),
+        ),
+    };
+    let mut request = legacy_request(provider, "provider-legacy", "provider-conversation");
+    request["model"] = json!(model);
+    let body = serde_json::to_vec(&json!({"method": ACCOUNT_FOR_OP, "params": request})).unwrap();
+    account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx)
+}
+
+const GEMINI: &str = "antigravity-gemini-3.8-flash";
+
+#[tokio::test]
+async fn unknown_account_provider_is_invalid_with_unique_model_provider_suggestion() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("google", false);
+    harness.install_facts(&[crate::tests::fact("google", GEMINI)]);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = v1_request("antigravity", "unknown-provider");
+    request["model"] = json!(GEMINI);
+    let reply = runner.call("route.account_for", &request).await;
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "invalid_request", "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"], json!({"field":"provider"}), "{}", reply.1
+    );
+    let message = reply.1["message"].as_str().unwrap();
+    assert!(message.contains("`antigravity`"), "{message}");
+    assert!(message.contains("`google`"), "{message}");
+}
+
+#[tokio::test]
+async fn legacy_unknown_account_provider_is_invalid_with_the_same_suggestion() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("google", false);
+    harness.install_facts(&[crate::tests::fact("google", GEMINI)]);
+    match legacy_provider_reply(&harness, credentials, "antigravity", GEMINI) {
+        OpReply::Error {
+            code,
+            message,
+            detail,
+        } => {
+            assert_eq!(code, "invalid_request", "{message}");
+            assert_eq!(detail, Some(json!({"field":"provider"})));
+            assert!(message.contains("`antigravity`"), "{message}");
+            assert!(message.contains("`google`"), "{message}");
+        }
+        other => panic!("expected provider refusal, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn known_account_provider_without_credentials_or_model_keeps_auth_required() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("google", false);
+    credentials.apply_listing(
+        &cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "empty-vault".into(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    for model in ["model", "no-catalog-row"] {
+        let mut request = v1_request("google", model);
+        request["model"] = json!(model);
+        let reply = runner.call("route.account_for", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+        assert_eq!(reply.1["code"], "auth_required", "{}", reply.1);
+        assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
+        assert_eq!(
+            legacy_provider_reply(&harness, credentials.clone(), "google", model).code(),
+            Some("auth_required")
+        );
+    }
+}
+
+#[tokio::test]
+async fn account_provider_alias_and_company_gateway_are_known_without_model_rows() {
+    use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("anthropic", false);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "aliases-and-gateway".into(),
+            credentials: [
+                ("anthropic-platform", "llm-provider", "apikey"),
+                ("company-gateway", "llm-gateway", "gateway"),
+            ]
+            .into_iter()
+            .map(|(provider, category, method)| ListedCredential {
+                id: format!("{provider}:key"),
+                provider_ids: vec![provider.into()],
+                serves: vec!["anthropic".into()],
+                categories: vec![category.into()],
+                state: "active".into(),
+                credential_type: "apikey".into(),
+                auth_method: Some(method.into()),
+                ..Default::default()
+            })
+            .collect(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    let targets = credentials
+        .catalog_resolution_for_providers(&["anthropic".into()].into())
+        .targets;
+    assert_eq!(
+        targets.get("anthropic-platform").map(String::as_str),
+        Some("anthropic")
+    );
+    assert_eq!(
+        targets.get("company-gateway").map(String::as_str),
+        Some("anthropic")
+    );
+    harness.set_credentials(credentials.clone());
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    for provider in ["anthropic-platform", "company-gateway"] {
+        let mut request = v1_request(provider, provider);
+        request["model"] = json!("no-catalog-row");
+        let reply = runner.call("route.account_for", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+        assert_eq!(reply.1["code"], "auth_required", "{}", reply.1);
+        assert_eq!(
+            legacy_provider_reply(&harness, credentials.clone(), provider, "no-catalog-row").code(),
+            Some("auth_required")
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_account_provider_does_not_guess_between_multiple_model_providers() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("google", false);
+    harness.install_facts(&[
+        crate::tests::fact("google", GEMINI),
+        crate::tests::fact("other-vendor", GEMINI),
+    ]);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    for model in [GEMINI, "no-catalog-row"] {
+        let mut request = v1_request("antigravity", model);
+        request["model"] = json!(model);
+        let reply = runner.call("route.account_for", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+        assert_eq!(reply.1["code"], "invalid_request", "{}", reply.1);
+        let message = reply.1["message"].as_str().unwrap();
+        assert!(message.contains("`antigravity`"), "{message}");
+        assert!(!message.contains("`google`"), "{message}");
+        assert!(!message.contains("`other-vendor`"), "{message}");
+    }
 }
 
 #[tokio::test]
@@ -464,7 +640,7 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
             "legacy class-aware fenced"
         );
     }
-    // Unknown provider: both entrypoints need a login.
+    // An unknown provider is a caller error on both entrypoints, not a login.
     {
         let (harness, credentials) = setup("synthetic", false);
         let shared = Arc::new(std::sync::Mutex::new(credentials));
@@ -476,7 +652,8 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
             )
             .await;
         assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-        assert_eq!(refused.1["code"], "auth_required", "{}", refused.1);
+        assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+        assert_eq!(refused.1["detail"], json!({"field":"provider"}));
         let policy = harness.operator_config().allocator_policy("unknown-vendor");
         let config = harness.operator_config();
         let classes = account_selection::ClassContext::load(
@@ -502,7 +679,7 @@ async fn class_aware_legacy_matches_v1_for_empty_and_fenced() {
         assert_eq!(
             account_selection::handle(ACCOUNT_FOR_OP, &body, &format!("reserved:{RUNNER}"), &ctx)
                 .code(),
-            Some("auth_required"),
+            Some("invalid_request"),
             "legacy class-aware unknown provider"
         );
     }

@@ -4734,6 +4734,7 @@ fn route_fence_refusal(
 /// `account_pool_exhausted` by `route_fence_refusal`. What remains is split
 /// by cause, because Broca classes `account_not_authorized` as an auth
 /// failure and pauses the worker: an account limit must never use it.
+/// - An unknown provider is a caller error (`invalid_request`), not a login.
 /// - No serving credential for the payment class at all needs a login
 ///   (`auth_required`).
 /// - Every remaining credential excluded by a fence (a billing or
@@ -4833,6 +4834,38 @@ fn empty_roster_refusal(
         }
     }
     if fact.is_none() {
+        // Missing model credentials only imply sign-in when the provider is
+        // known. Credential-provider mappings also name routing-only aliases
+        // and gateways without their own catalog model rows.
+        let known_provider = classes.catalog.contains(provider)
+            || classes.targets.contains_key(provider)
+            || classes.facts.iter().any(|fact| fact.provider_id == provider)
+            || classes.credentials.listed_credentials().iter().any(|row| {
+                row.categories.iter().any(|category| {
+                    matches!(category.as_str(), "llm-provider" | "llm-gateway")
+                }) && crate::broca_credentials::credential_providers(row, &classes.catalog)
+                    .iter()
+                    .any(|mapped| mapped == provider)
+            });
+        if !known_provider {
+            checking("unknown_provider");
+            let providers: BTreeSet<_> = classes
+                .facts
+                .iter()
+                .filter(|fact| fact.model_id == model)
+                .map(|fact| fact.provider_id.as_str())
+                .collect();
+            let mut message = format!("Routing does not know provider `{provider}`.");
+            if providers.len() == 1 {
+                let suggested = providers.first().unwrap();
+                message.push_str(&format!(" Model `{model}` is served by provider `{suggested}`; use that provider id."));
+            }
+            return Some(OpReply::typed(
+                "invalid_request",
+                message,
+                json!({"field": "provider"}),
+            ));
+        }
         checking("missing_model_credentials");
         return untimed(
             "auth_required",
