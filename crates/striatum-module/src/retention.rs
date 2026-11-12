@@ -1091,7 +1091,17 @@ mod tests {
         record_decision_at(&store, &path, &sampled[0], NOW - 3 * DAY_MS);
         record_decision_at(&store, &path, &sampled[1], NOW - 29 * DAY_MS);
 
+        // Diagnostics read the adequate set and rejections back over up to a
+        // week; compaction must not change what they see.
+        let diagnostics_before = store
+            .diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100)
+            .unwrap();
+        assert_eq!(diagnostics_before.len(), 5);
         let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(
+            store.diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100).unwrap(),
+            diagnostics_before
+        );
         assert_eq!(report.decision_details_stripped, 2);
         assert_eq!(report.decision_details_sampled, 2);
         assert!(report.drained);
