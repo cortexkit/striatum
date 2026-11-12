@@ -387,26 +387,36 @@ async fn measure(fixture: RequestFixture, batches: usize) {
         .map(|n| n.parse().expect("observation history must be a row count"))
         .unwrap_or(0);
     if history_rows > 0 {
-        let mut conn = rusqlite::Connection::open(harness.store_path()).unwrap();
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
         let principal = format!(
             "reserved:{}",
             fixture.catalog.runners[0]
                 .module
                 .trim_start_matches("reserved:")
         );
-        tx.execute(
-            "WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i+1<?1) \
-             INSERT INTO account_observation \
-             (observation_id,principal,runner,event_id,kind,bound,observation_json,effects_json,received_at) \
-             SELECT 'history-'||i, CASE WHEN i%2=0 THEN ?2 ELSE 'reserved:history-other' END, \
-             'history-runner-'||(i%4), 'history-event-'||i, 'advisory',0,'{}','[]',?3 FROM n",
-            rusqlite::params![i64::try_from(history_rows).unwrap(), principal, FIXTURE_NOW as i64 - 1],
-        )
-        .unwrap();
-        tx.commit().unwrap();
+        harness
+            .store()
+            .account_transaction(|tx| {
+                for i in 0..history_rows {
+                    tx.insert_observation(&striatum_store::AccountObservationRow {
+                        observation_id: format!("history-{i}"),
+                        principal: if i % 2 == 0 {
+                            principal.clone()
+                        } else {
+                            "reserved:history-other".into()
+                        },
+                        runner: format!("history-runner-{}", i % 4),
+                        event_id: format!("history-event-{i}"),
+                        kind: "advisory".into(),
+                        admission_id: None,
+                        bound: false,
+                        observation_json: "{}".into(),
+                        effects_json: "[]".into(),
+                        received_at: FIXTURE_NOW as i64 - 1,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
         println!("observation_history_rows={history_rows} per_table; two principals, four runners (stress fixture)");
     }
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;
