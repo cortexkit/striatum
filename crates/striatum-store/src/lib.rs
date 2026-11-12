@@ -672,7 +672,7 @@ impl SqliteRouteStateStore {
     /// identities and must not be used to resolve credential ownership.
     pub fn catalog_providers(&self) -> RouteStateResult<std::collections::BTreeSet<String>> {
         self.store
-            .with_conn(|conn: &Connection| {
+            .with_read(|conn: &Connection| {
                 let mut statement = conn.prepare("SELECT DISTINCT provider_id FROM model_facts")?;
                 let rows = statement.query_map([], |row| row.get(0))?;
                 rows.collect::<rusqlite::Result<_>>()

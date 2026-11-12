@@ -110,6 +110,48 @@ pub(crate) fn enabled(conn: &Connection) -> rusqlite::Result<bool> {
     .query_row([], |row| row.get(0))
 }
 
+/// Check durable clock differences without materializing the writer's TEMP
+/// snapshot. The writer must check again before synchronizing: evidence may
+/// change after this read snapshot is released.
+pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
+    if !enabled(conn)? {
+        return Ok(false);
+    }
+    let quarantined = quarantined_origins(conn)?;
+    let mut statement = conn.prepare("SELECT kind,origin_key,evidence FROM fence_recheck")?;
+    let mut clocks = statement
+        .query_map([], |row| {
+            Ok((
+                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
+    if quarantined.iter().any(|key| clocks.contains_key(key)) {
+        return Ok(true);
+    }
+    // Scan the UNION view once rather than correlating it against every clock.
+    let mut statement = conn.prepare("SELECT kind,origin_key,evidence FROM fence_origin")?;
+    for row in statement.query_map([], |row| {
+        Ok((
+            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+            row.get::<_, String>(2)?,
+        ))
+    })? {
+        let (key, evidence) = row?;
+        if quarantined.contains(&key) {
+            continue;
+        }
+        if clocks.remove(&key).as_deref() != Some(evidence.as_str()) {
+            return Ok(true);
+        }
+    }
+    if clocks.keys().any(|(kind, _)| kind != "observation") {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
