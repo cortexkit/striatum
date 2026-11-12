@@ -515,8 +515,9 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|conn: &Connection| {
                 let tx = crate::write_transaction(conn)?;
-                // The read pass is only a hint. Never restore clocks captured
-                // before another writer reported or claimed a newer refusal.
+                // The read pass is only a hint. Recheck the current fence
+                // evidence before syncing: another writer may have reported
+                // or claimed a newer refusal since the read.
                 let changed = crate::fence_rechecks::needs_sync(&tx)?;
                 if changed {
                     crate::fence_rechecks::sync(&tx)?;

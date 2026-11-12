@@ -110,9 +110,10 @@ pub(crate) fn enabled(conn: &Connection) -> rusqlite::Result<bool> {
     .query_row([], |row| row.get(0))
 }
 
-/// Check durable clock differences without materializing the writer's TEMP
-/// snapshot. The writer must check again before synchronizing: evidence may
-/// change after this read snapshot is released.
+/// Whether the stored recheck evidence differs from the current fence origins,
+/// checked without materializing the writer's TEMP snapshot. The writer must
+/// check again before synchronizing: evidence may change after this read
+/// snapshot is released.
 pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
     if !enabled(conn)? {
         return Ok(false);
