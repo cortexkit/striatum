@@ -93,9 +93,9 @@ pub const SHADOW_PURGE_MAX_BATCHES: usize = 32;
 /// from a large store.
 pub const DETAIL_STRIP_BATCH_ROWS: usize = 8;
 /// Most compaction batches one pass runs. With eight rows a batch a pass
-/// compacts about 500 decisions, over a hundred times what serving records,
-/// so a first deployment's backlog of a month of decisions drains in about
-/// six hours. With the pause between batches a pass spends about two seconds
+/// (one a minute) compacts about 500 decisions, where serving records about
+/// three a minute (4,300 a day on a busy install), so a first deployment's
+/// backlog of about 175,000 decisions drains in about six hours. With the pause between batches a pass spends about two seconds
 /// a minute on it, in slices of about 10 ms.
 pub const DETAIL_STRIP_MAX_BATCHES: usize = 64;
 /// Pause between batches so request handlers waiting for the store's single
