@@ -3994,6 +3994,147 @@ async fn xai_credit_window_is_a_billing_wall_until_one_probe_and_matching_succes
     }
 }
 
+/// One `account_for` call made straight to the handler on the calling
+/// thread, with a context loaded the way the wire handler loads it.
+fn admit_directly(
+    harness: &Harness,
+    principal: &str,
+    request: Value,
+    now: u64,
+) -> crate::account_selection::OpReply {
+    let config = harness.operator_config();
+    let policy = config.allocator_policy(request["provider"].as_str().unwrap());
+    let ctx = crate::account_selection::Ctx {
+        store: harness.store(),
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: now as i64,
+        classes: Some(
+            crate::account_selection::ClassContext::load(
+                harness.store(),
+                &harness.credentials(),
+                config,
+                crate::ACCOUNT_QUOTA.get(),
+                now as i64,
+            )
+            .unwrap(),
+        ),
+    };
+    crate::account_selection::handle(
+        crate::account_selection::ACCOUNT_FOR_OP,
+        &serde_json::to_vec(
+            &json!({"method":crate::account_selection::ACCOUNT_FOR_OP,"params":request}),
+        )
+        .unwrap(),
+        principal,
+        &ctx,
+    )
+}
+
+/// Two direct admissions race for one recovery probe. The loser builds its
+/// roster while the decision's probe reservation still excludes the account;
+/// the winner then claims the probe, which drops that reservation, before the
+/// loser explains its empty roster. The loser must still be told to wait:
+/// `account_not_authorized` would make its runner pause for sign-in.
+#[tokio::test]
+async fn a_probe_claimed_between_roster_and_refusal_still_answers_a_timed_wait() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = credit_xai_fixture();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let select = json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"});
+    let selected = owner.call("route.select", &select).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let runner = harness
+        .bind(
+            reserved(selected.1["result"]["runner"]["module"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    let mut request = account_request("xai", "race-send");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:xai",
+    );
+
+    let receipt = NOW + 600_000;
+    let _refusal = crate::InjectedClock::set(receipt);
+    credit_xai_reading(Some(0.0), receipt as i64);
+    let refusal = json!({"event_id":"race-refusal","kind":"account_limit_exhausted",
+        "admission_id":"race-send","served_account_id":"xai-account","credential_id":"oauth:xai",
+        "limit_window":"credit","observed_at_ms":receipt});
+    let observed = runner.call("route.account_observe", &refusal).await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+
+    // At the fence's deadline one probe is due, and selection binds its
+    // reservation to the probe decision.
+    let deadline = receipt + 3_600_000;
+    let _due = crate::InjectedClock::set(deadline);
+    credit_xai_reading(Some(0.0), deadline as i64);
+    let rows = credentials.listed_credentials().to_vec();
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-credit".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        deadline,
+    );
+    harness.set_credentials(credentials.clone());
+    let probe = owner.call("route.select", &select).await;
+    assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+    let decision = probe.1["result"]["decision_id"].as_str().unwrap().to_owned();
+
+    let principal = format!("reserved:{RUNNER}");
+    let mut winner = account_request("xai", "race-probe-winner");
+    winner["caller"] = json!({"runner":RUNNER});
+    winner["model_decision_id"] = json!(decision);
+    let mut loser = account_request("xai", "race-probe-loser");
+    loser["caller"] = json!({"runner":RUNNER});
+
+    // The winner runs inside the loser's admission, after the loser's roster
+    // has excluded the reserved account and before its refusal is chosen.
+    let won = Arc::new(std::sync::Mutex::new(None));
+    {
+        let harness = harness.clone();
+        let won = won.clone();
+        let principal = principal.clone();
+        crate::account_selection::after_roster_prepared("race-probe-loser", move || {
+            *won.lock().unwrap() = Some(admit_directly(&harness, &principal, winner, deadline));
+        });
+    }
+    let lost = admit_directly(&harness, &principal, loser, deadline);
+    let won = won
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the winner ran between the loser's roster and its refusal");
+    match won {
+        crate::account_selection::OpReply::Result(result) => {
+            assert_eq!(result["account"]["credential_id"], "oauth:xai", "{result}")
+        }
+        other => panic!("the probe decision's admission was refused: {other:?}"),
+    }
+    match lost {
+        crate::account_selection::OpReply::Error { code, detail, .. } => {
+            let detail = detail.unwrap_or_default();
+            assert_eq!(
+                code, "account_pool_exhausted",
+                "losing the probe is a wait, never an authorization failure: {detail}"
+            );
+            let retry_at = detail["reset_at_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("the wait names when to retry: {detail}"));
+            assert!(
+                (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
+                "{detail}"
+            );
+        }
+        other => panic!("a second probe was admitted: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn credit_window_is_not_an_undeclared_v1_report_extension() {
     let _clock = crate::InjectedClock::set(NOW);

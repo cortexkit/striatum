@@ -4585,6 +4585,8 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return because("route_fence", reply);
     }
+    #[cfg(test)]
+    run_after_roster_hook(&parsed.admission_id);
     if !roster.roster.as_ref().is_some_and(|roster| {
         roster.accounts.iter().any(|account| {
             parsed.candidates.as_ref().is_none_or(|candidates| {
@@ -4673,6 +4675,43 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
             )
         })
         .unwrap_or_else(store_error)
+}
+
+#[cfg(test)]
+type RosterHook = Box<dyn FnOnce() + Send>;
+
+/// Test hooks that `account_for` runs once, for the named admission, after its
+/// roster is prepared and before an empty roster is explained. A test uses one
+/// to run a competing admission at exactly that point instead of hoping two
+/// concurrent requests interleave there.
+#[cfg(test)]
+static AFTER_ROSTER_HOOKS: std::sync::Mutex<Vec<(String, RosterHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn after_roster_prepared(admission_id: &str, hook: impl FnOnce() + Send + 'static) {
+    AFTER_ROSTER_HOOKS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((admission_id.to_owned(), Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_after_roster_hook(admission_id: &str) {
+    // Take the hook out before running it: it may run another admission,
+    // which reaches this point too.
+    let hook = {
+        let mut hooks = AFTER_ROSTER_HOOKS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        hooks
+            .iter()
+            .position(|(id, _)| id == admission_id)
+            .map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn prepare_roster(
