@@ -2158,7 +2158,9 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         .filter(|reset| *reset > now)
         .map(|reset| reset as u64);
     let mut refusal = Refusal::no_route(reason, reset);
-    refusal.message = format!("{}: {}", refusal.message, no_route.refusal_message());
+    let mut diagnostic = no_route.clone();
+    diagnostic.earliest_reset = reset.map(|reset| reset as f64);
+    refusal.message = format!("{}: {}", refusal.message, diagnostic.refusal_message());
     refusal
         .detail
         .insert("rejected".into(), json!(no_route.rejected));
@@ -2500,18 +2502,20 @@ mod tests {
             requirements: None,
             best_rejected: None,
             earliest_reset: reset,
-            earliest_reset_route: None,
+            earliest_reset_route: Some("provider/model".into()),
         };
         let timed = no_route_refusal(
             &refusal(RouteFailureReason::QuotaOrCooldownExhausted, Some(2_000.0)),
             1_000.0,
         );
         assert_eq!(timed.wait_until_ms(), Some(2_000));
+        assert!(timed.message.contains("provider/model (until_ms=2000)"));
         let past = no_route_refusal(
             &refusal(RouteFailureReason::QuotaOrCooldownExhausted, Some(500.0)),
             1_000.0,
         );
         assert_eq!(past.wait_until_ms(), None);
+        assert!(!past.message.contains("Earliest route wall expiry"));
         let quality = no_route_refusal(
             &refusal(RouteFailureReason::AllRoutesInadequate, Some(2_000.0)),
             1_000.0,
