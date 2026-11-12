@@ -10,7 +10,7 @@ use crate::{err, transactions::write_transaction, SqliteRouteStateStore};
 struct PrunePlan {
     unserved: Vec<String>,
     candidates: Vec<String>,
-    since: i64,
+    last_decision_rowid: i64,
 }
 
 #[cfg(test)]
@@ -149,6 +149,33 @@ mod tests {
         }).unwrap();
         assert!(store.get_fact_by_route_key("p/unpicked").unwrap().is_some());
         assert!(store.get_fact_by_route_key("p/old").unwrap().is_some());
+    }
+
+    #[test]
+    fn prune_keeps_selection_timestamped_before_snapshot_but_inserted_after_it() {
+        let (_scratch, store) = rig("prune-queued-selection");
+        store.store.with_conn(seed).unwrap();
+        store.store.with_read(|connection| {
+            // A TEXT primary key leaves SQLite's independently assigned rowid
+            // as an insertion-order cursor, rather than a caller-supplied id.
+            assert_eq!(connection.query_row("SELECT wr FROM pragma_table_list WHERE name='model_route_decisions'", [], |row| row.get::<_, i64>(0))?, 0);
+            assert_eq!(connection.query_row("SELECT type FROM pragma_table_info('model_route_decisions') WHERE pk=1", [], |row| row.get::<_, String>(0))?, "TEXT");
+            let details = connection.prepare("EXPLAIN QUERY PLAN SELECT 1 FROM model_route_decisions WHERE rowid > ?1 AND selected_route_key=?2")?
+                .query_map(params![0, "p/unpicked"], |row| row.get::<_, String>(3))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(details.iter().any(|detail| detail.contains("INTEGER PRIMARY KEY (rowid>?)")), "recheck must search the insertion tail: {details:?}");
+            Ok(())
+        }).unwrap();
+        // Selection timestamps are assigned before writer acquisition. Simulate
+        // a queued selection by inserting its already-old timestamp afterward.
+        store.prune_unserved_after_plan(|| {
+            store.store.with_conn(|connection| connection.execute_batch(
+                "INSERT INTO model_route_decisions(id,target_agent,requirements_json,selected_route_key,score_json,rejected_json,anchor_version,created_at)
+                 VALUES ('queued','mason','{}','p/unpicked','{}','[]',1,CAST(strftime('%s','now') AS INTEGER)*1000-60000);"
+            )).unwrap();
+        }).unwrap();
+        assert!(store.get_fact_by_route_key("p/unpicked").unwrap().is_some());
+        assert!(store.get_fact_by_route_key("p/old").unwrap().is_none());
     }
 
     fn probe_writer(connection: &Connection, path: std::path::PathBuf) -> Arc<Mutex<Option<bool>>> {
@@ -361,10 +388,13 @@ fn plan_unserved_prune(connection: &Connection) -> rusqlite::Result<PrunePlan> {
         .is_autocommit()
         .then(|| connection.unchecked_transaction())
         .transpose()?;
-    // Round down to SQLite's clock resolution so decisions in the same second
-    // as this snapshot are also covered by the writer's race check.
     let since = connection.query_row(
         "SELECT CAST(strftime('%s', 'now') AS INTEGER) * 1000",
+        [],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let last_decision_rowid = connection.query_row(
+        "SELECT COALESCE(MAX(rowid), 0) FROM model_route_decisions",
         [],
         |row| row.get::<_, i64>(0),
     )?;
@@ -404,7 +434,7 @@ fn plan_unserved_prune(connection: &Connection) -> rusqlite::Result<PrunePlan> {
     Ok(PrunePlan {
         unserved,
         candidates,
-        since,
+        last_decision_rowid,
     })
 }
 
@@ -428,16 +458,16 @@ impl SqliteRouteStateStore {
                 .with_conn(|connection| {
                     let tx = write_transaction(connection)?;
                     for route in batch {
-                        // The reader already checked the full retention window.
-                        // Only selections since that snapshot can invalidate it;
-                        // scan that short range, not thirty days under the writer.
+                        // Timestamps are assigned before writer acquisition, so
+                        // a queued selection may predate the reader snapshot.
+                        // Rowids are assigned at insertion; retention removes old
+                        // rows, not the recent high-water mark. Scan only the tail.
                         let eligible = tx.query_row(
                             "SELECT EXISTS(SELECT 1 FROM model_facts
                          WHERE route_key=?1 AND fusiform_present=0 AND source<>'override')
                          AND NOT EXISTS(SELECT 1 FROM model_route_decisions
-                         INDEXED BY model_route_decisions_created_at_idx
-                         WHERE created_at >= ?2 AND selected_route_key=?1)",
-                            params![route, plan.since],
+                          WHERE rowid > ?2 AND selected_route_key=?1)",
+                            params![route, plan.last_decision_rowid],
                             |row| row.get::<_, bool>(0),
                         )?;
                         if eligible {
