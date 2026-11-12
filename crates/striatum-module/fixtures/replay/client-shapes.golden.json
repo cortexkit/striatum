@@ -10342,9 +10342,9 @@
                 "explanation_json": [
                   "route anthropic/claude-opus-5-5 for agent mc_summary",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "billing plane: anthropic/oauth (upstream, serving method: selected account class)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "speed 0.27 (tiebreak)",
                   "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $2.000000; plan pressure 1.0000; cost $2.000000; keep-free margin 0.0%; banked resets applied 0",
                   "route anthropic/claude-opus-5-5: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -10904,9 +10904,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "subscriptionCovered": true,
                     "subscriptionPricing": {
@@ -10946,7 +10946,7 @@
                   "pricingFallback": "anthropic/claude-opus-5 has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "thalamus-harness",
                 "selected_model_id": "claude-opus-5-5",
@@ -11143,9 +11143,9 @@
                 "explanation_json": [
                   "route anthropic/claude-opus-5-5 for agent mc_summary",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "billing plane: anthropic/oauth (upstream, serving method: selected account class)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "speed 0.27 (tiebreak)",
                   "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $2.000000; plan pressure 1.0000; cost $2.000000; keep-free margin 0.0%; banked resets applied 0",
                   "route anthropic/claude-opus-5-5: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -11705,9 +11705,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "subscriptionCovered": true,
                     "subscriptionPricing": {
@@ -11747,7 +11747,7 @@
                   "pricingFallback": "anthropic/claude-opus-5 has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "thalamus-harness",
                 "selected_model_id": "claude-opus-5-5",

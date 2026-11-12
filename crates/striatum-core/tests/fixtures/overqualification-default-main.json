@@ -1,0 +1,2229 @@
+{
+  "source": "main 62217ef2d2ea1902522b0fb394c2fadfdf1aaac4 routing_config.rs + model_router.rs; same explicit scenario inputs",
+  "rows": [
+    {
+      "consumer": "mason",
+      "iq": 10,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 10.0,
+            "target": 875.4998406158878
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "overqualification": 1.55,
+          "quota": 0.0,
+          "selectionCost": 426.00866141732274,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 426.00866141732274
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 20,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 20.0,
+            "target": 1115.8776260733
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "overqualification": 0.75,
+          "quota": 0.0,
+          "selectionCost": 425.20866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 425.20866141732273
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 30,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 30.0,
+            "target": 1286.0223327579297
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "overqualification": 0.35000000000000003,
+          "quota": 0.0,
+          "selectionCost": 424.80866141732275,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.80866141732275
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 40,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 40.0,
+            "target": 1422.253687099514
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "overqualification": 0.15000000000000002,
+          "quota": 0.0,
+          "selectionCost": 424.6086614173227,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.6086614173227
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 50,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 50.0,
+            "target": 1537.7848318776314
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "overqualification": 0.05,
+          "quota": 0.0,
+          "selectionCost": 424.50866141732274,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.50866141732274
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 60,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 60.0,
+            "target": 1639.1134311865278
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "quota": 0.0,
+          "selectionCost": 424.45866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.45866141732273
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 70,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 70.0,
+            "target": 1729.977223582668
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "quota": 0.0,
+          "selectionCost": 424.45866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.45866141732273
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 80,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 80.0,
+            "target": 1812.7485516366903
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "quota": 0.0,
+          "selectionCost": 424.45866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.45866141732273
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 90,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 90.0,
+            "target": 1889.0391107195535
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "quota": 0.0,
+          "selectionCost": 424.45866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.45866141732273
+      }
+    },
+    {
+      "consumer": "mason",
+      "iq": 100,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 100.0,
+            "target": 1960.0
+          }
+        },
+        "objective": {
+          "cost": 424.45866141732273,
+          "quota": 0.0,
+          "selectionCost": 424.45866141732273,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 4.6,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 21.222933070866137,
+            "listCostUsd": 4.6,
+            "normalizedCost": 424.45866141732273,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 10000000.0,
+                "freshInput": 150000.0,
+                "outputExcludingReasoning": 40000.0,
+                "reasoning": 60000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 10000000.0,
+              "freshInput": 150000.0,
+              "outputExcludingReasoning": 40000.0,
+              "reasoning": 60000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 424.45866141732273
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 10,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 10.0,
+            "target": 875.4998406158878
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "overqualification": 1.55,
+          "quota": 0.0,
+          "selectionCost": 23.69566929133858,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 23.69566929133858
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 20,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 20.0,
+            "target": 1115.8776260733
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "overqualification": 0.75,
+          "quota": 0.0,
+          "selectionCost": 22.895669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.895669291338578
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 30,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 30.0,
+            "target": 1286.0223327579297
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "overqualification": 0.35000000000000003,
+          "quota": 0.0,
+          "selectionCost": 22.49566929133858,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.49566929133858
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 40,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 40.0,
+            "target": 1422.253687099514
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "overqualification": 0.15000000000000002,
+          "quota": 0.0,
+          "selectionCost": 22.295669291338577,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.295669291338577
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 50,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 50.0,
+            "target": 1537.7848318776314
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "overqualification": 0.05,
+          "quota": 0.0,
+          "selectionCost": 22.19566929133858,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.19566929133858
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 60,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 60.0,
+            "target": 1639.1134311865278
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "quota": 0.0,
+          "selectionCost": 22.145669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.145669291338578
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 70,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "google/antigravity-gemini-3.8-flash",
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 70.0,
+            "target": 1729.977223582668
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "quota": 0.0,
+          "selectionCost": 22.145669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.145669291338578
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 80,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 80.0,
+            "target": 1812.7485516366903
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "quota": 0.0,
+          "selectionCost": 22.145669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.145669291338578
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 90,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 90.0,
+            "target": 1889.0391107195535
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "quota": 0.0,
+          "selectionCost": 22.145669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.145669291338578
+      }
+    },
+    {
+      "consumer": "sidekick",
+      "iq": 100,
+      "pick": "anthropic/claude-opus-5-5",
+      "score": {
+        "adequacy": 1.0,
+        "alsoAdequate": [
+          "openai/gpt-6.1-sol"
+        ],
+        "candidates": [
+          {
+            "eligible": true,
+            "elo": 1960.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "anthropic/claude-opus-5-5",
+            "routeKey": "anthropic/claude-opus-5-5"
+          },
+          {
+            "eligible": true,
+            "elo": 1710.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "google/antigravity-gemini-3.8-flash",
+            "routeKey": "google/antigravity-gemini-3.8-flash"
+          },
+          {
+            "eligible": true,
+            "elo": 1884.0,
+            "eloSource": "curated",
+            "eq": 1500.0,
+            "eqSource": "curated",
+            "model": "openai/gpt-6.1-sol",
+            "routeKey": "openai/gpt-6.1-sol"
+          }
+        ],
+        "metrics": {
+          "elo": {
+            "fact": 1960.0,
+            "fit": 1.0,
+            "requirement": 100.0,
+            "target": 1960.0
+          }
+        },
+        "objective": {
+          "cost": 22.145669291338578,
+          "quota": 0.0,
+          "selectionCost": 22.145669291338578,
+          "speedScore": 0.4666666666666667,
+          "subscriptionCovered": true,
+          "subscriptionPricing": {
+            "availablePoints": 16.0,
+            "bankedResetsApplied": 0,
+            "keepFreePercent": 0.0,
+            "listCostUsd": 0.24000000000000002,
+            "planPressure": 175.78124999999997,
+            "planTier": "scenario",
+            "planValues": [
+              {
+                "plan": null,
+                "planTier": "scenario",
+                "source": "operator",
+                "valueMultiplier": 38.1,
+                "weight": 1.0
+              }
+            ],
+            "priceUnit": "task",
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          },
+          "taskPricing": {
+            "finalCostUsd": 1.107283464566929,
+            "listCostUsd": 0.24000000000000002,
+            "normalizedCost": 22.145669291338578,
+            "omittedDimensions": [],
+            "pressure": 175.78124999999997,
+            "priceUnit": "task",
+            "profile": {
+              "keepsTokenizer": true,
+              "level": "own_cell",
+              "ownTaskCount": 30,
+              "ownWeight": 1.0,
+              "taskCount": 30,
+              "tokens": {
+                "cacheWrite": 0.0,
+                "cachedRead": 200000.0,
+                "freshInput": 10000.0,
+                "outputExcludingReasoning": 5000.0,
+                "reasoning": 3000.0
+              }
+            },
+            "tokens": {
+              "cacheWrite": 0.0,
+              "cachedRead": 200000.0,
+              "freshInput": 10000.0,
+              "outputExcludingReasoning": 5000.0,
+              "reasoning": 3000.0
+            },
+            "unpricedDimensions": [],
+            "valueMultiplier": 38.1,
+            "valueSource": "operator override"
+          }
+        },
+        "pricingMode": "basket",
+        "rawAdequacy": 1.0,
+        "selectionCost": 22.145669291338578
+      }
+    }
+  ]
+}

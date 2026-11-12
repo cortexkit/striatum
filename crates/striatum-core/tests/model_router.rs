@@ -3621,14 +3621,8 @@ fn has_term_line(explanation: &[String]) -> bool {
 }
 
 #[test]
-fn overqualification_multiplier_can_move_legacy_free_routes_out_of_the_bucket() {
-    // Put both larger models near the free-bucket edge so the fractional
-    // surcharge crosses it; a model deep inside the bucket stays in it.
-    let mut flagship = opus();
-    flagship.cost_per_m_tok_out = Some(1.49);
-    let mut middle = sol();
-    middle.cost_per_m_tok_out = Some(1.4);
-    let facts = vec![flash(), middle, flagship];
+fn overqualification_at_demand_30_hands_flash_the_work_opus_won_on_speed() {
+    let facts = vec![flash(), sol(), opus()];
     let without = select_model_route_with_config(
         input(facts.clone(), req(30.0, 0.0), covered()),
         &term_off(),
@@ -3659,8 +3653,8 @@ fn overqualification_multiplier_can_move_legacy_free_routes_out_of_the_bucket() 
             .unwrap()
             .overqualification
     };
-    assert!((term("anthropic/claude-opus-5-5") - 1.49 / 30.0 * 0.35).abs() < 1e-9);
-    assert!((term("openai/gpt-6.1-sol") - 1.4 / 30.0 * 0.141).abs() < 1e-4);
+    assert!((term("anthropic/claude-opus-5-5") - 0.35).abs() < 1e-9);
+    assert!((term("openai/gpt-6.1-sol") - 0.141).abs() < 1e-3);
     assert_eq!(term("google/antigravity-gemini-3.8-flash"), 0.0);
 }
 
@@ -3683,21 +3677,21 @@ fn overqualification_leaves_opus_at_demand_70_as_it_was() {
 fn overqualification_is_soft_opus_alone_at_demand_30_still_wins_and_says_why() {
     let selected = select_model_route(input(vec![opus()], req(30.0, 0.0), covered())).unwrap();
     assert_eq!(selected.route_key, "anthropic/claude-opus-5-5");
-    assert!((selected.score.objective.overqualification - 0.01295).abs() < 1e-9);
+    assert!((selected.score.objective.overqualification - 0.35).abs() < 1e-9);
     assert!(
-        (selected.score.selection_cost - 0.04995).abs() < 1e-9,
-        "the fractional surcharge scales the selection cost"
+        (selected.score.selection_cost - (1.11 / 30.0 + 0.35)).abs() < 1e-9,
+        "the term is added to the selection cost"
     );
     assert!(
         selected
             .explanation
             .iter()
-            .any(|line| line == "overqualified x1.350 (+0.01; surplus 70 over 30)"),
+            .any(|line| line == "overqualified +0.35 (surplus 70 over 30)"),
         "{:?}",
         selected.explanation
     );
     let json = serde_json::to_value(&selected.score).unwrap();
-    assert!((json["objective"]["overqualification"].as_f64().unwrap() - 0.01295).abs() < 1e-9);
+    assert!((json["objective"]["overqualification"].as_f64().unwrap() - 0.35).abs() < 1e-9);
 }
 
 #[test]
@@ -3728,10 +3722,7 @@ fn overqualification_has_no_term_when_iq_demand_is_zero() {
 #[test]
 fn overqualification_guard_keeps_opus_when_the_term_would_pick_a_route_short_on_eq() {
     // The recorded iq 55 / eq 40 mason: opus fits exactly, luna is 37 on eq.
-    let mut flagship = opus();
-    // A 2% surcharge must cross the bucket edge to exercise the fit guard.
-    flagship.cost_per_m_tok_out = Some(1.49);
-    let facts = vec![flagship, luna()];
+    let facts = vec![opus(), luna()];
     let without = select_model_route_with_config(
         input(facts.clone(), req(55.0, 40.0), covered()),
         &term_off(),
@@ -3770,9 +3761,7 @@ fn overqualification_guard_keeps_opus_when_the_term_would_pick_a_route_short_on_
 #[test]
 fn overqualification_guard_lets_the_term_move_work_to_a_route_that_fits_as_well() {
     // Same request; sol 6.1 fits eq 40 exactly and sits 34 over iq 55 (no term).
-    let mut flagship = opus();
-    flagship.cost_per_m_tok_out = Some(1.49);
-    let facts = vec![flagship, luna(), sol()];
+    let facts = vec![opus(), luna(), sol()];
     let without = select_model_route_with_config(
         input(facts.clone(), req(55.0, 40.0), covered()),
         &term_off(),

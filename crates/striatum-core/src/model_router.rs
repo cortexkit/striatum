@@ -1731,17 +1731,31 @@ fn apply_overqualification(
     if term <= 0.0 {
         return;
     }
-    let surcharge = objective.selection_cost * term;
+    let cost_scaled =
+        config.overqualification.mode == crate::routing_config::OverqualificationMode::CostScaled;
+    let surcharge = if cost_scaled {
+        objective.selection_cost * term
+    } else {
+        term
+    };
     objective.overqualification = surcharge;
     objective.selection_cost += surcharge;
     // Keep the multiplier beside the economic cost it scales.
     let at = notes.len().min(1);
     notes.insert(
         at,
-        format!(
-            "overqualified x{:.3} (+{surcharge:.2}; surplus {surplus:.0} over {:.0})",
-            1.0 + term, requirements.iq
-        ),
+        if cost_scaled {
+            format!(
+                "overqualified x{:.3} (+{surcharge:.2}; surplus {surplus:.0} over {:.0})",
+                1.0 + term,
+                requirements.iq
+            )
+        } else {
+            format!(
+                "overqualified +{term:.2} (surplus {surplus:.0} over {:.0})",
+                requirements.iq
+            )
+        },
     );
 }
 

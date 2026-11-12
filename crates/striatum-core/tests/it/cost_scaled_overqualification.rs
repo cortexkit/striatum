@@ -7,6 +7,16 @@ use striatum_core::{
     task_profile::{ProfileLevel, TaskProfile, TokenVector},
 };
 
+fn cost_scaled_config() -> RoutingConfig {
+    RoutingConfig {
+        overqualification: OverqualificationConfig {
+            mode: striatum_core::routing_config::OverqualificationMode::CostScaled,
+            ..DEFAULT_OVERQUALIFICATION
+        },
+        ..DEFAULT_ROUTING_CONFIG
+    }
+}
+
 fn task_profile(tokens: TokenVector) -> TaskProfile {
     TaskProfile {
         tokens,
@@ -39,7 +49,7 @@ fn cost_pair(far_cost: f64, iq: f64) -> striatum_core::SelectedModelRoute {
         .collect();
     select_model_route_with_profiles(
         input(facts, req(iq, 0.0), covered()),
-        &DEFAULT_ROUTING_CONFIG,
+        &cost_scaled_config(),
         None,
         &[],
         &HashMap::new(),
@@ -75,8 +85,7 @@ fn overqualification_cost_scaled_threshold_leaves_high_tier_work_unchanged() {
     }
 }
 
-#[test]
-fn overqualification_cost_replay_mason_and_sidekick_ledger_sweep() {
+fn replay(config: &RoutingConfig) -> Vec<serde_json::Value> {
     use serde_json::{json, Value};
     use striatum_core::subscription::SubscriptionPool;
     let fixture: Value = serde_json::from_str(include_str!(
@@ -165,17 +174,12 @@ fn overqualification_cost_replay_mason_and_sidekick_ledger_sweep() {
             request.target_agent = decision["target_agent"].as_str().unwrap().into();
             request
         };
-        let shortlist = price_selection_shortlist_with_profiles(
-            request(),
-            &DEFAULT_ROUTING_CONFIG,
-            false,
-            false,
-            &profiles,
-        )
-        .unwrap();
+        let shortlist =
+            price_selection_shortlist_with_profiles(request(), config, false, false, &profiles)
+                .unwrap();
         let selected = select_model_route_with_profiles(
             request(),
-            &DEFAULT_ROUTING_CONFIG,
+            config,
             None,
             &[],
             &HashMap::new(),
@@ -197,8 +201,33 @@ fn overqualification_cost_replay_mason_and_sidekick_ledger_sweep() {
         }));
     }
     assert_eq!(records.len(), 20);
+    records
+}
+
+#[test]
+fn overqualification_cost_replay_mason_and_sidekick_ledger_sweep() {
+    let records = replay(&cost_scaled_config());
     println!(
         "PRICING_REPLAY={}",
         serde_json::to_string(&records).unwrap()
+    );
+}
+
+#[test]
+fn overqualification_default_scores_are_byte_identical_to_main_replay() {
+    let baseline: serde_json::Value = serde_json::from_str(include_str!(
+        "../fixtures/overqualification-default-main.json"
+    ))
+    .unwrap();
+    let actual: Vec<_> = replay(&DEFAULT_ROUTING_CONFIG)
+        .into_iter()
+        .map(|row| {
+            serde_json::json!({"consumer":row["consumer"], "iq":row["requirements_json"]["iq"],
+            "pick":row["selected_route_key"], "score":row["score_json"]})
+        })
+        .collect();
+    assert_eq!(
+        serde_json::to_vec(&actual).unwrap(),
+        serde_json::to_vec(&baseline["rows"]).unwrap()
     );
 }

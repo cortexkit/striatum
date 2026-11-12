@@ -18,28 +18,32 @@ pub const DEFAULT_DEMAND_EXPONENT: f64 = 0.35;
 pub const DEFAULT_OVERQUALIFICATION_THRESHOLD: f64 = 40.0;
 /// Surplus points beyond the threshold over which the term (plus `base`) doubles.
 pub const DEFAULT_OVERQUALIFICATION_DOUBLING: f64 = 10.0;
-/// Fractional cost surcharge: at threshold + doubling the surcharge is `base`.
+/// Additive cost surcharge: at threshold + doubling the surcharge is `base`.
 pub const DEFAULT_OVERQUALIFICATION_BASE: f64 = 0.05;
 /// Keep overqualification a soft preference: a four-times cheaper route can
 /// still win at any surplus, before economic tie bands and the fit guard.
 pub const MAX_OVERQUALIFICATION_FACTOR: f64 = 4.0;
 
-/// Fractional selection-cost surcharge for routes far above the demand. Scaling
-/// the economic cost keeps the preference meaningful as quota pressure rises;
-/// the cap leaves sufficiently cheaper high-capability routes competitive.
-///
-/// `term = 0` when `surplus <= threshold`, else
-/// `min(3, base * (2^((surplus - threshold) / doubling) - 1))`.
-/// Selection multiplies cost plus quota by `1 + term`. The threshold and curve
-/// keep their existing values; the surcharge is a fraction of selection cost.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum OverqualificationMode {
+    #[default]
+    Additive,
+    CostScaled,
+}
+
+/// Additive mode retains the configurable legacy term. Cost-scaled mode uses
+/// the fixed default curve as a fraction of economic cost, capped at 3 so a
+/// sufficiently cheaper high-capability route can still win.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OverqualificationConfig {
+    pub mode: OverqualificationMode,
     pub threshold: f64,
     pub doubling: f64,
     pub base: f64,
 }
 
 pub const DEFAULT_OVERQUALIFICATION: OverqualificationConfig = OverqualificationConfig {
+    mode: OverqualificationMode::Additive,
     threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
     doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
     base: DEFAULT_OVERQUALIFICATION_BASE,
@@ -66,12 +70,16 @@ impl OverqualificationConfig {
     /// The term for a route `surplus` demand points above the request. Zero for
     /// an invalid configuration, so a bad value can never inflate every price.
     pub fn term(&self, surplus: f64) -> f64 {
+        if self.mode == OverqualificationMode::CostScaled {
+            return DEFAULT_OVERQUALIFICATION
+                .term(surplus)
+                .min(MAX_OVERQUALIFICATION_FACTOR - 1.0);
+        }
         if !self.is_valid() || self.base == 0.0 || !surplus.is_finite() || surplus <= self.threshold
         {
             return 0.0;
         }
-        (self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0))
-            .min(MAX_OVERQUALIFICATION_FACTOR - 1.0)
+        self.base * ((2f64).powf((surplus - self.threshold) / self.doubling) - 1.0)
     }
 }
 
@@ -105,6 +113,7 @@ pub(crate) const ROUTING_CONFIG_WITHOUT_OVERQUALIFICATION: RoutingConfig = Routi
     demand_exponent: DEFAULT_DEMAND_EXPONENT,
     allow_best_effort: true,
     overqualification: OverqualificationConfig {
+        mode: OverqualificationMode::Additive,
         threshold: DEFAULT_OVERQUALIFICATION_THRESHOLD,
         doubling: DEFAULT_OVERQUALIFICATION_DOUBLING,
         base: 0.0,
@@ -249,6 +258,10 @@ mod tests {
             ..config
         };
         assert_eq!(broken.term(70.0), 0.0);
+        let config = OverqualificationConfig {
+            mode: OverqualificationMode::CostScaled,
+            ..config
+        };
         let mut previous = 0.0;
         for surplus in 0..=200 {
             let term = config.term(surplus as f64);

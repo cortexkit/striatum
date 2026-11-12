@@ -575,6 +575,11 @@ async fn what_if_rejects_invalid_params_before_snapshotting() {
         json!({"head_choices":{"runner_module":42}}),
         json!({"head_choices":{"runner_module":"broca", "unexpected":true}}),
         json!({"unexpected":true}),
+        json!({"pricing_patch":{"unknown":true}}),
+        json!({"pricing_patch":{"overqualification":"other"}}),
+        json!({"pricing_patch":{"overqualification":{"mode":"cost_scaled"}}}),
+        json!({"pricing_patch":{"banked_resets":{"openai":"other"}}}),
+        json!({"pricing_patch":{"banked_resets":{"bad/provider":"capacity"}}}),
     ] {
         let mut params = json!({"consumer":fixture::SUMMARY,"iqs":[50]});
         params
@@ -586,6 +591,9 @@ async fn what_if_rejects_invalid_params_before_snapshotting() {
         assert_eq!(body["code"], "invalid_request", "{body}");
     }
 }
+
+#[path = "what_if_pricing_tests.rs"]
+mod pricing;
 
 /// Five same-IQ routes in distinct families, with an audit policy of two IQ
 /// top seats and one random extra, so the seed decides the third seat.

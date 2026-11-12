@@ -53,9 +53,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -584,9 +584,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -626,7 +626,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -773,9 +773,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -1304,9 +1304,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -1346,7 +1346,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -1374,9 +1374,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -1905,9 +1905,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -1947,7 +1947,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -2108,9 +2108,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 1.12",
+              "clears bar: adequacy 1.00, selection cost 1.18",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.29; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $25.000000; plan pressure 1.0000; cost $25.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":25.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":25.0,\"normalizedCost\":0.8333333333333334,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -2639,9 +2639,9 @@
               },
               "objective": {
                 "cost": 0.8333333333333334,
-                "overqualification": 0.2916666666666667,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 1.125,
+                "selectionCost": 1.1833333333333333,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -2681,7 +2681,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 1.125
+              "selectionCost": 1.1833333333333333
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -2709,9 +2709,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -3240,9 +3240,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -3282,7 +3282,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -3310,9 +3310,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -3841,9 +3841,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -3883,7 +3883,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -4057,9 +4057,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 0.45",
+              "clears bar: adequacy 1.00, selection cost 0.68",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.12; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $10.000000; plan pressure 1.0000; cost $10.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":10.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":10.0,\"normalizedCost\":0.3333333333333333,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -4588,9 +4588,9 @@
               },
               "objective": {
                 "cost": 0.3333333333333333,
-                "overqualification": 0.11666666666666667,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 0.44999999999999996,
+                "selectionCost": 0.6833333333333333,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -4630,7 +4630,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 0.44999999999999996
+              "selectionCost": 0.6833333333333333
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -4658,9 +4658,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 1.12",
+              "clears bar: adequacy 1.00, selection cost 1.18",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.29; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $25.000000; plan pressure 1.0000; cost $25.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":25.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":25.0,\"normalizedCost\":0.8333333333333334,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -5189,9 +5189,9 @@
               },
               "objective": {
                 "cost": 0.8333333333333334,
-                "overqualification": 0.2916666666666667,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 1.125,
+                "selectionCost": 1.1833333333333333,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -5231,7 +5231,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 1.125
+              "selectionCost": 1.1833333333333333
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -5259,9 +5259,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -5790,9 +5790,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -5832,7 +5832,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",
@@ -5860,9 +5860,9 @@
             "explanation_json": [
               "route openai/gpt-6.1-sol for agent mason",
               "elo: need 30/100 (bar 36), have 55 → clears",
-              "clears bar: adequacy 1.00, selection cost 3.60",
+              "clears bar: adequacy 1.00, selection cost 3.02",
               "billing plane: openai/oauth (quota_proxy, serving method: selected account class)",
-              "overqualified x1.350 (+0.93; surplus 70 over 30)",
+              "overqualified +0.35 (surplus 70 over 30)",
               "speed 0.27 (tiebreak)",
               "subscription value multiplier M 1.0000 (unmeasured); million output tokens list $80.000000; plan pressure 1.0000; cost $80.000000; keep-free margin 0.0%; banked resets applied 0",
               "route openai/gpt-6.1-sol: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":80.0,\"valueMultiplier\":1.0,\"valueSource\":\"unmeasured\",\"pressure\":1.0,\"finalCostUsd\":80.0,\"normalizedCost\":2.6666666666666665,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -6391,9 +6391,9 @@
               },
               "objective": {
                 "cost": 2.6666666666666665,
-                "overqualification": 0.9333333333333333,
+                "overqualification": 0.35000000000000003,
                 "quota": 0.0,
-                "selectionCost": 3.5999999999999996,
+                "selectionCost": 3.0166666666666666,
                 "speedScore": 0.26666666666666666,
                 "subscriptionCovered": true,
                 "subscriptionPricing": {
@@ -6433,7 +6433,7 @@
               "pricingFallback": "openai/gpt-6.1-sol has no usable ephemeral vector of its own and no fleet ephemeral vector",
               "pricingMode": "output_only",
               "rawAdequacy": 1.0,
-              "selectionCost": 3.5999999999999996
+              "selectionCost": 3.0166666666666666
             },
             "selected_harness": "tier-runner",
             "selected_model_id": "gpt-6.1-sol",

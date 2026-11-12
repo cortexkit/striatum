@@ -93,6 +93,7 @@
       "default": {
         "base": null,
         "doubling": null,
+        "mode": "additive",
         "threshold": null
       }
     },
@@ -607,8 +608,15 @@
         }
       ]
     },
+    "OverqualificationMode": {
+      "type": "string",
+      "enum": [
+        "additive",
+        "cost_scaled"
+      ]
+    },
     "OverqualificationSection": {
-      "description": "`overqualification`: `term = 0` while a route's surplus over\nthe iq demand (both on the 0..100 demand scale) is at most `threshold`, else\n`min(3, base * (2^((surplus - threshold) / doubling) - 1))`.\nSelection cost is multiplied by `1 + term` (bounded to 1..4).\n`base: 0` switches the term off.",
+      "description": "Additive mode (default) preserves the tunable cost term. Cost-scaled mode\nmultiplies selection cost by the fixed core curve, bounded to 1..4; custom\nthreshold/doubling/base values are refused in that mode.",
       "type": "object",
       "properties": {
         "base": {
@@ -626,6 +634,10 @@
           ],
           "format": "double",
           "exclusiveMinimum": 0
+        },
+        "mode": {
+          "$ref": "#/$defs/OverqualificationMode",
+          "default": "additive"
         },
         "threshold": {
           "type": [

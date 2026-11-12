@@ -525,6 +525,17 @@ pub(crate) fn overlay(
     overlay_pools(pools, snapshot, facts, now, pricing);
 }
 
+#[cfg(test)]
+pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop {
+    struct Restore(HashMap<String, SubscriptionPool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            cache().lock().unwrap().pools = std::mem::take(&mut self.0);
+        }
+    }
+    Restore(std::mem::replace(&mut cache().lock().unwrap().pools, pools))
+}
+
 /// Attach the cached subscription pools to the selection's snapshot. Every
 /// pool takes its keep-free reserve from the selection's `pricing`, including a
 /// pool whose provider has no fact here: `set_banked_allowance` compares pools

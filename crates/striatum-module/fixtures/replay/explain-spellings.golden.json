@@ -113,9 +113,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -795,9 +795,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -816,7 +816,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               },
               "variantSelection": {
@@ -845,9 +845,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -1412,9 +1412,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -1433,7 +1433,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -1626,9 +1626,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -2171,9 +2171,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -2192,7 +2192,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               }
             }
@@ -2217,9 +2217,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -2784,9 +2784,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -2805,7 +2805,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -2998,9 +2998,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -3543,9 +3543,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -3564,7 +3564,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               }
             }
@@ -3589,9 +3589,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -4156,9 +4156,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -4177,7 +4177,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -4961,9 +4961,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -5528,9 +5528,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -5549,7 +5549,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -5742,9 +5742,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -6287,9 +6287,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -6308,7 +6308,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               }
             }
@@ -6333,9 +6333,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -6900,9 +6900,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -6921,7 +6921,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -7114,9 +7114,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -7659,9 +7659,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -7680,7 +7680,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               }
             }
@@ -7705,9 +7705,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -8272,9 +8272,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -8293,7 +8293,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
@@ -8486,9 +8486,9 @@
                 "explanation": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -9031,9 +9031,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -9052,7 +9052,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 }
               }
             }
@@ -9077,9 +9077,9 @@
                 "explanation_json": [
                   "route example-provider/model-b for agent athena",
                   "elo: need 50/100 (bar 1412), have 1800 → clears",
-                  "clears bar: adequacy 1.00, selection cost 0.07",
+                  "clears bar: adequacy 1.00, selection cost 0.12",
                   "cost +0.07 (output $/Mtok: effective $2/Mtok, list $2/Mtok, metered)",
-                  "overqualified x1.050 (+0.00; surplus 50 over 50)",
+                  "overqualified +0.05 (surplus 50 over 50)",
                   "billing plane: example-provider/apikey (upstream, serving method: selected account class)",
                   "speed 0.27 (tiebreak)",
                   "route example-provider/model-b: task pricing (level=cold_start, tasks=0): {\"profile\":null,\"tokens\":null,\"priceUnit\":\"million output tokens\",\"listCostUsd\":2.0,\"valueMultiplier\":1.0,\"valueSource\":\"cold-start effective rate\",\"pressure\":1.0,\"finalCostUsd\":2.0,\"normalizedCost\":0.06666666666666667,\"omittedDimensions\":[],\"unpricedDimensions\":[]}",
@@ -9644,9 +9644,9 @@
                   },
                   "objective": {
                     "cost": 0.06666666666666667,
-                    "overqualification": 0.0033333333333333335,
+                    "overqualification": 0.05,
                     "quota": 0.0,
-                    "selectionCost": 0.06999999999999999,
+                    "selectionCost": 0.11666666666666667,
                     "speedScore": 0.26666666666666666,
                     "taskPricing": {
                       "finalCostUsd": 2.0,
@@ -9665,7 +9665,7 @@
                   "pricingFallback": "example-provider/model-a has no usable ephemeral vector of its own and no fleet ephemeral vector",
                   "pricingMode": "output_only",
                   "rawAdequacy": 1.0,
-                  "selectionCost": 0.06999999999999999
+                  "selectionCost": 0.11666666666666667
                 },
                 "selected_harness": "broca",
                 "selected_model_id": "model-b",
