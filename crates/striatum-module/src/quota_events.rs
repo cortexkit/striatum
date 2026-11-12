@@ -720,18 +720,18 @@ pub(super) async fn run(
         store,
         snapshot_baseline: Default::default(),
     };
+    let project_root =
+        std::env::temp_dir().join(format!("{}-quota-consumer", crate::DEFAULT_MODULE_ID));
+    let _ = std::fs::create_dir_all(&project_root);
     // Keep the flush timer polling even while delivery waits for a notice or a
     // usage.get reply. Neither side cancels an in-flight delivery at each tick.
     tokio::select! {
         _ = flush_snapshot_loop(Arc::clone(&live.cache), Arc::clone(&live.store), SNAPSHOT_FLUSH_INTERVAL) => {},
-        _ = delivery_loop(connection_file, &live) => {},
+        _ = delivery_loop(connection_file, &live, project_root) => {},
     }
 }
 
-async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota) {
-    let project_root =
-        std::env::temp_dir().join(format!("{}-quota-consumer", crate::DEFAULT_MODULE_ID));
-    let _ = std::fs::create_dir_all(&project_root);
+async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota, project_root: PathBuf) {
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
