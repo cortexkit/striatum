@@ -71,6 +71,11 @@ impl FenceRecheck {
             .map(|origin| origin.evidence_at)
             .max()
             .unwrap_or(i64::MIN);
+        // A reset can schedule an extra check, but cannot lend a second probe
+        // to another decision while the first decision still owns the slot.
+        if origins.iter().any(|origin| origin.claim_owner.is_some()) {
+            return origins.iter().map(|origin| origin.next_recheck_at).max().unwrap_or(i64::MIN);
+        }
         origins
             .iter()
             .map(|origin| origin.next_recheck_at)
@@ -453,7 +458,12 @@ fn claim_owned(
             return Ok(false);
         }
         let owned = consume_owner.is_some() && owner.as_deref() == consume_owner;
-        let due = reset.map_or(next, |reset| reset.min(next)) <= now;
+        if !owned && owner.is_some() && next > now {
+            return Ok(false);
+        }
+        // Admission reuses its decision's generation even if a provider reset
+        // arrived while the decision held the slot.
+        let due = if owned { next <= now } else { reset.map_or(next, |reset| reset.min(next)) <= now };
         if !quota && !due && !owned {
             return Ok(false);
         }
@@ -495,8 +505,10 @@ fn claim_owned(
         }
         if owned && !due {
             conn.execute(
-                "UPDATE fence_recheck SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
-                params![origin.kind, origin.origin_key],
+                "UPDATE fence_recheck SET claim_owner=?3,
+                    reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END
+                    WHERE kind=?1 AND origin_key=?2",
+                params![origin.kind, origin.origin_key, grant_owner, now],
             )?;
             continue;
         }
@@ -543,6 +555,79 @@ const EXPIRED_ADMISSION_PROBES: &str = "SELECT DISTINCT a.principal,a.admission_
       AND a.admission_valid_until<=?1";
 
 impl AccountTx<'_> {
+    /// A selected probe may be sent without account admission. Persist its
+    /// interval and intended credential together so its report can settle only
+    /// that probe, even after the selection's in-memory hold expires.
+    pub fn bind_decision_probe(
+        &self,
+        origins: &[FenceRecheck],
+        from: &str,
+        decision: &str,
+        account: &str,
+        credential: &str,
+        now: i64,
+    ) -> RouteStateResult<bool> {
+        if origins.is_empty() {
+            return Ok(true);
+        }
+        if origins.iter().all(|origin| origin.claim_owner.as_deref() == Some(from)) {
+            self.transfer_probe_authorization(from, decision)?;
+            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                params![from,decision]).map_err(err)?;
+        } else if !self.grant_fence_rechecks(origins, now, Some(decision))? {
+            return Ok(false);
+        }
+        let identity = striatum_core::route_state_store::ProviderOutcome {
+            account_ref: account.into(), credential_id: Some(credential.into()), ..Default::default()
+        };
+        self.conn.execute("UPDATE model_route_decisions SET provider_identity_json=?2 WHERE id=?1",
+            params![decision,serde_json::to_string(&identity).map_err(err)?]).map_err(err)?;
+        Ok(true)
+    }
+
+    /// A report naming another credential, or an expired/replaced generation,
+    /// cannot settle the selected probe. Reports without a probe authorization
+    /// keep their ordinary account-evidence behavior.
+    pub fn probe_report_matches(&self, owner: &str, credential: Option<&str>, preserve: bool) -> RouteStateResult<bool> {
+        if !enabled(self.conn).map_err(err)? { return Ok(true); }
+        sync(self.conn).map_err(err)?;
+        let authorized: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)", [owner], |row| row.get(0)).map_err(err)?;
+        if !authorized { return Ok(true); }
+        if preserve { return Ok(false); }
+        let current: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a JOIN fence_recheck r
+             ON a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
+             AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation
+             WHERE a.owner=?1 AND r.cleared_at IS NULL)", [owner], |row| row.get(0)).map_err(err)?;
+        if !current { return Ok(false); }
+        let Some(credential) = credential else { return Ok(true); };
+        self.conn.query_row("SELECT COALESCE(json_extract(provider_identity_json,'$.credentialId')=?2,0)
+            FROM model_route_decisions WHERE id=?1", params![owner,credential], |row| row.get(0)).map_err(err)
+    }
+
+    /// Failure consumes the exact authorized generation from the time it was
+    /// reported, not the earlier selection time. Retire admission authorizations
+    /// too, so a later unstarted-admission expiry cannot reopen a reported send.
+    /// Inconclusive local/request failures still release non-quota probes;
+    /// quota probes retain their periodic limit regardless of failure attribution.
+    pub fn fail_authorized_probe(&self, owner: &str, now: i64, inconclusive: bool) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? { return Ok(()); }
+        sync(self.conn).map_err(err)?;
+        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2+CASE WHEN quota=1 THEN ?3 WHEN ?5 THEN 0 ELSE ?4 END,
+            claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?2 THEN reset_check_at END
+            WHERE r.cleared_at IS NULL AND EXISTS (SELECT 1 FROM fence_probe_authorization a
+                WHERE a.owner=?1 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
+                AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",
+            params![owner,now,QUOTA_FENCE_RECHECK_MS,NON_QUOTA_FENCE_MAX_MS,inconclusive]).map_err(err)?;
+        self.conn.execute("DELETE FROM fence_probe_authorization AS a WHERE owner!=?1 AND EXISTS (
+            SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1 AND p.kind=a.kind AND p.origin_key=a.origin_key
+            AND p.evidence=a.evidence AND p.evidence_at=a.evidence_at AND p.claim_generation=a.claim_generation)",
+            [owner]).map_err(err)?;
+        self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+        Ok(())
+    }
+
     /// Preview cleanup without acquiring a writer. The write path checks again
     /// because a runner may start the admission after this snapshot is read.
     pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
@@ -572,7 +657,8 @@ impl AccountTx<'_> {
         for (principal, admission, owner) in expired {
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
-            self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL
+            self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
+                 claim_generation=claim_generation+1
                 WHERE r.cleared_at IS NULL AND EXISTS (
                     SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
                       AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
@@ -745,7 +831,7 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, None, owner, owner).map_err(err)
+        claim_owned(self.conn, origins, now, owner, owner, owner).map_err(err)
     }
     /// Success can heal only evidence older than this request's admission. A
     /// late completion of an older run must not erase a more recent refusal.

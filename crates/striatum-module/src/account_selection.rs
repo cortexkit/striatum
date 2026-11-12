@@ -1338,8 +1338,20 @@ impl ClassContext {
             return Ok(());
         };
         if self.probe_eligible(provider, model, &admission.credential_id) {
-            hold.bind(provider, &admission.credential_id, decision, self.now_ms);
-            store.bind_fence_probe_owner(&hold.owner, decision)?;
+            let claimed = store.account_transaction(|tx| {
+                let origins: Vec<_> = tx.fence_rechecks()?.into_iter().filter(|origin| {
+                    self.origin_applies(origin, provider, &admission.account_id, &admission.credential_id, model)
+                        && !self.origin_recovered(origin, &admission.account_id)
+                }).collect();
+                tx.bind_decision_probe(&origins, &hold.owner, decision, &admission.account_id,
+                    &admission.credential_id, self.now_ms)
+            })?;
+            if !claimed {
+                return Err(RouteStateStoreError("the selected recovery probe was already claimed".into()));
+            }
+            // A runner may send without a later account admission. Its decision
+            // must own the durable interval before the route is returned.
+            hold.release_selected(provider, &admission.credential_id, self.now_ms);
         }
         Ok(())
     }
@@ -2520,7 +2532,8 @@ impl ClassContext {
                 }
                 if !origins
                     .iter()
-                    .all(|origin| self.origin_due(origin, &account, model))
+                    .all(|origin| self.origin_due(origin, &account, model)
+                        || owner.is_some() && origin.claim_owner.as_deref() == owner)
                 {
                     return Ok(false);
                 }

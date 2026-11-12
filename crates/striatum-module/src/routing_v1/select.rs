@@ -2744,12 +2744,18 @@ mod tests {
 
     #[tokio::test]
     async fn panel_builds_catalog_once_but_each_seat_owns_its_probe() {
+        for quota in [false, true] {
+            panel_shared_probe_case(quota).await;
+        }
+    }
+
+    async fn panel_shared_probe_case(quota: bool) {
         use super::super::conformance_tests::install_panel_families;
         let _clock = crate::InjectedClock::set(RECOVERY_NOW);
         let harness = Harness::new("shared-panel-probes");
         let mut catalog = fixture::catalog();
         // Two different families use the same subscription account. A due
-        // provider fence permits exactly one decision to own its recovery probe.
+        // account fence permits exactly one decision to own its recovery probe.
         catalog
             .models
             .retain(|model| model.provider == fixture::SUBSCRIPTION_PROVIDER);
@@ -2780,17 +2786,36 @@ mod tests {
         );
         assert_eq!(baseline.1["result"]["seats"].as_array().unwrap().len(), 2);
         assert_eq!(take_input_builds(&harness), [1, 2, 2]);
-        crate::credential_fences::record(
-            harness.store(),
-            &harness.credentials(),
-            &striatum_core::route_state_store::CredentialRefusal {
-                provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
-                credential_id: catalog.accounts[0].credential_id.clone(),
-                code: "billing_exhausted".into(),
-            },
-            RECOVERY_NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
-        )
-        .unwrap();
+        if quota {
+            *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
+            let at = RECOVERY_NOW as i64 - 900_001;
+            let scope = striatum_core::accounts::FenceScope::General(striatum_core::accounts::GeneralWindow::FiveHour);
+            let fence = striatum_core::accounts::Fence {
+                account_id: catalog.accounts[0].account_id.clone(),
+                pool: Some(scope.clone().into()), recovery_set: Vec::new(), observed_at_ms: at,
+                reset: striatum_core::accounts::ResetTime::At(RECOVERY_NOW as i64 + 5 * 86_400_000),
+                retry_hint_ms: None, source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
+            };
+            harness.store().account_transaction(|tx| {
+                tx.insert_fence(&striatum_store::AccountFenceRow {
+                    fence_id: "shared-panel-quota".into(), provider: fixture::SUBSCRIPTION_PROVIDER.into(),
+                    account_id: fence.account_id.clone(), scope_json: serde_json::to_string(&scope).unwrap(),
+                    fence_json: serde_json::to_string(&fence).unwrap(), source: "broca_limit_exhausted".into(),
+                    observed_at: at, principal: "test".into(), admission_id: None, observation_id: None,
+                    created_at: at, cleared_at: None, cleared_reason: None,
+                })
+            }).unwrap();
+        } else {
+            crate::credential_fences::record(
+                harness.store(), &harness.credentials(),
+                &striatum_core::route_state_store::CredentialRefusal {
+                    provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                    credential_id: catalog.accounts[0].credential_id.clone(),
+                    code: "billing_exhausted".into(),
+                },
+                RECOVERY_NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
+            ).unwrap();
+        }
         take_input_builds(&harness);
         let probe = route.call("route.select_panel", &request).await;
         assert_eq!(probe.0, subc_protocol::FrameType::Response, "{probe:?}");
@@ -2806,6 +2831,29 @@ mod tests {
             baseline.1["result"]["seats"][0]["answer"]["route"]
         );
         assert_eq!(take_input_builds(&harness), [1, 2, 2]);
+        if !quota { return; }
+        let decision = seats[0]["answer"]["decision_id"].clone();
+        let _later_panel = crate::InjectedClock::set(RECOVERY_NOW + 120_000);
+        let later = route.call("route.select_panel", &request).await;
+        assert_eq!(later.0, subc_protocol::FrameType::Response, "{later:?}");
+        assert_eq!(later.1["result"]["seats"].as_array().unwrap().len(), 0,
+            "a later panel cannot reuse the same quota probe: {later:?}");
+        let _failure = crate::InjectedClock::set(RECOVERY_NOW + 200_000);
+        let reported = route.call("route.report", &json!({"decision_id":decision,"outcome":"failed"})).await;
+        assert_eq!(reported.0, subc_protocol::FrameType::Response, "{reported:?}");
+        let _old_interval = crate::InjectedClock::set(RECOVERY_NOW + 900_000);
+        let waiting = route.call("route.select_panel", &request).await;
+        assert_eq!(waiting.1["result"]["seats"].as_array().unwrap().len(), 0, "{waiting:?}");
+        let _next_interval = crate::InjectedClock::set(RECOVERY_NOW + 1_100_000);
+        let credentials = harness.credentials();
+        let mut credentials = credentials.lock().unwrap();
+        let rows = credentials.listed_credentials().to_vec();
+        credentials.apply_listing(&cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "next-panel-interval".into(), credentials: rows, ..Default::default()
+        }, RECOVERY_NOW + 1_100_000);
+        drop(credentials);
+        let next = route.call("route.select_panel", &request).await;
+        assert_eq!(next.1["result"]["seats"].as_array().unwrap().len(), 1, "{next:?}");
     }
 
     const ACCOUNT_RESET: u64 = RECOVERY_NOW + 600_000;

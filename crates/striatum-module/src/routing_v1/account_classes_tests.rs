@@ -4220,13 +4220,11 @@ fn admit_directly(
     )
 }
 
-/// Two direct admissions race for one recovery probe. The loser builds its
-/// roster while the decision's probe reservation still excludes the account;
-/// the winner then claims the probe, which drops that reservation, before the
-/// loser explains its empty roster. The loser must still be told to wait:
-/// `account_not_authorized` would make its runner pause for sign-in.
+/// Selection owns the durable probe before admission. Other admissions must
+/// get a timed wait both before and after its owner's admission, never a
+/// sign-in refusal merely because the probe's account is excluded.
 #[tokio::test]
-async fn a_probe_claimed_between_roster_and_refusal_still_answers_a_timed_wait() {
+async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = credit_xai_fixture();
     let owner = harness.bind(reserved(OWNER), None).await;
@@ -4256,7 +4254,7 @@ async fn a_probe_claimed_between_roster_and_refusal_still_answers_a_timed_wait()
     assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
 
     // An hour after the credit refusal its route fence is due for one
-    // probe, and selection binds that probe's reservation to its decision.
+    // probe, and selection durably claims it for its decision.
     let deadline = receipt + 3_600_000;
     let _due = crate::InjectedClock::set(deadline);
     credit_xai_reading(Some(0.0), deadline as i64);
@@ -4281,45 +4279,47 @@ async fn a_probe_claimed_between_roster_and_refusal_still_answers_a_timed_wait()
     let mut loser = account_request("xai", "race-probe-loser");
     loser["caller"] = json!({"runner":RUNNER});
 
-    // The winner runs inside the loser's admission, after the loser's roster
-    // has excluded the reserved account and before its refusal is chosen.
-    let won = Arc::new(std::sync::Mutex::new(None));
-    {
-        let harness = harness.clone();
-        let won = won.clone();
-        let principal = principal.clone();
-        crate::account_selection::after_roster_prepared("race-probe-loser", move || {
-            *won.lock().unwrap() = Some(admit_directly(&harness, &principal, winner, deadline));
-        });
-    }
-    let lost = admit_directly(&harness, &principal, loser, deadline);
-    let won = won
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the winner ran between the loser's roster and its refusal");
-    match won {
-        crate::account_selection::OpReply::Result(result) => {
-            assert_eq!(result["account"]["credential_id"], "oauth:xai", "{result}")
+    for admitted in [false, true] {
+        if admitted {
+            // An unrelated admission also loses while the owner has prepared
+            // its roster but has not yet committed account admission.
+            let raced = Arc::new(std::sync::Mutex::new(None));
+            let raced_hook = raced.clone();
+            let harness_hook = harness.clone();
+            let principal_hook = principal.clone();
+            let mut contender = loser.clone();
+            contender["admission_id"] = json!("during-owner-admission");
+            crate::account_selection::after_roster_prepared("race-probe-winner", move || {
+                *raced_hook.lock().unwrap() = Some(admit_directly(&harness_hook, &principal_hook, contender, deadline));
+            });
+            match admit_directly(&harness, &principal, winner.clone(), deadline) {
+                crate::account_selection::OpReply::Result(result) => {
+                    assert_eq!(result["account"]["credential_id"], "oauth:xai", "{result}")
+                }
+                other => panic!("the probe decision's admission was refused: {other:?}"),
+            }
+            assert!(matches!(raced.lock().unwrap().take(),
+                Some(crate::account_selection::OpReply::Error { code, detail: Some(detail), .. })
+                    if code == "account_pool_exhausted" && detail["reset_at_ms"].as_u64().is_some()));
         }
-        other => panic!("the probe decision's admission was refused: {other:?}"),
-    }
-    match lost {
-        crate::account_selection::OpReply::Error { code, detail, .. } => {
-            let detail = detail.unwrap_or_default();
-            assert_eq!(
-                code, "account_pool_exhausted",
-                "losing the probe is a wait, never an authorization failure: {detail}"
-            );
-            let retry_at = detail["reset_at_ms"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("the wait names when to retry: {detail}"));
-            assert!(
-                (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
-                "{detail}"
-            );
+        loser["admission_id"] = json!(format!("other-admission-{admitted}"));
+        match admit_directly(&harness, &principal, loser.clone(), deadline) {
+            crate::account_selection::OpReply::Error { code, detail, .. } => {
+                let detail = detail.unwrap_or_default();
+                assert_eq!(
+                    code, "account_pool_exhausted",
+                    "losing the probe is a wait, never an authorization failure: {detail}"
+                );
+                let retry_at = detail["reset_at_ms"]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("the wait names when to retry: {detail}"));
+                assert!(
+                    (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
+                    "{detail}"
+                );
+            }
+            other => panic!("a second probe was admitted: {other:?}"),
         }
-        other => panic!("a second probe was admitted: {other:?}"),
     }
 }
 

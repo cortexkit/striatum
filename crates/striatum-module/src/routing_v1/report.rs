@@ -8,9 +8,10 @@
 //! Outcomes are audit
 //! facts, not evidence that quota is exhausted. Eligibility and explicitly
 //! size-shaped refusals restrict only the account that actually served, and
-//! a failure with a future reset closes only the decision's route on that
-//! account until the reset, for at most 24 hours. Usage the report carries
-//! joins the route's usage history untimed, with an absent count kept
+//! a failed report with `runner_code` `account_limit_exhausted`/`quota_exhausted`
+//! or a future `reset_at_ms` keeps that account's route fenced until fresh
+//! recovery evidence arrives. A reset schedules an extra check, not a fixed hold.
+//! Reported usage joins the route's usage history untimed, with an absent count kept
 //! unknown; a report without output adds no history row.
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
@@ -73,6 +74,7 @@ pub(super) fn report_at(
         .and_then(|q| q.lock().ok().map(|q| q.clone())).unwrap_or_default();
     let account_ids = credentials.quota_account_ids(&quota);
     let mut effects = prepare_account_facts(params, &decision, deps, now as i64, &credentials, &quota, &account_ids)?;
+    effects.preserve_probe = !matches!(params["outcome"].as_str(), Some("completed" | "failed" | "cancelled"));
     let usage = request
         .usage
         .as_ref()
@@ -184,6 +186,7 @@ fn prepare_account_facts(
     account_ids: &crate::broca_credentials::CredentialAccounts,
 ) -> Result<striatum_store::V1ReportEffects, Refusal> {
     let mut effects = striatum_store::V1ReportEffects::default();
+    effects.reported_credential = params.get("credential_id").and_then(Value::as_str).map(str::to_owned);
     effects.quota_scope = Some(striatum_store::QuotaSuccessScope {
         family: super::operator_config(deps)
             .allocator_policy(&decision.provider)
