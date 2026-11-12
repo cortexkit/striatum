@@ -523,6 +523,12 @@ impl ClassContext {
 
 mod probe_reservations;
 
+// Replay tests compare old and new context repairs, including endpoint work
+// dispatched to blocking threads, so the test switch must be shared.
+#[cfg(test)]
+pub(crate) static LEGACY_CONTEXT_REPAIRS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
     pub(crate) static CONTEXT_LOADS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1070,10 +1076,16 @@ impl ClassContext {
             .chain(media_providers.iter())
             .collect::<BTreeSet<_>>()
         {
-            for (credential, state) in store
-                .pool_key_states(provider, now_ms)
-                .map_err(|error| error.to_string())?
-            {
+            let read_states = || store.pool_key_states(provider, now_ms);
+            #[cfg(test)]
+            let read_states = || {
+                if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
+                    store.legacy_pool_key_states_for_test(provider, now_ms)
+                } else {
+                    read_states()
+                }
+            };
+            for (credential, state) in read_states().map_err(|error| error.to_string())? {
                 if state.walled_until_ms.is_some_and(|until| until > now_ms)
                     || state.cooldown_until_ms.is_some_and(|until| until > now_ms)
                 {
@@ -1136,81 +1148,7 @@ impl ClassContext {
         let transient_route_fences = store
             .transient_account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
-        if !route_fences.is_empty() {
-            store
-                .account_transaction(|tx| {
-                    for fence in &route_fences {
-                        let recovery = (|| -> RouteStateResult<Option<i64>> {
-                            let account = crate::credential_fences::credential_account_id(
-                                &account_ids,
-                                &fence.credential_id,
-                            );
-                            let Some(account) = account else {
-                                return Ok(None);
-                            };
-                            // Clear all routes for a credential only after a reading newer
-                            // than every report and recovery of every retained account pool.
-                            let Some(newest_report) =
-                                latest_reports.get(&fence.credential_id).copied()
-                            else {
-                                return Ok(None);
-                            };
-                            let Some(latest) = crate::credential_fences::latest_reading_for_account(
-                                &quota, &account,
-                            ) else {
-                                return Ok(None);
-                            };
-                            let reading =
-                                quota_reading_for_model(&latest.entry, &account, None, &[]);
-                            let policy = config.allocator_policy(&fence.provider);
-                            let blocks: Vec<_> = tx
-                                .active_pool_fences(&fence.provider)?
-                                .into_iter()
-                                .filter(|block| block.evidence.account_id == account)
-                                .collect();
-                            let recovered = if blocks.is_empty() {
-                                crate::credential_fences::fresh_headroom_after_for_account(
-                                    &quota,
-                                    &account,
-                                    newest_report,
-                                    now_ms,
-                                    &policy,
-                                )
-                            } else {
-                                blocks.iter().all(|block| {
-                                    serde_json::from_str::<Fence>(&block.evidence.fence_json)
-                                        .is_ok_and(|mut evidence| {
-                                            evidence.pool = block.pool_key.clone();
-                                            evidence.recovery_set = block.recovery_set.clone();
-                                            evidence.observed_at_ms =
-                                                evidence.observed_at_ms.max(newest_report);
-                                            block_end(&evidence, reading.as_ref(), now_ms, &policy)
-                                                .is_some()
-                                        })
-                                })
-                            };
-                            Ok(recovered
-                                .then(|| {
-                                    latest
-                                        .entry
-                                        .get("fetchedAt")
-                                        .and_then(Value::as_str)
-                                        .and_then(account_quota::parse_rfc3339_ms)
-                                })
-                                .flatten())
-                        })()?;
-                        if let Some(at) = recovery {
-                            tx.clear_account_route_fences_before(
-                                &fence.provider,
-                                &fence.credential_id,
-                                at,
-                            )?;
-                        }
-                    }
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
-        }
+        repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
         route_fences = store
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
@@ -3529,6 +3467,187 @@ pub(crate) fn refresh_all_blocks(
         }
         Ok(())
     })
+}
+
+fn route_fence_recoveries(
+    tx: &AccountTx<'_>,
+    account_ids: &crate::broca_credentials::CredentialAccounts,
+    quota: &AccountQuotaState,
+    config: &crate::config_overrides::LiveConfig,
+    now_ms: i64,
+) -> RouteStateResult<Vec<(String, String, i64)>> {
+    let latest_reports = tx.route_fence_latest_reports()?;
+    let mut recoveries = Vec::new();
+    for fence in tx.report_route_fences(now_ms)? {
+        let Some(account) =
+            crate::credential_fences::credential_account_id(account_ids, &fence.credential_id)
+        else {
+            continue;
+        };
+        let Some(newest_report) = latest_reports.get(&fence.credential_id).copied() else {
+            continue;
+        };
+        let Some(latest) = crate::credential_fences::latest_reading_for_account(quota, &account)
+        else {
+            continue;
+        };
+        let Some(at) = latest
+            .entry
+            .get("fetchedAt")
+            .and_then(Value::as_str)
+            .and_then(account_quota::parse_rfc3339_ms)
+            .filter(|at| *at > newest_report)
+        else {
+            continue;
+        };
+        let reading = quota_reading_for_model(&latest.entry, &account, None, &[]);
+        let policy = config.allocator_policy(&fence.provider);
+        let blocks: Vec<_> = tx
+            .active_pool_fences(&fence.provider)?
+            .into_iter()
+            .filter(|block| block.evidence.account_id == account)
+            .collect();
+        // A credential-wide clear requires newer evidence than every report
+        // and recovery of every retained pool, not just the route being scored.
+        let recovered = if blocks.is_empty() {
+            crate::credential_fences::fresh_headroom_after_for_account(
+                quota,
+                &account,
+                newest_report,
+                now_ms,
+                &policy,
+            )
+        } else {
+            blocks.iter().all(|block| {
+                serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(
+                    |mut evidence| {
+                        evidence.pool = block.pool_key.clone();
+                        evidence.recovery_set = block.recovery_set.clone();
+                        evidence.observed_at_ms = evidence.observed_at_ms.max(newest_report);
+                        block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
+                    },
+                )
+            })
+        };
+        if recovered {
+            recoveries.push((fence.provider, fence.credential_id, at));
+        }
+    }
+    Ok(recoveries)
+}
+
+pub(crate) fn repair_route_fences(
+    store: &SqliteRouteStateStore,
+    account_ids: &crate::broca_credentials::CredentialAccounts,
+    quota: &AccountQuotaState,
+    config: &crate::config_overrides::LiveConfig,
+    now_ms: i64,
+    after_read: impl FnOnce(),
+) -> Result<(), String> {
+    #[cfg(test)]
+    if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
+        return legacy_route_fence_repair(store, account_ids, quota, config, now_ms);
+    }
+    let recoveries = store
+        .account_read(|tx| route_fence_recoveries(tx, account_ids, quota, config, now_ms))
+        .map_err(|error| error.to_string())?;
+    if recoveries.is_empty() {
+        return Ok(());
+    }
+    after_read();
+    store
+        .account_repair(|tx| {
+            // Re-read reports and pool requirements under the IMMEDIATE writer.
+            // A newer report can invalidate the read snapshot's recovery entirely.
+            let mut changed = false;
+            for (provider, credential, at) in
+                route_fence_recoveries(tx, account_ids, quota, config, now_ms)?
+            {
+                changed |= tx.clear_account_route_fences_before(&provider, &credential, at)? > 0;
+            }
+            Ok(changed)
+        })
+        .map_err(|error| error.to_string())
+}
+
+// Independent pre-read-first recovery path used only by the differential test.
+#[cfg(test)]
+fn legacy_route_fence_repair(
+    store: &SqliteRouteStateStore,
+    account_ids: &crate::broca_credentials::CredentialAccounts,
+    quota: &AccountQuotaState,
+    config: &crate::config_overrides::LiveConfig,
+    now_ms: i64,
+) -> Result<(), String> {
+    let routes = store
+        .account_route_fences(now_ms)
+        .map_err(|e| e.to_string())?;
+    if routes.is_empty() {
+        return Ok(());
+    }
+    let reports = store
+        .account_route_fence_latest_reports()
+        .map_err(|e| e.to_string())?;
+    store
+        .account_transaction(|tx| {
+            for fence in &routes {
+                let Some(account) = crate::credential_fences::credential_account_id(
+                    account_ids,
+                    &fence.credential_id,
+                ) else {
+                    continue;
+                };
+                let Some(report) = reports.get(&fence.credential_id).copied() else {
+                    continue;
+                };
+                let Some(latest) =
+                    crate::credential_fences::latest_reading_for_account(quota, &account)
+                else {
+                    continue;
+                };
+                let reading = quota_reading_for_model(&latest.entry, &account, None, &[]);
+                let policy = config.allocator_policy(&fence.provider);
+                let blocks: Vec<_> = tx
+                    .active_pool_fences(&fence.provider)?
+                    .into_iter()
+                    .filter(|block| block.evidence.account_id == account)
+                    .collect();
+                let recovered = if blocks.is_empty() {
+                    crate::credential_fences::fresh_headroom_after_for_account(
+                        quota, &account, report, now_ms, &policy,
+                    )
+                } else {
+                    blocks.iter().all(|block| {
+                        serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(
+                            |mut evidence| {
+                                evidence.pool = block.pool_key.clone();
+                                evidence.recovery_set = block.recovery_set.clone();
+                                evidence.observed_at_ms = evidence.observed_at_ms.max(report);
+                                block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
+                            },
+                        )
+                    })
+                };
+                if let Some(at) = recovered
+                    .then(|| {
+                        latest
+                            .entry
+                            .get("fetchedAt")
+                            .and_then(Value::as_str)
+                            .and_then(account_quota::parse_rfc3339_ms)
+                    })
+                    .flatten()
+                {
+                    tx.clear_account_route_fences_before(
+                        &fence.provider,
+                        &fence.credential_id,
+                        at,
+                    )?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
 }
 
 /// Reconcile both newly reported and persisted credential refusals. Once an

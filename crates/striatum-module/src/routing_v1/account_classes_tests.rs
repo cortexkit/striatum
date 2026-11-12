@@ -4478,3 +4478,732 @@ async fn stale_api_billing_probe_passes_its_route_fence_once_even_with_spend_rea
         old
     );
 }
+
+#[test]
+fn s4b_unchanged_contexts_on_both_s0_fixtures_take_only_catalog_key_writer() {
+    use super::request_cpu_bench as bench;
+    let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+    let counts = bench::FixtureCounts {
+        subscription_rules: 10,
+        exclusion_rules: 103,
+        runner_route_rules: 0,
+        catalog_facts: 836,
+        listed_credentials: 39,
+    };
+    for fixture in [
+        bench::production_fixture(),
+        bench::representative_fixture(counts),
+    ] {
+        let store = fixture.store();
+        let credentials = fixture.credentials();
+        // Materialize the fixture's seeded repair clocks before measuring an
+        // unchanged load. Only the catalogue writer-local key check is exempt.
+        crate::account_selection::ClassContext::load(
+            store,
+            &credentials,
+            fixture.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            bench::FIXTURE_NOW as i64,
+        )
+        .unwrap()
+        .reserve_selection_probes(store, &credentials)
+        .unwrap();
+        let commits = store.writer_commit_count_for_test();
+        let acquisitions = store.writer_acquisition_count_for_test();
+        let mut context = crate::account_selection::ClassContext::load(
+            store,
+            &credentials,
+            fixture.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            bench::FIXTURE_NOW as i64,
+        )
+        .unwrap();
+        context
+            .reserve_selection_probes(store, &credentials)
+            .unwrap();
+        assert_eq!(store.writer_commit_count_for_test(), commits);
+        assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 1);
+    }
+}
+
+#[test]
+fn s4b_route_recovery_unchanged_does_not_acquire_writer() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "model".into(),
+            until_ms: NOW as i64 + 3_600_000,
+            decision_id: "report".into(),
+            recorded_at: NOW as i64,
+        })
+        .unwrap();
+    let quota = crate::account_quota::AccountQuotaState::default();
+    let ids = credentials.quota_account_ids(&quota);
+    let commits = harness.store().writer_commit_count_for_test();
+    let acquisitions = harness.store().writer_acquisition_count_for_test();
+    crate::account_selection::repair_route_fences(
+        harness.store(),
+        &ids,
+        &quota,
+        &harness.operator_config(),
+        NOW as i64,
+        || panic!("unchanged recovery must not proceed to the writer"),
+    )
+    .unwrap();
+    assert_eq!(harness.store().writer_commit_count_for_test(), commits);
+    assert_eq!(
+        harness.store().writer_acquisition_count_for_test(),
+        acquisitions
+    );
+}
+
+#[test]
+fn s4b_route_recovery_rechecks_newer_sibling_report_under_writer() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, credentials) = setup("synthetic", false);
+    let now = NOW as i64;
+    let report = |model: &str, at| {
+        harness
+            .store()
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                model: model.into(),
+                until_ms: now + 3_600_000,
+                decision_id: model.into(),
+                recorded_at: at,
+            })
+            .unwrap()
+    };
+    report("model", now - 100);
+    oauth_weekly_reading_at(10.0, now + 3_600_000, now);
+    let quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
+    let ids = credentials.quota_account_ids(&quota);
+    crate::account_selection::repair_route_fences(
+        harness.store(),
+        &ids,
+        &quota,
+        &harness.operator_config(),
+        now,
+        || report("newer-sibling", now + 1_000),
+    )
+    .unwrap();
+    assert_eq!(
+        harness.store().account_route_fences(now).unwrap().len(),
+        2,
+        "newer evidence on a sibling route invalidates credential-wide recovery"
+    );
+    oauth_weekly_reading_at(10.0, now + 3_600_000, now + 10_000);
+    let quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
+    let commits = harness.store().writer_commit_count_for_test();
+    crate::account_selection::repair_route_fences(
+        harness.store(),
+        &ids,
+        &quota,
+        &harness.operator_config(),
+        now + 10_000,
+        || {},
+    )
+    .unwrap();
+    assert!(harness
+        .store()
+        .account_route_fences(now)
+        .unwrap()
+        .is_empty());
+    assert_eq!(harness.store().writer_commit_count_for_test() - commits, 1);
+    let acquisitions = harness.store().writer_acquisition_count_for_test();
+    crate::account_selection::repair_route_fences(
+        harness.store(),
+        &ids,
+        &quota,
+        &harness.operator_config(),
+        now + 10_000,
+        || {},
+    )
+    .unwrap();
+    assert_eq!(harness.store().writer_commit_count_for_test() - commits, 1);
+    assert_eq!(
+        harness.store().writer_acquisition_count_for_test(),
+        acquisitions
+    );
+}
+
+fn s4b_load(harness: &Harness, now: i64) -> crate::account_selection::ClassContext {
+    crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap()
+}
+
+fn s4b_refusal(harness: &Harness, at: i64) {
+    crate::credential_fences::record(
+        harness.store(),
+        &harness.credentials(),
+        &CredentialRefusal {
+            provider_id: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            code: "billing_exhausted".into(),
+        },
+        at,
+    )
+    .unwrap();
+}
+
+fn s4b_route(harness: &Harness, at: i64, until: i64) {
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "model".into(),
+            until_ms: until,
+            decision_id: "fixed-report".into(),
+            recorded_at: at,
+        })
+        .unwrap();
+}
+
+fn s4b_seed_trigger(
+    harness: &Harness,
+    credentials: &mut BrocaCredentials,
+    trigger: &str,
+    now: i64,
+) -> u64 {
+    let reset = now + 3_600_000;
+    match trigger {
+        "continuation" => {
+            harness
+                .store()
+                .account_transaction(|tx| {
+                    tx.record_continuation(
+                        "test",
+                        "expired-offer",
+                        &striatum_store::V1Recorded {
+                            body_json: "{}".into(),
+                            answer_json: "{}".into(),
+                        },
+                        "run",
+                        "admission",
+                        "previous",
+                        Some(("decision", "reservation", now)),
+                    )
+                })
+                .unwrap();
+        }
+        "listing" => {
+            let fingerprint = match credentials.listing_fingerprint("oauth:test") {
+                crate::broca_credentials::ListingLookup::Listed(fingerprint) => fingerprint,
+                _ => panic!("listed fixture"),
+            };
+            harness
+                .store()
+                .record_account_eligibility(&striatum_store::AccountEligibilityFact {
+                    provider: "synthetic".into(),
+                    credential_id: "oauth:test".into(),
+                    model: "other".into(),
+                    listing_fingerprint: Some(fingerprint.clone()),
+                    code: "ineligible".into(),
+                    observed_at: now - 100,
+                })
+                .unwrap();
+            for (credential, fingerprint) in [
+                ("oauth:test", Some(fingerprint.as_str())),
+                ("apikey:test", None),
+            ] {
+                harness
+                    .store()
+                    .record_credential_entitlement_fence(
+                        &CredentialRefusal {
+                            provider_id: "synthetic".into(),
+                            credential_id: credential.into(),
+                            code: "ENTITLEMENT_ERROR".into(),
+                        },
+                        fingerprint,
+                        now - 100,
+                    )
+                    .unwrap();
+            }
+            let mut rows = credentials.listed_credentials().to_vec();
+            for row in &mut rows {
+                row.plan_tier = Some(format!("changed-{now}"));
+            }
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: format!("changed-{now}"),
+                    credentials: rows,
+                    ..Default::default()
+                },
+                now as u64,
+            );
+            harness.set_credentials(credentials.clone());
+            // Clearing a listing-bound entitlement also checks its quota holds
+            // in one transaction, in addition to the three listing row repairs.
+            return 4;
+        }
+        "pool_deadline" => {
+            let mut rows = credentials.listed_credentials().to_vec();
+            rows.iter_mut()
+                .find(|row| row.id == "apikey:test")
+                .unwrap()
+                .categories
+                .push("media-provider".into());
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    view: "media-pool".into(),
+                    credentials: rows,
+                    ..Default::default()
+                },
+                now as u64,
+            );
+            harness.set_credentials(credentials.clone());
+            harness.store().with_writer_for_test(|conn| conn.execute(
+                "INSERT INTO pool_key_state(provider,credential_id,cooldown_until,updated_at) VALUES ('synthetic','oauth:test',1,0)",
+                [],
+            ).map(|_| ())).unwrap();
+        }
+        "size" => {
+            harness
+                .store()
+                .record_account_size_refusal(&striatum_store::AccountSizeRefusal {
+                    provider: "synthetic".into(),
+                    credential_id: "oauth:test".into(),
+                    model: "model".into(),
+                    size_class: 17,
+                    expires_at: reset,
+                    observed_at: now - 100,
+                })
+                .unwrap();
+            oauth_weekly_reading_at(10.0, reset, now);
+        }
+        "route_headroom" => {
+            s4b_route(harness, now - 100, reset);
+            oauth_weekly_reading_at(10.0, reset, now);
+        }
+        "route_reset" => {
+            s4b_route(harness, now - 100, reset + 3_600_000);
+            oauth_weekly_reading_at(100.0, reset, now);
+        }
+        "quota_create" | "quota_reset" | "quota_headroom" => {
+            oauth_weekly_reading_at(100.0, reset + 3_600_000, now - 100);
+            s4b_refusal(harness, now - 100);
+            if trigger != "quota_create" {
+                s4b_load(harness, now - 100);
+            }
+            oauth_weekly_reading_at(
+                if trigger == "quota_headroom" {
+                    10.0
+                } else {
+                    100.0
+                },
+                reset,
+                now,
+            );
+        }
+        "account" => {
+            exhaust_oauth(harness, "synthetic");
+            oauth_weekly_reading_at(10.0, reset, now);
+            // The seeded account fence is for the five-hour pool, so recovery
+            // must present that same window, not a different weekly pool.
+            let mut quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
+            for reading in quota.readings.readings.values_mut() {
+                reading.entry["usage"]["primary"]["windowMinutes"] = json!(300);
+            }
+        }
+        _ => panic!("unknown trigger {trigger}"),
+    }
+    1
+}
+
+fn s4b_repair_rows(
+    harness: &Harness,
+) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    [
+        "account_continue",
+        "account_eligibility",
+        "credential_entitlement_fences",
+        "account_size_refusal",
+        "pool_key_state",
+        "account_route_fence",
+        "account_fence",
+        "fence_recheck",
+        "fence_retired_origin",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut query = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3"))
+            .unwrap();
+        let columns = query.column_count();
+        let rows = query
+            .query_map([], |row| {
+                (0..columns).map(|column| row.get(column)).collect()
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()
+            .unwrap();
+        (table.into(), rows)
+    })
+    .collect()
+}
+
+#[test]
+fn s4b_each_context_repair_is_durable_and_not_repeated() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for trigger in [
+        "continuation",
+        "pool_deadline",
+        "listing",
+        "size",
+        "route_headroom",
+        "route_reset",
+        "quota_create",
+        "quota_reset",
+        "quota_headroom",
+        "account",
+    ] {
+        let (harness, mut credentials) = setup("synthetic", false);
+        let now = NOW as i64 + 10_000;
+        let expected = s4b_seed_trigger(&harness, &mut credentials, trigger, now);
+        let commits = harness.store().writer_commit_count_for_test();
+        s4b_load(&harness, now);
+        assert_eq!(
+            harness.store().writer_commit_count_for_test() - commits,
+            expected,
+            "{trigger}: each affected repair commits once"
+        );
+        let rows = s4b_repair_rows(&harness);
+        let acquisitions = harness.store().writer_acquisition_count_for_test();
+        s4b_load(&harness, now);
+        assert_eq!(
+            s4b_repair_rows(&harness),
+            rows,
+            "{trigger}: repeated load changes no durable row"
+        );
+        assert_eq!(
+            harness.store().writer_commit_count_for_test() - commits,
+            expected,
+            "{trigger}: no repeated commit"
+        );
+        assert_eq!(
+            harness.store().writer_acquisition_count_for_test() - acquisitions,
+            1,
+            "{trigger}: only the catalog key check"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct S4bReplayStep {
+    context: Value,
+    rows: std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>>,
+    pick: Value,
+    admission: Value,
+}
+
+async fn s4b_replay(legacy: bool) -> Vec<S4bReplayStep> {
+    let mut inputs = striatum_store::replay::Inputs::new(NOW as i64 + 10_000);
+    let _replay = inputs.install();
+    struct ResetLegacy;
+    impl Drop for ResetLegacy {
+        fn drop(&mut self) {
+            crate::account_selection::LEGACY_CONTEXT_REPAIRS
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _reset = ResetLegacy;
+    crate::account_selection::LEGACY_CONTEXT_REPAIRS
+        .store(legacy, std::sync::atomic::Ordering::SeqCst);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    // Fixture bootstrap has a process-local catalogue generation and a real
+    // telemetry-window start. Compare every table changed by the replay, not
+    // those untouched bootstrap rows; all action-generated values stay exact.
+    let baseline = s4b_all_rows(&harness);
+    let mut steps = Vec::new();
+    for (index, trigger) in [
+        "continuation",
+        "pool_deadline",
+        "listing",
+        "listing",
+        "size",
+        "route_headroom",
+        "route_reset",
+        "quota_create",
+        "quota_headroom",
+        "quota_create",
+        "quota_reset",
+        "account",
+        "size",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let now = NOW as i64 + 10_000 * (index as i64 + 1);
+        inputs.now_ms = now;
+        let _step_clock = inputs.install();
+        s4b_seed_trigger(&harness, &mut credentials, trigger, now);
+        let mut context = s4b_load(&harness, now);
+        context
+            .reserve_selection_probes(harness.store(), &harness.credentials())
+            .unwrap();
+        let context = json!({
+            "facts": context.facts, "refusals": format!("{:?}", context.refusals), "fences": context.fences,
+            "subscription": context.probe("synthetic", "model", false, false, None, "fixed-conversation"),
+            "priced": context.probe("synthetic", "model", true, false, None, "fixed-conversation"),
+        });
+        let pick = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30}}),
+            )
+            .await;
+        let admission = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", &format!("replay-{index}")),
+            )
+            .await;
+        let mut rows = s4b_all_rows(&harness);
+        rows.retain(|table, rows| baseline.get(table) != Some(rows));
+        steps.push(S4bReplayStep {
+            context,
+            rows,
+            pick: json!({"type":format!("{:?}",pick.0), "body":pick.1}),
+            admission: json!({"type":format!("{:?}",admission.0), "body":admission.1}),
+        });
+    }
+    steps
+}
+
+#[tokio::test]
+async fn s4b_trigger_sequences_match_pre_read_first_rows_context_picks_and_admissions() {
+    let _clock = crate::InjectedClock::set(NOW + 10_000);
+    // Replay inputs keep all generated identities and answers comparable;
+    // nothing is masked, including admission answers and persisted claim owners.
+    let before = s4b_replay(true).await;
+    let after = s4b_replay(false).await;
+    for (index, (before, after)) in before.iter().zip(&after).enumerate() {
+        assert_eq!(before, after, "trigger sequence diverged at step {index}");
+    }
+}
+
+#[tokio::test]
+async fn s4b_selection_reserving_a_probe_keeps_its_commit_count() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let mut counts = Vec::new();
+    for legacy in [true, false] {
+        let _replay = striatum_store::replay::Inputs::new(NOW as i64).install();
+        let (harness, _) = setup("synthetic", false);
+        crate::credential_fences::record(
+            harness.store(),
+            &harness.credentials(),
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            NOW as i64 - 7_200_000,
+        )
+        .unwrap();
+        crate::account_selection::LEGACY_CONTEXT_REPAIRS
+            .store(legacy, std::sync::atomic::Ordering::SeqCst);
+        let caller = harness.bind(reserved(OWNER), None).await;
+        let commits = harness.store().writer_commit_count_for_test();
+        let selected = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":30}}),
+            )
+            .await;
+        crate::account_selection::LEGACY_CONTEXT_REPAIRS
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        counts.push(harness.store().writer_commit_count_for_test() - commits);
+        let runner = harness.bind(reserved(RUNNER), None).await;
+        let reserved = runner
+            .call(
+                "route.account_for",
+                &account_request("synthetic", "reserved-elsewhere"),
+            )
+            .await;
+        assert_eq!(
+            reserved.1["code"], "account_pool_exhausted",
+            "selection must really reserve the only subscription probe: {}",
+            reserved.1
+        );
+    }
+    assert!(counts[0] > 0);
+    assert_eq!(counts[0], counts[1]);
+}
+
+#[tokio::test]
+async fn s4b_what_if_fresh_headroom_repairs_only_its_snapshot() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let now = NOW as i64;
+    oauth_weekly_reading_at(100.0, now + 3_600_000, now - 100);
+    s4b_route(&harness, now - 100, now + 3_600_000);
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let request = json!({"consumer":"mason","iqs":[30]});
+    let exhausted = operator.call("route.what_if", &request).await;
+    assert_eq!(exhausted.0, FrameType::Response, "{}", exhausted.1);
+    assert!(
+        exhausted.1["result"]["results"][0]["pick"].is_null(),
+        "{}",
+        exhausted.1
+    );
+    oauth_weekly_reading_at(10.0, now + 3_600_000, now);
+    let rows = s4b_repair_rows(&harness);
+    let acquisitions = harness.store().writer_acquisition_count_for_test();
+    let commits = harness.store().writer_commit_count_for_test();
+    let answer = operator.call("route.what_if", &request).await;
+    assert_eq!(answer.0, FrameType::Response, "{}", answer.1);
+    assert!(
+        answer.1["result"]["results"][0]["pick"].is_object(),
+        "fresh headroom must actually recover the preview's account: {}",
+        answer.1
+    );
+    // These three acquisitions are catalogue-change key reads on the writer
+    // connection, not read-first repair acquisitions. Moving facts reads off
+    // the writer should bring the acquisition count to zero.
+    assert_eq!(
+        harness.store().writer_acquisition_count_for_test() - acquisitions,
+        3
+    );
+    assert_eq!(harness.store().writer_commit_count_for_test(), commits);
+    assert_eq!(s4b_repair_rows(&harness), rows);
+    // A later live load must still perform its own durable recovery, just as a
+    // control store that never evaluated the preview would have to do.
+    let commits = harness.store().writer_commit_count_for_test();
+    let context = s4b_load(&harness, now);
+    assert_eq!(harness.store().writer_commit_count_for_test() - commits, 1);
+    assert!(harness
+        .store()
+        .account_route_fences(now)
+        .unwrap()
+        .is_empty());
+    assert!(context
+        .probe("synthetic", "model", false, false, None, "live")
+        .admission()
+        .is_some());
+}
+
+#[test]
+fn s4b_patched_headroom_snapshot_and_writable_control_repair_independently() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let now = NOW as i64;
+    oauth_weekly_reading_at(10.0, now + 3_600_000, now);
+    s4b_route(&harness, now - 100, now + 3_600_000);
+    harness.edit_config(|config| config["accounts"]["soft_quota_remaining_percent"] = json!(95.0));
+    let original = harness.operator_config();
+    let before = s4b_load(&harness, now);
+    assert!(before
+        .probe("synthetic", "model", false, false, None, "live")
+        .admission()
+        .is_none());
+    harness.edit_config(|config| config["accounts"]["soft_quota_remaining_percent"] = json!(5.0));
+    let patched = harness.operator_config();
+    harness.edit_config(|config| config["accounts"]["soft_quota_remaining_percent"] = json!(95.0));
+    let rows = s4b_repair_rows(&harness);
+    let acquisitions = harness.store().writer_acquisition_count_for_test();
+    let snapshot = harness.store().account_evaluation_snapshot(now).unwrap();
+    let snapshot_commits = snapshot.writer_commit_count_for_test();
+    let projected = crate::account_selection::ClassContext::load(
+        &snapshot,
+        &harness.credentials(),
+        patched.clone(),
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap();
+    assert!(projected
+        .probe("synthetic", "model", false, false, None, "live")
+        .admission()
+        .is_some());
+    assert!(snapshot.writer_commit_count_for_test() > snapshot_commits);
+    assert!(snapshot.account_route_fences(now).unwrap().is_empty());
+    assert_eq!(
+        harness.store().writer_acquisition_count_for_test(),
+        acquisitions
+    );
+    assert_eq!(s4b_repair_rows(&harness), rows);
+    let after = crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        original,
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        before.probe("synthetic", "model", false, false, None, "live"),
+        after.probe("synthetic", "model", false, false, None, "live")
+    );
+    assert_eq!(s4b_repair_rows(&harness), rows);
+    let commits = harness.store().writer_commit_count_for_test();
+    crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        patched,
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        harness.store().writer_commit_count_for_test() - commits,
+        1,
+        "the same patch on a writable context really takes the repair path"
+    );
+    assert!(harness
+        .store()
+        .account_route_fences(now)
+        .unwrap()
+        .is_empty());
+}
+
+fn s4b_all_rows(
+    harness: &Harness,
+) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let tables = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let columns = conn
+                .prepare(&format!("SELECT * FROM \"{table}\""))
+                .unwrap()
+                .column_count();
+            let order = (1..=columns)
+                .map(|column| column.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let rows = conn
+                .prepare(&format!("SELECT * FROM \"{table}\" ORDER BY {order}"))
+                .unwrap()
+                .query_map([], |row| {
+                    (0..columns).map(|column| row.get(column)).collect()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<Vec<rusqlite::types::Value>>>>()
+                .unwrap();
+            (table, rows)
+        })
+        .collect()
+}

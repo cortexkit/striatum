@@ -647,6 +647,24 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Latest report times in this transaction's view, including reports on
+    /// sibling routes of the same credential.
+    pub fn route_fence_latest_reports(
+        &self,
+    ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at))
+             FROM account_route_fence GROUP BY credential_id",
+            )
+            .map_err(err)?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(err)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(err)
+    }
+
     /// Clear older route evidence in the same transaction that checked its
     /// account's pool recovery requirements.
     pub fn clear_account_route_fences_before(
@@ -893,28 +911,59 @@ impl SqliteRouteStateStore {
                 .entry(credential.as_str())
                 .or_insert(fingerprint.as_str());
         }
-        self.store.with_conn(|conn: &Connection| {
-            if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(()); }
-            let read = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
-            let credentials = {
-                let mut statement = read.prepare("SELECT DISTINCT credential_id,listing_fingerprint FROM account_eligibility")?;
-                let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)))?;
+        let changed_credentials =
+            |conn: &Connection| -> rusqlite::Result<std::collections::BTreeSet<String>> {
                 let mut changed = std::collections::BTreeSet::new();
-                for row in rows {
+                if !account_fact_table_exists(conn, "account_eligibility")? {
+                    return Ok(changed);
+                }
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT credential_id,listing_fingerprint FROM account_eligibility",
+                )?;
+                for row in statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })? {
                     let (credential, recorded) = row?;
-                    if recorded.as_deref().is_none() || recorded.as_deref() != fingerprints.get(credential.as_str()).copied() {
+                    if recorded.as_deref().is_none()
+                        || recorded.as_deref() != fingerprints.get(credential.as_str()).copied()
+                    {
                         changed.insert(credential);
                     }
                 }
-                changed
+                Ok(changed)
             };
-            read.commit()?;
-            if credentials.is_empty() { return Ok(()); }
-            // Keep the connection gate across the read and write: a later
-            // reconciliation sees the committed facts and skips unchanged rows.
-            // Inspect facts each time, so a newly recorded restriction is not
-            // hidden by a cache of previously seen listing fingerprints.
+        let changed = self
+            .store
+            .with_read(|conn: &Connection| {
+                // A connection in autocommit mode needs its own read transaction
+                // to keep the comparison on one view.
+                let read = if conn.is_autocommit() {
+                    Some(Transaction::new_unchecked(
+                        conn,
+                        TransactionBehavior::Deferred,
+                    )?)
+                } else {
+                    None
+                };
+                let changed = changed_credentials(conn)?;
+                if let Some(read) = read {
+                    read.commit()?;
+                }
+                Ok(changed)
+            })
+            .map_err(err)?;
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.store.with_conn(|conn: &Connection| {
+            // Another caller may have reconciled while this caller waited for
+            // the connection gate. Do not open an empty write transaction.
+            if changed_credentials(conn)?.is_empty() { return Ok(()); }
             let tx = self.begin_account_write(conn)?;
+            // Inspect current rows again, including restrictions reported after
+            // the read snapshot. No remembered listing can hide a new row.
+            let credentials = changed_credentials(&tx)?;
+            if credentials.is_empty() { return Ok(()); }
             for credential in credentials {
                 match fingerprints.get(credential.as_str()) {
                     Some(fingerprint) => {
@@ -2404,6 +2453,25 @@ impl SqliteRouteStateStore {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }
                 Ok(result)
+            })
+            .map_err(err)?
+    }
+
+    /// Revalidate a read-path repair under the IMMEDIATE writer. A competing
+    /// writer may already have fixed the rows; commit only if the callback
+    /// actually changed durable state, otherwise release the transaction.
+    pub fn account_repair(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<bool>,
+    ) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = self.begin_account_write(conn)?;
+                let result = f(&AccountTx { conn: &tx });
+                if matches!(result, Ok(true)) {
+                    crate::evaluation_snapshot::timed_commit(tx)?;
+                }
+                Ok(result.map(|_| ()))
             })
             .map_err(err)?
     }

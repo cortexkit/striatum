@@ -108,6 +108,15 @@ fn key_states(
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
     crate::fence_rechecks::sync(conn)?;
+    read_key_states(conn, provider, now_ms, excluded_lease)
+}
+
+fn read_key_states(
+    conn: &Connection,
+    provider: &str,
+    now_ms: i64,
+    excluded_lease: Option<&str>,
+) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
     let mut states: BTreeMap<String, PoolKeyState> = BTreeMap::new();
     let mut statement = conn.prepare(
         "SELECT credential_id, last_used_at, walled_until, cooldown_until
@@ -462,7 +471,63 @@ impl SqliteRouteStateStore {
         provider: &str,
         now_ms: i64,
     ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
+        self.read_first_key_states(provider, now_ms, || {})
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn pool_key_states_after_read_for_test(
+        &self,
+        provider: &str,
+        now_ms: i64,
+        after_read: impl FnOnce(),
+    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
+        self.read_first_key_states(provider, now_ms, after_read)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn legacy_pool_key_states_for_test(
+        &self,
+        provider: &str,
+        now_ms: i64,
+    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
         self.account_transaction(|tx| key_states(tx.conn, provider, now_ms, None).map_err(err))
+    }
+
+    fn read_first_key_states(
+        &self,
+        provider: &str,
+        now_ms: i64,
+        after_read: impl FnOnce(),
+    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
+        let (states, needs_sync) = self
+            .store
+            .with_read(|conn: &Connection| {
+                Ok((
+                    read_key_states(conn, provider, now_ms, None)?,
+                    crate::fence_rechecks::needs_sync(conn)?,
+                ))
+            })
+            .map_err(err)?;
+        if !needs_sync {
+            return Ok(states);
+        }
+        after_read();
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = crate::write_transaction(conn)?;
+                // The read pass is only a hint. Never restore clocks captured
+                // before another writer reported or claimed a newer refusal.
+                let changed = crate::fence_rechecks::needs_sync(&tx)?;
+                if changed {
+                    crate::fence_rechecks::sync(&tx)?;
+                }
+                let states = read_key_states(&tx, provider, now_ms, None)?;
+                if changed {
+                    crate::evaluation_snapshot::timed_commit(tx)?;
+                }
+                Ok(states)
+            })
+            .map_err(err)
     }
 }
 
