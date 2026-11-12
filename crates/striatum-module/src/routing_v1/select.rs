@@ -1637,21 +1637,8 @@ impl<'a> Selection<'a> {
         self.score_candidates_evaluated(available, None)
     }
 
-    fn score_candidates_evaluated(
-        &self,
-        available: &HashSet<String>,
-        evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
-    ) -> Result<SelectedModelRoute, NoRouteError> {
-        let allowed = available
-            .iter()
-            .filter(|route| {
-                self.sources
-                    .operator_config
-                    .route_allowed(self.consumer, route, false)
-            })
-            .cloned()
-            .collect();
-        let mut snapshot = self.snapshot.clone();
+    fn scoring_snapshot(&self) -> ModelRouteStateSnapshot {
+        let mut snapshot = clone_scoring_snapshot(self.snapshot);
         for key in self.runtime_unavailable {
             // Account availability cannot lower the maximum model scores used to
             // interpret IQ. Operator exclusions still can, including not_for rules.
@@ -1668,7 +1655,25 @@ impl<'a> Selection<'a> {
                     .get_or_insert(true);
             }
         }
-        let input = self.pass().input(&allowed, snapshot.clone());
+        snapshot
+    }
+
+    fn score_candidates_evaluated(
+        &self,
+        available: &HashSet<String>,
+        evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
+        let allowed = available
+            .iter()
+            .filter(|route| {
+                self.sources
+                    .operator_config
+                    .route_allowed(self.consumer, route, false)
+            })
+            .cloned()
+            .collect();
+        let snapshot = self.scoring_snapshot();
+        let input = self.pass().input(&allowed, snapshot);
         let result = self
             .score_input_evaluated(input, self.consumer_exclude, None, evaluation)
             .map_err(select_policy::describe_filter_refusal)
@@ -1714,7 +1719,7 @@ impl<'a> Selection<'a> {
                     .cloned()
                     .collect();
                 recovery_available.extend(account_resets.keys().cloned());
-                let recovery_input = self.pass().input(&recovery_available, snapshot);
+                let recovery_input = self.pass().input(&recovery_available, self.scoring_snapshot());
                 (error.earliest_reset, error.earliest_reset_route) =
                     striatum_core::model_router::earliest_admissible_recovery(
                         &recovery_input,
@@ -2050,6 +2055,12 @@ impl<'a> Selection<'a> {
     }
 }
 
+fn clone_scoring_snapshot(snapshot: &ModelRouteStateSnapshot) -> ModelRouteStateSnapshot {
+    #[cfg(test)]
+    tests::SCORING_SNAPSHOT_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    snapshot.clone()
+}
+
 /// Select exposes account limits as route refusals; account admission's private
 /// codes and diagnostic messages are not a retry protocol for select callers.
 fn account_limit_refusal(pin: Option<&str>, reset: Option<i64>) -> Refusal {
@@ -2198,6 +2209,28 @@ mod tests {
     use super::*;
     use cortexkit_role_routing_conformance::fixture;
     use striatum_core::RouteStateStore;
+
+    pub(super) static SCORING_SNAPSHOT_COPIES: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn successful_select_does_not_copy_a_recovery_snapshot() {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (_, route) = configured().await;
+        SCORING_SNAPSHOT_COPIES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let reply = route
+            .call(
+                "route.select",
+                &json!({"consumer":fixture::SUMMARY, "requirements":{"iq":50}}),
+            )
+            .await;
+        assert_eq!(reply.0, subc_protocol::FrameType::Response, "{reply:?}");
+        let copies = SCORING_SNAPSHOT_COPIES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            copies, 1,
+            "only the existing scoring copy is needed; recovery must stay lazy"
+        );
+    }
 
     const RECOVERY_NOW: u64 = 1_800_000_000_000;
     const ACCOUNT_RESET: u64 = RECOVERY_NOW + 600_000;
