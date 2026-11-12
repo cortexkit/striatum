@@ -204,6 +204,20 @@ pub(crate) fn choices_for_harness(
             .filter(|row| credential_reaches_runner(credentials, runner, fact, row))
             .cloned()
             .collect();
+        if aliases.contains_key(provider) {
+            // A runner can name a borrowed provider in a model plan only through
+            // a declared gateway pair and a credential serving that provider.
+            let gateway_reachable = runner.pairs.is_some()
+                && reachable_credentials.iter().any(|row| {
+                    row.auth_method.as_deref() == Some("gateway")
+                        && broca_credentials::credential_serves_fact(
+                            row, fact, &providers, credentials,
+                        )
+                });
+            if !gateway_reachable {
+                continue;
+            }
+        }
         // A picker pin can use any covered account, regardless of temporary
         // quota or refusal fences; use account selection's coverage rule.
         let class = account_selection::resolve_class(
