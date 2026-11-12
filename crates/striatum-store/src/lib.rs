@@ -1358,6 +1358,12 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Newest registered migration, for upgrade-test version expectations.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn latest_migration_version_for_test() -> u32 {
+        route_state_migrations().last().unwrap().version
+    }
+
     /// Build an older on-disk schema for upgrade tests that exercise live callers.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_at_version_for_test(
