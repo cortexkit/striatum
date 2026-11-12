@@ -924,7 +924,7 @@ impl SqliteRouteStateStore {
                     None => { tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1", [&credential])?; }
                 }
             }
-            tx.commit()
+            crate::evaluation_snapshot::timed_commit(tx)
         }).map_err(err)
     }
 
@@ -1148,7 +1148,7 @@ impl SqliteRouteStateStore {
                         [credential_id],
                     )?;
                 }
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(cleared)
             })
             .map_err(err)
@@ -2370,7 +2370,7 @@ impl SqliteRouteStateStore {
                 let tx = Transaction::new_unchecked(conn, TransactionBehavior::Deferred)?;
                 let result = f(&AccountTx { conn: &tx });
                 if result.is_ok() {
-                    tx.commit()?;
+                    crate::evaluation_snapshot::timed_commit(tx)?;
                 }
                 Ok(result)
             })
@@ -2390,7 +2390,7 @@ impl SqliteRouteStateStore {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if result.is_ok() {
-                    tx.commit()?;
+                    crate::evaluation_snapshot::timed_commit(tx)?;
                 }
                 Ok(result)
             })

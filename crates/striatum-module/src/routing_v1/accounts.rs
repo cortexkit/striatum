@@ -164,6 +164,43 @@ fn same_name(left: &str, right: &str) -> bool {
     left.trim().eq_ignore_ascii_case(right.trim())
 }
 
+/// Observation requests omit the provider. Resolve it only for a slow log,
+/// using the caller's recorded principal and admission key, as admission does.
+pub(super) fn slow_call_provider(
+    operation: &str,
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> String {
+    if let Some(provider) = params["provider"]
+        .as_str()
+        .filter(|_| operation == "route.account_for")
+    {
+        return provider.to_owned();
+    }
+    if let Some(id) = params["decision_id"].as_str() {
+        if let Ok(Some(decision)) = deps.store.v1_decision(id) {
+            return decision.provider;
+        }
+    }
+    if let (Some(id), Ok(authority)) = (
+        params["admission_id"].as_str(),
+        account_caller(caller, deps),
+    ) {
+        if let Ok(Some(admission)) = deps.store.v1_admission(
+            &authority.recorded_principal(),
+            &authority.admission_key(id),
+        ) {
+            if let Ok(body) = serde_json::from_str::<Value>(&admission.body_json) {
+                if let Some(provider) = body["provider"].as_str() {
+                    return provider.to_owned();
+                }
+            }
+        }
+    }
+    "unavailable".into()
+}
+
 pub(super) fn account_for(
     params: &Value,
     caller: &Caller,

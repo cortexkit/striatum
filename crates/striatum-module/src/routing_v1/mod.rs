@@ -42,7 +42,7 @@ mod panels_tests;
 mod reads;
 mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
-mod request_cpu_bench;
+pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
 mod select;
 #[cfg(test)]
@@ -54,8 +54,6 @@ mod what_if_tests;
 
 #[cfg(test)]
 mod account_classes_tests;
-#[cfg(test)]
-mod wire_pair_tests;
 #[cfg(test)]
 mod account_ops_tests;
 #[cfg(test)]
@@ -103,6 +101,8 @@ mod select_engine_vectors_tests;
 mod select_options_tests;
 #[cfg(test)]
 mod task_ref_tests;
+#[cfg(test)]
+mod wire_pair_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
@@ -214,8 +214,11 @@ pub(crate) async fn serve(
     writer: &mpsc::Sender<Frame>,
     deps: &Deps<'_>,
 ) -> Result<(), ModuleError> {
+    let timing = crate::stage_timing::AccountCallTiming::new();
     let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
     let caller = Caller::for_route(channel, route_epoch);
+    let mut operation = String::new();
+    let mut call_params = Value::Null;
     let reply = match serde_json::from_slice::<Value>(&frame.body) {
         Ok(request) => {
             let method = request
@@ -224,13 +227,25 @@ pub(crate) async fn serve(
                 .unwrap_or_default()
                 .to_owned();
             let params = request.get("params").cloned().unwrap_or(Value::Null);
-            answer(&method, &params, &caller, deps).await
+            #[cfg(test)]
+            if matches!(
+                method.as_str(),
+                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
+            ) {
+                crate::stage_timing::ACCOUNT_DELAY
+                    .with(|delay| std::thread::sleep(delay.replace(std::time::Duration::ZERO)));
+            }
+            let reply = answer(&method, &params, &caller, deps).await;
+            operation = method;
+            call_params = params;
+            reply
         }
         Err(error) => Err(Refusal::invalid_request(
             "params",
             format!("the request body is not JSON: {error}"),
         )),
     };
+    let serialization = std::time::Instant::now();
     let (ty, body) = match reply {
         Ok(answer) => (
             FrameType::Response,
@@ -246,6 +261,25 @@ pub(crate) async fn serve(
             .map_err(ModuleError::Json)?,
         ),
     };
+    let serialization = crate::stage_timing::record_serialization(serialization);
+    let total = timing.elapsed();
+    if matches!(
+        operation.as_str(),
+        ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
+    ) && total > crate::stage_timing::SLOW_ACCOUNT_CALL
+    {
+        let stages = striatum_store::SqliteRouteStateStore::thread_stage_timing();
+        let provider = accounts::slow_call_provider(&operation, &call_params, &caller, deps);
+        timing.emit(
+            total,
+            &operation,
+            call_params["mode"].as_str().unwrap_or("admit"),
+            &provider,
+            &caller.principal,
+            serialization,
+            stages,
+        );
+    }
     let reply = Frame::build_with_version(
         ver,
         ty,

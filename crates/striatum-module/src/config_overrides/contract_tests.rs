@@ -588,6 +588,70 @@ fn check_config_offline_reads_the_store_or_says_why_it_skipped() {
 }
 
 #[test]
+fn check_config_counts_are_anonymous_and_available_without_variants_or_store() {
+    let mut rig = Rig::new();
+    rig.write(r#"{
+        "providers":{"private-provider":{"subscription":true,"pin_only":false}},
+        "models":{"private-provider/private-model":{"subscription":false,"pin_only":true}},
+        "runners":[{"module":"private-runner","routes":["private-provider","private-provider/private-model"]}]
+    }"#);
+    let lines = |report: &str| {
+        report
+            .lines()
+            .filter(|line| line.contains('='))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let expected_rules = [
+        "subscription_rules=2",
+        "exclusion_rules=2",
+        "runner_route_rules=2",
+    ];
+    let missing = rig.dir.join("missing.db");
+    let corrupt = rig.dir.join("corrupt.db");
+    std::fs::write(&corrupt, b"not a sqlite database").unwrap();
+    for path in [None, Some(missing.as_path()), Some(corrupt.as_path())] {
+        let report = check_config_offline(&rig.path, path).unwrap();
+        let counts = lines(&report);
+        assert_eq!(&counts[..3], expected_rules);
+        assert_eq!(counts.len(), 5);
+        for line in &counts[3..] {
+            assert!(line.contains("=unavailable ("), "{line}");
+            assert!(
+                !line.ends_with("()"),
+                "unavailability needs a reason: {line}"
+            );
+        }
+        assert!(!counts.join("\n").contains("private"));
+    }
+    let store_path = rig.dir.join("counts.db");
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE model_facts (name TEXT);
+        INSERT INTO model_facts VALUES ('private-model'), ('private-model-variant');
+        CREATE TABLE account_vault_roster (singleton INTEGER, roster_json TEXT);",
+        )
+        .unwrap();
+    connection.execute("INSERT INTO account_vault_roster VALUES (1, ?1)", [r#"{"identities":[{"credential_ids":["private-credential-a","private-credential-b"],"active_credential_ids":["private-credential-a"]},{"credential_ids":["private-credential-c"]}]}"#]).unwrap();
+    drop(connection);
+    let settings_before = std::fs::read(&rig.path).unwrap();
+    let store_before = std::fs::read(&store_path).unwrap();
+    let counts = lines(&check_config_offline(&rig.path, Some(&store_path)).unwrap());
+    assert_eq!(&counts[..3], expected_rules);
+    assert_eq!(
+        &counts[3..],
+        ["catalog_facts=2", "vault_roster_credentials=3"]
+    );
+    assert!(!counts.join("\n").contains("private"));
+    assert_eq!(std::fs::read(&rig.path).unwrap(), settings_before);
+    assert_eq!(std::fs::read(&store_path).unwrap(), store_before);
+    let mut invalid = Rig::new();
+    invalid.write(r#"{"unknown-setting":true}"#);
+    assert!(check_config_offline(&invalid.path, Some(&store_path)).is_err());
+}
+
+#[test]
 fn converted_keys_load_and_camel_case_spellings_are_refused() {
     let document = include_str!("../../fixtures/preserved-routing.jsonc");
     for camel in [

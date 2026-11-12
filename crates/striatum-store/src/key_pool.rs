@@ -217,7 +217,7 @@ impl SqliteRouteStateStore {
             .with_conn(|conn: &Connection| {
                 let tx = crate::write_transaction(conn)?;
                 let result = f(&tx)?;
-                tx.commit()?;
+                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(result)
             })
             .map_err(err)

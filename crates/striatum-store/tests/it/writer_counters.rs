@@ -1,0 +1,46 @@
+use striatum_core::key_pool::PoolKey;
+use striatum_store::{dev_descriptor, PoolAcquire, PoolAcquireOutcome, SqliteRouteStateStore};
+
+#[test]
+fn writer_counters_cover_pool_autocommit_and_deferred_read() {
+    let dir = cortexkit_test_support::ScratchDir::new("writer-counters");
+    let store = SqliteRouteStateStore::open(&dev_descriptor(
+        "striatum",
+        dir.join("store.db").to_string_lossy().into_owned(),
+    ))
+    .unwrap();
+    let commits = store.writer_commit_count_for_test();
+    let acquisitions = store.writer_acquisition_count_for_test();
+    let account_writes = store.account_write_transaction_count_for_test();
+    let keys = [PoolKey::new("apikey:test", None, "active")];
+    assert!(matches!(
+        store
+            .pool_acquire(&PoolAcquire {
+                provider: "test",
+                session_id: "session",
+                keys: &keys,
+                now_ms: 1_000,
+                lease_ms: 60_000,
+                affinity_idle_ms: 60_000,
+            })
+            .unwrap(),
+        PoolAcquireOutcome::Leased(_)
+    ));
+    assert_eq!(store.writer_commit_count_for_test() - commits, 1);
+    assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 1);
+    assert_eq!(
+        store.account_write_transaction_count_for_test(),
+        account_writes
+    );
+
+    store.put_quota_snapshot("{}", 1_000).unwrap();
+    assert_eq!(store.writer_commit_count_for_test() - commits, 2);
+    assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 2);
+
+    assert!(store
+        .account_read(|tx| tx.admission("test-principal", "not-admitted"))
+        .unwrap()
+        .is_none());
+    assert_eq!(store.writer_commit_count_for_test() - commits, 2);
+    assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 3);
+}

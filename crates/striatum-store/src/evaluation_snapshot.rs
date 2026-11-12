@@ -2,23 +2,134 @@
 //! decision/usage history and never opens a writer on the source database.
 
 use super::*;
+use std::sync::Arc;
 
 // Durable stores keep the shared library's lease and pooled reads unchanged.
 // A projection needs neither a lease file nor a migration/seed pass.
-pub(super) enum ConnectionStore {
+enum Backend {
     Live(SqliteStore),
     Projection(Mutex<Connection>),
 }
 
+#[derive(Default)]
+struct WriterMetrics {
+    commits: AtomicU64,
+    acquisitions: AtomicU64,
+    queue_ns: AtomicU64,
+    sql_ns: AtomicU64,
+    commit_ns: AtomicU64,
+    pending_commits: AtomicU64,
+}
+
+/// Cumulative connection timings. SQL includes row decoding inside the store
+/// callback; queue time ends as soon as the connection has been acquired.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreStageTiming {
+    pub writer_queue_ns: u64,
+    pub sql_ns: u64,
+    pub commit_ns: u64,
+}
+
+thread_local! {
+    static COMMIT_START: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static COMMIT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_TIMING: std::cell::Cell<StoreStageTiming> = const { std::cell::Cell::new(StoreStageTiming { writer_queue_ns: 0, sql_ns: 0, commit_ns: 0 }) };
+}
+
+fn finish_commit_timing() {
+    COMMIT_START.with(|start| {
+        if let Some(start) = start.take() {
+            COMMIT_NS.with(|total| total.set(total.get() + start.elapsed().as_nanos() as u64));
+        }
+    });
+}
+
+/// Finish measuring the commit before subsequent SQL in the same callback.
+pub(crate) fn timed_commit(tx: rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let start = std::time::Instant::now();
+    let before = COMMIT_NS.with(|total| total.get());
+    let result = tx.commit();
+    COMMIT_START.with(|pending| pending.set(None));
+    COMMIT_NS.with(|total| total.set(before + start.elapsed().as_nanos() as u64));
+    result
+}
+
+pub(super) struct ConnectionStore {
+    backend: Backend,
+    metrics: Arc<WriterMetrics>,
+}
+
 impl ConnectionStore {
+    fn new(backend: Backend) -> Self {
+        let metrics = Arc::new(WriterMetrics::default());
+        let install = |conn: &Connection| {
+            let commits = Arc::clone(&metrics);
+            conn.commit_hook(Some(move || {
+                commits.pending_commits.fetch_add(1, Ordering::Relaxed);
+                COMMIT_START.with(|start| start.set(Some(std::time::Instant::now())));
+                false
+            }));
+            let rollbacks = Arc::clone(&metrics);
+            conn.rollback_hook(Some(move || {
+                // A failed commit may invoke the commit hook before SQLite
+                // rolls it back. Do not publish that attempt as a commit.
+                if COMMIT_START.with(|start| start.get().is_some())
+                    && rollbacks.pending_commits.load(Ordering::Relaxed) > 0
+                {
+                    rollbacks.pending_commits.fetch_sub(1, Ordering::Relaxed);
+                }
+                finish_commit_timing();
+            }));
+            Ok(())
+        };
+        match &backend {
+            Backend::Live(store) => store.with_conn(install).expect("installing writer hooks"),
+            Backend::Projection(conn) => install(&conn.lock().unwrap()).unwrap(),
+        }
+        Self { backend, metrics }
+    }
+
+    pub fn live(store: SqliteStore) -> Self {
+        Self::new(Backend::Live(store))
+    }
+    pub fn projection(conn: Mutex<Connection>) -> Self {
+        Self::new(Backend::Projection(conn))
+    }
+
     pub fn with_conn<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, cortexkit_store::StoreError> {
-        match self {
-            Self::Live(store) => store.with_conn(f),
-            Self::Projection(connection) => {
-                f(&connection.lock().unwrap_or_else(|error| error.into_inner()))
+        let queued = std::time::Instant::now();
+        let measured = |conn: &Connection| {
+            let queue = queued.elapsed().as_nanos() as u64;
+            self.metrics.acquisitions.fetch_add(1, Ordering::Relaxed);
+            self.metrics.queue_ns.fetch_add(queue, Ordering::Relaxed);
+            let start = std::time::Instant::now();
+            let commit_before = COMMIT_NS.with(|n| n.get());
+            let result = f(conn);
+            finish_commit_timing();
+            let commit = COMMIT_NS.with(|n| n.get()) - commit_before;
+            let sql = (start.elapsed().as_nanos() as u64).saturating_sub(commit);
+            self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
+            self.metrics.commit_ns.fetch_add(commit, Ordering::Relaxed);
+            self.metrics.commits.fetch_add(
+                self.metrics.pending_commits.swap(0, Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+            THREAD_TIMING.with(|timing| {
+                let mut value = timing.get();
+                value.writer_queue_ns += queue;
+                value.sql_ns += sql;
+                value.commit_ns += commit;
+                timing.set(value);
+            });
+            result
+        };
+        match &self.backend {
+            Backend::Live(store) => store.with_conn(measured),
+            Backend::Projection(connection) => {
+                measured(&connection.lock().unwrap_or_else(|error| error.into_inner()))
                     .map_err(|error| cortexkit_store::StoreError::Backend(error.to_string()))
             }
         }
@@ -28,21 +139,55 @@ impl ConnectionStore {
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, cortexkit_store::StoreError> {
-        match self {
-            Self::Live(store) => store.with_read(f),
-            Self::Projection(_) => self.with_conn(f),
+        match &self.backend {
+            Backend::Live(store) => store.with_read(|conn| {
+                let start = std::time::Instant::now();
+                let result = f(conn);
+                let sql = start.elapsed().as_nanos() as u64;
+                self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
+                THREAD_TIMING.with(|timing| {
+                    let mut value = timing.get();
+                    value.sql_ns += sql;
+                    timing.set(value);
+                });
+                result
+            }),
+            Backend::Projection(_) => self.with_conn(f),
         }
     }
 
     pub fn epoch(&self) -> u64 {
-        match self {
-            Self::Live(store) => store.epoch(),
-            Self::Projection(_) => 0,
+        match &self.backend {
+            Backend::Live(store) => store.epoch(),
+            Backend::Projection(_) => 0,
         }
     }
 }
 
 impl SqliteRouteStateStore {
+    pub fn stage_timing(&self) -> StoreStageTiming {
+        StoreStageTiming {
+            writer_queue_ns: self.store.metrics.queue_ns.load(Ordering::Relaxed),
+            sql_ns: self.store.metrics.sql_ns.load(Ordering::Relaxed),
+            commit_ns: self.store.metrics.commit_ns.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Thread-local totals for synchronous account calls, excluding other callers.
+    pub fn thread_stage_timing() -> StoreStageTiming {
+        THREAD_TIMING.with(|timing| timing.get())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writer_commit_count_for_test(&self) -> u64 {
+        self.store.metrics.commits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writer_acquisition_count_for_test(&self) -> u64 {
+        self.store.metrics.acquisitions.load(Ordering::Relaxed)
+    }
+
     /// Copy only the evidence account preparation reads. Reconciliation may
     /// mutate this disposable in-memory store, but cannot reach the source.
     /// The pooled, read-only transaction ends before constructing the copy.
@@ -134,7 +279,7 @@ impl SqliteRouteStateStore {
             })
             .map_err(err)?;
         let store =
-            ConnectionStore::Projection(Mutex::new(Connection::open_in_memory().map_err(err)?));
+            ConnectionStore::projection(Mutex::new(Connection::open_in_memory().map_err(err)?));
         store
             .with_conn(|destination| {
                 destination.pragma_update(None, "foreign_keys", false)?;
