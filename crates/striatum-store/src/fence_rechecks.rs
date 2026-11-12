@@ -2814,7 +2814,9 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"));
-        assert!(error.to_string().contains("83"));
+        // The refusal names the store's version, the newest migration.
+        let latest = crate::route_state_migrations().last().unwrap().version;
+        assert!(error.to_string().contains(&latest.to_string()));
     }
 
     #[test]
