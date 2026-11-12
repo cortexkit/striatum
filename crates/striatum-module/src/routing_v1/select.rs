@@ -925,10 +925,7 @@ async fn select_at_tier(
                 if let Some(reset) =
                     classes.blocked_reset(&fact.provider_id, &fact.model_id, priced_per_token)
                 {
-                    account_blocks.insert(
-                        striatum_core::fact_to_route(fact).route_key,
-                        reset,
-                    );
+                    account_blocks.insert(striatum_core::fact_to_route(fact).route_key, reset);
                 }
             }
         }
@@ -1021,6 +1018,16 @@ async fn select_at_tier(
         }
         order
     });
+    let recovery_available = available
+        .iter()
+        .filter(|key| {
+            consumer_policy.mode != Some(crate::config_policy::ConsumerMode::Ladder)
+                || consumer_policy.ladder.iter().flatten().any(|entry| {
+                    RouteRef::parse_pin(entry).is_some_and(|route| route.route_key() == **key)
+                })
+        })
+        .cloned()
+        .collect();
     let selection = Selection {
         classifier_order,
         prefer_prompt_cache: request.prefer_prompt_cache.unwrap_or(false),
@@ -1038,6 +1045,8 @@ async fn select_at_tier(
         subscription_keys: &subscription_keys,
         rejections: &rejections,
         runtime_unavailable: &runtime_unavailable,
+        recovery_available: &recovery_available,
+        account_blocks: &account_blocks,
         routing_config: &priced.routing_config,
         slots: slots.as_ref(),
         min_band: live_config.min_band(),
@@ -1240,10 +1249,9 @@ async fn select_at_tier(
             // Account preflight is separate from model scoring. Only name an
             // account block when an otherwise adequate, policy-allowed model
             // would have been selected without that block.
-            let mut resets = Vec::new();
             let blocked: HashSet<_> = account_blocks
                 .iter()
-                .filter_map(|(key, reset)| {
+                .filter_map(|(key, _)| {
                     if consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
                         && !consumer_policy.ladder.iter().flatten().any(|entry| {
                             RouteRef::parse_pin(entry)
@@ -1257,15 +1265,19 @@ async fn select_at_tier(
                     {
                         return None;
                     }
-                    resets.extend(*reset);
                     Some(key.clone())
                 })
                 .collect();
             if !blocked.is_empty() {
-                return Err(Refusal::no_route(
+                let mut refusal = Refusal::no_route(
                     NoRouteReason::parse("accounts_blocked"),
-                    resets.into_iter().min().map(|reset| reset.max(0) as u64),
-                ));
+                    no_route.earliest_reset.map(|reset| reset as u64),
+                );
+                if no_route.earliest_reset.is_some() {
+                    refusal.message =
+                        format!("{}: {}", refusal.message, no_route.refusal_message());
+                }
+                return Err(refusal);
             }
             return Err(no_route_refusal(&no_route, now));
         }
@@ -1347,9 +1359,7 @@ async fn select_at_tier(
     }
     decision.requirements_json = input.to_string();
     decision.allowed_account_class =
-        striatum_core::accounts::AllowedAccountClass::from_pay_per_token(
-            priced_per_token,
-        );
+        striatum_core::accounts::AllowedAccountClass::from_pay_per_token(priced_per_token);
     let decision_id = deps
         .store
         .record_decision_with_task_ref(
@@ -1581,6 +1591,8 @@ struct Selection<'a> {
     /// Route-local refusals, by route key ([`select_policy::candidate_rejections`]).
     rejections: &'a HashMap<String, String>,
     runtime_unavailable: &'a HashSet<String>,
+    recovery_available: &'a HashSet<String>,
+    account_blocks: &'a HashMap<String, Option<i64>>,
     routing_config: &'a RoutingConfig,
     slots: Option<&'a ConcurrencySlots>,
     min_band: Option<f64>,
@@ -1656,10 +1668,63 @@ impl<'a> Selection<'a> {
                     .get_or_insert(true);
             }
         }
-        let input = self.pass().input(&allowed, snapshot);
+        let input = self.pass().input(&allowed, snapshot.clone());
         let result = self
             .score_input_evaluated(input, self.consumer_exclude, None, evaluation)
-            .map_err(select_policy::describe_filter_refusal);
+            .map_err(select_policy::describe_filter_refusal)
+            .map_err(|mut error| {
+                if error.reason == RouteFailureReason::InvalidRequirements {
+                    return error;
+                }
+                let account_resets: HashMap<_, _> = self
+                    .facts
+                    .iter()
+                    .filter_map(|fact| {
+                        let key = fact_to_route(fact).route_key;
+                        if !self.recovery_available.contains(&key)
+                            || !self.sources.operator_config.route_allowed(
+                                self.consumer,
+                                &key,
+                                false,
+                            )
+                        {
+                            return None;
+                        }
+                        let reset = self
+                            .classes
+                            .and_then(|classes| {
+                                classes.recovery_reset(
+                                    &fact.provider_id,
+                                    &fact.model_id,
+                                    self.priced_per_token,
+                                )
+                            })
+                            .or_else(|| self.account_blocks.get(&key).copied().flatten())?;
+                        Some((key, reset as f64))
+                    })
+                    .collect();
+                let mut recovery_available: HashSet<_> = self
+                    .recovery_available
+                    .iter()
+                    .filter(|key| {
+                        self.sources.operator_config.route_allowed(self.consumer, key, false)
+                            && (!self.account_blocks.contains_key(*key)
+                                || account_resets.contains_key(*key))
+                    })
+                    .cloned()
+                    .collect();
+                recovery_available.extend(account_resets.keys().cloned());
+                let recovery_input = self.pass().input(&recovery_available, snapshot);
+                (error.earliest_reset, error.earliest_reset_route) =
+                    striatum_core::model_router::earliest_admissible_recovery(
+                        &recovery_input,
+                        &self.pass().routing_config(),
+                        self.consumer_exclude,
+                        self.rejections,
+                        &account_resets,
+                    );
+                error
+            });
         select_policy::explain_dotted_exclusions(
             result,
             self.sources.operator_config,
@@ -2076,9 +2141,8 @@ fn refused_pin_reason(refusal: &Refusal) -> String {
         .map_or_else(|| refusal.code.as_str().to_owned(), str::to_owned)
 }
 
-/// The scorer's failure as a v1 `no_route`. Only the routes blocked by
-/// exhausted quota, a cooldown or a failure backoff make it timed, by the
-/// earliest deadline among them.
+/// The scorer's failure as a v1 `no_route`. Retry timing is independent of the
+/// reason: even a quality refusal can have an adequate route behind a timed block.
 fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     let reason = match no_route.reason {
         RouteFailureReason::NoAvailableModel => NoRouteReason::NoAvailableModel,
@@ -2089,9 +2153,8 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         | RouteFailureReason::AllRoutesInadequate
         | RouteFailureReason::InvalidRequirements => NoRouteReason::AllInadequate,
     };
-    let reset = (reason == NoRouteReason::QuotaOrCooldown)
-        .then_some(no_route.earliest_reset)
-        .flatten()
+    let reset = no_route
+        .earliest_reset
         .filter(|reset| *reset > now)
         .map(|reset| reset as u64);
     let mut refusal = Refusal::no_route(reason, reset);
@@ -2126,7 +2189,297 @@ fn clamp_sentence(sentence: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        conformance_tests::{install_catalog, Harness},
+        dispatch_tests::configured,
+    };
     use super::*;
+    use cortexkit_role_routing_conformance::fixture;
+    use striatum_core::RouteStateStore;
+
+    const RECOVERY_NOW: u64 = 1_800_000_000_000;
+    const ACCOUNT_RESET: u64 = RECOVERY_NOW + 600_000;
+    const DISTANT_WALL: u64 = RECOVERY_NOW + 864_000_000;
+    const ACCOUNT_ROUTE: &str = "example-subscription/model-c";
+    const MANUAL_ROUTE: &str = "example-subscription/model-d";
+    const WALL_ROUTE: &str = "example-provider/model-a";
+
+    fn subscription_recovery_catalog(harness: &Harness) {
+        let mut catalog = fixture::catalog();
+        for model in &mut catalog.models {
+            model.priced_per_token = false;
+        }
+        let mut cheap_account = catalog.accounts[0].clone();
+        cheap_account.provider = fixture::PRICED_PROVIDER.into();
+        cheap_account.credential_id = "cheap-credential".into();
+        cheap_account.account_id = "cheap-account".into();
+        catalog.accounts.push(cheap_account);
+        install_catalog(harness, &catalog);
+    }
+
+    fn fence_recovery_accounts(harness: &Harness) {
+        for (index, account) in fixture::catalog().accounts.into_iter().enumerate() {
+            if index == 1 {
+                let fingerprint = match harness
+                    .credentials()
+                    .lock()
+                    .unwrap()
+                    .listing_fingerprint(&account.credential_id)
+                {
+                    crate::broca_credentials::ListingLookup::Listed(fingerprint) => fingerprint,
+                    _ => panic!("fixture credential must be listed"),
+                };
+                harness
+                    .store()
+                    .record_account_eligibility(&striatum_store::AccountEligibilityFact {
+                        provider: fixture::SUBSCRIPTION_PROVIDER.into(),
+                        credential_id: account.credential_id,
+                        model: String::new(),
+                        listing_fingerprint: Some(fingerprint),
+                        code: "ineligible".into(),
+                        observed_at: RECOVERY_NOW as i64,
+                    })
+                    .unwrap();
+                continue;
+            }
+            crate::credential_fences::record(
+                harness.store(),
+                &harness.credentials(),
+                &striatum_core::route_state_store::CredentialRefusal {
+                    provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                    credential_id: account.credential_id,
+                    code: "billing_exhausted".into(),
+                },
+                RECOVERY_NOW as i64,
+            )
+            .unwrap();
+        }
+    }
+
+    fn recovery_wall(harness: &Harness, key: &str, until: u64) {
+        harness
+            .store()
+            .update_route_state(
+                key,
+                key,
+                &striatum_core::RouteStateUpdate {
+                    cooldown_until: Some(until as f64),
+                    observed_at_ms: Some(RECOVERY_NOW as i64 + 1),
+                    wall_class: Some(striatum_core::RouteWallClass::Quota),
+                    last_error: Some("quota exhausted".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    fn exhaust_recovery_accounts(reset: Option<u64>) {
+        let mut quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
+        for reading in quota.readings.readings.values_mut() {
+            if reading.entry["apiProvider"] != fixture::SUBSCRIPTION_PROVIDER {
+                continue;
+            }
+            reading.received_at_ms = RECOVERY_NOW as i64;
+            reading.entry["fetchedAt"] =
+                json!(crate::account_selection::rfc3339(RECOVERY_NOW as i64));
+            for name in ["primary", "secondary"] {
+                if let Some(window) = reading.entry["usage"][name].as_object_mut() {
+                    window.insert("usedPercent".into(), json!(100.0));
+                    match reset {
+                        Some(reset) => {
+                            window.insert(
+                                "resetsAt".into(),
+                                json!(crate::account_selection::rfc3339(reset as i64)),
+                            );
+                        }
+                        None => {
+                            window.remove("resetsAt");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recovery_reply(policy: Value, exhaust: bool) -> Refusal {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (harness, route) = configured().await;
+        subscription_recovery_catalog(&harness);
+        harness.edit_config(|config| {
+            config["models"][MANUAL_ROUTE] = policy;
+        });
+        recovery_wall(&harness, MANUAL_ROUTE, DISTANT_WALL);
+        if exhaust {
+            exhaust_recovery_accounts(Some(ACCOUNT_RESET));
+            fence_recovery_accounts(&harness);
+            recovery_wall(&harness, WALL_ROUTE, ACCOUNT_RESET + 900_000);
+        } else {
+            recovery_wall(&harness, ACCOUNT_ROUTE, ACCOUNT_RESET);
+        }
+        let available = if exhaust {
+            vec![ACCOUNT_ROUTE, MANUAL_ROUTE, WALL_ROUTE]
+        } else {
+            vec![ACCOUNT_ROUTE, MANUAL_ROUTE]
+        };
+        let reply = route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":fixture::SUMMARY, "requirements":{"iq":50},
+                    "available_routes":available, "hold_wait_max_s":0
+                }),
+            )
+            .await;
+        assert_eq!(reply.1["code"], "no_route", "{reply:?}");
+        serde_json::from_value(reply.1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_ignores_pin_only_wall_for_account_reset() {
+        let reply = recovery_reply(json!({"pin_only":true}), true).await;
+        assert_eq!(reply.detail["reason"], "quota_or_cooldown", "{reply:?}");
+        assert!(
+            reply.detail["rejected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|route| route["routeKey"] == ACCOUNT_ROUTE
+                    && route["reason"] == "no_eligible_account"),
+            "{reply:?}"
+        );
+        assert_eq!(reply.wait_until_ms(), Some(ACCOUNT_RESET), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_uses_admissible_wall_with_other_routes_excluded() {
+        let reply = recovery_reply(json!({"not_for":[fixture::SUMMARY]}), false).await;
+        assert_eq!(reply.wait_until_ms(), Some(ACCOUNT_RESET), "{reply:?}");
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_message_names_the_account_route_and_reset() {
+        let reply = recovery_reply(json!({"pin_only":true}), true).await;
+        assert!(
+            reply.message.contains(&format!(
+                "Earliest route wall expiry: {ACCOUNT_ROUTE} (until_ms={ACCOUNT_RESET})"
+            )),
+            "{reply:?}"
+        );
+        assert!(
+            !reply
+                .message
+                .contains(&format!("Earliest route wall expiry: {MANUAL_ROUTE}")),
+            "{reply:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_only_operator_excluded_walls_is_untimed() {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (harness, route) = configured().await;
+        harness.edit_config(|config| {
+            config["providers"][fixture::SUBSCRIPTION_PROVIDER]["pin_only"] = json!(true);
+        });
+        recovery_wall(&harness, ACCOUNT_ROUTE, ACCOUNT_RESET);
+        recovery_wall(&harness, MANUAL_ROUTE, DISTANT_WALL);
+        let reply = route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":fixture::SUMMARY, "requirements":{"iq":50},
+                    "available_routes":[ACCOUNT_ROUTE, MANUAL_ROUTE]
+                }),
+            )
+            .await;
+        assert_eq!(reply.1["code"], "no_route", "{reply:?}");
+        let refusal: Refusal = serde_json::from_value(reply.1).unwrap();
+        assert_eq!(refusal.wait_until_ms(), None, "{refusal:?}");
+        assert!(
+            !refusal.message.contains("Earliest route wall expiry"),
+            "{refusal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_all_inadequate_waits_for_adequate_accounts() {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (harness, route) = configured().await;
+        subscription_recovery_catalog(&harness);
+        harness.edit_config(|config| {
+            config["consumers"][fixture::SUMMARY]["below_bar"] = json!("refuse");
+        });
+        for mut fact in harness.store().get_facts().unwrap() {
+            fact.scores.elo = if fact.provider_id == fixture::SUBSCRIPTION_PROVIDER {
+                2000.0
+            } else {
+                400.0
+            };
+            harness
+                .store()
+                .upsert_fact(
+                    &fact,
+                    striatum_core::route_state_store::FactSource::Override,
+                )
+                .unwrap();
+        }
+        exhaust_recovery_accounts(Some(ACCOUNT_RESET));
+        fence_recovery_accounts(&harness);
+        let reply = route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":fixture::SUMMARY, "requirements":{"iq":100}, "hold_wait_max_s":0
+                }),
+            )
+            .await;
+        assert_eq!(reply.1["detail"]["reason"], "all_inadequate", "{reply:?}");
+        let refusal: Refusal = serde_json::from_value(reply.1).unwrap();
+        assert_eq!(refusal.wait_until_ms(), Some(ACCOUNT_RESET), "{refusal:?}");
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_accounts_blocked_keeps_a_known_reset_despite_an_unknown_account() {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (_, route) = configured().await;
+        exhaust_recovery_accounts(Some(ACCOUNT_RESET));
+        {
+            let mut quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
+            let reading = quota.readings.readings.values_mut().next().unwrap();
+            for name in ["primary", "secondary"] {
+                reading.entry["usage"][name]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("resetsAt");
+            }
+        }
+        let reply = route
+            .call(
+                "route.select",
+                &json!({"consumer":fixture::SUMMARY,
+            "requirements":{"iq":50}, "available_routes":[ACCOUNT_ROUTE], "hold_wait_max_s":0}),
+            )
+            .await;
+        assert_eq!(reply.1["detail"]["reason"], "accounts_blocked", "{reply:?}");
+        let refusal: Refusal = serde_json::from_value(reply.1).unwrap();
+        assert_eq!(refusal.wait_until_ms(), Some(ACCOUNT_RESET), "{refusal:?}");
+    }
+
+    #[tokio::test]
+    async fn no_route_recovery_accounts_blocked_without_known_resets_is_untimed() {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (_, route) = configured().await;
+        exhaust_recovery_accounts(None);
+        let reply = route
+            .call(
+                "route.select",
+                &json!({"consumer":fixture::SUMMARY,
+            "requirements":{"iq":50}, "available_routes":[ACCOUNT_ROUTE], "hold_wait_max_s":0}),
+            )
+            .await;
+        assert_eq!(reply.1["detail"]["reason"], "accounts_blocked", "{reply:?}");
+        let refusal: Refusal = serde_json::from_value(reply.1).unwrap();
+        assert_eq!(refusal.wait_until_ms(), None, "{refusal:?}");
+    }
 
     #[test]
     fn a_long_explanation_is_clamped_to_one_bounded_sentence() {
@@ -2137,7 +2490,7 @@ mod tests {
     }
 
     #[test]
-    fn only_quota_and_cooldown_refusals_carry_a_reset() {
+    fn known_recoveries_time_quota_and_quality_refusals() {
         let refusal = |reason, reset| NoRouteError {
             adequate_blockers: Default::default(),
             candidates: Vec::new(),
@@ -2159,8 +2512,13 @@ mod tests {
             1_000.0,
         );
         assert_eq!(past.wait_until_ms(), None);
-        let untimed = no_route_refusal(
+        let quality = no_route_refusal(
             &refusal(RouteFailureReason::AllRoutesInadequate, Some(2_000.0)),
+            1_000.0,
+        );
+        assert_eq!(quality.wait_until_ms(), Some(2_000));
+        let untimed = no_route_refusal(
+            &refusal(RouteFailureReason::AllRoutesInadequate, None),
             1_000.0,
         );
         assert_eq!(untimed.wait_until_ms(), None);
