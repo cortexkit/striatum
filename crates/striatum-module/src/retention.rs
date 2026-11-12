@@ -83,12 +83,21 @@ pub const RETENTION_MAX_BATCHES_PER_TABLE: usize = 16;
 /// second a minute on average, in short slices, and that backlog clears in
 /// about three and a half hours.
 pub const SHADOW_PURGE_MAX_BATCHES: usize = 32;
-/// Decisions one compaction batch walks. At about 150 KB read and parsed per
-/// compacted decision, 32 keep one batch's hold on the writer short; with 16
-/// batches a minute a pass compacts about 500 decisions, over a hundred times
-/// what serving records, so a first deployment's backlog of a month of
-/// decisions drains in about six hours.
-pub const DETAIL_STRIP_BATCH_ROWS: usize = 32;
+/// Decisions one compaction batch walks. Each compacted decision is read
+/// whole, parsed and rewritten while the batch holds the writer. Measured on
+/// live-sized rows (177 KB of scoring, 17 KB of quota signals; the ignored
+/// `measure_strip_batch_writer_hold` test in the store, release build, warm
+/// page cache), a batch held the writer for a median of about 1.2 ms per row
+/// plus 1 ms: 9.7 ms for 8 rows, 18 ms for 16, 37 ms for 32. Eight rows keep a
+/// batch near 10 ms, leaving room under a 20 ms budget for pages read cold
+/// from a large store.
+pub const DETAIL_STRIP_BATCH_ROWS: usize = 8;
+/// Most compaction batches one pass runs. With eight rows a batch a pass
+/// compacts about 500 decisions, over a hundred times what serving records,
+/// so a first deployment's backlog of a month of decisions drains in about
+/// six hours. With the pause between batches a pass spends about two seconds
+/// a minute on it, in slices of about 10 ms.
+pub const DETAIL_STRIP_MAX_BATCHES: usize = 64;
 /// Pause between batches so request handlers waiting for the store's single
 /// connection get it between deletes.
 const RETENTION_BATCH_PAUSE: Duration = Duration::from_millis(25);
@@ -360,6 +369,8 @@ pub struct PassBudget {
     /// read whole (about 150 KB) and rewritten, so its batches are smaller
     /// than the delete batches.
     pub detail_batch_rows: usize,
+    /// Most compaction batches one pass runs.
+    pub max_detail_batches: usize,
     pub max_batches_per_table: usize,
     pub max_shadow_purge_batches: usize,
     pub pause: Duration,
@@ -370,6 +381,7 @@ impl Default for PassBudget {
         Self {
             batch_rows: RETENTION_BATCH_ROWS,
             detail_batch_rows: DETAIL_STRIP_BATCH_ROWS,
+            max_detail_batches: DETAIL_STRIP_MAX_BATCHES,
             max_batches_per_table: RETENTION_MAX_BATCHES_PER_TABLE,
             max_shadow_purge_batches: SHADOW_PURGE_MAX_BATCHES,
             pause: RETENTION_BATCH_PAUSE,
@@ -531,7 +543,7 @@ pub fn run_retention_pass(
         "model_route_decisions (detail)",
         budget.detail_batch_rows,
         budget,
-        per_table,
+        budget.max_detail_batches,
         batches,
         || {
             store
@@ -885,6 +897,7 @@ mod tests {
         let budget = PassBudget {
             batch_rows: 4,
             detail_batch_rows: 4,
+            max_detail_batches: 1,
             max_batches_per_table: 1,
             max_shadow_purge_batches: 3,
             pause: Duration::ZERO,
@@ -1172,6 +1185,7 @@ mod tests {
         let budget = PassBudget {
             batch_rows: 2,
             detail_batch_rows: 2,
+            max_detail_batches: 1,
             max_batches_per_table: 1,
             max_shadow_purge_batches: 1,
             pause: Duration::ZERO,

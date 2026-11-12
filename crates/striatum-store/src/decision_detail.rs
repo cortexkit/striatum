@@ -30,7 +30,7 @@
 
 use std::collections::BTreeSet;
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::Value;
 use striatum_core::RouteStateResult;
 
@@ -132,8 +132,8 @@ impl SqliteRouteStateStore {
     /// where the previous batch stopped. Decisions in the 1-in-`sample_one_in`
     /// sample are passed over at full detail; a row already compacted (a
     /// continuation copies its predecessor's columns) is left as it is. The
-    /// batch runs in one IMMEDIATE transaction, so it holds the writer from
-    /// its first read.
+    /// batch runs in one write transaction, which holds the writer from its
+    /// first read.
     pub fn strip_decision_detail(
         &self,
         created_before: i64,
@@ -146,7 +146,7 @@ impl SqliteRouteStateStore {
         }
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let tx = crate::write_transaction(conn)?;
                 let batch = strip_batch(&tx, created_before, sample_one_in, limit, now_ms)?;
                 tx.commit()?;
                 Ok(batch)
@@ -320,5 +320,92 @@ mod tests {
         );
         let none = r#"{"state":"none","reason":"quota signal: none (no cached readings)"}"#;
         assert_eq!(compact_quota_signal_json(none), none);
+    }
+
+    /// A decision as large as a live one: about 900 candidate rows (about
+    /// 134 KB of `score_json`) and 160 quota signals (about 16 KB).
+    pub(crate) fn live_sized_decision(id: &str) -> striatum_core::route_state_store::DecisionInput {
+        let candidates: Vec<Value> = (0..900)
+            .map(|index| {
+                let route = format!("provider-{:02}/model-family-name-{index:03}:high", index % 40);
+                json!({"routeKey": route, "model": route, "elo": 1234.5, "eq": 1180.25,
+                    "eloSource": "operator_grade", "eqSource": "curated", "eligible": false})
+            })
+            .collect();
+        let also: Vec<String> = (0..15)
+            .map(|index| format!("provider-{:02}/model-family-name-{index:03}:high", index % 40))
+            .collect();
+        let score = json!({
+            "candidates": candidates,
+            "adequacy": 1.0, "rawAdequacy": 1.04, "selectionCost": 0.31,
+            "metrics": {"elo": {"fact": 1300.0, "target": 1250.0, "fit": 1.0}},
+            "objective": {"cost": 0.3, "quota": 0.01, "speedScore": 0.5, "selectionCost": 0.31,
+                "taskPricing": {"valueMultiplier": 6.0, "finalCostUsd": 0.4, "priceUnit": "task"}},
+            "alsoAdequate": also,
+            "pricingMode": "basket",
+        });
+        let signals: Vec<Value> = (0..160)
+            .map(|index| json!({"capacityKey": format!("provider-{index:03}/pool-weekly"),
+                "pressure": 0.125, "windowModel": "weekly", "exhaustedUntil": null}))
+            .collect();
+        striatum_core::route_state_store::DecisionInput {
+            decision_id: Some(id.into()),
+            decision_kind: "single".into(),
+            target_agent: "mason".into(),
+            requirements_json: r#"{"iq":70}"#.into(),
+            selected_route_key: Some(also[0].clone()),
+            score_json: score.to_string(),
+            rejected_json: "[]".into(),
+            explanation_json: Some(r#"["cost-primary"]"#.into()),
+            quota_signal_json: Some(json!({"state": "present", "signals": signals}).to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Writer hold time of one compaction batch on live-sized decisions, by
+    /// batch size. Run it in release to size `DETAIL_STRIP_BATCH_ROWS`:
+    /// `cargo test --release -p striatum-store --lib -- --ignored --nocapture
+    /// measure_strip_batch_writer_hold`.
+    #[test]
+    #[ignore = "measurement, not a check"]
+    fn measure_strip_batch_writer_hold() {
+        use striatum_core::RouteStateStore;
+        let scratch = cortexkit_test_support::ScratchDir::new("strip-batch-hold");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "strip-batch-hold",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let sizes = [1_usize, 2, 4, 8, 16, 32];
+        let rounds = 8;
+        let total: usize = sizes.iter().sum::<usize>() * rounds;
+        let sample = live_sized_decision("probe");
+        println!(
+            "score_json {} bytes, quota_signal_json {} bytes",
+            sample.score_json.len(),
+            sample.quota_signal_json.as_ref().unwrap().len()
+        );
+        for index in 0..total {
+            store
+                .record_decision(&live_sized_decision(&format!("dec-{index:05}")))
+                .unwrap();
+        }
+        for size in sizes {
+            let mut holds: Vec<f64> = (0..rounds)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let batch = store.strip_decision_detail(i64::MAX, 0, size, 1).unwrap();
+                    assert_eq!(batch.stripped, size);
+                    started.elapsed().as_secs_f64() * 1000.0
+                })
+                .collect();
+            holds.sort_by(f64::total_cmp);
+            println!(
+                "batch {size:>2} rows: median {:.2} ms, max {:.2} ms, {:.2} ms per row",
+                holds[rounds / 2],
+                holds[rounds - 1],
+                holds[rounds / 2] / size as f64
+            );
+        }
     }
 }

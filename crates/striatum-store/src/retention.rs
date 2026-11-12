@@ -33,7 +33,7 @@
 //!   stored older generation.
 
 use striatum_core::RouteStateResult;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Transaction};
 
 use super::{err, SqliteRouteStateStore, DECISION_MODE_SERVE};
 
@@ -315,15 +315,15 @@ impl SqliteRouteStateStore {
 }
 
 impl SqliteRouteStateStore {
-    /// Run one retention batch in an IMMEDIATE transaction, so the batch holds
-    /// the writer from its first read instead of upgrading a read part way.
+    /// Run one retention batch in the store's write transaction
+    /// ([`crate::write_transaction`]), committing it when the batch succeeds.
     fn retention_write<T>(
         &self,
         batch: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
         self.store
             .with_conn(|conn: &Connection| {
-                let tx = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
+                let tx = crate::write_transaction(conn)?;
                 let result = batch(&tx)?;
                 tx.commit()?;
                 Ok(result)
