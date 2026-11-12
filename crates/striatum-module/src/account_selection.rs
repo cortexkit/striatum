@@ -2677,6 +2677,15 @@ fn quota_reading_for_model(
     model_pools: &[striatum_core::quota_extract::ModelPool],
 ) -> Option<QuotaReading> {
     let entry: AccountEntry = serde_json::from_value(entry.clone()).ok()?;
+    quota_reading_from_entry(&entry, account_id, capacity_key, model_pools)
+}
+
+fn quota_reading_from_entry(
+    entry: &AccountEntry,
+    account_id: &str,
+    capacity_key: Option<&str>,
+    model_pools: &[striatum_core::quota_extract::ModelPool],
+) -> Option<QuotaReading> {
     let usage = entry.usage.as_ref();
     let reported = usage
         .map(|usage| {
