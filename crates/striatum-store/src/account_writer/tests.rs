@@ -538,6 +538,16 @@ fn live_sized_tick_writer_hold() {
                    'adm-1', 'dec-0', 'dec-cont', 'adm-1001', ?1)",
                 [now + 60_000],
             )?;
+            // Live stores hold about one probe authorization at a time. This
+            // one belongs to an admission that already started, so Tick finds
+            // nothing to release and every round does the same work.
+            conn.execute(
+                "INSERT INTO fence_probe_authorization (owner, kind, origin_key, evidence,
+                   evidence_at, claimed_at, claim_generation)
+                 VALUES (json_array('account_admission','reserved:runner-1','adm-1'),
+                   'account', '[\"fence\"]', '{}', ?1, ?1, 1)",
+                [now],
+            )?;
             conn.execute_batch("PRAGMA foreign_keys=ON")?;
             Ok(())
         })
@@ -546,9 +556,10 @@ fn live_sized_tick_writer_hold() {
         .store
         .with_conn(|conn| {
             for sql in [
-                crate::fence_rechecks::EXPIRED_ADMISSION_PROBES,
-                "UPDATE account_admission SET state='released', released_at=?1 WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1)",
-                "UPDATE account_continue SET released_at_ms=?1 WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1",
+                crate::fence_rechecks::EXPIRED_ADMISSION_PROBES.to_owned(),
+                format!("SELECT EXISTS({})", crate::fence_rechecks::EXPIRED_ADMISSION_PROBES),
+                "UPDATE account_admission SET state='released', released_at=?1 WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1)".to_owned(),
+                "UPDATE account_continue SET released_at_ms=?1 WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1".to_owned(),
             ] {
                 let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
                 let steps = plan
@@ -568,4 +579,14 @@ fn live_sized_tick_writer_hold() {
         held.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     eprintln!("tick writer hold over {rows} admissions, ms per round: {held:.1?}");
+    // Every selection's ClassContext::load previews the same lookup on a reader.
+    let mut preview = Vec::new();
+    for _ in 0..5 {
+        let started = Instant::now();
+        store
+            .account_read(|tx| tx.has_expired_admission_probes(now))
+            .unwrap();
+        preview.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("selection preview over {rows} admissions, ms per round: {preview:.1?}");
 }
