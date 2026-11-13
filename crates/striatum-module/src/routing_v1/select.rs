@@ -846,6 +846,8 @@ async fn prepare_selection(
     })
 }
 
+const RUNNER_PROVIDER_LIMIT: &str = "runner_provider_limit";
+
 async fn select_at_tier(
     params: &Value,
     caller: &Caller,
@@ -989,6 +991,22 @@ async fn select_at_tier(
         .iter()
         .filter_map(|fact| {
             let route = fact_to_route(fact);
+            // Provider limits can empty the runnable catalog before a hard
+            // pin reaches admission. Preserve that cause so admission can
+            // distinguish a limited row from an absent model, without changing
+            // empty-catalog answers caused by other capability gaps.
+            if reachable.is_empty()
+                && (request.pin.is_some() || request.pin_slot.is_some())
+                && request.pin_fallback != Some(PinFallback::Route)
+                && request.available_routes.as_ref().is_none_or(|routes| {
+                    routes.contains(&route.capacity_key)
+                })
+                && runners.iter().any(|runner| {
+                    registry.provider_limit(&runner.module, &route.route_key, &route.capacity_key)
+                })
+            {
+                return Some((route.route_key, RUNNER_PROVIDER_LIMIT.into()));
+            }
             if !runners
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
@@ -2098,15 +2116,21 @@ impl<'a> Selection<'a> {
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
         let snapshot = self.snapshot.clone();
         let refused = |code: &str, message: String| {
-            let (mut reason, mut reset) =
-                pin_reason(code, &snapshot, &pin_key, &pin_capacity, self.now);
+            let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)
+                && self.rejections.get(&pin_key).or_else(|| self.rejections.get(&pin_capacity))
+                    .is_some_and(|cause| cause == RUNNER_PROVIDER_LIMIT);
+            let (mut reason, mut reset) = if provider_limited {
+                (PinUnavailableReason::NotAvailable, None)
+            } else {
+                pin_reason(code, &snapshot, &pin_key, &pin_capacity, self.now)
+            };
             let unknown = reason == PinUnavailableReason::NotAvailable;
-            if (unknown
+            if !provider_limited && ((unknown
                 && matches!(
                     code,
                     "not_available" | "no_eligible_account" | "no_available_model"
                 ))
-                || code == "credential_billing_exhausted"
+                || code == "credential_billing_exhausted")
             {
                 reset = self.pin_account_recovery(
                     &pin_key,
@@ -2119,6 +2143,11 @@ impl<'a> Selection<'a> {
                 }
             }
             let mut refusal = Refusal::pin_unavailable(pin, reason, reset);
+            if provider_limited {
+                // A declared provider limit has no recovery time. Keep the
+                // missing_capability cause alongside the pin's wire reason.
+                refusal.detail.insert("cause".into(), json!("missing_capability"));
+            }
             if unknown {
                 // Availability's specific cause lives in the private refusal's
                 // message, not its generic code. Keep it even without a retry time.

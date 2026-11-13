@@ -555,7 +555,7 @@ fn account_state(
                 credential_type: account.method.clone(),
                 auth_method: Some(account.method.clone()),
                 provider_ids: vec![account.provider.clone()],
-                serves: vec![account.provider.clone()],
+                serves: account.serves.clone(),
                 refresh_adapter: Some(account.provider.clone()),
                 state: "active".into(),
                 record_version: 1,
@@ -688,7 +688,7 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
             credential_type: account.method.clone(),
             auth_method: Some(account.method.clone()),
             provider_ids: vec![account.provider.clone()],
-            serves: vec![account.provider.clone()],
+            serves: account.serves.clone(),
             categories: vec![if account.method == "gateway" {
                 "llm-gateway".into()
             } else {
@@ -757,6 +757,11 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         config["runners"] = json!(runners);
         for key in &subscription {
             config["models"][key] = json!({"subscription": true});
+        }
+        // The fixture offers its gateway routes for ordinary selection;
+        // production otherwise keeps company gateways pin-only by default.
+        for account in catalog.accounts.iter().filter(|account| account.method == "gateway") {
+            config["providers"][&account.provider]["pin_only"] = json!(false);
         }
     });
     *crate::ACCOUNT_QUOTA
@@ -871,20 +876,44 @@ impl RoutingSubject for KitSubject {
             .store()
             .get_facts()
             .map_err(|error| error.to_string())?;
+        let catalog_targets = credentials.catalog_targets(&facts);
         let mut serving = std::collections::BTreeSet::new();
         for route in routes {
+            let (provider, model) = route.route_key.split_once('/').ok_or_else(|| {
+                format!("runner route fact {} has no provider", route.route_key)
+            })?;
+            // Gateway route keys keep the gateway's identity, while wire and
+            // billing facts belong to the provider named by its credential's `serves`.
+            let catalog_key = if route.auth_method == "gateway" {
+                catalog_targets.get(provider)
+                    .map(|target| format!("{target}/{model}"))
+                    .unwrap_or_else(|| route.route_key.clone())
+            } else {
+                route.route_key.clone()
+            };
             let fact = facts
                 .iter_mut()
                 .find(|fact| {
-                    striatum_core::fact_to_route(fact).route_key == route.route_key
-                })
-                .ok_or_else(|| {
-                    format!("runner route fact {} has no catalog model", route.route_key)
-                })?;
+                    striatum_core::fact_to_route(fact).route_key == catalog_key
+                });
+            let Some(fact) = fact else {
+                // A gateway can declare a route with no matching catalog model
+                // under its credential's `serves`. Leave that route absent so
+                // refusal checks exercise routing.
+                if route.auth_method == "gateway"
+                    && credentials.listed_credentials().iter().any(|row| {
+                        row.provider_ids.iter().any(|id| id == provider)
+                            && row.auth_method.as_deref() == Some("gateway")
+                    })
+                {
+                    continue;
+                }
+                return Err(format!("runner route fact {} has no catalog model", route.route_key));
+            };
             credentials
                 .wire_apis
-                .insert(route.route_key.clone(), route.wire_api.clone());
-            serving.insert((fact.provider_id.clone(), route.auth_method.clone()));
+                .insert(catalog_key, route.wire_api.clone());
+            serving.insert((provider.to_owned(), route.auth_method.clone()));
             let mut plane = striatum_core::billing::BillingPlane {
                 provider_id: fact.provider_id.clone(),
                 auth_method: route.auth_method.clone(),
@@ -1365,16 +1394,50 @@ const NOT_APPLICABLE: &[&str] = &[
     "max_cost_usd_requirement_honoured",
 ];
 
-/// Every served check passes, and exactly [`NOT_APPLICABLE`] are inapplicable.
+// Support for these contract groups is being built separately;
+// select_kind stays unadvertised until media-kind selection is implemented.
+// Keep each gated kit case beside its group so advertising the group requires
+// removing it from this list.
+const PENDING_READERS: &[(&str, &str)] = &[
+    ("consumer_declarations", "placement_consumer_declarations"),
+    ("runner_harness_facts", "placement_harness_facts"),
+    ("decision_harness", "placement_decision_harness"),
+    ("select_kind", "placement_select_kind"),
+    ("select_eligible_routes", "placement_eligible_routes"),
+    ("select_price", "placement_select_price"),
+    ("report_attempt_outcomes", "placement_attempt_outcomes"),
+    // Signed-out recovery remains unserved until a separate change implements it.
+    ("account_continue_signed_out", "continue_signed_out"),
+];
+
+// The contract's KNOWN list does not include routing's extensions: tier
+// settings in operator configuration and resuming an existing account session.
+const ROUTING_EXTENSIONS: &[&str] = &["service_tier_settings", "account_continue_resume"];
+
+/// Every served check passes; the inapplicable checks are pinned explicitly.
 /// A failing check names the contract rule it holds the provider to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
-    for group in cortexkit_role_routing::capabilities::KNOWN {
+    let advertised: std::collections::BTreeSet<_> =
+        super::describe::CAPABILITIES.iter().copied().collect();
+    let known: std::collections::BTreeSet<_> =
+        cortexkit_role_routing::capabilities::KNOWN.iter().copied().collect();
+    for group in ROUTING_EXTENSIONS {
+        assert!(!known.contains(group), "extension {group} is now a contract group");
+    }
+    for (group, _) in PENDING_READERS {
+        assert!(known.contains(group), "unknown pending group {group}");
         assert!(
-            super::describe::CAPABILITIES.contains(group),
-            "undeclared group {group}"
+            !advertised.contains(group),
+            "served group {group} still marked pending"
         );
     }
+    let expected: std::collections::BTreeSet<_> = known
+        .into_iter()
+        .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
+        .chain(ROUTING_EXTENSIONS.iter().copied())
+        .collect();
+    assert_eq!(advertised, expected);
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };
@@ -1391,6 +1454,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "harness_limits_invalid_falls_back",
         "runner_requires_wire_api",
         "runner_gateway_credential",
+        "runner_gateway_explicit_providers",
         "warm_credential_fresh_honoured",
         "warm_credential_hard_filter_ignored",
         "warm_credential_unknown_ignored",
@@ -1406,12 +1470,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         );
     }
     assert!(report.failing().is_empty(), "{}", report.render());
-    assert_eq!(
-        report.not_applicable(),
-        NOT_APPLICABLE,
-        "{}",
-        report.render()
-    );
+    let expected_not_applicable: Vec<_> = NOT_APPLICABLE.iter().copied()
+        .chain(PENDING_READERS.iter().map(|(_, case)| *case)).collect();
+    let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
+    let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
+    assert_eq!(actual, expected, "{}", report.render());
 }
 
 #[tokio::test]

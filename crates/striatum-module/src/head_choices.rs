@@ -50,7 +50,7 @@ fn credential_reaches_runner(
             .standing_limits
             .as_ref()
             .and_then(|limits| limits.explicit_providers.as_ref())
-            .is_none_or(|providers| providers.contains(&fact.provider_id))
+            .is_none_or(|providers| credentials.runner_allows_provider(fact, row, providers))
             && row.auth_method.as_deref().is_some_and(|method| {
                 fact.billing_plane
                     .as_ref()

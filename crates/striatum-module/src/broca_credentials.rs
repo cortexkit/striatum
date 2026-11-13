@@ -349,6 +349,24 @@ impl CredentialData {
             .unwrap_or_else(|| self.wire_apis.get(&model).map(String::as_str))
     }
 
+    pub(crate) fn runner_allows_provider(
+        &self,
+        fact: &ModelFact,
+        row: &ListedCredential,
+        explicit_providers: &[String],
+    ) -> bool {
+        // A gateway owns its route and account pool, but borrows catalog rows
+        // from the unique provider its vault `serves` resolves to. Runner limits
+        // constrain those rows, not the gateway's name. An unresolved gateway
+        // cannot satisfy a provider limit, even when its own id is listed.
+        let provider = if row.auth_method.as_deref() == Some("gateway") {
+            self.priced_targets.get(&fact.provider_id)
+        } else {
+            Some(&fact.provider_id)
+        };
+        provider.is_some_and(|provider| explicit_providers.contains(provider))
+    }
+
     pub(crate) fn row_serves_wire_api(&self, fact: &ModelFact, auth_method: &str) -> bool {
         let provider = self
             .priced_targets

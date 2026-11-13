@@ -145,6 +145,10 @@ fn ordinary_consumers_do_not_reject_gateway_billing() {
 }
 
 fn fixture() -> Arc<Harness> {
+    fixture_for_catalog("anthropic", "claude")
+}
+
+fn fixture_for_catalog(served_provider: &str, model: &str) -> Arc<Harness> {
     let harness = Harness::new("company-gateway");
     for fact in harness.store().get_facts().unwrap() {
         harness
@@ -152,7 +156,7 @@ fn fixture() -> Arc<Harness> {
             .delete_fact(&striatum_core::fact_to_route(&fact).route_key)
             .unwrap();
     }
-    let facts = vec![crate::tests::fact("anthropic", "claude")];
+    let facts = vec![crate::tests::fact(served_provider, model)];
     harness.install_facts(&facts);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca"}, {"module":RUNNER}]);
@@ -177,7 +181,7 @@ fn fixture() -> Arc<Harness> {
                 id: id.into(),
                 categories: vec![category.into()],
                 provider_ids: vec![provider.into()],
-                serves: vec!["anthropic".into()],
+                serves: vec![served_provider.into()],
                 auth_method: Some(method.into()),
                 credential_type: "apikey".into(),
                 state: "active".into(),
@@ -202,7 +206,7 @@ fn fixture() -> Arc<Harness> {
         .map(|method| {
             let mut fact = facts[0].clone();
             fact.billing_plane = Some(BillingPlane {
-                provider_id: "anthropic".into(),
+                provider_id: served_provider.into(),
                 auth_method: method.into(),
                 kind: "upstream".into(),
                 selection_reason: "listed credential".into(),
@@ -213,13 +217,13 @@ fn fixture() -> Arc<Harness> {
         .collect();
     credentials
         .wire_apis
-        .insert("anthropic/claude".into(), "anthropic.messages".into());
+        .insert(format!("{served_provider}/{model}"), "anthropic.messages".into());
     credentials.publish_billing_catalog(
         PlaneCatalog::ordinary_test_catalog(&billing).with_wire_apis(&credentials.wire_apis),
     );
     credentials.catalog_snapshot = Some(Arc::new(crate::fusiform_catalog::decode_catalog_get(
         &serde_json::to_vec(&json!({"catalog_version":41, "resolved_at_ms":123,
-            "models":{"anthropic/claude":{"existence":"present", "model.type":"chat", "capability.tool_call":true}}}))
+            "models":{format!("{served_provider}/{model}"):{"existence":"present", "model.type":"chat", "capability.tool_call":true}}}))
             .unwrap()).unwrap()));
     credentials.runner_declarations = super::runners::declarations_from_catalog(&json!([
         {"module_id":"broca", "nonce_verified":true, "role_declarations":{"routing/v1":{"runner":{
@@ -234,7 +238,7 @@ fn fixture() -> Arc<Harness> {
             "harnesses":["claude-code", "direct-api"], "default_harness":"claude-code",
             "harness_limits":{
                 "claude-code":{"pairs":[{"wire_api":"anthropic.messages", "auth_method":"gateway"}],
-                    "explicit_providers":[GATEWAY]},
+                    "explicit_providers":[served_provider]},
                 "direct-api":{"pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"}],
                     "explicit_providers":["anthropic-platform"]}
             }
@@ -446,4 +450,206 @@ async fn gateway_decision_admits_only_its_gateway_account_without_subscription_p
         .unwrap();
     assert!(gateway.billing_plane.as_ref().unwrap().is_api_metered());
     assert_eq!(gateway.subscription_multiplier, None);
+}
+
+fn set_gateway_limit(harness: &Harness, providers: &[&str], per_harness: bool) {
+    let mut runner = json!({
+        "pairs":[{"wire_api":"anthropic.messages", "auth_method":"gateway"}],
+        "follows_account_choice":true,
+        "harnesses":["claude-code", "other"], "default_harness":"claude-code"
+    });
+    if per_harness {
+        runner["harness_limits"] = json!({"claude-code":{"explicit_providers":providers}});
+    } else {
+        runner["standing_limits"] = json!({"explicit_providers":providers});
+    }
+    harness.credentials().lock().unwrap().runner_declarations.insert(
+        RUNNER.into(),
+        super::runners::parse_declaration(&json!({"runner":runner})).unwrap().unwrap(),
+    );
+}
+
+async fn check_gateway_provider_limits(operation: &str) {
+    let model = "claude-opus-5-5";
+    let route = format!("{GATEWAY}/{model}");
+    for served_provider in ["anthropic", "openai"] {
+        for per_harness in [false, true] {
+            for providers in [
+                vec!["anthropic"],
+                vec!["anthropic", GATEWAY],
+                vec![GATEWAY],
+                vec!["anthropic", "openai"],
+            ] {
+                let harness = fixture_for_catalog(served_provider, model);
+                let allowed = providers.contains(&served_provider);
+                let context = format!("{operation}: serves={served_provider}, per_harness={per_harness}, providers={providers:?}");
+                let consumer = harness.bind(reserved("example-consumer"), None).await;
+                let request = json!({
+                    "consumer":"mason", "requirements":{"iq":0}, "pin":route,
+                    "runners":[RUNNER], "harness":"claude-code"
+                });
+                set_gateway_limit(&harness, &providers, per_harness);
+                let expected = if allowed { FrameType::Response } else { FrameType::Error };
+                // Admission keeps the route and runner bound by selection. Use
+                // the same policy throughout and verify the gateway's own pool.
+                let decision = if operation == "route.account_for" {
+                    let selected = consumer.call("route.select", &request).await;
+                    assert_eq!(selected.0, expected, "{context}: {selected:?}");
+                    if !allowed {
+                        continue;
+                    }
+                    Some(selected.1["result"]["decision_id"].clone())
+                } else {
+                    None
+                };
+                if operation == "route.head_choices" {
+                    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+                    let choices = operator.call(operation, &json!({
+                        "runner_module":RUNNER, "harness":"claude-code"
+                    })).await;
+                    assert_eq!(choices.0, FrameType::Response, "{context}: {choices:?}");
+                    let models = choices.1["result"]["models"].as_array().unwrap();
+                    assert_eq!(models.len(), usize::from(allowed), "{context}: {choices:?}");
+                    if allowed {
+                        assert_eq!(models[0]["provider"], GATEWAY, "{context}");
+                        assert_eq!(models[0]["model"], model, "{context}");
+                    }
+                    continue;
+                }
+                let reply = if let Some(decision) = decision {
+                    let runner = harness.bind(reserved(RUNNER), None).await;
+                    runner.call(operation, &json!({
+                        "provider":GATEWAY, "model":model, "decision_id":decision,
+                        "conversation_key":"provider-limit", "admission_id":"provider-limit"
+                    })).await
+                } else {
+                    consumer.call(operation, &request).await
+                };
+                assert_eq!(reply.0, expected, "{context}: {reply:?}");
+                if allowed && operation == "route.account_for" {
+                    assert_eq!(reply.1["result"]["account"]["provider"], GATEWAY, "{context}");
+                    assert_eq!(reply.1["result"]["account"]["credential_id"], "company-gateway", "{context}");
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn gateway_provider_limits_selection() {
+    check_gateway_provider_limits("route.select").await;
+}
+
+#[tokio::test]
+async fn gateway_provider_limits_head_choices() {
+    check_gateway_provider_limits("route.head_choices").await;
+}
+
+#[tokio::test]
+async fn gateway_provider_limits_account_admission() {
+    check_gateway_provider_limits("route.account_for").await;
+}
+
+async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
+    let provider = if method == "gateway" { GATEWAY } else { "anthropic" };
+    for (per_harness, allowed) in [(false, true), (false, false), (true, true), (true, false)] {
+        let harness = fixture_for_catalog("anthropic", "claude-opus-5-5");
+        harness.edit_config(|config| {
+            config["runners"] = json!([{"module":RUNNER}]);
+        });
+        {
+            let shared = harness.credentials();
+            let mut credentials = shared.lock().unwrap();
+            let mut row = credentials.listed_credentials().iter()
+                .find(|row| row.auth_method.as_deref() == Some(method))
+                .unwrap().clone();
+            row.provider_ids = vec![provider.into()];
+            credentials.apply_listing(&ScopedCredentialListing {
+                credentials: vec![row], view: "single-method".into(),
+                ..Default::default()
+            }, crate::now_ms());
+            credentials.refresh_serving_methods(&Default::default(),
+                &harness.store().get_facts().unwrap(), crate::now_ms() as i64, &[]);
+        }
+        let providers = if allowed { vec!["anthropic"] } else { vec!["openai"] };
+        let mut runner = json!({
+            "pairs":[{"wire_api":"anthropic.messages", "auth_method":method}],
+            "follows_account_choice":true,
+            "harnesses":["alpha"], "default_harness":"alpha"
+        });
+        if per_harness {
+            runner["harness_limits"] = json!({"alpha":{"explicit_providers":providers}});
+        } else {
+            runner["standing_limits"] = json!({"explicit_providers":providers});
+        }
+        harness.credentials().lock().unwrap().runner_declarations =
+            super::runners::declarations_from_catalog(&json!([{
+                "module_id":RUNNER, "nonce_verified":true,
+                "role_declarations":{"routing/v1":{"runner":runner}}
+            }]));
+        let consumer = harness.bind(reserved("example-consumer"), None).await;
+        let model = if absent_model && !allowed { "unserved-model" } else { "claude-opus-5-5" };
+        let request = json!({
+            "consumer":"mason", "requirements":{"iq":0},
+            "pin":format!("{provider}/{model}"), "runners":[RUNNER],
+            "harness":"alpha"
+        });
+        let reply = consumer.call("route.select", &request).await;
+        let context = format!("method={method}, per_harness={per_harness}, allowed={allowed}");
+        if allowed {
+            assert_eq!(reply.0, FrameType::Response, "{context}: {reply:?}");
+        } else {
+            assert_eq!(reply.0, FrameType::Error, "{context}: {reply:?}");
+            assert_eq!(reply.1["code"], "pin_unavailable", "{context}: {reply:?}");
+            assert_eq!(reply.1["detail"]["pin"], format!("{provider}/{model}"));
+            assert_eq!(reply.1["detail"]["reason"],
+                if absent_model { "unknown_model" } else { "not_available" }, "{context}: {reply:?}");
+            if !absent_model {
+                assert_eq!(reply.1["detail"]["cause"], "missing_capability", "{context}: {reply:?}");
+            }
+            assert!(reply.1["detail"].get("reset_at_ms").is_none(), "{context}: {reply:?}");
+            for fallback in [false, true] {
+                let mut routing = request.clone();
+                if fallback {
+                    routing["pin_fallback"] = json!("route");
+                } else {
+                    routing.as_object_mut().unwrap().remove("pin");
+                }
+                let unpinned = consumer.call("route.select", &routing).await;
+                assert_eq!(unpinned.0, FrameType::Error, "{context}: {unpinned:?}");
+                assert_eq!(unpinned.1["code"], "no_route", "{context}: {unpinned:?}");
+                assert_eq!(unpinned.1["detail"]["reason"], "missing_capability", "{context}: {unpinned:?}");
+            }
+            harness.credentials().lock().unwrap().runner_declarations
+                .get_mut(RUNNER).unwrap().pairs[0].wire_api = "openai.responses".into();
+            let incompatible = consumer.call("route.select", &request).await;
+            assert_eq!(incompatible.0, FrameType::Error, "{context}: {incompatible:?}");
+            assert_eq!(incompatible.1["code"], "no_route", "{context}: {incompatible:?}");
+            assert_eq!(incompatible.1["detail"]["reason"], "missing_capability", "{context}: {incompatible:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn apikey_provider_limits_refuse_unservable_pin() {
+    check_provider_limit_pin_refusal("apikey", false).await;
+}
+
+#[tokio::test]
+async fn gateway_provider_limits_refuse_unservable_pin() {
+    check_provider_limit_pin_refusal("gateway", false).await;
+}
+
+// Routing 0.7.20 CONTRACT.md:533–536 requires pin_unavailable for an
+// unservable pin; lines 694–698 define unknown_model for an absent row.
+// Conformance 0.10.22 src/checks/gateway.rs:105,264–270 pins an unserved
+// row even when provider limits have emptied every real route.
+#[tokio::test]
+async fn gateway_provider_limits_preserve_absent_pin_admission() {
+    check_provider_limit_pin_refusal("gateway", true).await;
+}
+
+#[tokio::test]
+async fn apikey_provider_limits_preserve_absent_pin_admission() {
+    check_provider_limit_pin_refusal("apikey", true).await;
 }
