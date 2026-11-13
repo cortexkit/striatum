@@ -44,6 +44,7 @@ pub(super) fn for_effects(request: &ReportRequest, now: u64) -> ReportRequest {
 
 pub(super) fn account_effects(
     request: &ReportRequest,
+    credentials: &crate::broca_credentials::BrocaCredentials,
     mut prepare: impl FnMut(&Value) -> Result<V1ReportEffects, Refusal>,
 ) -> Result<V1ReportEffects, Refusal> {
     let neutral = request
@@ -81,9 +82,17 @@ pub(super) fn account_effects(
             }
             Some(AttemptStatus::Credential) => {
                 params["refusal_class"] = "credential_refused".into();
-                effects.credential_refusal = effects
-                    .credential_refusal
-                    .or(prepare(&params)?.credential_refusal);
+                // A refused sign-in needs a new login, not a fence shared by every runner.
+                let extra = prepare(&params)?.credential_refusal.filter(|(refusal, _)| {
+                    credentials
+                        .listed_credentials()
+                        .iter()
+                        .find(|row| row.id == refusal.credential_id)
+                        .is_some_and(|row| {
+                            matches!(row.auth_method.as_deref(), Some("apikey" | "gateway"))
+                        })
+                });
+                effects.credential_refusal = effects.credential_refusal.or(extra);
             }
             _ => {}
         }

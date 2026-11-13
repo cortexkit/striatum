@@ -80,7 +80,7 @@ pub(super) fn report_at(
         .and_then(|q| q.lock().ok().map(|q| q.clone()))
         .unwrap_or_default();
     let account_ids = credentials.quota_account_ids(&quota);
-    let mut effects = attempt::account_effects(&effect_request, |params| {
+    let mut effects = attempt::account_effects(&effect_request, &credentials, |params| {
         prepare_account_facts(
             params,
             &decision,

@@ -648,7 +648,8 @@ async fn attempt_effects_match_legacy_twins_and_typed_account_additions() {
         }
         for (status, typed) in [
             ("quota", json!({"runner_code":"account_limit_exhausted"})),
-            ("credential", json!({"refusal_class":"credential_refused"})),
+            // OAuth sign-ins need reauthentication, so their status adds no credential-refusal field.
+            ("credential", json!({})),
         ] {
             for extra in [
                 json!({}),
@@ -674,7 +675,11 @@ async fn attempt_effects_match_legacy_twins_and_typed_account_additions() {
                     } else {
                         attempt.rows("credential_entitlement_fences").len()
                     };
-                    assert_eq!(walls, 1, "typed {status} must not be vacuous");
+                    assert_eq!(
+                        walls,
+                        usize::from(status == "quota"),
+                        "typed {status} effects"
+                    );
                 }
             }
             let eligibility = json!({"eligibility":{"scope":"account","code":"not_served"}});
@@ -748,4 +753,99 @@ async fn rejected_and_unknown_suppress_all_legacy_evidence_but_commit_cancelled(
             }
         }
     }).await;
+}
+
+async fn report_credential_method(method: &str) -> (std::sync::Arc<Harness>, Route) {
+    let (harness, route) = configured().await;
+    let mut catalog = fixture::catalog();
+    catalog.accounts.truncate(1);
+    catalog.accounts[0].method = method.into();
+    super::super::conformance_tests::install_catalog(&harness, &catalog);
+    let credentials = harness.credentials();
+    let mut credentials = credentials.lock().unwrap();
+    let mut rows = credentials.listed_credentials().to_vec();
+    // The vault type and opaque ID must not override the listed auth method.
+    let row = rows
+        .iter_mut()
+        .find(|row| row.id == "credential-1")
+        .unwrap();
+    row.credential_type = if method == "oauth" { "apikey" } else { "oauth" }.into();
+    credentials.apply_listing(
+        &cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "attempt-method-metadata".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        EFFECT_NOW,
+    );
+    drop(credentials);
+    let selected = result(
+        route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":fixture::SUMMARY,"requirements":{"iq":50},
+                    "pin":"example-subscription/model-c","runners":[fixture::RUNNER_ONE]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(selected["runner"]["module"], fixture::RUNNER_ONE);
+    let body = json!({"decision_id":selected["decision_id"], "outcome":"failed",
+        "credential_id":"credential-1", "attempt_outcome":{"status":"credential"}});
+    assert_eq!(
+        result(route.call("route.report", &body).await)["outcome"],
+        "failed"
+    );
+    (harness, route)
+}
+
+#[tokio::test]
+async fn oauth_credential_attempt_does_not_fence_sign_in_for_another_runner() {
+    let _clock = crate::InjectedClock::set(EFFECT_NOW);
+    let (harness, route) = report_credential_method("oauth").await;
+    assert!(
+        harness
+            .store()
+            .credential_entitlement_fences()
+            .unwrap()
+            .is_empty(),
+        "a refused sign-in must not become a credential-wide refusal"
+    );
+    let selected = result(
+        route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":fixture::SUMMARY,"requirements":{"iq":50},
+                    "pin":"example-subscription/model-c","runners":[fixture::RUNNER_TWO]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(selected["runner"]["module"], fixture::RUNNER_TWO);
+    let runner = harness.bind(reserved(fixture::RUNNER_TWO), None).await;
+    let admitted = result(
+        runner
+            .call(
+                "route.account_for",
+                &json!({
+                    "provider":"example-subscription","model":"model-c",
+                    "decision_id":selected["decision_id"], "conversation_key":"other-runner",
+                    "admission_id":"other-runner-after-sign-in-refusal"
+                }),
+            )
+            .await,
+    );
+    assert_eq!(admitted["account"]["credential_id"], "credential-1");
+}
+
+#[tokio::test]
+async fn apikey_credential_attempt_keeps_the_credential_refusal_effect() {
+    let _clock = crate::InjectedClock::set(EFFECT_NOW);
+    let (harness, _) = report_credential_method("apikey").await;
+    let fences = harness.store().credential_entitlement_fences().unwrap();
+    assert_eq!(fences.len(), 1);
+    assert_eq!(fences[0].credential_id, "credential-1");
+    assert_eq!(fences[0].code, "credential_refused");
 }
