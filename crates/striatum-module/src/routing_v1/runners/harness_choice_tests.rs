@@ -324,6 +324,9 @@ async fn harness_choice_fact_step_precedes_tool_tags_and_distinguishes_route_fil
 
 #[tokio::test]
 async fn harness_choice_candidate_facts_do_not_leak_into_held_legacy_picks_or_reparse() {
+    // Production serves the group; withholding it here pins what a router that
+    // doesn't serve it answers for the same declaration.
+    describe::without_capability(GROUP, async {
     let (harness, route) = configured().await;
     setup(&harness, json!([{"module":"declaring"}]));
     install(&harness, "declaring", &slot(json!({})));
@@ -373,6 +376,8 @@ async fn harness_choice_candidate_facts_do_not_leak_into_held_legacy_picks_or_re
         super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
         parsed
     );
+    })
+    .await;
 }
 
 #[tokio::test]

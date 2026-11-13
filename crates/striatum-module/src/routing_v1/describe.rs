@@ -80,10 +80,20 @@ pub(super) async fn with_candidate_capabilities<T>(
 
 #[cfg(test)]
 pub(super) async fn without_price<T>(future: impl std::future::Future<Output = T>) -> T {
+    without_capability(cortexkit_role_routing::capabilities::SELECT_PRICE, future).await
+}
+
+/// Serve every advertised group except `group`, to pin what a router that
+/// doesn't serve it answers.
+#[cfg(test)]
+pub(super) async fn without_capability<T>(
+    group: &str,
+    future: impl std::future::Future<Output = T>,
+) -> T {
     let groups = capabilities()
         .iter()
         .copied()
-        .filter(|group| *group != cortexkit_role_routing::capabilities::SELECT_PRICE)
+        .filter(|served| *served != group)
         .collect();
     CANDIDATE_CAPABILITIES.scope(groups, future).await
 }
