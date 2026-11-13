@@ -149,7 +149,7 @@ pub(super) fn report_at(
             request.outcome.is_failure(),
             &effects,
             usage.as_ref(),
-            |tx| {
+            move |tx| {
                 if reconcile {
                     crate::account_selection::refresh_credential_quota_holds_in(
                         tx,

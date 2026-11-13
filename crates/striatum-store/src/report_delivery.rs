@@ -3,7 +3,7 @@
 use super::*;
 use striatum_core::{route_state_store::CredentialRefusal, RouteOutcome};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct V1ReportEffects {
     /// Explicit serving credential from the report, before identity fallback.
     pub reported_credential: Option<String>,
@@ -19,6 +19,7 @@ pub struct V1ReportEffects {
     pub lift_credential: Option<(String, String)>,
 }
 
+#[derive(Clone)]
 pub struct V1ReportUsage {
     pub observation: UsageObservation,
     pub tier_applied: Option<String>,
@@ -40,11 +41,25 @@ impl SqliteRouteStateStore {
         failed: bool,
         effects: &V1ReportEffects,
         usage: Option<&V1ReportUsage>,
-        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()>,
+        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
-        let result = self.store.with_conn(|conn: &Connection| {
-            let tx = crate::write_transaction(conn)?;
+        let decision_id = decision_id.to_owned();
+        let delivery_key = delivery_key.to_owned();
+        let report_id = report_id.to_owned();
+        let recorded = recorded.clone();
+        let error = error.map(str::to_owned);
+        let effects = effects.clone();
+        let usage = usage.cloned();
+        let result = self.account_command(AccountCommandKind::Report, move |account| {
+            let decision_id = decision_id.as_str();
+            let delivery_key = delivery_key.as_str();
+            let report_id = report_id.as_str();
+            let error = error.as_deref();
+            let effects = &effects;
+            let usage = usage.as_ref();
+            let tx = account.conn;
+            (|| -> rusqlite::Result<(Option<V1Recorded>, bool)> {
             let standing = tx.query_row(
                 "SELECT body_json, answer_json FROM routing_v1_report_delivery
                  WHERE decision_id=?1 AND delivery_key=?2",
@@ -122,9 +137,9 @@ impl SqliteRouteStateStore {
             if let Some(usage) = usage { insert_usage(&tx, decision_id, usage)?; }
             #[cfg(test)]
             report_crash("before_commit");
-            tx.commit()?;
             Ok((Some(recorded.clone()), usage.is_some()))
-        }).map_err(err)?;
+            })().map_err(err)
+        })?;
         #[cfg(test)]
         report_crash("after_commit");
         // The only in-memory change is a cache invalidation, after commit.

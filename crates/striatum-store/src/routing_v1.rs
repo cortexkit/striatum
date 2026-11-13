@@ -443,6 +443,46 @@ impl SqliteRouteStateStore {
     }
 }
 
+impl crate::AccountTx<'_> {
+    /// Record the public replay answer in the same transaction as its grant.
+    pub fn v1_record_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        recorded: &V1Recorded,
+        now_ms: i64,
+    ) -> RouteStateResult<V1Recorded> {
+        self.conn
+            .execute(
+                "INSERT INTO routing_v1_admission
+             (principal, admission_id, body_json, answer_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(principal, admission_id) DO NOTHING",
+                params![
+                    principal,
+                    admission_id,
+                    recorded.body_json,
+                    recorded.answer_json,
+                    now_ms
+                ],
+            )
+            .map_err(err)?;
+        self.conn
+            .query_row(
+                "SELECT body_json, answer_json FROM routing_v1_admission
+             WHERE principal = ?1 AND admission_id = ?2",
+                params![principal, admission_id],
+                |row| {
+                    Ok(V1Recorded {
+                        body_json: row.get(0)?,
+                        answer_json: row.get(1)?,
+                    })
+                },
+            )
+            .map_err(err)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

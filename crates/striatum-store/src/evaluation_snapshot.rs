@@ -16,6 +16,7 @@ struct WriterMetrics {
     commits: AtomicU64,
     acquisitions: AtomicU64,
     queue_ns: AtomicU64,
+    command_queue_ns: AtomicU64,
     sql_ns: AtomicU64,
     commit_ns: AtomicU64,
     pending_commits: AtomicU64,
@@ -37,7 +38,7 @@ thread_local! {
     static CALL_TIMING: std::cell::Cell<Option<StoreStageTiming>> = const { std::cell::Cell::new(None) };
 }
 
-fn record_stage_timing(delta: StoreStageTiming) {
+pub(crate) fn record_stage_timing(delta: StoreStageTiming) {
     let add = |mut timing: StoreStageTiming| {
         timing.writer_queue_ns += delta.writer_queue_ns;
         timing.sql_ns += delta.sql_ns;
@@ -124,6 +125,15 @@ pub(super) struct ConnectionStore {
 }
 
 impl ConnectionStore {
+    pub(crate) fn is_projection(&self) -> bool {
+        matches!(self.backend, Backend::Projection(_))
+    }
+
+    pub(crate) fn record_command_wait(&self, ns: u64) {
+        self.metrics
+            .command_queue_ns
+            .fetch_add(ns, Ordering::Relaxed);
+    }
     fn new(backend: Backend) -> Self {
         let metrics = Arc::new(WriterMetrics::default());
         let install = |conn: &Connection| {
@@ -226,6 +236,10 @@ impl ConnectionStore {
 }
 
 impl SqliteRouteStateStore {
+    /// Queue time from command enqueue to batch start, excluding connection wait.
+    pub fn account_command_queue_ns(&self) -> u64 {
+        self.store.metrics.command_queue_ns.load(Ordering::Relaxed)
+    }
     pub fn stage_timing(&self) -> StoreStageTiming {
         StoreStageTiming {
             writer_queue_ns: self.store.metrics.queue_ns.load(Ordering::Relaxed),

@@ -17,6 +17,7 @@
 mod account_quota;
 mod account_refusal_log;
 mod account_selection;
+mod account_writer;
 mod serving_index;
 mod background;
 #[cfg(test)]
@@ -3197,16 +3198,26 @@ async fn handle_set_decision_outcome(
                             let model = decision.selected_model_id.as_deref().unwrap_or("");
                             let scope=striatum_store::QuotaSuccessScope {family:fence_config.allocator_policy(provider).family_for_model(model),
                                 pool:striatum_core::quota_extract::antigravity_pool_for_capacity(&format!("{provider}/{model}")).map(str::to_string)};
-                            store
-                                .account_transaction(|tx| {
+                            let decision_id = params.decision_id.clone();
+                            let provider = provider.to_owned();
+                            let model = model.to_owned();
+                            let credential = credential.to_owned();
+                            let identity = identity.clone();
+                            account_writer::execute(
+                                store,
+                                striatum_store::AccountCommandKind::Report,
+                                move |tx| {
+                                    let provider = provider.as_str();
+                                    let model = model.as_str();
+                                    let credential = credential.as_str();
                                     tx.heal_authorized_probe(
-                                        &params.decision_id,
+                                        &decision_id,
                                         provider,
                                         model,
                                         observed_at_ms,
                                     )?;
                                     let size = tx.size_admission_for_model_decision(
-                                        &params.decision_id,
+                                        &decision_id,
                                         provider,
                                         credential,
                                         model,
@@ -3237,15 +3248,24 @@ async fn handle_set_decision_outcome(
                             .is_none()
                         {
                             let model = decision.selected_model_id.as_deref().unwrap_or("");
-                            store
-                                .account_transaction(|tx| {
+                            let decision_id = params.decision_id.clone();
+                            let provider = provider.to_owned();
+                            let model = model.to_owned();
+                            let credential = credential.to_owned();
+                            account_writer::execute(
+                                store,
+                                striatum_store::AccountCommandKind::Report,
+                                move |tx| {
+                                    let provider = provider.as_str();
+                                    let model = model.as_str();
+                                    let credential = credential.as_str();
                                     if tx.probe_authorization_names_credential(
-                                        &params.decision_id,
+                                        &decision_id,
                                         credential,
                                         model,
                                     )? {
                                         tx.heal_authorized_probe(
-                                            &params.decision_id,
+                                            &decision_id,
                                             provider,
                                             model,
                                             observed_at_ms,
@@ -3287,12 +3307,17 @@ async fn handle_set_decision_outcome(
                     decision.selected_provider_id.as_deref(),
                     decision.selected_model_id.as_deref(),
                 ) {
-                    store
-                        .account_transaction(|tx| {
+                    let decision_id = params.decision_id.clone();
+                    let provider = provider.to_owned();
+                    let model = model.to_owned();
+                    account_writer::execute(
+                        store,
+                        striatum_store::AccountCommandKind::Report,
+                        move |tx| {
                             tx.heal_authorized_probe(
-                                &params.decision_id,
-                                provider,
-                                model,
+                                &decision_id,
+                                &provider,
+                                &model,
                                 observed_at_ms,
                             )
                         })
@@ -3313,12 +3338,17 @@ async fn handle_set_decision_outcome(
                 decision.selected_provider_id.as_deref(),
                 decision.selected_model_id.as_deref(),
             ) {
-                store
-                    .account_transaction(|tx| {
+                let decision_id = params.decision_id.clone();
+                let provider = provider.to_owned();
+                let model = model.to_owned();
+                account_writer::execute(
+                    store,
+                    striatum_store::AccountCommandKind::Report,
+                    move |tx| {
                         tx.release_inconclusive_probe(
-                            &params.decision_id,
-                            provider,
-                            model,
+                            &decision_id,
+                            &provider,
+                            &model,
                             observed_at_ms,
                         )
                     })
