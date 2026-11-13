@@ -405,3 +405,193 @@ async fn broca_paid_anthropic_attempts_and_limits_use_the_admission_pool() {
         }
     }
 }
+
+fn single_key_request(id: &str) -> Value {
+    let mut request = credential_only_request(id);
+    offer_key_account_ids(&mut request);
+    request["candidates"]["accounts"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(1);
+    request
+}
+
+async fn served_attempt_and_completed_run(
+    broca: &super::super::conformance_tests::Route,
+    id: &str,
+) {
+    observe_ok(
+        broca,
+        &json!({
+            "event_id":format!("{id}/start"),"kind":"admission_started",
+            "admission_id":id,"run_id":id
+        }),
+    )
+    .await;
+    let attempt = observe_ok(
+        broca,
+        &json!({
+            "caller":{"runner":"broca"},
+            "event_id":format!("{id}/served"),"kind":"attempt",
+            "admission_id":id,"run_id":id,"served_account_id":KEYS[0],
+            "credential_id":KEYS[0],"upstream_origin":"upstream"
+        }),
+    )
+    .await;
+    assert_eq!(attempt["effects"], json!([]));
+    observe_ok(
+        broca,
+        &json!({
+            "caller":{"runner":"broca"},
+            "event_id":format!("{id}/finish"),"kind":"run_finished",
+            "admission_id":id,"run_id":id,"terminal_reason":"completed",
+            "upstream_origin":"upstream"
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn decisionless_paid_key_quota_probe_retests_after_served_attempt_and_completed_run() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let scope = FenceScope::General(GeneralWindow::FiveHour);
+    let observed_at = NOW as i64 - 900_001;
+    let fence = Fence {
+        account_id: KEYS[0].into(),
+        pool: Some(scope.into()),
+        recovery_set: Vec::new(),
+        observed_at_ms: observed_at,
+        reset: ResetTime::Missing,
+        retry_hint_ms: None,
+        source: ConfirmationSource::BrocaAccountLimit,
+    };
+    harness
+        .store()
+        .account_transaction(|tx| {
+            tx.insert_fence(&AccountFenceRow {
+                fence_id: "decisionless-quota".into(),
+                provider: POOL.into(),
+                account_id: KEYS[0].into(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+                fence_json: serde_json::to_string(&fence).unwrap(),
+                source: "broca_limit_exhausted".into(),
+                observed_at,
+                principal: "reserved:broca".into(),
+                admission_id: None,
+                observation_id: None,
+                created_at: observed_at,
+                cleared_at: None,
+                cleared_reason: None,
+            })
+        })
+        .unwrap();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let admitted = broca
+        .call("route.account_for", &single_key_request("quota-probe"))
+        .await;
+    assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    harness
+        .store()
+        .account_read(|tx| {
+            let admission = tx.admission("reserved:broca", "quota-probe")?.unwrap();
+            assert_eq!(admission.account_id, KEYS[0]);
+            let rechecks = tx.fence_rechecks()?;
+            assert_eq!(rechecks.len(), 1);
+            assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64));
+            assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 900_000);
+            Ok(())
+        })
+        .unwrap();
+    served_attempt_and_completed_run(&broca, "quota-probe").await;
+    let blocked = broca
+        .call("route.account_for", &single_key_request("quota-too-soon"))
+        .await;
+    assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+    assert_eq!(blocked.1["code"], "account_pool_exhausted");
+
+    let _later = crate::InjectedClock::set(NOW + 900_001);
+    let retried = broca
+        .call("route.account_for", &single_key_request("quota-retest"))
+        .await;
+    assert_eq!(retried.0, FrameType::Response, "{}", retried.1);
+    harness
+        .store()
+        .account_read(|tx| {
+            let fences = tx.active_fences(POOL)?;
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].fence_id, "decisionless-quota");
+            assert_eq!(fences[0].observed_at, observed_at);
+            let rechecks = tx.fence_rechecks()?;
+            assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 900_001));
+            assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 1_800_001);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn decisionless_paid_key_non_quota_probe_retests_after_served_attempt_and_completed_run() {
+    for code in ["credential_refused", "billing_exhausted"] {
+        let _clock = crate::InjectedClock::set(NOW);
+        let harness = paid_anthropic_harness();
+        let observed_at = NOW as i64 - 3_600_001;
+        harness
+            .store()
+            .record_credential_entitlement_fence(
+                &CredentialRefusal {
+                    provider_id: POOL.into(),
+                    credential_id: KEYS[0].into(),
+                    code: code.into(),
+                },
+                None,
+                observed_at,
+            )
+            .unwrap();
+        let broca = harness.bind(reserved("broca"), None).await;
+        let admitted = broca
+            .call("route.account_for", &single_key_request("non-quota-probe"))
+            .await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        harness
+            .store()
+            .account_read(|tx| {
+                let rechecks = tx.fence_rechecks()?;
+                assert_eq!(rechecks.len(), 1);
+                assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64));
+                assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 3_600_000);
+                Ok(())
+            })
+            .unwrap();
+        served_attempt_and_completed_run(&broca, "non-quota-probe").await;
+        let blocked = broca
+            .call(
+                "route.account_for",
+                &single_key_request("non-quota-too-soon"),
+            )
+            .await;
+        assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
+        assert_eq!(blocked.1["code"], "account_pool_exhausted");
+        assert_eq!(blocked.1["detail"]["reset_at_ms"], NOW + 3_600_000);
+
+        let _later = crate::InjectedClock::set(NOW + 3_600_001);
+        let retried = broca
+            .call("route.account_for", &single_key_request("non-quota-retest"))
+            .await;
+        assert_eq!(retried.0, FrameType::Response, "{}", retried.1);
+        let fences = harness.store().credential_entitlement_fences().unwrap();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].credential_id, KEYS[0]);
+        assert_eq!(fences[0].code, code);
+        assert_eq!(fences[0].observed_at_ms, observed_at);
+        harness
+            .store()
+            .account_read(|tx| {
+                let rechecks = tx.fence_rechecks()?;
+                assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 3_600_001));
+                assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 7_200_001);
+                Ok(())
+            })
+            .unwrap();
+    }
+}
