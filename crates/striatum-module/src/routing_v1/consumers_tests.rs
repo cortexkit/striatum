@@ -92,6 +92,74 @@ fn on_runner(reply: &(FrameType, Value), module: &str) {
 }
 
 #[tokio::test]
+async fn production_consumer_declarations_serve_defaults_admission_placement_and_kind() {
+    let h = harness();
+    h.edit_config(|config| {
+        config["runners"] = json!([{"module":fixture::RUNNER_ONE}, {"module":"broca"}]);
+    });
+    placement_catalog(
+        &h,
+        json!([
+            {"name":"basal.task", "iq":40, "ladder":["example-provider/model-a"],
+             "selectors":["selector"], "placement":{"module":"broca"}, "kind":"llm"},
+            {"name":"basal.media", "iq":40, "kind":"transcribe"},
+            {"name":"foreign.task", "iq":40}
+        ]),
+    );
+    let owner = h.bind(reserved("basal"), None).await;
+    let selector = h.bind(reserved("selector"), None).await;
+    let request = json!({"consumer":"basal.task.child", "requirements":{}});
+    for route in [&owner, &selector] {
+        let reply = route.call("route.select", &request).await;
+        assert_eq!(selected_input(&h, &reply)["iq"], 40.0);
+        assert_eq!(reply.1["result"]["route"]["model"], "model-a");
+        on_runner(&reply, "broca");
+    }
+    let stranger = h.bind(reserved("stranger"), None).await;
+    admission_refused(
+        stranger.call("route.select", &request).await,
+        "consumer_not_owned",
+        "basal.task.child",
+    );
+    admission_refused(
+        owner.call("route.select", &select("foreign.task")).await,
+        "unknown_consumer",
+        "foreign.task",
+    );
+    let media = owner
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"basal.media", "requirements":{}
+            }),
+        )
+        .await;
+    no_route(&media, "no_available_model");
+    assert!(media.1["message"]
+        .as_str()
+        .unwrap()
+        .contains("route.select_engine"));
+    let describe = owner.call("role.describe", &json!({})).await;
+    assert_eq!(describe.0, FrameType::Response, "{describe:?}");
+    let groups = describe.1["result"]["capabilities"].as_array().unwrap();
+    assert_eq!(
+        groups
+            .iter()
+            .filter(|group| **group == json!("consumer_declarations"))
+            .count(),
+        1
+    );
+    assert!(!groups.contains(&json!("select_kind")));
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        assert_eq!(
+            super::describe::capabilities().as_ref(),
+            super::describe::CAPABILITIES
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn declared_placement_module_narrows_settings_and_caller_filters() {
     super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         let h = harness();
@@ -294,18 +362,21 @@ async fn declared_kind_select_retains_media_and_unknown_kinds_and_production_hol
         assert!(!super::describe::capabilities().contains(&"select_kind"));
     })
     .await;
-    // A cached candidate declaration cannot activate either constraint in production.
-    on_runner(
-        &owner.call("route.select", &select("basal.media")).await,
-        fixture::RUNNER_ONE,
-    );
-    consumers::replace_catalog(&json!([{"module_id":"basal","nonce_verified":true,
+    // Withholding the group must still disable cached and newly read declarations.
+    super::describe::without_capability("consumer_declarations", async {
+        on_runner(
+            &owner.call("route.select", &select("basal.media")).await,
+            fixture::RUNNER_ONE,
+        );
+        consumers::replace_catalog(&json!([{"module_id":"basal","nonce_verified":true,
         "role_declarations":{"routing/v1":{"consumers":declarations}}}]));
-    on_runner(
-        &owner.call("route.select", &select("basal.media")).await,
-        fixture::RUNNER_ONE,
-    );
-    assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
+        on_runner(
+            &owner.call("route.select", &select("basal.media")).await,
+            fixture::RUNNER_ONE,
+        );
+        assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -351,9 +422,12 @@ async fn declared_kind_engine_matches_or_refuses_crossing() {
     })
     .await;
     // An already decoded declaration still cannot restrict engines when the group is off.
-    request["consumer"] = json!("basal.synthesize");
-    let reply = owner.call("route.select_engine", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    super::describe::without_capability("consumer_declarations", async {
+        request["consumer"] = json!("basal.synthesize");
+        let reply = owner.call("route.select_engine", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -420,13 +494,15 @@ async fn declared_defaults_iq_precedence_refusals_and_production_hold() {
         }
     })
     .await;
-    // Even an already-read candidate catalog cannot enable defaults for a
-    // production request whose advertised capabilities still hold them back.
-    let reply = owner.call("route.select", &omitted).await;
-    assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
-    consumers::replace_catalog(&modules);
-    let reply = owner.call("route.select", &omitted).await;
-    assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+    // Withholding consumer_declarations disables defaults even after selects used them.
+    super::describe::without_capability("consumer_declarations", async {
+        let reply = owner.call("route.select", &omitted).await;
+        assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+        consumers::replace_catalog(&modules);
+        let reply = owner.call("route.select", &omitted).await;
+        assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -577,13 +653,16 @@ async fn declared_defaults_ladder_mode_operator_overrides_and_empty_ladder_refus
         });
     })
     .await;
-    let reply = owner.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["route"]["model"], "model-b",
-        "{}",
-        reply.1
-    );
+    super::describe::without_capability("consumer_declarations", async {
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-b",
+            "{}",
+            reply.1
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -709,20 +788,22 @@ async fn declared_admission_selectors_use_attested_identity_not_their_scope() {
     })
     .await;
 
-    // The held production capability list must not apply a selectors member,
-    // even after a candidate reader used it in the same process.
-    consumers::replace_catalog(&modules);
-    let owner = h.bind(reserved("admission-owner"), None).await;
-    let selector = h.bind(reserved("admission-selector"), None).await;
-    for route in [&owner, &selector] {
-        admission_refused(
-            route
-                .call("route.select", &select("admission-owner.task"))
-                .await,
-            "unknown_consumer",
-            "admission-owner.task",
-        );
-    }
+    // Withholding consumer_declarations disables selectors even after selects used them.
+    super::describe::without_capability("consumer_declarations", async {
+        consumers::replace_catalog(&modules);
+        let owner = h.bind(reserved("admission-owner"), None).await;
+        let selector = h.bind(reserved("admission-selector"), None).await;
+        for route in [&owner, &selector] {
+            admission_refused(
+                route
+                    .call("route.select", &select("admission-owner.task"))
+                    .await,
+                "unknown_consumer",
+                "admission-owner.task",
+            );
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -1310,20 +1391,23 @@ async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilitie
             .is_empty());
     })
     .await;
-    assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
-    consumers::replace_catalog(&modules);
-    assert!(!consumers::effective(&h.operator_config()).knows("broca.task"));
-    assert!(super::runners::declarations_from_catalog(&modules).is_empty());
-    let owner = h.bind(reserved("broca"), None).await;
-    refused(
-        owner.call("route.select", &select("broca.task")).await,
-        "unknown_consumer",
-        "broca.task",
-    );
-    let preview = operator.call("route.what_if", &preview_request).await;
-    assert_eq!(preview.0, FrameType::Error, "{preview:?}");
-    assert_eq!(preview.1["code"], "invalid_request");
-    assert_eq!(preview.1["detail"]["field"], "runner_declarations.broca");
+    super::describe::without_capability("consumer_declarations", async {
+        assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
+        consumers::replace_catalog(&modules);
+        assert!(!consumers::effective(&h.operator_config()).knows("broca.task"));
+        assert!(super::runners::declarations_from_catalog(&modules).is_empty());
+        let owner = h.bind(reserved("broca"), None).await;
+        refused(
+            owner.call("route.select", &select("broca.task")).await,
+            "unknown_consumer",
+            "broca.task",
+        );
+        let preview = operator.call("route.what_if", &preview_request).await;
+        assert_eq!(preview.0, FrameType::Error, "{preview:?}");
+        assert_eq!(preview.1["code"], "invalid_request");
+        assert_eq!(preview.1["detail"]["field"], "runner_declarations.broca");
+    })
+    .await;
 }
 
 #[tokio::test]

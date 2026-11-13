@@ -14,6 +14,7 @@ const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 /// parsers, so declarations and accepted members agree. Harnesses come from
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
+    cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
     "select_engine",
     "engine_reports",
     "engine_evals",
