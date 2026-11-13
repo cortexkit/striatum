@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use cortexkit_role_routing::declarations::{parse_consumer_declarations_serving, DemandDefaults};
+use cortexkit_role_routing::declarations::DemandDefaults;
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
 
@@ -11,6 +11,8 @@ use crate::config_overrides::LiveConfig;
 use crate::config_policy::ConsumerPolicy;
 
 use super::Caller;
+
+pub(super) mod declared;
 
 /// Claims stay keyed by their declaring module until the effective view is
 /// built. No module can overwrite another module's claim to the same name.
@@ -124,13 +126,16 @@ impl Catalog {
             else {
                 continue;
             };
-            match parse_consumer_declarations_serving(slot, &super::describe::capabilities()) {
+            match declared::parse(slot) {
                 Ok(declarations) => {
                     catalog.modules.insert(
                         module.to_owned(),
                         declarations
                             .consumers
                             .into_iter()
+                            .filter(|declaration| {
+                                declared::honor(module, declaration, &mut catalog.issues)
+                            })
                             .filter(|declaration| !crate::config_policy::is_slot(&declaration.name))
                             .map(|declaration| (declaration.name, declaration.defaults))
                             .collect(),
@@ -143,6 +148,8 @@ impl Catalog {
                 }
             }
         }
+        catalog.issues.sort();
+        catalog.issues.dedup();
         catalog
     }
 
@@ -185,6 +192,23 @@ impl Catalog {
             .defaults
             .retain(|name, _| registry.owners[name].len() == 1);
         registry
+    }
+}
+
+/// Until modules and settings use module-qualified consumer names together,
+/// undeclared settings names produce info logs rather than health warnings.
+pub(crate) fn settings_loaded(config: &LiveConfig) {
+    let catalog = CATALOG.get_or_init(Default::default).read().unwrap();
+    for name in config.v1_consumers() {
+        if !catalog
+            .modules
+            .values()
+            .any(|names| names.contains_key(&name))
+        {
+            crate::info_operator(format!(
+                "[striatum] settings consumer {name:?} has no module declaration"
+            ));
+        }
     }
 }
 

@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use cortexkit_role_routing_conformance::fixture;
 use serde_json::{json, Value};
+use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{install_catalog, reserved, Harness, Route};
@@ -30,6 +31,273 @@ fn entry(module: &str, verified: bool, names: &[&str]) -> Value {
 
 fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
+}
+
+async fn consumer_health_report(harness: &Harness) -> Value {
+    let frame = subc_protocol::Frame::build(
+        FrameType::Request,
+        crate::control_flags(),
+        0,
+        0,
+        1,
+        serde_json::to_vec(&json!({"op": subc_protocol::session::MODULE_CONTROL_OP_HEALTH_CHECK}))
+            .unwrap(),
+    )
+    .unwrap();
+    serde_json::from_slice(&harness.handle(frame).await.body).unwrap()
+}
+
+#[tokio::test]
+async fn declared_names_ignore_foreign_extensions_keep_legacy_admission_and_refresh() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        let before = consumer_health_report(&h).await;
+        let modules = json!([{
+            "module_id": "name-owner", "nonce_verified": true,
+            "role_declarations": {"routing/v1": {"consumers": [
+                {"name": "outside-new", "iq": 40, "eq": 70},
+                {"name": "name-owner.task", "iq": 40},
+                {"name": "outside-legacy", "eq": 23},
+                {"name": "outside-null", "eq": 24, "iq": null, "ladder": null,
+                 "placement": null, "selectors": null, "kind": null}
+            ]}}
+        }]);
+        crate::take_operator_warnings();
+        consumers::replace_catalog(&modules);
+        let health = consumers::health();
+        let after = consumer_health_report(&h).await;
+        assert!(before.get("status").is_some(), "{before}");
+        assert_eq!(after["status"], before["status"]);
+        assert_eq!(after["detail"], before["detail"]);
+        assert_eq!(after["metrics"]["consumerDeclarations"], health);
+        let issues = health["issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 3, "{health}");
+        let lines = crate::take_operator_warnings();
+        for issue in issues {
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line.contains(issue.as_str().unwrap()))
+                    .count(),
+                1
+            );
+        }
+        consumers::replace_catalog(&modules);
+        assert_eq!(consumers::health(), health);
+        assert!(crate::take_operator_warnings().is_empty());
+        let owner = h.bind(reserved("name-owner"), None).await;
+        let stranger = h.bind(reserved("other-module"), None).await;
+        let config = h.operator_config();
+        let registry = consumers::effective(&config);
+        assert!(!registry.knows("outside-new"));
+        assert!(!registry.policies.contains_key("outside-new"));
+        assert_eq!(
+            registry.with_defaults("outside-new", &select("outside-new"), &config)["requirements"]
+                .get("eq"),
+            None
+        );
+        refused(
+            owner.call("route.select", &select("outside-new")).await,
+            "unknown_consumer",
+            "outside-new",
+        );
+        for (name, eq) in [
+            ("outside-legacy", 23),
+            ("outside-null", 24),
+            ("name-owner.task", 0),
+        ] {
+            assert_eq!(
+                owner.call("route.select", &select(name)).await.0,
+                FrameType::Response
+            );
+            refused(
+                stranger.call("route.select", &select(name)).await,
+                "consumer_not_owned",
+                name,
+            );
+            if eq != 0 {
+                let defaults = registry.with_defaults(name, &select(name), &config);
+                assert_eq!(defaults["requirements"]["eq"], eq);
+                let missing_iq = registry.with_defaults(
+                    name,
+                    &json!({"consumer":name, "requirements":{}}),
+                    &config,
+                );
+                assert!(missing_iq["requirements"].get("iq").is_none());
+            }
+        }
+        let parsed = consumers::declared::parse_count();
+        for _ in 0..3 {
+            assert_eq!(
+                owner
+                    .call("route.select", &select("name-owner.task"))
+                    .await
+                    .0,
+                FrameType::Response
+            );
+        }
+        assert_eq!(
+            consumers::declared::parse_count(),
+            parsed,
+            "select must not parse declarations"
+        );
+        assert!(crate::take_operator_warnings().is_empty());
+        consumers::replace_catalog(&json!([entry("replacement", true, &["replacement.task"])]));
+        assert!(consumers::declared::parse_count() > parsed);
+        refused(
+            owner.call("route.select", &select("name-owner.task")).await,
+            "unknown_consumer",
+            "name-owner.task",
+        );
+        let replacement = h.bind(reserved("replacement"), None).await;
+        assert_eq!(
+            replacement
+                .call("route.select", &select("replacement.task"))
+                .await
+                .0,
+            FrameType::Response
+        );
+        assert_eq!(consumers::health()["issues"], json!([]));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn settings_only_names_log_info_at_load_without_health_warnings_or_request_logs() {
+    let h = harness();
+    consumers::replace_catalog(&json!([entry(
+        "declared-owner",
+        true,
+        &["declared-owner.task"]
+    )]));
+    crate::take_operator_warnings();
+    crate::take_operator_infos();
+    h.edit_config(|config| {
+        config["consumers"] = json!({"settings-only": {}, "declared-owner.task": {}});
+    });
+    assert_eq!(
+        crate::take_operator_infos(),
+        vec!["[striatum] settings consumer \"settings-only\" has no module declaration"]
+    );
+    assert!(crate::take_operator_warnings().is_empty());
+    assert_eq!(consumers::health()["issues"], json!([]));
+    let caller = h.bind(reserved("any-bound-module"), None).await;
+    for _ in 0..3 {
+        h.operator_config();
+        assert_eq!(
+            caller
+                .call("route.select", &select("settings-only"))
+                .await
+                .0,
+            FrameType::Response
+        );
+    }
+    assert!(crate::take_operator_infos().is_empty());
+    assert!(crate::take_operator_warnings().is_empty());
+    assert_eq!(consumers::health()["issues"], json!([]));
+}
+
+#[tokio::test]
+async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilities() {
+    let h = harness();
+    let models: serde_json::Map<_, _> = h
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .map(|mut fact| {
+            fact.supports_tool_use = Some(true);
+            h.store()
+                .upsert_fact(&fact, striatum_core::FactSource::Override)
+                .unwrap();
+            (
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                json!({"existence":"present", "capability.tool_call":true}),
+            )
+        })
+        .collect();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({"catalog_version":41, "resolved_at_ms":123, "models":models}))
+            .unwrap(),
+    )
+    .unwrap();
+    h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    h.edit_config(|config| {
+        config["consumers"] = json!({"preview": {}});
+        config["runners"] = json!([{"module":"broca"}]);
+    });
+    let slot = json!({
+        "consumers": [{"name":"broca.task", "iq":40}, {"name":"foreign-task", "iq":40}],
+        "runner": {
+            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
+                     {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
+            "harnesses":["name-test"], "default_harness":"name-test"
+        }
+    });
+    let modules = json!([{"module_id":"broca", "nonce_verified":true,
+        "role_declarations":{"routing/v1":slot}}]);
+    let operator = h.bind(reserved("callosum"), None).await;
+    let preview_request = json!({"consumer":"preview", "iqs":[0], "runner":"broca",
+        "runner_declarations":{"broca":slot},
+        "head_choices":{"runner_module":"broca", "harness":"name-test"}});
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        consumers::replace_catalog(&modules);
+        let registry = consumers::effective(&h.operator_config());
+        assert!(registry.knows("broca.task"));
+        assert!(!registry.knows("foreign-task"));
+        let runners = super::runners::declarations_from_catalog(&modules);
+        assert_eq!(
+            runners["broca"].harnesses(),
+            Some(["name-test".to_string()].as_slice())
+        );
+        h.credentials().lock().unwrap().runner_declarations = runners;
+        let owner = h.bind(reserved("broca"), None).await;
+        let live = owner.call("route.select", &select("broca.task")).await;
+        assert_eq!(live.0, FrameType::Response, "{live:?}");
+        assert_eq!(live.1["result"]["runner"]["module"], "broca");
+        // The proposed runner must be read from the overlay, not the live copy.
+        h.credentials().lock().unwrap().runner_declarations.clear();
+        let preview = operator.call("route.what_if", &preview_request).await;
+        assert_eq!(preview.0, FrameType::Response, "{preview:?}");
+        assert!(
+            preview.1["result"]["results"][0]["pick"]["route"].is_string(),
+            "{preview:?}"
+        );
+        assert!(
+            !preview.1["result"]["head_choices"]["models"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{preview:?}"
+        );
+        let unchanged = owner.call("route.select", &select("broca.task")).await;
+        assert_eq!(unchanged.0, FrameType::Response, "{unchanged:?}");
+        assert!(
+            unchanged.1["result"]["runner"].get("harness").is_none(),
+            "{unchanged:?}"
+        );
+        assert!(h
+            .credentials()
+            .lock()
+            .unwrap()
+            .runner_declarations
+            .is_empty());
+    })
+    .await;
+    assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
+    consumers::replace_catalog(&modules);
+    assert!(!consumers::effective(&h.operator_config()).knows("broca.task"));
+    assert!(super::runners::declarations_from_catalog(&modules).is_empty());
+    let owner = h.bind(reserved("broca"), None).await;
+    refused(
+        owner.call("route.select", &select("broca.task")).await,
+        "unknown_consumer",
+        "broca.task",
+    );
+    let preview = operator.call("route.what_if", &preview_request).await;
+    assert_eq!(preview.0, FrameType::Error, "{preview:?}");
+    assert_eq!(preview.1["code"], "invalid_request");
+    assert_eq!(preview.1["detail"]["field"], "runner_declarations.broca");
 }
 
 #[tokio::test]
