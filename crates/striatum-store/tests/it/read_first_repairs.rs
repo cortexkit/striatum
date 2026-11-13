@@ -1,4 +1,4 @@
-use striatum_store::{dev_descriptor, PoolWallKind, SqliteRouteStateStore};
+use striatum_store::{dev_descriptor, AccountCommandKind, PoolWallKind, SqliteRouteStateStore};
 
 fn store(label: &str) -> (cortexkit_test_support::ScratchDir, SqliteRouteStateStore) {
     let dir = cortexkit_test_support::ScratchDir::new(label);
@@ -32,7 +32,7 @@ fn pool_states_unchanged_do_not_acquire_writer() {
 }
 
 #[test]
-fn pool_repair_rechecks_newer_writer_and_commits_only_once() {
+fn pool_repair_rechecks_newer_writer_without_repeating_row_changes() {
     let (_dir, store) = store("read-first-pool-race");
     // The inserted pool_key_state row needs a durable retry clock.
     store
@@ -43,7 +43,10 @@ fn pool_repair_rechecks_newer_writer_and_commits_only_once() {
             )
         })
         .unwrap();
-    let before = store.writer_commit_count_for_test();
+    let before = store.account_command_count_for_test(AccountCommandKind::Maintenance);
+    let rows_before = store
+        .account_command_row_changes_for_test(AccountCommandKind::Maintenance)
+        .len();
     let states = store
         .pool_key_states_after_read_for_test("p", 200, || {
             // This runs after the reader has released its snapshot, on a separate
@@ -59,7 +62,19 @@ fn pool_repair_rechecks_newer_writer_and_commits_only_once() {
     assert_eq!(clocks[0].evidence_at, 500);
     assert_eq!(clocks[0].due_at(), 3_600_500);
     assert_eq!(
-        store.writer_commit_count_for_test() - before,
+        store.account_command_count_for_test(AccountCommandKind::Maintenance) - before,
+        2
+    );
+    let changes = store.account_command_row_changes_for_test(AccountCommandKind::Maintenance);
+    let changes = &changes[rows_before..];
+    assert_eq!(changes.len(), 2);
+    assert!(changes[0] > 0);
+    assert_eq!(
+        changes[1], 0,
+        "the stale repair must not repeat the competing writer's row changes"
+    );
+    assert_eq!(
+        changes.iter().filter(|rows| **rows > 0).count(),
         1,
         "only the competing writer changed durable rows"
     );

@@ -1,0 +1,54 @@
+# Store entry points that write account-state tables, including trigger effects.
+# Production module callers use account_writer.rs.
+# AccountTx operations are connection scoped, not store entry points.
+# The private what-if SQL projection may execute the same operations directly.
+@projection crates/striatum-store/src/evaluation_snapshot.rs::projection_command
+direct_account_transaction
+account_transaction
+account_repair
+record_account_eligibility
+record_account_size_refusal
+clear_account_size_refusal
+record_account_route_fence
+record_transient_account_route_fence
+record_billing_account_route_fence
+reconcile_account_route_fence
+clear_account_route_fences_before
+clear_all_account_route_fences_for_credential
+record_credential_entitlement_fence
+touch_credential_entitlement_fence
+clear_credential_entitlement_fence
+clear_credential_entitlement_fences_for_credential
+clear_credential_entitlement_fences
+adopt_credential_entitlement_fingerprint
+bind_fence_probe_owner
+pool_acquire
+pool_acquire_for_route
+pool_renew
+pool_release
+pool_wall
+pool_key_states
+v1_record_decision
+v1_record_selection
+v1_record_report
+v1_record_admission
+put_account_vault_roster
+clear_route_cooldowns
+record_provider_cooldown
+update_route_state
+set_decision_outcome
+clear_failure_backoff
+apply_fusiform_catalog
+apply_fusiform_catalog_for_providers
+apply_fusiform_catalog_snapshot_for_providers
+upsert_fact
+prune_unserved_unpicked_facts
+prune_account_admissions
+prune_account_affinities
+prune_account_observations
+prune_observation_events
+prune_v1_decisions
+prune_v1_admissions
+prune_v1_affinities
+prune_account_continuations
+prune_retired_fence_origins

@@ -1842,6 +1842,144 @@ async fn entitlement_is_credential_wide_and_old_billing_refusals_keep_other_keys
     );
 }
 
+#[test]
+fn reconciliation_writes_once_and_rechecks_new_facts_with_the_same_listing() {
+    use striatum_store::AccountCommandKind::Repair;
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("synthetic", false);
+    let fingerprint = match credentials.listing_fingerprint("oauth:test") {
+        crate::broca_credentials::ListingLookup::Listed(value) => value,
+        _ => panic!("the fixture must have a successful listing"),
+    };
+    let fact = striatum_store::AccountEligibilityFact {
+        provider: "synthetic".into(),
+        credential_id: "oauth:test".into(),
+        model: "unlisted-model".into(),
+        listing_fingerprint: None,
+        code: "ineligible".into(),
+        observed_at: 1,
+    };
+    harness.store().record_account_eligibility(&fact).unwrap();
+    let commands = harness.store().account_command_count_for_test(Repair);
+    let rows_before = harness
+        .store()
+        .account_command_row_changes_for_test(Repair)
+        .len();
+    let outside = harness.store().outside_account_writer_count_for_test();
+    let hints = Arc::new(std::sync::Barrier::new(20));
+    let readers: Vec<_> = (0..20)
+        .map(|_| {
+            let store = harness.store().clone();
+            let credentials = harness.credentials();
+            let config = harness.operator_config();
+            let hints = hints.clone();
+            std::thread::spawn(move || {
+                let _clock = crate::InjectedClock::set(NOW);
+                // All callers observe the missing fingerprint before any command
+                // is submitted, so the writer must recheck twenty stale hints.
+                crate::credential_fences::before_listing_repair_for_test(move || {
+                    hints.wait();
+                });
+                crate::account_selection::ClassContext::load(
+                    &store,
+                    &credentials,
+                    config,
+                    None,
+                    NOW as i64,
+                )
+                .unwrap();
+            })
+        })
+        .collect();
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(
+        harness.store().account_command_count_for_test(Repair) - commands,
+        20
+    );
+    let changes = harness.store().account_command_row_changes_for_test(Repair);
+    let changes = &changes[rows_before..];
+    assert_eq!(changes.len(), 20);
+    assert_eq!(changes.iter().filter(|rows| **rows > 0).count(), 1);
+    assert_eq!(
+        changes.iter().sum::<u64>(),
+        1,
+        "only the missing fingerprint changes"
+    );
+    assert_eq!(
+        harness.store().account_eligibility().unwrap()[0]
+            .listing_fingerprint
+            .as_deref(),
+        Some(fingerprint.as_str())
+    );
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &harness.credentials(),
+            harness.operator_config(),
+            None,
+            NOW as i64,
+        )
+        .unwrap()
+    };
+    let commands = harness.store().account_command_count_for_test(Repair);
+    load();
+    assert_eq!(
+        harness.store().account_command_count_for_test(Repair),
+        commands,
+        "an identical later load enqueues no repair"
+    );
+    harness
+        .store()
+        .record_account_eligibility(&striatum_store::AccountEligibilityFact {
+            observed_at: 2,
+            ..fact
+        })
+        .unwrap();
+    load();
+    assert_eq!(
+        harness.store().account_command_count_for_test(Repair) - commands,
+        1,
+        "a new fact without a fingerprint must adopt even an unchanged listing"
+    );
+    assert_eq!(
+        harness
+            .store()
+            .account_command_row_changes_for_test(Repair)
+            .last(),
+        Some(&1)
+    );
+    load();
+    assert_eq!(
+        harness.store().account_command_count_for_test(Repair) - commands,
+        1
+    );
+    let mut listing = credentials.listed_credentials().to_vec();
+    for row in &mut listing {
+        row.plan_tier = Some("new-plan".into());
+    }
+    credentials.apply_listing(
+        &cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "changed-listing".into(),
+            credentials: listing,
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials);
+    load();
+    assert_eq!(
+        harness.store().account_command_count_for_test(Repair) - commands,
+        2
+    );
+    assert!(harness.store().account_eligibility().unwrap().is_empty());
+    assert_eq!(
+        harness.store().outside_account_writer_count_for_test(),
+        outside
+    );
+}
+
 #[tokio::test]
 async fn unchanged_context_reads_without_reserving_the_writer() {
     let _clock = crate::InjectedClock::set(NOW);
@@ -1886,40 +2024,68 @@ async fn unchanged_quota_hold_reads_without_reserving_the_writer() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     oauth_weekly_reading_at(100.0, NOW as i64 + 3_600_000, NOW as i64);
-    harness.store().record_credential_entitlement_fence(
-        &striatum_core::route_state_store::CredentialRefusal {
-            provider_id: "synthetic".into(), credential_id: "oauth:test".into(),
-            code: "billing_exhausted".into(),
-        }, None, NOW as i64,
-    ).unwrap();
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            NOW as i64,
+        )
+        .unwrap();
     let credentials = harness.credentials();
-    let load = || crate::account_selection::ClassContext::load(
-        harness.store(), &credentials, harness.operator_config(), crate::ACCOUNT_QUOTA.get(), NOW as i64,
-    );
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &credentials,
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            NOW as i64,
+        )
+    };
     assert_eq!(load().unwrap().refusals.len(), 1);
-    assert_eq!(harness.store().account_read(|tx| tx.active_pool_fences("synthetic")).unwrap().len(), 1);
+    assert_eq!(
+        harness
+            .store()
+            .account_read(|tx| tx.active_pool_fences("synthetic"))
+            .unwrap()
+            .len(),
+        1
+    );
     let writer = rusqlite::Connection::open(harness.store_path()).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let before = harness.store().account_write_transaction_count_for_test();
     let result = load();
     writer.execute_batch("ROLLBACK").unwrap();
-    assert!(result.is_ok(), "unchanged hold reserved the writer: {:?}", result.err());
-    assert_eq!(harness.store().account_write_transaction_count_for_test(), before);
+    assert!(
+        result.is_ok(),
+        "unchanged hold reserved the writer: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        harness.store().account_write_transaction_count_for_test(),
+        before
+    );
 }
 
 #[tokio::test]
 async fn selection_reuses_one_read_only_context_across_ladder_entries() {
-    let (loads, _) = select_past_held_ladder_entry().await;
+    let (loads, _, _, _) = select_past_held_ladder_entry().await;
     assert_eq!(loads, 1);
 }
 
 #[tokio::test]
-async fn selection_with_unchanged_context_opens_no_account_write_transactions() {
-    let (_, writes) = select_past_held_ladder_entry().await;
-    assert_eq!(writes, 0);
+async fn selection_with_unchanged_context_sends_no_repairs_and_one_affinity_command() {
+    let (_, batches, repairs, selections) = select_past_held_ladder_entry().await;
+    assert_eq!(repairs, 0);
+    assert_eq!(selections, 1);
+    assert_eq!(batches, selections);
 }
 
-async fn select_past_held_ladder_entry() -> (u64, u64) {
+async fn select_past_held_ladder_entry() -> (u64, u64, u64, u64) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);
     let first = crate::tests::fact("synthetic", "model");
@@ -1948,6 +2114,12 @@ async fn select_past_held_ladder_entry() -> (u64, u64) {
     let caller = harness.bind(reserved(OWNER), None).await;
     let loads = crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get());
     let writes = harness.store().account_write_transaction_count_for_test();
+    let repairs = harness
+        .store()
+        .account_command_count_for_test(striatum_store::AccountCommandKind::Repair);
+    let selections = harness
+        .store()
+        .account_command_count_for_test(striatum_store::AccountCommandKind::Selection);
     let serving = harness.store().account_serving_counts().unwrap();
     let selected = caller
         .select_with_profiles(
@@ -1971,6 +2143,14 @@ async fn select_past_held_ladder_entry() -> (u64, u64) {
     (
         crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get()) - loads,
         harness.store().account_write_transaction_count_for_test() - writes,
+        harness
+            .store()
+            .account_command_count_for_test(striatum_store::AccountCommandKind::Repair)
+            - repairs,
+        harness
+            .store()
+            .account_command_count_for_test(striatum_store::AccountCommandKind::Selection)
+            - selections,
     )
 }
 
@@ -4915,9 +5095,10 @@ fn s4b_seed_trigger(
                 now as u64,
             );
             harness.set_credentials(credentials.clone());
-            // Clearing a listing-bound entitlement also checks its quota holds
-            // in one transaction, in addition to the three listing row repairs.
-            return 4;
+            // One Repair command holds fingerprint adoption or clear, the
+            // quota-hold clear and eligibility reconciliation. It replaces
+            // one transaction plus three autocommits for this listing.
+            return 1;
         }
         "pool_deadline" => {
             let mut rows = credentials.listed_credentials().to_vec();

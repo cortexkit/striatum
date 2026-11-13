@@ -156,7 +156,10 @@ impl SqliteRouteStateStore {
     /// Bind a decision and, when it carries an affinity key, make it the key's
     /// previous decision, in one transaction.
     pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {
-        self.v1_record_selection(decision, None)
+        let decision = decision.to_owned();
+        self.account_command(crate::AccountCommandKind::Selection, move |tx| {
+            tx.v1_record_decision(&decision)
+        })
     }
 
     /// Persist the immutable selection answer with its decision binding.
@@ -166,54 +169,11 @@ impl SqliteRouteStateStore {
         decision: &V1Decision,
         selection_json: Option<&str>,
     ) -> RouteStateResult<()> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = crate::write_transaction(c)?;
-                tx.execute(
-                    "INSERT INTO routing_v1_decision
-                       (decision_id, principal, consumer, project_id, provider, model, variant,
-                         runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![
-                        decision.decision_id,
-                        decision.principal,
-                        decision.consumer,
-                        decision.project_id,
-                        decision.provider,
-                        decision.model,
-                        decision.variant,
-                        decision.runner_module,
-                        decision.affinity,
-                        decision.created_at_ms,
-                        decision.expires_at_ms,
-                        decision.allowed_account_class.as_str(),
-                    ],
-                )?;
-                if let Some(selection_json) = selection_json {
-                    tx.execute("UPDATE routing_v1_decision SET selection_json=?2 WHERE decision_id=?1",
-                        params![decision.decision_id, selection_json])?;
-                }
-                if let Some(affinity) = &decision.affinity {
-                    tx.execute(
-                        "INSERT INTO routing_v1_affinity
-                           (principal, consumer, affinity, decision_id, updated_at_ms, ended_at_ms)
-                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)
-                         ON CONFLICT(principal, consumer, affinity) DO UPDATE SET
-                           decision_id = excluded.decision_id,
-                           updated_at_ms = excluded.updated_at_ms,
-                           ended_at_ms = NULL",
-                        params![
-                            decision.principal,
-                            decision.consumer,
-                            affinity,
-                            decision.decision_id,
-                            decision.created_at_ms,
-                        ],
-                    )?;
-                }
-                tx.commit()
-            })
-            .map_err(err)
+        let decision = decision.to_owned();
+        let selection_json = selection_json.map(str::to_owned);
+        self.account_command(crate::AccountCommandKind::Selection, move |tx| {
+            tx.v1_record_selection(&decision, selection_json.as_deref())
+        })
     }
 
     /// Return selection-time facts, never a reconstruction from today's catalog.
@@ -340,43 +300,12 @@ impl SqliteRouteStateStore {
         failed: bool,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = crate::write_transaction(c)?;
-                let inserted = tx.execute(
-                    "INSERT INTO routing_v1_report
-                       (decision_id, report_id, body_json, answer_json, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(decision_id) DO NOTHING",
-                    params![
-                        decision_id,
-                        report_id,
-                        recorded.body_json,
-                        recorded.answer_json,
-                        now_ms
-                    ],
-                )?;
-                if inserted == 1 && failed {
-                    tx.execute(
-                        "UPDATE routing_v1_affinity SET ended_at_ms=?2
-                         WHERE decision_id=?1 AND ended_at_ms IS NULL",
-                        params![decision_id, now_ms],
-                    )?;
-                }
-                let standing = tx.query_row(
-                    "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",
-                    params![decision_id],
-                    |row| {
-                        Ok(V1Recorded {
-                            body_json: row.get(0)?,
-                            answer_json: row.get(1)?,
-                        })
-                    },
-                )?;
-                tx.commit()?;
-                Ok(standing)
-            })
-            .map_err(err)
+        let decision_id = decision_id.to_owned();
+        let report_id = report_id.to_owned();
+        let recorded = recorded.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.v1_record_report(&decision_id, &report_id, &recorded, failed, now_ms)
+        })
     }
 
     /// The first v1 admission a runner made under `admission_id`.
@@ -412,34 +341,12 @@ impl SqliteRouteStateStore {
         recorded: &V1Recorded,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
-        self.store
-            .with_conn(|c: &Connection| {
-                c.execute(
-                    "INSERT INTO routing_v1_admission
-                       (principal, admission_id, body_json, answer_json, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
-                     ON CONFLICT(principal, admission_id) DO NOTHING",
-                    params![
-                        principal,
-                        admission_id,
-                        recorded.body_json,
-                        recorded.answer_json,
-                        now_ms
-                    ],
-                )?;
-                c.query_row(
-                    "SELECT body_json, answer_json FROM routing_v1_admission
-                     WHERE principal = ?1 AND admission_id = ?2",
-                    params![principal, admission_id],
-                    |row| {
-                        Ok(V1Recorded {
-                            body_json: row.get(0)?,
-                            answer_json: row.get(1)?,
-                        })
-                    },
-                )
-            })
-            .map_err(err)
+        let principal = principal.to_owned();
+        let admission_id = admission_id.to_owned();
+        let recorded = recorded.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.v1_record_admission(&principal, &admission_id, &recorded, now_ms)
+        })
     }
 }
 
@@ -662,5 +569,111 @@ mod tests {
             .v1_admission("reserved:other", "adm")
             .unwrap()
             .is_none());
+    }
+}
+
+impl crate::AccountTx<'_> {
+    pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {
+        self.v1_record_selection(decision, None)
+    }
+
+    pub fn v1_record_selection(
+        &self,
+        decision: &V1Decision,
+        selection_json: Option<&str>,
+    ) -> RouteStateResult<()> {
+        self.command_sql(|c: &Connection| {
+                let tx = c;
+                tx.execute(
+                    "INSERT INTO routing_v1_decision
+                       (decision_id, principal, consumer, project_id, provider, model, variant,
+                         runner_module, affinity, created_at_ms, expires_at_ms, allowed_account_class)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        decision.decision_id,
+                        decision.principal,
+                        decision.consumer,
+                        decision.project_id,
+                        decision.provider,
+                        decision.model,
+                        decision.variant,
+                        decision.runner_module,
+                        decision.affinity,
+                        decision.created_at_ms,
+                        decision.expires_at_ms,
+                        decision.allowed_account_class.as_str(),
+                    ],
+                )?;
+                if let Some(selection_json) = selection_json {
+                    tx.execute("UPDATE routing_v1_decision SET selection_json=?2 WHERE decision_id=?1",
+                        params![decision.decision_id, selection_json])?;
+                }
+                if let Some(affinity) = &decision.affinity {
+                    tx.execute(
+                        "INSERT INTO routing_v1_affinity
+                           (principal, consumer, affinity, decision_id, updated_at_ms, ended_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, NULL)
+                         ON CONFLICT(principal, consumer, affinity) DO UPDATE SET
+                           decision_id = excluded.decision_id,
+                           updated_at_ms = excluded.updated_at_ms,
+                           ended_at_ms = NULL",
+                        params![
+                            decision.principal,
+                            decision.consumer,
+                            affinity,
+                            decision.decision_id,
+                            decision.created_at_ms,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .map_err(err)
+    }
+
+    pub fn v1_record_report(
+        &self,
+        decision_id: &str,
+        report_id: &str,
+        recorded: &V1Recorded,
+        failed: bool,
+        now_ms: i64,
+    ) -> RouteStateResult<V1Recorded> {
+        self.command_sql(|c: &Connection| {
+            let tx = c;
+            let inserted = tx.execute(
+                "INSERT INTO routing_v1_report
+                       (decision_id, report_id, body_json, answer_json, created_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(decision_id) DO NOTHING",
+                params![
+                    decision_id,
+                    report_id,
+                    recorded.body_json,
+                    recorded.answer_json,
+                    now_ms
+                ],
+            )?;
+            if inserted == 1 && failed {
+                tx.execute(
+                    "UPDATE routing_v1_affinity SET ended_at_ms=?2
+                         WHERE decision_id=?1 AND ended_at_ms IS NULL",
+                    params![decision_id, now_ms],
+                )?;
+            }
+            let standing = tx.query_row(
+                "SELECT body_json, answer_json FROM routing_v1_report WHERE decision_id = ?1",
+                params![decision_id],
+                |row| {
+                    Ok(V1Recorded {
+                        body_json: row.get(0)?,
+                        answer_json: row.get(1)?,
+                    })
+                },
+            )?;
+
+            Ok(standing)
+        })
+        .map_err(err)
     }
 }

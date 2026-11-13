@@ -503,6 +503,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
             .unwrap();
         println!("observation_history_rows={history_rows} per_table; two principals, four runners (stress fixture)");
     }
+    let outside_before = harness.store().outside_account_writer_count_for_test();
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;
     let runner = harness
         .bind(reserved(&fixture.catalog.runners[0].module), None)
@@ -591,6 +592,11 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     for batch in 0..batches {
         admission_burst(&fixture, &runner, batch, &mut times[6]).await;
     }
+    assert_eq!(
+        harness.store().outside_account_writer_count_for_test(),
+        outside_before,
+        "the request mix wrote account state outside the writer"
+    );
     for (name, samples) in [
         "select",
         "account_for",

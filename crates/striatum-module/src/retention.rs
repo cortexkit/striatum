@@ -482,7 +482,11 @@ pub fn run_retention_pass(
     let history_before = before(now_ms, window_ms(windows.account_selection_days, DAY_MS));
     let (admissions, admissions_drained) =
         drain("account_admission", budget, per_table, batches, || {
-            counted(store.prune_account_admissions(history_before, rows))
+            counted(crate::account_writer::prune_account_admissions(
+                store,
+                history_before,
+                rows,
+            ))
         });
     let (holds, holds_drained) = drain("account_hold", budget, per_table, batches, || {
         counted(store.prune_account_holds(history_before, rows))
@@ -490,8 +494,7 @@ pub fn run_retention_pass(
     let mut pins = 0;
     let (affinities, affinities_drained) =
         drain("account_affinity", budget, per_table, batches, || {
-            store
-                .prune_account_affinities(history_before, rows)
+            crate::account_writer::prune_account_affinities(store, history_before, rows)
                 .map(|batch| {
                     pins += batch.pins;
                     (batch.affinities, batch.affinities)
@@ -505,7 +508,11 @@ pub fn run_retention_pass(
     let observed_before = before(now_ms, window_ms(windows.account_observation_days, DAY_MS));
     let (observations, observations_drained) =
         drain("account_observation", budget, per_table, batches, || {
-            counted(store.prune_account_observations(observed_before, rows))
+            counted(crate::account_writer::prune_account_observations(
+                store,
+                observed_before,
+                rows,
+            ))
         });
     let keys_before = before(now_ms, OBSERVATION_EVENT_KEY_WINDOW_MS);
     let (observation_events, observation_events_drained) = drain(
@@ -513,7 +520,13 @@ pub fn run_retention_pass(
         budget,
         per_table,
         batches,
-        || counted(store.prune_observation_events(keys_before, rows)),
+        || {
+            counted(crate::account_writer::prune_observation_events(
+                store,
+                keys_before,
+                rows,
+            ))
+        },
     );
     let decided_before = before(
         now_ms,
@@ -565,14 +578,17 @@ pub fn run_retention_pass(
     let continuation_before = before(now_ms, CONTINUATION_WINDOW_MS);
     let (continuations, continuations_drained) =
         drain("account_continue", budget, per_table, batches, || {
-            counted(store.prune_account_continuations(continuation_before, rows))
+            counted(crate::account_writer::prune_account_continuations(
+                store,
+                continuation_before,
+                rows,
+            ))
         });
     let replay_before = before(now_ms, V1_REPLAY_WINDOW_MS);
     let (mut v1_reports, mut v1_report_deliveries) = (0, 0);
     let (v1_decisions, v1_decisions_drained) =
         drain("routing_v1_decision", budget, per_table, batches, || {
-            store
-                .prune_v1_decisions(replay_before, rows)
+            crate::account_writer::prune_v1_decisions(store, replay_before, rows)
                 .map(|batch| {
                     v1_reports += batch.reports;
                     v1_report_deliveries += batch.deliveries;
@@ -593,26 +609,39 @@ pub fn run_retention_pass(
     );
     let (v1_admissions, v1_admissions_drained) =
         drain("routing_v1_admission", budget, per_table, batches, || {
-            counted(store.prune_v1_admissions(replay_before, rows))
+            counted(crate::account_writer::prune_v1_admissions(
+                store,
+                replay_before,
+                rows,
+            ))
         });
     let (v1_affinities, v1_affinities_drained) =
         drain("routing_v1_affinity", budget, per_table, batches, || {
-            counted(store.prune_v1_affinities(replay_before, rows))
+            counted(crate::account_writer::prune_v1_affinities(
+                store,
+                replay_before,
+                rows,
+            ))
         });
     let speed_window_start = before(
         now_ms,
         striatum_core::route_state_store::OBSERVED_SPEED_WINDOW_MS as i64,
     );
     let speed_cap_before = before(now_ms, SPEED_SAMPLE_CAP_MS);
-    let (speed_samples, speed_samples_drained) =
-        drain("model_route_speed_samples", budget, per_table, batches, || {
+    let (speed_samples, speed_samples_drained) = drain(
+        "model_route_speed_samples",
+        budget,
+        per_table,
+        batches,
+        || {
             counted(store.prune_speed_samples(
                 speed_window_start,
                 speed_cap_before,
                 SPEED_SAMPLES_KEPT_PAST_WINDOW,
                 rows,
             ))
-        });
+        },
+    );
     let calls_before = before(now_ms, ROUTING_CALL_COUNT_WINDOW_MS);
     let (call_counts, call_counts_drained) =
         drain("routing_call_count", budget, per_table, batches, || {
@@ -621,7 +650,11 @@ pub fn run_retention_pass(
     let retired_before = before(now_ms, RETIRED_FENCE_ORIGIN_WINDOW_MS);
     let (retired_origins, retired_origins_drained) =
         drain("fence_retired_origin", budget, per_table, batches, || {
-            counted(store.prune_retired_fence_origins(retired_before, rows))
+            counted(crate::account_writer::prune_retired_fence_origins(
+                store,
+                retired_before,
+                rows,
+            ))
         });
     let (unscored, unscored_drained) = drain(
         "routing_unscored_admissible_models",

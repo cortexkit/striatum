@@ -2079,8 +2079,7 @@ async fn select_at_tier_attempt(
     }
     let value = serde_json::to_value(answer)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    deps.store
-        .v1_record_selection(&binding, Some(&value.to_string()))
+    crate::account_writer::v1_record_selection(deps.store, &binding, Some(&value.to_string()))
         .map_err(store_refusal)?;
     Ok(SelectionAttempt::Selected(value))
 }

@@ -793,15 +793,10 @@ impl SqliteRouteStateStore {
     }
 
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
-        self.account_transaction(|tx| {
-            tx.transfer_probe_authorization(from, to)?;
-            tx.conn
-                .execute(
-                    "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
-                    params![from, to],
-                )
-                .map(|_| ())
-                .map_err(err)
+        let from = from.to_owned();
+        let to = to.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.bind_fence_probe_owner(&from, &to)
         })
     }
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
@@ -3655,5 +3650,20 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+impl crate::AccountTx<'_> {
+    pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        self.command_scope(|tx| {
+            tx.transfer_probe_authorization(from, to)?;
+            tx.conn
+                .execute(
+                    "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                    params![from, to],
+                )
+                .map(|_| ())
+                .map_err(err)
+        })
     }
 }

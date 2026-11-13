@@ -2384,8 +2384,7 @@ fn apply_overrides<S: RouteStateStore>(
         // replaced by an override. Restore only stamps that were actually withdrawn,
         // using the seed when it has the route and otherwise the unknown value.
         restore_withdrawn_catalog_fields(&mut base, seed_fact, &withdrawn_fact_fields);
-        store
-            .upsert_fact(&merge_override(&base, ov), FactSource::Override)
+        crate::account_writer::upsert_fact(store, &merge_override(&base, ov), FactSource::Override)
             .map_err(|e| format!("upsert override {route_key}: {e}"))?;
         store
             .mark_operator_fact_fields(&route_key, &named_fact_fields)
@@ -2414,8 +2413,7 @@ fn apply_overrides<S: RouteStateStore>(
                         })?
                         .and_then(|fact| fact.max_output_tokens);
                 }
-                store
-                    .upsert_fact(&restored, FactSource::Seed)
+                crate::account_writer::upsert_fact(store, &restored, FactSource::Seed)
                     .map_err(|e| format!("reverting {route_key} to seed: {e}"))?
             }
             // Not in the JSON seed: DEMOTE the source stamp, never delete the

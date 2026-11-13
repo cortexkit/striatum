@@ -10,13 +10,14 @@ enum Progress {
 }
 
 thread_local! {
-    static BUSY_HANDSHAKE: RefCell<Option<(Sender<Progress>, Receiver<()>)>> = const { RefCell::new(None) };
+    static BUSY_HANDSHAKE: RefCell<Option<std::sync::Arc<std::sync::Mutex<(Sender<Progress>, Receiver<()>)>>>> = const { RefCell::new(None) };
 }
 
 fn wait_for_lock_release(_: i32) -> bool {
     BUSY_HANDSHAKE.with(|handshake| {
         let handshake = handshake.borrow();
-        let (progress, release) = handshake.as_ref().unwrap();
+        let handshake = handshake.as_ref().unwrap().lock().unwrap();
+        let (progress, release) = &*handshake;
         progress.send(Progress::Waiting).unwrap();
         release.recv_timeout(Duration::from_secs(10)).unwrap();
     });
@@ -28,13 +29,22 @@ fn assert_writer_waits(
     path: &std::path::Path,
     operation: impl FnOnce(&SqliteRouteStateStore) -> RouteStateResult<()> + Send + 'static,
 ) -> SqliteRouteStateStore {
-    let blocker = Connection::open(path).unwrap();
-    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let (progress_tx, progress_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
+    let shared_handshake =
+        std::sync::Arc::new(std::sync::Mutex::new((progress_tx.clone(), release_rx)));
+    let writer_handshake = shared_handshake.clone();
+    store
+        .account_command(AccountCommandKind::Maintenance, move |_| {
+            BUSY_HANDSHAKE.with(|slot| *slot.borrow_mut() = Some(writer_handshake));
+            Ok(())
+        })
+        .unwrap();
+    let blocker = Connection::open(path).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
     let worker = std::thread::spawn(move || {
         BUSY_HANDSHAKE.with(|handshake| {
-            *handshake.borrow_mut() = Some((progress_tx.clone(), release_rx));
+            *handshake.borrow_mut() = Some(shared_handshake);
         });
         store
             .set_busy_handler_for_test(Some(wait_for_lock_release))

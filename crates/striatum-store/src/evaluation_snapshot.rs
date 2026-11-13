@@ -20,6 +20,68 @@ struct WriterMetrics {
     sql_ns: AtomicU64,
     commit_ns: AtomicU64,
     pending_commits: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    outside_account_writer: AtomicU64,
+}
+
+pub const ACCOUNT_TABLES: &[&str] = &[
+    "credential_entitlement_fences",
+    "account_eligibility",
+    "account_route_fence",
+    "account_non_quota_route_fence",
+    "account_size_refusal",
+    "account_non_quota_size_refusal",
+    "account_principal_exclusion",
+    "account_transient_backoff",
+    "account_admission",
+    "account_observation",
+    "account_fence",
+    "account_continue",
+    "pool_key_state",
+    "pool_key_lease",
+    "model_route_state",
+    "provider_cooldown_state",
+    "fence_recheck",
+    "fence_probe_authorization",
+    "fence_recheck_route_clear",
+    "fence_success_pool",
+    "fence_retired_origin",
+    "account_observation_event",
+    "account_affinity",
+    "account_quota_reading",
+    "account_quota_completeness",
+    "account_vault_roster",
+    "account_pin",
+    "pool_session_affinity",
+    "routing_v1_affinity",
+    "account_selection_salt",
+];
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static IN_ACCOUNT_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACCOUNT_ROWS_CHANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn account_rows_changed() -> u64 {
+    ACCOUNT_ROWS_CHANGED.with(|rows| rows.get())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct AccountBatchGuard;
+#[cfg(any(test, feature = "test-support"))]
+impl AccountBatchGuard {
+    pub(crate) fn enter() -> Self {
+        IN_ACCOUNT_BATCH.with(|inside| assert!(!inside.replace(true)));
+        Self
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for AccountBatchGuard {
+    fn drop(&mut self) {
+        IN_ACCOUNT_BATCH.with(|inside| inside.set(false));
+    }
 }
 
 /// Cumulative connection timings. SQL includes row decoding inside the store
@@ -137,6 +199,30 @@ impl ConnectionStore {
     fn new(backend: Backend) -> Self {
         let metrics = Arc::new(WriterMetrics::default());
         let install = |conn: &Connection| {
+            #[cfg(any(test, feature = "test-support"))]
+            if matches!(&backend, Backend::Live(_)) {
+                // SQLITE_IGNORE for DELETE disables SQLite's truncate shortcut,
+                // which otherwise skips row hooks for a whole-table delete.
+                conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+                    if matches!(context.action, rusqlite::hooks::AuthAction::Delete { table_name } if ACCOUNT_TABLES.contains(&table_name)) {
+                        rusqlite::hooks::Authorization::Ignore
+                    } else {
+                        rusqlite::hooks::Authorization::Allow
+                    }
+                }));
+                let changes = Arc::clone(&metrics);
+                conn.update_hook(Some(move |_, _: &str, table: &str, _| {
+                    if ACCOUNT_TABLES.contains(&table) {
+                        if IN_ACCOUNT_BATCH.with(|inside| inside.get()) {
+                            ACCOUNT_ROWS_CHANGED.with(|rows| rows.set(rows.get() + 1));
+                        } else {
+                            changes
+                                .outside_account_writer
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }));
+            }
             let commits = Arc::clone(&metrics);
             conn.commit_hook(Some(move || {
                 commits.pending_commits.fetch_add(1, Ordering::Relaxed);
@@ -236,6 +322,23 @@ impl ConnectionStore {
 }
 
 impl SqliteRouteStateStore {
+    pub(crate) fn projection_command<T>(
+        &self,
+        command: impl FnOnce(&crate::AccountTx<'_>) -> RouteStateResult<T>,
+    ) -> RouteStateResult<T> {
+        assert!(
+            self.store.is_projection(),
+            "direct commands require a private projection"
+        );
+        self.direct_account_transaction(command)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn outside_account_writer_count_for_test(&self) -> u64 {
+        self.store
+            .metrics
+            .outside_account_writer
+            .load(Ordering::Relaxed)
+    }
     /// Queue time from command enqueue to batch start, excluding connection wait.
     pub fn account_command_queue_ns(&self) -> u64 {
         self.store.metrics.command_queue_ns.load(Ordering::Relaxed)

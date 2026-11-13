@@ -257,25 +257,25 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         .map_err(store_refusal)?;
     let answer = SelectEngineAnswer::new(&id, now + wire::DECISION_TTL_MS, winner.selected.clone());
     let value = serde_json::to_value(&answer).map_err(store_refusal)?;
-    deps.store
-        .v1_record_selection(
-            &V1Decision {
-                decision_id: id,
-                principal: caller.principal.clone(),
-                consumer: request.consumer,
-                allowed_account_class: decision.allowed_account_class,
-                project_id: decision.project_id,
-                provider: winner.engine.provider.clone(),
-                model: winner.engine.model.clone(),
-                variant: None,
-                runner_module: winner.selected.module.clone().unwrap_or_default(),
-                affinity: None,
-                created_at_ms: now as i64,
-                expires_at_ms: answer.expires_at_ms as i64,
-            },
-            Some(&value.to_string()),
-        )
-        .map_err(store_refusal)?;
+    crate::account_writer::v1_record_selection(
+        deps.store,
+        &V1Decision {
+            decision_id: id,
+            principal: caller.principal.clone(),
+            consumer: request.consumer,
+            allowed_account_class: decision.allowed_account_class,
+            project_id: decision.project_id,
+            provider: winner.engine.provider.clone(),
+            model: winner.engine.model.clone(),
+            variant: None,
+            runner_module: winner.selected.module.clone().unwrap_or_default(),
+            affinity: None,
+            created_at_ms: now as i64,
+            expires_at_ms: answer.expires_at_ms as i64,
+        },
+        Some(&value.to_string()),
+    )
+    .map_err(store_refusal)?;
     Ok(value)
 }
 
