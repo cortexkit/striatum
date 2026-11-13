@@ -3448,7 +3448,7 @@ fn record_provider_reset_fence(
         // Without a frozen identity, accept only a listed credential that serves
         // the decision's model. Provider account aliases are not credential ids.
         let facts = store.get_facts().map_err(|e| e.to_string())?;
-        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let catalog = facts.iter().collect();
         let Some(fact) = facts
             .iter()
             .find(|fact| fact.provider_id == provider_id && fact.model_id == model)

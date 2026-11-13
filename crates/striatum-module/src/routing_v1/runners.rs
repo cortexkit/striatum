@@ -333,10 +333,7 @@ impl Registry {
         harness: Option<&str>,
         resolve_default: bool,
     ) -> Self {
-        let catalog = facts
-            .iter()
-            .map(|fact| fact.provider_id.clone())
-            .collect::<BTreeSet<_>>();
+        let catalog = facts.iter().collect::<crate::broca_credentials::AuthCatalog>();
         let entries = source
             .policies
             .into_iter()

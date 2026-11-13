@@ -25,6 +25,63 @@ pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
 
 pub(crate) type CredentialAccounts = BTreeMap<String, Option<String>>;
 
+/// Provider membership and positive sign-in coverage from one complete fact
+/// snapshot. Build before filtering candidates: a model outside a panel or pick
+/// can still establish that its provider limits a sign-in to listed models.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AuthCatalog {
+    pub providers: BTreeSet<String>,
+    signins: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl<'a> FromIterator<&'a ModelFact> for AuthCatalog {
+    fn from_iter<T: IntoIterator<Item = &'a ModelFact>>(facts: T) -> Self {
+        let mut catalog = Self::default();
+        for fact in facts {
+            catalog.providers.insert(fact.provider_id.clone());
+            for method in fact
+                .auth_methods
+                .iter()
+                .flatten()
+                .filter(|method| *method != "apikey")
+            {
+                catalog.signins.entry(fact.provider_id.clone())
+                    .or_default()
+                    .insert(method.clone());
+            }
+        }
+        catalog
+    }
+}
+
+impl std::ops::Deref for AuthCatalog {
+    type Target = BTreeSet<String>;
+    fn deref(&self) -> &Self::Target {
+        &self.providers
+    }
+}
+
+impl AuthCatalog {
+    pub(crate) fn inherit_aliases(&mut self, targets: &BTreeMap<String, String>) {
+        for (alias, target) in targets {
+            if let Some(methods) = self.signins.get(target).cloned() {
+                self.signins.insert(alias.clone(), methods);
+            }
+        }
+    }
+
+    fn allows(&self, fact: &ModelFact, method: Option<&str>) -> bool {
+        match &fact.auth_methods {
+            Some(allowed) => method.is_some_and(|method| allowed.iter().any(|value| value == method)),
+            None => !method.is_some_and(|method| {
+                method != "apikey"
+                    && self.signins.get(&fact.provider_id)
+                        .is_some_and(|methods| methods.contains(method))
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BrocaCredentials {
     inner: Arc<CredentialData>,
@@ -116,7 +173,7 @@ pub struct CredentialData {
     listed: Vec<ListedCredential>,
     media_list_granted: bool,
     gateway_grant_warned: bool,
-    catalog_providers: BTreeSet<String>,
+    catalog_providers: AuthCatalog,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
     pub(crate) runner_service_tiers:
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
@@ -183,7 +240,7 @@ pub(crate) fn credential_providers(
 pub(crate) fn credential_serves_fact(
     row: &ListedCredential,
     fact: &ModelFact,
-    catalog: &BTreeSet<String>,
+    catalog: &AuthCatalog,
     credentials: &CredentialData,
 ) -> bool {
     row.state == "active"
@@ -192,11 +249,7 @@ pub(crate) fn credential_serves_fact(
             .iter()
             .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
         && credential_providers(row, catalog).contains(&fact.provider_id)
-        && fact.auth_methods.as_ref().is_none_or(|allowed| {
-            row.auth_method
-                .as_ref()
-                .is_some_and(|method| allowed.contains(method))
-        })
+        && catalog.allows(fact, row.auth_method.as_deref())
         && credentials.method_serves_fact(fact, row.auth_method.as_deref())
 }
 
@@ -485,7 +538,7 @@ impl CredentialData {
         {
             return Vec::new();
         }
-        let serving = self.serving_method(fact).auth_method;
+        let serving = self.serving_method(fact, &self.catalog_providers).auth_method;
         self.listed
             .iter()
             .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
@@ -500,14 +553,17 @@ impl CredentialData {
     /// The method a route is served and priced under: the one the last
     /// refresh resolved, or before any refresh the single method of the
     /// credentials listed for it (the same fallback pricing uses).
-    fn serving_method(&self, fact: &ModelFact) -> ServingMethod {
+    fn serving_method(&self, fact: &ModelFact, catalog: &AuthCatalog) -> ServingMethod {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
-        self.serving.get(&key).cloned().unwrap_or_else(|| {
+        self.serving.get(&key).filter(|serving| {
+            self.catalog_providers.signins == catalog.signins
+                && serving.auth_method.as_deref().is_none_or(|method| catalog.allows(fact, Some(method)))
+        }).cloned().unwrap_or_else(|| {
             choose_method(
                 BTreeSet::new(),
                 self.listed
                     .iter()
-                    .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
+                    .filter(|row| credential_serves_fact(row, fact, catalog, self))
                     .filter_map(|row| row.auth_method.clone())
                     .collect(),
             )
@@ -824,7 +880,7 @@ impl CredentialData {
         at_ms: i64,
         model_pools: &[striatum_core::quota_extract::ModelPool],
     ) {
-        self.catalog_providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        self.catalog_providers = facts.iter().collect();
         self.providers.clear();
         self.unmapped_ids.clear();
         for row in self.listed.iter().filter(|row| {
@@ -846,6 +902,9 @@ impl CredentialData {
         self.priced_targets = self.catalog_targets(facts);
         let mut facts = facts.to_vec();
         striatum_core::score_alias::append_alias_rows(&mut facts, &self.priced_targets);
+        let mut catalog: AuthCatalog = facts.iter().collect();
+        catalog.providers = self.catalog_providers.providers.clone();
+        self.catalog_providers = catalog;
         self.serving = facts
             .iter()
             .map(|fact| {
@@ -953,9 +1012,10 @@ impl CredentialData {
         if self.legacy_pricing_baseline {
             return;
         }
+        let catalog = facts.iter().collect();
         for fact in facts {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
-            let method = self.serving_method(fact);
+            let method = self.serving_method(fact, &catalog);
             let catalog_key =
                 striatum_core::score_alias::catalog_key(&self.priced_targets, &key);
             let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
@@ -1080,7 +1140,7 @@ impl CredentialData {
     }
 
     pub(crate) fn statically_served_routes(&self, facts: &[ModelFact]) -> HashSet<String> {
-        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let catalog = facts.iter().collect();
         facts
             .iter()
             .filter(|fact| {
@@ -1100,7 +1160,7 @@ impl CredentialData {
     /// in a fresh listing must join the provider and satisfy the login allowlist.
     pub fn served_routes(&self, facts: &[ModelFact], now_ms: u64) -> (Vec<String>, Option<String>) {
         let fallback = self.fallback_reason(now_ms);
-        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let catalog = facts.iter().collect();
         let routes = facts
             .iter()
             .filter(|fact| {
@@ -1201,7 +1261,7 @@ mod tests {
         unmapped.id = "unmapped".into();
         unmapped.serves = vec!["unknown".into()];
         let mut cache = BrocaCredentials::default();
-        cache.catalog_providers = ["kimi-for-coding".into()].into();
+        cache.catalog_providers.providers = ["kimi-for-coding".into()].into();
         cache.apply_listing(
             &listing(vec![
                 explicit,

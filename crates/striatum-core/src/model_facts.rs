@@ -317,8 +317,10 @@ pub struct ModelFact {
     pub provider_id: String,
     #[serde(rename = "modelID")]
     pub model_id: String,
-    /// Fusiform's allowed login methods. Absence is unrestricted; an empty list
-    /// permits no credential. The operator's provider mapping is still required.
+    /// Fusiform's allowed login methods. An empty list permits no credential.
+    /// Absence permits API keys and sign-ins not positively listed on any row of
+    /// this provider. Vault credential metadata must still map the credential
+    /// to this catalog provider through `provider_ids` or an unambiguous `serves`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_methods: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

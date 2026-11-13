@@ -242,7 +242,7 @@ fn prepare_account_facts(
         return Ok(effects);
     };
     // Reports cannot turn an arbitrary credential into an account fact.
-    let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+    let catalog = facts.iter().collect();
     let serves = |credential: &str| {
         credentials.listed_credentials().iter().any(|row| {
             row.id == credential
