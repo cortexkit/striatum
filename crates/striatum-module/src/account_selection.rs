@@ -5674,7 +5674,25 @@ fn empty_roster_refusal(
         .facts
         .iter()
         .find(|fact| fact.provider_id == provider && fact.model_id == model);
-    let class_rows = fact.map_or_else(Vec::new, |fact| classes.class(fact, priced).rows);
+    let route_class = fact.map(|fact| classes.class(fact, priced));
+    let paid_rows = if params.is_some_and(|params| params.model_decision_id.is_none())
+        && route_class.as_ref().is_some_and(|class| class.subscription)
+    {
+        // Paid pools borrow the catalog model but keep their own provider id.
+        // Their keys need the same spending decision as direct provider keys.
+        classes.facts.iter()
+            .filter(|fact| {
+                fact.model_id == model
+                    && (fact.provider_id == provider
+                        || classes.targets.get(&fact.provider_id)
+                            .is_some_and(|target| target == provider))
+            })
+            .flat_map(|fact| classes.class(fact, true).rows)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let class_rows = route_class.map_or_else(Vec::new, |class| class.rows);
     let mut exclusions = Vec::new();
     if let Some(candidates) = params.and_then(|params| params.candidates.as_ref()) {
         for candidate in &candidates.accounts {
@@ -5686,7 +5704,8 @@ fn empty_roster_refusal(
             let reason = match row {
                 None => Some("unknown_credential"),
                 Some(row)
-                    if !crate::broca_credentials::credential_providers(row, &classes.catalog)
+                    if !paid_rows.iter().any(|paid| paid.id == row.id)
+                        && !crate::broca_credentials::credential_providers(row, &classes.catalog)
                         .iter()
                         .any(|mapped| mapped == provider) =>
                 {
@@ -5698,7 +5717,11 @@ fn empty_roster_refusal(
                     Some("account_id_mismatch")
                 }
                 Some(row) if !class_rows.iter().any(|allowed| allowed.id == row.id) => {
-                    Some("not_in_account_class")
+                    Some(if paid_rows.iter().any(|paid| paid.id == row.id) {
+                        "routing_decision_required"
+                    } else {
+                        "not_in_account_class"
+                    })
                 }
                 Some(_) => None,
             };
@@ -5706,6 +5729,20 @@ fn empty_roster_refusal(
                 exclusions.push(json!({"account_id":candidate.account_id,
                     "credential_id":candidate.credential_id, "reason":reason}));
             }
+        }
+        // Waiting or signing in cannot authorize spending. When the runner
+        // offers only paid keys outside the subscription class, it must ask
+        // for a selection decision before retrying the admission.
+        if !candidates.accounts.is_empty()
+            && exclusions.len() == candidates.accounts.len()
+            && exclusions.iter()
+                .all(|exclusion| exclusion["reason"] == "routing_decision_required")
+        {
+            return Some(because("routing_decision_required", OpReply::typed(
+                "invalid_request",
+                "A paid key on a model a subscription serves needs a routing decision; select with a pin first, then send its decision_id.",
+                json!({"field":"decision_id", "exclusions":exclusions}),
+            )));
         }
     }
     if fact.is_none() {
