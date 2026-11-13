@@ -52,7 +52,10 @@ pub(super) fn account_effects(
         .as_ref()
         .is_some_and(|attempt| attempt.legacy_outcome() == Outcome::Cancelled);
     if neutral {
-        // The commit must still check that this credential owns any selected probe.
+        // A neutral result applies no effect, but the commit still needs the
+        // credential: if selection reserved this decision's single recovery test
+        // (probe) for a blocked account, the commit checks that the report came
+        // from that same credential before settling the probe.
         return Ok(V1ReportEffects {
             reported_credential: request.credential_id.clone(),
             ..Default::default()
