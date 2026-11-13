@@ -1282,16 +1282,7 @@
             "topK": 2,
             "width": 3
           },
-          "runnerUp": [
-            {
-              "contextWindow": 1000000,
-              "family": "family-3",
-              "maxOutputTokens": 64000,
-              "phase": "topK",
-              "promptParams": {},
-              "routeKey": "pw/m3"
-            }
-          ]
+          "runnerUp": []
         }
       },
       "test": "manager_runtime::runtime_behavior_tests::an_extra_seat_stays_empty_when_its_only_spare_is_below_the_bar"
@@ -1487,7 +1478,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -1793,7 +1784,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -2099,7 +2090,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -2405,7 +2396,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -2711,7 +2702,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -3017,7 +3008,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 5,
               "callerAdmitted": 5,
@@ -6039,7 +6030,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -6299,7 +6290,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -6559,7 +6550,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -6819,7 +6810,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -7079,7 +7070,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -7339,7 +7330,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -7599,7 +7590,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -7859,7 +7850,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -8119,7 +8110,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -8379,7 +8370,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -8639,7 +8630,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -8896,7 +8887,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -9150,7 +9141,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -9404,7 +9395,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -9666,7 +9657,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 4,
               "callerAdmitted": 4,
@@ -10410,7 +10401,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 3,
               "callerAdmitted": 3,
@@ -11143,7 +11134,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 1,
               "callerAdmitted": 1,
@@ -11409,7 +11400,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 0,
               "callerAdmitted": 1,
@@ -11709,7 +11700,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 0,
               "callerAdmitted": 1,
@@ -11859,7 +11850,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 0,
               "callerAdmitted": 1,
@@ -12010,7 +12001,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 1,
               "callerAdmitted": 1,
@@ -12300,7 +12291,7 @@
             "class": "design_review",
             "extra": 0,
             "extraBy": null,
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 1,
               "callerAdmitted": 1,
@@ -12632,7 +12623,7 @@
             "class": "evaluate",
             "extra": 1,
             "extraBy": "eq",
-            "floor": null,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 1,
               "callerAdmitted": 1,
@@ -12798,7 +12789,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 1,
               "callerAdmitted": 1,
@@ -12915,7 +12906,7 @@
             "class": "explain",
             "extra": 0,
             "extraBy": null,
-            "floor": 50,
+            "floor": 70,
             "funnel": {
               "adequacyEligible": 0,
               "callerAdmitted": 1,
@@ -14509,12 +14500,10 @@
             "cacheReadRate": 0.1,
             "cacheWriteRate": 0.5,
             "confidence": "curated",
-            "inputRate": 0.5,
-            "supportsToolUse": true,
-            "supportsVision": true,
             "contextWindow": 500000.0,
             "costPerMTokOut": 1.0,
             "family": "a",
+            "inputRate": 0.5,
             "maxOutputTokens": 64000,
             "modelID": "small",
             "promptDefaults": null,
@@ -14524,18 +14513,18 @@
               "eq": 1900.0,
               "speed": 100.0
             },
+            "supportsToolUse": true,
+            "supportsVision": true,
             "variant": null
           },
           {
             "cacheReadRate": 0.1,
             "cacheWriteRate": 0.5,
             "confidence": "curated",
-            "inputRate": 0.5,
-            "supportsToolUse": true,
-            "supportsVision": true,
             "contextWindow": 1000000.0,
             "costPerMTokOut": 1.0,
             "family": "b",
+            "inputRate": 0.5,
             "maxOutputTokens": 64000,
             "modelID": "kept",
             "promptDefaults": null,
@@ -14545,18 +14534,18 @@
               "eq": 1900.0,
               "speed": 100.0
             },
+            "supportsToolUse": true,
+            "supportsVision": true,
             "variant": null
           },
           {
             "cacheReadRate": 0.1,
             "cacheWriteRate": 0.5,
             "confidence": "curated",
-            "inputRate": 0.5,
-            "supportsToolUse": true,
-            "supportsVision": true,
             "contextWindow": 1000000.0,
             "costPerMTokOut": 1.0,
             "family": "b",
+            "inputRate": 0.5,
             "maxOutputTokens": 64000,
             "modelID": "duplicate",
             "promptDefaults": null,
@@ -14566,18 +14555,18 @@
               "eq": 1900.0,
               "speed": 100.0
             },
+            "supportsToolUse": true,
+            "supportsVision": true,
             "variant": null
           },
           {
             "cacheReadRate": 0.1,
             "cacheWriteRate": 0.5,
             "confidence": "curated",
-            "inputRate": 0.5,
-            "supportsToolUse": true,
-            "supportsVision": true,
             "contextWindow": 1000000.0,
             "costPerMTokOut": 1.0,
             "family": "c",
+            "inputRate": 0.5,
             "maxOutputTokens": 64000,
             "modelID": "replacement",
             "promptDefaults": null,
@@ -14587,6 +14576,8 @@
               "eq": 1900.0,
               "speed": 100.0
             },
+            "supportsToolUse": true,
+            "supportsVision": true,
             "variant": null
           }
         ],

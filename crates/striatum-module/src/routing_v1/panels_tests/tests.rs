@@ -144,7 +144,7 @@ async fn spec_extra_floor_shortfalls_keep_incident_package_sizes_and_rejected_ro
     for tokens in [85_068, 80_982, 46_960] {
         request["package_tokens"] = json!(tokens);
         let answer = panel(&route, &request).await;
-        assert_eq!(answer.seats.len(), 3);
+        assert_eq!(answer.seats.len(), 1);
         let shortfall = answer.shortfall.unwrap();
         assert_eq!(shortfall.code, ShortfallCode::FloorUnmeetable);
         let detail = shortfall.detail.unwrap();

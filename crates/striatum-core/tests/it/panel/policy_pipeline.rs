@@ -155,9 +155,9 @@ fn builtin_defaults_and_lab_wire_class() {
         (Audit, 2, By::Iq, 1, Some(Extra::Random), Some(80)),
         (Spec, 3, By::Iq, 1, Some(Extra::Random), Some(80)),
         (Diagnose, 3, By::Iq, 0, None, Some(80)),
-        (DesignReview, 3, By::Eq, 0, None, None),
-        (Evaluate, 2, By::Iq, 1, Some(Extra::Eq), None),
-        (Explain, 1, By::Cost, 0, None, Some(50)),
+        (DesignReview, 3, By::Eq, 0, None, Some(70)),
+        (Evaluate, 2, By::Iq, 1, Some(Extra::Eq), Some(70)),
+        (Explain, 1, By::Cost, 0, None, Some(70)),
         (Lab, 4, By::Iq, 0, None, None),
     ] {
         assert_eq!(
@@ -202,7 +202,7 @@ fn explain_cost_seat_clears_inclusive_demand_bar() {
         demand_exponent: 0.7,
         ..DEFAULT_ROUTING_CONFIG
     };
-    let bar = demand_bar(top, 50.0, config.demand_exponent);
+    let bar = demand_bar(top, 70.0, config.demand_exponent);
     let mut at = fact("at", bar, Some("at"));
     at.cost_per_m_tok_out = Some(10.0);
     let mut below = fact("below", bar - 0.001, Some("below"));
@@ -224,6 +224,42 @@ fn explain_cost_seat_clears_inclusive_demand_bar() {
             .collect::<Vec<_>>(),
         ["p/frontier"]
     );
+}
+
+#[test]
+fn athena_defaults_gate_iq_before_ordering_by_eq_or_cost() {
+    let bar = demand_bar(2000.0, 70.0, DEFAULT_ROUTING_CONFIG.demand_exponent);
+    let mut frontier = fact("frontier", 2000.0, Some("frontier"));
+    frontier.scores.eq = 60.0;
+    frontier.cost_per_m_tok_out = Some(100.0);
+    let mut qualified = fact("qualified", bar + 0.001, Some("qualified"));
+    qualified.scores.eq = 80.0;
+    qualified.cost_per_m_tok_out = Some(10.0);
+    // Straddle floor 70's IQ bar so neither a higher floor nor an admission
+    // bypass can pass. EQ and cost still order the routes that clear the bar.
+    let mut below = fact("below", bar - 0.001, Some("below"));
+    below.scores.eq = 100.0;
+    below.cost_per_m_tok_out = Some(0.01);
+    for (class, expected) in [
+        (PanelClass::DesignReview, vec!["p/qualified", "p/frontier"]),
+        (PanelClass::Evaluate, vec!["p/frontier", "p/qualified"]),
+        (PanelClass::Explain, vec!["p/qualified"]),
+    ] {
+        let mut input = n_pick_input(
+            vec![below.clone(), frontier.clone(), qualified.clone()],
+            spec(8, 0.0, PanelDiversity::None),
+        );
+        input.panel_spec.class = class;
+        let panel = select_panel(input).unwrap();
+        assert_eq!(keys(&panel), expected, "{class:?}");
+        if class != PanelClass::Explain {
+            let shortfall = panel.shortfall.unwrap();
+            assert_eq!(shortfall.code, PanelShortfallCode::IqFloorUnmeetable);
+            assert!(shortfall.causes.iter().any(|cause| {
+                cause.model == "p/below" && cause.reason == PanelCauseReason::BelowIqFloor
+            }));
+        }
+    }
 }
 
 #[test]
@@ -278,7 +314,7 @@ fn eq_topk_filters_by_policy_bar() {
 }
 
 #[test]
-fn diagnose_iq_topk_can_sit_below_floor_bar_and_prefers_pro() {
+fn iq_topk_floor_rejects_a_below_bar_preferred_pro_sibling() {
     for class in [PanelClass::Audit, PanelClass::Diagnose, PanelClass::Spec] {
         let panel = choose(
             vec![
@@ -289,16 +325,102 @@ fn diagnose_iq_topk_can_sit_below_floor_bar_and_prefers_pro() {
             class,
             policy(2, PanelOrder::Iq, Some(80)),
         );
-        assert_eq!(keys(&panel), ["p/frontier", "p/base-pro"]);
+        assert_eq!(keys(&panel), ["p/frontier"]);
         let funnel = panel.policy.as_ref().unwrap().funnel.as_ref().unwrap();
-        assert_eq!(funnel.adequacy_eligible, 2);
-        assert_eq!(funnel.distinct_families, 2);
-        assert!(
-            panel.shortfall.is_none(),
-            "the bar must not refuse a full IQ panel"
+        assert_eq!(funnel.adequacy_eligible, 1);
+        assert_eq!(funnel.distinct_families, 1);
+        assert_eq!(
+            panel.shortfall.unwrap().code,
+            PanelShortfallCode::IqFloorUnmeetable
         );
         assert!(100.0 < demand_bar(2000.0, 80.0, DEFAULT_DEMAND_EXPONENT));
     }
+}
+
+#[test]
+fn iq_ranked_top_seats_obey_the_class_floor() {
+    let panel = choose(
+        vec![
+            fact("frontier", 2000.0, Some("a")),
+            fact("just-below", 1999.99, Some("b")),
+        ],
+        PanelClass::Diagnose,
+        policy(2, PanelOrder::Iq, Some(100)),
+    );
+    assert_eq!(keys(&panel), ["p/frontier"]);
+    assert!(panel.runner_up.is_empty());
+    let shortfall = panel.shortfall.unwrap();
+    assert_eq!(shortfall.code, PanelShortfallCode::IqFloorUnmeetable);
+    assert!(shortfall.causes.iter().any(|cause| {
+        cause.model == "p/just-below" && cause.reason == PanelCauseReason::BelowIqFloor
+    }));
+}
+
+#[test]
+fn walled_strong_family_leaves_a_top_seat_empty_instead_of_seating_a_weak_model() {
+    for wall in ["quota", "excluded", "unavailable", "package"] {
+        let mut facts = vec![
+            fact("frontier", 2000.0, Some("a")),
+            fact("strong", 1950.0, Some("b")),
+            fact("weak", 593.0, Some("c")),
+        ];
+        for row in &mut facts {
+            if row.model_id != "strong" {
+                row.context_window = Some(1_000_000.0);
+            }
+        }
+        let mut input = n_pick_input(facts, spec(2, 0.0, PanelDiversity::Family));
+        match wall {
+            "quota" => {
+                input.runtime_snapshot = Some(ModelRouteStateSnapshot {
+                    now: 1000.0,
+                    by_route: HashMap::from([(
+                        "p/strong".into(),
+                        RouteRuntimeState {
+                            quota_exhausted_until: Some(2000.0),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                })
+            }
+            "excluded" => input.operator_exclude_keys.push("p/strong".into()),
+            "unavailable" => {
+                input.available_models.remove("p/strong");
+            }
+            "package" => input.package_tokens = Some(100_000),
+            _ => unreachable!(),
+        }
+        let panel = select_panel_with_policy(
+            input,
+            &DEFAULT_ROUTING_CONFIG,
+            &policy(2, PanelOrder::Iq, Some(80)),
+        )
+        .unwrap();
+        assert_eq!(keys(&panel), ["p/frontier"], "{wall}");
+        assert!(panel.runner_up.iter().all(|row| row.route_key != "p/weak"));
+        let shortfall = panel.shortfall.unwrap();
+        assert!(
+            shortfall.causes.iter().any(|cause| {
+                cause.model == "p/weak" && cause.reason == PanelCauseReason::BelowIqFloor
+            }),
+            "{wall}: {shortfall:?}"
+        );
+    }
+}
+
+#[test]
+fn iq_ranked_top_seats_without_a_floor_keep_weak_distinct_families() {
+    let panel = choose(
+        vec![
+            fact("frontier", 2000.0, Some("a")),
+            fact("weak", 593.0, Some("b")),
+        ],
+        PanelClass::Evaluate,
+        policy(2, PanelOrder::Iq, None),
+    );
+    assert_eq!(keys(&panel), ["p/frontier", "p/weak"]);
+    assert!(panel.shortfall.is_none());
 }
 
 #[test]
