@@ -690,7 +690,8 @@ fn parse_admitted_request(
             let defaults = consumers.defaults_for(consumer);
             if defaults.iq.is_some() {
                 // A declaration relaxes required IQ only for its admitted callers.
-                // Other requests retain the legacy parser's refusal ordering.
+                // Requests without a declared IQ default keep using
+                // parse_select_request_serving, so their refusals are unchanged.
                 if !evaluation {
                     consumers.admit(consumer, caller)?;
                 }
@@ -760,8 +761,9 @@ async fn prepare_selection(
     // Payment class comes only from the resolved consumer policy, not from the
     // consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
-    // Keep the declared ladder out of name-only policy overlays: a settings
-    // child belonging to another owner must not inherit it.
+    // Keep the declared ladder separate from settings policy looked up by
+    // consumer name: a settings child belonging to another owner must not
+    // inherit it.
     let ladder = super::describe::capabilities()
         .contains(&"consumer_declarations")
         .then(|| consumers.defaults_for(&consumer).ladder)
@@ -2123,8 +2125,9 @@ impl<'a> Selection<'a> {
         let input = self.pass().input(&allowed, Default::default());
         let rejections = self.eligible_rejections(&input.facts, None);
         // Reuse static admission so exclusions cannot hide a policy or capability
-        // refusal. Ignore runtime walls here: a hostable route behind a cooldown
-        // still belongs to ranking and keeps the scorer's timed refusal.
+        // refusal. Ignore quota walls, blocks and cooldowns here: a hostable route
+        // behind a cooldown still belongs to ranking and keeps the scorer's timed
+        // refusal.
         let admission = striatum_core::model_router::admit_routes_with_availability(
             &input.facts,
             None,

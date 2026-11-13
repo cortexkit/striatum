@@ -2401,9 +2401,10 @@ impl SqliteRouteStateStore {
         Ok(tx)
     }
 
-    /// Number of account write transactions begun by this store: the account
-    /// writer's batches plus the direct account transactions that have not
-    /// moved into the writer yet.
+    /// Number of account write transactions begun by this store: batches from
+    /// the account writer (the single thread that groups account commands into
+    /// shared commits), plus account transactions some callers still open
+    /// directly through `begin_account_write`.
     #[cfg(any(test, feature = "test-support"))]
     pub fn account_write_transaction_count_for_test(&self) -> u64 {
         self.account_write_transactions

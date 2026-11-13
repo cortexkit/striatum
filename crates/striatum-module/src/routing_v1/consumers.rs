@@ -187,9 +187,10 @@ impl Catalog {
             registry.owners.entry(name).or_default().insert(owner);
         }
         // An ownerless settings child cannot open admission beneath a declared
-        // namespace using iq, ladder, placement, selectors or kind, including
-        // inherited values. Without those members it remains settings-only,
-        // admitting any currently bound caller as before.
+        // namespace whose declaration uses the 0.7.18 members (a default iq,
+        // a ladder of pins, a runner placement, caller selectors or a kind),
+        // including values it would inherit. Without those members it remains
+        // settings-only, admitting any currently bound caller as before.
         let inherited_owners: Vec<_> = registry
             .owners
             .iter()
