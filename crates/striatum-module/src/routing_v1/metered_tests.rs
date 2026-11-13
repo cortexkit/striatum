@@ -596,7 +596,7 @@ async fn broca_abandoned_probe_selection_holds_until_its_interval() {
     );
 }
 
-fn quota_probe_harness() -> Arc<Harness> {
+pub(super) fn quota_probe_harness() -> Arc<Harness> {
     let harness = broca_fence_harness();
     harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
         provider: "inception".into(),

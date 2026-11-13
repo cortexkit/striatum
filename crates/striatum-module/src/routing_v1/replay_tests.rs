@@ -593,6 +593,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "observe_backoff",
                                 "observe_credential_refused",
                                 "select_panel",
+                                "select_panel_estimate",
                                 "consumer_models",
                                 "select_engine",
                                 "engine_reports",
