@@ -1804,6 +1804,40 @@ pub(crate) fn after_join_snapshot_for_test() {
     });
 }
 
+/// Re-derive credential quota holds, account blocks and serving methods from
+/// the latest account readings. Runs on a blocking thread: it reads SQLite and
+/// may wait for account writer repairs.
+fn refresh_account_views(
+    state: &SharedAccountQuota,
+    store: &Arc<SqliteRouteStateStore>,
+    broca_credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    routing_config_path: &std::path::Path,
+    at_ms: i64,
+) {
+    // The state is copied first so no account lock is held while the
+    // store transaction is open.
+    let snapshot = state.lock().ok().map(|guard| guard.clone());
+    if let Some(snapshot) = snapshot {
+        let config = crate::config_overrides::live_config(&crate::config_overrides::config_path());
+        let quota_view = Arc::new(Mutex::new(snapshot.clone()));
+        if let Err(error) = crate::account_selection::ClassContext::load(
+            store,
+            broca_credentials,
+            config.clone(),
+            Some(&quota_view),
+            at_ms,
+        ) {
+            tracing::warn!(error = %error, "credential quota holds not refreshed");
+        }
+        if let Err(error) =
+            crate::account_selection::refresh_all_blocks(store, &snapshot, &config, at_ms)
+        {
+            tracing::warn!(error = %error, "account blocks not refreshed");
+        }
+    }
+    refresh_serving_methods(state, store, broca_credentials, routing_config_path);
+}
+
 /// Refresh the vault roster and serving-method joins independently of quota delivery.
 /// Quota samples and fallback snapshots are written by the quota event consumer.
 pub async fn account_quota_loop(
@@ -1859,33 +1893,37 @@ pub async fn account_quota_loop(
         }
 
         // Readings that arrived since the last admission still end blocks and
-        // grow whole-account recovery sets.
-        // The state is copied first so no account lock is held while the
-        // store transaction is open.
-        let snapshot = state.lock().ok().map(|guard| guard.clone());
-        if let Some(snapshot) = snapshot {
-            let config =
-                crate::config_overrides::live_config(&crate::config_overrides::config_path());
-            let quota_view = Arc::new(Mutex::new(snapshot.clone()));
-            if let Err(error) = crate::account_selection::ClassContext::load(
-                &store,
-                &broca_credentials,
-                config.clone(),
-                Some(&quota_view),
-                at_ms,
-            ) {
-                tracing::warn!(error = %error, "credential quota holds not refreshed");
+        // grow whole-account recovery sets. Account selection and pricing must
+        // also agree on the serving login, so the method map is built after both
+        // roster and readings have been refreshed.
+        //
+        // This work reads SQLite and can queue repairs behind every batch the
+        // account writer is running. Doing it on this task would block a runtime
+        // worker, and possibly the one driving Tokio's IO and timers, which would
+        // stall the whole routing runtime. Run it on the blocking pool instead.
+        let refresh = {
+            let (state, store, broca_credentials, routing_config_path) = (
+                Arc::clone(&state),
+                Arc::clone(&store),
+                Arc::clone(&broca_credentials),
+                routing_config_path.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
+                refresh_account_views(
+                    &state,
+                    &store,
+                    &broca_credentials,
+                    &routing_config_path,
+                    at_ms,
+                )
+            })
+        };
+        if let Err(error) = refresh.await {
+            if error.is_panic() {
+                std::panic::resume_unwind(error.into_panic());
             }
-            if let Err(error) =
-                crate::account_selection::refresh_all_blocks(&store, &snapshot, &config, at_ms)
-            {
-                tracing::warn!(error = %error, "account blocks not refreshed");
-            }
+            tracing::warn!(%error, "account view refresh worker failed");
         }
-
-        // Account selection and pricing must agree on the serving login. Build
-        // the method map after both roster and readings have been refreshed.
-        refresh_serving_methods(&state, &store, &broca_credentials, &routing_config_path);
         crate::subscription_economics::refresh(
             &connection_file_path,
             &project_root,

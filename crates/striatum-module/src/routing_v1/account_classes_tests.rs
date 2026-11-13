@@ -843,6 +843,126 @@ async fn decisions_keep_both_wire_classes_after_consumer_edits() {
 }
 
 #[tokio::test]
+async fn paid_only_runner_candidates_require_a_routing_decision() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let key = json!({"account_id":"apikey-account", "credential_id":"apikey:test"});
+    let subscription = json!({"account_id":"oauth-account", "credential_id":"oauth:test"});
+    let mut request = account_request("synthetic", "paid-only-no-decision");
+    request["candidates"] = json!({"view_digest":"paid-only", "accounts":[key.clone()]});
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["field"], "decision_id", "{}", refused.1);
+    assert_eq!(
+        refused.1["detail"]["exclusions"],
+        json!([{"account_id":"apikey-account", "credential_id":"apikey:test",
+            "reason":"routing_decision_required"}]),
+        "{}", refused.1
+    );
+    assert_eq!(
+        cortexkit_role_routing::refusals::retry_class(
+            refused.1["code"].as_str().unwrap(), &refused.1["detail"]
+        ),
+        cortexkit_role_routing::refusals::RetryClass::Permanent
+    );
+    for (id, accounts) in [
+        ("subscription-only", json!([subscription.clone()])),
+        ("mixed", json!([key, subscription])),
+    ] {
+        let mut request = account_request("synthetic", id);
+        request["candidates"] = json!({"view_digest":id, "accounts":accounts});
+        assert_credential(&runner.call("route.account_for", &request).await, "oauth:test");
+    }
+}
+
+#[tokio::test]
+async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner_provider() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials) = setup("anthropic", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    let key = rows.iter_mut().find(|row| row.id == "apikey:test").unwrap();
+    key.id = "apikey:anthropic:erin".into();
+    key.account_id = Some("erin".into());
+    key.provider_ids = vec!["anthropic-platform".into()];
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "anthropic-paid-pool".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(
+        &Default::default(), &[account_fact("anthropic")], NOW as i64, &[],
+    );
+    credentials.runner_declarations.insert(
+        RUNNER.into(),
+        super::runners::parse_declaration(&json!({"runner": {
+            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
+                {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
+            "follows_account_choice":true
+        }})).unwrap().unwrap(),
+    );
+    credentials.runner_routed_accounts.insert(RUNNER.into(), vec!["apikey".into(), "oauth".into()]);
+    credentials.wire_apis.insert("anthropic/model".into(), "anthropic.messages".into());
+    let planes = credentials.billing_catalog.clone();
+    credentials.publish_billing_catalog(planes.with_wire_apis(&credentials.wire_apis));
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["providers"]["anthropic-platform"] = json!({"pin_only":true, "only_for":["mason"]});
+    });
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut unselected = account_request("anthropic", "unselected-erin");
+    unselected["candidates"] = json!({"view_digest":"erin-only", "accounts":[{
+        "account_id":"erin", "credential_id":"apikey:anthropic:erin"
+    }]});
+    let refused = runner.call("route.account_for", &unselected).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["field"], "decision_id", "{}", refused.1);
+    assert_eq!(refused.1["detail"]["exclusions"], json!([{
+        "account_id":"erin", "credential_id":"apikey:anthropic:erin", "reason":"routing_decision_required"
+    }]), "{}", refused.1);
+    let selected = caller.call("route.select", &json!({
+        "consumer":"mason", "pin":"anthropic-platform/model", "requirements":{"iq":0}
+    })).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    assert_eq!(selected.1["result"]["route"]["provider"], "anthropic-platform", "{}", selected.1);
+    assert_eq!(selected.1["result"]["runner"]["model"]["provider"], "anthropic", "{}", selected.1);
+    assert_eq!(selected.1["result"]["runner"]["auth"]["pool"], "anthropic-platform", "{}", selected.1);
+    for offered in [false, true] {
+        for pool_hint in [false, true] {
+            let mut request = account_request("anthropic", &format!("pool-decision-{offered}-{pool_hint}"));
+            request["decision_id"] = selected.1["result"]["decision_id"].clone();
+            if pool_hint {
+                request["pool"] = json!("anthropic-platform");
+            }
+            if offered {
+                request["candidates"] = json!({"view_digest":"erin-only", "accounts":[{
+                    "account_id":"erin", "credential_id":"apikey:anthropic:erin"
+                }]});
+            }
+            let refused = runner.call("route.account_for", &request).await;
+            assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+            assert_eq!(refused.1["code"], "unknown_decision", "{}", refused.1);
+            assert_eq!(refused.1["detail"], json!({}), "{}", refused.1);
+            // The decision binds the paid pool, not the catalog provider the
+            // runner uses to speak to Anthropic. Sending the selected route keeps
+            // account admission in that pool without weakening decision binding.
+            request["provider"] = json!("anthropic-platform");
+            let admitted = runner.call("route.account_for", &request).await;
+            assert_credential(&admitted, "apikey:anthropic:erin");
+            assert_eq!(admitted.1["result"]["account"]["provider"], "anthropic-platform");
+            assert_eq!(admitted.1["result"]["account"]["method"], "apikey");
+            assert_eq!(admitted.1["result"]["reason"]["decision_id"], request["decision_id"]);
+        }
+    }
+}
+
+#[tokio::test]
 async fn ten_default_admissions_never_spend_after_subscription_exhaustion_or_entitlement_refusal() {
     let _clock = crate::InjectedClock::set(NOW);
     for (provider, converted_live) in [("synthetic", false), ("openai", true)] {

@@ -23,6 +23,7 @@ const METERED: &str = "example-provider/model-a";
 const SUBSCRIPTION: &str = "example-subscription/model-c";
 const STEMS: &[&str] = &[
     "basal-flow",
+    "pinned",
     "magic-context-summary",
     "price-metered",
     "price-subscription-5m-1h",
@@ -219,6 +220,10 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
             ]}}}
     ]));
     harness.edit_config(|config| {
+        // The generic fixture owns flow as its sample module. This vector
+        // exercises Basal's declaration, so it must not retain another owner
+        // for the equivalent legacy spelling.
+        config["consumers"].as_object_mut().unwrap().remove("flow");
         config["runners"] = json!([
             {"module":fixture::RUNNER_ONE},
             {"module":"broca"},
@@ -248,9 +253,12 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
 
     let mut params = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"pin":METERED});
     let (caller, expected_runner) = match stem {
-        "basal-flow" | "broca-harness" => {
+        "basal-flow" | "broca-harness" | "pinned" => {
             params = json!({"consumer":"basal.flow","requirements":{"iq":50,"tools":"none"},
                 "eligible_routes":[{"provider":"example-provider","model":"model-a"}]});
+            if stem == "pinned" {
+                params["pin"] = json!(METERED);
+            }
             ("basal", "broca")
         }
         "magic-context-summary" | "caller-runner-unresolved" | "consumer-not-owned" => {
@@ -330,6 +338,14 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
         answer["runner"]["module"], expected_runner,
         "{stem}: {body}"
     );
+    if stem == "pinned" {
+        assert_eq!(answer["pin_outcome"], "pinned", "{body}");
+        assert_eq!(
+            answer["route"],
+            json!({"provider":"example-provider","model":"model-a"}),
+            "{body}"
+        );
+    }
     if stem == "broca-harness" {
         assert_eq!(answer["runner"]["harness"], "broca", "{body}");
     } else if expected_runner == "broca" {

@@ -1280,7 +1280,8 @@ async fn settings_only_names_log_info_at_load_without_health_warnings_or_request
     crate::take_operator_warnings();
     crate::take_operator_infos();
     h.edit_config(|config| {
-        config["consumers"] = json!({"settings-only": {}, "declared-owner.task": {}});
+        config["consumers"] =
+            json!({"settings-only": {}, "declared-owner.task": {}, "head": {}, "classifier": {}});
     });
     assert_eq!(
         crate::take_operator_infos(),
@@ -2102,4 +2103,73 @@ fn catalog_wire_decodes_routing_declarations_with_the_pinned_protocol() {
     assert_eq!(declarations.consumers[0].name, "example.worker");
     assert_eq!(modules[0]["nonce_verified"], true);
     assert_eq!(modules[0]["module_id"], "declaring-module");
+}
+
+#[tokio::test]
+async fn consumer_alias_admission_does_not_bypass_module_ownership() {
+    let h = harness();
+    consumers::replace_catalog(&json!([entry(
+        "prefrontal-core",
+        true,
+        &["prefrontal-core.sidekick"]
+    )]));
+    h.edit_config(|config| {
+        config["consumers"] = json!({"sidekick": {}});
+    });
+    let owner = h.bind(reserved("prefrontal-core"), None).await;
+    let stranger = h.bind(reserved("another-module"), None).await;
+    for consumer in [
+        "sidekick",
+        "prefrontal-core.sidekick",
+        "sidekick.explore",
+        "prefrontal-core.sidekick.explore",
+    ] {
+        assert_eq!(
+            owner.call("route.select", &select(consumer)).await.0,
+            FrameType::Response
+        );
+        let (ty, reply) = stranger.call("route.select", &select(consumer)).await;
+        assert_eq!(ty, FrameType::Error, "{reply}");
+        assert_eq!(reply["code"], "consumer_not_owned", "{reply}");
+    }
+}
+
+#[test]
+fn consumer_alias_ownership_conflict_warns_once_at_catalog_load() {
+    let _h = harness();
+    let catalog = json!([
+        entry("legacy-alias-warning-owner", true, &["flow"]),
+        entry("basal", true, &["basal.flow"]),
+    ]);
+    let expected = "consumer alias ownership conflict: \"flow\" declared by \"legacy-alias-warning-owner\" and \"basal.flow\" declared by \"basal\"";
+    crate::take_operator_warnings();
+    consumers::replace_catalog(&catalog);
+    let issues = consumers::health()["issues"].as_array().unwrap().clone();
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue.as_str() == Some(expected))
+            .count(),
+        1
+    );
+    let warnings = crate::take_operator_warnings();
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.contains(expected))
+            .count(),
+        1
+    );
+    consumers::replace_catalog(&catalog);
+    assert!(crate::take_operator_warnings().is_empty());
+
+    let same_owner = json!([entry("basal", true, &["flow", "basal.flow"])]);
+    consumers::replace_catalog(&same_owner);
+    assert!(!consumers::health()["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue
+            .as_str()
+            .is_some_and(|issue| issue.contains("consumer alias ownership conflict"))));
 }

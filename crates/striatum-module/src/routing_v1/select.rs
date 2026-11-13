@@ -190,7 +190,7 @@ pub(super) async fn evaluate(
     profile_lookup: &ProfileLookup,
 ) -> Result<Value, Refusal> {
     let shared = RequestInputs::read(deps, Some(view))?;
-    evaluate_with_inputs(params, caller, deps, view, profile_lookup, &shared).await
+    evaluate_with_inputs(params, caller, deps, view, profile_lookup, &shared, false).await
 }
 
 pub(super) async fn evaluate_with_inputs(
@@ -200,8 +200,27 @@ pub(super) async fn evaluate_with_inputs(
     view: &Evaluation<'_>,
     profile_lookup: &ProfileLookup,
     shared: &RequestInputs,
+    panel_seat: bool,
 ) -> Result<Value, Refusal> {
     let mut inputs = prepare_selection(params, caller, deps, shared, Some(view)).await?;
+    if panel_seat {
+        let (layers, status) = selection_settings(params, &inputs.request, caller, deps).await?;
+        let request = inputs.request.clone();
+        return select_with_tier_fallback(
+            params,
+            caller,
+            deps,
+            profile_lookup,
+            &request,
+            &layers,
+            status,
+            true,
+            shared,
+            &mut inputs,
+            Some(view),
+        )
+        .await;
+    }
     select_at_tier(
         params,
         caller,
@@ -211,7 +230,7 @@ pub(super) async fn evaluate_with_inputs(
         None,
         &mut TierTrace::default(),
         &crate::tier_settings::Layers::new(None, None),
-        false,
+        panel_seat,
         Some(view),
         shared,
         &mut inputs,
@@ -264,36 +283,8 @@ async fn select_with_profile_lookup_kind(
     );
     let consumers = super::consumers::effective(&config);
     let request = parse_admitted_request(params, caller, &consumers, false)?;
-    let (settings_layers, project_settings) = if let Some(settings) = &request.settings {
-        settings.check_project_stamp(
-            caller
-                .scope_authority
-                .as_ref()
-                .and_then(|scope| scope.project_id.as_deref())
-                .or_else(|| {
-                    caller
-                        .scope
-                        .as_ref()
-                        .and_then(|scope| scope.project_id.as_deref())
-                }),
-        )?;
-        match settings.project_id.as_deref() {
-            Some(project) => {
-                let (layers, status) =
-                    crate::project_settings::layers(project, deps.routing_config_path).await;
-                (layers, Some(status))
-            }
-            None => (crate::tier_settings::Layers::new(None, None), None),
-        }
-    } else {
-        (
-            crate::tier_settings::Layers::new(
-                params.get("project_root").and_then(Value::as_str),
-                params.get("workspace_root").and_then(Value::as_str),
-            ),
-            None,
-        )
-    };
+    let (settings_layers, project_settings) =
+        selection_settings(params, &request, caller, deps).await?;
     let mut result = async {
         let owned;
         let shared = match shared {
@@ -315,6 +306,7 @@ async fn select_with_profile_lookup_kind(
             panel_seat,
             shared,
             &mut inputs,
+            None,
         )
         .await
     }
@@ -343,6 +335,50 @@ async fn select_with_profile_lookup_kind(
     result
 }
 
+async fn selection_settings(
+    params: &Value,
+    request: &SelectRequest,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<
+    (
+        crate::tier_settings::Layers,
+        Option<cortexkit_role_routing::select::ProjectSettings>,
+    ),
+    Refusal,
+> {
+    Ok(if let Some(settings) = &request.settings {
+        settings.check_project_stamp(
+            caller
+                .scope_authority
+                .as_ref()
+                .and_then(|scope| scope.project_id.as_deref())
+                .or_else(|| {
+                    caller
+                        .scope
+                        .as_ref()
+                        .and_then(|scope| scope.project_id.as_deref())
+                }),
+        )?;
+        match settings.project_id.as_deref() {
+            Some(project) => {
+                let (layers, status) =
+                    crate::project_settings::layers(project, deps.routing_config_path).await;
+                (layers, Some(status))
+            }
+            None => (crate::tier_settings::Layers::new(None, None), None),
+        }
+    } else {
+        (
+            crate::tier_settings::Layers::new(
+                params.get("project_root").and_then(Value::as_str),
+                params.get("workspace_root").and_then(Value::as_str),
+            ),
+            None,
+        )
+    })
+}
+
 async fn select_with_tier_fallback(
     params: &Value,
     caller: &Caller,
@@ -354,6 +390,7 @@ async fn select_with_tier_fallback(
     panel_seat: bool,
     shared: &RequestInputs,
     inputs: &mut SelectionInputs,
+    evaluation: Option<&Evaluation<'_>>,
 ) -> Result<Value, Refusal> {
     use cortexkit_role_routing::service_tier::ServiceTier;
     let mut trace = TierTrace {
@@ -371,7 +408,7 @@ async fn select_with_tier_fallback(
             &mut trace,
             settings_layers,
             panel_seat,
-            None,
+            evaluation,
             shared,
             inputs,
         )
@@ -410,7 +447,7 @@ async fn select_with_tier_fallback(
                     &mut trace,
                     settings_layers,
                     panel_seat,
-                    None,
+                    evaluation,
                     shared,
                     inputs,
                 )
@@ -440,7 +477,7 @@ async fn select_with_tier_fallback(
             &mut trace,
             settings_layers,
             panel_seat,
-            None,
+            evaluation,
             shared,
             inputs,
         )
@@ -1791,11 +1828,81 @@ async fn select_at_tier_attempt(
     .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
     if evaluation.is_some() {
-        return Ok(SelectionAttempt::Selected(json!({
+        let mut preview = json!({
             "route": selected.route_key,
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
-        })));
+        });
+        if panel_seat {
+            let route = RouteRef {
+                provider: selected.model.provider_id.clone(),
+                model: selected.model.model_id.clone(),
+                variant: selected.prompt_params.variant.clone(),
+            };
+            let fact = facts
+                .iter()
+                .filter(|fact| fact.provider_id == route.provider && fact.model_id == route.model)
+                .min_by_key(|fact| u8::from(fact.variant != route.variant));
+            let mut runner_ref = RunnerRef::new(runner.module.clone(), route.clone());
+            // An estimate can describe the pool but cannot acquire a key or
+            // promise a credential. The actual selection owns that reservation.
+            if key_pool::is_pool_provider(&catalog_targets, &route.provider)
+                && !fact.is_some_and(|fact| {
+                    fact.billing_plane
+                        .as_ref()
+                        .is_some_and(|plane| plane.auth_method == "gateway")
+                })
+            {
+                runner_ref.model.provider = catalog_targets[&route.provider].clone();
+                runner_ref = runner_ref.with_auth(RunnerAuth {
+                    pool: Some(route.provider.clone()),
+                    credential_id: None,
+                });
+            }
+            if let Some(harness) = registry.get(runner).and_then(|runner| {
+                runner.harness_for_route(
+                    request.harness.as_deref(),
+                    &selected.route_key,
+                    &selected.capacity_key,
+                )
+            }) {
+                runner_ref = runner_ref.with_harness(harness);
+            }
+            let explanation = clamp_sentence(format!(
+                "{} on {} for consumer {consumer}, chosen by {}.",
+                route.pin(),
+                runner.module,
+                basis.as_str()
+            ));
+            let mut selection = cortexkit_role_routing::panel::PanelEstimateSelection::new(
+                route,
+                runner_ref,
+                fact.and_then(|fact| fact.context_window)
+                    .map_or(0, |window| window as u64),
+                fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0),
+                now_ms() + DECISION_TTL_MS,
+                explanation,
+            );
+            selection.service_tier_chosen = service_tier.map(|tier| tier.as_str().to_owned());
+            selection.price = price_answer::for_selection(
+                &selected,
+                &inputs.facts,
+                priced.classes.as_ref(),
+                live_config,
+                priced_per_token,
+                request,
+                demand.iq,
+                service_tier,
+                profile_lookup,
+            );
+            selection.detail = (request.detail == Some(true)).then(|| json!({
+                "basis": basis.as_str(), "explanation": selected.explanation,
+                "rejected": selected.rejected, "score": selected.score, "variant": variant_choice,
+            }));
+            selection.project_settings = tier_trace.project_settings.clone();
+            preview["selection"] = serde_json::to_value(selection).map_err(store_refusal)?;
+        }
+        return Ok(SelectionAttempt::Selected(preview));
     }
 
     // Record the decision in the ledger every selection writes, then bind it.

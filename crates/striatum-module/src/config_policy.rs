@@ -423,13 +423,94 @@ pub struct RunnerPolicy {
     pub via_vault: bool,
 }
 
-/// Match only whole dotted consumer segments, never an unrelated name that
-/// happens to start with the same characters.
-pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
+/// Settings and callers deploy independently, so both spellings remain live
+/// until every caller has moved to its module-owned name. Verify had one old
+/// policy for two tasks; an old rule therefore applies to both new siblings.
+pub const CONSUMER_ALIAS_PAIRS: &[(&str, &str)] = &[
+    ("mason", "prefrontal-core.mason"),
+    ("sidekick", "prefrontal-core.sidekick"),
+    ("athena", "prefrontal-core.athena"),
+    ("athena.gather", "prefrontal-core.athena.gather"),
+    ("synthesizer", "prefrontal-core.athena.synthesizer"),
+    ("lab", "prefrontal-core.lab"),
+    ("core", "prefrontal-core.wake"),
+    ("codemode", "basal.codemode"),
+    ("flow", "basal.flow"),
+    ("mc_summary", "magic-context.summary"),
+    ("mc_dream", "magic-context.dream"),
+    ("mc_dream_classify", "magic-context.dream.classify-memories"),
+    ("mc_dream_curate", "magic-context.dream.curate"),
+    (
+        "mc_dream_compress_cues",
+        "magic-context.dream.compress-cues",
+    ),
+    (
+        "mc_dream_review_user",
+        "magic-context.dream.review-user-memories",
+    ),
+    ("mc_dream_map", "magic-context.dream.map-memories"),
+    ("mc_dream_primers", "magic-context.dream.refresh-primers"),
+    (
+        "mc_dream_retrospective",
+        "magic-context.dream.reflect-events",
+    ),
+    ("mc_dream_verify", "magic-context.dream.verify"),
+    ("mc_dream_verify", "magic-context.dream.verify-broad"),
+];
+
+/// Head choices belong to routing itself, not a module declaration. Classifier
+/// requests are also a routing protocol consumer rather than a module workload.
+pub fn routing_builtin_consumer(name: &str) -> bool {
+    matches!(name, "head" | "classifier")
+}
+
+fn dotted_prefix(prefix: &str, consumer: &str) -> bool {
     consumer == prefix
         || consumer
             .strip_prefix(prefix)
             .is_some_and(|tail| tail.starts_with('.'))
+}
+
+pub fn consumer_spellings(name: &str) -> Vec<String> {
+    let longest = CONSUMER_ALIAS_PAIRS
+        .iter()
+        .filter(|(old, _)| dotted_prefix(old, name))
+        .map(|(old, _)| old.len())
+        .max();
+    match longest {
+        Some(length) => CONSUMER_ALIAS_PAIRS
+            .iter()
+            .filter(|(old, _)| old.len() == length && dotted_prefix(old, name))
+            .map(|(old, new)| format!("{new}{}", &name[old.len()..]))
+            .collect(),
+        None => vec![name.to_owned()],
+    }
+}
+
+pub fn consumer_specificity(name: &str) -> usize {
+    consumer_spellings(name)
+        .iter()
+        .map(String::len)
+        .max()
+        .unwrap_or(0)
+}
+
+pub fn consumer_entry<'a, T>(entries: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
+    entries.get(name).or_else(|| {
+        entries.iter().find_map(|(key, value)| {
+            (consumer_matches(key, name) && consumer_matches(name, key)).then_some(value)
+        })
+    })
+}
+
+/// Match whole dotted segments after translating legacy names. Translating
+/// both operands lets either deployment order retain the operator's policy.
+pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
+    consumer_spellings(prefix).iter().any(|prefix| {
+        consumer_spellings(consumer)
+            .iter()
+            .any(|consumer| dotted_prefix(prefix, consumer))
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -631,9 +712,12 @@ pub fn resolve_consumer_policy(
         }
         let mut chain: Vec<_> = source
             .iter()
-            .filter(|(name, _)| !is_slot(name) && consumer_matches(name, consumer))
+            .filter(|(name, _)| {
+                (!is_slot(name) || consumer_matches(consumer, name))
+                    && consumer_matches(name, consumer)
+            })
             .collect();
-        chain.sort_by_key(|(name, _)| name.len());
+        chain.sort_by_key(|(name, _)| consumer_specificity(name));
         for (_, entry) in chain {
             overlay(entry);
         }

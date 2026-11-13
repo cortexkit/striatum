@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"colliculus.voice_message","kind":"transcribe","privacy":"remote_allowed","requirements":{"duration_ms":-1}}},"reply":{"code":"invalid_requirements","message":"duration_ms is invalid: invalid value: integer `-1`, expected u64","detail":{"field":"duration_ms"}}}

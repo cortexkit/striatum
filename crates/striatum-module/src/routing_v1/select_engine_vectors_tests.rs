@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    sync::Arc,
+};
 
 use cortexkit_claustrum_client::{ListedCredential, ListedGrant, ScopedCredentialListing};
 use serde_json::{json, Value};
@@ -32,8 +36,65 @@ fn engine(kind: &str) -> Value {
         "max_duration_ms":60000,"latency_class":"realtime"})
 }
 
-fn params(kind: &str) -> Value {
-    json!({"consumer":"phone.media","kind":kind,"requirements":{},"privacy":"remote_allowed"})
+#[derive(Clone, Copy)]
+enum Version {
+    V1,
+    V2,
+}
+
+impl Version {
+    fn consumer(self) -> &'static str {
+        match self {
+            Self::V1 => "phone.media",
+            Self::V2 => "colliculus.voice_message",
+        }
+    }
+
+    fn module(self) -> &'static str {
+        match self {
+            Self::V1 => "fixture-media",
+            Self::V2 => "colliculus",
+        }
+    }
+
+    fn directory(self) -> &'static str {
+        match self {
+            Self::V1 => "route-select-engine-v1",
+            Self::V2 => "route-select-engine-v2",
+        }
+    }
+
+    fn catalog(self, with_engines: bool) -> Value {
+        let mut modules = match self {
+            Self::V1 => json!([
+                {"module_id":"callosum","nonce_verified":true,
+                    "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
+            ]),
+            Self::V2 => json!([
+                {"module_id":"colliculus","nonce_verified":true,
+                    "role_declarations":{"routing/v1":{"consumers":[{
+                        "name":"colliculus.voice_message","kind":"transcribe",
+                        "selectors":["callosum"]}]}}}
+            ]),
+        };
+        if with_engines {
+            match self {
+                Self::V1 => modules.as_array_mut().unwrap().push(json!({
+                    "module_id":self.module(),"nonce_verified":true,
+                    "role_declarations":{"media-provider/v1":{"engines":KINDS.map(engine)}}
+                })),
+                Self::V2 => {
+                    modules[0]["role_declarations"]["media-provider/v1"] =
+                        json!({"engines":[engine("transcribe")]})
+                }
+            }
+        }
+        modules
+    }
+}
+
+fn params(version: Version, kind: &str) -> Value {
+    json!({"consumer":version.consumer(),"kind":kind,"requirements":{},"privacy":"remote_allowed"})
 }
 
 fn key() -> ListedCredential {
@@ -81,14 +142,9 @@ fn credentials(rows: Vec<ListedCredential>, granted: bool, listed_at: i64) -> Br
     credentials
 }
 
-fn fixture() -> Arc<Harness> {
+fn fixture(version: Version) -> Arc<Harness> {
     let harness = Harness::new("select-engine-vectors");
-    super::consumers::replace_catalog(&json!([
-        {"module_id":"fixture-media","nonce_verified":true,
-            "role_declarations":{"media-provider/v1":{"engines":KINDS.map(engine)}}},
-        {"module_id":"callosum","nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
-    ]));
+    super::consumers::replace_catalog(&version.catalog(true));
     harness.set_credentials(credentials(vec![key()], true, NOW));
     harness
 }
@@ -106,7 +162,29 @@ impl Samples {
         code: Option<&str>,
         filter: Option<&str>,
     ) -> Value {
-        let frame = route.request_frame("route.select_engine", params);
+        self.capture_method(
+            name,
+            harness,
+            route,
+            "route.select_engine",
+            params,
+            code,
+            filter,
+        )
+        .await
+    }
+
+    async fn capture_method(
+        &mut self,
+        name: &str,
+        harness: &Harness,
+        route: &Route,
+        method: &str,
+        params: &Value,
+        code: Option<&str>,
+        filter: Option<&str>,
+    ) -> Value {
+        let frame = route.request_frame(method, params);
         let request = frame.body.clone();
         let reply = harness.handle(frame).await;
         let value: Value = serde_json::from_slice(&reply.body).unwrap();
@@ -131,10 +209,15 @@ impl Samples {
         value
     }
 
-    fn verify(self) {
-        let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/route-select-engine-v1");
-        let update = std::env::var_os("UPDATE_ROUTE_SELECT_ENGINE_VECTORS").is_some();
+    fn verify(self, version: Version) {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-vectors")
+            .join(version.directory());
+        let update = std::env::var_os(match version {
+            Version::V1 => "UPDATE_ROUTE_SELECT_ENGINE_VECTORS",
+            Version::V2 => "UPDATE_ROUTE_SELECT_ENGINE_V2_VECTORS",
+        })
+        .is_some();
         let mut sums = String::new();
         for (name, bytes) in &self.0 {
             let path = directory.join(name);
@@ -150,30 +233,48 @@ impl Samples {
             std::fs::write(&path, &sums).unwrap();
         }
         assert_eq!(std::fs::read_to_string(path).unwrap(), sums);
-        let files: Vec<_> = std::fs::read_dir(directory)
+        let files: BTreeSet<_> = std::fs::read_dir(directory)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .filter(|name| name.ends_with(".json"))
             .collect();
-        assert_eq!(files.len(), self.0.len(), "unlisted sample files");
+        let expected: BTreeSet<_> = self
+            .0
+            .keys()
+            .cloned()
+            .chain(["README.md".into(), "SHA256SUMS".into()])
+            .collect();
+        assert_eq!(files, expected, "extra or missing vector files");
     }
 }
 
 #[tokio::test]
 async fn serving_bytes_match_tagged_vectors() {
+    capture_vectors(Version::V1).await;
+}
+
+#[tokio::test]
+async fn serving_bytes_match_v2_vectors() {
+    capture_vectors(Version::V2).await;
+}
+
+async fn capture_vectors(version: Version) {
     let _clock = crate::InjectedClock::set(NOW as u64);
     let _ids = striatum_store::replay::Inputs::new(NOW).install();
     let mut samples = Samples::default();
-    let harness = fixture();
+    let harness = fixture(version);
     let route = harness.bind(reserved("callosum"), None).await;
     let mut first = Value::Null;
     for kind in KINDS {
+        // A kind-bound voice-message consumer cannot request the other v1 media kinds.
+        if matches!(version, Version::V2) && kind != "transcribe" {
+            continue;
+        }
         let reply = samples
             .capture(
                 &format!("accepted-{kind}"),
                 &harness,
                 &route,
-                &params(kind),
+                &params(version, kind),
                 None,
                 None,
             )
@@ -182,7 +283,7 @@ async fn serving_bytes_match_tagged_vectors() {
             reply["result"]["engine"]["model"],
             format!("fixture-{kind}")
         );
-        assert_eq!(reply["result"]["engine"]["module"], "fixture-media");
+        assert_eq!(reply["result"]["engine"]["module"], version.module());
         if kind == "transcribe" {
             first = reply;
         }
@@ -192,7 +293,7 @@ async fn serving_bytes_match_tagged_vectors() {
             "repeated-transcribe",
             &harness,
             &route,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             None,
             None,
         )
@@ -202,7 +303,7 @@ async fn serving_bytes_match_tagged_vectors() {
         first["result"]["decision_id"],
         repeated["result"]["decision_id"]
     );
-    let mut local = params("transcribe");
+    let mut local = params(version, "transcribe");
     local["privacy"] = json!("local_only");
     let mut phone = engine("transcribe");
     phone["local"] = json!(true);
@@ -223,12 +324,51 @@ async fn serving_bytes_match_tagged_vectors() {
     assert_eq!(reply["result"]["engine"]["index"], 0);
     assert!(reply["result"]["engine"].get("module").is_none());
 
+    if matches!(version, Version::V2) {
+        let executor = harness.bind(reserved("colliculus"), None).await;
+        let mut admission = json!({
+            "admission_id":"before-expiry","conversation_key":"voice-message",
+            "provider":PROVIDER,"model":"fixture-transcribe",
+            "decision_id":first["result"]["decision_id"],"hold_wait_max_s":0
+        });
+        // The provider executor, not the selecting phone, redeems a remote decision.
+        // A successful admission before expiry rules out a slot or owner refusal.
+        let admitted = executor.call("route.account_for", &admission).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+        assert_eq!(admitted.1["result"]["admission"]["state"], "reserved");
+        let mut expired = credentials(vec![key()], true, NOW);
+        expired.engine_clock_offset_ms = 600_000;
+        harness.set_credentials(expired);
+        // Existing admissions replay after expiry; only a new admission is refused.
+        assert_eq!(
+            executor.call("route.account_for", &admission).await,
+            admitted
+        );
+        admission["admission_id"] = json!("at-expiry");
+        samples
+            .capture_method(
+                "decision-expired",
+                &harness,
+                &executor,
+                "route.account_for",
+                &admission,
+                Some("unknown_decision"),
+                None,
+            )
+            .await;
+        harness.set_credentials(credentials(vec![key()], true, NOW));
+    }
+
+    let unknown_kind = match version {
+        Version::V1 => ("unknown-kind", "no_engine", Some("kind")),
+        Version::V2 => ("kind-mismatch", "invalid_request", None),
+    };
     for (name, patch, code, filter) in [
         (
-            "unknown-kind",
+            unknown_kind.0,
             json!({"kind":"future_kind"}),
-            "no_engine",
-            Some("kind"),
+            unknown_kind.1,
+            unknown_kind.2,
         ),
         (
             "requirements-unmet",
@@ -261,13 +401,16 @@ async fn serving_bytes_match_tagged_vectors() {
             None,
         ),
     ] {
-        let mut request = params("transcribe");
+        let mut request = params(version, "transcribe");
         for (key, value) in patch.as_object().unwrap() {
             request[key] = value.clone();
         }
-        samples
+        let reply = samples
             .capture(name, &harness, &route, &request, Some(code), filter)
             .await;
+        if name == "kind-mismatch" {
+            assert_eq!(reply["detail"]["field"], "kind");
+        }
     }
     let foreign = harness.bind(reserved("stranger"), None).await;
     samples
@@ -275,7 +418,7 @@ async fn serving_bytes_match_tagged_vectors() {
             "caller-not-owner",
             &harness,
             &foreign,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             Some("consumer_not_owned"),
             None,
         )
@@ -286,7 +429,7 @@ async fn serving_bytes_match_tagged_vectors() {
             "caller-direct",
             &harness,
             &direct,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             Some("consumer_not_owned"),
             None,
         )
@@ -313,32 +456,29 @@ async fn serving_bytes_match_tagged_vectors() {
             "flow-scope-not-supported",
             &harness,
             &flow,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             Some("flow_scope_not_supported"),
             None,
         )
         .await;
 
-    super::consumers::replace_catalog(&json!([
-        {"module_id":"callosum","nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
-    ]));
+    super::consumers::replace_catalog(&version.catalog(false));
     samples
         .capture(
             "no-engines",
             &harness,
             &route,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             Some("no_engine"),
             Some("kind"),
         )
         .await;
 
-    capture_unavailable(&mut samples).await;
-    samples.verify();
+    capture_unavailable(&mut samples, version).await;
+    samples.verify(version);
 }
 
-async fn capture_unavailable(samples: &mut Samples) {
+async fn capture_unavailable(samples: &mut Samples, version: Version) {
     for name in [
         "route-cooldown",
         "route-quota-exhausted",
@@ -351,7 +491,7 @@ async fn capture_unavailable(samples: &mut Samples) {
         "provider-reset-account-route-fence",
         "accepted-transient-only-account",
     ] {
-        let harness = fixture();
+        let harness = fixture(version);
         let store = harness.store();
         let route_key = "media-vendor/fixture-transcribe";
         let until = NOW + 60_000;
@@ -435,7 +575,7 @@ async fn capture_unavailable(samples: &mut Samples) {
                 name,
                 &harness,
                 &route,
-                &params("transcribe"),
+                &params(version, "transcribe"),
                 (!transient_only).then_some("no_engine"),
                 (!transient_only).then_some("reachability"),
             )
@@ -449,7 +589,7 @@ async fn capture_unavailable(samples: &mut Samples) {
         "listing-failed",
         "no-admissible-media-credential",
     ] {
-        let harness = fixture();
+        let harness = fixture(version);
         let mut credentials = match name {
             "listing-missing" => BrocaCredentials::default(),
             "listing-grant-missing" => credentials(vec![key()], false, NOW),
@@ -471,14 +611,14 @@ async fn capture_unavailable(samples: &mut Samples) {
                 name,
                 &harness,
                 &route,
-                &params("transcribe"),
+                &params(version, "transcribe"),
                 Some("no_engine"),
                 Some("reachability"),
             )
             .await;
     }
 
-    let harness = fixture();
+    let harness = fixture(version);
     let route = harness.bind(reserved("callosum"), None).await;
     // A missing table induces a stable storage failure, not a fabricated refusal.
     rusqlite::Connection::open(harness.store_path())
@@ -490,7 +630,7 @@ async fn capture_unavailable(samples: &mut Samples) {
             "store-error",
             &harness,
             &route,
-            &params("transcribe"),
+            &params(version, "transcribe"),
             Some("store_error"),
             None,
         )

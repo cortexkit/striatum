@@ -337,7 +337,9 @@ impl Harness {
         assert!(serving, "the frame loop must keep serving");
         drop(route_epochs);
         drop(writer);
-        replies.recv().await.expect("every request gets a reply")
+        let reply = replies.recv().await.expect("every request gets a reply");
+        assert_no_pending_refusal(&reply);
+        reply
     }
 
     /// Run a pre-rebind request frame through the production handler after a
@@ -362,6 +364,7 @@ impl Harness {
         .await
         .unwrap();
         let reply = replies.recv().await.unwrap();
+        assert_no_pending_refusal(&reply);
         (
             reply.header.ty,
             serde_json::from_slice(&reply.body).unwrap(),
@@ -1566,13 +1569,29 @@ const NOT_APPLICABLE: &[&str] = &[
     "unrequested_harness_uses_declaration",
 ];
 
-// Support for these contract groups is being built separately;
-// select_kind stays unadvertised until media-kind selection is implemented.
-// Keep each gated kit case beside its group so advertising the group requires
-// removing it from this list.
-const PENDING_READERS: &[(&str, &str)] = &[
-    ("select_kind", "placement_select_kind"),
+// The concurrency campaign owns consumer_priority and the concurrency_full
+// refusal reason: scheduling priority and account concurrency limits are not
+// implemented here. The conformance kit's run_suite has no priority check yet;
+// concurrency_full is a refusal reason, not a capability. Keep both unserved.
+// select_kind remains pending separately until media selection is implemented.
+const PENDING_READERS: &[(&str, &[&str])] = &[
+    ("select_kind", &["placement_select_kind"]),
+    ("consumer_priority", &[]),
 ];
+const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
+
+fn assert_no_pending_refusal(reply: &Frame) {
+    if reply.header.ty == FrameType::Error {
+        let body: Value = serde_json::from_slice(&reply.body).unwrap();
+        if body["code"] == "no_route" {
+            let reason = body["detail"]["reason"].as_str().unwrap_or_default();
+            assert!(
+                !PENDING_REFUSAL_REASONS.contains(&reason),
+                "served refusal {reason} still marked pending: {body}"
+            );
+        }
+    }
+}
 
 // Capabilities routing advertises that the contract crate's list of known
 // groups doesn't define: tier settings in operator configuration, and resuming
@@ -1616,6 +1635,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };
+    for reason in PENDING_REFUSAL_REASONS {
+        assert!(cortexkit_role_routing::errors::NoRouteReason::parse(reason).is_known());
+        assert!(!known.contains(reason), "refusal {reason} became a capability");
+        assert!(!advertised.contains(reason), "pending refusal advertised as a group");
+    }
     let report = run_suite(&subject).await;
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
@@ -1650,7 +1674,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let expected_not_applicable: Vec<_> = NOT_APPLICABLE
         .iter()
         .copied()
-        .chain(PENDING_READERS.iter().map(|(_, case)| *case))
+        .chain(PENDING_READERS.iter().flat_map(|(_, cases)| cases.iter().copied()))
         .collect();
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();

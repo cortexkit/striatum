@@ -25,6 +25,7 @@ in a `result` or `error` envelope.
 | Filename stem | Declaration / request | Answer |
 | --- | --- | --- |
 | `basal-flow` | Basal declares `basal.flow` with `placement: {module: "broca"}` and no demand default. Per-call IQ 50, `tools: "none"`, and exact `eligible_routes` narrow the call. | Broca, even though another runner appears first in settings. No `runner.harness`: today's harness-less Broca shape. |
+| `pinned` | The same declared Basal demand, explicitly pinned to `example-provider/model-a`. | The pinned route on Broca, with `pin_outcome: "pinned"`. |
 | `magic-context-summary` | Magic Context declares `magic-context.summary`, IQ 40 and `placement: "caller_runner"`. The request omits IQ and sends `tools: "none"` and `runners: ["broca"]`. | The non-runner attested caller `reserved:magic-context` resolves to the single catalog runner Broca. Resolved IQ is 40. |
 | `price-metered` | Pin `example-provider/model-a`. | `basis: "metered"`, catalog list rates, no multiplier. |
 | `price-subscription-5m-1h` | Pin `example-subscription/model-c`, with twenty completed tasks in real usage history for `example_summary` at IQ 50. | `basis: "subscription_equivalent"`, multiplier 22, `5m` / `1h` cache-write lifetimes, and `estimated_task_usd: 0.009272727272727273` together. |
@@ -72,13 +73,13 @@ UPDATE_ROUTE_SELECT_DECLARED_VECTORS=1 cargo nextest run --locked -p striatum-mo
 ```
 
 For a remote build with read-only synced sources, run regeneration in a writable
-scratch copy. Copy the twenty JSON files and `SHA256SUMS` to a new output
+scratch copy. Copy the twenty-two JSON files and `SHA256SUMS` to a new output
 directory, return those paths, then install the files here locally. Only the
 update environment variable permits writing generated files; it does not rewrite
 this README. Without it, the same test generates samples in memory and fails on
 any byte or digest difference, and rejects unlisted files by name.
 
-`SHA256SUMS` covers all twenty JSON files and this README in bytewise filename
+`SHA256SUMS` covers all twenty-two JSON files and this README in bytewise filename
 order, excluding only the manifest itself. Independently verify it with:
 
 ```sh

@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"colliculus.voice_message","kind":"future_kind","privacy":"remote_allowed","requirements":{}}},"reply":{"code":"invalid_request","message":"consumer kind transcribe cannot be selected as future_kind","detail":{"field":"kind"}}}

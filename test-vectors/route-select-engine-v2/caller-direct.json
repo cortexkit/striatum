@@ -1,0 +1,1 @@
+{"request":{"method":"route.select_engine","params":{"consumer":"colliculus.voice_message","kind":"transcribe","privacy":"remote_allowed","requirements":{}}},"reply":{"code":"consumer_not_owned","message":"the caller and its scope do not own consumer \"colliculus.voice_message\"","detail":{"consumer":"colliculus.voice_message"}}}
