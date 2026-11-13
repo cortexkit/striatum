@@ -2133,3 +2133,43 @@ async fn consumer_alias_admission_does_not_bypass_module_ownership() {
         assert_eq!(reply["code"], "consumer_not_owned", "{reply}");
     }
 }
+
+#[test]
+fn consumer_alias_ownership_conflict_warns_once_at_catalog_load() {
+    let _h = harness();
+    let catalog = json!([
+        entry("legacy-alias-warning-owner", true, &["flow"]),
+        entry("basal", true, &["basal.flow"]),
+    ]);
+    let expected = "consumer alias ownership conflict: \"flow\" declared by \"legacy-alias-warning-owner\" and \"basal.flow\" declared by \"basal\"";
+    crate::take_operator_warnings();
+    consumers::replace_catalog(&catalog);
+    let issues = consumers::health()["issues"].as_array().unwrap().clone();
+    assert_eq!(
+        issues
+            .iter()
+            .filter(|issue| issue.as_str() == Some(expected))
+            .count(),
+        1
+    );
+    let warnings = crate::take_operator_warnings();
+    assert_eq!(
+        warnings
+            .iter()
+            .filter(|warning| warning.contains(expected))
+            .count(),
+        1
+    );
+    consumers::replace_catalog(&catalog);
+    assert!(crate::take_operator_warnings().is_empty());
+
+    let same_owner = json!([entry("basal", true, &["flow", "basal.flow"])]);
+    consumers::replace_catalog(&same_owner);
+    assert!(!consumers::health()["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|issue| issue
+            .as_str()
+            .is_some_and(|issue| issue.contains("consumer alias ownership conflict"))));
+}

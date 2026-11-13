@@ -149,6 +149,32 @@ impl Catalog {
                 }
             }
         }
+        // Different owners of the two spellings are an admission conflict, not
+        // independent workloads. Report it at catalog load, before a caller
+        // discovers the conflict through a refused selection.
+        for (old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
+            let old_owners: Vec<_> = catalog
+                .modules
+                .iter()
+                .filter(|(_, names)| names.contains_key(*old))
+                .map(|(module, _)| module.as_str())
+                .collect();
+            let new_owners: Vec<_> = catalog
+                .modules
+                .iter()
+                .filter(|(_, names)| names.contains_key(*new))
+                .map(|(module, _)| module.as_str())
+                .collect();
+            for old_owner in &old_owners {
+                for new_owner in &new_owners {
+                    if old_owner != new_owner {
+                        catalog.issues.push(format!(
+                            "consumer alias ownership conflict: {old:?} declared by {old_owner:?} and {new:?} declared by {new_owner:?}"
+                        ));
+                    }
+                }
+            }
+        }
         catalog.issues.sort();
         catalog.issues.dedup();
         catalog
