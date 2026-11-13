@@ -44,6 +44,11 @@ pub(crate) fn cache() -> &'static ProfileCache {
     CACHE.get_or_init(ProfileCache::default)
 }
 
+#[cfg(test)]
+pub(crate) fn publish_snapshot_for_test(snapshot: ProfileSnapshot) {
+    cache().publish(snapshot);
+}
+
 impl ProfileSnapshot {
     /// A partial map must not mix profile pricing and cold-start pricing in one select.
     pub(crate) fn lookup(

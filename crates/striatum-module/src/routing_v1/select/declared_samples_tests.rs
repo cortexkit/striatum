@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
-use super::super::conformance_tests::{reserved, selection_facts};
+use super::super::conformance_tests::{reserved, selection_facts, Harness};
 use super::super::dispatch_tests::configured;
 use super::super::{consumers, describe, runners};
 
@@ -30,6 +30,8 @@ const STEMS: &[&str] = &[
     "price-unpriced",
     "decision-harness",
     "broca-harness",
+    "caller-runner-unresolved",
+    "consumer-not-owned",
 ];
 
 fn require_production_capabilities() {
@@ -47,9 +49,97 @@ fn require_production_capabilities() {
     }
 }
 
+struct ClearProfileSnapshot;
+
+impl Drop for ClearProfileSnapshot {
+    fn drop(&mut self) {
+        crate::task_profile_refresh::publish_snapshot_for_test(Default::default());
+    }
+}
+
+fn seed_completed_history(harness: &Harness) {
+    use striatum_core::{DecisionInput, DecisionOutcomeUpdate, RouteOutcome, UsageObservation};
+    let observed_at = NOW as i64 - 2 * striatum_core::task_profile::TASK_CLOSE_MS as i64;
+    for index in 0..20 {
+        let id = format!("summary-history-{index}");
+        harness
+            .store()
+            .record_decision_with_task_ref(
+                &DecisionInput {
+                    decision_id: Some(id.clone()),
+                    consumer: Some(fixture::SUMMARY.into()),
+                    target_agent: fixture::SUMMARY.into(),
+                    selected_route_key: Some(SUBSCRIPTION.into()),
+                    selected_provider_id: Some("example-subscription".into()),
+                    selected_model_id: Some("model-c".into()),
+                    requirements_json: json!({"iq":50}).to_string(),
+                    ..Default::default()
+                },
+                None,
+                None,
+                Some(&id),
+            )
+            .unwrap();
+        harness
+            .store()
+            .record_usage_delivery_for_decision(
+                &UsageObservation {
+                    id: id.clone(),
+                    route_key: SUBSCRIPTION.into(),
+                    capacity_key: SUBSCRIPTION.into(),
+                    provider_id: "example-subscription".into(),
+                    input_tokens: Some(1000.0),
+                    cached_read_tokens: Some(0.0),
+                    cache_write_tokens: Some(0.0),
+                    output_tokens: 10_000.0,
+                    reasoning_tokens: Some(0.0),
+                    duration_ms: 1000.0,
+                    workload_class: None,
+                    account_key: None,
+                    observed_at: observed_at as f64,
+                },
+                &id,
+            )
+            .unwrap();
+        harness
+            .store()
+            .set_decision_outcome(
+                &id,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: RouteOutcome::Completed,
+                    last_error: None,
+                    observed_at_ms: observed_at,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+    }
+    let rows = harness.store().closed_task_usage(NOW as i64).unwrap();
+    assert_eq!(rows.len(), 20);
+    let facts = harness.store().get_facts().unwrap();
+    let snapshot = crate::task_profile_refresh::build_snapshot(&rows, &facts);
+    let fact = facts
+        .iter()
+        .find(|fact| fact.provider_id == "example-subscription" && fact.model_id == "model-c")
+        .unwrap();
+    let profiles = snapshot.lookup(fixture::SUMMARY, 50.0, std::slice::from_ref(fact));
+    assert_eq!(profiles[SUBSCRIPTION].task_count, 20);
+    assert_eq!(profiles[SUBSCRIPTION].tokens.fresh_input, 1000.0);
+    assert_eq!(
+        profiles[SUBSCRIPTION].tokens.output_excluding_reasoning,
+        10_000.0
+    );
+    // The frame handler reads the same published cache as the live refresh loop,
+    // not a test-supplied profile callback.
+    crate::task_profile_refresh::publish_snapshot_for_test(snapshot);
+}
+
 async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
     let _clock = crate::InjectedClock::set(NOW);
     let _ids = striatum_store::replay::Inputs::new(NOW as i64).install();
+    crate::task_profile_refresh::publish_snapshot_for_test(Default::default());
+    let _profiles = ClearProfileSnapshot;
     // Each pair starts with independent decisions, account state and replay IDs.
     let (harness, _) = configured().await;
     let mut facts = SelectionFacts::new();
@@ -163,11 +253,21 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
                 "eligible_routes":[{"provider":"example-provider","model":"model-a"}]});
             ("basal", "broca")
         }
-        "magic-context-summary" => {
+        "magic-context-summary" | "caller-runner-unresolved" | "consumer-not-owned" => {
             params = json!({"consumer":"magic-context.summary","requirements":{"tools":"none"},
                 "runners":["broca"],
                 "eligible_routes":[{"provider":"example-provider","model":"model-a"}]});
-            ("magic-context", "broca")
+            if stem == "caller-runner-unresolved" {
+                params["runners"] = json!([]);
+            }
+            (
+                if stem == "consumer-not-owned" {
+                    "unrelated-caller"
+                } else {
+                    "magic-context"
+                },
+                "broca",
+            )
         }
         "price-subscription-5m-1h" | "price-subscription-30m-12h" => {
             params["pin"] = json!(SUBSCRIPTION);
@@ -180,17 +280,43 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
         "price-metered" | "price-unpriced" => (fixture::CONSUMER, fixture::RUNNER_ONE),
         _ => panic!("unknown sample: {stem}"),
     };
+    if stem == "price-subscription-5m-1h" {
+        seed_completed_history(&harness);
+    }
     let route = harness.bind(reserved(caller), None).await;
     let frame = route.request_frame("route.select", &params);
     let request = frame.body.clone();
     let reply = harness.handle(frame).await;
+    let refusal = matches!(stem, "caller-runner-unresolved" | "consumer-not-owned");
     assert_eq!(
         reply.header.ty,
-        FrameType::Response,
+        if refusal {
+            FrameType::Error
+        } else {
+            FrameType::Response
+        },
         "{stem}: {}",
         String::from_utf8_lossy(&reply.body)
     );
     let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    if refusal {
+        let _: cortexkit_role_routing::errors::Refusal =
+            serde_json::from_value(body.clone()).unwrap();
+        if stem == "caller-runner-unresolved" {
+            assert_eq!(body["code"], "no_route", "{body}");
+            assert_eq!(
+                body["detail"]["reason"], "caller_runner_unresolved",
+                "{body}"
+            );
+            assert!(body["detail"].get("reset_at_ms").is_none(), "{body}");
+        } else {
+            assert_eq!(body["code"], "consumer_not_owned", "{body}");
+        }
+        return [
+            (format!("{stem}.request.json"), request),
+            (format!("{stem}.reply.json"), reply.body),
+        ];
+    }
     let answer = &body["result"];
     let mut defaults = DemandDefaults::default();
     if stem == "magic-context-summary" {
@@ -254,6 +380,17 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
             .unwrap();
         let requirements: Value = serde_json::from_str(&decision.requirements_json).unwrap();
         assert_eq!(requirements["iq"].as_f64(), Some(40.0));
+    }
+    if stem == "price-subscription-5m-1h" {
+        // Twenty completed tasks each used 1,000 fresh input and 10,000 output
+        // tokens: (0.004 + 0.2) / 22 USD at the quoted subscription rates.
+        let estimate = answer["price"]["estimated_task_usd"].as_f64().unwrap();
+        assert!((estimate - 0.009272727272727273).abs() < 1e-15, "{body}");
+    } else {
+        assert!(
+            answer["price"].get("estimated_task_usd").is_none(),
+            "{stem}: {body}"
+        );
     }
     // Preserve handler bytes, including member order and generated fields.
     [
