@@ -178,7 +178,7 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         ..Default::default()
     };
     for (class, class_name, by, floor) in [
-        (PanelClass::DesignReview, "design_review", "eq", json!(80)),
+        (PanelClass::DesignReview, "design_review", "eq", json!(70)),
         (PanelClass::Diagnose, "diagnose", "iq", json!(80)),
     ] {
         let policy = ClassPanelPolicy::default_for_class(class);
@@ -194,7 +194,7 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         );
         let stored = serde_json::to_string(&panel.policy.unwrap()).unwrap();
         let readback: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        let expected = json!({
+        let mut expected = json!({
             "selection":"class_policy", "class":class_name, "topK":3, "by":by,
             "funnel": {
                 "catalog": 3, "scored": 3, "operatorAdmitted": 3, "callerAdmitted": 3,
@@ -213,6 +213,18 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
                 {"slot":0,"routeKey":"p/A","variant":"base"}
             ], "siblingCollapses":[]
         });
+        if class == PanelClass::DesignReview {
+            for key in ["adequacyEligible", "distinctFamilies", "initiallyAdmitted"] {
+                expected["funnel"][key] = json!(2);
+            }
+            expected["seats"].as_array_mut().unwrap().push(
+                json!({"slot":1,"routeKey":"p/D","reason":"topK","rank":2}),
+            );
+            expected["seatedVariants"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"slot":1,"routeKey":"p/D","variant":"base"}));
+        }
         assert_eq!(readback, expected);
     }
 }

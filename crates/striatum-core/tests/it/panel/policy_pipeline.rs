@@ -155,9 +155,9 @@ fn builtin_defaults_and_lab_wire_class() {
         (Audit, 2, By::Iq, 1, Some(Extra::Random), Some(80)),
         (Spec, 3, By::Iq, 1, Some(Extra::Random), Some(80)),
         (Diagnose, 3, By::Iq, 0, None, Some(80)),
-        (DesignReview, 3, By::Eq, 0, None, Some(80)),
-        (Evaluate, 2, By::Iq, 1, Some(Extra::Eq), Some(80)),
-        (Explain, 1, By::Cost, 0, None, Some(80)),
+        (DesignReview, 3, By::Eq, 0, None, Some(70)),
+        (Evaluate, 2, By::Iq, 1, Some(Extra::Eq), Some(70)),
+        (Explain, 1, By::Cost, 0, None, Some(70)),
         (Lab, 4, By::Iq, 0, None, None),
     ] {
         assert_eq!(
@@ -202,7 +202,7 @@ fn explain_cost_seat_clears_inclusive_demand_bar() {
         demand_exponent: 0.7,
         ..DEFAULT_ROUTING_CONFIG
     };
-    let bar = demand_bar(top, 80.0, config.demand_exponent);
+    let bar = demand_bar(top, 70.0, config.demand_exponent);
     let mut at = fact("at", bar, Some("at"));
     at.cost_per_m_tok_out = Some(10.0);
     let mut below = fact("below", bar - 0.001, Some("below"));
@@ -228,15 +228,16 @@ fn explain_cost_seat_clears_inclusive_demand_bar() {
 
 #[test]
 fn athena_defaults_gate_iq_before_ordering_by_eq_or_cost() {
+    let bar = demand_bar(2000.0, 70.0, DEFAULT_ROUTING_CONFIG.demand_exponent);
     let mut frontier = fact("frontier", 2000.0, Some("frontier"));
     frontier.scores.eq = 60.0;
     frontier.cost_per_m_tok_out = Some(100.0);
-    let mut qualified = fact("qualified", 1900.0, Some("qualified"));
+    let mut qualified = fact("qualified", bar + 0.001, Some("qualified"));
     qualified.scores.eq = 80.0;
     qualified.cost_per_m_tok_out = Some(10.0);
-    // This route clears floor 50 but not 80. Its EQ and cost would win if
-    // either ranking were allowed to bypass the IQ admission bar.
-    let mut below = fact("below", 1750.0, Some("below"));
+    // Straddle floor 70's IQ bar so neither a higher floor nor an admission
+    // bypass can pass. EQ and cost still order the routes that clear the bar.
+    let mut below = fact("below", bar - 0.001, Some("below"));
     below.scores.eq = 100.0;
     below.cost_per_m_tok_out = Some(0.01);
     for (class, expected) in [

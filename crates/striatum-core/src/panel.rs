@@ -110,9 +110,9 @@ impl ClassPanelPolicy {
             Audit => (2, By::Iq, 1, Some(Extra::Random), Some(80)),
             Spec => (3, By::Iq, 1, Some(Extra::Random), Some(80)),
             Diagnose => (3, By::Iq, 0, None, Some(80)),
-            DesignReview => (3, By::Eq, 0, None, Some(80)),
-            Evaluate => (2, By::Iq, 1, Some(Extra::Eq), Some(80)),
-            Explain => (1, By::Cost, 0, None, Some(80)),
+            DesignReview => (3, By::Eq, 0, None, Some(70)),
+            Evaluate => (2, By::Iq, 1, Some(Extra::Eq), Some(70)),
+            Explain => (1, By::Cost, 0, None, Some(70)),
             Lab => (4, By::Iq, 0, None, None),
         };
         Self {
