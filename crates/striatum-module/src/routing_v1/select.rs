@@ -40,6 +40,8 @@ use crate::{
 };
 
 #[cfg(test)]
+mod consumer_pin_tests;
+#[cfg(test)]
 mod declared_samples_tests;
 mod eligible_routes;
 #[cfg(test)]
@@ -92,6 +94,7 @@ const BILLING_WAIT: Duration = Duration::from_millis(1500);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Basis {
     RequestPin,
+    ConsumerPin,
     ProjectPin,
     Affinity,
     Preferred,
@@ -102,6 +105,7 @@ impl Basis {
     fn as_str(self) -> &'static str {
         match self {
             Basis::RequestPin => "the request's pin",
+            Basis::ConsumerPin => "the consumer's operator pin",
             Basis::ProjectPin => "the project's operator pin",
             Basis::Affinity => "affinity with the previous decision",
             Basis::Preferred => "the request's preference among adequate routes",
@@ -285,6 +289,7 @@ async fn select_with_profile_lookup_kind(
     let request = parse_admitted_request(params, caller, &consumers, false)?;
     let (settings_layers, project_settings) =
         selection_settings(params, &request, caller, deps).await?;
+    let mut effective_request = request.clone();
     let mut result = async {
         let owned;
         let shared = match shared {
@@ -295,6 +300,7 @@ async fn select_with_profile_lookup_kind(
             }
         };
         let mut inputs = prepare_selection(params, caller, deps, shared, None).await?;
+        effective_request = inputs.request.clone();
         select_with_tier_fallback(
             params,
             caller,
@@ -317,8 +323,8 @@ async fn select_with_profile_lookup_kind(
         }
     }
     if let Err(refusal) = &result {
-        if (request.pin.is_some() || request.pin_slot.is_some())
-            && request.pin_fallback != Some(PinFallback::Route)
+        if (effective_request.pin.is_some() || effective_request.pin_slot.is_some())
+            && effective_request.pin_fallback != Some(PinFallback::Route)
             && (matches!(
                 refusal.code,
                 RefusalCode::NoRoute
@@ -329,7 +335,7 @@ async fn select_with_profile_lookup_kind(
         {
             // Record the final refusal, not unsuccessful probes of higher tiers.
             // Hard pins bypass scoring, which normally writes the refusal decision.
-            record_pinned_refusal(&request, refusal, caller, deps);
+            record_pinned_refusal(&effective_request, refusal, caller, deps);
         }
     }
     result
@@ -703,6 +709,7 @@ fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stag
 /// Every tier attempt clones it before applying tier or sticky-account filters.
 struct SelectionInputs {
     request: SelectRequest,
+    consumer_pinned: bool,
     now: f64,
     facts: Vec<ModelFact>,
     snapshot: ModelRouteStateSnapshot,
@@ -783,7 +790,7 @@ async fn prepare_selection(
         return Err(refusal);
     }
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
-    let request =
+    let mut request =
         parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
     if request.eligible_routes.as_ref().is_some_and(Vec::is_empty) {
         return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
@@ -820,6 +827,20 @@ async fn prepare_selection(
         },
         &consumers.policies,
     );
+    // An operator's consumer pin is a hard selection, not a one-route ladder:
+    // it bypasses automatic pin-only fences but still uses all pin admission
+    // and account checks. Never let a caller's fallback preference replace it.
+    let consumer_pinned = request.pin.is_none()
+        && request.pin_slot.is_none()
+        && consumer_policy.pin.is_some();
+    if consumer_pinned {
+        let pin = consumer_policy.pin.as_ref().unwrap();
+        request.pin = Some(pin.variant.as_ref().map_or_else(
+            || pin.model.clone(),
+            |variant| format!("{}:{variant}", pin.model),
+        ));
+        request.pin_fallback = None;
+    }
     let priced_per_token = select_policy::priced_per_token(&consumer_policy, legacy_consumer);
     let crate::PreparedSelectionInputs {
         catalog_snapshot,
@@ -993,6 +1014,7 @@ async fn prepare_selection(
     count_input_build(&shared.operator_config, 1);
     Ok(SelectionInputs {
         request,
+        consumer_pinned,
         now,
         facts,
         snapshot,
@@ -1616,7 +1638,8 @@ async fn select_at_tier_attempt(
             })
         })
         .map(|previous| format!("{}/{}", previous.provider, previous.model));
-    // Request pin, then project pin, then the continuing model, then the mode.
+    // Request (or consumer settings) pin, then project pin, then the continuing
+    // model, then the mode.
     // A pin does not fall through unless the request asks for it with
     // `pin_fallback: "route"`: then a pin that cannot be served is dropped
     // before the order runs, and the order runs as for an unpinned request.
@@ -1717,15 +1740,18 @@ async fn select_at_tier_attempt(
             },
         )
     });
-    // `pin_outcome` is answered exactly when the request pinned: `fell_back`
-    // when its pin was dropped above, `pinned` when the pin was served.
-    let pin_outcome = request.pin.as_ref().or(request.pin_slot.as_ref()).map(|_| {
-        if pin_reason.is_some() {
-            PinOutcome::FellBack
-        } else {
-            PinOutcome::Pinned
-        }
-    });
+    // The contract reserves pin_outcome for a pin carried by the request,
+    // not a settings pin promoted internally for admission.
+    let pin_outcome = (!inputs.consumer_pinned)
+        .then(|| request.pin.as_ref().or(request.pin_slot.as_ref()))
+        .flatten()
+        .map(|_| {
+            if pin_reason.is_some() {
+                PinOutcome::FellBack
+            } else {
+                PinOutcome::Pinned
+            }
+        });
     // `prefer` ranks within the automatic order only: a pin, the continuing
     // model and an operator ladder each decide before it. A listed route is
     // answered only when it alone would be an adequate answer to this same
@@ -1756,6 +1782,7 @@ async fn select_at_tier_attempt(
                 select_policy::OrderBasis::Continuing | select_policy::OrderBasis::Mode => None,
             };
             let basis = match order {
+                select_policy::OrderBasis::RequestPin if inputs.consumer_pinned => Basis::ConsumerPin,
                 select_policy::OrderBasis::RequestPin => Basis::RequestPin,
                 select_policy::OrderBasis::ProjectPin => Basis::ProjectPin,
                 select_policy::OrderBasis::Continuing => Basis::Affinity,
@@ -2110,7 +2137,9 @@ async fn select_at_tier_attempt(
             )
             .map_err(|refusal| {
                 let pin = match basis {
-                    Basis::RequestPin => request.pin_slot.as_deref().or(request_pin.as_deref()),
+                    Basis::RequestPin | Basis::ConsumerPin => {
+                        request.pin_slot.as_deref().or(request_pin.as_deref())
+                    }
                     Basis::ProjectPin => project_pin.as_deref(),
                     _ => None,
                 };
@@ -2516,6 +2545,17 @@ impl<'a> Selection<'a> {
     fn pin(&self, pin: &str, available: &HashSet<String>) -> Result<SelectedModelRoute, Refusal> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
+        if self.facts.iter().any(|fact| {
+            fact.decommissioned
+                && fact.provider_id == parsed.provider
+                && fact.model_id == parsed.model
+        }) {
+            return Err(Refusal::pin_unavailable(
+                pin,
+                PinUnavailableReason::parse("decommissioned"),
+                None,
+            ));
+        }
         if self.exclude.contains(&parsed.route_key())
             || self.exclude.contains(&parsed.provider)
             || !self
@@ -2922,6 +2962,7 @@ fn pin_reason(
     };
     match code {
         "invalid_model_pin" => (PinUnavailableReason::Invalid, None),
+        "decommissioned" => (PinUnavailableReason::parse("decommissioned"), None),
         "unknown_model_provider" => (PinUnavailableReason::UnknownProvider, None),
         "unknown_model" => (PinUnavailableReason::UnknownModel, None),
         "invalid_model_variant" => (PinUnavailableReason::InvalidVariant, None),

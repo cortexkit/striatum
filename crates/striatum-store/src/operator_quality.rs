@@ -55,8 +55,13 @@ pub(super) fn overlay_operator_quality(
     canonical_ids: &[Option<String>],
 ) -> rusqlite::Result<()> {
     let grades = fingerprint_rows(c)?;
+    let decommissioned = decommissioned_rows(c)?;
     for (fact, canonical_id) in facts.iter_mut().zip(canonical_ids) {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        fact.decommissioned = decommissioned.contains_key(&key)
+            || canonical_id
+                .as_ref()
+                .is_some_and(|id| decommissioned.values().any(|model| model == id));
         let grade = grades.get(&key).or_else(|| {
             canonical_id.as_ref().and_then(|id| grades.values().find(|grade| &grade.model == id))
         });
@@ -78,6 +83,21 @@ pub(super) fn overlay_operator_quality(
     Ok(())
 }
 
+pub(super) fn decommissioned_rows(c: &Connection) -> rusqlite::Result<BTreeMap<String, String>> {
+    let exists: bool = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'routing_operator_decommissioned')",
+        [], |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(BTreeMap::new());
+    }
+    let mut stmt = c.prepare(
+        "SELECT route_key, model FROM routing_operator_decommissioned ORDER BY route_key",
+    )?;
+    let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+    rows.collect()
+}
+
 impl SqliteRouteStateStore {
     /// Keep catalog grades separate from curated scores so withdrawing a grade
     /// restores the stored score rather than persisting the catalog overlay.
@@ -85,6 +105,17 @@ impl SqliteRouteStateStore {
         &self,
         active: bool,
         grades: &BTreeMap<String, OperatorQuality>,
+    ) -> RouteStateResult<()> {
+        self.replace_operator_quality_snapshot(active, grades, &BTreeMap::new())
+    }
+
+    /// Replace both current-state quality facts atomically. A flag-only row must
+    /// not manufacture a grade, and a later poll can withdraw either fact.
+    pub fn replace_operator_quality_snapshot(
+        &self,
+        active: bool,
+        grades: &BTreeMap<String, OperatorQuality>,
+        decommissioned: &BTreeMap<String, String>,
     ) -> RouteStateResult<()> {
         self.store
             .with_conn(|c: &Connection| {
@@ -94,6 +125,13 @@ impl SqliteRouteStateStore {
                     tx.execute(
                         "INSERT INTO routing_operator_quality VALUES (?1, ?2, ?3, ?4)",
                         params![route, grade.model, grade.elo, grade.eq],
+                    )?;
+                }
+                tx.execute("DELETE FROM routing_operator_decommissioned", [])?;
+                for (route, model) in decommissioned {
+                    tx.execute(
+                        "INSERT INTO routing_operator_decommissioned VALUES (?1, ?2)",
+                        params![route, model],
                     )?;
                 }
                 tx.execute(
@@ -191,6 +229,41 @@ pub(super) fn observe_decision(c: &Connection, score: &str, now_ms: i64) -> rusq
 mod tests {
     use super::*;
     use striatum_core::{FactSource, RouteStateStore};
+
+    #[test]
+    fn decommissioned_migration_cache_snapshot_restart_and_atomic_replacement() {
+        let dir = cortexkit_test_support::scratch_root().join(format!("decommissioned-store-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let descriptor = crate::dev_descriptor("decommissioned-store", dir.join("route.db").to_string_lossy().into_owned());
+        drop(SqliteRouteStateStore::open_at_version_for_test(&descriptor, 85).unwrap());
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let fact:ModelFact = serde_json::from_value(json!({
+            "providerID":"vendor", "modelID":"retired", "confidence":"curated",
+            "scores":{"elo":1000,"eq":1100,"speed":0}
+        })).unwrap();
+        store.upsert_fact(&fact,FactSource::Override).unwrap();
+        let read = |store:&SqliteRouteStateStore|store.get_facts().unwrap().into_iter().find(|f|f.provider_id=="vendor" && f.model_id=="retired").unwrap();
+        assert!(!read(&store).decommissioned);
+        let before = store.catalog_fingerprint().unwrap();
+        let flags = BTreeMap::from([("vendor/retired".into(),"vendor/retired".into())]);
+        store.replace_operator_quality_snapshot(false,&BTreeMap::new(),&flags).unwrap();
+        assert!(read(&store).decommissioned);
+        assert_eq!(read(&store).score_provenance,ScoreProvenance::Override);
+        assert_ne!(store.catalog_fingerprint().unwrap(),before);
+        assert!(read(&store.account_evaluation_snapshot(123).unwrap()).decommissioned);
+        assert!(!store.get_fact_by_route_key("vendor/retired").unwrap().unwrap().decommissioned);
+        store.store.with_conn(|c|c.execute_batch("CREATE TEMP TRIGGER reject_withdrawal BEFORE INSERT ON routing_operator_decommissioned BEGIN SELECT RAISE(ABORT, 'rejected'); END;")).unwrap();
+        let grades = BTreeMap::from([("vendor/retired".into(),OperatorQuality {model:"vendor/retired".into(),elo:1900.0,eq:1900.0})]);
+        assert!(store.replace_operator_quality_snapshot(true,&grades,&flags).is_err());
+        assert!(store.operator_quality().unwrap().is_empty(),"grade replacement must roll back with withdrawals");
+        assert!(read(&store).decommissioned);
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        assert!(read(&store).decommissioned);
+        store.replace_operator_quality_snapshot(false,&BTreeMap::new(),&BTreeMap::new()).unwrap();
+        assert!(!read(&store).decommissioned);
+        assert_eq!(store.catalog_fingerprint().unwrap(),before);
+    }
     use serde_json::json;
 
     #[test]

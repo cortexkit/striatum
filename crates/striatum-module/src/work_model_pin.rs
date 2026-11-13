@@ -193,6 +193,9 @@ pub(crate) fn select_with_availability(
         .unwrap_or(&facts[0])
         .clone();
     let route = fact_to_route(&fact);
+    if fact.decommissioned {
+        return Err(refuse("decommissioned", format!("{pin}: model is decommissioned")));
+    }
     if let Some(reason) = availability_rejections.get(&route.route_key)
         .or_else(|| availability_rejections.get(&route.capacity_key))
         .filter(|reason| reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:"))

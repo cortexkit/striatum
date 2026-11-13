@@ -110,6 +110,18 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
                 .map(|(index, engine)| EngineCandidate::caller_local(index, engine)),
         );
     }
+    // Withdrawal applies to media and caller-local engines before ranking.
+    // Resolved facts also carry it when a credential uses a different provider
+    // name from the catalog's provider name.
+    candidates.retain(|candidate| {
+        let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+        !catalog.as_ref().is_some_and(|catalog| catalog.is_decommissioned(&key))
+            && !inputs.facts.iter().any(|fact| {
+                fact.decommissioned
+                    && fact.provider_id == candidate.engine.provider
+                    && fact.model_id == candidate.engine.model
+            })
+    });
     let mut accounts = crate::account_selection::ClassContext::read_with_catalog(
         deps.store,
         deps.broca_credentials,

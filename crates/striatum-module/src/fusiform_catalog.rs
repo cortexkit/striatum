@@ -14,7 +14,7 @@
 //!
 //! Wire decoding is isolated here and pinned to the producer-real fixture copied
 //! from `fusiform/crates/fusiform-module/fixtures/served-payloads.json` at Fusiform
-//! commit `7d604d1`; no other module should depend on these private wire structs.
+//! commit `9591c73`; no other module should depend on these private wire structs.
 //! `catalog-paged.json` pins the paged request and response from the same producer
 //! fixture at Fusiform `245826d`.
 
@@ -133,6 +133,8 @@ struct CatalogGetReply {
     #[serde(default)]
     curated: Vec<CatalogCuratedModel>,
     #[serde(default)]
+    login_methods: Vec<CatalogCuratedModel>,
+    #[serde(default)]
     quality_scores: Option<QualityScores>,
 }
 
@@ -159,6 +161,8 @@ struct CatalogPage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     curated: Vec<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    login_methods: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     aliased: Vec<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality_scores: Option<QualityScores>,
@@ -180,6 +184,7 @@ impl CatalogPage {
         self.withheld.append(&mut page.withheld);
         self.uncertain.append(&mut page.uncertain);
         self.curated.append(&mut page.curated);
+        self.login_methods.append(&mut page.login_methods);
         self.aliased.append(&mut page.aliased);
         self.next_page_token = page.next_page_token;
         Ok(())
@@ -315,6 +320,7 @@ pub(crate) struct CatalogSnapshot {
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, striatum_store::OperatorQuality>,
+    decommissioned: BTreeMap<String, String>,
     /// `(provider_id, model_id)` of entries served under a well-formed
     /// `provider/model` key whose facts could not be decoded. Applying the
     /// snapshot leaves their stored rows and cached base rates as they were:
@@ -323,6 +329,9 @@ pub(crate) struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn is_decommissioned(&self, route: &str) -> bool {
+        self.decommissioned.contains_key(route)
+    }
     pub(crate) fn engine_cost(
         &self,
         request: &cortexkit_role_routing::select_engine::SelectEngineRequest,
@@ -967,13 +976,14 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
     let mut auth_methods = BTreeMap::new();
-    for row in reply.curated {
+    let documented: BTreeSet<_> = reply.login_methods.iter().map(|row| row.model.clone()).collect();
+    for row in reply.curated.into_iter().chain(reply.login_methods) {
         let mut methods = row.auth_methods;
         methods.sort();
         methods.dedup();
         if auth_methods.insert(row.model.clone(), methods).is_some() {
             return Err(error(format!(
-                "duplicate Fusiform curated model: {}",
+                "duplicate Fusiform auth-method model: {}",
                 row.model
             )));
         }
@@ -986,9 +996,21 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut model_kinds = BTreeMap::new();
     let mut audio_input_prices = BTreeMap::new();
     let mut grades = BTreeMap::new();
+    let mut decommissioned = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for (served_key, entry) in reply.models {
+        // The operator's withdrawal is independent of whether this model has
+        // been graded. The canonical model ID makes the withdrawal apply to
+        // reseller routes for the same model too.
+        if entry.get("quality.decommissioned").and_then(Value::as_bool) == Some(true) {
+            let model = entry
+                .get("model.canonical_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or(&served_key);
+            decommissioned.insert(served_key.clone(), model.to_owned());
+        }
         if reply
             .quality_scores
             .as_ref()
@@ -1027,7 +1049,8 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             &entry,
             entry_auth_methods,
         ) {
-            Ok((fact, model_rates)) => {
+            Ok((mut fact, model_rates)) => {
+                fact.login_methods_documented = documented.contains(&served_key);
                 audio_input_prices.insert(
                     served_key.clone(),
                     AudioInputPrice::decode(&served_key, &entry),
@@ -1065,6 +1088,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         audio_input_prices,
         quality_scores: reply.quality_scores,
         grades,
+        decommissioned,
     })
 }
 
@@ -1106,6 +1130,7 @@ fn decode_model_entry(
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         auth_methods,
+        login_methods_documented: false,
         present,
         context_window: model.context.map(|value| value as f64),
         max_output_tokens: model.output,
@@ -1682,6 +1707,7 @@ pub(crate) fn apply_mapped_catalog(
     )
     .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     let mut grades = snapshot.grades.clone();
+    let mut decommissioned = snapshot.decommissioned.clone();
     // Cache grades for provider aliases resolved from credential metadata,
     // using the same catalog targets as pricing for coverage and shadow notices.
     if let Some(credentials) = credentials {
@@ -1699,15 +1725,21 @@ pub(crate) fn apply_mapped_catalog(
             if let Some(grade) = snapshot.grades.get(&catalog_key) {
                 grades.entry(route).or_insert_with(|| grade.clone());
             }
+            if let Some(model) = snapshot.decommissioned.get(&catalog_key) {
+                decommissioned
+                    .entry(format!("{}/{}", fact.provider_id, fact.model_id))
+                    .or_insert_with(|| model.clone());
+            }
         }
     }
     store
-        .replace_operator_quality(
+        .replace_operator_quality_snapshot(
             snapshot
                 .quality_scores
                 .as_ref()
                 .is_some_and(|scores| scores.graded_by == "operator"),
             &grades,
+            &decommissioned,
         )
         .map_err(|reason| error(format!("apply operator quality: {reason}")))?;
     if let Some(credentials) = credentials {
@@ -1978,6 +2010,7 @@ pub async fn catalog_refresh_loop(
 
 #[cfg(test)]
 mod tests {
+    include!("fusiform_catalog_login_methods_tests.rs");
     include!("operator_quality_tests.rs");
     include!("fusiform_catalog_paging_tests.rs");
     include!("billing_readiness_tests.rs");
@@ -2473,7 +2506,7 @@ mod tests {
     }
 
     #[test]
-    fn all_eighteen_pinned_plane_cases_and_refusals_decode() {
+    fn all_pinned_plane_cases_and_refusals_decode() {
         let fixture = fixture();
         let mut served = 0;
         let mut refused = 0;
@@ -2507,10 +2540,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!((served, refused), (13, 5));
+        assert_eq!((served, refused), (25, 5));
         let pin: Value =
             serde_json::from_str(include_str!("../fixtures/served-payloads.pin.json")).unwrap();
-        assert_eq!(pin["commit"], "7d604d1623b9085b3f3277c889d417d2ccb6f5e0");
+        assert_eq!(pin["commit"], "9591c735106d7d31f6ba917be96b00810be81af0");
         assert_eq!(
             pin["sha256"],
             format!(
@@ -3310,7 +3343,7 @@ mod tests {
         );
         assert_eq!(
             digest,
-            "f9555ed07197b60119627a391d75ffa59a3f9f5647df28251220fbe19faee1fc"
+            "afeac184c2481f67afe3c7dee03b5a96c069cfa86ffd7fb037f9674c5de4aa46"
         );
         let snapshot = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         assert_eq!(snapshot.cursor.catalog_version, 0);
@@ -3323,7 +3356,7 @@ mod tests {
         );
         assert_eq!(fact.supports_vision, Some(true));
         assert_eq!(fact.supports_tool_use, Some(true));
-        assert_eq!(fact.context_window, Some(200_000.0));
+        assert_eq!(fact.context_window, Some(1_000_000.0));
         assert_eq!(fact.max_output_tokens, Some(64_000));
         assert_eq!(fact.cost_per_mtok_out, Some(15.0));
         assert_eq!(fact.input_rate, Some(3.0));

@@ -322,7 +322,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 84] {
+fn route_state_migrations() -> [Migration; 86] {
     [
         Migration {
             version: 1,
@@ -660,6 +660,14 @@ fn route_state_migrations() -> [Migration; 84] {
             version: 85,
             statements: include_str!("../migrations/085_observation_principal_event.sql"),
         },
+        Migration {
+            version: 86,
+            statements: include_str!("../migrations/086_operator_decommissioned.sql"),
+        },
+        Migration {
+            version: 87,
+            statements: include_str!("../migrations/087_login_methods_coverage.sql"),
+        },
     ]
 }
 
@@ -801,6 +809,7 @@ pub struct FusiformFactUpdate {
     pub provider_id: String,
     pub model_id: String,
     pub auth_methods: Option<Vec<String>>,
+    pub login_methods_documented: bool,
     pub present: bool,
     pub context_window: Option<f64>,
     pub max_output_tokens: Option<u64>,
@@ -856,6 +865,8 @@ struct CatalogFingerprintRow {
     excluded: bool,
     fusiform_present: Option<bool>,
     auth_methods_json: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    login_methods_documented: bool,
     reasoning_efforts_json: Option<String>,
     canonical_id: Option<String>,
     upstream_status: Option<String>,
@@ -890,7 +901,8 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
                 input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                 supports_vision, supports_tool_use, prompt_defaults_json, confidence,
                 speed_multiplier, excluded, fusiform_present, auth_methods_json,
-                reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind
+                reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind,
+                login_methods_documented
          FROM model_facts
          ORDER BY route_key",
     )?;
@@ -922,6 +934,7 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
             excluded: row.get::<_, i64>(20)? != 0,
             fusiform_present: row.get::<_, Option<i64>>(21)?.map(|value| value != 0),
             auth_methods_json: row.get(22)?,
+            login_methods_documented: row.get(28)?,
             reasoning_efforts_json: row.get(23)?,
             canonical_id: row.get(24)?,
             upstream_status: row.get(25)?,
@@ -931,8 +944,16 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let grades = operator_quality::fingerprint_rows(connection)?;
-    let bytes = serde_json::to_vec(&(rows, grades))
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let decommissioned = operator_quality::decommissioned_rows(connection)?;
+    // Creating an empty withdrawal table changes no routing facts, so keep the
+    // catalog fingerprint unchanged. Nonempty withdrawals affect routing and
+    // must participate in the hash.
+    let bytes = if decommissioned.is_empty() {
+        serde_json::to_vec(&(rows, grades))
+    } else {
+        serde_json::to_vec(&(rows, grades, decommissioned))
+    }
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
     Ok(hex[..16].to_string())
 }
@@ -992,6 +1013,23 @@ fn install_catalog_change_tracking(connection: &Connection) -> rusqlite::Result<
              BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
              CREATE TEMP TRIGGER IF NOT EXISTS catalog_quality_writes_on_delete
              AFTER DELETE ON routing_operator_quality
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;",
+        )?;
+    }
+    let has_decommissioned: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'routing_operator_decommissioned')",
+        [], |row| row.get(0),
+    )?;
+    if has_decommissioned {
+        connection.execute_batch(
+            "CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_insert
+             AFTER INSERT ON routing_operator_decommissioned
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_update
+             AFTER UPDATE ON routing_operator_decommissioned
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_delete
+             AFTER DELETE ON routing_operator_decommissioned
              BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;",
         )?;
     }
@@ -3060,9 +3098,11 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     Ok(ModelFact {
         billing_plane: None,
         auth_methods,
+        login_methods_documented: row.get("login_methods_documented")?,
         // Read-time provenance, never stored: a fact loaded from the row has whatever
         // speed the row holds, and the median stand-in is applied above this.
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: row.get("provider_id")?,
         model_id: row.get("model_id")?,
         variant: row.get::<_, Option<String>>("variant")?,
@@ -6543,7 +6583,7 @@ mod tests {
         store
             .apply_fusiform_catalog(
                 &[FusiformFactUpdate {
-                    auth_methods: None,
+                    auth_methods: None, login_methods_documented: false,
                     provider_id: fact.provider_id.clone(),
                     model_id: "fingerprint-cache-probe".to_string(),
                     present: true,
@@ -7003,7 +7043,8 @@ impl crate::AccountTx<'_> {
                                max_output_tokens_source, cost_tier_source,
                                cost_per_mtok_out_source, supports_vision_source,
                                supports_tool_use_source, auth_methods_json,
-                               reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind
+                               reasoning_efforts_json, canonical_id, upstream_status, model_type, model_kind,
+                               login_methods_documented
                              ) VALUES (
                                ?1, ?1, ?2, ?3, NULL, NULL, ?4, ?5, ?6, ?7,
                                ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, 'unknown',
@@ -7011,7 +7052,7 @@ impl crate::AccountTx<'_> {
                                NULL, 0, 'unscored', ?15, NULL, NULL, NULL,
                                'fusiform', ?16, ?17,
                                'fusiform', 'fusiform', 'fusiform', 'fusiform',
-                               'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23
+                                'fusiform', 'fusiform', ?18, ?19, ?20, ?21, ?22, ?23, ?24
                              )",
                             params![
                                 route_key,
@@ -7037,6 +7078,7 @@ impl crate::AccountTx<'_> {
                                 fact.upstream_status,
                                 fact.model_type,
                                 fact.model_kind,
+                                fact.login_methods_documented,
                             ],
                         )?;
                         stored_models
@@ -7086,7 +7128,7 @@ impl crate::AccountTx<'_> {
                                fusiform_present = ?12, updated_at = ?13,
                                auth_methods_json = ?16, reasoning_efforts_json = ?17,
                                canonical_id = ?18, upstream_status = ?19,
-                               model_type = ?20, model_kind = ?21
+                               model_type = ?20, model_kind = ?21, login_methods_documented = ?22
                              WHERE provider_id = ?14 AND model_id = ?15",
                             params![
                                 fact.context_window,
@@ -7110,6 +7152,7 @@ impl crate::AccountTx<'_> {
                                 fact.upstream_status,
                                 fact.model_type,
                                 fact.model_kind,
+                                fact.login_methods_documented,
                             ],
                         )?;
                     }
@@ -7339,11 +7382,13 @@ impl crate::AccountTx<'_> {
                        scores_json, context_window, max_output_tokens, cost_tier, cost_per_mtok_out,
                          input_rate, cache_read_rate, cache_write_rate, reasoning_rate,
                          supports_vision, supports_tool_use, prompt_defaults_json, confidence, notes, speed_multiplier,
-                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json,
+                          source, updated_at, aa_index, review_by_ms, eq_source, auth_methods_json, login_methods_documented,
                           canonical_id, upstream_status, model_type, model_kind
                          ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,
                            (SELECT auth_methods_json FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
+                           COALESCE((SELECT login_methods_documented FROM model_facts
+                            WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1), 0),
                            (SELECT canonical_id FROM model_facts
                             WHERE provider_id = ?3 AND model_id = ?4 ORDER BY route_key LIMIT 1),
                             (SELECT upstream_status FROM model_facts

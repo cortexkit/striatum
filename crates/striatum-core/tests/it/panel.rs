@@ -18,8 +18,9 @@ mod shortfall_diagnostics;
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: "p".into(),
         model_id: model.into(),
         variant: None,

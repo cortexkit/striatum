@@ -171,7 +171,7 @@ pub(crate) fn choices_for_harness(
         );
     };
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
-    let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+    let providers = facts.iter().collect();
     let subscription_specs = &config.compiled_routing_policy().subscription;
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
     for fact in &facts {
@@ -186,6 +186,7 @@ pub(crate) fn choices_for_harness(
         rows.sort_by(|a, b| a.variant.cmp(&b.variant));
         let fact = rows[0];
         if striatum_core::model_facts::llm_classification_rejection(fact, false).is_some()
+            || fact.decommissioned
             || fact.is_deprecated_upstream()
             || fact.score_provenance == striatum_core::ScoreProvenance::Unscored
             || fact.supports_tool_use != Some(true)

@@ -317,10 +317,17 @@ pub struct ModelFact {
     pub provider_id: String,
     #[serde(rename = "modelID")]
     pub model_id: String,
-    /// Fusiform's allowed login methods. Absence is unrestricted; an empty list
-    /// permits no credential. The operator's provider mapping is still required.
+    /// Fusiform's allowed login methods. An empty list permits no credential.
+    /// Curated rows restrict only themselves. Documented `login_methods` rows
+    /// also limit their provider's sign-ins to models carrying that disclosure.
+    /// Vault credential metadata must still map the credential
+    /// to this catalog provider through `provider_ids` or an unambiguous `serves`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_methods: Option<Vec<String>>,
+    /// Whether `auth_methods` came from Fusiform's documented `login_methods`
+    /// coverage, rather than a curated row's local credential restriction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login_methods_documented: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// Fusiform's `model.lineage`, verbatim; absence belongs to `other`.
@@ -368,6 +375,10 @@ pub struct ModelFact {
     /// placeholder would look like a measurement on the next read.
     #[serde(skip)]
     pub speed_is_fleet_median: bool,
+    /// Current operator withdrawal, overlaid from the catalog rather than
+    /// persisted in a model row so a later poll can restore the route.
+    #[serde(skip)]
+    pub decommissioned: bool,
     /// Subscription subsidy multiplier applied at read time (see
     /// [`RoutePricing::subscription_multiplier`]). Divides `cost_per_m_tok_out` to yield the
     /// effective price. `None` (or a non-positive/non-finite value) means "no

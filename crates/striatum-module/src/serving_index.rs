@@ -2,9 +2,9 @@
 //! Billing planes, requested runner wire/auth pairs and provider limits, listing
 //! age and probe ownership stay dynamic.
 
-use crate::{broca_credentials::BrocaCredentials, config_overrides::LiveConfig};
+use crate::{broca_credentials::{AuthCatalog, BrocaCredentials}, config_overrides::LiveConfig};
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},
 };
 use striatum_core::ModelFact;
@@ -15,6 +15,7 @@ struct FactKey {
     provider: String,
     model: String,
     methods: Option<Vec<String>>,
+    login_methods_documented: bool,
 }
 
 #[cfg(test)]
@@ -66,6 +67,7 @@ impl From<&ModelFact> for FactKey {
             provider: fact.provider_id.clone(),
             model: fact.model_id.clone(),
             methods: fact.auth_methods.clone(),
+            login_methods_documented: fact.login_methods_documented,
         }
     }
 }
@@ -87,8 +89,8 @@ pub(crate) struct ServingIndex {
     config: Arc<LiveConfig>,
     generation: CatalogFingerprintKey,
     credentials: u64,
-    selection_catalog: BTreeSet<String>,
-    runner_catalog: BTreeSet<String>,
+    selection_catalog: AuthCatalog,
+    runner_catalog: AuthCatalog,
     facts: BTreeMap<FactKey, Arc<FactServing>>,
 }
 
@@ -125,7 +127,9 @@ impl ServingIndex {
         after_facts();
         let targets = credentials.catalog_targets(&facts);
         striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
-        let runner_catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let runner_catalog: AuthCatalog = facts.iter().collect();
+        let mut selection_catalog = runner_catalog.clone();
+        selection_catalog.providers = snapshot.providers.clone();
         let entries = facts
             .iter()
             .map(|fact| {
@@ -135,7 +139,7 @@ impl ServingIndex {
                         config,
                         credentials,
                         fact,
-                        &snapshot.providers,
+                        &selection_catalog,
                         &runner_catalog,
                         &targets,
                     )),
@@ -149,7 +153,7 @@ impl ServingIndex {
             generation: snapshot.generation,
             credentials: credential_generation,
             facts: entries,
-            selection_catalog: snapshot.providers.clone(),
+            selection_catalog,
             runner_catalog,
         });
         cache.push_front(Arc::clone(&index));
@@ -162,8 +166,8 @@ impl ServingIndex {
         config: &LiveConfig,
         credentials: &BrocaCredentials,
         fact: &ModelFact,
-        selection_catalog: &BTreeSet<String>,
-        runner_catalog: &BTreeSet<String>,
+        selection_catalog: &AuthCatalog,
+        runner_catalog: &AuthCatalog,
         targets: &BTreeMap<String, String>,
     ) -> FactServing {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
@@ -207,7 +211,7 @@ impl ServingIndex {
         config: &Arc<LiveConfig>,
         credentials: &BrocaCredentials,
         fact: &ModelFact,
-        catalog: &BTreeSet<String>,
+        catalog: &AuthCatalog,
         targets: &BTreeMap<String, String>,
     ) -> Arc<FactServing> {
         if Arc::ptr_eq(&self.config, config)
@@ -234,7 +238,7 @@ impl ServingIndex {
         config: &LiveConfig,
         credentials: &BrocaCredentials,
         fact: &ModelFact,
-        catalog: &BTreeSet<String>,
+        catalog: &AuthCatalog,
     ) -> Arc<FactServing> {
         let generation = credentials.serving_generation();
         if let Some(entry) = cache().lock().unwrap().iter().find_map(|index| {

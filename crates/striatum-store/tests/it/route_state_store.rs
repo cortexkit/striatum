@@ -61,8 +61,9 @@ impl Drop for Rig {
 fn fact(provider: &str, model: &str) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: provider.into(),
         model_id: model.into(),
         variant: None,
@@ -3064,7 +3065,7 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
     assert_eq!(initial.supports_vision, Some(true));
 
     let update = |vision| FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: "anthropic".to_string(),
         model_id: "claude-opus-4-5".to_string(),
         present: true,
@@ -3172,7 +3173,7 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
     let rig = Rig::new("fusiform-pair-key");
     let store = rig.open();
     let fact = |provider: &str| FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: "shared-spelling".to_string(),
         present: true,
@@ -3221,7 +3222,7 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
     let rig = Rig::new("fusiform-provider-scope");
     let store = rig.open();
     let fact = |provider: &str, model: &str| FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: true,
@@ -3280,7 +3281,7 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
     let store = rig.open();
     let route_key = make_route_key("anthropic", "claude-opus-4-5", None);
     let withdrawn = |provider: &str, model: &str| FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: false,
@@ -3360,7 +3361,7 @@ fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
     let rig = Rig::new("fusiform-batch-repeat");
     let store = rig.open();
     let entry = |provider: &str, model: &str, context_window: f64| FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: true,
@@ -4280,7 +4281,7 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         .unwrap();
 
     let served = FusiformFactUpdate {
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         provider_id: "test".into(),
         model_id: "catalog-served".into(),
         present: true,
@@ -4491,7 +4492,7 @@ fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
     store
         .apply_fusiform_catalog(
             &[FusiformFactUpdate {
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 provider_id: "p".into(),
                 model_id: "discovered".into(),
                 present: true,
@@ -4541,7 +4542,7 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
         provider_id: initial.provider_id.clone(),
         model_id: initial.model_id.clone(),
         present: true,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         context_window: initial.context_window,
         max_output_tokens: initial.max_output_tokens,
         cost_tier: initial.cost_tier,
