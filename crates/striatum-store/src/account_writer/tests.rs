@@ -347,7 +347,7 @@ fn crash_before_commit_retries_fresh_and_after_commit_replays_without_second_cla
         let (scratch, store) = fixture("account-writer-crash");
         drop(store);
         let path = scratch.path().join("state.db");
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
+        let output = std::process::Command::new(crate::test_exe::current_test_exe().unwrap())
             .args([
                 "--exact",
                 "account_writer::tests::crash_child",
