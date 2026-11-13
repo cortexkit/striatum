@@ -1365,16 +1365,48 @@ const NOT_APPLICABLE: &[&str] = &[
     "max_cost_usd_requirement_honoured",
 ];
 
-/// Every served check passes, and exactly [`NOT_APPLICABLE`] are inapplicable.
+// Support for reading these contract groups is being built separately;
+// select_kind stays unadvertised until media-kind selection is implemented.
+// Keep each gated kit case beside its group so advertising the group requires
+// removing it from this list.
+const PENDING_READERS: &[(&str, &str)] = &[
+    ("consumer_declarations", "placement_consumer_declarations"),
+    ("runner_harness_facts", "placement_harness_facts"),
+    ("decision_harness", "placement_decision_harness"),
+    ("select_kind", "placement_select_kind"),
+    ("select_eligible_routes", "placement_eligible_routes"),
+    ("select_price", "placement_select_price"),
+    ("report_attempt_outcomes", "placement_attempt_outcomes"),
+];
+
+// The contract's KNOWN list does not include routing's extensions: tier
+// settings in operator configuration and resuming an existing account session.
+const ROUTING_EXTENSIONS: &[&str] = &["service_tier_settings", "account_continue_resume"];
+
+/// Every served check passes; the inapplicable checks are pinned explicitly.
 /// A failing check names the contract rule it holds the provider to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
-    for group in cortexkit_role_routing::capabilities::KNOWN {
+    let advertised: std::collections::BTreeSet<_> =
+        super::describe::CAPABILITIES.iter().copied().collect();
+    let known: std::collections::BTreeSet<_> =
+        cortexkit_role_routing::capabilities::KNOWN.iter().copied().collect();
+    for group in ROUTING_EXTENSIONS {
+        assert!(!known.contains(group), "extension {group} is now a contract group");
+    }
+    for (group, _) in PENDING_READERS {
+        assert!(known.contains(group), "unknown pending group {group}");
         assert!(
-            super::describe::CAPABILITIES.contains(group),
-            "undeclared group {group}"
+            !advertised.contains(group),
+            "served group {group} still marked pending"
         );
     }
+    let expected: std::collections::BTreeSet<_> = known
+        .into_iter()
+        .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
+        .chain(ROUTING_EXTENSIONS.iter().copied())
+        .collect();
+    assert_eq!(advertised, expected);
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };
@@ -1391,6 +1423,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "harness_limits_invalid_falls_back",
         "runner_requires_wire_api",
         "runner_gateway_credential",
+        "runner_gateway_explicit_providers",
         "warm_credential_fresh_honoured",
         "warm_credential_hard_filter_ignored",
         "warm_credential_unknown_ignored",
@@ -1406,12 +1439,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         );
     }
     assert!(report.failing().is_empty(), "{}", report.render());
-    assert_eq!(
-        report.not_applicable(),
-        NOT_APPLICABLE,
-        "{}",
-        report.render()
-    );
+    let expected_not_applicable: Vec<_> = NOT_APPLICABLE.iter().copied()
+        .chain(PENDING_READERS.iter().map(|(_, case)| *case)).collect();
+    let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
+    let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
+    assert_eq!(actual, expected, "{}", report.render());
 }
 
 #[tokio::test]

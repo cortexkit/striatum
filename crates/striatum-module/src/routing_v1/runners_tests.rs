@@ -987,6 +987,72 @@ fn standing_provider_limits_and_verified_catalog_replacement_are_enforced() {
 }
 
 #[test]
+fn provider_limits_keep_apikey_and_oauth_provider_identity() {
+    let provider = "company-provider";
+    let route = format!("{provider}/claude-opus-5-5");
+    for method in ["apikey", "oauth"] {
+        for per_harness in [false, true] {
+            for providers in [vec!["anthropic"], vec![provider], vec!["anthropic", provider]] {
+                let mut facts = vec![fact("anthropic", "claude-opus-5-5", None)];
+                let mut credentials = credentials(
+                    &facts, row(&[provider], &["anthropic"], Some(method)), NOW,
+                );
+                credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+                let targets = credentials.catalog_targets(&facts);
+                assert_eq!(targets.get(provider).map(String::as_str), Some("anthropic"));
+                striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
+                let mut slot = json!({"runner": {
+                    "pairs":[{"wire_api":"anthropic.messages", "auth_method":method}],
+                    "harnesses":["alpha", "beta"]
+                }});
+                if per_harness {
+                    slot["runner"]["harness_limits"] = json!({"alpha":{"explicit_providers":providers}});
+                } else {
+                    slot["runner"]["standing_limits"] = json!({"explicit_providers":providers});
+                }
+                credentials.runner_declarations.insert(
+                    "fixture-runner".into(), runners::parse_declaration(&slot).unwrap().unwrap(),
+                );
+                let registry = Registry::build_for_harness(
+                    vec![policy(None)], &credentials, &facts, NOW, Some("alpha"),
+                );
+                assert_eq!(registry.runs("fixture-runner", &route, &route), providers.contains(&provider),
+                    "method={method}, per_harness={per_harness}, providers={providers:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn gateway_provider_limits_use_catalog_targets_not_id_spelling() {
+    let provider = "acme-llm";
+    let route = format!("{provider}/claude-opus-5-5");
+    for serves in [vec!["anthropic"], vec![], vec!["anthropic", "openai"]] {
+        let mut facts = vec![
+            fact("anthropic", "claude-opus-5-5", None),
+            fact("openai", "model-example", None),
+        ];
+        let mut credentials = credentials(
+            &facts, row(&[provider], &serves, Some("gateway")), NOW,
+        );
+        credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
+        let targets = credentials.catalog_targets(&facts);
+        striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
+        for providers in [vec!["anthropic"], vec!["anthropic", provider], vec![provider]] {
+            credentials.runner_declarations.insert("fixture-runner".into(),
+                runners::parse_declaration(&json!({"runner": {
+                    "pairs":[{"wire_api":"anthropic.messages", "auth_method":"gateway"}],
+                    "standing_limits":{"explicit_providers":providers}
+                }})).unwrap().unwrap());
+            let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
+            assert_eq!(registry.runs("fixture-runner", &route, &route),
+                serves == ["anthropic"] && providers.contains(&"anthropic"),
+                "serves={serves:?}, providers={providers:?}");
+        }
+    }
+}
+
+#[test]
 fn runner_declaration_validation_matches_the_shared_contract_shape() {
     let valid =
         json!({"runner": {"pairs": [{"wire_api":"anthropic.messages", "auth_method":"oauth"}]}});

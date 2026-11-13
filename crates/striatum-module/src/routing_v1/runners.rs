@@ -320,7 +320,7 @@ impl Registry {
                                         .as_ref()
                                         .and_then(|limits| limits.explicit_providers.as_ref())
                                         .is_none_or(|providers| {
-                                            providers.contains(&fact.provider_id)
+                                            credentials.runner_allows_provider(fact, row, providers)
                                         })
                                         && {
                                             let method = row.auth_method.as_deref().unwrap_or("");
