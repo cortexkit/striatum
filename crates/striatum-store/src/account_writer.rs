@@ -33,6 +33,12 @@ impl AccountTx<'_> {
     pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
+        self.sync_fence_rechecks()
+    }
+
+    /// The part of a Tick that synchronizes fence rechecks, for a caller that
+    /// applies the admission and continuation expiries itself.
+    pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
         crate::fence_rechecks::sync(self.conn).map_err(err)
     }
 }

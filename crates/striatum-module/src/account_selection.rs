@@ -6784,7 +6784,7 @@ fn serve(
 /// back (marked `expired` once its start window has passed) and charges
 /// nothing; different identity fields are a conflict.
 fn replay(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     principal: &str,
     existing: AccountAdmissionRow,
     request_fingerprint: &str,
@@ -6843,7 +6843,7 @@ fn pin_conflict(current: Option<&AccountAffinityRow>, expected: &PinRef) -> OpRe
 
 #[allow(clippy::too_many_arguments)]
 fn commit_admission(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
@@ -7224,7 +7224,7 @@ pub(crate) fn observe_authorized(
 }
 
 fn record_observation(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     admission_principal: &str,
@@ -7478,7 +7478,7 @@ fn apply_credential_refused(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_bound_observation(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     parsed: &ObserveParams,

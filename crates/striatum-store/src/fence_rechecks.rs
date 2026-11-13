@@ -1092,9 +1092,13 @@ impl AccountTx<'_> {
     /// quota interval limits real sends after a provider refused a request, not
     /// reservations; releasing an unused probe restores that budget without
     /// adding a send.
-    pub fn release_expired_admission_probes(&self, now: i64) -> RouteStateResult<()> {
+    /// Returns the admissions it moved from `reserved` to `expired`.
+    pub fn release_expired_admission_probes(
+        &self,
+        now: i64,
+    ) -> RouteStateResult<Vec<(String, String)>> {
         if !enabled(self.conn).map_err(err)? {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let expired = self
             .conn
@@ -1111,9 +1115,10 @@ impl AccountTx<'_> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
         if expired.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         sync(self.conn).map_err(err)?;
+        let mut marked = Vec::new();
         for (principal, admission, owner) in expired {
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
@@ -1125,9 +1130,11 @@ impl AccountTx<'_> {
                       AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
                 params![owner,now]).map_err(err)?;
             self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
-            self.mark_admission_expired(&principal, &admission)?;
+            if self.mark_admission_expired(&principal, &admission)? {
+                marked.push((principal, admission));
+            }
         }
-        Ok(())
+        Ok(marked)
     }
 
     /// Anonymous decisions may report a credential discovered only at launch.

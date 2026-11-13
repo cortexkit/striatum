@@ -95,7 +95,9 @@ pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
     AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountRouteFence,
-    AccountSizeRefusal, AccountTx, CredentialProbeClaim, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionStateRow, ContinuationStateRow,
+    CredentialProbeClaim, DemandStateRow, LatestAdmissionRow, PinStartedRow, PrunedAdmission,
+    PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
     OBSERVATION_BACKOFFS_SQL,
 };
 

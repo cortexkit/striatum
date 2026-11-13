@@ -629,11 +629,13 @@ impl AccountTx<'_> {
         id: &str,
         size: u32,
         decision: Option<&str>,
-    ) -> RouteStateResult<()> {
+    ) -> RouteStateResult<bool> {
+        // Returns whether the scope was stored: stores without the
+        // fence-recheck schema have no scope columns.
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
-            return Ok(());
+            return Ok(false);
         }
-        self.conn.execute("UPDATE account_admission SET input_size_class=?3,model_decision_id=?4 WHERE principal=?1 AND admission_id=?2",params![principal,id,size,decision]).map(|_|()).map_err(err)
+        self.conn.execute("UPDATE account_admission SET input_size_class=?3,model_decision_id=?4 WHERE principal=?1 AND admission_id=?2",params![principal,id,size,decision]).map(|changed|changed==1).map_err(err)
     }
 
     pub fn size_admission_for_model_decision(
@@ -1381,6 +1383,8 @@ pub struct AccountTx<'a> {
 }
 
 mod continuation;
+mod state_rows;
+pub use state_rows::*;
 
 impl AccountTx<'_> {
     /// The installation-local salt for hashing conversation keys, created with

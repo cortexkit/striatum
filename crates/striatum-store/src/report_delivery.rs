@@ -44,6 +44,49 @@ impl SqliteRouteStateStore {
         reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
+        self.v1_commit_report_with_continuation(
+            decision_id,
+            delivery_key,
+            report_id,
+            recorded,
+            outcome,
+            error,
+            failed,
+            effects,
+            usage,
+            reconcile,
+            |account, _, decision_id, now| account.use_continuation(decision_id, now),
+            now,
+        )
+    }
+
+    /// As [`Self::v1_commit_report`], with the first accepted report's
+    /// continuation use delegated to `use_continuation`. It receives the
+    /// writer's opaque working state, so the module can keep its in-memory
+    /// admission state in step with the rows that use changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v1_commit_report_with_continuation(
+        &self,
+        decision_id: &str,
+        delivery_key: &str,
+        report_id: &str,
+        recorded: &V1Recorded,
+        outcome: RouteOutcome,
+        error: Option<&str>,
+        failed: bool,
+        effects: &V1ReportEffects,
+        usage: Option<&V1ReportUsage>,
+        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        use_continuation: impl FnOnce(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+                &str,
+                i64,
+            ) -> RouteStateResult<()>
+            + Send
+            + 'static,
+        now: i64,
+    ) -> RouteStateResult<Option<V1Recorded>> {
         let decision_id = decision_id.to_owned();
         let delivery_key = delivery_key.to_owned();
         let report_id = report_id.to_owned();
@@ -51,7 +94,8 @@ impl SqliteRouteStateStore {
         let error = error.map(str::to_owned);
         let effects = effects.clone();
         let usage = usage.cloned();
-        let result = self.account_command(AccountCommandKind::Report, move |account| {
+        let command = move |account: &AccountTx<'_>,
+                            state: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
             let decision_id = decision_id.as_str();
             let delivery_key = delivery_key.as_str();
             let report_id = report_id.as_str();
@@ -91,7 +135,7 @@ impl SqliteRouteStateStore {
             )? == 1;
             if first {
                 let account = AccountTx { conn: &tx };
-                account.use_continuation(decision_id, now).map_err(sql_error)?;
+                use_continuation(&account, state, decision_id, now).map_err(sql_error)?;
                 let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
                 let settle = account.probe_report_matches(
                     decision_id, effects.reported_credential.as_deref(), effects.preserve_probe).map_err(sql_error)?;
@@ -139,7 +183,15 @@ impl SqliteRouteStateStore {
             report_crash("before_commit");
             Ok((Some(recorded.clone()), usage.is_some()))
             })().map_err(err)
-        })?;
+        };
+        let result = if self.is_account_evaluation_projection() {
+            self.account_command(AccountCommandKind::Report, move |account| {
+                command(account, None)
+            })?
+        } else {
+            self.enqueue_account_state_command(AccountCommandKind::Report, command)?
+                .wait()?
+        };
         #[cfg(test)]
         report_crash("after_commit");
         // The only in-memory change is a cache invalidation, after commit.

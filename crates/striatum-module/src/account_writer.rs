@@ -255,7 +255,10 @@ pub(crate) fn prune_account_admissions(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
-    store.prune_account_admissions(before, limit)
+    // Pruning is a writer command so the admission state drops the same rows.
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.prune_account_admissions(before, limit)
+    })
 }
 
 pub(crate) fn prune_account_affinities(
@@ -263,7 +266,10 @@ pub(crate) fn prune_account_affinities(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<AffinityRetentionBatch> {
-    store.prune_account_affinities(before, limit)
+    // Pruning is a writer command so the admission state drops the same rows.
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.prune_account_affinities(before, limit)
+    })
 }
 
 pub(crate) fn prune_account_observations(
@@ -311,7 +317,10 @@ pub(crate) fn prune_account_continuations(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
-    store.prune_account_continuations(before, limit)
+    // Pruning is a writer command so the admission state drops the same rows.
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.prune_account_continuations(before, limit)
+    })
 }
 
 pub(crate) fn prune_retired_fence_origins(

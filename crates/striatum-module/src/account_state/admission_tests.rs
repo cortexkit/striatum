@@ -1,0 +1,650 @@
+//! Load-equivalence of the in-memory admission state: after any generated
+//! sequence of writer commands, pruning included, the published state must
+//! equal a fresh load of the same SQL rows.
+
+use super::*;
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+use striatum_store::{AccountCommandKind, AccountPinRow, LatestAdmissionRow};
+
+fn fixture(
+    name: &str,
+) -> (
+    cortexkit_test_support::ScratchDir,
+    Arc<SqliteRouteStateStore>,
+) {
+    let scratch = cortexkit_test_support::ScratchDir::new(name);
+    let store = SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+        name,
+        scratch.path().join("state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    (scratch, Arc::new(store))
+}
+
+fn install(store: &SqliteRouteStateStore) -> Arc<StateOwner> {
+    let owner = Arc::new(StateOwner::default());
+    store.install_account_state_bridge(owner.clone()).unwrap();
+    owner
+}
+
+fn published(owner: &StateOwner) -> AdmissionState {
+    owner.published_snapshot().unwrap().admissions.clone()
+}
+
+fn loaded(store: &SqliteRouteStateStore) -> AdmissionState {
+    store
+        .account_transaction(AccountState::load)
+        .unwrap()
+        .admissions
+}
+
+fn assert_equivalent(store: &SqliteRouteStateStore, owner: &StateOwner, context: &str) {
+    let memory = published(owner);
+    assert!(memory.closing.is_empty(), "{context}: unsettled chains");
+    assert_eq!(loaded(store), memory, "{context}");
+}
+
+fn run<T: Send + 'static>(
+    store: &SqliteRouteStateStore,
+    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
+) -> RouteStateResult<T> {
+    crate::account_writer::execute(store, AccountCommandKind::Repair, command)
+}
+
+const PROVIDER: &str = "prov";
+
+#[derive(Clone)]
+struct Admission {
+    principal: String,
+    id: String,
+    hash: String,
+    account: String,
+    credential: String,
+    pin: String,
+    generation: u64,
+    charged: bool,
+    bytes: u64,
+    committed_at: i64,
+    valid_for: i64,
+    lease_for: i64,
+}
+
+impl Admission {
+    fn row(&self) -> AccountAdmissionRow {
+        AccountAdmissionRow {
+            principal: self.principal.clone(),
+            admission_id: self.id.clone(),
+            request_fingerprint: "fp".into(),
+            request_mode: "admit".into(),
+            decision_id: format!("decision-{}", self.id),
+            conversation_hash: self.hash.clone(),
+            provider: PROVIDER.into(),
+            model: "model".into(),
+            account_id: self.account.clone(),
+            credential_id: self.credential.clone(),
+            pin_id: self.pin.clone(),
+            pin_generation: self.generation,
+            state: "reserved".into(),
+            charged: self.charged,
+            request_bytes: if self.charged { self.bytes } else { 0 },
+            request_bytes_estimated: false,
+            committed_at: self.committed_at,
+            admission_valid_until: self.committed_at + self.valid_for,
+            lease_valid_until: self.committed_at + self.lease_for,
+            reply_json: "{}".into(),
+            run_id: None,
+            started_at: None,
+            started_late: false,
+            released_at: None,
+            finished_at: None,
+        }
+    }
+
+    fn pin_row(&self) -> AccountPinRow {
+        AccountPinRow {
+            pin_id: self.pin.clone(),
+            principal: self.principal.clone(),
+            conversation_hash: self.hash.clone(),
+            provider: PROVIDER.into(),
+            pin_generation: self.generation,
+            affinity_model: "model".into(),
+            account_id: self.account.clone(),
+            credential_id: self.credential.clone(),
+            pin_mode: "conversation_lease".into(),
+            previous_pin_id: None,
+            decision_id: format!("decision-{}", self.id),
+            created_at: self.committed_at,
+        }
+    }
+
+    fn affinity(&self, now: i64) -> AccountAffinityRow {
+        AccountAffinityRow {
+            principal: self.principal.clone(),
+            conversation_hash: self.hash.clone(),
+            provider: PROVIDER.into(),
+            affinity_model: "model".into(),
+            pin_id: self.pin.clone(),
+            pin_generation: self.generation,
+            account_id: self.account.clone(),
+            credential_id: self.credential.clone(),
+            credential_binding_revision: 1,
+            policy_version: 1,
+            initial_demand_bytes: self.bytes,
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + self.lease_for,
+            lease_valid_until: Some(now + self.lease_for),
+        }
+    }
+}
+
+/// Insert a pinned admission and, when it is the conversation's first or a
+/// reassignment, install its pin as the affinity. Pins are always fresh, as
+/// serving issues them.
+fn admit(tx: &mut AccountCommand<'_>, admission: &Admission, install: bool) -> RouteStateResult<()> {
+    let current = tx.affinity(&admission.principal, &admission.hash, PROVIDER)?;
+    tx.insert_pin(&admission.pin_row())?;
+    tx.insert_admission(&admission.row())?;
+    tx.record_admission_probe_scope(
+        &admission.principal,
+        &admission.id,
+        admission.bytes as u32 % 7,
+        Some(&format!("model-decision-{}", admission.id)),
+    )?;
+    if install {
+        let expected = current
+            .as_ref()
+            .map(|row| (row.pin_id.as_str(), row.pin_generation));
+        tx.put_affinity(&admission.affinity(admission.committed_at), expected)?;
+    }
+    Ok(())
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn below(&mut self, n: u64) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.0 >> 33) % n
+    }
+
+    fn pick<'a, T>(&mut self, items: &'a [T]) -> Option<&'a T> {
+        (!items.is_empty()).then(|| &items[self.below(items.len() as u64) as usize])
+    }
+}
+
+const OPERATIONS: usize = 19;
+const OPERATION_NAMES: [&str; OPERATIONS] = [
+    "admit",
+    "reassign_or_stale_affinity",
+    "touch_affinity",
+    "end_lease",
+    "expire",
+    "start",
+    "release",
+    "finish_with_continuations",
+    "offer_continuation",
+    "use_continuation",
+    "use_observed_continuation",
+    "release_expired_continuations",
+    "tick",
+    "prune_admissions",
+    "prune_affinities",
+    "prune_continuations",
+    "rolled_back_command",
+    "reload",
+    "admit_without_affinity",
+];
+
+/// What the generator has created so far, for choosing targets.
+#[derive(Default)]
+struct World {
+    admissions: Vec<Admission>,
+    runs: Vec<(String, String, String)>,
+    decisions: Vec<String>,
+    serial: u64,
+}
+
+impl World {
+    fn fresh(&mut self, prefix: &str) -> String {
+        self.serial += 1;
+        format!("{prefix}-{}", self.serial)
+    }
+
+    fn new_admission(&mut self, rng: &mut Rng, now: i64) -> Admission {
+        let principal = format!("p{}", rng.below(2));
+        let hash = format!("h{}", rng.below(3));
+        let account = format!("a{}", rng.below(2));
+        // Pin generations are unique per conversation; a global counter keeps
+        // them unique even when a caller moves the admission to another one.
+        self.serial += 1;
+        let generation = self.serial;
+        Admission {
+            principal,
+            id: self.fresh("adm"),
+            hash,
+            credential: format!("{account}-key"),
+            account,
+            pin: self.fresh("pin"),
+            generation,
+            charged: rng.below(4) != 0,
+            bytes: 1 + rng.below(1000),
+            // Equal and out-of-order commit times exercise the rowid tie-break.
+            committed_at: now - rng.below(3) as i64,
+            valid_for: 1 + rng.below(40) as i64,
+            lease_for: 1 + rng.below(80) as i64,
+        }
+    }
+}
+
+/// Apply one generated operation through the writer.
+fn apply(
+    store: &Arc<SqliteRouteStateStore>,
+    owner: &StateOwner,
+    world: &mut World,
+    rng: &mut Rng,
+    op: usize,
+    now: i64,
+) {
+    let any = |rng: &mut Rng, world: &World| rng.pick(&world.admissions).cloned();
+    let result = match op {
+        0 | 18 => {
+            let admission = world.new_admission(rng, now);
+            world.admissions.push(admission.clone());
+            let install = op == 0;
+            run(store, move |tx| admit(tx, &admission, install))
+        }
+        1 => {
+            let Some(target) = any(rng, world) else { return };
+            let stale = rng.below(3) == 0;
+            let mut fresh = world.new_admission(rng, now);
+            fresh.principal = target.principal.clone();
+            fresh.hash = target.hash.clone();
+            run(store, move |tx| {
+                tx.insert_pin(&fresh.pin_row())?;
+                let current = tx.affinity(&fresh.principal, &fresh.hash, PROVIDER)?;
+                let expected = if stale {
+                    Some((target.pin.clone(), target.generation + 100))
+                } else {
+                    current.map(|row| (row.pin_id, row.pin_generation))
+                };
+                tx.put_affinity(
+                    &fresh.affinity(now),
+                    expected.as_ref().map(|(pin, generation)| (pin.as_str(), *generation)),
+                )?;
+                Ok(())
+            })
+        }
+        2 => {
+            let Some(target) = any(rng, world) else { return };
+            let lease = (rng.below(2) == 0).then_some(now + rng.below(50) as i64);
+            run(store, move |tx| {
+                tx.touch_affinity(
+                    &target.principal,
+                    &target.hash,
+                    PROVIDER,
+                    (&target.pin, target.generation),
+                    now,
+                    now + 30,
+                    lease,
+                )
+                .map(|_| ())
+            })
+        }
+        3 => {
+            let Some(target) = any(rng, world) else { return };
+            let at = now - rng.below(20) as i64;
+            run(store, move |tx| tx.end_lease(&target.pin, at).map(|_| ()))
+        }
+        4 => {
+            let Some(target) = any(rng, world) else { return };
+            run(store, move |tx| {
+                tx.mark_admission_expired(&target.principal, &target.id)
+                    .map(|_| ())
+            })
+        }
+        5 => {
+            let Some(target) = any(rng, world) else { return };
+            let run_id = world.fresh("run");
+            let late = rng.below(2) == 0;
+            let started = (target.principal.clone(), target.id.clone(), run_id.clone());
+            let result = run(store, move |tx| {
+                tx.mark_admission_started(&target.principal, &target.id, &run_id, now, late)
+            });
+            if matches!(result, Ok(true)) {
+                world.runs.push(started);
+            }
+            result.map(|_| ())
+        }
+        6 => {
+            let Some(target) = any(rng, world) else { return };
+            run(store, move |tx| {
+                tx.mark_admission_released(&target.principal, &target.id, now)
+                    .map(|_| ())
+            })
+        }
+        7 => {
+            // As observation does: finishing an original finishes its run's
+            // continuations in the same command.
+            let Some((principal, id, run_id)) = rng.pick(&world.runs).cloned() else {
+                return;
+            };
+            run(store, move |tx| {
+                if tx.mark_admission_finished(&principal, &id, now)? {
+                    tx.finish_continuations(&principal, &id, &run_id, now)?;
+                }
+                Ok(())
+            })
+        }
+        8 => {
+            // Most offers continue a started run; some name an original that
+            // never started, so retention can reach its chain.
+            let (principal, original, run_id) = if rng.below(4) != 0 {
+                let Some(started) = rng.pick(&world.runs).cloned() else { return };
+                started
+            } else {
+                let Some(target) = any(rng, world) else { return };
+                (target.principal, target.id, world.fresh("run"))
+            };
+            let mut reservation = world.new_admission(rng, now);
+            reservation.principal = principal.clone();
+            world.admissions.push(reservation.clone());
+            let previous = if rng.below(2) == 0 {
+                rng.pick(&world.decisions).cloned().unwrap_or_else(|| "root".into())
+            } else {
+                "root".into()
+            };
+            let decision = world.fresh("decision");
+            world.decisions.push(decision.clone());
+            let selection = world.fresh("selection");
+            let valid_until = now + rng.below(30) as i64;
+            run(store, move |tx| {
+                admit(tx, &reservation, false)?;
+                tx.record_continuation(
+                    &principal,
+                    &selection,
+                    &V1Recorded {
+                        body_json: "{}".into(),
+                        answer_json: "{}".into(),
+                    },
+                    &run_id,
+                    &original,
+                    &previous,
+                    Some((&decision, &reservation.id, valid_until)),
+                )
+            })
+        }
+        9 => {
+            let Some(decision) = rng.pick(&world.decisions).cloned() else { return };
+            run(store, move |tx| tx.use_continuation(&decision, now))
+        }
+        10 => {
+            let Some((principal, id, run_id)) = rng.pick(&world.runs).cloned() else {
+                return;
+            };
+            let account = format!("a{}", rng.below(2));
+            let credential = (rng.below(2) == 0).then(|| format!("{account}-key"));
+            run(store, move |tx| {
+                tx.use_observed_continuation(
+                    &principal,
+                    &id,
+                    &run_id,
+                    &account,
+                    credential.as_deref(),
+                    now,
+                )
+                .map(|_| ())
+            })
+        }
+        11 => run(store, move |tx| tx.release_expired_continuations(now)),
+        12 => crate::account_writer::tick(store, now),
+        13 => crate::account_writer::prune_account_admissions(
+            store,
+            now - rng.below(60) as i64,
+            1 + rng.below(6) as usize,
+        )
+        .map(|_| ()),
+        14 => crate::account_writer::prune_account_affinities(
+            store,
+            now - rng.below(60) as i64,
+            1 + rng.below(6) as usize,
+        )
+        .map(|_| ()),
+        15 => crate::account_writer::prune_account_continuations(
+            store,
+            now - rng.below(60) as i64,
+            1 + rng.below(6) as usize,
+        )
+        .map(|_| ()),
+        16 => {
+            let admission = world.new_admission(rng, now);
+            let failed = run(store, move |tx| {
+                admit(tx, &admission, true)?;
+                tx.release_expired_continuations(now)?;
+                Err::<(), _>(RouteStateStoreError("generated rollback".into()))
+            });
+            assert!(failed.is_err());
+            Ok(())
+        }
+        17 => {
+            owner.reload.store(true, Ordering::Release);
+            crate::account_writer::tick(store, now)
+        }
+        _ => unreachable!(),
+    };
+    result.unwrap_or_else(|error| panic!("{}: {error}", OPERATION_NAMES[op]));
+}
+
+fn generated(seed: u64, steps: usize) -> Vec<(usize, i64)> {
+    let mut rng = Rng(seed);
+    let mut now = 1_000;
+    (0..steps)
+        .map(|_| {
+            now += rng.below(8) as i64;
+            (rng.below(OPERATIONS as u64) as usize, now)
+        })
+        .collect()
+}
+
+#[test]
+fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
+    let seeds = 1..=16u64;
+    let mut coverage = [false; OPERATIONS];
+    for seed in seeds.clone() {
+        for (op, _) in generated(seed, 160) {
+            coverage[op] = true;
+        }
+    }
+    for (op, reached) in coverage.iter().enumerate() {
+        assert!(reached, "generator never reaches {}", OPERATION_NAMES[op]);
+    }
+    let mut reached = BTreeMap::<&str, usize>::new();
+    for seed in seeds {
+        let (_scratch, store) = fixture(&format!("admission-state-property-{seed}"));
+        let owner = install(&store);
+        let mut world = World::default();
+        let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9));
+        for (step, (op, now)) in generated(seed, 160).into_iter().enumerate() {
+            apply(&store, &owner, &mut world, &mut rng, op, now);
+            assert_equivalent(
+                &store,
+                &owner,
+                &format!("seed={seed} step={step} op={}", OPERATION_NAMES[op]),
+            );
+        }
+        let state = published(&owner);
+        for (name, size) in [
+            ("open", state.open.len()),
+            ("latest", state.latest.len()),
+            ("demand", state.demand.len()),
+            ("affinity", state.affinity.len()),
+            ("pin_started", state.pin_started.len()),
+            ("offers", state.offers.len()),
+            ("chains", state.chains.len()),
+        ] {
+            *reached.entry(name).or_default() += size;
+        }
+    }
+    // Every index must have held entries at some sequence end, or the
+    // comparison above proved nothing about it.
+    for (name, total) in &reached {
+        assert!(*total > 0, "no sequence ended with a non-empty {name} index");
+    }
+}
+
+fn admission(principal: &str, id: &str, pin: &str, generation: u64, at: i64, lasts: i64) -> Admission {
+    Admission {
+        principal: principal.into(),
+        id: id.into(),
+        hash: "h".into(),
+        account: "a".into(),
+        credential: "a-key".into(),
+        pin: pin.into(),
+        generation,
+        charged: true,
+        bytes: 10,
+        committed_at: at,
+        valid_for: lasts,
+        lease_for: lasts,
+    }
+}
+
+fn prune_everything_before(store: &SqliteRouteStateStore, before: i64) {
+    crate::account_writer::prune_account_admissions(store, before, 100).unwrap();
+}
+
+#[test]
+fn pruning_the_newest_finished_admission_reveals_the_older_open_one() {
+    let (_scratch, store) = fixture("admission-state-prune-latest");
+    let owner = install(&store);
+    let older = admission("p", "older", "pin-1", 1, 10, 1_000);
+    let newer = admission("p", "newer", "pin-2", 2, 20, 1);
+    run(&store, move |tx| {
+        admit(tx, &older, true)?;
+        admit(tx, &newer, true)?;
+        tx.mark_admission_started("p", "newer", "run", 20, false)?;
+        tx.mark_admission_finished("p", "newer", 21)?;
+        Ok(())
+    })
+    .unwrap();
+    let conversation = ("p".to_string(), "h".to_string(), PROVIDER.to_string());
+    let latest = |owner: &StateOwner| {
+        published(owner)
+            .latest
+            .get(&conversation)
+            .map(|row| LatestAdmissionRow::clone(row).admission_id)
+    };
+    assert_eq!(latest(&owner).as_deref(), Some("newer"));
+    let reads = maintenance_reads();
+    prune_everything_before(&store, 100);
+    assert_eq!(latest(&owner).as_deref(), Some("older"));
+    assert!(maintenance_reads() > reads, "the recheck is a counted maintenance read");
+    assert_equivalent(&store, &owner, "after pruning the newest admission");
+}
+
+#[test]
+fn pruning_a_pins_last_started_admission_clears_its_started_count() {
+    let (_scratch, store) = fixture("admission-state-prune-pin-started");
+    let owner = install(&store);
+    let only = admission("p", "only", "pin-1", 1, 10, 1);
+    run(&store, move |tx| {
+        admit(tx, &only, true)?;
+        tx.mark_admission_started("p", "only", "run", 10, false)?;
+        tx.mark_admission_finished("p", "only", 11)?;
+        Ok(())
+    })
+    .unwrap();
+    let conversation = ("p".to_string(), "h".to_string(), PROVIDER.to_string());
+    assert_eq!(published(&owner).pin_started.get(&conversation), Some(&1));
+    prune_everything_before(&store, 100);
+    assert_eq!(published(&owner).pin_started.get(&conversation), None);
+    assert_equivalent(&store, &owner, "after pruning the pin's started admission");
+}
+
+#[test]
+fn pruning_the_newest_used_offer_reveals_the_older_used_one() {
+    let (_scratch, store) = fixture("admission-state-prune-used-offer");
+    let owner = install(&store);
+    // An original that expired unstarted is open but not live, so retention
+    // may delete its continuation rows while the chain still exists.
+    let original = admission("p", "original", "pin-1", 1, 10, 1_000);
+    let first = admission("p", "first", "pin-2", 2, 10, 1);
+    let second = admission("p", "second", "pin-3", 3, 13, 1);
+    let record = V1Recorded {
+        body_json: "{}".into(),
+        answer_json: "{}".into(),
+    };
+    run(&store, move |tx| {
+        admit(tx, &original, true)?;
+        tx.mark_admission_expired("p", "original")?;
+        admit(tx, &first, false)?;
+        tx.record_continuation("p", "s1", &record, "run", "original", "root", Some(("d1", "first", 12)))?;
+        tx.use_continuation("d1", 11)?;
+        admit(tx, &second, false)?;
+        tx.record_continuation("p", "s2", &record, "run", "original", "d1", Some(("d2", "second", 14)))?;
+        tx.use_continuation("d2", 13)?;
+        // The first reservation stays started, so its row is retained; the
+        // second finishes and becomes prunable.
+        tx.mark_admission_finished("p", "second", 14)?;
+        Ok(())
+    })
+    .unwrap();
+    let original = ("p".to_string(), "original".to_string());
+    let latest_used = |owner: &StateOwner| {
+        published(owner)
+            .chains
+            .get(&original)
+            .and_then(|chain| chain.latest_used.clone())
+            .map(|(_, reservation)| reservation)
+    };
+    assert_eq!(latest_used(&owner).as_deref(), Some("second"));
+    let reads = maintenance_reads();
+    let pruned = crate::account_writer::prune_account_continuations(&store, 100, 100).unwrap();
+    assert_eq!(pruned, 1, "only the newest used offer is unprotected");
+    assert_eq!(latest_used(&owner).as_deref(), Some("first"));
+    assert!(maintenance_reads() > reads, "the recheck is a counted maintenance read");
+    assert_equivalent(&store, &owner, "after pruning the newest used offer");
+}
+
+#[test]
+fn working_copy_fork_shares_admission_shards_and_reports_cost() {
+    let (_scratch, store) = fixture("admission-state-fork");
+    let owner = install(&store);
+    let rows: Vec<_> = (0..2_000)
+        .map(|i| {
+            let mut row = admission(&format!("p{}", i % 7), &format!("a{i}"), &format!("pin-{i}"), 1, 10 + i, 1_000);
+            row.hash = format!("h{i}");
+            row
+        })
+        .collect();
+    run(&store, move |tx| {
+        for row in &rows {
+            admit(tx, row, true)?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let snapshot = owner.published_snapshot().unwrap();
+    let fork = snapshot.fork();
+    let fork = fork.as_any().downcast_ref::<AccountState>().unwrap();
+    assert!(fork.admissions.open.shares_storage_with(&snapshot.admissions.open));
+    assert!(fork.admissions.demand.shares_storage_with(&snapshot.admissions.demand));
+    let start = std::time::Instant::now();
+    for _ in 0..100_000 {
+        std::hint::black_box(owner.published_snapshot().unwrap().fork());
+    }
+    let fork_ns = start.elapsed().as_nanos() / 100_000;
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        loaded(&store);
+    }
+    eprintln!(
+        "admission state with {} open admissions: snapshot-and-fork {fork_ns}ns/op; SQL load {}us/op (20 loads)",
+        snapshot.admissions.open.len(),
+        start.elapsed().as_micros() / 20
+    );
+}

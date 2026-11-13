@@ -630,6 +630,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     {
         samples.print(name);
     }
+    crate::account_state::report_admission_state(harness.store());
     if std::env::var_os("STRIATUM_CPU_WAL_TICKS").is_some() {
         println!(
             "reader_cache_cost added_us/checkout=0 added_us/request=0 configuration=open_only"
