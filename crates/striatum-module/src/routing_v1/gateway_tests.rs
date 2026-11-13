@@ -549,3 +549,107 @@ async fn gateway_provider_limits_head_choices() {
 async fn gateway_provider_limits_account_admission() {
     check_gateway_provider_limits("route.account_for").await;
 }
+
+async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
+    let provider = if method == "gateway" { GATEWAY } else { "anthropic" };
+    for (per_harness, allowed) in [(false, true), (false, false), (true, true), (true, false)] {
+        let harness = fixture_for_catalog("anthropic", "claude-opus-5-5");
+        harness.edit_config(|config| {
+            config["runners"] = json!([{"module":RUNNER}]);
+        });
+        {
+            let shared = harness.credentials();
+            let mut credentials = shared.lock().unwrap();
+            let mut row = credentials.listed_credentials().iter()
+                .find(|row| row.auth_method.as_deref() == Some(method))
+                .unwrap().clone();
+            row.provider_ids = vec![provider.into()];
+            credentials.apply_listing(&ScopedCredentialListing {
+                credentials: vec![row], view: "single-method".into(),
+                ..Default::default()
+            }, crate::now_ms());
+            credentials.refresh_serving_methods(&Default::default(),
+                &harness.store().get_facts().unwrap(), crate::now_ms() as i64, &[]);
+        }
+        let providers = if allowed { vec!["anthropic"] } else { vec!["openai"] };
+        let mut runner = json!({
+            "pairs":[{"wire_api":"anthropic.messages", "auth_method":method}],
+            "follows_account_choice":true,
+            "harnesses":["alpha"], "default_harness":"alpha"
+        });
+        if per_harness {
+            runner["harness_limits"] = json!({"alpha":{"explicit_providers":providers}});
+        } else {
+            runner["standing_limits"] = json!({"explicit_providers":providers});
+        }
+        harness.credentials().lock().unwrap().runner_declarations =
+            super::runners::declarations_from_catalog(&json!([{
+                "module_id":RUNNER, "nonce_verified":true,
+                "role_declarations":{"routing/v1":{"runner":runner}}
+            }]));
+        let consumer = harness.bind(reserved("example-consumer"), None).await;
+        let model = if absent_model && !allowed { "unserved-model" } else { "claude-opus-5-5" };
+        let request = json!({
+            "consumer":"mason", "requirements":{"iq":0},
+            "pin":format!("{provider}/{model}"), "runners":[RUNNER],
+            "harness":"alpha"
+        });
+        let reply = consumer.call("route.select", &request).await;
+        let context = format!("method={method}, per_harness={per_harness}, allowed={allowed}");
+        if allowed {
+            assert_eq!(reply.0, FrameType::Response, "{context}: {reply:?}");
+        } else {
+            assert_eq!(reply.0, FrameType::Error, "{context}: {reply:?}");
+            assert_eq!(reply.1["code"], "pin_unavailable", "{context}: {reply:?}");
+            assert_eq!(reply.1["detail"]["pin"], format!("{provider}/{model}"));
+            assert_eq!(reply.1["detail"]["reason"],
+                if absent_model { "unknown_model" } else { "not_available" }, "{context}: {reply:?}");
+            if !absent_model {
+                assert_eq!(reply.1["detail"]["cause"], "missing_capability", "{context}: {reply:?}");
+            }
+            assert!(reply.1["detail"].get("reset_at_ms").is_none(), "{context}: {reply:?}");
+            for fallback in [false, true] {
+                let mut routing = request.clone();
+                if fallback {
+                    routing["pin_fallback"] = json!("route");
+                } else {
+                    routing.as_object_mut().unwrap().remove("pin");
+                }
+                let unpinned = consumer.call("route.select", &routing).await;
+                assert_eq!(unpinned.0, FrameType::Error, "{context}: {unpinned:?}");
+                assert_eq!(unpinned.1["code"], "no_route", "{context}: {unpinned:?}");
+                assert_eq!(unpinned.1["detail"]["reason"], "missing_capability", "{context}: {unpinned:?}");
+            }
+            harness.credentials().lock().unwrap().runner_declarations
+                .get_mut(RUNNER).unwrap().pairs[0].wire_api = "openai.responses".into();
+            let incompatible = consumer.call("route.select", &request).await;
+            assert_eq!(incompatible.0, FrameType::Error, "{context}: {incompatible:?}");
+            assert_eq!(incompatible.1["code"], "no_route", "{context}: {incompatible:?}");
+            assert_eq!(incompatible.1["detail"]["reason"], "missing_capability", "{context}: {incompatible:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn apikey_provider_limits_refuse_unservable_pin() {
+    check_provider_limit_pin_refusal("apikey", false).await;
+}
+
+#[tokio::test]
+async fn gateway_provider_limits_refuse_unservable_pin() {
+    check_provider_limit_pin_refusal("gateway", false).await;
+}
+
+// Routing 0.7.20 CONTRACT.md:533–536 requires pin_unavailable for an
+// unservable pin; lines 694–698 define unknown_model for an absent row.
+// Conformance 0.10.22 src/checks/gateway.rs:105,264–270 pins an unserved
+// row even when provider limits have emptied every real route.
+#[tokio::test]
+async fn gateway_provider_limits_preserve_absent_pin_admission() {
+    check_provider_limit_pin_refusal("gateway", true).await;
+}
+
+#[tokio::test]
+async fn apikey_provider_limits_preserve_absent_pin_admission() {
+    check_provider_limit_pin_refusal("apikey", true).await;
+}
