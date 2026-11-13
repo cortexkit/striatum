@@ -867,7 +867,15 @@ async fn select_at_tier(
     shared: &RequestInputs,
     inputs: &mut SelectionInputs,
 ) -> Result<Value, Refusal> {
+    // A lost binding means another decision already owns this credential's
+    // recovery probe. The retry records that owner's probe as held until its
+    // deadline, and a held probe makes the credential ineligible for the rest
+    // of this request, so each retry has one fewer candidate and the loop ends
+    // on its own. The cap is a backstop: if a hold ever failed to exclude its
+    // credential, the request answers the timed wait instead of spinning.
+    const MAX_LOST_PROBE_RETRIES: usize = 16;
     let mut lost_until: Option<i64> = None;
+    let mut lost = 0;
     loop {
         match select_at_tier_attempt(
             params,
@@ -888,6 +896,13 @@ async fn select_at_tier(
             Ok(SelectionAttempt::Selected(answer)) => return Ok(answer),
             Ok(SelectionAttempt::ProbeLost(until)) => {
                 lost_until = Some(lost_until.map_or(until, |prior| prior.min(until)));
+                lost += 1;
+                if lost >= MAX_LOST_PROBE_RETRIES {
+                    return Err(account_limit_refusal(
+                        inputs.request.pin.as_deref(),
+                        lost_until,
+                    ));
+                }
             }
             Err(refusal) => {
                 if let Some(until) = lost_until.filter(|_| {
