@@ -1568,7 +1568,6 @@ const NOT_APPLICABLE: &[&str] = &[
 // Keep each gated kit case beside its group so advertising the group requires
 // removing it from this list.
 const PENDING_READERS: &[(&str, &str)] = &[
-    ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
 ];
 

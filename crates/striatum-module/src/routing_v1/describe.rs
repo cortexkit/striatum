@@ -37,6 +37,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "observe_credential_refused",
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     cortexkit_role_routing::capabilities::RUNNER_HARNESS_FACTS,
+    cortexkit_role_routing::capabilities::DECISION_HARNESS,
     "select_hold_control",
     cortexkit_role_routing::capabilities::SELECT_PREFER,
     cortexkit_role_routing::capabilities::SELECT_EXCLUDE_PROVIDERS,

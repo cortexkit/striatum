@@ -602,6 +602,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_price",
                                 "runner_harness_facts",
                                 "report_attempt_outcomes",
+                                "decision_harness",
                             ][..],
                         ),
                         (
