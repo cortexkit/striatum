@@ -1561,6 +1561,9 @@ const NOT_APPLICABLE: &[&str] = &[
     "questions_requirement_honoured",
     "max_cost_usd_requirement_honoured",
     "declared_consumer_conflict_refused",
+    // Serving decision_harness means routing names a harness rather than
+    // omitting an ambiguous one, so the kit skips the omission case.
+    "unrequested_harness_uses_declaration",
 ];
 
 // Support for these contract groups is being built separately;
