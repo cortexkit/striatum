@@ -1,5 +1,7 @@
 use super::*;
 
+mod signed_out_tests;
+
 fn result(reply: (FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     reply.1["result"].clone()

@@ -28,6 +28,50 @@ fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refu
     serde_json::from_str(&record.answer_json).map_err(unavailable)
 }
 
+fn record_signed_out(
+    tx: &AccountTx<'_>,
+    ctx: &Ctx<'_>,
+    principal: &str,
+    runner: &str,
+    provider: &str,
+    request: &ContinueRequest,
+    body_json: &str,
+) -> RouteStateResult<()> {
+    let code = striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE;
+    let fingerprint = ctx.classes.as_ref().and_then(|classes| {
+        match classes.credentials.signed_out_fingerprint(&request.exhausted.credential_id) {
+            crate::broca_credentials::ListingLookup::Listed(value) => Some(value),
+            _ => None,
+        }
+    });
+    // Routing's non-quota evidence lasts at most one hour before one probe.
+    // Vault usability is separate: needs_reauth never admits even that probe.
+    // If the vault stays usable throughout, the hourly probe deliberately
+    // departs from 0.7.20 CONTRACT.md lines 1269–1275 and 1311–1313, which
+    // otherwise require vault-confirmed recovery from sign-in loss.
+    tx.record_credential_refusal(
+        &striatum_core::route_state_store::CredentialRefusal {
+            provider_id: provider.into(),
+            credential_id: request.exhausted.credential_id.clone(),
+            code: code.into(),
+        },
+        fingerprint.as_deref(),
+        (request.exhausted.observed_at_ms as i64).min(ctx.now_ms),
+    )?;
+    tx.insert_observation(&AccountObservationRow {
+        observation_id: new_id("aco"),
+        principal: principal.into(),
+        runner: runner.into(),
+        event_id: new_id("continue-event"),
+        kind: code.into(),
+        admission_id: Some(request.admission_id.clone()),
+        bound: true,
+        observation_json: body_json.into(),
+        effects_json: json!([{"effect":"signed_out_fence"}]).to_string(),
+        received_at: ctx.now_ms,
+    })
+}
+
 pub(crate) fn continue_account(
     request: &ContinueRequest,
     principal: &str,
@@ -171,19 +215,26 @@ pub(crate) fn continue_account(
             if tx.continuation_has_used_successor(principal,&request.admission_id,&request.run_id,&request.previous_decision_id)? {
                 return Ok(refuse("unknown_decision", "previous decision is no longer current"));
             }
-            // The stored admission authenticates the exhausted account. Record its evidence
-            // through the same observation handler used by account_limit_exhausted reports.
-            let raw = json!({"event_id":new_id("continue-event"), "caller":{"runner":runner},
-                "kind":"account_limit_exhausted", "admission_id":current_id, "run_id":request.run_id,
-                "served_account_id":request.exhausted.account, "credential_id":request.exhausted.credential_id,
-                "limit_window":request.exhausted.limit_window, "pool":request.exhausted.pool,
-                "resets_at_ms":request.exhausted.resets_at_ms, "retry_after_s":request.exhausted.retry_after_s,
-                "observed_at_ms":request.exhausted.observed_at_ms});
-            let observation: ObserveParams = serde_json::from_value(raw.clone()).map_err(|e|RouteStateStoreError(e.to_string()))?;
             let provider = &previous.provider;
             let policy = ctx.provider_policy(provider);
             let scoped = Ctx { policy:&policy, ..Ctx {store:ctx.store,accounts:ctx.accounts,flags:ctx.flags,policy:ctx.policy,now_ms:ctx.now_ms,classes:ctx.classes.clone()} };
-            record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
+            let mut signed_out = tx.signed_out_credentials(principal, &request.admission_id, &request.run_id)?;
+            // The stored admission authenticates this sign-in signal. It is not
+            // quota exhaustion or a provider's refusal of a key for every use.
+            if request.exhausted.limit_window == "signed_out" {
+                record_signed_out(tx, ctx, principal, runner, provider, request, &body_json)?;
+                signed_out.push(current.credential_id.clone());
+            } else {
+                // Quota continuations keep the ordinary exhaustion observation path.
+                let raw = json!({"event_id":new_id("continue-event"), "caller":{"runner":runner},
+                    "kind":"account_limit_exhausted", "admission_id":current_id, "run_id":request.run_id,
+                    "served_account_id":request.exhausted.account, "credential_id":request.exhausted.credential_id,
+                    "limit_window":request.exhausted.limit_window, "pool":request.exhausted.pool,
+                    "resets_at_ms":request.exhausted.resets_at_ms, "retry_after_s":request.exhausted.retry_after_s,
+                    "observed_at_ms":request.exhausted.observed_at_ms});
+                let observation: ObserveParams = serde_json::from_value(raw.clone()).map_err(|e|RouteStateStoreError(e.to_string()))?;
+                record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
+            }
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {
                 return Ok(refuse("account_pinned", "the caller pinned an account"));
@@ -200,7 +251,7 @@ pub(crate) fn continue_account(
             // The exhausted account must leave even if its quota reading still has headroom.
             if let Some(roster) = &mut roster.roster {
                 for account in &mut roster.accounts {
-                    account.credentials.retain(|c|classes.method(&c.credential_id)==method);
+                    account.credentials.retain(|c|classes.method(&c.credential_id)==method && !signed_out.contains(&c.credential_id));
                 }
                 roster.accounts.retain(|a| a.account_id != current.account_id && !a.credentials.is_empty());
             }
@@ -211,7 +262,7 @@ pub(crate) fn continue_account(
             let candidates=params.request(principal,false).candidates;
             let compatible:Vec<_>=reset_roster.iter().filter_map(|r|r.roster.as_ref()).flat_map(|r|&r.accounts)
                 .filter(|a|a.account_id!=current.account_id).flat_map(|a|a.credentials.iter().map(move|c|(a,c)))
-                .filter(|(a,c)|classes.method(&c.credential_id)==method && candidates.as_ref().is_none_or(|candidates|candidates.contains(&a.account_id,&c.credential_id))).collect();
+                .filter(|(a,c)|classes.method(&c.credential_id)==method && !signed_out.contains(&c.credential_id) && candidates.as_ref().is_none_or(|candidates|candidates.contains(&a.account_id,&c.credential_id))).collect();
             let mut until = route_fenced.iter().filter(|(a,_)|compatible.iter().any(|(candidate,_)|candidate.account_id==**a)).map(|(_,at)|*at).filter(|at|*at>ctx.now_ms).min();
             for (_,credential) in compatible {
                 if let Some(at)=classes.quota_hold_reset(provider,&credential.credential_id) {
@@ -245,6 +296,9 @@ pub(crate) fn continue_account(
                     if let Some(at) = detail.as_ref().and_then(|d|d["reset_at_ms"].as_i64()).filter(|at|*at>ctx.now_ms) {
                         until=Some(until.map_or(at,|old|old.min(at)));
                     }
+                    // Excluding this run's signed-out credentials is not missing
+                    // authorization: it is waiting for a different usable account.
+                    let code = if !signed_out.is_empty() && code == "auth_required" { "account_pool_exhausted".into() } else { code };
                     let mut hold=ContinueHold::new(code,json!("no compatible account is available"));
                     hold.until_ms=until.map(|at|at as u64);
                     Ok(ContinueAnswer::Hold(hold))

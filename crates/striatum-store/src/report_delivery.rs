@@ -292,14 +292,17 @@ fn apply_account_effects(
         tx.record_eligibility(fact).map_err(sql_error)?;
     }
     if let Some((refusal, fingerprint)) = &effects.credential_refusal {
-        conn.execute(
+        let changed = conn.execute(
             "INSERT INTO credential_entitlement_fences (provider_id,credential_id,code,listing_fingerprint,observed_at_ms)
              VALUES (?1,?2,?3,?4,?5) ON CONFLICT(provider_id,credential_id) DO UPDATE SET
-             code=excluded.code, observed_at_ms=MAX(credential_entitlement_fences.observed_at_ms,excluded.observed_at_ms),
-             listing_fingerprint=COALESCE(credential_entitlement_fences.listing_fingerprint,excluded.listing_fingerprint)",
+              code=excluded.code, observed_at_ms=MAX(credential_entitlement_fences.observed_at_ms,excluded.observed_at_ms),
+              listing_fingerprint=CASE WHEN credential_entitlement_fences.code='signed_out' AND excluded.code!='signed_out'
+                THEN excluded.listing_fingerprint ELSE COALESCE(credential_entitlement_fences.listing_fingerprint,excluded.listing_fingerprint) END
+              WHERE excluded.code!='signed_out' OR credential_entitlement_fences.code='signed_out'",
             params![refusal.provider_id, refusal.credential_id, refusal.code, fingerprint, now],
         )?;
-        if crate::fence_rechecks::enabled(conn)? {
+        // A sign-in report must not replace or postpone an independent refusal.
+        if changed != 0 && crate::fence_rechecks::enabled(conn)? {
             conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
             crate::fence_rechecks::register(
                 conn,

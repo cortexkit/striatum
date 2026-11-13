@@ -1012,7 +1012,10 @@ impl RoutingSubject for KitSubject {
         credentials: &[cortexkit_role_routing_conformance::ContinueCredential],
     ) -> Result<(), String> {
         let harness = self.harness();
-        let catalog = fixture::continue_catalog();
+        let mut catalog = fixture::continue_catalog();
+        // The kit removes spares to check that sign-in evidence alone excludes
+        // the original credential; installing the full fixture would hide it.
+        catalog.accounts.retain(|account| credentials.iter().any(|credential| credential.account == *account));
         install_catalog(&harness, &catalog);
         for credential in credentials {
             for model in catalog.models.iter().filter(|model| {
@@ -1387,6 +1390,7 @@ const NOT_APPLICABLE: &[&str] = &[
     "account_for_tier_undeclared",
     "warm_credential_undeclared_refused",
     "continue_undeclared_group_refuses_mode",
+    "continue_signed_out_undeclared_refuses_window",
     "undeclared_harness_group_refuses_member",
     "undeclared_prefer_group_refuses_member",
     "undeclared_exclude_providers_group_refuses_member",
@@ -1406,8 +1410,6 @@ const PENDING_READERS: &[(&str, &str)] = &[
     ("select_eligible_routes", "placement_eligible_routes"),
     ("select_price", "placement_select_price"),
     ("report_attempt_outcomes", "placement_attempt_outcomes"),
-    // Signed-out recovery remains unserved until a separate change implements it.
-    ("account_continue_signed_out", "continue_signed_out"),
 ];
 
 // The contract's KNOWN list does not include routing's extensions: tier

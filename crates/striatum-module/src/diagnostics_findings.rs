@@ -324,7 +324,8 @@ fn credential_fences(
         .map(|fence| {
             let age_ms = now_ms.saturating_sub(fence.observed_at_ms).max(0);
             let billing = crate::credential_fences::is_billing_code(&fence.code);
-            let kind = if billing { "billing" } else { "entitlement" };
+            let signed_out = fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE;
+            let kind = if signed_out { "sign_in" } else if billing { "billing" } else { "entitlement" };
             let account_id =
                 crate::credential_fences::roster_account_id(quota, &fence.credential_id)
                     .or_else(|| Some(fence.credential_id.clone()));
@@ -422,7 +423,9 @@ fn credential_fences(
                     hint,
                 };
             }
-            let hint = if billing {
+            let hint = if signed_out {
+                "Sign in to this account again. A usable new vault listing clears the sign-in fence immediately. If the vault never marks it unusable, routing allows one recovery probe after at most 1h; a vault listing that still needs sign-in cannot be probed.".into()
+            } else if billing {
                 format!(
                     "Top up the credential's paid balance, then lift the fence with route.clear_credential_fences {{\"credentialId\":\"{}\"}}. Non-quota refusals permit one probe after at most 1h; quota holds recheck every 15m without a fresh reading.",
                     fence.credential_id
@@ -1219,6 +1222,18 @@ mod tests {
 
     const NOW: i64 = 1_800_000_000_000;
     const MINUTE: i64 = 60_000;
+
+    #[test]
+    fn signed_out_finding_describes_sign_in_not_a_refused_key() {
+        let findings = credential_fences(&[CredentialEntitlementFence {
+            provider_id: "provider".into(), credential_id: "oauth".into(),
+            code: "signed_out".into(), listing_fingerprint: None, observed_at_ms: NOW,
+        }], &Default::default(), &[], NOW);
+        assert_eq!(findings[0].samples[0]["kind"], "sign_in");
+        assert!(findings[0].hint.contains("Sign in"));
+        assert!(!findings[0].hint.contains("refused"));
+        assert!(!findings[0].summary.contains("entitlement"));
+    }
 
     fn empty() -> Evidence {
         Evidence {
