@@ -1560,6 +1560,7 @@ const NOT_APPLICABLE: &[&str] = &[
     "undeclared_exclude_providers_group_refuses_member",
     "questions_requirement_honoured",
     "max_cost_usd_requirement_honoured",
+    "declared_consumer_conflict_refused",
 ];
 
 // Support for these contract groups is being built separately;
@@ -1567,7 +1568,6 @@ const NOT_APPLICABLE: &[&str] = &[
 // Keep each gated kit case beside its group so advertising the group requires
 // removing it from this list.
 const PENDING_READERS: &[(&str, &str)] = &[
-    ("consumer_declarations", "placement_consumer_declarations"),
     ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
     ("report_attempt_outcomes", "placement_attempt_outcomes"),
@@ -1636,6 +1636,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "warm_credential_admission_conflict",
         "warm_credential_non_admit_refused",
         "placement_eligible_routes",
+        "placement_consumer_declarations",
     ] {
         assert_eq!(
             report.outcome(check),
@@ -1660,11 +1661,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
     use cortexkit_role_routing::capabilities::{
         CONSUMER_DECLARATIONS, REPORT_ATTEMPT_OUTCOMES, SELECT_KIND,
     };
-    let groups = [
-        CONSUMER_DECLARATIONS,
-        SELECT_KIND,
-        REPORT_ATTEMPT_OUTCOMES,
-    ];
+    let groups = [SELECT_KIND, REPORT_ATTEMPT_OUTCOMES];
     let harness = Harness::new("candidate-capabilities");
     let slot = json!({
         "consumers": [{"name":"example-consumer.task", "iq":40}],
@@ -1682,10 +1679,11 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
             super::describe::capabilities().as_ref(),
             super::describe::CAPABILITIES
         );
-        assert!(!super::consumers::Catalog::from_catalog(&catalog)
+        assert!(super::describe::capabilities().contains(&CONSUMER_DECLARATIONS));
+        assert!(super::consumers::Catalog::from_catalog(&catalog)
             .effective(&harness.operator_config())
             .knows("example-consumer.task"));
-        assert!(super::runners::parse_declaration(&slot).is_err());
+        assert!(super::runners::parse_declaration(&slot).unwrap().is_some());
         assert!(
             cortexkit_role_routing::select::parse_select_request_serving(
                 &select,
