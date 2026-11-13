@@ -18,6 +18,7 @@ mod account_quota;
 mod account_refusal_log;
 mod account_selection;
 mod account_writer;
+mod account_state;
 mod serving_index;
 mod background;
 #[cfg(test)]
@@ -1317,6 +1318,11 @@ where
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
     let store = open_route_state_store(&descriptor)?;
+    // HELLO negotiates the storage descriptor supplied by HELLO_ACK, so it
+    // cannot wait for loading. Do not start background tasks or dispatch queued
+    // requests until account state is published; early requests wait, not fail.
+    account_state::initialize(store.as_ref())
+        .map_err(|error| ModuleError::Message(format!("load account state: {error}")))?;
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.

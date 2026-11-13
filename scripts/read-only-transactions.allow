@@ -2,4 +2,5 @@
 crates/striatum-store/src/lib.rs::read_resolved_facts # SELECT-only snapshot of model facts and operator-grade overlays; no transaction writes.
 crates/striatum-store/src/account_selection.rs::reconcile_account_eligibility # SELECT-only listing snapshot commits before the separate IMMEDIATE write phase.
 crates/striatum-store/src/account_selection.rs::account_read # Callback contract permits reads only; admissions and observations use account_transaction.
+crates/striatum-store/src/account_state.rs::refresh # State loader's single consistent read at startup, data_version reload and failed-batch reload; it never writes.
 crates/striatum-store/src/prune_facts.rs::plan_unserved_prune # SELECT-only fact and recent-decision snapshot; commits before separate IMMEDIATE keyed deletes.

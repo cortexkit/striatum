@@ -47,6 +47,9 @@ pub(crate) fn execute<T: Send + 'static>(
     kind: AccountCommandKind,
     command: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
+    if !store.is_account_evaluation_projection() {
+        crate::account_state::initialize(store)?;
+    }
     #[cfg(test)]
     let inputs = crate::TestThreadState::capture();
     store.account_command(kind, move |tx| {

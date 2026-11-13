@@ -90,7 +90,7 @@ impl SqliteRouteStateStore {
                 params![decision_id, report_id, recorded.body_json, recorded.answer_json, now],
             )? == 1;
             if first {
-                let account = AccountTx { conn: &tx };
+                let account = AccountTx { conn: &tx, state: account.state };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
                 let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
                 let settle = account.probe_report_matches(

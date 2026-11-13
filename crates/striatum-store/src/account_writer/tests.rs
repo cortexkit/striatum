@@ -22,6 +22,7 @@ fn queued<T: Send + 'static>(
     (
         Queued {
             enqueued: Instant::now(),
+            initialize_only: false,
             command: Box::new(TypedCommand {
                 run: Some(f),
                 result: None,
@@ -206,7 +207,14 @@ fn isolated_batch(fail: bool) -> (Vec<String>, Vec<String>) {
     }
     store
         .store
-        .with_conn(|conn| write_batch(conn, &mut batch, &store.account_write_transactions))
+        .with_conn(|conn| {
+            write_batch(
+                conn,
+                &mut batch,
+                &mut None,
+                &store.account_write_transactions,
+            )
+        })
         .unwrap();
     for command in batch {
         command.command.publish(None, StoreStageTiming::default());
@@ -271,7 +279,7 @@ fn begin_commit_and_transaction_aborting_statement_fail_every_command() {
                 CREATE TABLE deferred_parent(id PRIMARY KEY);
                 CREATE TABLE deferred_child(parent REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED);")?;
             if fault == "begin" { conn.execute_batch("BEGIN IMMEDIATE")?; }
-            let result = write_batch(conn, &mut batch, &store.account_write_transactions);
+            let result = write_batch(conn, &mut batch, &mut None, &store.account_write_transactions);
             if fault == "begin" { conn.execute_batch("ROLLBACK")?; }
             result
         }).unwrap_err().to_string();
@@ -307,6 +315,7 @@ fn writer_death_wakes_pending_and_later_callers_and_fires_exit_hook() {
     let (exit, exited) = mpsc::channel();
     let writer = AccountWriter::start(
         store.store.clone(),
+        store.account_state.clone(),
         store.account_write_transactions.clone(),
         Arc::new(move || {
             exit.send(()).unwrap();

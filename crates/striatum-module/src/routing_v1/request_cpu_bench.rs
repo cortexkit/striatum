@@ -77,6 +77,25 @@ pub(crate) struct RequestFixture {
 }
 
 impl RequestFixture {
+    pub(crate) async fn account_request(
+        &self,
+        admission_id: &str,
+    ) -> (subc_protocol::FrameType, Value) {
+        let runner = self
+            .harness
+            .bind(reserved(&self.catalog.runners[0].module), None)
+            .await;
+        runner
+            .call(
+                "route.account_for",
+                &json!({
+                    "provider": "cpu-provider-0", "model": "model-0",
+                    "conversation_key": admission_id, "admission_id": admission_id,
+                }),
+            )
+            .await
+    }
+
     pub(crate) fn edit_config(&self, edit: impl FnOnce(&mut Value)) {
         self.harness.edit_config(edit);
     }

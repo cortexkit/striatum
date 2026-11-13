@@ -1377,6 +1377,7 @@ pub const ACCOUNT_DEMAND_SQL: &str =
 /// method reads or writes through the same transaction, so a whole admission
 /// commits or rolls back as one.
 pub struct AccountTx<'a> {
+    pub(crate) state: Option<&'a dyn crate::AccountWorkingState>,
     pub(crate) conn: &'a Connection,
 }
 
@@ -1386,15 +1387,7 @@ impl AccountTx<'_> {
     /// The installation-local salt for hashing conversation keys, created with
     /// `fresh` the first time it is needed and never changed afterwards.
     pub fn salt(&self, now: i64, fresh: impl FnOnce() -> String) -> RouteStateResult<String> {
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT salt FROM account_selection_salt WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(err)?;
+        let existing = self.existing_salt()?;
         if let Some(salt) = existing {
             return Ok(salt);
         }
@@ -1405,6 +1398,9 @@ impl AccountTx<'_> {
                 params![salt, now],
             )
             .map_err(err)?;
+        if let Some(state) = self.state {
+            state.set_selection_salt(salt.clone());
+        }
         Ok(salt)
     }
 
@@ -2161,6 +2157,9 @@ impl AccountTx<'_> {
     /// The salt if one was ever created. A read-only caller uses this: with no
     /// salt no conversation can have affinity yet.
     pub fn existing_salt(&self) -> RouteStateResult<Option<String>> {
+        if let Some(state) = self.state {
+            return Ok(state.selection_salt());
+        }
         self.conn
             .query_row(
                 "SELECT salt FROM account_selection_salt WHERE singleton = 1",
@@ -2224,6 +2223,7 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
+        let state = self.account_state.get().map(|bridge| bridge.snapshot()).transpose()?;
         self.store
             .with_read(|conn: &Connection| {
                 // A pooled reader already has a snapshot; a bare connection
@@ -2236,7 +2236,7 @@ impl SqliteRouteStateStore {
                 } else {
                     None
                 };
-                let result = f(&AccountTx { conn });
+                let result = f(&AccountTx { conn, state: state.as_deref() });
                 if result.is_ok() {
                     if let Some(tx) = tx {
                         crate::evaluation_snapshot::timed_commit(tx)?;
@@ -2271,7 +2271,7 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
-                let result = f(&AccountTx { conn: &tx });
+                let result = f(&AccountTx { conn: &tx, state: None });
                 if result.is_ok() {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }
@@ -2291,7 +2291,7 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
-                let result = f(&AccountTx { conn: &tx });
+                let result = f(&AccountTx { conn: &tx, state: None });
                 if matches!(result, Ok(true)) {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }

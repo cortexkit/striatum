@@ -1096,6 +1096,7 @@ pub struct SqliteRouteStateStore {
     catalog_cache_identity: AtomicU64,
     store: std::sync::Arc<evaluation_snapshot::ConnectionStore>,
     account_writer: std::sync::OnceLock<account_writer::AccountWriter>,
+    account_state: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,
     maintenance: Option<Mutex<Connection>>,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
@@ -1129,6 +1130,8 @@ pub struct SqliteRouteStateStore {
 mod evaluation_snapshot;
 mod account_writer;
 pub use account_writer::{AccountCommandKind, AccountReply};
+mod account_state;
+pub use account_state::{AccountStateBridge, AccountWorkingState};
 #[cfg(any(test, feature = "test-support"))]
 pub use evaluation_snapshot::record_stage_timing_for_test;
 pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
@@ -1649,6 +1652,7 @@ impl SqliteRouteStateStore {
             maintenance: None,
             store: std::sync::Arc::new(store),
             account_writer: std::sync::OnceLock::new(),
+            account_state: std::sync::Arc::new(std::sync::OnceLock::new()),
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),

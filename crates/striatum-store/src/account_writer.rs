@@ -40,8 +40,23 @@ impl AccountTx<'_> {
 fn write_batch(
     conn: &Connection,
     batch: &mut [Queued],
+    state: &mut Option<Box<dyn crate::AccountWorkingState>>,
     #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<bool> {
+    // Startup must not manufacture a write transaction or a second publication.
+    // The loader already published its consistent read before this barrier runs.
+    if batch.iter().all(|queued| queued.initialize_only) {
+        for queued in batch {
+            queued
+                .command
+                .run(&AccountTx {
+                    conn,
+                    state: state.as_deref(),
+                })
+                .expect("initialization barrier cannot fail");
+        }
+        return Ok(false);
+    }
     #[cfg(any(test, feature = "test-support"))]
     let _batch = evaluation_snapshot::AccountBatchGuard::enter();
     let transaction = crate::write_transaction(conn)?;
@@ -49,8 +64,13 @@ fn write_batch(
     transactions.fetch_add(1, Ordering::Relaxed);
     for queued in batch {
         conn.execute_batch("SAVEPOINT account_command")?;
-        let status = queued.command.run(&AccountTx { conn });
+        let before = state.as_ref().map(|state| state.fork());
+        let status = queued.command.run(&AccountTx {
+            conn,
+            state: state.as_deref(),
+        });
         if let Err(error) = status {
+            *state = before;
             // A full rollback requested by a SQLite trigger, disk-full and
             // I/O failures can destroy the
             // transaction, including savepoints. Never run a sibling in
@@ -68,7 +88,7 @@ fn write_batch(
     }
     #[cfg(any(test, feature = "test-support"))]
     crash_for_test("before_commit");
-    evaluation_snapshot::timed_commit(transaction)
+    evaluation_snapshot::timed_commit(transaction).map(|()| true)
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -134,6 +154,7 @@ where
 
 struct Queued {
     enqueued: Instant,
+    initialize_only: bool,
     command: Box<dyn Command>,
 }
 
@@ -168,6 +189,7 @@ pub(crate) struct AccountWriter {
 impl AccountWriter {
     fn start(
         store: Arc<evaluation_snapshot::ConnectionStore>,
+        bridge: Arc<std::sync::OnceLock<Arc<dyn crate::AccountStateBridge>>>,
         #[cfg(any(test, feature = "test-support"))] transactions: Arc<AtomicU64>,
         exit: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -182,55 +204,73 @@ impl AccountWriter {
         let spawn = std::thread::Builder::new()
             .name("account-writer".into())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    while let Ok(first) = receiver.recv() {
-                        let mut batch = vec![first];
-                        // No linger: an idle writer begins immediately. After a
-                        // commit, drain only commands already queued, up to 32.
-                        while batch.len() < MAX_BATCH {
-                            match receiver.try_recv() {
-                                Ok(command) => batch.push(command),
-                                Err(_) => break,
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> RouteStateResult<()> {
+                        let mut state = crate::account_state::WriterAccountState::new(bridge);
+                        while let Ok(first) = receiver.recv() {
+                            let mut batch = vec![first];
+                            // No linger: an idle writer begins immediately. After a
+                            // commit, drain only commands already queued, up to 32.
+                            while batch.len() < MAX_BATCH {
+                                match receiver.try_recv() {
+                                    Ok(command) => batch.push(command),
+                                    Err(_) => break,
+                                }
+                            }
+                            let started = Instant::now();
+                            #[cfg(any(test, feature = "test-support"))]
+                            if batch.iter().any(|queued| !queued.initialize_only) {
+                                sizes.lock().unwrap().push(batch.len());
+                            }
+                            for command in &batch {
+                                store.record_command_wait(
+                                    started.duration_since(command.enqueued).as_nanos() as u64,
+                                );
+                            }
+                            let before = SqliteRouteStateStore::thread_stage_timing();
+                            let result = store
+                                .with_conn(|conn| {
+                                    Ok((|| -> RouteStateResult<_> {
+                                        state.refresh(conn)?;
+                                        let result = write_batch(
+                                            conn,
+                                            &mut batch,
+                                            &mut state.working,
+                                            #[cfg(any(test, feature = "test-support"))]
+                                            &transactions,
+                                        );
+                                        match result {
+                                            Ok(true) => state.publish(),
+                                            Ok(false) => {}
+                                            Err(_) => state.invalidate(),
+                                        }
+                                        Ok(result)
+                                    })())
+                                })
+                                .map_err(err)??;
+                            let after = SqliteRouteStateStore::thread_stage_timing();
+                            let timing = StoreStageTiming {
+                                writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
+                                sql_ns: after.sql_ns - before.sql_ns,
+                                commit_ns: after.commit_ns - before.commit_ns,
+                            };
+                            #[cfg(any(test, feature = "test-support"))]
+                            if matches!(result, Ok(true)) {
+                                crash_for_test("after_commit");
+                            }
+                            let failure = result.err().map(|error| error.to_string());
+                            for queued in batch {
+                                queued.command.publish(failure.as_deref(), timing);
                             }
                         }
-                        let started = Instant::now();
-                        #[cfg(any(test, feature = "test-support"))]
-                        sizes.lock().unwrap().push(batch.len());
-                        for command in &batch {
-                            store.record_command_wait(
-                                started.duration_since(command.enqueued).as_nanos() as u64,
-                            );
-                        }
-                        let before = SqliteRouteStateStore::thread_stage_timing();
-                        let result = store.with_conn(|conn| {
-                            write_batch(
-                                conn,
-                                &mut batch,
-                                #[cfg(any(test, feature = "test-support"))]
-                                &transactions,
-                            )
-                        });
-                        let after = SqliteRouteStateStore::thread_stage_timing();
-                        let timing = StoreStageTiming {
-                            writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
-                            sql_ns: after.sql_ns - before.sql_ns,
-                            commit_ns: after.commit_ns - before.commit_ns,
-                        };
-                        #[cfg(any(test, feature = "test-support"))]
-                        if result.is_ok() {
-                            crash_for_test("after_commit");
-                        }
-                        let failure = result.err().map(|error| error.to_string());
-                        for queued in batch {
-                            queued.command.publish(failure.as_deref(), timing);
-                        }
-                    }
-                }));
+                        Ok(())
+                    },
+                ));
                 drop(receiver);
                 // Dropping receiver and any in-flight batch wakes every blocked
                 // caller even if a command panicked before producing a result.
                 thread_dead.store(true, Ordering::Release);
-                if result.is_err() {
+                if !matches!(result, Ok(Ok(()))) {
                     thread_exit();
                 }
             });
@@ -259,6 +299,14 @@ impl AccountWriter {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_inner(f, false)
+    }
+
+    fn enqueue_inner<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        initialize_only: bool,
+    ) -> RouteStateResult<AccountReply<T>> {
         if self.dead.load(Ordering::Acquire) {
             return Err(stopped());
         }
@@ -269,6 +317,7 @@ impl AccountWriter {
             .expect("writer sender exists until drop")
             .send(Queued {
                 enqueued: Instant::now(),
+                initialize_only,
                 command: Box::new(TypedCommand {
                     run: Some(f),
                     result: None,
@@ -294,6 +343,28 @@ impl Drop for AccountWriter {
 }
 
 impl SqliteRouteStateStore {
+    pub(crate) fn initialize_account_writer_state(&self) -> RouteStateResult<()> {
+        self.account_writer_engine()
+            .enqueue_inner(|_| Ok(()), true)?
+            .wait()
+    }
+
+    fn account_writer_engine(&self) -> &AccountWriter {
+        self.account_writer.get_or_init(|| {
+            AccountWriter::start(
+                self.store.clone(),
+                self.account_state.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                self.account_write_transactions.clone(),
+                Arc::new(|| {
+                    tracing::error!("account writer died; restarting is required");
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    std::process::exit(1);
+                }),
+            )
+        })
+    }
+
     pub fn enqueue_account_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
@@ -304,18 +375,7 @@ impl SqliteRouteStateStore {
                 "private projections cannot enqueue account writer commands",
             ));
         }
-        let writer = self.account_writer.get_or_init(|| {
-            AccountWriter::start(
-                self.store.clone(),
-                #[cfg(any(test, feature = "test-support"))]
-                self.account_write_transactions.clone(),
-                Arc::new(|| {
-                    tracing::error!("account writer died; restarting is required");
-                    #[cfg(not(any(test, feature = "test-support")))]
-                    std::process::exit(1);
-                }),
-            )
-        });
+        let writer = self.account_writer_engine();
         #[cfg(any(test, feature = "test-support"))]
         let inputs = crate::replay::current();
         #[cfg(any(test, feature = "test-support"))]
