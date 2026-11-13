@@ -435,8 +435,8 @@ fn entry_rates(model: &str, facts: &Value) -> Result<ModelRates, String> {
         .as_object()
         .ok_or_else(|| "model facts are not an object".to_string())?
     {
-        // Keep mode rates as well as the ordinary basket: a mode is evidence
-        // that a model offers a service tier, and prices API-key traffic.
+        // Mode rates establish service-tier prices. Lifetime rates must also
+        // survive in memory so settlement never substitutes a different TTL.
         if !striatum_core::BasketDimension::ALL
             .into_iter()
             .any(|dimension| {
@@ -444,7 +444,10 @@ fn entry_rates(model: &str, facts: &Value) -> Result<ModelRates, String> {
                     || key
                         .strip_prefix(dimension.fact_key())
                         .is_some_and(|suffix| {
-                            suffix.starts_with(".above_context.") || suffix.starts_with(".mode.")
+                            suffix.starts_with(".above_context.")
+                                || suffix.starts_with(".mode.")
+                                || (dimension == striatum_core::BasketDimension::CacheWrite
+                                    && suffix.starts_with(".ttl."))
                         })
             })
         {
@@ -2019,6 +2022,41 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    #[test]
+    fn price_rate_lifetimes_survive_catalog_and_plane_ingestion_verbatim() {
+        for (model, lifetimes) in [
+            ("anthropic/claude", [("5m", 3.75), ("1h", 6.0)]),
+            ("openai/gpt-6.1", [("30m", 3.125), ("12h", 5.0)]),
+        ] {
+            let mut entry = readable_entry(200_000);
+            for (lifetime, rate) in lifetimes {
+                entry[format!("rate.cache_write.ttl.{lifetime}")] = json!({"state": "priced", "currency": "USD", "exponent": 6, "units": (rate * 1_000_000.0) as i64});
+                entry[format!("rate.cache_write.ttl.{lifetime}.above_context.200000")] = json!({"state": "priced", "currency": "USD", "exponent": 6, "units": (rate * 2_000_000.0) as i64});
+                entry[format!("rate.cache_write.ttl.{lifetime}.mode.fast")] = json!({"state": "priced", "currency": "USD", "exponent": 6, "units": (rate * 3_000_000.0) as i64});
+            }
+            let snapshot = isolation_catalog(1, json!({model: entry.clone()}));
+            let plane_page = model_rates(&json!({model: entry})).unwrap();
+            let catalog = PlaneCatalog {
+                base: snapshot.rates,
+                ..Default::default()
+            };
+            assert_eq!(catalog.base, plane_page);
+            let mode = catalog.mode_rates(model, "fast");
+            for (lifetime, rate) in lifetimes {
+                let key = format!("rate.cache_write.ttl.{lifetime}");
+                assert_eq!(
+                    catalog.base[model].rates[&key],
+                    BillingRate::Priced { rate }
+                );
+                assert_eq!(
+                    catalog.base[model].rates[&format!("{key}.above_context.200000")],
+                    BillingRate::Priced { rate: rate * 2.0 }
+                );
+                assert_eq!(mode[&key], BillingRate::Priced { rate: rate * 3.0 });
+            }
+        }
     }
 
     /// Only `effort` options name variants; toggles and token budgets do not,

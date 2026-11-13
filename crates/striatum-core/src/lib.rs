@@ -27,6 +27,7 @@ pub mod model_resolution;
 pub mod model_router;
 pub mod package_ceiling;
 pub mod panel;
+pub mod price_rates;
 pub mod provider_model_spec;
 pub mod quota;
 pub mod quota_extract;
