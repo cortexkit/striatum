@@ -14,7 +14,7 @@ use super::super::conformance_tests::{
 };
 use super::super::describe;
 
-#[path = "consumer_pin_tests/samples.rs"]
+#[path = "consumer_pin_tests/tests.rs"]
 mod samples;
 
 const CHAIR: &str = "prefrontal-core.athena.synthesizer";
