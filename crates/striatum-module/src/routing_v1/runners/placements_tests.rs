@@ -865,3 +865,140 @@ async fn consumer_placements_repeated_selects_never_parse_loaded_lists() {
         before
     );
 }
+
+fn classifier_harness() -> std::sync::Arc<Harness> {
+    let harness = Harness::new("classifier-placements");
+    let description: Value = serde_json::from_slice(include_bytes!(
+        "../../../tests/fixtures/classifier-describe.reply.json"
+    ))
+    .unwrap();
+    let model = &description["result"]["models"][0];
+    let key = model["model"].as_str().unwrap();
+    let (provider, name) = key.split_once('/').unwrap();
+    let rate = model["price"]["input_per_mtok_usd"].as_f64().unwrap();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+        "catalog_version":1, "resolved_at_ms":1, "models":{key:{
+            "existence":"present", "model.kind":"decision",
+            "capability.input_modalities":["text"],
+            "rate.input":{"state":"priced","currency":"USD","units":(rate * 1e9).round() as i64,"exponent":9},
+            "rate.output":{"state":"stated_zero"}
+        }}
+    })).unwrap()).unwrap();
+    let mut fact = crate::routing_v1::conformance_tests::catalog_fact(
+        &cortexkit_role_routing_conformance::CatalogModel {
+            provider: provider.into(),
+            model: name.into(),
+            family: None,
+            iq: 80,
+            context_window: 200_000,
+            max_output_tokens: 32_000,
+            tool_calls: false,
+            modalities: Vec::new(),
+            structured_output: false,
+            priced_per_token: true,
+        },
+        0,
+    );
+    fact.input_rate = snapshot.parts().0[0].input_rate.clone();
+    fact.cost_per_m_tok_out = snapshot.parts().0[0].cost_per_mtok_out;
+    let facts = vec![fact];
+    harness.install_facts(&facts);
+    harness
+        .store()
+        .apply_fusiform_catalog(snapshot.parts().0, snapshot.parts().1)
+        .unwrap();
+    let mut credentials = crate::broca_credentials::BrocaCredentials::api_test_credentials(&facts);
+    credentials.publish_plan_prices(&json!({"prices":[]}));
+    credentials.catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    let mut cache = crate::routing_v1::classifier::DescribeCache::default();
+    cache.catalog(&json!([{"module_id":"broca", "nonce_verified":true,"capabilities":{"provides":["classifier/v1"]}}]), &mut credentials, crate::now_ms() as i64);
+    cache.reply(
+        "broca",
+        Some(&description),
+        &mut credentials,
+        crate::now_ms() as i64,
+    );
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["consumers"]["classifier"] = json!({"owner":"broca"});
+        config["runners"] = json!([{"module":"chat-runner"}]);
+    });
+    harness
+}
+
+#[tokio::test]
+async fn consumer_placements_classifier_excluding_caller_never_substitutes_another_runner() {
+    let harness = classifier_harness();
+    let caller = harness.bind(reserved("broca"), None).await;
+    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    let baseline = selected(caller.call("route.select", &params).await);
+    assert_eq!(baseline["runner"]["module"], "broca");
+    harness.edit_config(|config| {
+        config["runners"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"module":"broca"}));
+        config["consumers"]["classifier"]["runners"] = json!([{"module":"broca"}]);
+    });
+    assert_eq!(
+        selected(caller.call("route.select", &params).await)["runner"],
+        baseline["runner"]
+    );
+    harness.edit_config(|config| {
+        config["consumers"]["classifier"]["runners"] = json!([{"module":"chat-runner"}]);
+    });
+    refused(
+        caller.call("route.select", &params).await,
+        "harness_unavailable",
+    );
+}
+
+#[tokio::test]
+async fn consumer_placements_classifier_empty_or_unauthorized_list_never_falls_back() {
+    let harness = classifier_harness();
+    let caller = harness.bind(reserved("broca"), None).await;
+    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    assert_eq!(
+        selected(caller.call("route.select", &params).await)["runner"]["module"],
+        "broca"
+    );
+    for entries in [json!([]), json!([{"module":"broca"}])] {
+        harness.edit_config(|config| config["consumers"]["classifier"]["runners"] = entries);
+        refused(
+            caller.call("route.select", &params).await,
+            "harness_unavailable",
+        );
+    }
+}
+
+#[tokio::test]
+async fn consumer_placements_classifier_entry_routes_and_harness_only_narrow() {
+    let harness = classifier_harness();
+    let caller = harness.bind(reserved("broca"), None).await;
+    let params = json!({"consumer":"classifier","requirements":{"iq":0}});
+    let baseline = selected(caller.call("route.select", &params).await);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca"}]);
+        config["consumers"]["classifier"]["runners"] = json!([
+            {"module":"broca","routes":[baseline["route"]["provider"].clone()]}
+        ]);
+    });
+    assert_eq!(
+        selected(caller.call("route.select", &params).await)["runner"],
+        baseline["runner"]
+    );
+    harness.edit_config(|config| {
+        config["consumers"]["classifier"]["runners"][0]["routes"] = json!(["absent-provider"])
+    });
+    let answer = caller.call("route.select", &params).await;
+    assert_eq!(answer.0, FrameType::Error, "{answer:?}");
+    assert_eq!(answer.1["code"], "no_route", "{answer:?}");
+    harness.edit_config(|config| {
+        config["consumers"]["classifier"]["runners"] =
+            json!([{"module":"broca","harness":"unhosted"}])
+    });
+    refused(
+        caller.call("route.select", &params).await,
+        "harness_unavailable",
+    );
+}

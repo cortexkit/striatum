@@ -838,8 +838,10 @@ async fn prepare_selection(
                     .attested_module()
                     .filter(|_| caller.binding_is_current())
                     .map(|module| {
-                        super::runners::Registry::classifier(
+                        super::runners::Registry::classifier_for_consumer(
                             module,
+                            operator_config,
+                            &consumer_policy,
                             &credentials,
                             &facts,
                             now as u64,

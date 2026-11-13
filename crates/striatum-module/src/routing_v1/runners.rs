@@ -196,6 +196,44 @@ impl From<Vec<RunnerPolicy>> for RunnerPolicies<'_> {
 }
 
 impl Registry {
+    pub(crate) fn classifier_for_consumer(
+        module: &str,
+        config: &crate::config_overrides::LiveConfig,
+        consumer: &crate::config_policy::ConsumerPolicy,
+        credentials: &BrocaCredentials,
+        facts: &[ModelFact],
+        now_ms: u64,
+    ) -> Self {
+        let mut registry = Self::classifier(module, credentials, facts, now_ms);
+        // Classifier selects may run only on the module the daemon verified as
+        // the caller. Settings may narrow that runner, never replace it.
+        // The old scalar spelling keeps its existing caller-bound behavior.
+        if consumer.runners.is_none() || consumer.runner.is_some() {
+            return registry;
+        }
+        let Some(original) = registry.entries.pop() else {
+            return registry;
+        };
+        registry.entries = RunnerPolicies::for_consumer(config, consumer)
+            .policies
+            .into_iter()
+            .filter(|policy| policy.module == module)
+            .map(|policy| {
+                let mut runner = original.clone();
+                runner.route_policy = config.runner_routes(&policy).cloned();
+                runner.policy.harness = policy.harness;
+                runner.policy.routes.as_mut().unwrap().retain(|route| {
+                    runner
+                        .route_policy
+                        .as_ref()
+                        .is_none_or(|specs| specs.resolve(route, false))
+                });
+                runner
+            })
+            .collect();
+        registry
+    }
+
     pub(crate) fn classifier(
         module: &str,
         credentials: &BrocaCredentials,
