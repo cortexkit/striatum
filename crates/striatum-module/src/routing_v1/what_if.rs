@@ -9,7 +9,7 @@ use cortexkit_role_routing::panel::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder, PanelOrder};
+use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder};
 
 use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
 
@@ -378,34 +378,22 @@ fn chosen_by(seat: &super::panels::EvaluatedSeat, policy: ClassPanelPolicy, seed
     let rank = seat
         .rank
         .map_or_else(String::new, |rank| format!(" ranked {rank}"));
-    let (rule, floor_applies) = if seat.phase == PanelPhase::Top {
-        (
-            format!(
-                "top-{} seat{rank} by {}",
-                policy.top_k,
-                name(json!(policy.by))
-            ),
-            policy.by != PanelOrder::Iq,
+    let rule = if seat.phase == PanelPhase::Top {
+        format!(
+            "top-{} seat{rank} by {}",
+            policy.top_k,
+            name(json!(policy.by))
         )
     } else if policy.extra_by == Some(PanelExtraOrder::Random) {
-        (
-            format!("extra seat drawn at random with seed {seed:?} from families not yet seated"),
-            true,
-        )
+        format!("extra seat drawn at random with seed {seed:?} from families not yet seated")
     } else {
-        (
-            format!(
-                "extra seat{rank} by {} among families not yet seated",
-                name(json!(policy.extra_by))
-            ),
-            true,
+        format!(
+            "extra seat{rank} by {} among families not yet seated",
+            name(json!(policy.extra_by))
         )
     };
     match policy.floor {
-        Some(floor) if floor_applies => format!("{rule}; clears class floor {floor}"),
-        Some(floor) => {
-            format!("{rule}; class floor {floor} does not apply to IQ-ranked top seats")
-        }
+        Some(floor) => format!("{rule}; clears class floor {floor}"),
         None => rule,
     }
 }

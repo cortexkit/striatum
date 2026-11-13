@@ -700,6 +700,10 @@ fn package_refusal(
         "The evidence package is {} tokens; {readers} panel seats can read that much.",
         grouped_token_count(tokens)
     )];
+    // Show the closest fits first so a nearly sufficient budget is not hidden
+    // behind smaller catalog entries when the message is shortened.
+    let mut too_small = too_small.to_vec();
+    too_small.sort_by(|a, b| b.1.cmp(&a.1));
     sentences.extend(too_small.iter().take(4).map(|(route, budget)| {
         format!(
             "{route} can read up to {} tokens.",
@@ -961,7 +965,11 @@ fn select_panel_admitted_inner(
                     .max(ceiling.tokens),
             );
             if package_tokens.unwrap() > ceiling.tokens {
-                package_limits.push((ceiling.route_key.clone(), ceiling.tokens));
+                // A larger context window cannot make a below-floor route a
+                // usable seat, so do not suggest it as a package-size remedy.
+                if iq_bar.is_none_or(|bar| admitted.route.fact.scores.elo >= bar) {
+                    package_limits.push((ceiling.route_key.clone(), ceiling.tokens));
+                }
                 causes.push(PanelCause {
                     model,
                     reason: PanelCauseReason::PackageTooLarge,
@@ -1048,7 +1056,7 @@ fn select_panel_admitted_inner(
         .iter()
         .enumerate()
         .filter_map(|(index, candidate)| {
-            if automatic && class_policy.by != PanelOrder::Iq && !clears_bar(candidate) {
+            if automatic && !clears_bar(candidate) {
                 causes.push(below_bar_cause(candidate));
                 None
             } else {
@@ -1089,14 +1097,8 @@ fn select_panel_admitted_inner(
                     && !model_seated(&candidates[*index], &selected_models)
             })
             .collect::<Vec<_>>();
-        extras.retain(|index| {
-            if clears_bar(&candidates[*index]) {
-                true
-            } else {
-                causes.push(below_bar_cause(&candidates[*index]));
-                false
-            }
-        });
+        // The top-seat scan already recorded every below-floor rejection.
+        extras.retain(|index| clears_bar(&candidates[*index]));
         let extra_order = class_policy.extra_by.unwrap();
         order_extras(&mut extras, &candidates, extra_order);
         let random = extra_order == PanelExtraOrder::Random;
@@ -1219,7 +1221,7 @@ fn select_panel_admitted_inner(
         )
     };
     // A rejected route is not necessarily a lost seat: it may share a seated
-    // family or fail the extra-seat floor even with an unlimited package budget.
+    // family or fail the class floor even with an unlimited package budget.
     // Probe the same selector without recursively probing diagnostics. Package
     // fit is binding only if removing that gate adds seats. Otherwise test the
     // floor on the package-unconstrained pool, so a route blocked by both gates

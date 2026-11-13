@@ -786,7 +786,7 @@ async fn what_if_panel_seats_what_select_panel_seats_for_the_same_seed() {
         assert_eq!(seats.len(), 3, "{row}");
         assert_eq!(
             seats[0]["chosen_by"],
-            "top-2 seat ranked 1 by iq; class floor 0 does not apply to IQ-ranked top seats"
+            "top-2 seat ranked 1 by iq; clears class floor 0"
         );
         assert!(seats[2]["chosen_by"]
             .as_str()
@@ -825,6 +825,91 @@ async fn what_if_panel_seed_decides_the_random_extra_seat_deterministically() {
         extras.len() > 1,
         "the seed never changed the extra seat: {extras:?}"
     );
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn what_if_all_panel_classes_keep_the_floor_when_strong_families_are_walled() {
+    use super::request_cpu_bench::{representative_fixture, FixtureCounts, FIXTURE_NOW};
+
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let bench = representative_fixture(FixtureCounts {
+        subscription_rules: 12,
+        exclusion_rules: 12,
+        runner_route_rules: 1,
+        catalog_facts: 12,
+        listed_credentials: 4,
+    });
+    let harness = &bench.harness;
+    // The CPU fixture starts with equal scores. Give it four strong independent
+    // families and eight weak ones so admission walls can expose a quality gap.
+    let mut facts = harness.store().get_facts().unwrap();
+    for fact in &mut facts {
+        let index: usize = fact
+            .model_id
+            .strip_prefix("model-")
+            .unwrap()
+            .parse()
+            .unwrap();
+        fact.family = Some(format!("family-{index}"));
+        fact.scores.elo = if index < 4 {
+            2000.0 - 20.0 * index as f64
+        } else {
+            593.0
+        };
+        harness
+            .store()
+            .upsert_fact(fact, striatum_core::FactSource::Override)
+            .unwrap();
+    }
+    let operator = operator(harness).await;
+    let panel = json!({"class":["audit","design_review","evaluate","diagnose","explain","spec","lab"],"seed":"floor-comparison"});
+    let before = rows(harness);
+    let baseline = dry_panels(&operator, panel.clone(), json!({})).await;
+    let models: serde_json::Map<_, _> = (1..4)
+        .map(|index| {
+            (
+                format!("cpu-provider-0/model-{index}"),
+                json!({"not_for":["athena","lab"]}),
+            )
+        })
+        .collect();
+    let walled = dry_panels(&operator, panel, json!({"policy_patch":{"models":models}})).await;
+    for (scenario, result) in [("baseline", &baseline), ("walled", &walled)] {
+        for row in result["panels"].as_array().unwrap() {
+            println!(
+                "PANEL_COMPARISON {}",
+                json!({"scenario":scenario,"class":row["class"],
+                "policy":row["policy"],"seats":dry_seats(row),"shortfall":row["shortfall"]})
+            );
+        }
+    }
+    assert_eq!(
+        before,
+        rows(harness),
+        "panel previews must not write to the bench store"
+    );
+    for (result, counts) in [
+        (&baseline, [3, 3, 3, 3, 1, 4, 4]),
+        (&walled, [1, 3, 3, 1, 1, 1, 4]),
+    ] {
+        for (row, count) in result["panels"].as_array().unwrap().iter().zip(counts) {
+            assert_eq!(row["seats"].as_array().unwrap().len(), count, "{row}");
+        }
+    }
+    for index in [0, 3, 5] {
+        let row = &walled["panels"][index];
+        assert_eq!(row["seats"][0]["route"], "cpu-provider-0/model-0");
+        assert_eq!(row["shortfall"]["code"], "floor_unmeetable", "{row}");
+        assert!(
+            row["shortfall"]["detail"]["causes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|cause| { cause["reason"] == "below_iq_floor" }),
+            "{row}"
+        );
+    }
 }
 
 #[tokio::test]

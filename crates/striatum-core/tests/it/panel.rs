@@ -173,7 +173,7 @@ fn roster_package_refusal_names_binding_seat_limits_and_zero_fitting_width() {
     let panel = select_panel(input).unwrap();
     let refusal = panel.shortfall.unwrap();
     assert_eq!(refusal.code, PanelShortfallCode::PackageUnmeetable);
-    assert_eq!(refusal.detail, "The evidence package is 500,000 tokens; none of the 2 panel seats can read that much. p/small can read up to 210,000 tokens. p/kept can read up to 460,000 tokens. A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.");
+    assert_eq!(refusal.detail, "The evidence package is 500,000 tokens; none of the 2 panel seats can read that much. p/kept can read up to 460,000 tokens. p/small can read up to 210,000 tokens. A seat gives evidence half of its context window after reserving room for its answer and prompt; the other half is kept for the panel's discussion. Narrow the evidence (line ranges or fewer includes) or set a smaller roster in the project's athena.members setting. Nothing was sent to a model and no evidence was cut.");
     assert!(panel.members.is_empty());
     for (model, detail) in [
         (
@@ -865,8 +865,8 @@ fn shortfall_precedence_and_empty_success() {
     let below = select_panel(below_input).unwrap();
     assert_eq!(
         below.shortfall.unwrap().code,
-        PanelShortfallCode::DiversityUnmeetable,
-        "the below-floor IQ top seat is admitted; lowering the floor adds no family"
+        PanelShortfallCode::IqFloorUnmeetable,
+        "the below-floor IQ top seat is refused; lowering the floor adds a family"
     );
     let diversity = select_panel(n_pick_input(
         vec![fact("one", 60.0, Some("a"))],
