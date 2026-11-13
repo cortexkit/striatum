@@ -32,7 +32,7 @@ use striatum_core::ModelRequirements;
 fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: provider.to_string(),

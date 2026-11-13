@@ -607,7 +607,7 @@ fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
             &[FusiformFactUpdate {
                 provider_id: fact.provider_id.clone(),
                 model_id: fact.model_id.clone(),
-                auth_methods: fact.auth_methods.clone(),
+                auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
                 present: true,
                 context_window: fact.context_window,
                 max_output_tokens: fact.max_output_tokens,
@@ -3764,12 +3764,6 @@ fn backoff_fixture() -> Arc<Harness> {
         })
         .collect();
     harness.install_facts(&facts);
-    // install_facts sets operator scores but does not update stored auth_methods.
-    // Publish both OAuth allowlists through the catalog so this fixture tests
-    // account-wide backoff rather than whether a model permits the sign-in.
-    for fact in &facts {
-        catalog_fact(&harness, fact);
-    }
     credentials.apply_listing(
         &ScopedCredentialListing {
             view: "two-accounts".into(),

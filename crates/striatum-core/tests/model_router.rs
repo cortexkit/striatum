@@ -69,7 +69,7 @@ fn fact(b: FactBuilder) -> ModelFact {
     let has_vector = b.class_vector.is_some();
     ModelFact {
         billing_plane: None,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: b.provider_id,

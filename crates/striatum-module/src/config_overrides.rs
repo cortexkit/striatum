@@ -2347,7 +2347,7 @@ fn apply_overrides<S: RouteStateStore>(
             .or_else(|| seed_fact.cloned())
             .unwrap_or_else(|| ModelFact {
                 billing_plane: None,
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
                 provider_id,
@@ -2459,7 +2459,7 @@ mod tests {
     fn model_overrides_preserve_catalog_family_and_refuse_family_writes() {
         let base = ModelFact {
             billing_plane: None,
-            auth_methods: None,
+            auth_methods: None, login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: "p".into(),

@@ -963,6 +963,13 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
         catalog["models"][key] = json!({"rate.input":{"state":"priced","currency":"USD","units":100,"exponent":0},
             "rate.output":{"state":"priced","currency":"USD","units":100,"exponent":0}});
     }
+    let muse: Value = serde_json::from_slice(include_bytes!("../fixtures/muse-curated.json")).unwrap();
+    catalog["curated"] = muse["curated"].clone();
+    for model in ["muse-wonder-full-1.0", "muse-spark-1.3-contributor", "muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0"] {
+        catalog["models"][format!("meta/{model}")] = json!({
+            "rate.input":{"state":"priced","currency":"USD","units":100,"exponent":0},
+            "rate.output":{"state":"priced","currency":"USD","units":100,"exponent":0}});
+    }
     let facts: Vec<_> = catalog["models"].as_object_mut().unwrap().iter_mut().map(|(key, entry)| {
         // The golden's rate-filtered reads omit existence and capabilities.
         // Scores and capabilities here are fixture inputs, not model claims.
@@ -986,7 +993,7 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
     let mut credentials = BrocaCredentials::default();
     credentials.apply_listing(&ScopedCredentialListing {
         view:"golden-login-funnel".into(),
-        credentials:[("openai","chatgpt"),("anthropic","oauth"),("google","antigravity")].into_iter().map(|(provider,method)| ListedCredential {
+        credentials:[("openai","chatgpt"),("anthropic","oauth"),("google","antigravity"),("meta","oauth")].into_iter().map(|(provider,method)| ListedCredential {
             id:format!("{method}:{provider}"), account_id:Some(format!("account-{provider}")), state:"active".into(), categories:vec!["llm-provider".into()],
             provider_ids:vec![provider.into()], serves:vec![provider.into()], credential_type:"oauth".into(),
             auth_method:Some(method.into()), ..Default::default()
@@ -1026,14 +1033,18 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
         measurements.push((picker,candidates,pick,funnel));
     }
     let removed = BTreeSet::from(["openai/gpt-4o".to_string(),"openai/gpt-5.5".to_string()]);
-    assert_eq!(measurements[0].0.len(),5);
-    assert_eq!(measurements[1].0.len(),3);
+    assert_eq!(measurements[0].0.len(),10);
+    assert_eq!(measurements[1].0.len(),8);
     assert_eq!(measurements[0].0.difference(&measurements[1].0).cloned().collect::<BTreeSet<_>>(),removed);
     assert_eq!(measurements[0].1.difference(&measurements[1].1).cloned().collect::<BTreeSet<_>>(),removed);
     assert!(measurements[1].0.is_subset(&measurements[0].0));
     assert!(measurements[1].1.is_subset(&measurements[0].1));
-    assert_eq!(measurements[0].3["reachable"],5);
-    assert_eq!(measurements[1].3["reachable"],3);
+    assert_eq!(measurements[0].3["reachable"],10);
+    assert_eq!(measurements[1].3["reachable"],8);
+    for model in ["muse-wonder-full-1.0", "muse-spark-1.3-contributor", "muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0"] {
+        assert!(measurements[1].0.contains(&format!("meta/{model}")));
+        assert!(measurements[1].1.contains(&format!("meta/{model}")));
+    }
     assert_eq!(measurements[0],measurements[2],"dropping the listing restores every surface, even after the serving index was warmed");
     println!("golden-derived fixture before/after/restored: {measurements:#?}");
 }

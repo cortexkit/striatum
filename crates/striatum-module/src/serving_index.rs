@@ -15,6 +15,7 @@ struct FactKey {
     provider: String,
     model: String,
     methods: Option<Vec<String>>,
+    login_methods_documented: bool,
 }
 
 #[cfg(test)]
@@ -66,6 +67,7 @@ impl From<&ModelFact> for FactKey {
             provider: fact.provider_id.clone(),
             model: fact.model_id.clone(),
             methods: fact.auth_methods.clone(),
+            login_methods_documented: fact.login_methods_documented,
         }
     }
 }

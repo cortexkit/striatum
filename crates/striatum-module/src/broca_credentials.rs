@@ -25,9 +25,10 @@ pub(crate) const EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED: &str =
 
 pub(crate) type CredentialAccounts = BTreeMap<String, Option<String>>;
 
-/// Provider membership and positive sign-in coverage from one complete fact
-/// snapshot. Build before filtering candidates: a model outside a panel or pick
-/// can still establish that its provider limits a sign-in to listed models.
+/// Provider membership and documented `login_methods` coverage from one complete
+/// fact snapshot. Curated auth restrictions describe only their own row. Build
+/// before filtering candidates: a model outside a panel or pick can still
+/// establish that its provider limits a sign-in to documented models.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct AuthCatalog {
     pub providers: BTreeSet<String>,
@@ -42,6 +43,7 @@ impl<'a> FromIterator<&'a ModelFact> for AuthCatalog {
             for method in fact
                 .auth_methods
                 .iter()
+                .filter(|_| fact.login_methods_documented)
                 .flatten()
                 .filter(|method| *method != "apikey")
             {
@@ -71,14 +73,14 @@ impl AuthCatalog {
     }
 
     fn allows(&self, fact: &ModelFact, method: Option<&str>) -> bool {
-        match &fact.auth_methods {
-            Some(allowed) => method.is_some_and(|method| allowed.iter().any(|value| value == method)),
-            None => !method.is_some_and(|method| {
-                method != "apikey"
-                    && self.signins.get(&fact.provider_id)
-                        .is_some_and(|methods| methods.contains(method))
-            }),
+        if method.is_some_and(|method| method != "apikey"
+            && self.signins.get(&fact.provider_id).is_some_and(|methods| methods.contains(method)))
+            && !fact.login_methods_documented {
+            return false;
         }
+        fact.auth_methods.as_ref().is_none_or(|allowed| {
+            method.is_some_and(|method| allowed.iter().any(|value| value == method))
+        })
     }
 }
 
@@ -1194,12 +1196,14 @@ mod tests {
             auth_method: Some("custom-signin".into()), reason: "roster".into(),
         });
         fact.auth_methods = Some(vec!["apikey".into(), "custom-signin".into()]);
+        fact.login_methods_documented = true;
         let catalog = [&fact].into_iter().collect();
         assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
             "new positive coverage must not discard a valid quota roster choice");
 
         let mut other = crate::tests::fact("other-vendor", "listed");
         other.auth_methods = Some(vec!["another-signin".into()]);
+        other.login_methods_documented = true;
         let catalog = [&fact, &other].into_iter().collect();
         assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
             "a different provider's coverage must not affect this model's pricing");

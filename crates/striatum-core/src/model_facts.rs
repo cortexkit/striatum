@@ -318,11 +318,16 @@ pub struct ModelFact {
     #[serde(rename = "modelID")]
     pub model_id: String,
     /// Fusiform's allowed login methods. An empty list permits no credential.
-    /// Absence permits API keys and sign-ins not positively listed on any row of
-    /// this provider. Vault credential metadata must still map the credential
+    /// Curated rows restrict only themselves. Documented `login_methods` rows
+    /// also limit their provider's sign-ins to models carrying that disclosure.
+    /// Vault credential metadata must still map the credential
     /// to this catalog provider through `provider_ids` or an unambiguous `serves`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_methods: Option<Vec<String>>,
+    /// Whether `auth_methods` came from Fusiform's documented `login_methods`
+    /// coverage, rather than a curated row's local credential restriction.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub login_methods_documented: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
     /// Fusiform's `model.lineage`, verbatim; absence belongs to `other`.

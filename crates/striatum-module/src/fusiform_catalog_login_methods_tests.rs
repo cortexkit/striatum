@@ -80,6 +80,47 @@ mod login_methods_tests {
     }
 
     #[test]
+    fn curated_only_signin_preserves_unlisted_sibling_reach() {
+        let rig = Rig::new("curated-sibling");
+        let store = rig.store();
+        for model in ["muse-wonder-full-1.0", "muse-spark-1.3-contributor"] {
+            store
+                .upsert_fact(
+                    &crate::tests::fact("meta", model),
+                    striatum_core::FactSource::Seed,
+                )
+                .unwrap();
+        }
+        let reply = json!({"catalog_version":1,"resolved_at_ms":-1,
+            "models":{"meta/muse-wonder-full-1.0":{"existence":"present"},
+                      "meta/muse-spark-1.3-contributor":{"existence":"present"}},
+            "curated":[{"model":"meta/muse-wonder-full-1.0","auth_methods":["oauth"]}]});
+        apply(&store, &reply);
+        drop(store);
+        let facts = rig.store().get_facts().unwrap();
+        assert_eq!(
+            facts
+                .iter()
+                .filter(|fact| fact.provider_id == "meta")
+                .count(),
+            2
+        );
+        let mut cache = BrocaCredentials::default();
+        cache.apply_listing(
+            &ScopedCredentialListing {
+                view: "curated-sibling".into(),
+                credentials: vec![muse_credential("oauth", true)],
+                ..Default::default()
+            },
+            1,
+        );
+        let routes = cache.served_routes(&facts, 1).0;
+        assert!(routes.contains(&"meta/muse-spark-1.3-contributor".into()),
+            "a curated row restricts only itself; it does not document the sign-in's complete coverage");
+        assert!(routes.contains(&"meta/muse-wonder-full-1.0".into()));
+    }
+
+    #[test]
     fn positive_login_listing_denies_unlisted_openai_row() {
         let rig = Rig::new("positive-login");
         let facts = apply(&rig.store(), &golden_reply());
@@ -173,7 +214,7 @@ mod login_methods_tests {
     }
 
     #[test]
-    fn curated_and_login_methods_share_provider_positive_listing() {
+    fn only_login_methods_establish_provider_positive_listing() {
         let rig = Rig::new("generic-login");
         for member in ["curated", "login_methods"] {
             let reply = json!({"catalog_version":1,"resolved_at_ms":-1,
@@ -197,12 +238,125 @@ mod login_methods_tests {
                         &catalog,
                         &Default::default()
                     ),
-                    fact.model_id == "listed",
+                    member == "curated" || fact.model_id == "listed",
                     "{member}: {}",
                     fact.model_id
                 );
             }
         }
+    }
+
+    #[test]
+    fn source_change_preserves_row_policy_but_withdraws_coverage_and_refreshes_variants() {
+        use striatum_core::FactSource;
+        let rig = Rig::new("login-source");
+        let store = rig.store();
+        let mut reply = golden_reply();
+        let facts = apply(&store, &reply);
+        let mut variant = facts
+            .iter()
+            .find(|fact| fact.model_id == "gpt-6.1-sol")
+            .unwrap()
+            .clone();
+        variant.variant = Some("high".into());
+        variant.login_methods_documented = false;
+        store.upsert_fact(&variant, FactSource::Override).unwrap();
+        assert!(
+            store
+                .get_fact_by_route_key("openai/gpt-6.1-sol/high")
+                .unwrap()
+                .unwrap()
+                .login_methods_documented,
+            "a score variant inherits the catalog's coverage source, not the caller's marker"
+        );
+        let fingerprint = store.catalog_fingerprint().unwrap();
+        reply["curated"] = reply
+            .as_object_mut()
+            .unwrap()
+            .remove("login_methods")
+            .unwrap();
+        reply["catalog_version"] = json!(2);
+        apply(&store, &reply);
+        assert_ne!(
+            fingerprint,
+            store.catalog_fingerprint().unwrap(),
+            "changing only disclosure provenance still changes routing reachability"
+        );
+        drop(store);
+        let store = rig.store();
+        let listed = store
+            .get_fact_by_route_key("openai/gpt-6.1-sol/high")
+            .unwrap()
+            .unwrap();
+        assert!(!listed.login_methods_documented);
+        assert_eq!(
+            listed.auth_methods,
+            Some(vec!["apikey".into(), "chatgpt".into()])
+        );
+        let facts = store.get_facts().unwrap();
+        assert!(cache("chatgpt")
+            .served_routes(&facts, 1)
+            .0
+            .contains(&"openai/gpt-4o".into()));
+        assert!(
+            !cache("chatgpt")
+                .served_routes(&facts, 1)
+                .0
+                .contains(&"openai/gpt-5.5".into()),
+            "the API-only curated row keeps its local restriction"
+        );
+    }
+
+    #[test]
+    fn additive_coverage_migration_keeps_existing_rows_and_curated_policy() {
+        let rig = Rig::new("login-migration");
+        let path = rig.dir.join("route.db");
+        let descriptor = striatum_store::dev_descriptor(
+            "fusiform-catalog-test",
+            path.to_string_lossy().into_owned(),
+        );
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 86).unwrap();
+        drop(old);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let key: String = connection
+            .query_row(
+                "SELECT route_key FROM model_facts ORDER BY route_key LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE model_facts SET auth_methods_json='[\"oauth\"]' WHERE route_key=?1",
+                [&key],
+            )
+            .unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM model_facts", [], |row| row.get(0))
+            .unwrap();
+        drop(connection);
+        let store = rig.store();
+        let fact = store.get_fact_by_route_key(&key).unwrap().unwrap();
+        assert_eq!(fact.auth_methods, Some(vec!["oauth".into()]));
+        assert!(
+            !fact.login_methods_documented,
+            "a migration cannot infer documented coverage from a curated restriction"
+        );
+        drop(store);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM model_facts", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            count
+        );
+        assert_eq!(
+            connection
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
+        );
     }
 
     #[test]

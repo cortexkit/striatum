@@ -976,6 +976,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
     let mut auth_methods = BTreeMap::new();
+    let documented: BTreeSet<_> = reply.login_methods.iter().map(|row| row.model.clone()).collect();
     for row in reply.curated.into_iter().chain(reply.login_methods) {
         let mut methods = row.auth_methods;
         methods.sort();
@@ -1048,7 +1049,8 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             &entry,
             entry_auth_methods,
         ) {
-            Ok((fact, model_rates)) => {
+            Ok((mut fact, model_rates)) => {
+                fact.login_methods_documented = documented.contains(&served_key);
                 audio_input_prices.insert(
                     served_key.clone(),
                     AudioInputPrice::decode(&served_key, &entry),
@@ -1128,6 +1130,7 @@ fn decode_model_entry(
         provider_id: provider_id.to_string(),
         model_id: model_id.to_string(),
         auth_methods,
+        login_methods_documented: false,
         present,
         context_window: model.context.map(|value| value as f64),
         max_output_tokens: model.output,
@@ -2321,8 +2324,7 @@ mod tests {
             );
             let (routes, fallback) = cache.served_routes(&facts, 1);
             assert!(fallback.is_none());
-            assert_eq!(routes.iter().any(|key| key == "meta/unrestricted"), methods.contains(&"apikey"),
-                "a provider's positive OAuth listing excludes its unlisted row, but not API keys");
+            assert!(routes.iter().any(|key| key == "meta/unrestricted"));
             let available = routes.into_iter().collect();
             let admission = admit_routes(
                 &facts,
@@ -2359,8 +2361,8 @@ mod tests {
                     .contains(&("meta".into(), "oauth".into())));
             }
             if methods.len() > 1 {
-                assert!(cache.plane_keys().contains(&("meta".into(), "apikey".into())),
-                    "the key still serves the unlisted row even though it cannot serve the OAuth-only row");
+                assert!(!cache.plane_keys().contains(&("meta".into(), "apikey".into())),
+                    "an ineligible key must not make the restricted model's billing method ambiguous");
             }
         }
     }
