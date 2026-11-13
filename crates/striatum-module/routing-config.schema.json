@@ -361,7 +361,7 @@
           "default": null
         },
         "runners": {
-          "description": "Replaces the global placement list, including when explicitly empty.",
+          "description": "Replaces the global runner list for this consumer and its dotted children, including when empty.",
           "type": [
             "array",
             "null"

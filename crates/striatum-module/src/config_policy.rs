@@ -565,7 +565,7 @@ pub struct ConsumerPolicy {
     pub ladder: Option<Vec<String>>,
     pub variants: Option<BTreeMap<String, String>>,
     pub runner: Option<String>,
-    /// Replaces the global placement list, including when explicitly empty.
+    /// Replaces the global runner list for this consumer and its dotted children, including when empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runners: Option<Vec<RunnerPolicy>>,
     pub owner: Option<String>,
