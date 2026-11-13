@@ -493,3 +493,79 @@ fn crash_before_commit_retries_fresh_and_after_commit_replays_without_second_cla
         );
     }
 }
+
+/// How long one background Tick holds the account writer when the admission
+/// history is as large as the live store's (about 221k rows). Every routing
+/// write queues behind this batch, and before Tick moved off the async runtime
+/// the runtime itself waited for it too. Also prints SQLite's plan for each
+/// Tick statement so a full scan of the history shows up by name.
+#[test]
+#[ignore = "live-sized Tick writer-hold measurement; run in release with --ignored --nocapture"]
+fn live_sized_tick_writer_hold() {
+    let rows: i64 = std::env::var("STRIATUM_TICK_ADMISSIONS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(221_642);
+    let (_scratch, store) = fixture("account-writer-tick-live-sized");
+    let now = 1_900_000_000_000_i64;
+    store
+        .store
+        .with_conn(|conn| {
+            // Synthetic history names no real decisions or pins; only its size
+            // and shape matter for the timing.
+            conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+            conn.execute(
+                "INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+                   request_mode, decision_id, conversation_hash, provider, model, account_id,
+                   credential_id, pin_id, pin_generation, state, charged, request_bytes,
+                   request_bytes_estimated, committed_at, admission_valid_until,
+                   lease_valid_until, reply_json, run_id, started_at, finished_at, released_at,
+                   model_decision_id)
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<?1)
+                 SELECT 'reserved:runner-'||(i%8), 'adm-'||i, 'fp', 'admit', 'dec-'||i, 'conv',
+                   'anthropic', 'pick', 'acct-'||(i%20), 'cred-'||(i%40), 'pin', 1,
+                   CASE WHEN i%1000=0 THEN 'reserved' ELSE 'finished' END, 0, 0, 0,
+                   ?2-i*1000, ?2-i*1000, ?2-i*1000,
+                   json_object('pad', hex(randomblob(400))), 'run-'||i, ?2-i*1000, ?2-i*1000,
+                   NULL, 'mdec-'||i
+                 FROM n",
+                rusqlite::params![rows, now],
+            )?;
+            conn.execute(
+                "INSERT INTO account_continue (principal, selection_id, request_json, answer_json,
+                   run_id, admission_id, previous_decision_id, decision_id, reservation_id,
+                   valid_until_ms) VALUES ('reserved:runner-1', 'sel', '{}', '{}', 'run-1',
+                   'adm-1', 'dec-0', 'dec-cont', 'adm-1001', ?1)",
+                [now + 60_000],
+            )?;
+            conn.execute_batch("PRAGMA foreign_keys=ON")?;
+            Ok(())
+        })
+        .unwrap();
+    store
+        .store
+        .with_conn(|conn| {
+            for sql in [
+                crate::fence_rechecks::EXPIRED_ADMISSION_PROBES,
+                "UPDATE account_admission SET state='released', released_at=?1 WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1)",
+                "UPDATE account_continue SET released_at_ms=?1 WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1",
+            ] {
+                let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let steps = plan
+                    .query_map([now], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                eprintln!("plan {:?}: {steps:?}", &sql[..60]);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let mut held = Vec::new();
+    for round in 0..5 {
+        let started = Instant::now();
+        store
+            .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + round))
+            .unwrap();
+        held.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!("tick writer hold over {rows} admissions, ms per round: {held:.1?}");
+}

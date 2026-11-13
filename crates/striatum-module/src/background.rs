@@ -130,7 +130,10 @@ pub(super) fn start(
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
     let mut loops = BackgroundLoops::default();
-    loops.spawn("account maintenance", account_tick_loop(Arc::clone(store)));
+    loops.spawn(
+        "account maintenance",
+        account_tick_loop(Arc::clone(store), ACCOUNT_TICK_PERIOD),
+    );
     loops.spawn(
         "WAL checkpoints",
         checkpoint_loop(Arc::clone(store), std::time::Duration::from_secs(15)),
@@ -253,8 +256,9 @@ pub(super) fn start(
     })
 }
 
-async fn account_tick_loop(store: SharedStore) {
-    let period = std::time::Duration::from_secs(10);
+const ACCOUNT_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     loop {
         ticks.tick().await;
@@ -290,6 +294,105 @@ async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tick waits for the account writer to commit. A slow batch ahead of it
+    /// (here one second of sleep inside a command) must not stop the routing
+    /// runtime from reading sockets or firing timers while Tick waits.
+    ///
+    /// The tick loop is woken by its own timer, so it runs on the worker that
+    /// was driving Tokio's IO and timer events. If that worker blocks the thread
+    /// while waiting, no other worker takes the driver over, and every socket
+    /// read and timer in the runtime waits for the writer too.
+    #[test]
+    fn a_tick_waiting_on_a_busy_account_writer_leaves_the_runtime_serving() {
+        use std::io::{Read, Write};
+        use striatum_store::AccountCommandKind;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const WRITER_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+        const SERVED_WITHIN: std::time::Duration = std::time::Duration::from_millis(50);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = cortexkit_test_support::ScratchDir::new("tick-runtime-stall");
+        let store = Arc::new(
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "tick-runtime-stall",
+                dir.join("store.db").to_string_lossy().into_owned(),
+            ))
+            .unwrap(),
+        );
+
+        // An unrelated one-byte echo service stands in for a route request.
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            while socket.read_exact(&mut byte).await.is_ok() {
+                if socket.write_all(&byte).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut round_trip = || {
+            let started = std::time::Instant::now();
+            client.write_all(b"x").unwrap();
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).unwrap();
+            started.elapsed()
+        };
+        round_trip();
+
+        // A timer that falls due while Tick is waiting.
+        let timer_due = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let timer = runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(timer_due)).await;
+            std::time::Instant::now().saturating_duration_since(timer_due)
+        });
+
+        let (held, holding) = std::sync::mpsc::channel();
+        let slow = store
+            .enqueue_account_command(AccountCommandKind::Maintenance, move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(WRITER_HOLD);
+                Ok(())
+            })
+            .unwrap();
+        holding.recv().unwrap();
+        let ticks = runtime.spawn(account_tick_loop(
+            Arc::clone(&store),
+            std::time::Duration::from_millis(20),
+        ));
+        while store.account_command_count_for_test(AccountCommandKind::Tick) == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Let the worker that runs Tick settle into its wait.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let echo = round_trip();
+        let timer_late = runtime.block_on(timer).unwrap();
+        slow.wait().unwrap();
+        ticks.abort();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        eprintln!("echo round trip {echo:?}; timer fired {timer_late:?} late");
+        assert!(
+            echo < SERVED_WITHIN,
+            "echo took {echo:?} while Tick waited on a busy account writer"
+        );
+        assert!(
+            timer_late < SERVED_WITHIN,
+            "timer fired {timer_late:?} late while Tick waited on a busy account writer"
+        );
+    }
 
     #[tokio::test]
     async fn checkpoint_timer_truncates_an_over_cap_wal() {

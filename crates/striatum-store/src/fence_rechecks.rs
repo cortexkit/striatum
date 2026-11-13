@@ -995,7 +995,7 @@ fn compare_block_functions(
 
 // Start from the sparse authorization table, then look up each admission by
 // its primary key instead of scanning the admission history on every request.
-const EXPIRED_ADMISSION_PROBES: &str = "SELECT DISTINCT a.principal,a.admission_id,p.owner
+pub(crate) const EXPIRED_ADMISSION_PROBES: &str = "SELECT DISTINCT a.principal,a.admission_id,p.owner
     FROM fence_probe_authorization p JOIN account_admission a
       ON a.principal=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[1]')
       AND a.admission_id=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[2]')
