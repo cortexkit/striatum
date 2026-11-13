@@ -25,6 +25,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "account_status",
     "head_choices",
     "report_outcomes",
+    cortexkit_role_routing::capabilities::REPORT_ATTEMPT_OUTCOMES,
     "report_usage_run_id",
     "select_pin_slot",
     "select_available_routes",

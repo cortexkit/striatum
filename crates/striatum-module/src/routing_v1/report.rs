@@ -69,12 +69,28 @@ pub(super) fn report_at(
     // and null members out alike and fixes the member order.
     let body_json = serde_json::to_string(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;
-    let credentials = deps.broca_credentials.lock().map_err(store_refusal)?.snapshot();
-    let quota = crate::ACCOUNT_QUOTA.get()
-        .and_then(|q| q.lock().ok().map(|q| q.clone())).unwrap_or_default();
+    let effect_request = attempt::for_effects(&request, now);
+    let credentials = deps
+        .broca_credentials
+        .lock()
+        .map_err(store_refusal)?
+        .snapshot();
+    let quota = crate::ACCOUNT_QUOTA
+        .get()
+        .and_then(|q| q.lock().ok().map(|q| q.clone()))
+        .unwrap_or_default();
     let account_ids = credentials.quota_account_ids(&quota);
-    let mut effects = prepare_account_facts(params, &decision, deps, now as i64, &credentials, &quota, &account_ids)?;
-    effects.preserve_probe = !matches!(params["outcome"].as_str(), Some("completed" | "failed" | "cancelled"));
+    let mut effects = attempt::account_effects(&effect_request, &credentials, |params| {
+        prepare_account_facts(
+            params,
+            &decision,
+            deps,
+            now as i64,
+            &credentials,
+            &quota,
+            &account_ids,
+        )
+    })?;
     let usage = request
         .usage
         .as_ref()
@@ -91,7 +107,7 @@ pub(super) fn report_at(
         .transpose()?
         .flatten();
     // Only success lifts the credential fence, never a neutral cancellation.
-    if request.outcome == Outcome::Completed {
+    if effect_request.outcome == Outcome::Completed {
         let credential = deps
             .store
             .decision_provider_identity(&request.decision_id)
@@ -135,8 +151,8 @@ pub(super) fn report_at(
                 body_json: body_json.clone(),
                 answer_json,
             },
-            ledger_outcome(&request, now),
-            request
+            ledger_outcome(&effect_request, now),
+            effect_request
                 .outcome
                 .is_failure()
                 .then(|| {
@@ -146,7 +162,7 @@ pub(super) fn report_at(
                         .unwrap_or_else(|| request.outcome.to_string())
                 })
                 .as_deref(),
-            request.outcome.is_failure(),
+            effect_request.outcome.is_failure(),
             &effects,
             usage.as_ref(),
             move |tx| {

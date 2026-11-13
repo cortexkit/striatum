@@ -601,6 +601,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "account_continue_signed_out",
                                 "select_price",
                                 "runner_harness_facts",
+                                "report_attempt_outcomes",
                             ][..],
                         ),
                         (

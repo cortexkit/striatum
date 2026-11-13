@@ -1570,7 +1570,6 @@ const NOT_APPLICABLE: &[&str] = &[
 const PENDING_READERS: &[(&str, &str)] = &[
     ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
-    ("report_attempt_outcomes", "placement_attempt_outcomes"),
 ];
 
 // Capabilities routing advertises that the contract crate's list of known
@@ -1696,7 +1695,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
                 &report,
                 &super::describe::capabilities()
             )
-            .is_err()
+            .is_ok()
         );
     };
     production();
@@ -1744,7 +1743,11 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
         assert_eq!(served.0, FrameType::Response, "{served:?}");
         let advertised = served.1["result"]["capabilities"].as_array().unwrap();
         for group in groups {
-            assert!(!advertised.contains(&json!(group)), "{served:?}");
+            assert_eq!(
+                advertised.contains(&json!(group)),
+                super::describe::CAPABILITIES.contains(&group),
+                "{served:?}"
+            );
         }
     })
     .await;
