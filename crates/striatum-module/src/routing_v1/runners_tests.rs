@@ -1346,7 +1346,7 @@ async fn ambiguous_legacy_program_is_unnamed_until_decision_harness_then_uses_de
             catalog.runners[0].default_harness = None;
             install_catalog(&harness, &catalog);
             let caller = harness.bind(reserved("example-consumer"), None).await;
-            // Harness-order ruling R2: only decision_harness binds the first admitting declared harness.
+            // Only decision_harness binds the first admitting declared harness when the runner has no default.
             let params = json!({
                 "consumer":"mason", "requirements":{"iq":0}, "runners":["runner-one"]
             });
