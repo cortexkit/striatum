@@ -1,0 +1,1 @@
+{"code":"pin_unavailable","message":"the pin \"anthropic/missing:medium\" cannot be served: unknown_model","detail":{"pin":"anthropic/missing:medium","reason":"unknown_model"}}
