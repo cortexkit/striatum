@@ -501,7 +501,7 @@ pub(super) fn catalog_fact(
 ) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: model.provider.clone(),
@@ -1175,9 +1175,10 @@ impl RoutingSubject for KitSubject {
     ) -> Result<(), String> {
         let harness = self.harness();
         let mut catalog = fixture::continue_catalog();
-        // The kit removes spares to check that sign-in evidence alone excludes
-        // the original credential; installing the full fixture would hide it.
-        catalog.accounts.retain(|account| credentials.iter().any(|credential| credential.account == *account));
+        // The supplied roster can remove spares to test sign-in exclusion or
+        // add accounts for chained continuations. Install it exactly rather
+        // than limiting it to accounts from the static catalog fixture.
+        catalog.accounts = credentials.iter().map(|credential| credential.account.clone()).collect();
         install_catalog(&harness, &catalog);
         for credential in credentials {
             for model in catalog.models.iter().filter(|model| {
@@ -1574,9 +1575,30 @@ const NOT_APPLICABLE: &[&str] = &[
 // refusal reason: scheduling priority and account concurrency limits are not
 // implemented here. The conformance kit's run_suite has no priority check yet;
 // concurrency_full is a refusal reason, not a capability. Keep both unserved.
-// select_kind remains pending separately until media selection is implemented.
+// select_kind and select_media remain pending until media selection is implemented.
 const PENDING_READERS: &[(&str, &[&str])] = &[
     ("select_kind", &["placement_select_kind"]),
+    (
+        "select_media",
+        &[
+            "select_media_privacy",
+            "select_media_requirements",
+            "select_media_video",
+            "select_media_ranking",
+            "select_media_ladder",
+            "select_media_llm_refuses_media",
+            "select_media_refuses_llm",
+            "select_media_metric_limit",
+            "select_media_unlisted_kind",
+            "select_media_answer",
+            "select_media_pin",
+            "select_media_price",
+            "select_media_demand",
+            "select_media_ungraded_level",
+            "select_media_policy",
+            "select_media_report_admission",
+        ],
+    ),
     ("consumer_priority", &[]),
 ];
 const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
@@ -1663,6 +1685,9 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "warm_credential_non_admit_refused",
         "placement_eligible_routes",
         "placement_consumer_declarations",
+        "continue_account_decision_preserves_route",
+        "continue_account_decision_wrong_admission_refused",
+        "continue_account_decision_chain",
     ] {
         assert_eq!(
             report.outcome(check),

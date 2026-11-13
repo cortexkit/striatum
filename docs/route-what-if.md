@@ -198,9 +198,14 @@ Panels are not seated by single select. `route.select_panel` ranks top-K seats
 by the class policy's `by` order (IQ, EQ or cost), then fills extra seats by
 `extra_by` (random, IQ, EQ or cost), one route per family and per canonical
 model. The class floor (a demand bar relative to the top routable route) gates
-only non-IQ-ranked top seats and extra seats. Each scored route is then checked
-by a pinned select for runner and account admission. Class policies come from
-operator `panels` settings, or from the class's built-in default.
+every automatic top seat and extra seat, regardless of ranking order. Each
+scored route is then checked for runner and account admission. Class policies
+come from operator `panels` settings, or from the class's built-in default.
+Audit, spec and diagnose default to floor 80; design_review, evaluate and
+explain default to 70. The floor gates IQ admission; it does not
+replace EQ or cost ordering. Lab uses the separate lab consumer and remains
+floorless by default. An operator's complete class policy still takes precedence,
+including an omitted or lower floor.
 
 With `panel`, the what-if runs that same code path for each listed class,
 under the call's `policy_patch` and `runner_declarations`, against the same
@@ -246,7 +251,7 @@ The result gains `panels`, one row per class in request order:
     "family": "claude",
     "rank": 1,
     "cost_usd": null,
-    "chosen_by": "top-2 seat ranked 1 by iq; class floor 80 does not apply to IQ-ranked top seats"
+    "chosen_by": "top-2 seat ranked 1 by iq; clears class floor 80"
   }],
   "shortfall": null,
   "funnel": {"catalog": 12, "scored": 12, "operatorAdmitted": 10, "...": 0}

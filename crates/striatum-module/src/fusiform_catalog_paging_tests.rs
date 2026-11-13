@@ -108,7 +108,7 @@ fn paged_golden_request_and_response_bytes_are_pinned() {
 }
 
 #[tokio::test]
-async fn paged_three_pages_apply_together_with_retired_models_and_curated_auth() {
+async fn paged_three_pages_apply_together_with_retired_models_and_auth_policies() {
     use striatum_core::{FactSource, RouteStateStore as _};
     let rig = Rig::new("paged-three");
     let store = std::sync::Arc::new(rig.store());
@@ -119,6 +119,10 @@ async fn paged_three_pages_apply_together_with_retired_models_and_curated_auth()
     }
     let mut retired = paged_payload(7, 700, "beta", Some("opaque::second:do-not-parse"));
     retired["models"]["beta/m"]["existence"] = json!("absent");
+    let mut last = paged_payload(7, 700, "zulu", None);
+    // Login-method disclosures on later pages must survive assembly just like
+    // curated disclosures, or page boundaries would change reachability.
+    last["login_methods"] = last.as_object_mut().unwrap().remove("curated").unwrap();
     let (mut client, peer) = paged_wire(vec![
         (
             paged_request(None),
@@ -133,7 +137,7 @@ async fn paged_three_pages_apply_together_with_retired_models_and_curated_auth()
         (
             paged_request(Some("opaque::second:do-not-parse")),
             FrameType::Response,
-            paged_payload(7, 700, "zulu", None),
+            last,
         ),
     ])
     .await;

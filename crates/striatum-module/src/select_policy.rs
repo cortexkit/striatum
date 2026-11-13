@@ -322,11 +322,8 @@ pub(crate) fn prepare_candidates(
             let rows = guard
                 .as_ref()
                 .map_or(&[][..], |guard| guard.listed_credentials());
-            let catalog_providers: std::collections::BTreeSet<String> = facts
-                .iter()
-                .filter(|fact| !catalog_targets.contains_key(&fact.provider_id))
-                .map(|fact| fact.provider_id.clone())
-                .collect();
+            let mut catalog_providers: crate::broca_credentials::AuthCatalog = facts.iter().collect();
+            catalog_providers.providers.retain(|provider| !catalog_targets.contains_key(provider));
             let mut metered_accounts = std::collections::HashSet::new();
             for fact in facts {
                 let route = fact_to_route(fact);

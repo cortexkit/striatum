@@ -1,5 +1,4 @@
 use std::{
-    collections::BTreeSet,
     sync::{Arc, Mutex},
 };
 
@@ -124,7 +123,7 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
 fn api_class_excludes_antigravity_but_alias_keeps_its_subscription() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, credentials, facts) = setup();
-    let catalog = BTreeSet::from(["google".into()]);
+    let catalog = facts.iter().collect();
     for (fact, expected, subscription) in [
         (&facts[0], "apikey:google", false),
         (&facts[1], "antigravity:google", true),
@@ -253,7 +252,7 @@ async fn athena_can_select_api_and_antigravity_rows() {
 fn single_method_and_discovery_gaps_keep_existing_reachability() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, mut credentials, facts) = setup();
-    let catalog = BTreeSet::from(["google".into()]);
+    let catalog = facts.iter().collect();
     let key = credentials.listed_credentials()[1].clone();
     credentials.apply_listing(
         &ScopedCredentialListing {
@@ -335,7 +334,7 @@ fn borrowed_rows_use_catalog_wire_family_without_changing_provider_membership() 
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
     let mut borrowed = facts[0].clone();
     borrowed.provider_id = "company-google".into();
-    let catalog = BTreeSet::from(["google".into()]);
+    let catalog = facts.iter().collect();
     assert!(credential_serves_fact(
         &rows[0],
         &borrowed,
@@ -360,7 +359,7 @@ fn borrowed_rows_use_catalog_wire_family_without_changing_provider_membership() 
 fn matching_pair_does_not_bypass_the_selected_runners_endpoint_requirement() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, mut credentials, facts) = setup();
-    let catalog = BTreeSet::from(["google".into()]);
+    let catalog = facts.iter().collect();
     credentials.wire_api_models.clear();
     credentials.runner_declarations.insert(
         RUNNER.into(),

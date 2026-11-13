@@ -53,7 +53,7 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
     FusiformFactUpdate {
         provider_id: provider.to_string(),
         model_id: model.to_string(),
-        auth_methods: None,
+        auth_methods: None, login_methods_documented: false,
         present: true,
         context_window: Some(200_000.0),
         max_output_tokens: Some(32_000),

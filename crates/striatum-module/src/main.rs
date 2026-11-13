@@ -2027,7 +2027,7 @@ fn merge_model_upsert(
             };
             ModelFact {
                 billing_plane: None,
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
                 provider_id: params.provider_id.clone(),
@@ -3466,7 +3466,7 @@ fn record_provider_reset_fence(
         // Without a frozen identity, accept only a listed credential that serves
         // the decision's model. Provider account aliases are not credential ids.
         let facts = store.get_facts().map_err(|e| e.to_string())?;
-        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let catalog = facts.iter().collect();
         let Some(fact) = facts
             .iter()
             .find(|fact| fact.provider_id == provider_id && fact.model_id == model)
@@ -7343,7 +7343,7 @@ mod tests {
     pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
             billing_plane: None,
-            auth_methods: None,
+            auth_methods: None, login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: provider.into(),
@@ -13100,13 +13100,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let result = &body["result"];
         assert_eq!(result["members"].as_array().unwrap().len(), 1);
-        assert_eq!(result["runnerUp"].as_array().unwrap().len(), 1);
+        assert_eq!(result["runnerUp"].as_array().unwrap().len(), 0);
         assert!(
             result.get("runner_up").is_none(),
             "wire keys stay camelCase"
         );
         assert_eq!(result["members"][0]["temperature"], 0.2);
-        assert!(result["runnerUp"][0].get("temperature").is_none());
         assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
         assert!(result["decisionID"].as_str().is_some());
         assert_eq!(result["policy"]["selection"], "class_policy");
@@ -13320,7 +13319,7 @@ mod tests {
                 |(provider, model, efforts)| striatum_store::FusiformFactUpdate {
                     provider_id: (*provider).into(),
                     model_id: (*model).into(),
-                    auth_methods: None,
+                    auth_methods: None, login_methods_documented: false,
                     present: true,
                     context_window: Some(200_000.0),
                     max_output_tokens: None,
@@ -15160,7 +15159,7 @@ mod tests {
             striatum_store::FusiformFactUpdate {
                 provider_id: provider.into(),
                 model_id: model.into(),
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 present: true,
                 context_window: Some(200_000.0),
                 max_output_tokens: None,

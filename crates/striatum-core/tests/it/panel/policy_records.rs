@@ -154,14 +154,13 @@ fn ranks_count_family_skips_but_not_package_admission_removals() {
             .iter()
             .map(|member| (member.route_key.as_str(), member.temperature))
             .collect::<Vec<_>>(),
-        [("p/A", Some(0.2)), ("p/D", Some(0.8))]
+        [("p/A", Some(0.2))]
     );
     let record = serde_json::to_value(panel.policy.unwrap()).unwrap();
     assert_eq!(
         record["seats"],
         json!([
-            {"slot":0,"routeKey":"p/A","reason":"topK","rank":1},
-            {"slot":1,"routeKey":"p/D","reason":"topK","rank":3}
+            {"slot":0,"routeKey":"p/A","reason":"topK","rank":1}
         ])
     );
 }
@@ -179,7 +178,7 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         ..Default::default()
     };
     for (class, class_name, by, floor) in [
-        (PanelClass::DesignReview, "design_review", "eq", json!(null)),
+        (PanelClass::DesignReview, "design_review", "eq", json!(70)),
         (PanelClass::Diagnose, "diagnose", "iq", json!(80)),
     ] {
         let policy = ClassPanelPolicy::default_for_class(class);
@@ -195,32 +194,38 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         );
         let stored = serde_json::to_string(&panel.policy.unwrap()).unwrap();
         let readback: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        assert_eq!(
-            readback,
-            json!({
-                "selection":"class_policy", "class":class_name, "topK":3, "by":by,
-                "funnel": {
-                    "catalog": 3, "scored": 3, "operatorAdmitted": 3, "callerAdmitted": 3,
-                    "reachable": 3, "capabilityEligible": 3, "quotaEligible": 3, "packageFit": 3,
-                    "adequacyEligible": 3, "distinctFamilies": 3, "initiallyAdmitted": 3,
-                    "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
-                        "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
-                        "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
-                },
-                "extra":0, "extraBy":null, "floor":floor, "width":3, "seed":null,
-                "pins":{"synthesizer":{"model":"p/synth","variant":"high"}},
-                "seats":[
-                    {"slot":0,"routeKey":"p/A","reason":"topK","rank":1},
-                    {"slot":1,"routeKey":"p/D","reason":"topK","rank":2},
-                    {"slot":2,"routeKey":"p/E","reason":"topK","rank":3}
-                ],
-                "seatedVariants":[
-                    {"slot":0,"routeKey":"p/A","variant":"base"},
-                    {"slot":1,"routeKey":"p/D","variant":"base"},
-                    {"slot":2,"routeKey":"p/E","variant":"base"}
-                ], "siblingCollapses":[]
-            })
-        );
+        let mut expected = json!({
+            "selection":"class_policy", "class":class_name, "topK":3, "by":by,
+            "funnel": {
+                "catalog": 3, "scored": 3, "operatorAdmitted": 3, "callerAdmitted": 3,
+                "reachable": 3, "capabilityEligible": 3, "quotaEligible": 3, "packageFit": 3,
+                "adequacyEligible": 1, "distinctFamilies": 1, "initiallyAdmitted": 1,
+                "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
+                    "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
+                    "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
+            },
+            "extra":0, "extraBy":null, "floor":floor, "width":3, "seed":null,
+            "pins":{"synthesizer":{"model":"p/synth","variant":"high"}},
+            "seats":[
+                {"slot":0,"routeKey":"p/A","reason":"topK","rank":1}
+            ],
+            "seatedVariants":[
+                {"slot":0,"routeKey":"p/A","variant":"base"}
+            ], "siblingCollapses":[]
+        });
+        if class == PanelClass::DesignReview {
+            for key in ["adequacyEligible", "distinctFamilies", "initiallyAdmitted"] {
+                expected["funnel"][key] = json!(2);
+            }
+            expected["seats"].as_array_mut().unwrap().push(
+                json!({"slot":1,"routeKey":"p/D","reason":"topK","rank":2}),
+            );
+            expected["seatedVariants"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"slot":1,"routeKey":"p/D","variant":"base"}));
+        }
+        assert_eq!(readback, expected);
     }
 }
 
@@ -300,7 +305,7 @@ fn extra_ranks_count_family_skips_and_omit_below_bar_candidates() {
         &PanelSelectionContext::default(),
     );
     assert_eq!(extras(&panel), ["p/first", "p/third"]);
-    assert_eq!(spares(&panel, PanelPhase::TopK), ["p/duplicate", "p/below"]);
+    assert_eq!(spares(&panel, PanelPhase::TopK), ["p/duplicate"]);
     assert_eq!(spares(&panel, PanelPhase::Extra), ["p/duplicate"]);
     let record = serde_json::to_value(panel.policy.unwrap()).unwrap();
     assert_eq!(record["seats"][1]["rank"], 1);
@@ -327,7 +332,7 @@ fn retained_below_bar_pro_has_no_extra_seat_or_spare() {
     );
     assert!(extras(&panel).is_empty());
     assert!(spares(&panel, PanelPhase::Extra).is_empty());
-    assert_eq!(spares(&panel, PanelPhase::TopK), ["p/base-pro"]);
+    assert!(spares(&panel, PanelPhase::TopK).is_empty());
     let record = serde_json::to_value(panel.policy.unwrap()).unwrap();
     assert_eq!(record["seed"], json!(null), "no random seat was drawn");
 }

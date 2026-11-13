@@ -71,7 +71,7 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
         .map(|fact| FusiformFactUpdate {
             provider_id: fact.provider_id.clone(),
             model_id: fact.model_id.clone(),
-            auth_methods: Some(vec!["apikey".into()]),
+            auth_methods: Some(vec!["apikey".into()]), login_methods_documented: false,
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,

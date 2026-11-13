@@ -1121,13 +1121,6 @@
             },
             {
               "contextWindow": 200000,
-              "family": "qwen",
-              "phase": "topK",
-              "promptParams": {},
-              "routeKey": "low/small"
-            },
-            {
-              "contextWindow": 200000,
               "family": "grok",
               "phase": "extra",
               "promptParams": {},
@@ -1336,13 +1329,6 @@
               "phase": "topK",
               "promptParams": {},
               "routeKey": "google/g"
-            },
-            {
-              "contextWindow": 200000,
-              "family": "qwen",
-              "phase": "topK",
-              "promptParams": {},
-              "routeKey": "low/small"
             },
             {
               "contextWindow": 200000,

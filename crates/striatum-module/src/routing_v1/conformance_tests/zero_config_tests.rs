@@ -237,7 +237,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     // pins may still use metered credentials. OAuth establishes subscription
     // coverage without operator-authored subscription labels.
     let credentials = shared.lock().unwrap();
-    let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+    let providers = facts.iter().collect();
     for fact in &facts {
         let class = account_selection::resolve_class(
             credentials.listed_credentials(),
