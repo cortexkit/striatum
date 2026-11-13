@@ -360,6 +360,16 @@
           ],
           "default": null
         },
+        "runners": {
+          "description": "Replaces the global placement list, including when explicitly empty.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/RunnerPolicy"
+          }
+        },
         "service_tier": {
           "anyOf": [
             {

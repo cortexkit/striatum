@@ -59,6 +59,30 @@ pub(super) struct Monitor {
 }
 
 impl Monitor {
+    fn settings_for_config(
+        &mut self,
+        config: &crate::config_overrides::LiveConfig,
+        mut report: impl FnMut(String),
+    ) {
+        let mut policies = config.v1_runners();
+        let global: HashSet<_> = policies.iter().map(|entry| entry.module.clone()).collect();
+        for (name, entries) in config.consumer_runner_lists() {
+            for entry in entries {
+                if !global.contains(&entry.module) {
+                    let warning = format!(
+                        "[striatum] settings consumers.{name}.runners module {:?}: refused: module is absent from the global runners list",
+                        entry.module
+                    );
+                    if self.warned.insert(warning.clone()) {
+                        report(warning);
+                    }
+                }
+                policies.push(entry);
+            }
+        }
+        self.settings(policies, report);
+    }
+
     pub(super) fn settings(&mut self, policies: Vec<RunnerPolicy>, report: impl FnMut(String)) {
         self.routes = policies
             .iter()
@@ -136,9 +160,9 @@ fn monitor() -> &'static Mutex<Monitor> {
     MONITOR.get_or_init(Default::default)
 }
 
-pub(crate) fn settings_loaded(policies: Vec<RunnerPolicy>) {
+pub(crate) fn settings_loaded(config: &crate::config_overrides::LiveConfig) {
     let mut monitor = monitor().lock().unwrap();
-    monitor.settings(policies, crate::warn_operator);
+    monitor.settings_for_config(config, crate::warn_operator);
 }
 
 pub(super) fn declarations_changed(declarations: &BTreeMap<String, RunnerDeclaration>) {

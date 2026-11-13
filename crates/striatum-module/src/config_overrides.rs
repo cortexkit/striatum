@@ -59,8 +59,7 @@ struct CompiledPolicy {
     allocator_default: Arc<striatum_core::accounts::AllocatorPolicy>,
     allocators: BTreeMap<String, Arc<striatum_core::accounts::AllocatorPolicy>>,
     model_pools: Vec<striatum_core::quota_extract::ModelPool>,
-    runner_routes:
-        BTreeMap<(String, Option<String>), Arc<striatum_core::provider_model_spec::CompiledSpecs>>,
+    runner_routes: BTreeMap<Vec<String>, Arc<striatum_core::provider_model_spec::CompiledSpecs>>,
     metered_fallback: std::collections::BTreeSet<String>,
 }
 
@@ -97,10 +96,16 @@ impl CompiledPolicy {
             runner_routes: config
                 .runners
                 .iter()
+                .chain(
+                    config
+                        .consumers
+                        .values()
+                        .flat_map(|consumer| consumer.runners.iter().flatten()),
+                )
                 .filter_map(|runner| {
                     runner.routes.as_ref().map(|routes| {
                         (
-                            (runner.module.clone(), runner.harness.clone()),
+                            routes.clone(),
                             Arc::new(crate::routing_v1::runners::placements::compile(routes)),
                         )
                     })
@@ -206,7 +211,22 @@ impl LiveConfig {
                 .and_then(|provider| provider.rules.service_tier),
         )
     }
-    fn new(config: RoutingConfigFile, document: Option<String>) -> Self {
+    fn new(mut config: RoutingConfigFile, document: Option<String>) -> Self {
+        // Expand the old spelling on its own entry, before dotted inheritance.
+        // Retain the old module so a select with no global entry for it still
+        // answers no_available_model, rather than the new list's harness_unavailable.
+        for consumer in config.consumers.values_mut() {
+            if let Some(module) = &consumer.runner {
+                consumer.runners = Some(
+                    config
+                        .runners
+                        .iter()
+                        .filter(|entry| &entry.module == module)
+                        .cloned()
+                        .collect(),
+                );
+            }
+        }
         let mut pricing = route_pricing(&config.model_routing);
         pricing.banked_resets_capacity = config
             .providers
@@ -490,6 +510,18 @@ fn parse_config_with_reporter(
             ));
         }
     }
+    if let Some(consumers) = value
+        .get("consumers")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (name, entry) in consumers {
+            if entry.get("runner").is_some() && entry.get("runners").is_some() {
+                return Err(format!(
+                    "consumers.{name}: runner and runners are mutually exclusive"
+                ));
+            }
+        }
+    }
     if let Some(root) = value.as_object_mut() {
         let removed = crate::config_convert::remove_account_model_families(root);
         if !removed.is_empty() {
@@ -536,6 +568,11 @@ fn parse_config_with_reporter(
         report(&format!(
             "ignored per-route multiplier `{key}`; subscription multipliers are provider-wide"
         ));
+    }
+    for (name, consumer) in &config.consumers {
+        if let Some(runners) = &consumer.runners {
+            validate_runner_list(runners, &format!("consumers.{name}.runners"))?;
+        }
     }
     config.prepare()?;
     validate_live_config(&config)?;
@@ -638,7 +675,7 @@ fn live_config_at_with_reporter(
     let active = match next {
         Ok(config) => {
             crate::routing_v1::consumers::settings_loaded(&config);
-            crate::routing_v1::runners::placements::settings_loaded(config.v1_runners());
+            crate::routing_v1::runners::placements::settings_loaded(&config);
             Arc::new(config)
         }
         Err(error) => {
@@ -757,36 +794,7 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
         }
     }
     if let Some(runners) = &section.runners {
-        let mut seen = std::collections::HashSet::new();
-        for runner in runners {
-            if !is_word(&runner.module)
-                || !seen.insert((&runner.module, &runner.harness))
-                || runner
-                    .harness
-                    .as_deref()
-                    .is_some_and(|harness| !is_word(harness))
-            {
-                return Err(format!(
-                    "model_routing.runners: module {:?} and harness must be non-empty words, each (module, harness) listed once",
-                    runner.module
-                ));
-            }
-            for spec in runner.routes.iter().flatten() {
-                let parsed = striatum_core::provider_model_spec::parse_spec(spec);
-                if spec.trim() != spec || parsed.is_none_or(|parsed| parsed.negated) {
-                    return Err(format!(
-                        "model_routing.runners.{}: route {spec:?} must be provider, provider/model or provider/model/variant",
-                        runner.module
-                    ));
-                }
-            }
-            if let Some(tag) = runner.tool_capabilities.iter().find(|tag| !is_word(tag)) {
-                return Err(format!(
-                    "model_routing.runners.{}: tool capability {tag:?} must be one non-empty word",
-                    runner.module
-                ));
-            }
-        }
+        validate_runner_list(runners, "model_routing.runners")?;
     }
     let consumers = v1_consumer_ids(section);
     for (project, pins) in &section.project_pins {
@@ -806,6 +814,41 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
                     "model_routing.project_pins.{project}.{consumer}: pin {pin:?} must be provider/model[:variant]"
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_runner_list(runners: &[RunnerPolicy], path: &str) -> Result<(), String> {
+    let is_word = |text: &str| !text.is_empty() && !text.chars().any(char::is_whitespace);
+    let mut seen = std::collections::HashSet::new();
+    for runner in runners {
+        if !is_word(&runner.module)
+            || !seen.insert((&runner.module, &runner.harness))
+            || runner
+                .harness
+                .as_deref()
+                .is_some_and(|harness| !is_word(harness))
+        {
+            return Err(format!(
+                    "{path}: module {:?} and harness must be non-empty words, each (module, harness) listed once",
+                    runner.module
+                ));
+        }
+        for spec in runner.routes.iter().flatten() {
+            let parsed = striatum_core::provider_model_spec::parse_spec(spec);
+            if spec.trim() != spec || parsed.is_none_or(|parsed| parsed.negated) {
+                return Err(format!(
+                        "{path}.{}: route {spec:?} must be provider, provider/model or provider/model/variant",
+                        runner.module
+                    ));
+            }
+        }
+        if let Some(tag) = runner.tool_capabilities.iter().find(|tag| !is_word(tag)) {
+            return Err(format!(
+                "{path}.{}: tool capability {tag:?} must be one non-empty word",
+                runner.module
+            ));
         }
     }
     Ok(())
@@ -864,9 +907,10 @@ impl LiveConfig {
         &self,
         runner: &RunnerPolicy,
     ) -> Option<&Arc<striatum_core::provider_model_spec::CompiledSpecs>> {
-        self.compiled
-            .runner_routes
-            .get(&(runner.module.clone(), runner.harness.clone()))
+        runner
+            .routes
+            .as_ref()
+            .and_then(|routes| self.compiled.runner_routes.get(routes))
     }
 
     pub fn min_band(&self) -> Option<f64> {
@@ -913,6 +957,19 @@ impl LiveConfig {
     /// The `routing/v1` runners, in preference order.
     pub fn v1_runners(&self) -> Vec<RunnerPolicy> {
         self.config.runners.clone()
+    }
+
+    pub(crate) fn consumer_runner_lists(&self) -> BTreeMap<String, Vec<RunnerPolicy>> {
+        self.config
+            .consumers
+            .iter()
+            .filter_map(|(name, policy)| {
+                policy
+                    .runners
+                    .clone()
+                    .map(|runners| (name.clone(), runners))
+            })
+            .collect()
     }
 
     /// The operator's pin for `consumer` within `project_id`, if any.
