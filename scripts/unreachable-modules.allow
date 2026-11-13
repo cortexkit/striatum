@@ -1,2 +1,2 @@
 # Deliberately dormant routing modules: <crate>/<module> # reason
-# No exceptions are currently needed.
+striatum-core/price_rates # rate resolver lands before its caller; select-answer integration wires it and removes this line
