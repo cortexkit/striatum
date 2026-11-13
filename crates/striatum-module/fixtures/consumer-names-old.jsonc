@@ -1,0 +1,31 @@
+{
+  // Consumer rules leave model-b as the only eligible example-provider model.
+  "consumers": {
+    "mason": {"pin": {"model": "example-provider/model-b"}},
+    "sidekick": {"pin": {"model": "example-provider/model-b"}},
+    "athena": {"pin": {"model": "example-provider/model-b"}},
+    "athena.gather": {"pin": {"model": "example-provider/model-b"}},
+    "synthesizer": {"pin": {"model": "example-provider/model-b"}},
+    "lab": {"pin": {"model": "example-provider/model-b"}},
+    "core": {"pin": {"model": "example-provider/model-b"}},
+    "codemode": {"pin": {"model": "example-provider/model-b"}},
+    "flow": {"pin": {"model": "example-provider/model-b"}},
+    "mc_summary": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_classify": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_curate": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_compress_cues": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_review_user": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_map": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_primers": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_retrospective": {"pin": {"model": "example-provider/model-b"}},
+    "mc_dream_verify": {"pin": {"model": "example-provider/model-b"}},
+  },
+  "providers": {
+    "example-provider": {"pin_only": false, "subscription": true, "only_for": ["mason", "sidekick", "athena", "synthesizer", "lab", "core", "codemode", "flow", "mc_summary", "mc_dream", "mc_dream_classify", "mc_dream_curate", "mc_dream_compress_cues", "mc_dream_review_user", "mc_dream_map", "mc_dream_primers", "mc_dream_retrospective", "mc_dream_verify"]}
+  },
+  "models": {
+    "example-provider/model-a": {"not_for": ["mason", "sidekick", "athena", "synthesizer", "lab", "core", "codemode", "flow", "mc_summary", "mc_dream", "mc_dream_classify", "mc_dream_curate", "mc_dream_compress_cues", "mc_dream_review_user", "mc_dream_map", "mc_dream_primers", "mc_dream_retrospective", "mc_dream_verify"]},
+    "unused-provider/manual": {"pin_only_for": ["mason", "sidekick", "athena", "synthesizer", "lab", "core", "codemode", "flow", "mc_summary", "mc_dream", "mc_dream_classify", "mc_dream_curate", "mc_dream_compress_cues", "mc_dream_review_user", "mc_dream_map", "mc_dream_primers", "mc_dream_retrospective", "mc_dream_verify"]}
+  }
+}

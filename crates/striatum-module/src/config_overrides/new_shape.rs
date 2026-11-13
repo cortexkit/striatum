@@ -8,6 +8,8 @@ impl RoutingConfigFile {
     /// Only the entity-shaped fields are read from disk; the grouped views are
     /// rebuilt atomically with each validated snapshot.
     pub(super) fn prepare(&mut self) -> Result<(), String> {
+        // Two spellings of one policy cannot be ordered without silently
+        // discarding an operator's intent, even when their values happen to agree.
         let mut exclusion_groups = serde_json::Map::new();
         let mut variants = serde_json::Map::new();
         let mut global = Vec::new();
@@ -23,6 +25,33 @@ impl RoutingConfigFile {
                     .map(|(key, model)| (key.as_str(), &model.rules)),
             )
             .collect();
+        let names: Vec<&str> = self
+            .consumers
+            .keys()
+            .map(String::as_str)
+            .chain(entities.iter().flat_map(|(_, rules)| {
+                rules
+                    .only_for
+                    .iter()
+                    .chain(rules.not_for.iter())
+                    .chain(rules.pin_only_for.iter())
+                    .flatten()
+                    .map(String::as_str)
+            }))
+            .collect();
+        for (old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
+            for name in &names {
+                if let Some(tail) = name.strip_prefix(old) {
+                    let alias = format!("{new}{tail}");
+                    if (tail.is_empty() || tail.starts_with('.')) && names.contains(&alias.as_str())
+                    {
+                        return Err(format!(
+                            "consumer alias pair {name:?} and {alias:?} cannot both be configured"
+                        ));
+                    }
+                }
+            }
+        }
         for (key, rules) in &entities {
             for name in rules.only_for.iter().chain(rules.not_for.iter()).flatten() {
                 if name.split('.').any(str::is_empty) || name.chars().any(char::is_whitespace) {
@@ -73,9 +102,16 @@ impl RoutingConfigFile {
         let mut groups = serde_json::Map::new();
         for consumer in crate::select_policy::Consumer::ALL {
             if let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) {
-                if let Some(entries) = variants.get(id) {
-                    groups.insert(id.into(), entries.clone());
-                }
+                let policy = resolve_consumer_policy(
+                    id,
+                    &self.consumers,
+                    &ConsumerPolicy::default(),
+                    &BTreeMap::new(),
+                );
+                groups.insert(
+                    id.into(),
+                    serde_json::json!(policy.variants.unwrap_or_default()),
+                );
             }
         }
         groups.insert("all".into(), serde_json::json!(self.default_variants));
@@ -156,10 +192,13 @@ impl RoutingConfigFile {
         }
         self.model_routing.pins = serde_json::from_value(serde_json::Value::Object(pins))
             .map_err(|error| error.to_string())?;
+        self.model_routing.pins.synthesizer =
+            crate::config_policy::consumer_entry(&self.consumers, "synthesizer")
+                .and_then(|policy| policy.pin.clone());
         self.model_routing.consumers = Some(
             self.consumers
                 .keys()
-                .filter(|id| !is_slot(id))
+                .filter(|id| !is_slot(id) || id.as_str() == "synthesizer")
                 .cloned()
                 .collect(),
         );
@@ -275,7 +314,9 @@ impl LiveConfig {
     /// consumer defaults. The older slot-pin reads still use `slot_pin` and
     /// `config_policy::slot_consumer`'s reserved slot list.
     pub(crate) fn select_slot_pin(&self, slot: &str) -> Option<String> {
-        let pin = self.config.consumers.get(slot)?.pin.as_ref()?;
+        let pin = crate::config_policy::consumer_entry(&self.config.consumers, slot)?
+            .pin
+            .as_ref()?;
         Some(pin.variant.as_ref().map_or_else(
             || pin.model.clone(),
             |variant| format!("{}:{variant}", pin.model),
@@ -284,7 +325,11 @@ impl LiveConfig {
 
     pub fn slot_pin(&self, slot: &str) -> Option<&crate::config_policy::SynthesizerPin> {
         is_slot(slot)
-            .then(|| self.config.consumers.get(slot)?.pin.as_ref())
+            .then(|| {
+                crate::config_policy::consumer_entry(&self.config.consumers, slot)?
+                    .pin
+                    .as_ref()
+            })
             .flatten()
     }
     pub fn consumer_policy(

@@ -220,6 +220,10 @@ async fn capture(stem: &str) -> [(String, Vec<u8>); 2] {
             ]}}}
     ]));
     harness.edit_config(|config| {
+        // The generic fixture owns flow as its sample module. This vector
+        // exercises Basal's declaration, so it must not retain another owner
+        // for the equivalent legacy spelling.
+        config["consumers"].as_object_mut().unwrap().remove("flow");
         config["runners"] = json!([
             {"module":fixture::RUNNER_ONE},
             {"module":"broca"},
