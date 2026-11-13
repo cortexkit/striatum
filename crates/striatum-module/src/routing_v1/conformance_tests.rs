@@ -1409,7 +1409,6 @@ const PENDING_READERS: &[(&str, &str)] = &[
     ("select_kind", "placement_select_kind"),
     ("select_eligible_routes", "placement_eligible_routes"),
     ("select_price", "placement_select_price"),
-    ("report_attempt_outcomes", "placement_attempt_outcomes"),
 ];
 
 // Capabilities routing advertises that the contract crate's list of known
