@@ -709,13 +709,19 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             }
             refusal
         }
-        "invalid_request" => Refusal::invalid_request(
-            detail
-                .and_then(|detail| detail.get("field"))
-                .and_then(Value::as_str)
-                .unwrap_or("params"),
-            message.clone(),
-        ),
+        "invalid_request" => {
+            let mut refusal = Refusal::invalid_request(
+                detail
+                    .and_then(|detail| detail.get("field"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("params"),
+                message.clone(),
+            );
+            if let Some(exclusions) = detail.and_then(|detail| detail.get("exclusions")) {
+                refusal.detail.insert("exclusions".into(), exclusions.clone());
+            }
+            refusal
+        }
         // Declared (0.5.2) and untimed: module-wide, use your own credential.
         "account_selection_disabled" => {
             Refusal::new(RefusalCode::AccountSelectionDisabled, message.clone())
