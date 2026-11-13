@@ -1192,6 +1192,13 @@
       "description": "A runner module `routing/v1` answers with (`runners[]`).\nListed in preference order: the first listed runner that can serve the\nanswered route is named.",
       "type": "object",
       "properties": {
+        "harness": {
+          "description": "Restrict this placement to one of the runner's declared harnesses.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "module": {
           "description": "The runner's module id. Only a route principal the daemon verified as\nthis module may call the runner operations.",
           "type": "string",

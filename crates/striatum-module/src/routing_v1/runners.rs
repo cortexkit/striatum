@@ -19,6 +19,9 @@ mod harness_choice;
 mod harness_facts;
 #[cfg(test)]
 mod harness_facts_tests;
+pub(crate) mod placements;
+#[cfg(test)]
+mod placements_tests;
 pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
@@ -60,6 +63,8 @@ pub(crate) struct EffectiveRunner {
     provider_limit_models: BTreeSet<String>,
     #[serde(skip)]
     harness_choices: Option<Vec<harness_choice::Candidate>>,
+    #[serde(skip)]
+    placement_baseline: Option<Box<EffectiveRunner>>,
 }
 
 pub(crate) fn can_offer_account(
@@ -89,6 +94,9 @@ fn is_false(value: &bool) -> bool {
 }
 
 impl EffectiveRunner {
+    pub(super) fn wire_declaration(&self) -> Option<&RunnerDeclaration> {
+        self.wire_declaration.as_ref()
+    }
     pub(crate) fn requires_wire_api_for_pair(&self, pair: &RunnerPair) -> bool {
         self.wire_declaration
             .as_ref()
@@ -115,6 +123,30 @@ impl EffectiveRunner {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Registry {
     pub entries: Vec<EffectiveRunner>,
+}
+
+/// Session selection keeps placements distinct; module-scoped operations keep
+/// reading the first configured entry, as they did before harness placements.
+pub(crate) trait RunnerKey {
+    fn matches(&self, policy: &RunnerPolicy) -> bool;
+}
+
+impl RunnerKey for str {
+    fn matches(&self, policy: &RunnerPolicy) -> bool {
+        self == policy.module
+    }
+}
+
+impl RunnerKey for String {
+    fn matches(&self, policy: &RunnerPolicy) -> bool {
+        self.as_str() == policy.module
+    }
+}
+
+impl RunnerKey for RunnerPolicy {
+    fn matches(&self, policy: &RunnerPolicy) -> bool {
+        self.module == policy.module && self.harness == policy.harness
+    }
 }
 
 pub(crate) struct RunnerPolicies<'a> {
@@ -174,6 +206,7 @@ impl Registry {
             entries: vec![EffectiveRunner {
                 policy: RunnerPolicy {
                     module: module.into(),
+                    harness: None,
                     routes: Some(reachable.iter().cloned().collect()),
                     tool_capabilities: Vec::new(),
                     via_vault: true,
@@ -195,6 +228,7 @@ impl Registry {
                 no_account_models: BTreeSet::new(),
                 provider_limit_models: BTreeSet::new(),
                 harness_choices: None,
+                placement_baseline: None,
             }],
         }
     }
@@ -422,9 +456,9 @@ impl Registry {
                         policy
                             .routes
                             .as_ref()
-                            .map(|routes| std::sync::Arc::new(CompiledSpecs::compile(routes)))
+                            .map(|routes| std::sync::Arc::new(placements::compile(routes)))
                     },
-                    |config| config.runner_routes(&policy.module).cloned(),
+                    |config| config.runner_routes(&policy).cloned(),
                 );
                 let routes = facts
                     .iter()
@@ -476,6 +510,7 @@ impl Registry {
                     no_account_models,
                     provider_limit_models,
                     harness_choices: None,
+                    placement_baseline: None,
                 }
             })
             .collect();
@@ -492,48 +527,78 @@ impl Registry {
             .collect()
     }
 
-    pub(crate) fn get(&self, module: &str) -> Option<&EffectiveRunner> {
+    pub(crate) fn get(&self, key: &(impl RunnerKey + ?Sized)) -> Option<&EffectiveRunner> {
         self.entries
             .iter()
-            .find(|runner| runner.policy.module == module)
+            .find(|runner| key.matches(&runner.policy))
     }
 
-    pub(crate) fn runs(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn runs(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             // Variants share their model's transport and credential reach, but
             // operator route rules still judge the exact requested variant.
             runner.matches_route(route, capacity, |runner| &runner.reachable_models)
         })
     }
 
-    pub(crate) fn can_run(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn can_run(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             runner.matches_route(route, capacity, |runner| {
                 &runner.statically_reachable_models
             })
         })
     }
 
-    pub(crate) fn no_runner_account(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn no_runner_account(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             runner.matches_route(route, capacity, |runner| &runner.no_account_models)
         })
     }
 
-    pub(crate) fn provider_limit(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn provider_limit(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             runner.matches_route(route, capacity, |runner| &runner.provider_limit_models)
         })
     }
 
-    pub(crate) fn wire_family_unverified(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn wire_family_unverified(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             runner.matches_route(route, capacity, |runner| &runner.unverified_wire_models)
         })
     }
 
-    pub(crate) fn requires_wire_api(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
+    pub(crate) fn requires_wire_api(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
             runner.matches_route(route, capacity, |runner| &runner.missing_wire_api_models)
         })
     }
@@ -883,12 +948,14 @@ pub(crate) async fn refresh_loop(
                 }
             }
             let tier_modules = if let Ok(mut credentials) = credentials.lock() {
-                cache.catalog(
+                let tiers = cache.catalog(
                     &modules,
                     &policies,
                     &mut credentials,
                     crate::now_ms() as i64,
-                )
+                );
+                placements::declarations_changed(&credentials.runner_declarations);
+                tiers
             } else {
                 BTreeSet::new()
             };

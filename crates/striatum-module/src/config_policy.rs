@@ -405,6 +405,9 @@ pub struct RunnerPolicy {
     /// this module may call the runner operations.
     #[schemars(regex(pattern = r"^\S+$"))]
     pub module: String,
+    /// Restrict this placement to one of the runner's declared harnesses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     /// The routes it runs, in the exclusion grammar (`provider`,
     /// `provider/model`, `provider/model/variant`). Absent: every route it
     /// serves. With `via_vault`, reach also requires a serving vault credential.

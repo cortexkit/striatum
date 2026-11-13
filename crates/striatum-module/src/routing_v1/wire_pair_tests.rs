@@ -379,6 +379,7 @@ fn matching_pair_does_not_bypass_the_selected_runners_endpoint_requirement() {
     ));
     let registry = super::runners::Registry::build(
         vec![crate::config_policy::RunnerPolicy {
+            harness: None,
             module: RUNNER.into(),
             via_vault: true,
             routes: None,

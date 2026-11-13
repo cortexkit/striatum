@@ -59,7 +59,8 @@ struct CompiledPolicy {
     allocator_default: Arc<striatum_core::accounts::AllocatorPolicy>,
     allocators: BTreeMap<String, Arc<striatum_core::accounts::AllocatorPolicy>>,
     model_pools: Vec<striatum_core::quota_extract::ModelPool>,
-    runner_routes: BTreeMap<String, Arc<striatum_core::provider_model_spec::CompiledSpecs>>,
+    runner_routes:
+        BTreeMap<(String, Option<String>), Arc<striatum_core::provider_model_spec::CompiledSpecs>>,
     metered_fallback: std::collections::BTreeSet<String>,
 }
 
@@ -99,10 +100,8 @@ impl CompiledPolicy {
                 .filter_map(|runner| {
                     runner.routes.as_ref().map(|routes| {
                         (
-                            runner.module.clone(),
-                            Arc::new(striatum_core::provider_model_spec::CompiledSpecs::compile(
-                                routes,
-                            )),
+                            (runner.module.clone(), runner.harness.clone()),
+                            Arc::new(crate::routing_v1::runners::placements::compile(routes)),
                         )
                     })
                 })
@@ -639,6 +638,7 @@ fn live_config_at_with_reporter(
     let active = match next {
         Ok(config) => {
             crate::routing_v1::consumers::settings_loaded(&config);
+            crate::routing_v1::runners::placements::settings_loaded(config.v1_runners());
             Arc::new(config)
         }
         Err(error) => {
@@ -759,9 +759,15 @@ fn validate_v1_policy(section: &ModelRoutingSection) -> Result<(), String> {
     if let Some(runners) = &section.runners {
         let mut seen = std::collections::HashSet::new();
         for runner in runners {
-            if !is_word(&runner.module) || !seen.insert(runner.module.as_str()) {
+            if !is_word(&runner.module)
+                || !seen.insert((&runner.module, &runner.harness))
+                || runner
+                    .harness
+                    .as_deref()
+                    .is_some_and(|harness| !is_word(harness))
+            {
                 return Err(format!(
-                    "model_routing.runners: module {:?} must be one non-empty word, listed once",
+                    "model_routing.runners: module {:?} and harness must be non-empty words, each (module, harness) listed once",
                     runner.module
                 ));
             }
@@ -856,9 +862,11 @@ impl LiveConfig {
 
     pub(crate) fn runner_routes(
         &self,
-        module: &str,
+        runner: &RunnerPolicy,
     ) -> Option<&Arc<striatum_core::provider_model_spec::CompiledSpecs>> {
-        self.compiled.runner_routes.get(module)
+        self.compiled
+            .runner_routes
+            .get(&(runner.module.clone(), runner.harness.clone()))
     }
 
     pub fn min_band(&self) -> Option<f64> {

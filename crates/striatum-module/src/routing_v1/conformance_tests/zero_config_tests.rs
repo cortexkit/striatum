@@ -82,6 +82,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
         // registry reaches every row. The missing settings file is untouched.
         let enrolled = crate::routing_v1::runners::Registry::build(
             vec![crate::config_policy::RunnerPolicy {
+                harness: None,
                 module: "broca".into(),
                 routes: None,
                 tool_capabilities: vec![],
