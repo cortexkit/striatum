@@ -995,8 +995,13 @@ fn compare_block_functions(
 
 // Start from the sparse authorization table, then look up each admission by
 // its primary key instead of scanning the admission history on every request.
-const EXPIRED_ADMISSION_PROBES: &str = "SELECT DISTINCT a.principal,a.admission_id,p.owner
-    FROM fence_probe_authorization p JOIN account_admission a
+// CROSS JOIN is SQLite's way to pin that loop order: with a plain JOIN the
+// planner preferred scanning all of account_admission (hundreds of thousands
+// of rows live) and probing the authorization index for each one, which held
+// the account writer for hundreds of milliseconds on every Tick.
+pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
+    "SELECT DISTINCT a.principal,a.admission_id,p.owner
+    FROM fence_probe_authorization p CROSS JOIN account_admission a
       ON a.principal=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[1]')
       AND a.admission_id=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[2]')
     WHERE p.owner=json_array('account_admission',a.principal,a.admission_id)
@@ -1520,6 +1525,38 @@ impl AccountTx<'_> {
 
 #[cfg(test)]
 mod tests {
+    /// Tick and every selection preview run this lookup. The authorization
+    /// table holds a handful of rows while account_admission keeps months of
+    /// history, so the plan must loop over authorizations and look admissions
+    /// up by key. A plan that scans account_admission held the account writer
+    /// for hundreds of milliseconds per Tick on a live-sized history.
+    #[test]
+    fn expired_admission_probe_lookup_never_scans_admission_history() {
+        let scratch = cortexkit_test_support::ScratchDir::new("expired-probe-plan");
+        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "expired-probe-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let preview = format!("SELECT EXISTS({})", super::EXPIRED_ADMISSION_PROBES);
+        for sql in [super::EXPIRED_ADMISSION_PROBES, preview.as_str()] {
+            let plan = store
+                .store
+                .with_conn(|conn| {
+                    conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?
+                        .query_map([0_i64], |row| row.get::<_, String>(3))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH a USING INDEX"))
+                    && !plan.iter().any(|step| step.starts_with("SCAN a")),
+                "account_admission must be searched by key, not scanned: {plan:?}"
+            );
+        }
+    }
+
     #[test]
     fn blocks_parity_rows_cover_all_kinds_states_and_lifetimes() {
         let scratch = cortexkit_test_support::ScratchDir::new("block-parity");

@@ -130,7 +130,10 @@ pub(super) fn start(
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
     let mut loops = BackgroundLoops::default();
-    loops.spawn("account maintenance", account_tick_loop(Arc::clone(store)));
+    loops.spawn(
+        "account maintenance",
+        account_tick_loop(Arc::clone(store), ACCOUNT_TICK_PERIOD),
+    );
     loops.spawn(
         "WAL checkpoints",
         checkpoint_loop(Arc::clone(store), std::time::Duration::from_secs(15)),
@@ -253,13 +256,30 @@ pub(super) fn start(
     })
 }
 
-async fn account_tick_loop(store: SharedStore) {
-    let period = std::time::Duration::from_secs(10);
+const ACCOUNT_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(10);
+
+async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     loop {
         ticks.tick().await;
-        if let Err(error) = crate::account_writer::tick(&store, crate::now_ms() as i64) {
-            tracing::warn!(%error, "account maintenance failed");
+        // Tick waits on a thread until the account writer commits it, which can
+        // take as long as every batch queued ahead of it. This task is woken by
+        // its own timer, so it runs on the worker that was driving Tokio's IO and
+        // timers; blocking that worker would freeze every socket read and timer
+        // in the routing runtime until the writer answered. Wait on the blocking
+        // pool instead.
+        let store = Arc::clone(&store);
+        let outcome = tokio::task::spawn_blocking(move || {
+            crate::account_writer::tick(&store, crate::now_ms() as i64)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "account maintenance failed"),
+            // A panic still stops this loop, so the serving loop reports it
+            // and the module restarts, as when Tick ran on this task.
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => tracing::warn!(%error, "account maintenance worker failed"),
         }
     }
 }
@@ -290,6 +310,220 @@ async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// While a slow account writer batch (one and a half seconds of sleep
+    /// inside a command) is in progress, start `waiter`, a background loop that
+    /// will queue a command behind it. Once that command is queued, the routing
+    /// runtime must still answer an unrelated socket request and fire an
+    /// unrelated timer within 50 ms.
+    ///
+    /// Each loop is woken by a timer, so it runs on the worker that was driving
+    /// Tokio's IO and timer events. If that worker blocks its thread while the
+    /// command waits, no other worker takes the driver over, and every socket
+    /// read and timer in the runtime waits for the writer too.
+    fn assert_runtime_serves_while_writer_is_busy(
+        name: &str,
+        queued: striatum_store::AccountCommandKind,
+        seed: impl FnOnce(&std::path::Path),
+        waiter: impl FnOnce(
+            SharedStore,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+    ) {
+        use std::io::{Read, Write};
+        use striatum_store::AccountCommandKind;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        const WRITER_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
+        const SERVED_WITHIN: std::time::Duration = std::time::Duration::from_millis(50);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = cortexkit_test_support::ScratchDir::new(name);
+        let path = dir.join("store.db");
+        let store = Arc::new(
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                name,
+                path.to_string_lossy().into_owned(),
+            ))
+            .unwrap(),
+        );
+        seed(&path);
+
+        // An unrelated one-byte echo service stands in for a route request.
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        runtime.spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut byte = [0u8; 1];
+            while socket.read_exact(&mut byte).await.is_ok() {
+                if socket.write_all(&byte).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        let mut round_trip = || {
+            let started = std::time::Instant::now();
+            client.write_all(b"x").unwrap();
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).unwrap();
+            started.elapsed()
+        };
+        round_trip();
+
+        // A timer that falls due while the loop's command is waiting.
+        let timer_due = std::time::Instant::now() + std::time::Duration::from_millis(400);
+        let timer = runtime.spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(timer_due)).await;
+            std::time::Instant::now().saturating_duration_since(timer_due)
+        });
+
+        let (held, holding) = std::sync::mpsc::channel();
+        let slow = store
+            .enqueue_account_command(AccountCommandKind::Maintenance, move |_| {
+                held.send(()).unwrap();
+                std::thread::sleep(WRITER_HOLD);
+                Ok(())
+            })
+            .unwrap();
+        holding.recv().unwrap();
+        let background = runtime.spawn(waiter(Arc::clone(&store)));
+        while store.account_command_count_for_test(queued) == 0 {
+            assert!(!background.is_finished(), "{name}: loop stopped early");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // Let the worker that runs the loop settle into its wait.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let echo = round_trip();
+        let timer_late = runtime.block_on(timer).unwrap();
+        slow.wait().unwrap();
+        background.abort();
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        eprintln!("{name}: echo round trip {echo:?}; timer fired {timer_late:?} late");
+        assert!(
+            echo < SERVED_WITHIN,
+            "{name}: echo took {echo:?} while a command waited on a busy account writer"
+        );
+        assert!(
+            timer_late < SERVED_WITHIN,
+            "{name}: timer fired {timer_late:?} late while a command waited on a busy account writer"
+        );
+    }
+
+    #[test]
+    fn a_tick_waiting_on_a_busy_account_writer_leaves_the_runtime_serving() {
+        assert_runtime_serves_while_writer_is_busy(
+            "tick-runtime-stall",
+            striatum_store::AccountCommandKind::Tick,
+            |_| {},
+            |store| {
+                Box::pin(account_tick_loop(
+                    store,
+                    std::time::Duration::from_millis(20),
+                ))
+            },
+        );
+    }
+
+    /// Lists no credentials, after a short timer wait so the account roster
+    /// loop resumes from a timer, like a real listing reply read off a socket.
+    struct SlowEmptyResolver;
+
+    impl cortexkit_claustrum_client::CredentialResolver for SlowEmptyResolver {
+        fn resolve<'a>(
+            &'a self,
+            _raw_handle: &'a str,
+            _min_ttl_ms: Option<u64>,
+            _force_refresh: bool,
+        ) -> cortexkit_claustrum_client::CredentialResolverFuture<
+            'a,
+            Result<
+                cortexkit_claustrum_client::ResolvedCredential,
+                cortexkit_claustrum_client::CredentialResolverError,
+            >,
+        > {
+            Box::pin(async {
+                Err(cortexkit_claustrum_client::CredentialResolverError::unavailable())
+            })
+        }
+
+        fn get_scoped<'a>(
+            &'a self,
+            _credential_id: &'a str,
+        ) -> cortexkit_claustrum_client::CredentialResolverFuture<
+            'a,
+            Result<
+                cortexkit_claustrum_client::ResolvedCredential,
+                cortexkit_claustrum_client::CredentialResolverError,
+            >,
+        > {
+            Box::pin(async {
+                Err(cortexkit_claustrum_client::CredentialResolverError::unavailable())
+            })
+        }
+
+        fn list_scoped(
+            &self,
+        ) -> cortexkit_claustrum_client::CredentialResolverFuture<
+            '_,
+            Result<
+                cortexkit_claustrum_client::ScopedCredentialListing,
+                cortexkit_claustrum_client::CredentialResolverError,
+            >,
+        > {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                Err(cortexkit_claustrum_client::CredentialResolverError::unavailable())
+            })
+        }
+    }
+
+    #[test]
+    fn the_account_roster_loop_waiting_on_a_busy_account_writer_leaves_the_runtime_serving() {
+        let scratch = cortexkit_test_support::ScratchDir::new("roster-loop-runtime-stall-files");
+        let connection_file = scratch.join("subc.json");
+        assert_runtime_serves_while_writer_is_busy(
+            "roster-loop-runtime-stall",
+            striatum_store::AccountCommandKind::Repair,
+            // An unused continuation offer past its deadline makes the loop's
+            // selection context release it through the account writer.
+            |path| {
+                rusqlite::Connection::open(path)
+                    .unwrap()
+                    .execute(
+                        "INSERT INTO account_continue (principal, selection_id, request_json,
+                           answer_json, run_id, admission_id, previous_decision_id,
+                           decision_id, reservation_id, valid_until_ms)
+                         VALUES ('reserved:runner', 'sel', '{}', '{}', 'run', 'adm', 'dec-0',
+                           'dec-1', 'adm-1', 1)",
+                        [],
+                    )
+                    .unwrap();
+            },
+            move |store| {
+                let state = Arc::new(Mutex::new(account_quota::restore_account_state(
+                    store.as_ref(),
+                )));
+                let credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
+                Box::pin(account_quota::account_quota_loop(
+                    connection_file,
+                    state,
+                    store,
+                    Arc::new(SlowEmptyResolver),
+                    credentials,
+                    crate::config_overrides::config_path(),
+                ))
+            },
+        );
+    }
 
     #[tokio::test]
     async fn checkpoint_timer_truncates_an_over_cap_wal() {
