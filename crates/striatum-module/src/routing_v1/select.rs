@@ -19,8 +19,9 @@ use std::time::Duration;
 
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode};
 use cortexkit_role_routing::select::{
-    parse_select_request_serving, Modality, PinFallback, PinOutcome, RouteRef, RunnerAuth,
-    RunnerRef, SelectAnswer, SelectRequest, ToolsRequirement, EXPLANATION_MAX_CHARS,
+    parse_select_request_serving, parse_select_request_with_defaults, Modality, PinFallback,
+    PinOutcome, RouteRef, RunnerAuth, RunnerRef, SelectAnswer, SelectRequest, ToolsRequirement,
+    EXPLANATION_MAX_CHARS,
 };
 use serde_json::{json, Value};
 use striatum_core::model_router::{
@@ -255,10 +256,12 @@ async fn select_with_profile_lookup_kind(
         "concurrency_slots",
         &["key", "running", "limit", "queued"],
     )?;
-    let request = parse_select_request_serving(
-        &crate::tier_settings::without_context(params),
-        &super::describe::capabilities(),
-    )?;
+    let config = shared.map_or_else(
+        || operator_config(deps),
+        |inputs| inputs.operator_config.clone(),
+    );
+    let consumers = super::consumers::effective(&config);
+    let request = parse_admitted_request(params, caller, &consumers, false)?;
     let (settings_layers, project_settings) = if let Some(settings) = &request.settings {
         settings.check_project_stamp(
             caller
@@ -671,6 +674,33 @@ struct SelectionInputs {
     priced_per_token: bool,
 }
 
+fn parse_admitted_request(
+    params: &Value,
+    caller: &Caller,
+    consumers: &super::consumers::Registry,
+    evaluation: bool,
+) -> Result<SelectRequest, Refusal> {
+    let capabilities = super::describe::capabilities();
+    let params = crate::tier_settings::without_context(params);
+    if capabilities
+        .iter()
+        .any(|cap| *cap == "consumer_declarations")
+    {
+        if let Some(consumer) = params.get("consumer").and_then(Value::as_str) {
+            let defaults = consumers.defaults_for(consumer);
+            if defaults.iq.is_some() {
+                // A declaration relaxes required IQ only for its admitted callers.
+                // Other requests retain the legacy parser's refusal ordering.
+                if !evaluation {
+                    consumers.admit(consumer, caller)?;
+                }
+                return parse_select_request_with_defaults(&params, &capabilities, &defaults);
+            }
+        }
+    }
+    parse_select_request_serving(&params, &capabilities)
+}
+
 async fn prepare_selection(
     params: &Value,
     caller: &Caller,
@@ -693,22 +723,17 @@ async fn prepare_selection(
             "task_ref must be 1-128 bytes of printable ASCII (0x21-0x7E)",
         ));
     }
-    let request = parse_select_request_serving(
-        &crate::tier_settings::without_context(params),
-        &super::describe::capabilities(),
-    )?;
     let live_config = &shared.live_config;
     let operator_config = &shared.operator_config;
-    let consumer = request.consumer.clone();
     let consumers = super::consumers::effective(&operator_config);
+    let request = parse_admitted_request(params, caller, &consumers, evaluation.is_some())?;
+    let consumer = request.consumer.clone();
     if evaluation.is_none() {
         consumers.admit(&consumer, caller)?;
     }
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
-    let request = parse_select_request_serving(
-        &crate::tier_settings::without_context(&effective_params),
-        &super::describe::capabilities(),
-    )?;
+    let request =
+        parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
     if request.eligible_routes.as_ref().is_some_and(Vec::is_empty) {
         return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
     }
@@ -724,11 +749,21 @@ async fn prepare_selection(
     // Payment class comes only from the resolved consumer policy, not from the
     // consumer's name.
     let legacy_consumer = select_policy::Consumer::from_id(&consumer);
+    // Keep the declared ladder out of name-only policy overlays: a settings
+    // child belonging to another owner must not inherit it.
+    let ladder = super::describe::capabilities()
+        .contains(&"consumer_declarations")
+        .then(|| consumers.defaults_for(&consumer).ladder)
+        .flatten();
     let consumer_policy = operator_config.consumer_policy(
         &consumer,
         &crate::config_policy::ConsumerPolicy {
             iq: Some(f64::from(request.requirements.iq)),
             eq: request.requirements.eq.map(f64::from),
+            mode: ladder
+                .as_ref()
+                .map(|_| crate::config_policy::ConsumerMode::Ladder),
+            ladder,
             ..Default::default()
         },
         &consumers.policies,
