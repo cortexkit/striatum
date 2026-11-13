@@ -221,6 +221,9 @@ async fn refused_typed_map_is_wholly_legacy_and_warns_at_catalog_read() {
 
 #[tokio::test]
 async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
+    // Production serves the group; withholding it here pins what a router that
+    // doesn't serve it reads from the same declaration.
+    describe::without_capability(GROUP, async {
     let (harness, _) = configured().await;
     harness.edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
     let value = slot(json!({"primary":{
@@ -262,6 +265,8 @@ async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
             candidate_registry.entries[0].pairs.as_ref().unwrap().len(),
             1
         );
+    })
+    .await;
     })
     .await;
 }
