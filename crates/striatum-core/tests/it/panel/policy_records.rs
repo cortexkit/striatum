@@ -178,7 +178,7 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         ..Default::default()
     };
     for (class, class_name, by, floor) in [
-        (PanelClass::DesignReview, "design_review", "eq", json!(null)),
+        (PanelClass::DesignReview, "design_review", "eq", json!(80)),
         (PanelClass::Diagnose, "diagnose", "iq", json!(80)),
     ] {
         let policy = ClassPanelPolicy::default_for_class(class);
@@ -194,12 +194,12 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
         );
         let stored = serde_json::to_string(&panel.policy.unwrap()).unwrap();
         let readback: serde_json::Value = serde_json::from_str(&stored).unwrap();
-        let mut expected = json!({
+        let expected = json!({
             "selection":"class_policy", "class":class_name, "topK":3, "by":by,
             "funnel": {
                 "catalog": 3, "scored": 3, "operatorAdmitted": 3, "callerAdmitted": 3,
                 "reachable": 3, "capabilityEligible": 3, "quotaEligible": 3, "packageFit": 3,
-                "adequacyEligible": 3, "distinctFamilies": 3, "initiallyAdmitted": 3,
+                "adequacyEligible": 1, "distinctFamilies": 1, "initiallyAdmitted": 1,
                 "gateOrder": ["deprecated_upstream", "unscored_awaiting_placement", "excluded_by_operator",
                     "excluded", "unavailable", "capability", "quota_or_backoff", "package_fit",
                     "sibling_collapse", "family_labeled", "phase_adequacy", "distinct_families", "initially_admitted"]
@@ -207,26 +207,12 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
             "extra":0, "extraBy":null, "floor":floor, "width":3, "seed":null,
             "pins":{"synthesizer":{"model":"p/synth","variant":"high"}},
             "seats":[
-                {"slot":0,"routeKey":"p/A","reason":"topK","rank":1},
-                {"slot":1,"routeKey":"p/D","reason":"topK","rank":2},
-                {"slot":2,"routeKey":"p/E","reason":"topK","rank":3}
+                {"slot":0,"routeKey":"p/A","reason":"topK","rank":1}
             ],
             "seatedVariants":[
-                {"slot":0,"routeKey":"p/A","variant":"base"},
-                {"slot":1,"routeKey":"p/D","variant":"base"},
-                {"slot":2,"routeKey":"p/E","variant":"base"}
+                {"slot":0,"routeKey":"p/A","variant":"base"}
             ], "siblingCollapses":[]
         });
-        if class == PanelClass::Diagnose {
-            for key in ["adequacyEligible", "distinctFamilies", "initiallyAdmitted"] {
-                expected["funnel"][key] = json!(1);
-            }
-            expected["seats"].as_array_mut().unwrap().truncate(1);
-            expected["seatedVariants"]
-                .as_array_mut()
-                .unwrap()
-                .truncate(1);
-        }
         assert_eq!(readback, expected);
     }
 }

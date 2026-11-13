@@ -891,13 +891,13 @@ async fn what_if_all_panel_classes_keep_the_floor_when_strong_families_are_walle
     );
     for (result, counts) in [
         (&baseline, [3, 3, 3, 3, 1, 4, 4]),
-        (&walled, [1, 3, 3, 1, 1, 1, 4]),
+        (&walled, [1, 1, 1, 1, 1, 1, 4]),
     ] {
         for (row, count) in result["panels"].as_array().unwrap().iter().zip(counts) {
             assert_eq!(row["seats"].as_array().unwrap().len(), count, "{row}");
         }
     }
-    for index in [0, 3, 5] {
+    for index in [0, 1, 2, 3, 5] {
         let row = &walled["panels"][index];
         assert_eq!(row["seats"][0]["route"], "cpu-provider-0/model-0");
         assert_eq!(row["shortfall"]["code"], "floor_unmeetable", "{row}");
