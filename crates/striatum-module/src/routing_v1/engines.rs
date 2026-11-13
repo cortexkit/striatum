@@ -2,8 +2,9 @@
 
 use cortexkit_role_routing::{
     engine_measurements::{self as measurements, EngineIdentity, EvalScore, EvaluationSet},
-    errors::{Refusal, RefusalCode},
+    errors::{NoRouteReason, Refusal, RefusalCode},
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
+    select_media::{self as media, SelectMediaAnswer, SelectMediaRequest},
 };
 use serde_json::Value;
 use striatum_core::{accounts::AllowedAccountClass, route_state_store::DecisionInput};
@@ -60,8 +61,66 @@ pub(super) fn select(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
     select_inner(params, caller, deps)
 }
 
+pub(super) const MEDIA_KINDS: &[&str] = &[
+    "transcribe",
+    "stream_transcribe",
+    "synthesize",
+    "realtime",
+    "image",
+    "video",
+];
+
+pub(super) fn select_media(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    let request =
+        media::parse_select_media_request(params, &super::describe::capabilities(), MEDIA_KINDS)?;
+    select_request(
+        params,
+        caller,
+        deps,
+        request.engine_request(),
+        Some(&request),
+    )
+}
+
+fn missing_media_catalog_requirement(request: &SelectMediaRequest) -> Option<&'static str> {
+    // No served catalog row carries these facts yet. An absent fact cannot
+    // prove a stated requirement, including for caller-local offers with no row.
+    // Keep the catalog keys together so future decoding has one matching site;
+    // the input-duration limit must never substitute for an output-duration cap.
+    [
+        (
+            request.requirements.output_duration_ms.is_some(),
+            "limit.output_duration_ms",
+        ),
+        (
+            request.requirements.aspect_ratio.is_some(),
+            "capability.aspect_ratios",
+        ),
+        (
+            request.requirements.audio.is_some(),
+            "capability.output_audio",
+        ),
+    ]
+    .into_iter()
+    .find_map(|(present, fact)| present.then_some(fact))
+}
+
 fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let request = wire::parse_select_engine_request(params)?;
+    select_request(params, caller, deps, request, None)
+}
+
+fn select_request(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    request: wire::SelectEngineRequest,
+    media: Option<&SelectMediaRequest>,
+) -> Result<Value, Refusal> {
     let config = super::operator_config(deps);
     let consumers = super::consumers::effective(&config);
     consumers.admit(&request.consumer, caller)?;
@@ -115,7 +174,9 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
     // name from the catalog's provider name.
     candidates.retain(|candidate| {
         let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
-        !catalog.as_ref().is_some_and(|catalog| catalog.is_decommissioned(&key))
+        !catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.is_decommissioned(&key))
             && !inputs.facts.iter().any(|fact| {
                 fact.decommissioned
                     && fact.provider_id == candidate.engine.provider
@@ -133,16 +194,21 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
     )
     .map_err(store_refusal)?;
     for candidate in &mut candidates {
-        candidate.cost = catalog
-            .as_ref()
-            .and_then(|catalog| {
-                catalog.engine_cost(
-                    &request,
-                    &candidate.engine.provider,
-                    &candidate.engine.model,
-                )
+        candidate.cost = media
+            .is_none()
+            .then(|| {
+                catalog
+                    .as_ref()
+                    .and_then(|catalog| {
+                        catalog.engine_cost(
+                            &request,
+                            &candidate.engine.provider,
+                            &candidate.engine.model,
+                        )
+                    })
+                    .map(FactNumber)
             })
-            .map(FactNumber);
+            .flatten();
         let key = striatum_core::make_route_key(
             &candidate.engine.provider,
             &candidate.engine.model,
@@ -175,7 +241,7 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         #[cfg(test)]
         let facts = media_facts.get(&(key, candidate.engine.kind.as_str().to_owned()));
         #[cfg(test)]
-        if let Some((_, cost)) = facts {
+        if let Some((_, cost)) = facts.filter(|_| media.is_none()) {
             candidate.cost = cost.filter(|value| value.is_finite()).map(FactNumber);
         }
     }
@@ -199,7 +265,7 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
             wire::Kind::Transcribe => Some("wer"),
             _ => None,
         });
-    let (evaluations, samples) = deps
+    let (mut evaluations, samples) = deps
         .store
         .engine_measurements(
             request.kind.as_str(),
@@ -207,6 +273,28 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
             &identities.into_iter().collect::<Vec<_>>(),
         )
         .map_err(store_refusal)?;
+    if let Some(limit) = media.and_then(|media| media.requirements.metric_limit.as_ref()) {
+        if Some(limit.metric.as_str()) != metric {
+            let identities: Vec<_> = candidates
+                .iter()
+                .filter(|candidate| {
+                    !candidate.selected.caller_local && candidate.engine.kind == request.kind
+                })
+                .map(|candidate| {
+                    (
+                        candidate.engine.provider.as_str(),
+                        candidate.engine.model.as_str(),
+                    )
+                })
+                .collect();
+            evaluations.extend(
+                deps.store
+                    .engine_measurements(request.kind.as_str(), Some(&limit.metric), &identities)
+                    .map_err(store_refusal)?
+                    .0,
+            );
+        }
+    }
     if request.requirements.latency_class == Some(wire::LatencyClass::Realtime) {
         for candidate in &mut candidates {
             if candidate.selected.caller_local {
@@ -250,8 +338,55 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
             )
         })
         .collect();
+    if let Some(media) = media {
+        if let Some(fact) = missing_media_catalog_requirement(media) {
+            let mut refusal = Refusal::no_route(NoRouteReason::MissingCapability, None);
+            refusal.message = format!("catalog rows have no {fact} fact");
+            return Err(refusal);
+        }
+        candidates.retain(|candidate| {
+            let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+            media
+                .exclude
+                .as_ref()
+                .is_none_or(|routes| !routes.contains(&key))
+                && media
+                    .exclude_providers
+                    .as_ref()
+                    .is_none_or(|providers| !providers.contains(&candidate.engine.provider))
+                && media
+                    .eligible_routes
+                    .as_ref()
+                    .is_none_or(|routes| routes.iter().any(|route| route.route_key() == key))
+        });
+        if let Some(limit) = &media.requirements.metric_limit {
+            let mut floor_request = request.clone();
+            floor_request.requirements.metric = Some(limit.metric.clone());
+            measurements::apply_evaluations(&floor_request, &mut candidates, &evaluations);
+            candidates.retain(|candidate| limit.admits(candidate.accuracy.map(EvalScore::get)));
+        }
+    }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
-    let winner = wire::select_engine(&request, &candidates)?;
+    let winner = if media.is_some() {
+        // Until grade and job pricing are available, measurement is the only
+        // ranking fact. Identity precedes origin when two modules offer engines.
+        candidates
+            .iter()
+            .filter(|candidate| {
+                wire::select_engine(&request, std::slice::from_ref(*candidate)).is_ok()
+            })
+            .min_by(|a, b| {
+                b.accuracy
+                    .cmp(&a.accuracy)
+                    .then_with(|| a.engine.provider.cmp(&b.engine.provider))
+                    .then_with(|| a.engine.model.cmp(&b.engine.model))
+                    .then_with(|| a.selected.module.cmp(&b.selected.module))
+                    .then_with(|| a.selected.index.cmp(&b.selected.index))
+            })
+            .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?
+    } else {
+        wire::select_engine(&request, &candidates)?
+    };
     let scope = caller.scope.as_ref();
     let decision = DecisionInput {
         decision_kind: "engine".into(), consumer: Some(request.consumer.clone()), target_agent: request.consumer.clone(),
@@ -268,7 +403,14 @@ fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Valu
         .record_decision_with_task_ref(&decision, winner.selected.module.as_deref(), None, None)
         .map_err(store_refusal)?;
     let answer = SelectEngineAnswer::new(&id, now + wire::DECISION_TTL_MS, winner.selected.clone());
-    let value = serde_json::to_value(&answer).map_err(store_refusal)?;
+    let value = if let Some(request) = media {
+        let answer = SelectMediaAnswer::new(&id, answer.expires_at_ms, winner.selected.clone());
+        media::check_answer(request, &answer)?;
+        serde_json::to_value(answer)
+    } else {
+        serde_json::to_value(&answer)
+    }
+    .map_err(store_refusal)?;
     crate::account_writer::v1_record_selection(
         deps.store,
         &V1Decision {
