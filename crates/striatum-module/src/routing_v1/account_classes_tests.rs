@@ -607,7 +607,7 @@ fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
             &[FusiformFactUpdate {
                 provider_id: fact.provider_id.clone(),
                 model_id: fact.model_id.clone(),
-                auth_methods: fact.auth_methods.clone(),
+                auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
                 present: true,
                 context_window: fact.context_window,
                 max_output_tokens: fact.max_output_tokens,

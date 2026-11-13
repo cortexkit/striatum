@@ -220,7 +220,7 @@ pub(crate) struct ClassContext {
     route_fences: Vec<striatum_store::AccountRouteFence>,
     transient_route_fences: Vec<striatum_store::AccountRouteFence>,
     pool_walls: BTreeSet<(String, String)>,
-    catalog: BTreeSet<String>,
+    catalog: crate::broca_credentials::AuthCatalog,
     targets: BTreeMap<String, String>,
     tier_accounts: Option<BTreeMap<String, Vec<String>>>,
     continuation_credential: Option<String>,
@@ -641,7 +641,7 @@ pub(crate) fn media_credential_serves(
 pub(crate) fn resolve_class<'a>(
     rows: &'a [cortexkit_claustrum_client::ListedCredential],
     fact: &striatum_core::ModelFact,
-    catalog: &BTreeSet<String>,
+    catalog: &crate::broca_credentials::AuthCatalog,
     credentials: &crate::broca_credentials::CredentialData,
     specs: &(impl striatum_core::provider_model_spec::SpecResolver + ?Sized),
     borrowed: bool,
@@ -1128,15 +1128,15 @@ impl ClassContext {
         let mut size_refusals = store
             .account_size_refusals(now_ms)
             .map_err(|error| error.to_string())?;
-        let catalog = store
-            .catalog_providers()
-            .map_err(|error| error.to_string())?;
+        let mut catalog: crate::broca_credentials::AuthCatalog = catalog_snapshot.facts.iter().collect();
+        catalog.providers = catalog_snapshot.providers.clone();
         let identity_facts: Vec<_> = facts
             .iter()
             .filter(|fact| catalog.contains(&fact.provider_id))
             .cloned()
             .collect();
         let targets = credentials.catalog_targets(&identity_facts);
+        catalog.inherit_aliases(&targets);
         let media_providers: BTreeSet<_> = credentials
             .listed_credentials()
             .iter()

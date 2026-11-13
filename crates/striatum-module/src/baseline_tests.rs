@@ -298,6 +298,7 @@ fn install_catalog(
         let fact = ModelFact {
             billing_plane: None,
             auth_methods: list("auth_methods"),
+            login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: provider.clone(),
@@ -336,7 +337,7 @@ fn install_catalog(
         updates.push(FusiformFactUpdate {
             provider_id: provider,
             model_id: model,
-            auth_methods: fact.auth_methods.clone(),
+            auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,

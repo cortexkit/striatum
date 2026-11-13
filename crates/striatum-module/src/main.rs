@@ -2009,7 +2009,7 @@ fn merge_model_upsert(
             };
             ModelFact {
                 billing_plane: None,
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
                 provider_id: params.provider_id.clone(),
@@ -3448,7 +3448,7 @@ fn record_provider_reset_fence(
         // Without a frozen identity, accept only a listed credential that serves
         // the decision's model. Provider account aliases are not credential ids.
         let facts = store.get_facts().map_err(|e| e.to_string())?;
-        let catalog = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+        let catalog = facts.iter().collect();
         let Some(fact) = facts
             .iter()
             .find(|fact| fact.provider_id == provider_id && fact.model_id == model)
@@ -7325,7 +7325,7 @@ mod tests {
     pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
             billing_plane: None,
-            auth_methods: None,
+            auth_methods: None, login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: provider.into(),
@@ -13302,7 +13302,7 @@ mod tests {
                 |(provider, model, efforts)| striatum_store::FusiformFactUpdate {
                     provider_id: (*provider).into(),
                     model_id: (*model).into(),
-                    auth_methods: None,
+                    auth_methods: None, login_methods_documented: false,
                     present: true,
                     context_window: Some(200_000.0),
                     max_output_tokens: None,
@@ -15142,7 +15142,7 @@ mod tests {
             striatum_store::FusiformFactUpdate {
                 provider_id: provider.into(),
                 model_id: model.into(),
-                auth_methods: None,
+                auth_methods: None, login_methods_documented: false,
                 present: true,
                 context_window: Some(200_000.0),
                 max_output_tokens: None,

@@ -76,7 +76,8 @@ mod consumer_and_pin {
             use striatum_store::{FusiformFactUpdate, FusiformCatalogCursor};
             let fact = self.store.get_fact_by_route_key(&format!("{provider}/{model}")).unwrap().unwrap();
             let update = FusiformFactUpdate {
-                provider_id: provider.into(), model_id: model.into(), auth_methods: methods, present: true,
+                provider_id: provider.into(), model_id: model.into(), auth_methods: methods,
+                login_methods_documented: false, present: true,
                 context_window: fact.context_window, max_output_tokens: fact.max_output_tokens.map(|n| n as u64),
                 cost_tier: fact.cost_tier, cost_per_mtok_out: fact.cost_per_m_tok_out,
                 input_rate: fact.input_rate, cache_read_rate: fact.cache_read_rate, cache_write_rate: fact.cache_write_rate, reasoning_rate: fact.reasoning_rate,
@@ -899,7 +900,7 @@ mod consumer_and_pin {
                 &[striatum_store::FusiformFactUpdate {
                     provider_id: "openai".into(),
                     model_id: "pin".into(),
-                    auth_methods: None,
+                    auth_methods: None, login_methods_documented: false,
                     present: true,
                     context_window: Some(200_000.0),
                     max_output_tokens: None,

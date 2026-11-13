@@ -171,7 +171,7 @@ pub(crate) fn choices_for_harness(
         );
     };
     let reasoning = store.reasoning_catalog().map_err(store_error)?;
-    let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
+    let providers = facts.iter().collect();
     let subscription_specs = &config.compiled_routing_policy().subscription;
     let mut grouped: BTreeMap<(&str, &str), Vec<&ModelFact>> = BTreeMap::new();
     for fact in &facts {
