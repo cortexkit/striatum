@@ -202,6 +202,11 @@ pub(crate) struct ClassContext {
     selection_probes: Option<std::sync::Arc<probe_reservations::Selection>>,
 }
 
+pub(crate) enum ProbeBinding {
+    Bound,
+    Lost { retry_at: i64 },
+}
+
 type ClassMemo = std::collections::HashMap<
     String,
     std::collections::HashMap<String, [Option<ClassMemoEntry>; 4]>,
@@ -253,7 +258,12 @@ impl Clone for RequestIndexes {
         // Clones share the structural ServingIndex, but not the dynamic cells:
         // each clone can reserve a different probe and read newer refusal and
         // fence evidence without changing the original context's answers.
-        Self::default()
+        // Remembered probe holds must survive cloning: a hold can disappear
+        // when another selection records a durable claim this snapshot cannot see.
+        Self {
+            probe_holds: std::sync::Mutex::new(self.probe_holds.lock().unwrap().clone()),
+            ..Self::default()
+        }
     }
 }
 
@@ -511,6 +521,11 @@ impl ClassContext {
         );
     }
 
+    pub(crate) fn remember_probe_holds(&self, other: &Self) {
+        let holds = other.probe_holds().clone();
+        self.probe_holds().extend(holds);
+    }
+
     fn probe_holds(
         &self,
     ) -> std::sync::MutexGuard<'_, std::collections::HashMap<ProbeHoldKey, i64>> {
@@ -522,6 +537,41 @@ impl ClassContext {
 }
 
 mod probe_reservations;
+
+#[cfg(test)]
+type ProbeBindHook = Box<dyn FnOnce(&SqliteRouteStateStore) + Send>;
+#[cfg(test)]
+static BEFORE_PROBE_BIND: std::sync::Mutex<Vec<(usize, ProbeBindHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Run once after scoring chose a probe and before its durable binding.
+#[cfg(test)]
+pub(crate) fn before_probe_bind(
+    credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    hook: impl FnOnce(&SqliteRouteStateStore) + Send + 'static,
+) {
+    BEFORE_PROBE_BIND
+        .lock()
+        .unwrap()
+        .push((std::sync::Arc::as_ptr(credentials) as usize, Box::new(hook)));
+}
+
+#[cfg(test)]
+fn run_before_probe_bind_hook(
+    scope: &std::sync::Weak<std::sync::Mutex<crate::broca_credentials::BrocaCredentials>>,
+    store: &SqliteRouteStateStore,
+) {
+    let hook = {
+        let mut hooks = BEFORE_PROBE_BIND.lock().unwrap();
+        hooks
+            .iter()
+            .position(|(key, _)| *key == scope.as_ptr() as usize)
+            .map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook(store);
+    }
+}
 
 // Replay tests compare old and new context repairs, including endpoint work
 // dispatched to blocking threads, so the test switch must be shared.
@@ -1301,9 +1351,15 @@ impl ClassContext {
         if probes.is_empty() {
             return Ok(());
         }
-        let hold = probe_reservations::Selection::new(credentials, probes, self.now_ms);
+        let (hold, blocked) = probe_reservations::Selection::new(credentials, probes, self.now_ms);
         self.probe_owner = Some(hold.owner.clone());
         self.selection_probes = Some(std::sync::Arc::new(hold));
+        // A competing selection can bind and release its hold before scoring
+        // first checks eligibility. Remember the hold while still using the
+        // snapshot that predates its durable claim.
+        for (provider, credential, until) in blocked {
+            self.note_probe_reserved(&provider, &credential, until);
+        }
         // A direct admission can claim a probe between the first store read
         // and reservation. Read after taking the hold so its renewed fence
         // cannot remain probe-eligible in this scoring snapshot.
@@ -1320,6 +1376,8 @@ impl ClassContext {
         Ok(())
     }
 
+    /// Report when scoring lost its probe, leaving a timed hold for a
+    /// fresh selection attempt. Store failures remain errors, not probe losses.
     pub(crate) fn bind_selected_probe(
         &self,
         store: &SqliteRouteStateStore,
@@ -1327,33 +1385,61 @@ impl ClassContext {
         model: &str,
         priced: bool,
         decision: &str,
-    ) -> RouteStateResult<()> {
+    ) -> RouteStateResult<ProbeBinding> {
         let Some(hold) = &self.selection_probes else {
-            return Ok(());
+            return Ok(ProbeBinding::Bound);
         };
         let Outcome::Admit(admission) = self
             .probe(provider, model, priced, false, None, "probe-reservation")
             .outcome
         else {
-            return Ok(());
+            return Ok(ProbeBinding::Lost {
+                retry_at: self
+                    .blocked_reset(provider, model, priced)
+                    .flatten()
+                    .unwrap_or(self.now_ms.saturating_add(120_000)),
+            });
         };
         if self.probe_eligible(provider, model, &admission.credential_id) {
-            let claimed = store.account_transaction(|tx| {
-                let origins: Vec<_> = tx.fence_rechecks()?.into_iter().filter(|origin| {
-                    self.origin_applies(origin, provider, &admission.account_id, &admission.credential_id, model)
-                        && !self.origin_recovered(origin, &admission.account_id)
-                }).collect();
-                tx.bind_decision_probe(&origins, &hold.owner, decision, &admission.account_id,
-                    &admission.credential_id, self.now_ms)
+            #[cfg(test)]
+            run_before_probe_bind_hook(&self.probe_scope, store);
+            let (claimed, retry_at) = store.account_transaction(|tx| {
+                let origins: Vec<_> = tx
+                    .fence_rechecks()?
+                    .into_iter()
+                    .filter(|origin| {
+                        self.origin_applies(
+                            origin,
+                            provider,
+                            &admission.account_id,
+                            &admission.credential_id,
+                            model,
+                        ) && !self.origin_recovered(origin, &admission.account_id)
+                    })
+                    .collect();
+                let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
+                let claimed = tx.bind_decision_probe(
+                    &origins,
+                    &hold.owner,
+                    decision,
+                    &admission.account_id,
+                    &admission.credential_id,
+                    self.now_ms,
+                )?;
+                Ok((claimed, retry_at))
             })?;
             if !claimed {
-                return Err(RouteStateStoreError("the selected recovery probe was already claimed".into()));
+                let retry_at = retry_at
+                    .unwrap_or(self.now_ms)
+                    .max(self.now_ms.saturating_add(1));
+                self.note_probe_reserved(provider, &admission.credential_id, retry_at);
+                return Ok(ProbeBinding::Lost { retry_at });
             }
             // A runner may send without a later account admission. Its decision
             // must own the durable interval before the route is returned.
             hold.release_selected(provider, &admission.credential_id, self.now_ms);
         }
-        Ok(())
+        Ok(ProbeBinding::Bound)
     }
 
     pub(crate) fn class(
@@ -8512,7 +8598,7 @@ mod compiled_class_tests {
                 .collect(),
         );
         assert_reference(&probing, &fact);
-        let hold = probe_reservations::Selection::new(
+        let (hold, _) = probe_reservations::Selection::new(
             &fixture.credentials(),
             oauth
                 .iter()

@@ -1058,7 +1058,55 @@ impl Drop for RouteSelectTimingGuard {
     }
 }
 
+fn lost_probe_wait(until: i64) -> ErrorBody {
+    ErrorBody {
+        code: "no_route".into(),
+        message:
+            "The selected recovery probe is held by another request. Retry after its hold expires."
+                .into(),
+        detail: Some(json!({"reason":"accounts_blocked", "reset_at_ms":until})),
+    }
+}
+
 pub(super) async fn handle_select_request(
+    frame: Frame,
+    route_epoch: u32,
+    writer: &mpsc::Sender<Frame>,
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+    min_band: &SharedMinBand,
+    routing_config_path: &Path,
+    operator_config_path: &Path,
+    broca_credentials: &SharedBrocaCredentials,
+) -> Result<(), ModuleError> {
+    let mut lost_probe_until: Option<i64> = None;
+    let mut lost_probe_routes = HashSet::new();
+    loop {
+        let mut probe_lost = false;
+        handle_select_request_attempt(
+            frame.clone(),
+            route_epoch,
+            writer,
+            quota_cache,
+            store,
+            min_band,
+            routing_config_path,
+            operator_config_path,
+            broca_credentials,
+            &mut probe_lost,
+            &mut lost_probe_until,
+            &mut lost_probe_routes,
+        )
+        .await?;
+        if !probe_lost {
+            return Ok(());
+        }
+        // Rebuild account evidence after a lost bind, before writing any reply.
+        // The durable claim excludes the credential and supplies its retry time.
+    }
+}
+
+async fn handle_select_request_attempt(
     mut frame: Frame,
     route_epoch: u32,
     writer: &mpsc::Sender<Frame>,
@@ -1068,6 +1116,9 @@ pub(super) async fn handle_select_request(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
+    probe_lost: &mut bool,
+    lost_probe_until: &mut Option<i64>,
+    lost_probe_routes: &mut HashSet<String>,
 ) -> Result<(), ModuleError> {
     let timing = RouteSelectTimingGuard::new();
     let live_config_started = Instant::now();
@@ -2035,6 +2086,7 @@ pub(super) async fn handle_select_request(
         )
     };
     let mut exclude = params.exclude_route_keys.clone();
+    exclude.extend(lost_probe_routes.iter().cloned());
     add_stage_ms(&timing.policy_ms, policy_started.elapsed());
     let head_history_started = Instant::now();
     let head_refusals = head_content_policy_exclusions(
@@ -2347,7 +2399,7 @@ pub(super) async fn handle_select_request(
                     remember_provider_identity(store, &decision_id, &selected, broca_credentials)?;
                 }
                 if let Some(classes) = &classes {
-                    classes
+                    let binding = classes
                         .bind_selected_probe(
                             store,
                             &selected.model.provider_id,
@@ -2356,6 +2408,12 @@ pub(super) async fn handle_select_request(
                             &decision_id,
                         )
                         .map_err(|error| ModuleError::Message(error.to_string()))?;
+                    if let account_selection::ProbeBinding::Lost { retry_at } = binding {
+                        *probe_lost = true;
+                        lost_probe_routes.insert(selected.route_key.clone());
+                        *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                        return Ok(());
+                    }
                 }
                 add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
                 let finish_started = Instant::now();
@@ -2431,6 +2489,11 @@ pub(super) async fn handle_select_request(
                 return reply;
             }
             Err(mut refusal) => {
+                if let Some(until) = *lost_probe_until {
+                    return send_route_error_body(
+                        writer, ver, channel, epoch, corr, lost_probe_wait(until),
+                    ).await;
+                }
                 if let Some(detail) = pin_availability.get(&pin_key) {
                     if !refusal.message.contains(detail) {
                         refusal.message = format!("{} ({detail})", refusal.message);
@@ -2694,7 +2757,7 @@ pub(super) async fn handle_select_request(
             match recorded {
                 Ok(decision_id) => {
                     if let Some(classes) = &classes {
-                        classes
+                        let binding = classes
                             .bind_selected_probe(
                                 store,
                                 &selected.model.provider_id,
@@ -2703,6 +2766,12 @@ pub(super) async fn handle_select_request(
                                 &decision_id,
                             )
                             .map_err(|error| ModuleError::Message(error.to_string()))?;
+                        if let account_selection::ProbeBinding::Lost { retry_at } = binding {
+                            *probe_lost = true;
+                            lost_probe_routes.insert(selected.route_key.clone());
+                            *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                            return Ok(());
+                        }
                     }
                     if selected_harness == Some(substrate_policy::Harness::Broca) {
                         // The decision row has committed, so the selection stands
@@ -2853,6 +2922,11 @@ pub(super) async fn handle_select_request(
             }
         }
         Err(mut no_route) => {
+            if let Some(until) = *lost_probe_until {
+                return send_route_error_body(
+                    writer, ver, channel, epoch, corr, lost_probe_wait(until),
+                ).await;
+            }
             // Head-specific exclusions and non-relaxable billing walls explain the
             // same no-route result. Keep them on one message path so callers receive
             // the full reason rather than a second, competing error surface.

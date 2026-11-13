@@ -848,6 +848,11 @@ async fn prepare_selection(
 
 const RUNNER_PROVIDER_LIMIT: &str = "runner_provider_limit";
 
+enum SelectionAttempt {
+    Selected(Value),
+    ProbeLost(i64),
+}
+
 async fn select_at_tier(
     params: &Value,
     caller: &Caller,
@@ -862,6 +867,60 @@ async fn select_at_tier(
     shared: &RequestInputs,
     inputs: &mut SelectionInputs,
 ) -> Result<Value, Refusal> {
+    let mut lost_until: Option<i64> = None;
+    loop {
+        match select_at_tier_attempt(
+            params,
+            caller,
+            deps,
+            profile_lookup,
+            service_tier,
+            sticky_credential,
+            tier_trace,
+            tier_settings,
+            panel_seat,
+            evaluation,
+            shared,
+            inputs,
+        )
+        .await
+        {
+            Ok(SelectionAttempt::Selected(answer)) => return Ok(answer),
+            Ok(SelectionAttempt::ProbeLost(until)) => {
+                lost_until = Some(lost_until.map_or(until, |prior| prior.min(until)));
+            }
+            Err(refusal) => {
+                if let Some(until) = lost_until.filter(|_| {
+                    matches!(
+                        refusal.code,
+                        RefusalCode::NoRoute | RefusalCode::PinUnavailable
+                    )
+                }) {
+                    return Err(account_limit_refusal(
+                        inputs.request.pin.as_deref(),
+                        Some(until),
+                    ));
+                }
+                return Err(refusal);
+            }
+        }
+    }
+}
+
+async fn select_at_tier_attempt(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    profile_lookup: &ProfileLookup,
+    service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
+    sticky_credential: Option<&str>,
+    tier_trace: &mut TierTrace,
+    tier_settings: &crate::tier_settings::Layers,
+    panel_seat: bool,
+    evaluation: Option<&Evaluation<'_>>,
+    shared: &RequestInputs,
+    inputs: &mut SelectionInputs,
+) -> Result<SelectionAttempt, Refusal> {
     #[cfg(test)]
     count_input_build(&shared.operator_config, 2);
     tier_trace.rejections.clear();
@@ -1555,11 +1614,11 @@ async fn select_at_tier(
     .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?;
 
     if evaluation.is_some() {
-        return Ok(json!({
+        return Ok(SelectionAttempt::Selected(json!({
             "route": selected.route_key,
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
-        }));
+        })));
     }
 
     // Record the decision in the ledger every selection writes, then bind it.
@@ -1624,7 +1683,7 @@ async fn select_at_tier(
         )
         .map_err(store_refusal)?;
     if let Some(classes) = &priced.classes {
-        classes
+        let binding = classes
             .bind_selected_probe(
                 deps.store,
                 &selected.model.provider_id,
@@ -1633,6 +1692,16 @@ async fn select_at_tier(
                 &decision_id,
             )
             .map_err(store_refusal)?;
+        if let account_selection::ProbeBinding::Lost { retry_at } = binding {
+            // Retry the same tier with the lost credential held. Each conflict
+            // removes a credential from this request's remaining candidates.
+            if let Some(original) = &inputs.priced.classes {
+                original.remember_probe_holds(classes);
+            } else {
+                inputs.priced.classes = priced.classes.take();
+            }
+            return Ok(SelectionAttempt::ProbeLost(retry_at));
+        }
     }
     let service_tier = service_tier.or_else(|| {
         configured_tiers
@@ -1820,7 +1889,7 @@ async fn select_at_tier(
     deps.store
         .v1_record_selection(&binding, Some(&value.to_string()))
         .map_err(store_refusal)?;
-    Ok(value)
+    Ok(SelectionAttempt::Selected(value))
 }
 
 /// Everything one select's automatic and pinned attempts share.

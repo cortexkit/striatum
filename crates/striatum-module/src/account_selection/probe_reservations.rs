@@ -56,16 +56,21 @@ impl Selection {
         credentials: &SharedBrocaCredentials,
         probes: Vec<(String, String)>,
         now: i64,
-    ) -> Self {
+    ) -> (Self, Vec<(String, String, i64)>) {
         let scope = Arc::downgrade(credentials);
         let owner = super::new_id("probe");
         let mut reservations = live(now);
+        let mut blocked = Vec::new();
         for (provider, credential) in probes {
-            if !reservations.iter().any(|entry| {
+            if let Some(holder) = reservations.iter().find(|entry| {
                 entry.scope.ptr_eq(&scope)
                     && entry.provider == provider
                     && entry.credential == credential
             }) {
+                if holder.owner != owner {
+                    blocked.push((provider, credential, holder.expires_at));
+                }
+            } else {
                 reservations.push(Reservation {
                     scope: scope.clone(),
                     provider,
@@ -75,7 +80,7 @@ impl Selection {
                 });
             }
         }
-        Self { scope, owner }
+        (Self { scope, owner }, blocked)
     }
 
     pub fn release_selected(&self, provider: &str, credential: &str, now: i64) {
