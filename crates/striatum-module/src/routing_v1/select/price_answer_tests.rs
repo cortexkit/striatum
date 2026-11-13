@@ -38,6 +38,26 @@ fn checked(params: &Value, answer: &Value) {
     check_answer_serving(&request, &answer, &caps).unwrap();
 }
 
+fn declare_price_harness(
+    credentials: &mut crate::broca_credentials::BrocaCredentials,
+    module: &str,
+    wire: &str,
+    methods: &[&str],
+) {
+    let pairs: Vec<_> = methods
+        .iter()
+        .map(|method| json!({"wire_api":wire,"auth_method":method}))
+        .collect();
+    credentials.runner_declarations.insert(
+        module.into(),
+        super::super::runners::parse_declaration(&json!({"runner":{
+            "pairs":pairs, "harnesses":["price-test"], "follows_account_choice":true
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
+}
+
 fn lookup(
     tokens: TokenVector,
 ) -> impl Fn(&str, f64, &[ModelFact]) -> crate::select::TaskProfileLookup + Sync {
@@ -245,15 +265,11 @@ async fn mixed_credentials_quote_subscription_or_metered_and_fallback_uses_list_
         .unwrap();
     let credentials = h.credentials();
     let mut credentials = credentials.lock().unwrap();
-    credentials.runner_declarations.insert(
-        "class-runner".into(),
-        super::super::runners::parse_declaration(&json!({"runner":{
-            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"},
-                     {"wire_api":"anthropic.messages","auth_method":"oauth"}],
-            "harnesses":["price-test"], "follows_account_choice":true
-        }}))
-        .unwrap()
-        .unwrap(),
+    declare_price_harness(
+        &mut credentials,
+        "class-runner",
+        "anthropic.messages",
+        &["apikey", "oauth"],
     );
     credentials
         .wire_apis
@@ -351,9 +367,20 @@ async fn no_price_for_unmeasured_subscription_or_unpriced_antigravity() {
             .unwrap();
     }
     let credentials = h.credentials();
-    credentials.lock().unwrap().publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
+    let mut credentials = credentials.lock().unwrap();
+    declare_price_harness(
+        &mut credentials,
+        "class-runner",
+        "anthropic.messages",
+        &["apikey", "oauth"],
     );
+    credentials
+        .wire_apis
+        .insert("antigravity/model".into(), "anthropic.messages".into());
+    let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
+        .with_wire_apis(&credentials.wire_apis);
+    credentials.publish_billing_catalog(catalog);
+    drop(credentials);
     let route = h.bind(reserved("class-owner"), None).await;
     let unpriced = answered(
         &route,
@@ -374,6 +401,16 @@ async fn nonstandard_tier_uses_catalog_modes_not_quota_draw_and_omits_unknown_mo
             method,
             "openai.responses",
         );
+        {
+            let shared = h.credentials();
+            let mut credentials = shared.lock().unwrap();
+            declare_price_harness(
+                &mut credentials,
+                "tier-runner",
+                "openai.responses",
+                &[method],
+            );
+        }
         h.edit_config(|config| {
             config["providers"]["openai"]["subscription_multiplier"] = json!(22);
             config["providers"]["openai"]["subscription"] = json!(method == "oauth");
