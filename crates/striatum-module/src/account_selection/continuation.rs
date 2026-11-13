@@ -4,7 +4,13 @@ use cortexkit_role_routing::account_continue::{
     ContinueAnswer, ContinueHold, ContinueOffer, ContinueRefusal, ContinueRequest,
 };
 use cortexkit_role_routing::errors::Refusal;
-use striatum_store::V1Recorded;
+use striatum_store::{V1Decision, V1Recorded};
+
+struct PreviousDecision {
+    provider: String,
+    model: String,
+    selection: Option<V1Decision>,
+}
 
 fn refuse(code: &str, detail: &str) -> ContinueAnswer {
     ContinueAnswer::Refuse(ContinueRefusal::new(code, json!(detail)))
@@ -111,10 +117,34 @@ pub(crate) fn continue_account(
             ));
         }
     }
-    let previous = ctx
+    let selection = ctx
         .store
         .v1_decision(&request.previous_decision_id)
         .map_err(unavailable)?;
+    // Model-pinned runs have an account decision, but no selection ledger.
+    // Account decisions are authority only within the admission that made them.
+    let previous = match selection {
+        Some(selection) => Some(PreviousDecision {
+            provider: selection.provider.clone(),
+            model: selection.model.clone(),
+            selection: Some(selection),
+        }),
+        None => ctx
+            .store
+            .account_decision(&request.previous_decision_id)
+            .map_err(unavailable)?
+            .filter(|decision| {
+                decision.principal == principal
+                    && decision.admission_id.as_deref() == Some(&request.admission_id)
+                    && decision.mode == DECISION_MODE_SERVE
+                    && decision.outcome == "admit"
+            })
+            .map(|decision| PreviousDecision {
+                provider: decision.provider,
+                model: decision.model,
+                selection: None,
+            }),
+    };
     let original = ctx
         .store
         .v1_admission(principal, &request.admission_id)
@@ -128,7 +158,10 @@ pub(crate) fn continue_account(
         .map(|body| {
             let mut body = body.clone();
             body["caller"] = json!({"runner":runner});
-            body["model_decision_id"] = json!(request.previous_decision_id);
+            body["model_decision_id"] = json!(previous
+                .as_ref()
+                .and_then(|previous| previous.selection.as_ref())
+                .map(|selection| &selection.decision_id));
             body["mode"] = json!("admit");
             body["expected_pin"] = Value::Null;
             body["admission_id"] = json!(new_id("continue"));
@@ -223,7 +256,11 @@ pub(crate) fn continue_account(
             let Some(previous) = &previous else { return Ok(refuse("unknown_decision", "previous decision is unknown")); };
             let Some(original) = &original else { return Ok(refuse("unknown_decision", "admission is unknown")); };
             let Some(admitted) = tx.admission(principal, &request.admission_id)? else { return Ok(refuse("unknown_decision", "admission is unknown")); };
-            let current_id = if original["decision_id"] == request.previous_decision_id {
+            if previous.selection.is_none() && original["decision_id"].is_string() {
+                return Ok(refuse("unknown_decision", "previous decision is not the run's selection"));
+            }
+            let current_id = if original["decision_id"] == request.previous_decision_id
+                || (previous.selection.is_none() && admitted.decision_id == request.previous_decision_id) {
                 request.admission_id.clone()
             } else {
                 let Some(id) = tx.continued_reservation(principal, &request.admission_id, &request.run_id, &request.previous_decision_id)? else {
@@ -235,8 +272,8 @@ pub(crate) fn continue_account(
                 return Ok(refuse("unknown_decision", "previous decision does not belong to the run"));
             };
             let salt = tx.salt(ctx.now_ms, fresh_salt)?;
-            if previous.runner_module != runner
-                || project.is_some_and(|project| previous.project_id.as_deref() != Some(project))
+            if previous.selection.as_ref().is_some_and(|selection| selection.runner_module != runner
+                || project.is_some_and(|project| selection.project_id.as_deref() != Some(project)))
                 || admitted.run_id.as_deref() != Some(&request.run_id)
                 || admitted.state != "started"
                 || admitted.conversation_hash != conversation_hash(&salt, principal, &request.conversation_key)
@@ -329,8 +366,14 @@ pub(crate) fn continue_account(
                 OpReply::Result(result) => {
                     let id = result["reason"]["decision_id"].as_str().unwrap();
                     let row = tx.admission(principal,&params.admission_id)?.unwrap();
-                    tx.link_continued_decision(&request.previous_decision_id,id,ctx.now_ms,row.admission_valid_until)?;
-                    tx.bind_model_account(id,provider,&previous.model,&row.account_id,&row.credential_id)?;
+                    if previous.selection.is_some() {
+                        tx.link_continued_decision(&request.previous_decision_id,id,ctx.now_ms,row.admission_valid_until)?;
+                        tx.bind_model_account(id,provider,&previous.model,&row.account_id,&row.credential_id)?;
+                    } else {
+                        // The reservation is new, but its account decision remains
+                        // under the original admission so the next switch can name it.
+                        tx.bind_continued_account_decision(id,&request.admission_id)?;
+                    }
                     reservation=Some((id.to_owned(),params.admission_id.clone(),row.admission_valid_until));
                     Ok(ContinueAnswer::Offer(ContinueOffer::new(row.credential_id,row.account_id,id,row.admission_valid_until.max(0) as u64)))
                 }
