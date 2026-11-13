@@ -20,6 +20,7 @@ use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 pub(crate) const FIXTURE_NOW: u64 = 1_900_000_000_000;
+const ADMISSION_BURST_REQUESTS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FixtureCounts {
@@ -337,6 +338,16 @@ impl Before {
         }
     }
     fn finish(self, store: &striatum_store::SqliteRouteStateStore, samples: &mut Samples) {
+        let wall = self.started.elapsed().as_micros();
+        self.finish_with_wall_times(store, samples, [wall]);
+    }
+
+    fn finish_with_wall_times(
+        self,
+        store: &striatum_store::SqliteRouteStateStore,
+        samples: &mut Samples,
+        wall_times: impl IntoIterator<Item = u128>,
+    ) {
         for (total, count) in samples
             .index_builds
             .iter_mut()
@@ -344,7 +355,7 @@ impl Before {
         {
             *total += count;
         }
-        samples.wall.push(self.started.elapsed().as_micros());
+        samples.wall.extend(wall_times);
         samples.cpu += cpu_us() - self.cpu;
         let stages = store.stage_timing();
         samples.queue_ns += stages.writer_queue_ns - self.stages.writer_queue_ns;
@@ -364,7 +375,8 @@ impl Samples {
         }
         let n = count as f64;
         let percentile = |p: usize| self.wall[(count * p).div_ceil(100).saturating_sub(1)];
-        println!("{name} n={count} refusals={} cpu_us/op={:.2} p50_us={} p99_us={} writer_queue_wait_us/op={:.2} sql_us/op={:.2} commit_us/op={:.2} serialization_us/op={:.2} commits/op={:.3} writer_acquisitions/op={:.3}", self.refusals,
+        // StoreStageTiming measures connection contention, not command-queue wait.
+        println!("{name} n={count} refusals={} cpu_us/op={:.2} p50_us={} p99_us={} connection_wait_us/op={:.2} sql_us/op={:.2} commit_us/op={:.2} serialization_us/op={:.2} commits/op={:.3} writer_acquisitions/op={:.3}", self.refusals,
             self.cpu as f64 / n, percentile(50), percentile(99), self.queue_ns as f64 / n / 1_000.0,
             self.sql_ns as f64 / n / 1_000.0, self.commit_ns as f64 / n / 1_000.0,
             self.serialization_ns as f64 / n / 1_000.0, self.commits as f64 / n, self.acquisitions as f64 / n);
@@ -397,6 +409,55 @@ async fn call(
         );
     }
     body["result"].clone()
+}
+
+async fn admission_burst(
+    fixture: &RequestFixture,
+    runner: &Route,
+    batch: usize,
+    samples: &mut Samples,
+) {
+    let frames: Vec<_> = (0..ADMISSION_BURST_REQUESTS)
+        .map(|i| {
+            let admission = format!("cpu-admission-burst-{batch}-{i}");
+            runner.request_frame(
+                "route.account_for",
+                &json!({"provider":"cpu-provider-0", "model":"model-0",
+                    "conversation_key":admission, "admission_id":admission}),
+            )
+        })
+        .collect();
+    let before = Before::new(fixture.store());
+    let mut pending = tokio::task::JoinSet::new();
+    for frame in frames {
+        let harness = Arc::clone(&fixture.harness);
+        let enqueued = Instant::now();
+        pending.spawn(async move {
+            // The normal frame dispatcher drives each synchronous account
+            // handler on the production blocking pool. Calling serve directly
+            // would serialize the handlers on this current-thread test runtime.
+            let reply = harness.handle(frame).await;
+            let body: Value = serde_json::from_slice(&reply.body).unwrap();
+            (enqueued.elapsed().as_micros(), reply.header.ty, body)
+        });
+    }
+    let mut wall_times = Vec::with_capacity(ADMISSION_BURST_REQUESTS);
+    while let Some(reply) = pending.join_next().await {
+        let (wall, ty, body) = reply.expect("admission request task panicked");
+        wall_times.push(wall);
+        if ty != FrameType::Response {
+            samples.refusals += 1;
+            assert!(
+                fixture.catalog.models.is_empty() || fixture.catalog.accounts.is_empty(),
+                "route.account_for: {body}"
+            );
+        }
+    }
+    assert_eq!(wall_times.len(), ADMISSION_BURST_REQUESTS);
+    // These counters and process CPU are shared by all overlapping requests.
+    // Sample them once, but retain each request's enqueue-to-reply latency so
+    // Samples::print divides totals by completed requests, not by bursts.
+    before.finish_with_wall_times(fixture.store(), samples, wall_times);
 }
 
 async fn measure(fixture: RequestFixture, batches: usize) {
@@ -450,7 +511,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
         &mut Samples::default(),
     )
     .await;
-    let mut times: [Samples; 6] = std::array::from_fn(|_| Samples::default());
+    let mut times: [Samples; 7] = std::array::from_fn(|_| Samples::default());
     for batch in 0..batches {
         let mut decisions = Vec::new();
         for _ in 0..30 {
@@ -520,6 +581,11 @@ async fn measure(fixture: RequestFixture, batches: usize) {
         "quota burst events={events} applied_bodies={} (includes epoch-start full reply)",
         burst.applied_bodies()
     );
+    // Run after the sequential mix so its fixture history stays comparable to
+    // earlier measurements. Each burst is fully drained before the next one.
+    for batch in 0..batches {
+        admission_burst(&fixture, &runner, batch, &mut times[6]).await;
+    }
     for (name, samples) in [
         "select",
         "account_for",
@@ -527,6 +593,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
         "report",
         "tier_fallback",
         "quota_event_burst",
+        "admission_burst",
     ]
     .into_iter()
     .zip(&mut times)
@@ -614,6 +681,80 @@ async fn measure(fixture: RequestFixture, batches: usize) {
             });
         }
     }
+}
+
+#[test]
+fn burst_sampler_retains_request_latencies_and_counts_shared_commit_once() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = representative_fixture(FixtureCounts::smoke());
+    let mut samples = Samples::default();
+    let before = Before::new(fixture.store());
+    fixture
+        .store()
+        .put_quota_snapshot("{}", FIXTURE_NOW as i64)
+        .unwrap();
+    before.finish_with_wall_times(fixture.store(), &mut samples, 1..=64);
+    assert_eq!(samples.wall, (1..=64).collect::<Vec<_>>());
+    assert_eq!(samples.commits, 1);
+    assert_eq!(samples.acquisitions, 1);
+}
+
+#[tokio::test]
+async fn admission_burst_samples_64_distinct_requests_without_multiplying_shared_counters() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = representative_fixture(FixtureCounts::smoke());
+    let runner = fixture
+        .harness
+        .bind(reserved(&fixture.catalog.runners[0].module), None)
+        .await;
+    let store = fixture.store();
+    let commits = store.writer_commit_count_for_test();
+    let acquisitions = store.writer_acquisition_count_for_test();
+    let stages = store.stage_timing();
+    let cpu_before = cpu_us();
+    let mut samples = Samples::default();
+    admission_burst(&fixture, &runner, 0, &mut samples).await;
+    assert_eq!(samples.wall.len(), 64);
+    admission_burst(&fixture, &runner, 1, &mut samples).await;
+    assert_eq!(samples.wall.len(), 128);
+    assert_eq!(samples.refusals, 0);
+    assert!(samples.cpu <= cpu_us() - cpu_before);
+    assert!(samples.commits > 0);
+    assert_eq!(
+        samples.commits,
+        store.writer_commit_count_for_test() - commits
+    );
+    assert_eq!(
+        samples.acquisitions,
+        store.writer_acquisition_count_for_test() - acquisitions
+    );
+    let after = store.stage_timing();
+    assert_eq!(
+        samples.queue_ns,
+        after.writer_queue_ns - stages.writer_queue_ns
+    );
+    assert_eq!(samples.sql_ns, after.sql_ns - stages.sql_ns);
+    assert_eq!(samples.commit_ns, after.commit_ns - stages.commit_ns);
+    let principal = format!(
+        "reserved:{}",
+        fixture.catalog.runners[0]
+            .module
+            .trim_start_matches("reserved:")
+    );
+    store
+        .account_read(|tx| {
+            for batch in 0..2 {
+                for i in 0..64 {
+                    let admission = format!("cpu-admission-burst-{batch}-{i}");
+                    assert!(
+                        tx.admission(&principal, &admission)?.is_some(),
+                        "{admission}"
+                    );
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[tokio::test]
