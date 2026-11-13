@@ -1407,7 +1407,6 @@ const PENDING_READERS: &[(&str, &str)] = &[
     ("runner_harness_facts", "placement_harness_facts"),
     ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
-    ("select_eligible_routes", "placement_eligible_routes"),
     ("select_price", "placement_select_price"),
     ("report_attempt_outcomes", "placement_attempt_outcomes"),
 ];
@@ -1474,6 +1473,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "warm_credential_existing_affinity",
         "warm_credential_admission_conflict",
         "warm_credential_non_admit_refused",
+        "placement_eligible_routes",
     ] {
         assert_eq!(
             report.outcome(check),
@@ -1496,11 +1496,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
 #[tokio::test]
 async fn candidate_capabilities_reach_readers_without_leaking_to_production_calls() {
     use cortexkit_role_routing::capabilities::{
-        CONSUMER_DECLARATIONS, REPORT_ATTEMPT_OUTCOMES, SELECT_ELIGIBLE_ROUTES,
+        CONSUMER_DECLARATIONS, REPORT_ATTEMPT_OUTCOMES, SELECT_KIND,
     };
     let groups = [
         CONSUMER_DECLARATIONS,
-        SELECT_ELIGIBLE_ROUTES,
+        SELECT_KIND,
         REPORT_ATTEMPT_OUTCOMES,
     ];
     let harness = Harness::new("candidate-capabilities");
@@ -1513,7 +1513,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
         "role_declarations":{"routing/v1":slot}
     }]);
     let select =
-        json!({"consumer":"example-consumer.task", "requirements":{"iq":40}, "eligible_routes":[]});
+        json!({"consumer":"example-consumer.task", "requirements":{"iq":40}, "kind":"llm"});
     let report = json!({"decision_id":"missing", "outcome":"cancelled", "attempt_outcome":{"status":"rejected"}});
     let production = || {
         assert_eq!(

@@ -27,6 +27,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "report_usage_run_id",
     "select_pin_slot",
     "select_available_routes",
+    cortexkit_role_routing::capabilities::SELECT_ELIGIBLE_ROUTES,
     "select_prefer_prompt_cache",
     "select_settings",
     "observe_backoff",
