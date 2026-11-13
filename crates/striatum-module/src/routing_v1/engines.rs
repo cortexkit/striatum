@@ -368,8 +368,10 @@ fn select_request(
     }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
     let winner = if media.is_some() {
-        // Until grade and job pricing are available, measurement is the only
-        // ranking fact. Identity precedes origin when two modules offer engines.
+        // Media routes are not yet ranked by the operator's per-kind quality
+        // grade or by a priced estimate of this job, so measured accuracy is the
+        // only ranking fact for now. Identity precedes origin when two modules
+        // offer the same engine.
         candidates
             .iter()
             .filter(|candidate| {
