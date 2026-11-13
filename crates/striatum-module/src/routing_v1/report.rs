@@ -15,14 +15,16 @@
 //! unknown; a report without output adds no history row.
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
-use cortexkit_role_routing::report::{
-    parse_report_request_serving, Outcome, ReportAnswer, ReportRequest,
-};
+use cortexkit_role_routing::report::{Outcome, ReportAnswer, ReportRequest};
 use striatum_core::{RouteOutcome, RouteStateStore};
 use striatum_store::V1Recorded;
 use serde_json::Value;
 
 use super::{now_ms, provider_refusal, store_refusal, Caller, Deps};
+
+mod attempt;
+#[cfg(test)]
+mod attempt_tests;
 
 const MEMBERS: &[&str] = &[
     "decision_id",
@@ -47,9 +49,7 @@ pub(super) fn report_at(
     deps: &Deps<'_>,
     now: u64,
 ) -> Result<Value, Refusal> {
-    super::refuse_unknown_members(params, MEMBERS)?;
-    super::shapes::closed(params, "eligibility", &["scope", "code"])?;
-    let request = parse_report_request_serving(params, &super::describe::capabilities())?;
+    let request = attempt::parse(params)?;
     let decision = deps
         .store
         .v1_decision(&request.decision_id)
