@@ -842,7 +842,9 @@ fn converted_via_vault_runner_matches_the_frozen_served_set_without_a_declaratio
     assert!(converted.via_vault);
     converted.module = "fixture-runner".into();
     let actual = routes(Registry::build(vec![converted], &credentials, &facts, NOW));
-    assert_eq!(actual, ["vendor-a/unrestricted", "vendor-a/allowed"]);
+    // Once a provider lists OAuth on any model, its unlisted models no longer
+    // inherit OAuth reachability.
+    assert_eq!(actual, ["vendor-a/allowed"]);
     let (previous, fallback) = credentials.served_routes(&facts, NOW);
     assert_eq!(fallback, None);
     assert_eq!(actual, previous);
