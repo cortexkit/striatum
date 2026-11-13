@@ -1,0 +1,407 @@
+use super::*;
+
+const MODEL: &str = "claude-haiku-5-5";
+const POOL: &str = "anthropic-platform";
+const KEYS: [&str; 2] = ["apikey:anthropic:dave", "apikey:anthropic:erin"];
+
+fn paid_anthropic_harness() -> Arc<Harness> {
+    let harness = Harness::new("paid-anthropic-shape");
+    let mut fact = account_fact("anthropic");
+    fact.model_id = MODEL.into();
+    harness.install_facts(&[fact.clone()]);
+    catalog_fact(&harness, &fact);
+    let mut subscription = fact.clone();
+    subscription.billing_plane.as_mut().unwrap().auth_method = "oauth".into();
+    subscription.billing_plane.as_mut().unwrap().kind = "subscription".into();
+    let mut rows: Vec<_> = KEYS
+        .iter()
+        .map(|id| ListedCredential {
+            id: (*id).into(),
+            account_id: None,
+            state: "active".into(),
+            categories: vec!["llm-provider".into()],
+            provider_ids: vec![POOL.into()],
+            serves: vec!["anthropic".into()],
+            credential_type: "apikey".into(),
+            auth_method: Some("apikey".into()),
+            ..Default::default()
+        })
+        .collect();
+    rows.push(ListedCredential {
+        id: "oauth:anthropic:subscription".into(),
+        account_id: Some("anthropic-subscription".into()),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        provider_ids: vec!["anthropic".into()],
+        serves: vec!["anthropic".into()],
+        credential_type: "oauth".into(),
+        auth_method: Some("oauth".into()),
+        ..Default::default()
+    });
+    let mut credentials = BrocaCredentials::default();
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "paid-anthropic-vault".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW as i64, &[]);
+    credentials.runner_declarations.insert(
+        "broca".into(),
+        super::super::runners::parse_declaration(&json!({"runner": {
+            "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
+                {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
+            "follows_account_choice":true
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
+    credentials
+        .runner_routed_accounts
+        .insert("broca".into(), vec!["apikey".into(), "oauth".into()]);
+    credentials
+        .wire_apis
+        .insert(format!("anthropic/{MODEL}"), "anthropic.messages".into());
+    credentials.publish_billing_catalog(
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription])
+            .with_wire_apis(&credentials.wire_apis),
+    );
+    credentials.publish_plan_prices(&json!({"prices":[]}));
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["runners"] = json!([{"module":"broca","via_vault":true}]);
+        config["consumers"] = json!({
+            "mason":{"owner":OWNER,"mode":"demand"},
+            "codemode":{"owner":OWNER,"mode":"demand","pay_per_token":true}
+        });
+        config["providers"][POOL] = json!({"pin_only":true,"not_for":["mason"]});
+    });
+    harness
+}
+
+fn credential_only_request(id: &str) -> Value {
+    json!({
+        "provider":POOL,"model":MODEL,"mode":"admit",
+        "conversation_key":format!("conversation-{id}"),"admission_id":id,
+        "candidates":{"view_digest":"paid-anthropic-vault","accounts":
+            KEYS.iter().map(|id| json!({"credential_id":id})).collect::<Vec<_>>()}
+    })
+}
+
+fn offer_key_account_ids(request: &mut Value) {
+    for account in request["candidates"]["accounts"].as_array_mut().unwrap() {
+        account["account_id"] = account["credential_id"].clone();
+    }
+}
+
+fn assert_missing_candidate_account_id(reply: &(FrameType, Value)) {
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(
+        reply.1,
+        json!({
+            "code":"invalid_request", "detail":{"field":"candidates"},
+            "message":"candidates is invalid: missing field `account_id`"
+        })
+    );
+}
+
+#[tokio::test]
+async fn broca_paid_anthropic_candidates_require_account_ids_with_pinned_decision() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let broca = harness.bind(reserved("broca"), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"codemode","pin":format!("{POOL}/{MODEL}"),"requirements":{"iq":0}
+            }),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    assert_eq!(
+        selected.1["result"]["route"]["provider"], POOL,
+        "{}",
+        selected.1
+    );
+    assert_eq!(
+        selected.1["result"]["runner"]["module"], "broca",
+        "{}",
+        selected.1
+    );
+    assert_eq!(
+        selected.1["result"]["runner"]["model"]["provider"], "anthropic",
+        "{}",
+        selected.1
+    );
+    let mut request = credential_only_request("paid-anthropic-with-decision");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    assert_missing_candidate_account_id(&broca.call("route.account_for", &request).await);
+    offer_key_account_ids(&mut request);
+    let admitted = broca.call("route.account_for", &request).await;
+    assert_eq!(
+        admitted.0,
+        FrameType::Response,
+        "request={request}; reply={}",
+        admitted.1
+    );
+    assert!(KEYS.contains(
+        &admitted.1["result"]["account"]["credential_id"]
+            .as_str()
+            .unwrap()
+    ));
+    assert_eq!(admitted.1["result"]["account"]["provider"], POOL);
+    assert_eq!(admitted.1["result"]["account"]["method"], "apikey");
+}
+
+#[tokio::test]
+async fn broca_paid_anthropic_candidates_require_account_ids_without_decision() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    let broca = harness.bind(reserved("broca"), None).await;
+    let mut request = credential_only_request("paid-anthropic-without-decision");
+    assert_missing_candidate_account_id(&broca.call("route.account_for", &request).await);
+    offer_key_account_ids(&mut request);
+    let admitted = broca.call("route.account_for", &request).await;
+    assert_eq!(
+        admitted.0,
+        FrameType::Response,
+        "request={request}; reply={}",
+        admitted.1
+    );
+    assert!(KEYS.contains(
+        &admitted.1["result"]["account"]["credential_id"]
+            .as_str()
+            .unwrap()
+    ));
+    assert_eq!(
+        admitted.1["result"]["account"]["account_id"],
+        admitted.1["result"]["account"]["credential_id"]
+    );
+    assert_eq!(admitted.1["result"]["account"]["provider"], POOL);
+    assert_eq!(admitted.1["result"]["account"]["method"], "apikey");
+
+    // Naming the subscription provider instead cannot force a paid fallback.
+    request["provider"] = json!("anthropic");
+    request["admission_id"] = json!("subscription-provider-without-decision");
+    request["conversation_key"] = json!("subscription-provider-without-decision");
+    let refused = broca.call("route.account_for", &request).await;
+    assert_eq!(
+        refused.0,
+        FrameType::Error,
+        "request={request}; reply={}",
+        refused.1
+    );
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    assert_eq!(
+        refused.1["detail"]["field"], "decision_id",
+        "request={request}; reply={}",
+        refused.1
+    );
+    assert_eq!(
+        refused.1["detail"]["exclusions"],
+        json!(KEYS.iter().map(|id|
+        json!({"account_id":id,"credential_id":id,"reason":"routing_decision_required"})
+    ).collect::<Vec<_>>())
+    );
+}
+
+async fn observe_ok(broca: &super::super::conformance_tests::Route, params: &Value) -> Value {
+    let reply = broca.call("route.account_observe", params).await;
+    assert_eq!(
+        reply.0,
+        FrameType::Response,
+        "request={params}; reply={}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["result"]["observation"]["bound"], true,
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["result"]["observation"]["duplicate"], false,
+        "{}",
+        reply.1
+    );
+    reply.1["result"]["observation"].clone()
+}
+
+#[tokio::test]
+async fn broca_paid_anthropic_attempts_and_limits_use_the_admission_pool() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for with_decision in [true, false] {
+        for reported_provider in [POOL, "anthropic"] {
+            let harness = paid_anthropic_harness();
+            let broca = harness.bind(reserved("broca"), None).await;
+            let mut request = credential_only_request("paid-observed");
+            offer_key_account_ids(&mut request);
+            if with_decision {
+                let owner = harness.bind(reserved(OWNER), None).await;
+                let selected = owner.call("route.select", &json!({
+                    "consumer":"codemode","pin":format!("{POOL}/{MODEL}"),"requirements":{"iq":0}
+                })).await;
+                assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+                request["decision_id"] = selected.1["result"]["decision_id"].clone();
+            }
+            let admitted = broca.call("route.account_for", &request).await;
+            assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+            let account = &admitted.1["result"]["account"];
+            assert_eq!(account["provider"], POOL);
+            assert_eq!(account["method"], "apikey");
+            assert_eq!(account["account_id"], account["credential_id"]);
+            let key = account["credential_id"].as_str().unwrap();
+            assert!(KEYS.contains(&key));
+            observe_ok(
+                &broca,
+                &json!({
+                    "event_id":"paid-start","kind":"admission_started",
+                    "admission_id":"paid-observed","run_id":"paid-run"
+                }),
+            )
+            .await;
+
+            let mut attempt = json!({
+                "event_id":"paid-attempt","kind":"attempt",
+                "admission_id":"paid-observed","run_id":"paid-run",
+                "served_account_id":key,"credential_id":key,"provider":reported_provider,
+                "observed_at_ms":NOW,"upstream_origin":"upstream",
+                "headers":{
+                    "anthropic-ratelimit-requests-limit":"50",
+                    "anthropic-ratelimit-requests-remaining":"49",
+                    "anthropic-ratelimit-requests-reset":"2027-01-15T08:01:00Z",
+                    "anthropic-ratelimit-tokens-limit":"30000",
+                    "anthropic-ratelimit-tokens-remaining":"29000"
+                }
+            });
+            // The closed v1 observation has no provider member. Broca's older
+            // caller-bearing shape preserves it as raw, non-authoritative data.
+            let refused = broca.call("route.account_observe", &attempt).await;
+            assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+            assert_eq!(
+                refused.1,
+                json!({"code":"invalid_request",
+                "detail":{"field":"provider"},"message":"provider is not a member of this request"})
+            );
+            attempt["caller"] = json!({"runner":"broca"});
+            let observed = observe_ok(&broca, &attempt).await;
+            assert_eq!(observed["effects"], json!([]));
+            harness
+                .store()
+                .account_read(|tx| {
+                    let admission = tx.admission("reserved:broca", "paid-observed")?.unwrap();
+                    assert_eq!(admission.provider, POOL);
+                    assert_eq!(admission.account_id, key);
+                    assert_eq!(admission.credential_id, key);
+                    let observation = tx
+                        .observation_by_event("reserved:broca", "broca", "paid-attempt")?
+                        .unwrap();
+                    assert!(observation.bound);
+                    assert_eq!(observation.admission_id.as_deref(), Some("paid-observed"));
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&observation.observation_json).unwrap(),
+                        attempt
+                    );
+                    assert!(tx.active_fences(POOL)?.is_empty());
+                    assert!(tx.active_fences("anthropic")?.is_empty());
+                    Ok(())
+                })
+                .unwrap();
+
+            // A separate explicit exhaustion event creates a quota fence in the
+            // admitted pool; the plain per-minute API headers above do not.
+            let limited = observe_ok(
+                &broca,
+                &json!({
+                    "event_id":"paid-limit","kind":"account_limit_exhausted",
+                    "admission_id":"paid-observed","credential_id":key,
+                    "served_account_id":key,"limit_window":"five_hour",
+                    "observed_at_ms":NOW,"resets_at_ms":NOW + 300_000,"resets_at_source":"header"
+                }),
+            )
+            .await;
+            assert!(
+                limited["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|effect| effect.as_str().is_some_and(|text| text.contains("fence"))),
+                "{limited}"
+            );
+            let fences = harness
+                .store()
+                .account_read(|tx| tx.active_fences(POOL))
+                .unwrap();
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].account_id, key);
+            assert_eq!(fences[0].provider, POOL);
+            assert_eq!(fences[0].admission_id.as_deref(), Some("paid-observed"));
+            assert_eq!(fences[0].observation_id.as_deref(), limited["id"].as_str());
+
+            let scope = FenceScope::General(GeneralWindow::FiveHour);
+            let subscription_fence = Fence {
+                account_id: "anthropic-subscription".into(),
+                pool: Some(scope.into()),
+                recovery_set: Vec::new(),
+                observed_at_ms: NOW as i64 - 1_000,
+                reset: ResetTime::At(NOW as i64 + 300_000),
+                retry_hint_ms: None,
+                source: ConfirmationSource::BrocaAccountLimit,
+            };
+            harness
+                .store()
+                .account_transaction(|tx| {
+                    tx.insert_fence(&AccountFenceRow {
+                        fence_id: "subscription-sentinel".into(),
+                        provider: "anthropic".into(),
+                        account_id: subscription_fence.account_id.clone(),
+                        scope_json: serde_json::to_string(&scope).unwrap(),
+                        fence_json: serde_json::to_string(&subscription_fence).unwrap(),
+                        source: "broca_limit_exhausted".into(),
+                        observed_at: NOW as i64 - 1_000,
+                        principal: "reserved:broca".into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: NOW as i64 - 1_000,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    })
+                })
+                .unwrap();
+
+            attempt["event_id"] = json!("paid-served-after-limit");
+            assert_eq!(observe_ok(&broca, &attempt).await["effects"], json!([]));
+            observe_ok(
+                &broca,
+                &json!({
+                    "event_id":"paid-finish","kind":"run_finished",
+                    "admission_id":"paid-observed","run_id":"paid-run"
+                }),
+            )
+            .await;
+            harness
+                .store()
+                .account_read(|tx| {
+                    let admission = tx.admission("reserved:broca", "paid-observed")?.unwrap();
+                    assert_eq!(admission.state, "finished");
+                    let affinity = tx
+                        .affinity("reserved:broca", &admission.conversation_hash, POOL)?
+                        .unwrap();
+                    assert_eq!(affinity.lease_valid_until, Some(NOW as i64));
+                    // Ordinary LLM account observations do not claim serving-success
+                    // healing: even the admitted key's quota fence remains in place.
+                    let remaining = tx.active_fences(POOL)?;
+                    assert_eq!(remaining.len(), 1);
+                    assert_eq!(remaining[0].fence_id, fences[0].fence_id);
+                    let subscription = tx.active_fences("anthropic")?;
+                    assert_eq!(subscription.len(), 1);
+                    assert_eq!(subscription[0].fence_id, "subscription-sentinel");
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+}

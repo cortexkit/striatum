@@ -20,6 +20,8 @@ const NOW: u64 = 1_800_000_000_000;
 const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
+mod paid_anthropic_shape_tests;
+
 fn assert_configured_runner_caller_without_writer(harness: &Harness, frame: &subc_protocol::Frame) {
     let path = harness.store_path().with_extension("caller.jsonc");
     let config = crate::config_convert::convert_value(json!({
