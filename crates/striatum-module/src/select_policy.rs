@@ -485,10 +485,10 @@ impl Consumer {
 
     /// The request class named by a consumer's root, if it names one.
     pub(crate) fn from_id(id: &str) -> Option<Consumer> {
-        let root = id.split('.').next().unwrap_or(id);
         Self::ALL
             .into_iter()
-            .find(|consumer| crate::variant_policy::consumer_group(Some(*consumer)) == Some(root))
+            .find(|consumer| crate::variant_policy::consumer_group(Some(*consumer))
+                .is_some_and(|root| crate::config_policy::consumer_matches(root, id)))
     }
 }
 

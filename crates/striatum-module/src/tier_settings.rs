@@ -245,7 +245,9 @@ pub(crate) fn at_level(
     let mut matched: Vec<_> = consumers
         .filter(|(name, _, _)| crate::config_policy::consumer_matches(name, consumer))
         .collect();
-    matched.sort_by_key(|(name, _, _)| std::cmp::Reverse(name.len()));
+    matched.sort_by_key(|(name, _, _)| {
+        std::cmp::Reverse(crate::config_policy::consumer_specificity(name))
+    });
     let route = format!("{provider}/{model}");
     matched
         .iter()

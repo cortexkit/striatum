@@ -14,9 +14,9 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
 use striatum_core::provider_model_spec::{parse_spec, spec_names_key, ParsedSpec};
 use striatum_store::{PublishedEfforts, ReasoningCatalog};
-use serde::Serialize;
 
 use crate::config_policy::VariantGroups;
 use crate::select_policy::Consumer;
@@ -169,7 +169,7 @@ pub(crate) fn resolve(
                 .filter(|(name, entries)| {
                     !entries.is_empty() && crate::config_policy::consumer_matches(name, consumer)
                 })
-                .max_by_key(|(name, _)| name.len())
+                .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
         })
         .map(|(name, entries)| (name, entries, VariantSource::Consumer))
         .into_iter()

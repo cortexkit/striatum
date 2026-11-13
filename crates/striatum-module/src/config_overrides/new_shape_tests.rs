@@ -713,3 +713,130 @@ fn banked_reset_pricing_is_provider_scoped_and_defaults_to_emergency() {
     }
     assert!(parse_config(r#"{"providers":{"openai":{"banked_resets":"automatic"}}}"#).is_err());
 }
+
+#[test]
+fn consumer_alias_pairs_reject_ambiguous_settings_and_rules() {
+    for &(old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
+        for value in [
+            json!({"consumers": {old: {}, new: {}}}),
+            json!({"models": {"p/m": {"only_for": [old, new]}}}),
+            json!({"consumers": {old: {}}, "providers": {"p": {"pin_only_for": [new]}}}),
+        ] {
+            let error = parse_config(&value.to_string()).unwrap_err();
+            assert!(error.contains(old) && error.contains(new), "{error}");
+            assert!(error.contains("consumer alias pair"), "{error}");
+        }
+    }
+    assert!(parse_config(
+        &json!({"consumers": {
+            "sidekick.explore": {}, "prefrontal-core.sidekick.explore": {}
+        }})
+        .to_string()
+    )
+    .is_err());
+    // The two new verify tasks are siblings, not aliases of one another.
+    assert!(parse_config(
+        &json!({"consumers": {
+            "magic-context.dream.verify": {}, "magic-context.dream.verify-broad": {}
+        }})
+        .to_string()
+    )
+    .is_ok());
+}
+
+#[test]
+fn consumer_alias_lookup_preserves_inheritance_and_independent_policy_fields() {
+    use crate::config_policy::BelowBarPolicy;
+    for root in ["sidekick", "prefrontal-core.sidekick"] {
+        let config = config(json!({"consumers": {
+            root: {
+                "iq": 71, "eq": 52, "below_bar": "refuse", "service_tier": "fast",
+                "variants": {"p/model": "high"}, "pin": {"model": "p/model"},
+                "projects": {"project": {"pin": "p/project"}}
+            }
+        }}));
+        for consumer in ["sidekick.explore", "prefrontal-core.sidekick.explore"] {
+            let policy =
+                config.consumer_policy(consumer, &ConsumerPolicy::default(), &BTreeMap::new());
+            assert_eq!(policy.iq, Some(71.0));
+            assert_eq!(policy.eq, Some(52.0));
+            assert_eq!(policy.below_bar, Some(BelowBarPolicy::Refuse));
+            assert_eq!(policy.ladder, Some(vec!["p/model".into()]));
+            assert_eq!(policy.variants.as_ref().unwrap()["p/model"], "high");
+            assert_eq!(config.project_pin("project", consumer), Some("p/project"));
+            assert_eq!(
+                config.service_tier(consumer, "p", "model"),
+                Some(cortexkit_role_routing::service_tier::ServiceTier::Fast)
+            );
+            let variant = crate::variant_policy::resolve(
+                config.variant_groups(),
+                &BTreeMap::new(),
+                None,
+                &crate::variant_policy::VariantRequest {
+                    route_key: "p/model",
+                    provider_id: "p",
+                    model_id: "model",
+                    explicit: None,
+                    curated: Some("low"),
+                    consumer: Some(consumer),
+                },
+            );
+            assert_eq!(variant.variant.as_deref(), Some("high"));
+        }
+    }
+    let config = config(json!({"consumers": {
+        "magic-context.dream": {"iq": 71, "service_tier": "fast"},
+        "mc_dream_map": {"iq": 31, "service_tier": "standard"}
+    }}));
+    for consumer in ["mc_dream_map", "magic-context.dream.map-memories"] {
+        assert_eq!(
+            config
+                .consumer_policy(consumer, &Default::default(), &BTreeMap::new())
+                .iq,
+            Some(31.0)
+        );
+        assert_eq!(
+            config.service_tier(consumer, "p", "model"),
+            Some(cortexkit_role_routing::service_tier::ServiceTier::Standard)
+        );
+    }
+}
+
+#[test]
+fn consumer_alias_rules_pins_and_default_below_bar_use_either_spelling() {
+    for &(old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
+        for configured in [old, new] {
+            let config = config(json!({
+                "consumers": {configured: {"pin": {"model": "p/allowed"}}},
+                "providers": {"p": {"only_for": [if old == "synthesizer" { "athena" } else { configured }]}},
+                "models": {"p/denied": {"not_for": [configured]}, "p/manual": {"pin_only_for": [configured]}}
+            }));
+            for consumer in [old, new] {
+                assert!(config.route_allowed(consumer, "p/allowed", true));
+                assert!(!config.route_allowed(consumer, "p/denied", true));
+                assert!(!config.route_allowed(consumer, "p/manual", false));
+                assert!(config.route_allowed(consumer, "p/manual", true));
+            }
+            if old == "synthesizer" {
+                assert_eq!(config.slot_pin("synthesizer").unwrap().model, "p/allowed");
+                assert_eq!(
+                    config.select_slot_pin("synthesizer"),
+                    Some("p/allowed".into())
+                );
+            }
+        }
+    }
+    let config = config(json!({}));
+    for name in [
+        "mason",
+        "prefrontal-core.mason",
+        "prefrontal-core.mason.child",
+    ] {
+        assert_eq!(
+            config
+                .consumer_policy(name, &Default::default(), &BTreeMap::new())
+                .below_bar,
+            Some(crate::config_policy::BelowBarPolicy::Refuse)
+        );
+    }
+}

@@ -985,7 +985,7 @@ impl LiveConfig {
                 policy
                     .projects
                     .get(project_id)
-                    .map(|project| (name.len(), project.pin.as_str()))
+                    .map(|project| (crate::config_policy::consumer_specificity(name), project.pin.as_str()))
             })
             .max_by_key(|(length, _)| *length)
             .map(|(_, pin)| pin)

@@ -186,6 +186,25 @@ impl Catalog {
         for (name, owner) in config.consumer_owners() {
             registry.owners.entry(name).or_default().insert(owner);
         }
+        // An alias must not turn a declared consumer into an ownerless settings
+        // entry: admission is the same whichever spelling a caller supplies.
+        let alias_owners: Vec<_> = registry
+            .owners
+            .keys()
+            .map(|name| {
+                let owners = registry
+                    .owners
+                    .iter()
+                    .filter(|(other, _)| {
+                        crate::config_policy::consumer_matches(name, other)
+                            && crate::config_policy::consumer_matches(other, name)
+                    })
+                    .flat_map(|(_, owners)| owners.iter().cloned())
+                    .collect::<BTreeSet<_>>();
+                (name.clone(), owners)
+            })
+            .collect();
+        registry.owners.extend(alias_owners);
         // An ownerless settings child cannot open admission beneath a declared
         // namespace whose declaration uses the 0.7.18 members (a default iq,
         // a ladder of pins, a runner placement, caller selectors or a kind),
@@ -200,7 +219,7 @@ impl Catalog {
                     .defaults
                     .keys()
                     .filter(|ancestor| crate::config_policy::consumer_matches(ancestor, name))
-                    .max_by_key(|ancestor| ancestor.len())?;
+                    .max_by_key(|ancestor| crate::config_policy::consumer_specificity(ancestor))?;
                 let owners = &registry.owners[ancestor];
                 registry
                     .defaults
@@ -229,6 +248,9 @@ impl Catalog {
 pub(crate) fn settings_loaded(config: &LiveConfig) {
     let catalog = CATALOG.get_or_init(Default::default).read().unwrap();
     for name in config.v1_consumers() {
+        if crate::config_policy::routing_builtin_consumer(&name) {
+            continue;
+        }
         if !catalog
             .modules
             .values()
@@ -264,13 +286,11 @@ impl Registry {
     /// Resolve whole dotted segments so an unlisted child uses the nearest
     /// declared or configured name, including its ownership restrictions.
     fn owners_for(&self, consumer: &str) -> Option<&BTreeSet<String>> {
-        let mut name = consumer;
-        loop {
-            if let Some(owners) = self.owners.get(name) {
-                return Some(owners);
-            }
-            name = name.rsplit_once('.')?.0;
-        }
+        self.owners
+            .iter()
+            .filter(|(name, _)| crate::config_policy::consumer_matches(name, consumer))
+            .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
+            .map(|(_, owners)| owners)
     }
 
     pub(crate) fn knows(&self, consumer: &str) -> bool {
@@ -296,7 +316,7 @@ impl Registry {
                     && self.owners.get(*name) == self.owners_for(consumer)
             })
             .collect();
-        chain.sort_by_key(|(name, _)| name.len());
+        chain.sort_by_key(|(name, _)| crate::config_policy::consumer_specificity(name));
         for (_, defaults) in chain {
             macro_rules! inherit {
                 ($($field:ident),+ $(,)?) => {
@@ -390,7 +410,7 @@ impl Registry {
                         && self.owners.get(*name) == Some(owners)
                         && defaults.selectors.is_some()
                 })
-                .max_by_key(|(name, _)| name.len())
+                .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
                 .and_then(|(_, defaults)| defaults.selectors.as_ref());
             if caller.attested_module() == Some(owner.as_str())
                 || caller.attested_module().is_some_and(|module| {

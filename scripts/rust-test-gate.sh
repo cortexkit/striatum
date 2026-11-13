@@ -18,6 +18,7 @@ python3 -m unittest scripts/tests/test_subc_daemon_env.py
 python3 scripts/subc-daemon-env.py
 python3 -m unittest scripts/tests/test_write_transactions.py
 python3 scripts/write-transactions.py
+python3 -m unittest scripts/tests/test_convert_consumer_names.py
 
 cargo nextest run --locked --lib --bins --tests
 printf 'gate summary: source checks and routing tests passed\n'
