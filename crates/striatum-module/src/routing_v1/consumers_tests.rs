@@ -33,6 +33,399 @@ fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
 }
 
+fn admission_refused(reply: (FrameType, Value), code: &str, consumer: &str) {
+    refused(reply.clone(), code, consumer);
+    assert_eq!(reply.1["detail"], json!({"consumer": consumer}));
+    for member in ["reset_at_ms", "retry_after_ms", "retry_at_ms"] {
+        assert!(reply.1.get(member).is_none(), "{}", reply.1);
+    }
+}
+
+#[tokio::test]
+async fn declared_admission_selectors_use_attested_identity_not_their_scope() {
+    let h = harness();
+    let modules = json!([{
+        "module_id": "admission-owner", "nonce_verified": true,
+        "role_declarations": {"routing/v1": {"consumers": [
+            {"name": "admission-owner.task", "iq": 40, "selectors": ["admission-selector"]}
+        ]}}
+    }]);
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        consumers::replace_catalog(&modules);
+        let owner = h.bind(reserved("admission-owner"), None).await;
+        let selector = h.bind(reserved("admission-selector"), None).await;
+        let delegate = scoped(&h, "admission-owner", true, h.reserve_channel(), 1).await;
+        for route in [&selector, &owner, &delegate] {
+            let reply = route
+                .call("route.select", &select("admission-owner.task"))
+                .await;
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        }
+        let stranger = h.bind(reserved("stranger"), None).await;
+        let selector_scope = scoped(&h, "admission-selector", true, h.reserve_channel(), 1).await;
+        let unauthorized = scoped(&h, "admission-owner", false, h.reserve_channel(), 1).await;
+        for route in [&stranger, &selector_scope, &unauthorized] {
+            admission_refused(
+                route
+                    .call("route.select", &select("admission-owner.task"))
+                    .await,
+                "consumer_not_owned",
+                "admission-owner.task",
+            );
+        }
+    })
+    .await;
+
+    // The held production capability list must not apply a selectors member,
+    // even after a candidate reader used it in the same process.
+    consumers::replace_catalog(&modules);
+    let owner = h.bind(reserved("admission-owner"), None).await;
+    let selector = h.bind(reserved("admission-selector"), None).await;
+    for route in [&owner, &selector] {
+        admission_refused(
+            route
+                .call("route.select", &select("admission-owner.task"))
+                .await,
+            "unknown_consumer",
+            "admission-owner.task",
+        );
+    }
+}
+
+#[tokio::test]
+async fn declared_admission_unlisted_dotted_children_inherit_legacy_and_settings_admission() {
+    let h = harness();
+    h.edit_config(|config| {
+        config["consumers"]["settings-parent"] = json!({
+            "mode": "ladder", "ladder": ["example-provider/model-b"]
+        });
+        config["consumers"]["settings-parent.owned"] = json!({"owner": "settings-owner"});
+    });
+    consumers::replace_catalog(&json!([{
+        "module_id": "legacy-owner", "nonce_verified": true,
+        "role_declarations": {"routing/v1": {"consumers": [
+            {"name": "legacy-owner.task", "eq": 17},
+            {"name": "legacy-owner.task.nested", "eq": 19},
+            {"name": "transitional-task", "eq": 23}
+        ]}}
+    }]));
+    let owner = h.bind(reserved("legacy-owner"), None).await;
+    let stranger = h.bind(reserved("stranger"), None).await;
+    let config = h.operator_config();
+    let registry = consumers::effective(&config);
+    for (consumer, eq) in [
+        ("legacy-owner.task.child", 17),
+        ("legacy-owner.task.nested.child", 19),
+        ("transitional-task.child", 23),
+    ] {
+        assert!(registry.knows(consumer));
+        assert_eq!(
+            registry.with_defaults(consumer, &select(consumer), &config)["requirements"]["eq"],
+            eq
+        );
+        let reply = owner.call("route.select", &select(consumer)).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let id = reply.1["result"]["decision_id"].as_str().unwrap();
+        assert_eq!(
+            h.store().v1_decision(id).unwrap().unwrap().consumer,
+            consumer
+        );
+        admission_refused(
+            stranger.call("route.select", &select(consumer)).await,
+            "consumer_not_owned",
+            consumer,
+        );
+    }
+    let direct = h.bind(json!({"kind": "direct"}), None).await;
+    for route in [&owner, &stranger, &direct] {
+        let reply = route
+            .call("route.select", &select("settings-parent.child"))
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["route"]["model"], "model-b");
+    }
+    let settings_owner = h.bind(reserved("settings-owner"), None).await;
+    let reply = settings_owner
+        .call("route.select", &select("settings-parent.owned.child"))
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["route"]["model"], "model-b");
+    admission_refused(
+        stranger
+            .call("route.select", &select("settings-parent.owned.child"))
+            .await,
+        "consumer_not_owned",
+        "settings-parent.owned.child",
+    );
+    for consumer in [
+        "legacy-owner.task_child",
+        "transitional-task_child",
+        "no-ancestor.child",
+    ] {
+        assert!(!registry.knows(consumer));
+        admission_refused(
+            owner.call("route.select", &select(consumer)).await,
+            "unknown_consumer",
+            consumer,
+        );
+    }
+}
+
+#[tokio::test]
+async fn declared_admission_selector_selects_an_engine_and_reports_its_own_decisions() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        consumers::replace_catalog(&json!([{
+            "module_id": "engine-owner", "nonce_verified": true,
+            "role_declarations": {"routing/v1": {"consumers": [
+                {"name": "engine-owner.task", "iq": 40, "selectors": ["engine-selector"]}
+            ]}}
+        }]));
+        let selector = h.bind(reserved("engine-selector"), None).await;
+        let request = json!({"consumer": "engine-owner.task", "kind": "transcribe",
+        "requirements": {}, "privacy": "local_only", "caller_local": [{
+            "kind": "transcribe", "provider": "media-vendor", "model": "local-engine",
+            "local": true, "formats": ["audio/wav"], "languages": ["en"],
+            "latency_class": "interactive"
+        }]});
+        let stranger = h.bind(reserved("stranger"), None).await;
+        admission_refused(
+            stranger.call("route.select_engine", &request).await,
+            "consumer_not_owned",
+            "engine-owner.task",
+        );
+        let selected = selector.call("route.select_engine", &request).await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        assert_eq!(selected.1["result"]["engine"]["model"], "local-engine");
+        let llm = selector
+            .call("route.select", &select("engine-owner.task"))
+            .await;
+        assert_eq!(llm.0, FrameType::Response, "{}", llm.1);
+        for decision in [selected, llm] {
+            let report =
+                json!({"decision_id": decision.1["result"]["decision_id"], "outcome": "completed"});
+            let reply = selector.call("route.report", &report).await;
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn declared_admission_inherits_selectors_and_locks_only_extended_settings_children() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        h.edit_config(|config| {
+            for name in [
+                "inherit-owner.task.settings",
+                "inherit-owner.task.branch.settings",
+                "inherit-owner.legacy.settings",
+            ] {
+                config["consumers"][name] = json!({});
+            }
+            config["consumers"]["inherit-owner.task.owned"] = json!({"owner": "inherit-owner"});
+            config["consumers"]["inherit-owner.task.foreign"] = json!({"owner": "settings-owner"});
+        });
+        let modules = json!([{
+            "module_id": "inherit-owner", "nonce_verified": true,
+            "role_declarations": {"routing/v1": {"consumers": [
+                {"name": "inherit-owner.task", "iq": 40, "selectors": ["parent-selector"]},
+                {"name": "inherit-owner.task.branch"},
+                {"name": "inherit-owner.task.closed", "selectors": []},
+                {"name": "inherit-owner.task.changed", "selectors": ["child-selector"]},
+                {"name": "inherit-owner.task_underscore"},
+                {"name": "inherit-owner.legacy", "eq": 17}
+            ]}}
+        }]);
+        consumers::replace_catalog(&modules);
+        let owner = h.bind(reserved("inherit-owner"), None).await;
+        let parent_selector = h.bind(reserved("parent-selector"), None).await;
+        let child_selector = h.bind(reserved("child-selector"), None).await;
+        let stranger = h.bind(reserved("stranger"), None).await;
+        for consumer in [
+            "inherit-owner.task.child",
+            "inherit-owner.task.branch",
+            "inherit-owner.task.branch.child",
+            "inherit-owner.task.settings",
+            "inherit-owner.task.branch.settings",
+            "inherit-owner.task.owned",
+        ] {
+            for route in [&parent_selector, &owner] {
+                let reply = route.call("route.select", &select(consumer)).await;
+                assert_eq!(reply.0, FrameType::Response, "{consumer}: {}", reply.1);
+            }
+            for route in [&child_selector, &stranger] {
+                admission_refused(
+                    route.call("route.select", &select(consumer)).await,
+                    "consumer_not_owned",
+                    consumer,
+                );
+            }
+        }
+        for consumer in [
+            "inherit-owner.task.closed",
+            "inherit-owner.task.closed.child",
+            "inherit-owner.task_underscore",
+        ] {
+            assert_eq!(
+                owner.call("route.select", &select(consumer)).await.0,
+                FrameType::Response
+            );
+            admission_refused(
+                parent_selector
+                    .call("route.select", &select(consumer))
+                    .await,
+                "consumer_not_owned",
+                consumer,
+            );
+        }
+        for consumer in [
+            "inherit-owner.task.changed",
+            "inherit-owner.task.changed.child",
+        ] {
+            assert_eq!(
+                child_selector
+                    .call("route.select", &select(consumer))
+                    .await
+                    .0,
+                FrameType::Response
+            );
+            admission_refused(
+                parent_selector
+                    .call("route.select", &select(consumer))
+                    .await,
+                "consumer_not_owned",
+                consumer,
+            );
+        }
+        let settings_owner = h.bind(reserved("settings-owner"), None).await;
+        assert_eq!(
+            settings_owner
+                .call("route.select", &select("inherit-owner.task.foreign"))
+                .await
+                .0,
+            FrameType::Response
+        );
+        for route in [&owner, &parent_selector] {
+            admission_refused(
+                route
+                    .call("route.select", &select("inherit-owner.task.foreign"))
+                    .await,
+                "consumer_not_owned",
+                "inherit-owner.task.foreign",
+            );
+        }
+        for route in [&owner, &parent_selector, &stranger] {
+            assert_eq!(
+                route
+                    .call("route.select", &select("inherit-owner.legacy.settings"))
+                    .await
+                    .0,
+                FrameType::Response
+            );
+        }
+        let config = h.operator_config();
+        assert!(consumers::effective(&config).with_defaults(
+            "inherit-owner.legacy.settings",
+            &select("inherit-owner.legacy.settings"),
+            &config
+        )["requirements"]
+            .get("eq")
+            .is_none());
+        let mut refreshed = modules;
+        refreshed[0]["role_declarations"]["routing/v1"]["consumers"][0]["selectors"] = json!([]);
+        consumers::replace_catalog(&refreshed);
+        admission_refused(
+            parent_selector
+                .call(
+                    "route.select",
+                    &select("inherit-owner.task.branch.settings"),
+                )
+                .await,
+            "consumer_not_owned",
+            "inherit-owner.task.branch.settings",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn declared_admission_ignored_claims_do_not_conflict_but_legacy_and_settings_claims_do() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        let owner_entry = json!({"module_id": "conflict-owner", "nonce_verified": true,
+        "role_declarations": {"routing/v1": {"consumers": [{
+            "name": "conflict-owner.task", "iq": 40, "eq": 17,
+            "selectors": ["conflict-selector"]
+        }]}}});
+        let ignored_entry = json!({"module_id": "other-owner", "nonce_verified": true,
+        "role_declarations": {"routing/v1": {"consumers": [{
+            "name": "conflict-owner.task", "iq": 60, "selectors": ["other-selector"]
+        }]}}});
+        let owner = h.bind(reserved("conflict-owner"), None).await;
+        let selector = h.bind(reserved("conflict-selector"), None).await;
+        let other = h.bind(reserved("other-owner"), None).await;
+        let other_selector = h.bind(reserved("other-selector"), None).await;
+        for modules in [
+            json!([owner_entry, ignored_entry]),
+            json!([ignored_entry, owner_entry]),
+        ] {
+            consumers::replace_catalog(&modules);
+            for route in [&selector, &owner] {
+                let reply = route
+                    .call("route.select", &select("conflict-owner.task"))
+                    .await;
+                assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            }
+            for route in [&other, &other_selector] {
+                admission_refused(
+                    route
+                        .call("route.select", &select("conflict-owner.task"))
+                        .await,
+                    "consumer_not_owned",
+                    "conflict-owner.task",
+                );
+            }
+        }
+        let legacy_claim = entry("other-owner", true, &["conflict-owner.task"]);
+        for modules in [
+            json!([owner_entry, legacy_claim]),
+            json!([legacy_claim, owner_entry]),
+            json!([owner_entry]),
+        ] {
+            if modules.as_array().unwrap().len() == 1 {
+                h.edit_config(|config| {
+                    config["consumers"]["conflict-owner.task"] = json!({"owner": "other-owner"})
+                });
+            }
+            consumers::replace_catalog(&modules);
+            let config = h.operator_config();
+            let registry = consumers::effective(&config);
+            assert!(!registry.policies.contains_key("conflict-owner.task"));
+            assert!(!registry
+                .names()
+                .iter()
+                .any(|name| name == "conflict-owner.task"));
+            let defaults = registry.with_defaults(
+                "conflict-owner.task",
+                &select("conflict-owner.task"),
+                &config,
+            );
+            assert_eq!(defaults["requirements"], json!({"iq": 30}));
+            for route in [&owner, &selector, &other, &other_selector] {
+                for consumer in ["conflict-owner.task", "conflict-owner.task.child"] {
+                    admission_refused(
+                        route.call("route.select", &select(consumer)).await,
+                        "consumer_not_owned",
+                        consumer,
+                    );
+                }
+            }
+        }
+    })
+    .await;
+}
+
 async fn consumer_health_report(harness: &Harness) -> Value {
     let frame = subc_protocol::Frame::build(
         FrameType::Request,

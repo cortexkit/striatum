@@ -185,6 +185,33 @@ impl Catalog {
         for (name, owner) in config.consumer_owners() {
             registry.owners.entry(name).or_default().insert(owner);
         }
+        // An ownerless settings child cannot open admission beneath a declared
+        // namespace using iq, ladder, placement, selectors or kind, including
+        // inherited values. Without those members it remains settings-only,
+        // admitting any currently bound caller as before.
+        let inherited_owners: Vec<_> = registry
+            .owners
+            .iter()
+            .filter(|(_, owners)| owners.is_empty())
+            .filter_map(|(name, _)| {
+                let ancestor = registry
+                    .defaults
+                    .keys()
+                    .filter(|ancestor| crate::config_policy::consumer_matches(ancestor, name))
+                    .max_by_key(|ancestor| ancestor.len())?;
+                let owners = &registry.owners[ancestor];
+                registry
+                    .defaults
+                    .iter()
+                    .any(|(parent, defaults)| {
+                        crate::config_policy::consumer_matches(parent, ancestor)
+                            && &registry.owners[parent] == owners
+                            && declared::extended(defaults)
+                    })
+                    .then(|| (name.clone(), owners.clone()))
+            })
+            .collect();
+        registry.owners.extend(inherited_owners);
         registry
             .policies
             .retain(|name, _| registry.owners[name].len() == 1);
@@ -232,8 +259,20 @@ pub(crate) fn provides_agent_host(module: &str) -> bool {
 }
 
 impl Registry {
+    /// Resolve whole dotted segments so an unlisted child uses the nearest
+    /// declared or configured name, including its ownership restrictions.
+    fn owners_for(&self, consumer: &str) -> Option<&BTreeSet<String>> {
+        let mut name = consumer;
+        loop {
+            if let Some(owners) = self.owners.get(name) {
+                return Some(owners);
+            }
+            name = name.rsplit_once('.')?.0;
+        }
+    }
+
     pub(crate) fn knows(&self, consumer: &str) -> bool {
-        self.owners.contains_key(consumer)
+        self.owners_for(consumer).is_some()
     }
 
     pub(crate) fn names(&self) -> Vec<String> {
@@ -258,18 +297,15 @@ impl Registry {
             .iter()
             .filter(|(name, _)| {
                 crate::config_policy::consumer_matches(name, consumer)
-                    && self.owners.get(*name) == self.owners.get(consumer)
+                    && self.owners.get(*name) == self.owners_for(consumer)
             })
             .collect();
         chain.sort_by_key(|(name, _)| name.len());
         for (_, defaults) in chain {
-            requirements.extend(
-                serde_json::to_value(defaults)
-                    .unwrap()
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            );
+            let mut demand = serde_json::to_value(defaults).unwrap();
+            // Selectors authorize callers; they are not model requirements.
+            demand.as_object_mut().unwrap().remove("selectors");
+            requirements.extend(demand.as_object().unwrap().clone());
         }
         if let Some(request) = params.get("requirements").and_then(Value::as_object) {
             requirements.extend(
@@ -304,7 +340,7 @@ impl Registry {
     }
 
     pub(crate) fn admit(&self, consumer: &str, caller: &Caller) -> Result<(), Refusal> {
-        let Some(owners) = self.owners.get(consumer) else {
+        let Some(owners) = self.owners_for(consumer) else {
             return Err(Refusal::unknown_consumer(consumer));
         };
         if !caller.binding_is_current() {
@@ -316,7 +352,20 @@ impl Registry {
         }
         if owners.len() == 1 {
             let owner = owners.first().unwrap();
+            let selectors = self
+                .defaults
+                .iter()
+                .filter(|(name, defaults)| {
+                    crate::config_policy::consumer_matches(name, consumer)
+                        && self.owners.get(*name) == Some(owners)
+                        && defaults.selectors.is_some()
+                })
+                .max_by_key(|(name, _)| name.len())
+                .and_then(|(_, defaults)| defaults.selectors.as_ref());
             if caller.attested_module() == Some(owner.as_str())
+                || caller.attested_module().is_some_and(|module| {
+                    selectors.is_some_and(|selectors| selectors.iter().any(|id| id == module))
+                })
                 || caller.scope_authority.as_ref().is_some_and(|scope| {
                     scope.owner_authorized && scope.owner == format!("reserved:{owner}")
                 })
