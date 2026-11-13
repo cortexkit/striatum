@@ -40,7 +40,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
                 {"name":"mason"}, {"name":"sidekick"}, {"name":"head"},
                 {"name":"codemode"}, {"name":"flow"}
             ]}}},
-        {"module_id":"colliculus", "nonce_verified":true,
+        {"module_id":"callosum", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}},
         {"module_id":"magic-context", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"consumers":[{"name":"mc_summary"}]}}},
@@ -116,7 +116,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
             "prefrontal-core",
             &["mason", "sidekick", "head", "codemode", "flow"][..],
         ),
-        ("colliculus", &["phone.media"][..]),
+        ("callosum", &["phone.media"][..]),
         ("magic-context", &["mc_summary"][..]),
     ] {
         let caller = harness.bind(reserved(owner), None).await;
@@ -372,7 +372,7 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
     // Media engines have no subscription alternative or pin operation. The
     // LLM-only spend fence must not disable an installed phone transcription path.
     crate::routing_v1::consumers::replace_catalog(&json!([
-        {"module_id":"colliculus","nonce_verified":true,"role_declarations":{
+        {"module_id":"callosum","nonce_verified":true,"role_declarations":{
             "routing/v1":{"consumers":[{"name":"phone.media"}]},
             "media-provider/v1":{"engines":[{"kind":"transcribe","provider":"openai",
                 "model":"gpt-transcribe","local":false,"formats":["audio/wav"],
@@ -393,7 +393,7 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
         ..Default::default()
     }, crate::now_ms());
     harness.set_credentials(credentials);
-    let caller = harness.bind(reserved("colliculus"), None).await;
+    let caller = harness.bind(reserved("callosum"), None).await;
     let selected = caller.call("route.select_engine", &json!({
         "consumer":"phone.media", "kind":"transcribe", "requirements":{}, "privacy":"remote_allowed"
     })).await;

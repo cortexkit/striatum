@@ -901,6 +901,20 @@ thread_local! {
     /// it caused was reported to the operator.
     static OPERATOR_WARNINGS: std::cell::RefCell<OperatorWarnings> =
         std::cell::RefCell::new(OperatorWarnings::default());
+    static OPERATOR_INFOS: std::cell::RefCell<OperatorWarnings> =
+        std::cell::RefCell::new(OperatorWarnings::default());
+}
+
+/// Write an informational line without treating it as an operator warning.
+fn info_operator(line: String) {
+    #[cfg(test)]
+    OPERATOR_INFOS.with(|sink| sink.borrow().lock().unwrap().push(line.clone()));
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+fn take_operator_infos() -> Vec<String> {
+    OPERATOR_INFOS.with(|sink| std::mem::take(&mut *sink.borrow().lock().unwrap()))
 }
 
 /// Write one diagnostic line to the module's stderr log.
@@ -993,6 +1007,7 @@ impl Drop for InjectedClock {
 struct TestThreadState {
     now_ms: Option<u64>,
     warnings: OperatorWarnings,
+    infos: OperatorWarnings,
     replay: Option<striatum_store::replay::Inputs>,
 }
 
@@ -1002,6 +1017,7 @@ impl TestThreadState {
         Self {
             now_ms: INJECTED_NOW_MS.with(std::cell::Cell::get),
             warnings: OPERATOR_WARNINGS.with(|sink| Arc::clone(&sink.borrow())),
+            infos: OPERATOR_INFOS.with(|sink| Arc::clone(&sink.borrow())),
             replay: striatum_store::replay::current(),
         }
     }
@@ -1015,6 +1031,7 @@ impl TestThreadState {
             previous: Some(TestThreadState {
                 now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
                 warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
+                infos: OPERATOR_INFOS.with(|sink| sink.replace(self.infos)),
                 replay: None,
             }),
             _replay: replay,
@@ -1035,6 +1052,7 @@ impl Drop for InstalledTestThreadState {
         if let Some(previous) = self.previous.take() {
             INJECTED_NOW_MS.with(|clock| clock.set(previous.now_ms));
             OPERATOR_WARNINGS.with(|sink| *sink.borrow_mut() = previous.warnings);
+            OPERATOR_INFOS.with(|sink| *sink.borrow_mut() = previous.infos);
         }
     }
 }

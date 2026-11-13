@@ -637,7 +637,10 @@ fn live_config_at_with_reporter(
         return Err("config changed while loading; retry".into());
     }
     let active = match next {
-        Ok(config) => Arc::new(config),
+        Ok(config) => {
+            crate::routing_v1::consumers::settings_loaded(&config);
+            Arc::new(config)
+        }
         Err(error) => {
             let Some(cache) = caches.get(path) else {
                 return Err(error);
