@@ -2,7 +2,7 @@
 
 use cortexkit_role_routing::declarations::{
     parse_consumer_declarations_serving, ConsumerDeclaration, ConsumerDeclarations,
-    DeclarationError,
+    DeclarationError, DemandDefaults,
 };
 use serde_json::Value;
 
@@ -25,13 +25,7 @@ pub(super) fn honor(
     {
         return true;
     }
-    let defaults = &declaration.defaults;
-    let extended = defaults.iq.is_some()
-        || defaults.ladder.is_some()
-        || defaults.placement.is_some()
-        || defaults.selectors.is_some()
-        || defaults.kind.is_some();
-    if extended {
+    if extended(&declaration.defaults) {
         issues.push(format!(
             "ignored consumer {name:?} from module {module:?}: a consumer using declared defaults must equal its module id or start with {module}."
         ));
@@ -46,6 +40,14 @@ pub(super) fn honor(
         ));
         true
     }
+}
+
+pub(super) fn extended(defaults: &DemandDefaults) -> bool {
+    defaults.iq.is_some()
+        || defaults.ladder.is_some()
+        || defaults.placement.is_some()
+        || defaults.selectors.is_some()
+        || defaults.kind.is_some()
 }
 
 #[cfg(test)]
