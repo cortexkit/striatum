@@ -54,6 +54,201 @@ fn refused(reply: (FrameType, Value), reason: &str) {
 }
 
 #[tokio::test]
+async fn harness_refusals_caller_runners_follow_consumer_placements() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"legacy"}]));
+    install(&harness, "legacy", &slot(json!({})));
+    let mut tagged = request(json!({"iq":0,"tool_capabilities":["test:absent/v1"]}));
+    tagged["harness"] = json!("primary");
+    refused(
+        route.call("route.select", &tagged).await,
+        "missing_capability",
+    );
+    let mut params = request(json!({"iq":0}));
+    params["runners"] = json!(["missing"]);
+    harness.edit_config(|config| {
+        config["consumers"]["harness_choice_test"]["runner"] = json!("not-configured");
+    });
+    for callers in [None, Some(json!(["missing"]))] {
+        let mut missing_placement = request(json!({"iq":0}));
+        if let Some(callers) = callers {
+            missing_placement["runners"] = callers;
+        }
+        refused(
+            route.call("route.select", &missing_placement).await,
+            "no_available_model",
+        );
+        missing_placement["harness"] = json!("primary");
+        refused(
+            route.call("route.select", &missing_placement).await,
+            "harness_unavailable",
+        );
+    }
+    harness.edit_config(|config| {
+        config["runners"] = json!([]);
+        config["consumers"]["harness_choice_test"] = json!({});
+    });
+    refused(
+        route.call("route.select", &params).await,
+        "no_available_model",
+    );
+    params["harness"] = json!("primary");
+    refused(
+        route.call("route.select", &params).await,
+        "harness_unavailable",
+    );
+    params.as_object_mut().unwrap().remove("harness");
+    harness.edit_config(|config| config["runners"] = json!([{"module":"legacy"}]));
+    for callers in [json!(["missing"]), json!([])] {
+        params["runners"] = callers;
+        let reply = route.call("route.select", &params).await;
+        assert!(
+            reply.1["detail"].get("reset_at_ms").is_none(),
+            "{}",
+            reply.1
+        );
+        refused(reply, "harness_unavailable");
+    }
+}
+
+fn exclude_on_every_harness(exclude: Value) -> Value {
+    slot(
+        json!({"primary":{"exclude":exclude}, "secondary":{"exclude":exclude}, "inherited":{"exclude":exclude}}),
+    )
+}
+
+#[tokio::test]
+async fn harness_refusals_route_exclusions_preserve_cooldowns_and_policy() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({})));
+        let params = request(json!({"iq":0}));
+        let first = selected(route.call("route.select", &params).await);
+        let key = format!(
+            "{}/{}",
+            first["route"]["provider"].as_str().unwrap(),
+            first["route"]["model"].as_str().unwrap()
+        );
+        install(
+            &harness,
+            "declaring",
+            &exclude_on_every_harness(json!([key])),
+        );
+        let next = selected(route.call("route.select", &params).await);
+        let other = format!(
+            "{}/{}",
+            next["route"]["provider"].as_str().unwrap(),
+            next["route"]["model"].as_str().unwrap()
+        );
+        let mut only = params.clone();
+        only["available_routes"] = json!([key, other]);
+        let reset = crate::now_ms() as u64 + 60_000;
+        let cooldown = route
+            .call(
+                "route.record_cooldown",
+                &json!({"routeKey":other,"capacityKey":other,"cooldownUntil":reset}),
+            )
+            .await;
+        assert_eq!(cooldown.0, FrameType::Response, "{}", cooldown.1);
+        let timed = route.call("route.select", &only).await;
+        assert_eq!(timed.1["detail"]["reset_at_ms"], reset, "{}", timed.1);
+        refused(timed, "quota_or_cooldown");
+        install(
+            &harness,
+            "declaring",
+            &exclude_on_every_harness(json!([key, other])),
+        );
+        let excluded = route.call("route.select", &only).await;
+        assert!(
+            excluded.1["detail"].get("reset_at_ms").is_none(),
+            "{}",
+            excluded.1
+        );
+        refused(excluded, "harness_unavailable");
+        only["exclude"] = json!([key, other]);
+        refused(
+            route.call("route.select", &only).await,
+            "no_available_model",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_refusals_unhostable_pins_keep_pin_reason_and_fallback() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({})));
+        let first = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        let key = format!(
+            "{}/{}",
+            first["route"]["provider"].as_str().unwrap(),
+            first["route"]["model"].as_str().unwrap()
+        );
+        harness
+            .edit_config(|config| config["consumers"]["harness_pin"]["pin"] = json!({"model":key}));
+        for pin in [json!({"pin":key}), json!({"pin_slot":"harness_pin"})] {
+            install(
+                &harness,
+                "declaring",
+                &exclude_on_every_harness(json!([key])),
+            );
+            let mut params = request(json!({"iq":0}));
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(pin.as_object().unwrap().clone());
+            let unavailable = route.call("route.select", &params).await;
+            assert_eq!(
+                unavailable.1["code"], "pin_unavailable",
+                "{}",
+                unavailable.1
+            );
+            assert_eq!(
+                unavailable.1["detail"]["reason"], "not_available",
+                "{}",
+                unavailable.1
+            );
+            params["pin_fallback"] = json!("route");
+            let fallback = selected(route.call("route.select", &params).await);
+            assert_eq!(fallback["pin_outcome"], "fell_back", "{fallback}");
+            assert_eq!(
+                fallback["detail"]["pin_reason"], "not_available",
+                "{fallback}"
+            );
+            assert_ne!(fallback["route"], first["route"], "{fallback}");
+            let providers: Vec<_> = harness
+                .store()
+                .get_facts()
+                .unwrap()
+                .into_iter()
+                .map(|fact| fact.provider_id)
+                .collect();
+            install(
+                &harness,
+                "declaring",
+                &exclude_on_every_harness(json!(providers)),
+            );
+            params.as_object_mut().unwrap().remove("pin_fallback");
+            let all_excluded = route.call("route.select", &params).await;
+            assert_eq!(
+                all_excluded.1["code"], "pin_unavailable",
+                "{}",
+                all_excluded.1
+            );
+            assert_eq!(
+                all_excluded.1["detail"]["reason"], "not_available",
+                "{}",
+                all_excluded.1
+            );
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn harness_choice_capability_needs_are_per_runner_and_do_not_require_fork_answer() {
     describe::with_candidate_capabilities(&[GROUP], async {
         let (harness, route) = configured().await;

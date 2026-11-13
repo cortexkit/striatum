@@ -856,9 +856,9 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "no_available_model"
+              "reason": "harness_unavailable"
             },
-            "message": "no route meets the request: no_available_model"
+            "message": "no route meets the request: harness_unavailable"
           }
         },
         {
@@ -877,9 +877,9 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "no_available_model"
+              "reason": "harness_unavailable"
             },
-            "message": "no route meets the request: no_available_model"
+            "message": "no route meets the request: harness_unavailable"
           }
         },
         {
@@ -900,9 +900,9 @@
           "reply": {
             "code": "no_route",
             "detail": {
-              "reason": "no_available_model"
+              "reason": "harness_unavailable"
             },
-            "message": "no route meets the request: no_available_model"
+            "message": "no route meets the request: harness_unavailable"
           }
         }
       ],
