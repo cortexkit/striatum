@@ -2394,10 +2394,16 @@ impl AccountTx<'_> {
 
 impl SqliteRouteStateStore {
     fn begin_account_write<'a>(&self, conn: &'a Connection) -> rusqlite::Result<Transaction<'a>> {
-        crate::write_transaction(conn)
+        let tx = crate::write_transaction(conn)?;
+        #[cfg(any(test, feature = "test-support"))]
+        self.account_write_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(tx)
     }
 
-    /// Number of account writer batch transactions begun by this store.
+    /// Number of account write transactions begun by this store: the account
+    /// writer's batches plus the direct account transactions that have not
+    /// moved into the writer yet.
     #[cfg(any(test, feature = "test-support"))]
     pub fn account_write_transaction_count_for_test(&self) -> u64 {
         self.account_write_transactions
