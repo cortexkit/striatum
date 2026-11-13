@@ -4561,6 +4561,95 @@ async fn stale_api_billing_probe_passes_its_route_fence_once_even_with_spend_rea
     );
 }
 
+#[tokio::test]
+async fn account_writer_fresh_admit_is_one_command_and_probe_retry_skips_roster() {
+    use striatum_store::AccountCommandKind::{Admit, Replay};
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let old = NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1;
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "apikey:test".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            old,
+        )
+        .unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "apikey:test".into(),
+            model: "model".into(),
+            until_ms: NOW as i64 + 8 * 86_400_000,
+            recorded_at: old,
+            decision_id: "billing-refusal".into(),
+        })
+        .unwrap();
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_usage_reply(&mut state, &serde_json::to_vec(&json!({
+        "result":[{"provider":"platform", "apiProvider":"synthetic", "account":"apikey-account",
+            "credentialRef":"apikey:test", "fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+            "usage":{}, "spend":[{"id":"credits","remaining":{"minor":20000,"exponent":2,"unit":"USD"}}]}]
+    })).unwrap(), NOW as i64).unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"codemode", "requirements":{"iq":30},"pin":"synthetic/model"}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let mut request = account_request("synthetic", "writer-probe-replay");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    let admits = harness.store().account_command_count_for_test(Admit);
+    let replays = harness.store().account_command_count_for_test(Replay);
+    let admitted = runner.call("route.account_for", &request).await;
+    assert_credential(&admitted, "apikey:test");
+    assert_eq!(
+        harness.store().account_command_count_for_test(Admit) - admits,
+        1
+    );
+    assert_eq!(
+        harness.store().account_command_count_for_test(Replay),
+        replays
+    );
+    let claims = format!("{:?}", harness.store().fence_rechecks().unwrap());
+    let prepared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sentinel = prepared.clone();
+    crate::account_selection::after_roster_prepared("writer-probe-replay", move || {
+        sentinel.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let retried = runner.call("route.account_for", &request).await;
+    assert_eq!(retried, admitted);
+    assert!(!prepared.load(std::sync::atomic::Ordering::Relaxed));
+    assert_eq!(
+        harness.store().account_command_count_for_test(Admit) - admits,
+        1
+    );
+    assert_eq!(
+        harness.store().account_command_count_for_test(Replay) - replays,
+        1
+    );
+    assert_eq!(
+        format!("{:?}", harness.store().fence_rechecks().unwrap()),
+        claims
+    );
+    request["admission_id"] = json!("writer-second-probe");
+    request["conversation_key"] = json!("writer-second-probe");
+    assert_eq!(
+        runner.call("route.account_for", &request).await.0,
+        FrameType::Error,
+        "the first probe claim emptied the eligible roster"
+    );
+}
+
 #[test]
 fn s4b_unchanged_contexts_on_both_s0_fixtures_take_only_catalog_key_writer() {
     use super::request_cpu_bench as bench;

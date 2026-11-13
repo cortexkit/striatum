@@ -158,6 +158,7 @@ fn commit(
         tier_served: None,
         cost: None,
     });
+    let fence_id = format!("fence:{id}");
     store.v1_commit_report(
         id,
         key,
@@ -168,10 +169,10 @@ fn commit(
         true,
         &effects,
         usage.as_ref(),
-        |tx| {
+        move |tx| {
             tx.insert_pool_fence(&AccountPoolFenceRow {
                 evidence: AccountFenceRow {
-                    fence_id: format!("fence:{id}"),
+                    fence_id,
                     provider: "example".into(),
                     account_id: "account".into(),
                     scope_json: "null".into(),

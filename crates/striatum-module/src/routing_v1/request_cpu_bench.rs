@@ -309,6 +309,7 @@ struct Samples {
     cpu: i64,
     wall: Vec<u128>,
     queue_ns: u64,
+    command_queue_ns: u64,
     sql_ns: u64,
     commit_ns: u64,
     serialization_ns: u64,
@@ -321,6 +322,7 @@ struct Before {
     cpu: i64,
     started: Instant,
     stages: striatum_store::StoreStageTiming,
+    command_queue_ns: u64,
     serialization: u64,
     commits: u64,
     acquisitions: u64,
@@ -332,6 +334,7 @@ impl Before {
             cpu: cpu_us(),
             started: Instant::now(),
             stages: store.stage_timing(),
+            command_queue_ns: store.account_command_queue_ns(),
             serialization: crate::stage_timing::serialization_ns(),
             commits: store.writer_commit_count_for_test(),
             acquisitions: store.writer_acquisition_count_for_test(),
@@ -359,6 +362,7 @@ impl Before {
         samples.cpu += cpu_us() - self.cpu;
         let stages = store.stage_timing();
         samples.queue_ns += stages.writer_queue_ns - self.stages.writer_queue_ns;
+        samples.command_queue_ns += store.account_command_queue_ns() - self.command_queue_ns;
         samples.sql_ns += stages.sql_ns - self.stages.sql_ns;
         samples.commit_ns += stages.commit_ns - self.stages.commit_ns;
         samples.serialization_ns += crate::stage_timing::serialization_ns() - self.serialization;
@@ -376,8 +380,9 @@ impl Samples {
         let n = count as f64;
         let percentile = |p: usize| self.wall[(count * p).div_ceil(100).saturating_sub(1)];
         // StoreStageTiming measures connection contention, not command-queue wait.
-        println!("{name} n={count} refusals={} cpu_us/op={:.2} p50_us={} p99_us={} connection_wait_us/op={:.2} sql_us/op={:.2} commit_us/op={:.2} serialization_us/op={:.2} commits/op={:.3} writer_acquisitions/op={:.3}", self.refusals,
+        println!("{name} n={count} refusals={} cpu_us/op={:.2} p50_us={} p99_us={} connection_wait_us/op={:.2} writer_queue_wait_us/op={:.2} sql_us/op={:.2} commit_us/op={:.2} serialization_us/op={:.2} commits/op={:.3} writer_acquisitions/op={:.3}", self.refusals,
             self.cpu as f64 / n, percentile(50), percentile(99), self.queue_ns as f64 / n / 1_000.0,
+            self.command_queue_ns as f64 / n / 1_000.0,
             self.sql_ns as f64 / n / 1_000.0, self.commit_ns as f64 / n / 1_000.0,
             self.serialization_ns as f64 / n / 1_000.0, self.commits as f64 / n, self.acquisitions as f64 / n);
         println!(

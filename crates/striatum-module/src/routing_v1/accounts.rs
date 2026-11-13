@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use super::{account_ctx, now_ms, provider_refusal, Caller, Deps};
 use crate::account_refusal_log::{because, checking};
-use crate::account_selection::{self, OpReply, ACCOUNT_FOR_OP};
+use crate::account_selection::{self, OpReply};
 use crate::{account_quota, config_overrides};
 
 /// A store or serialization failure inside `route.account_for`. The contract
@@ -322,51 +322,14 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         }
     }
 
-    let mut legacy = json!({
-        "provider": request.provider,
-        "model": request.model,
-        "conversation_key": request.conversation_key,
-        "admission_id": authority.admission_key(&request.admission_id),
-        "mode": request.mode().as_str(),
-        "initial_input_bytes": request.initial_input_bytes.unwrap_or(0),
-        "initial_input_estimated": request.initial_input_estimated.unwrap_or(false),
-        "caller": { "runner": authority.module },
-    });
-    for (member, value) in [
-        ("affinity_model", json!(request.affinity_model)),
-        ("expected_pin", json!(request.expected_pin)),
-        ("candidates", json!(request.candidates)),
-        ("requested_account", json!(request.requested_account)),
-        ("warm_credential", json!(request.warm_credential)),
-        ("hold_wait_max_s", json!(hold_wait_max_s)),
-        ("model_decision_id", json!(request.decision_id)),
-        ("service_tier", json!(request.service_tier)),
-        (
-            "parent_conversation_key",
-            params
-                .get("parent_conversation_key")
-                .cloned()
-                .unwrap_or(Value::Null),
-        ),
-        ("pool", params.get("pool").cloned().unwrap_or(Value::Null)),
-        (
-            "hold_ok",
-            params.get("hold_ok").cloned().unwrap_or(Value::Null),
-        ),
-        (
-            "request_input_tokens",
-            params
-                .get("request_input_tokens")
-                .cloned()
-                .unwrap_or(Value::Null),
-        ),
-    ] {
-        if !value.is_null() {
-            legacy[member] = value;
-        }
-    }
-    let body = serde_json::to_vec(&json!({ "method": ACCOUNT_FOR_OP, "params": legacy }))
-        .map_err(internal_unavailable)?;
+    let parsed = account_selection::AccountForParams::from_v1(
+        &request,
+        authority.admission_key(&request.admission_id),
+        authority.module.to_owned(),
+        hold_wait_max_s,
+        params,
+    )
+    .map_err(op_refusal)?;
     let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
     let policy =
         config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
@@ -400,58 +363,110 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             .for_engine(&request.provider, &request.model)
             .map_err(store_unavailable)?;
     }
-    let answer = match account_selection::handle(ACCOUNT_FOR_OP, &body, &authority.principal, &ctx)
-    {
-        OpReply::Result(result) => admission_answer(&result, &request)?,
+    let record = AdmissionRecord {
+        principal,
+        request,
+        body_json,
+        bound_tier,
+    };
+    match account_selection::account_for_parsed(parsed, &authority.principal, &ctx, Some(record)) {
+        OpReply::Result(result) => Ok(result),
+        error => Err(op_refusal(error)),
+    }
+}
+
+fn op_refusal(reply: OpReply) -> Refusal {
+    match reply {
         OpReply::Error {
             code,
             message,
             detail,
-        } => return Err(account_refusal(&code, message, detail.as_ref())),
-    };
-    let chosen = answer["service_tier_chosen"].as_str();
-    let effective_tier = bound_tier
-        .as_deref()
-        .filter(|tier| *tier != "standard")
-        .and_then(ServiceTier::parse)
-        .or(request.service_tier);
-    // A decision fixes the service tier; the general contract check permits a
-    // step-down, so decision-bound admissions must also require equality.
-    if !check_chosen(effective_tier, chosen)
-        || bound_tier
+        } => account_refusal(&code, message, detail.as_ref()),
+        OpReply::Result(_) => internal_unavailable("expected refusal"),
+    }
+}
+
+/// Public replay data captured before enqueue; persisted atomically with the
+/// allocator's grant so a lost reply cannot leave only half an admission.
+pub(crate) struct AdmissionRecord {
+    principal: String,
+    request: AccountForRequest,
+    body_json: String,
+    bound_tier: Option<String>,
+}
+
+impl AdmissionRecord {
+    pub(crate) fn finish(
+        &self,
+        tx: &striatum_store::AccountTx<'_>,
+        reply: OpReply,
+        now: i64,
+    ) -> striatum_core::route_state_store::RouteStateResult<OpReply> {
+        let result = match reply {
+            OpReply::Result(result) => result,
+            error => return Ok(error),
+        };
+        let answer = match self.answer(&result) {
+            Ok(answer) => answer,
+            Err(refusal) => {
+                return Err(striatum_core::route_state_store::RouteStateStoreError(
+                    refusal.message,
+                ))
+            }
+        };
+        let standing = tx.v1_record_admission(
+            &self.principal,
+            &self.request.admission_id,
+            &V1Recorded {
+                body_json: self.body_json.clone(),
+                answer_json: answer.to_string(),
+            },
+            now,
+        )?;
+        match standing_answer(standing, &self.body_json) {
+            Ok(answer) => Ok(OpReply::Result(answer)),
+            Err(refusal) => Ok(OpReply::typed(
+                refusal.code.as_str(),
+                refusal.message,
+                json!(refusal.detail),
+            )),
+        }
+    }
+
+    fn answer(&self, result: &Value) -> Result<Value, Refusal> {
+        let request = &self.request;
+        let bound_tier = &self.bound_tier;
+        let answer = admission_answer(result, request)?;
+        let chosen = answer["service_tier_chosen"].as_str();
+        let effective_tier = bound_tier
             .as_deref()
-            .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
-    {
-        checking("chosen_service_tier");
-        let mut refusal = account_unavailable(
+            .filter(|tier| *tier != "standard")
+            .and_then(ServiceTier::parse)
+            .or(request.service_tier);
+        // A decision fixes the service tier; the general contract check permits
+        // a step-down, so decision-bound admissions must also require equality.
+        if !check_chosen(effective_tier, chosen)
+            || bound_tier
+                .as_deref()
+                .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
+        {
+            checking("chosen_service_tier");
+            let mut refusal = account_unavailable(
             "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
         );
-        let detail = json!({
-            "code": "account_selection_unavailable",
-            "retry_after_s": null,
-            "decision_id": request.decision_id,
-            "exclusions": request.candidates.iter().flat_map(|candidates| &candidates.accounts)
-                .map(|candidate| json!({"account_id":candidate.account_id,"reason":"bound_service_tier_unavailable"}))
-                .collect::<Vec<_>>(),
-        });
-        refusal.detail.extend(detail.as_object().unwrap().clone());
-        return Err(refusal);
+            let detail = json!({
+                "code": "account_selection_unavailable",
+                "retry_after_s": null,
+                "decision_id": request.decision_id,
+                "exclusions": request.candidates.iter().flat_map(|candidates| &candidates.accounts)
+                    .map(|candidate| json!({"account_id":candidate.account_id,"reason":"bound_service_tier_unavailable"}))
+                    .collect::<Vec<_>>(),
+            });
+            refusal.detail.extend(detail.as_object().unwrap().clone());
+            return Err(refusal);
+        }
+        Ok(answer)
     }
-    let answer_json = serde_json::to_string(&answer).map_err(internal_unavailable)?;
-    checking("admission_record");
-    let standing = deps
-        .store
-        .v1_record_admission(
-            &principal,
-            &request.admission_id,
-            &V1Recorded {
-                body_json: body_json.clone(),
-                answer_json,
-            },
-            now_ms() as i64,
-        )
-        .map_err(store_unavailable)?;
-    replay_admission(standing, &body_json, &request, &authority, deps)
 }
 
 fn continue_account(
@@ -528,23 +543,44 @@ fn replay_admission(
     authority: &AccountCaller<'_>,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    let principal = authority.principal.clone();
+    let id = authority.admission_key(&request.admission_id);
+    let body_json = body_json.to_owned();
+    let request = request.clone();
+    crate::account_writer::execute(
+        deps.store,
+        striatum_store::AccountCommandKind::Replay,
+        move |tx| {
+            Ok(replay_admission_tx(
+                tx, first, &body_json, &request, &principal, &id,
+            ))
+        },
+    )
+    .map_err(store_unavailable)?
+}
+
+fn replay_admission_tx(
+    tx: &striatum_store::AccountTx<'_>,
+    first: V1Recorded,
+    body_json: &str,
+    request: &AccountForRequest,
+    principal: &str,
+    id: &str,
+) -> Result<Value, Refusal> {
     let original = standing_answer(first, body_json)?;
     if request.mode().as_str() != "admit" {
         return Ok(original);
     }
-    let current = deps
-        .store
-        .account_transaction(|tx| {
-            let id = authority.admission_key(&request.admission_id);
-            if !tx
-                .admission(&authority.principal, &id)?
-                .is_some_and(|row| row.state == "started")
-            {
-                return Ok(None);
-            }
-            tx.latest_used_continuation(&authority.principal, &id)
-        })
-        .map_err(store_unavailable)?;
+    let current = (|| {
+        if !tx
+            .admission(principal, id)?
+            .is_some_and(|row| row.state == "started")
+        {
+            return Ok(None);
+        }
+        tx.latest_used_continuation(principal, id)
+    })()
+    .map_err(store_unavailable)?;
     let Some(current) = current else {
         return Ok(original);
     };

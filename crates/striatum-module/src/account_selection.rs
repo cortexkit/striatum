@@ -104,7 +104,7 @@ impl OpReply {
         }
     }
 
-    fn typed(code: &str, message: impl Into<String>, detail: Value) -> Self {
+    pub(crate) fn typed(code: &str, message: impl Into<String>, detail: Value) -> Self {
         OpReply::Error {
             code: code.to_string(),
             message: message.into(),
@@ -162,6 +162,34 @@ pub struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    fn command_context(&self) -> CommandContext {
+        CommandContext {
+            flags: self.flags.clone(),
+            policy: self.policy.clone(),
+            now_ms: self.now_ms,
+            classes: self.classes.clone(),
+        }
+    }
+
+    fn provider_policy(&self, provider: &str) -> AllocatorPolicy {
+        self.classes.as_ref().map_or_else(
+            || self.policy.clone(),
+            |classes| classes.config.allocator_policy(provider),
+        )
+    }
+}
+
+/// The immutable request inputs a command may use while holding the writer.
+/// It deliberately holds no store handle, preventing nested writer acquisition.
+#[derive(Clone)]
+struct CommandContext {
+    flags: AccountSelectionFlags,
+    policy: AllocatorPolicy,
+    now_ms: i64,
+    classes: Option<ClassContext>,
+}
+
+impl CommandContext {
     fn provider_policy(&self, provider: &str) -> AllocatorPolicy {
         self.classes.as_ref().map_or_else(
             || self.policy.clone(),
@@ -4413,7 +4441,7 @@ impl AccountRefParams {
 /// The parameters `route.account_for` accepts. Field names are the wire
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
-struct AccountForParams {
+pub(crate) struct AccountForParams {
     #[serde(default)]
     service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
@@ -4469,6 +4497,75 @@ struct AccountForParams {
 }
 
 impl AccountForParams {
+    pub(crate) fn from_v1(
+        request: &cortexkit_role_routing::account::AccountForRequest,
+        admission_key: String,
+        runner: String,
+        hold_wait_max_s: u64,
+        extras: &Value,
+    ) -> Result<Self, OpReply> {
+        // Only the legacy-only optional extensions need decoding. The public
+        // request has already been parsed and validated by the v1 contract.
+        let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
+        let parsed = Self {
+            service_tier: request.service_tier,
+            service_tier_chosen: None,
+            service_tier_bound: false,
+            parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
+                .map_err(|e| invalid(e.to_string()))?,
+            hold_ok: serde_json::from_value(optional("hold_ok"))
+                .map_err(|e| invalid(e.to_string()))?,
+            request_input_tokens: serde_json::from_value(optional("request_input_tokens"))
+                .map_err(|e| invalid(e.to_string()))?,
+            provider: request.provider.clone(),
+            model: request.model.clone(),
+            affinity_model: request.affinity_model.clone(),
+            conversation_key: request.conversation_key.clone(),
+            caller: CallerParams { runner },
+            admission_id: admission_key,
+            mode: match request.mode().as_str() {
+                "renew" => RequestMode::Renew,
+                "reassign" => RequestMode::Reassign,
+                _ => RequestMode::Admit,
+            },
+            expected_pin: request.expected_pin.as_ref().map(|pin| PinRef {
+                id: pin.id.clone(),
+                generation: pin.generation,
+            }),
+            initial_input_bytes: request.initial_input_bytes.unwrap_or(0),
+            initial_input_estimated: request.initial_input_estimated.unwrap_or(false),
+            model_decision_id: request.decision_id.clone(),
+            decision_id: None,
+            candidates: request
+                .candidates
+                .as_ref()
+                .map(|candidates| CandidatesParams {
+                    view_digest: candidates.view_digest.clone(),
+                    accounts: candidates
+                        .accounts
+                        .iter()
+                        .map(|account| CandidateParams {
+                            account_id: account.account_id.clone(),
+                            credential_id: account.credential_id.clone(),
+                        })
+                        .collect(),
+                }),
+            requested_account: request
+                .requested_account
+                .as_ref()
+                .map(|account| AccountRefParams {
+                    account_id: account.account_id.clone(),
+                    credential_id: account.credential_id.clone(),
+                }),
+            preferred_existing_account: None,
+            warm_credential: request.warm_credential.clone(),
+            hold_wait_max_s: Some(hold_wait_max_s),
+            pool: serde_json::from_value(optional("pool")).map_err(|e| invalid(e.to_string()))?,
+        };
+        parsed.validate()?;
+        Ok(parsed)
+    }
+
     fn validate(&self) -> Result<(), OpReply> {
         if self.admission_id.trim().is_empty() {
             return Err(because(
@@ -4853,10 +4950,28 @@ pub(crate) use continuation::continue_account;
 
 fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     checking("account_for_parse");
-    let mut parsed = match parse_account_for(params) {
+    let parsed = match parse_account_for(params) {
         Ok(parsed) => parsed,
         Err(reply) => return reply,
     };
+    account_for_parsed(parsed, principal, ctx, None)
+}
+
+pub(crate) fn account_for_parsed(
+    mut parsed: AccountForParams,
+    principal: &str,
+    ctx: &Ctx<'_>,
+    finish: Option<crate::routing_v1::accounts::AdmissionRecord>,
+) -> OpReply {
+    if !ctx.flags.enabled {
+        return OpReply::typed(
+            DISABLED_CODE,
+            format!(
+                "{ACCOUNT_FOR_OP} is not served: account selection is disabled in routing policy"
+            ),
+            json!({ "code": DISABLED_CODE }),
+        );
+    }
     let provider = normalize(&parsed.provider);
     let mut classes = ctx.classes.clone();
     if let Some(classes) = &mut classes {
@@ -4872,12 +4987,28 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     };
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
-    match ctx.store.account_transaction(|tx| {
-        tx.admission(principal, &parsed.admission_id)?
-            .map(|row| replay(tx, principal, row, &request_fingerprint, ctx.now_ms))
-            .transpose()
-    }) {
-        Ok(Some(reply)) => return reply,
+    match ctx
+        .store
+        .account_read(|tx| tx.admission(principal, &parsed.admission_id))
+    {
+        Ok(Some(_)) => {
+            let principal = principal.to_owned();
+            let now = ctx.now_ms;
+            return crate::account_writer::execute(
+                ctx.store,
+                striatum_store::AccountCommandKind::Replay,
+                move |tx| {
+                    let row = tx
+                        .admission(&principal, &parsed.admission_id)?
+                        .ok_or_else(|| {
+                            RouteStateStoreError("admission disappeared; retry".into())
+                        })?;
+                    let reply = replay(tx, &principal, row, &request_fingerprint, now)?;
+                    finish_reply(tx, reply, finish.as_ref(), now)
+                },
+            )
+            .unwrap_or_else(store_error);
+        }
         Ok(None) => {}
         Err(error) => return store_error(error),
     }
@@ -5002,20 +5133,37 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
     }
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
-    ctx.store
-        .account_transaction(|tx| {
-            tx.release_expired_continuations(ctx.now_ms)?;
-            serve(
+    let command_ctx = ctx.command_context();
+    let principal = principal.to_owned();
+    crate::account_writer::execute(
+        ctx.store,
+        striatum_store::AccountCommandKind::Admit,
+        move |tx| {
+            tx.release_expired_continuations(command_ctx.now_ms)?;
+            let reply = serve(
                 tx,
-                ctx,
-                principal,
+                &command_ctx,
+                &principal,
                 &parsed,
                 &provider,
                 &roster,
                 &request_fingerprint,
-            )
+            )?;
+            finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)
         })
         .unwrap_or_else(store_error)
+}
+
+fn finish_reply(
+    tx: &AccountTx<'_>,
+    reply: OpReply,
+    finish: Option<&crate::routing_v1::accounts::AdmissionRecord>,
+    now: i64,
+) -> RouteStateResult<OpReply> {
+    match finish {
+        Some(finish) => finish.finish(tx, reply, now),
+        None => Ok(reply),
+    }
 }
 
 #[cfg(test)]
@@ -6011,7 +6159,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// before the reply leaves, so a reply always describes a durable decision.
 fn serve(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
     provider: &str,
@@ -6566,7 +6714,7 @@ fn serve(
                 &decision,
                 state.roster.as_ref(),
                 &state.fences,
-                ctx.policy,
+                &ctx.policy,
                 &params.model,
                 now,
             );
@@ -6653,7 +6801,7 @@ fn pin_conflict(current: Option<&AccountAffinityRow>, expected: &PinRef) -> OpRe
 #[allow(clippy::too_many_arguments)]
 fn commit_admission(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
     provider: &str,
@@ -7010,16 +7158,22 @@ pub(crate) fn observe_authorized(
         })
         .collect();
     checking("observation_transaction");
-    ctx.store
-        .account_transaction(|tx| {
+    let command_ctx = ctx.command_context();
+    let principal = principal.to_owned();
+    let admission_principal = admission_principal.to_owned();
+    let params = params.clone();
+    crate::account_writer::execute(
+        ctx.store,
+        striatum_store::AccountCommandKind::Observe,
+        move |tx| {
             record_observation(
                 tx,
-                ctx,
-                principal,
-                admission_principal,
+                &command_ctx,
+                &principal,
+                &admission_principal,
                 allow_served_account,
                 &parsed,
-                params,
+                &params,
                 &roster_digests,
             )
         })
@@ -7028,7 +7182,7 @@ pub(crate) fn observe_authorized(
 
 fn record_observation(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     admission_principal: &str,
     allow_served_account: bool,
@@ -7168,11 +7322,9 @@ fn record_observation(
         effects.push(json!({ "effect": "advisory", "why": "unknown observation kind" }));
     } else if let (true, Some(row)) = (bound, admission.as_ref()) {
         let policy = ctx.provider_policy(&row.provider);
-        let scoped_ctx = Ctx {
-            store: ctx.store,
-            accounts: ctx.accounts,
+        let scoped_ctx = CommandContext {
             flags: ctx.flags,
-            policy: &policy,
+            policy,
             now_ms: ctx.now_ms,
             classes: ctx.classes.clone(),
         };
@@ -7201,7 +7353,7 @@ fn record_observation(
 
 fn apply_credential_refused(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     parsed: &ObserveParams,
     admission: Option<&AccountAdmissionRow>,
     effects: &mut Vec<Value>,
@@ -7284,7 +7436,7 @@ fn apply_credential_refused(
 #[allow(clippy::too_many_arguments)]
 fn apply_bound_observation(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     parsed: &ObserveParams,
     admission: &AccountAdmissionRow,
@@ -7522,7 +7674,7 @@ fn apply_bound_observation(
 /// else a header says is kept with the observation and changes nothing shared.
 fn header_fences(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     parsed: &ObserveParams,
     admission: &AccountAdmissionRow,
@@ -7599,7 +7751,7 @@ fn latest_reading<'r>(
 #[allow(clippy::too_many_arguments)]
 fn apply_confirmation(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     admission: &AccountAdmissionRow,
     observation_id: &str,
@@ -7654,7 +7806,7 @@ fn apply_confirmation(
             if fence.pool.is_none() {
                 // A whole-account block lifts only on a reading that reports
                 // every pool the account's latest fresh reading reported.
-                fence.recovery_set = recovery_set_from(latest_reading, ctx.now_ms, ctx.policy);
+                fence.recovery_set = recovery_set_from(latest_reading, ctx.now_ms, &ctx.policy);
             }
             let fence_id = new_id("acf");
             tx.insert_pool_fence(&AccountPoolFenceRow {
@@ -7698,11 +7850,14 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
         Err(error) => return invalid(format!("invalid route.account_release params: {error}")),
     };
     let now = ctx.now_ms;
-    ctx.store
-        .account_transaction(|tx| {
+    let principal = principal.to_owned();
+    crate::account_writer::execute(
+        ctx.store,
+        striatum_store::AccountCommandKind::Release,
+        move |tx| {
             // Only this principal's own admission can be released; any other
             // id changes nothing.
-            let Some(row) = tx.admission(principal, &parsed.admission_id)? else {
+            let Some(row) = tx.admission(&principal, &parsed.admission_id)? else {
                 return Ok(OpReply::Result(json!({
                     "release": {
                         "admission_id": parsed.admission_id,
@@ -7712,7 +7867,7 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                     }
                 })));
             };
-            let released = tx.mark_admission_released(principal, &row.admission_id, now)?;
+            let released = tx.mark_admission_released(&principal, &row.admission_id, now)?;
             // Release ends the conversation's lease; it never erases affinity
             // and never cancels a request in flight.
             // A completed or already released admission must not end a lease
@@ -7723,7 +7878,7 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                 tx.end_lease(&row.pin_id, now)?
             };
             let state = tx
-                .admission(principal, &row.admission_id)?
+                .admission(&principal, &row.admission_id)?
                 .map_or(row.state.clone(), |current| current.state);
             Ok(OpReply::Result(json!({
                 "release": {
@@ -9046,7 +9201,7 @@ mod tests {
             .account_transaction(|tx| {
                 serve(
                     tx,
-                    &ctx,
+                    &ctx.command_context(),
                     BROCA,
                     &parsed,
                     "anthropic",
@@ -9312,7 +9467,7 @@ mod tests {
             .account_transaction(|tx| {
                 serve(
                     tx,
-                    &ctx,
+                    &ctx.command_context(),
                     "runner",
                     &parsed,
                     "anthropic",

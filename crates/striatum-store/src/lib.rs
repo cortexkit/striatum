@@ -1134,7 +1134,8 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
     catalog_cache_identity: AtomicU64,
-    store: evaluation_snapshot::ConnectionStore,
+    store: std::sync::Arc<evaluation_snapshot::ConnectionStore>,
+    account_writer: std::sync::OnceLock<account_writer::AccountWriter>,
     maintenance: Option<Mutex<Connection>>,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
@@ -1162,10 +1163,12 @@ pub struct SqliteRouteStateStore {
     /// rows, but does not apply operator grades used only for selection.
     catalog_facts: Mutex<Option<(CatalogFingerprintKey, Vec<CatalogFact>)>>,
     #[cfg(any(test, feature = "test-support"))]
-    account_write_transactions: AtomicU64,
+    account_write_transactions: std::sync::Arc<AtomicU64>,
 }
 
 mod evaluation_snapshot;
+mod account_writer;
+pub use account_writer::{AccountCommandKind, AccountReply};
 #[cfg(any(test, feature = "test-support"))]
 pub use evaluation_snapshot::record_stage_timing_for_test;
 pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
@@ -1684,7 +1687,8 @@ impl SqliteRouteStateStore {
     fn from_inner(store: evaluation_snapshot::ConnectionStore) -> Self {
         Self {
             maintenance: None,
-            store,
+            store: std::sync::Arc::new(store),
+            account_writer: std::sync::OnceLock::new(),
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),
@@ -1694,7 +1698,7 @@ impl SqliteRouteStateStore {
             catalog_facts: Mutex::new(None),
             catalog_cache_identity: AtomicU64::new(next_catalog_cache_identity()),
             #[cfg(any(test, feature = "test-support"))]
-            account_write_transactions: AtomicU64::new(0),
+            account_write_transactions: std::sync::Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -2564,9 +2568,12 @@ impl SqliteRouteStateStore {
         readings: &[PersistedAccountReading],
         completeness: &[PersistedProviderCompleteness],
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let tx = write_transaction(c)?;
+        let rows = rows.to_vec();
+        let readings = readings.to_vec();
+        let completeness = completeness.to_vec();
+        self.account_command(AccountCommandKind::QuotaDelta, move |account| {
+            let tx = account.conn;
+            (|| -> rusqlite::Result<usize> {
                 let mut inserted = 0;
                 {
                     let mut statement = tx.prepare(
@@ -2577,7 +2584,7 @@ impl SqliteRouteStateStore {
                             stale_since, stale_class)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     )?;
-                    for row in rows {
+                    for row in &rows {
                         if row.account_key.is_empty()
                             || row.window_key.is_empty()
                             || row.observed_at < 0
@@ -2598,7 +2605,7 @@ impl SqliteRouteStateStore {
                         ])?;
                     }
                 }
-                for reading in readings {
+                for reading in &readings {
                     tx.execute(
                         "INSERT INTO account_quota_reading
                            (provider, account_id, entry_json, fetched_at, received_at, tombstoned_at)
@@ -2618,7 +2625,7 @@ impl SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                for row in completeness {
+                for row in &completeness {
                     tx.execute(
                         "INSERT INTO account_quota_completeness
                            (provider, last_polled_at, last_poll_complete, last_complete_at)
@@ -2635,10 +2642,9 @@ impl SqliteRouteStateStore {
                         ],
                     )?;
                 }
-                crate::evaluation_snapshot::timed_commit(tx)?;
                 Ok(inserted)
-            })
-            .map_err(err)
+            })().map_err(err)
+        })
     }
 
     /// The last vault roster routing persisted, or `None` before the first listing.

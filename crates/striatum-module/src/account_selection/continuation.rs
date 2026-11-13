@@ -246,7 +246,7 @@ pub(crate) fn continue_account(
                     "resets_at_ms":request.exhausted.resets_at_ms, "retry_after_s":request.exhausted.retry_after_s,
                     "observed_at_ms":request.exhausted.observed_at_ms});
                 let observation: ObserveParams = serde_json::from_value(raw.clone()).map_err(|e|RouteStateStoreError(e.to_string()))?;
-                record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
+                record_observation(tx,&scoped.command_context(),principal,principal,false,&observation,&raw,&roster_facts)?;
             }
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {
@@ -305,7 +305,7 @@ pub(crate) fn continue_account(
             // Bind the offered account only after creating its model decision, so the
             // previous decision keeps the credential and account that actually served it.
             params.model_decision_id = None;
-            let result = serve(tx,&scoped,principal,params,provider,&roster,&fingerprint(params))?;
+            let result = serve(tx,&scoped.command_context(),principal,params,provider,&roster,&fingerprint(params))?;
             match result {
                 OpReply::Result(result) => {
                     let id = result["reason"]["decision_id"].as_str().unwrap();

@@ -27,7 +27,7 @@ use crate::{
     account_selection, send, ModuleError, SharedBrocaCredentials, SharedQuotaCache, SharedStore,
 };
 
-mod accounts;
+pub(crate) mod accounts;
 pub(crate) mod classifier;
 #[cfg(test)]
 mod classifier_tests;

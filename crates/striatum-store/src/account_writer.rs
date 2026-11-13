@@ -1,0 +1,309 @@
+//! Group commit on the store's existing writer connection. A command owns its
+//! inputs and its reply stays private until the enclosing commit has returned.
+
+use super::*;
+use std::sync::{mpsc, Arc};
+use std::time::Instant;
+
+const MAX_BATCH: usize = 32;
+
+fn write_batch(
+    conn: &Connection,
+    batch: &mut [Queued],
+    #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
+) -> rusqlite::Result<()> {
+    let transaction = crate::write_transaction(conn)?;
+    #[cfg(any(test, feature = "test-support"))]
+    transactions.fetch_add(1, Ordering::Relaxed);
+    for queued in batch {
+        conn.execute_batch("SAVEPOINT account_command")?;
+        let status = queued.command.run(&AccountTx { conn });
+        if let Err(error) = status {
+            // A full rollback requested by a SQLite trigger, disk-full and
+            // I/O failures can destroy the
+            // transaction, including savepoints. Never run a sibling in
+            // autocommit after such a failure.
+            if conn.is_autocommit() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            conn.execute_batch("ROLLBACK TO account_command")?;
+            if conn.is_autocommit() {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
+            tracing::debug!(%error, "account command rolled back");
+        }
+        conn.execute_batch("RELEASE account_command")?;
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    crash_for_test("before_commit");
+    evaluation_snapshot::timed_commit(transaction)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn crash_for_test(point: &str) {
+    if std::env::var("STRIATUM_TEST_ACCOUNT_WRITER_CRASH").as_deref() == Ok(point) {
+        std::process::exit(86);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccountCommandKind {
+    Admit,
+    Replay,
+    Observe,
+    Report,
+    QuotaDelta,
+    Release,
+}
+
+fn stopped() -> RouteStateStoreError {
+    err("store_error: account writer stopped; retry the operation")
+}
+
+trait Command: Send {
+    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()>;
+    fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming);
+}
+
+struct TypedCommand<F, T> {
+    run: Option<F>,
+    result: Option<RouteStateResult<T>>,
+    reply: mpsc::Sender<RouteStateResult<T>>,
+    timing: Arc<Mutex<StoreStageTiming>>,
+}
+
+impl<F, T> Command for TypedCommand<F, T>
+where
+    F: FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send,
+    T: Send,
+{
+    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()> {
+        let result = self.run.take().expect("command runs once")(tx);
+        let status = result.as_ref().map(|_| ()).map_err(err);
+        self.result = Some(result);
+        status
+    }
+
+    fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming) {
+        *self.timing.lock().unwrap() = timing;
+        let result = match failure {
+            Some(error) => Err(err(format!("store_error: {error}; retry the operation"))),
+            None => self.result.expect("committed command has a result"),
+        };
+        // A caller may have disconnected after COMMIT. Its durable idempotency
+        // row, not delivery of this message, determines the retry's answer.
+        let _ = self.reply.send(result);
+    }
+}
+
+struct Queued {
+    enqueued: Instant,
+    command: Box<dyn Command>,
+}
+
+/// An owned pending reply. Dropping it does not cancel a queued write.
+pub struct AccountReply<T>(
+    mpsc::Receiver<RouteStateResult<T>>,
+    Arc<Mutex<StoreStageTiming>>,
+);
+
+impl<T> AccountReply<T> {
+    pub fn wait(self) -> RouteStateResult<T> {
+        let result = self.0.recv().unwrap_or_else(|_| Err(stopped()));
+        // The connection work ran on the writer, but belongs in this caller's
+        // timing scope too. Store-wide burst counters still count the batch once.
+        evaluation_snapshot::record_stage_timing(*self.1.lock().unwrap());
+        result
+    }
+}
+
+pub(crate) struct AccountWriter {
+    sender: Option<mpsc::Sender<Queued>>,
+    dead: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    #[cfg(any(test, feature = "test-support"))]
+    batch_sizes: Arc<Mutex<Vec<usize>>>,
+    #[cfg(any(test, feature = "test-support"))]
+    commands: [AtomicU64; 6],
+}
+
+impl AccountWriter {
+    fn start(
+        store: Arc<evaluation_snapshot::ConnectionStore>,
+        #[cfg(any(test, feature = "test-support"))] transactions: Arc<AtomicU64>,
+        exit: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
+        let (sender, receiver) = mpsc::channel::<Queued>();
+        let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_dead = dead.clone();
+        let thread_exit = exit.clone();
+        #[cfg(any(test, feature = "test-support"))]
+        let batch_sizes = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(any(test, feature = "test-support"))]
+        let sizes = batch_sizes.clone();
+        let spawn = std::thread::Builder::new()
+            .name("account-writer".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    while let Ok(first) = receiver.recv() {
+                        let mut batch = vec![first];
+                        // No linger: an idle writer begins immediately. After a
+                        // commit, drain only commands already queued, up to 32.
+                        while batch.len() < MAX_BATCH {
+                            match receiver.try_recv() {
+                                Ok(command) => batch.push(command),
+                                Err(_) => break,
+                            }
+                        }
+                        let started = Instant::now();
+                        #[cfg(any(test, feature = "test-support"))]
+                        sizes.lock().unwrap().push(batch.len());
+                        for command in &batch {
+                            store.record_command_wait(
+                                started.duration_since(command.enqueued).as_nanos() as u64,
+                            );
+                        }
+                        let before = SqliteRouteStateStore::thread_stage_timing();
+                        let result = store.with_conn(|conn| {
+                            write_batch(
+                                conn,
+                                &mut batch,
+                                #[cfg(any(test, feature = "test-support"))]
+                                &transactions,
+                            )
+                        });
+                        let after = SqliteRouteStateStore::thread_stage_timing();
+                        let timing = StoreStageTiming {
+                            writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
+                            sql_ns: after.sql_ns - before.sql_ns,
+                            commit_ns: after.commit_ns - before.commit_ns,
+                        };
+                        #[cfg(any(test, feature = "test-support"))]
+                        if result.is_ok() {
+                            crash_for_test("after_commit");
+                        }
+                        let failure = result.err().map(|error| error.to_string());
+                        for queued in batch {
+                            queued.command.publish(failure.as_deref(), timing);
+                        }
+                    }
+                }));
+                drop(receiver);
+                // Dropping receiver and any in-flight batch wakes every blocked
+                // caller even if a command panicked before producing a result.
+                thread_dead.store(true, Ordering::Release);
+                if result.is_err() {
+                    thread_exit();
+                }
+            });
+        let thread = match spawn {
+            Ok(thread) => Some(thread),
+            Err(_) => {
+                dead.store(true, Ordering::Release);
+                exit();
+                None
+            }
+        };
+        Self {
+            sender: Some(sender),
+            dead,
+            thread,
+            #[cfg(any(test, feature = "test-support"))]
+            batch_sizes,
+            #[cfg(any(test, feature = "test-support"))]
+            commands: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn enqueue<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
+        if self.dead.load(Ordering::Acquire) {
+            return Err(stopped());
+        }
+        let (reply, receiver) = mpsc::channel();
+        let timing = Arc::new(Mutex::new(StoreStageTiming::default()));
+        self.sender
+            .as_ref()
+            .expect("writer sender exists until drop")
+            .send(Queued {
+                enqueued: Instant::now(),
+                command: Box::new(TypedCommand {
+                    run: Some(f),
+                    result: None,
+                    reply,
+                    timing: timing.clone(),
+                }),
+            })
+            .map_err(|_| stopped())?;
+        Ok(AccountReply(receiver, timing))
+    }
+}
+
+impl Drop for AccountWriter {
+    fn drop(&mut self) {
+        // Closing the queue drains committed replies before releasing the
+        // connection and its lease. A queued command is never acknowledged on
+        // a shutdown-only path that skips COMMIT.
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl SqliteRouteStateStore {
+    pub fn enqueue_account_command<T: Send + 'static>(
+        &self,
+        kind: AccountCommandKind,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
+        let writer = self.account_writer.get_or_init(|| {
+            AccountWriter::start(
+                self.store.clone(),
+                #[cfg(any(test, feature = "test-support"))]
+                self.account_write_transactions.clone(),
+                Arc::new(|| {
+                    tracing::error!("account writer died; restarting is required");
+                    #[cfg(not(any(test, feature = "test-support")))]
+                    std::process::exit(1);
+                }),
+            )
+        });
+        let reply = writer.enqueue(f)?;
+        #[cfg(any(test, feature = "test-support"))]
+        writer.commands[kind as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let _ = kind;
+        Ok(reply)
+    }
+
+    pub fn account_command<T: Send + 'static>(
+        &self,
+        kind: AccountCommandKind,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    ) -> RouteStateResult<T> {
+        if self.store.is_projection() {
+            return self.account_transaction(f);
+        }
+        self.enqueue_account_command(kind, f)?.wait()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn account_writer_batch_sizes_for_test(&self) -> Vec<usize> {
+        self.account_writer.get().map_or_else(Vec::new, |writer| {
+            writer.batch_sizes.lock().unwrap().clone()
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn account_command_count_for_test(&self, kind: AccountCommandKind) -> u64 {
+        self.account_writer.get().map_or(0, |writer| {
+            writer.commands[kind as usize].load(Ordering::Relaxed)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests;
