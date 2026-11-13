@@ -13080,13 +13080,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         let result = &body["result"];
         assert_eq!(result["members"].as_array().unwrap().len(), 1);
-        assert_eq!(result["runnerUp"].as_array().unwrap().len(), 1);
+        assert_eq!(result["runnerUp"].as_array().unwrap().len(), 0);
         assert!(
             result.get("runner_up").is_none(),
             "wire keys stay camelCase"
         );
         assert_eq!(result["members"][0]["temperature"], 0.2);
-        assert!(result["runnerUp"][0].get("temperature").is_none());
         assert_eq!(result["members"][0]["promptParams"]["variant"], "xhigh");
         assert!(result["decisionID"].as_str().is_some());
         assert_eq!(result["policy"]["selection"], "class_policy");
