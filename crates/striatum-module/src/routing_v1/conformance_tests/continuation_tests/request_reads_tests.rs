@@ -338,38 +338,46 @@ fn a_late_duplicate_reassignment_replays_instead_of_reporting_a_pin_conflict() {
     assert_eq!(late, competing);
 }
 
-/// A request refused before its writer command must still replay an
-/// admission of the same id: here an identical request without a candidate
-/// list took the id meanwhile (candidates are not part of the request's
-/// identity), so the refused one replays that admission.
+/// A request refused before its writer command (here every credential is
+/// route-fenced) must still replay a closed admission of the same id. The
+/// published state holds only open admissions, so this refusal path checks
+/// the id by key before answering.
 #[test]
-fn a_request_refused_before_the_writer_replays_an_admission_made_meanwhile() {
+fn a_request_refused_before_the_writer_replays_its_closed_admission() {
+    use striatum_store::AccountCommandKind::Admit;
     let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
     let direct = Direct::new();
-    let excluding = |id: &str| {
-        let mut request = direct.request(id, id);
-        request["candidates"] = json!({"view_digest":"runner-view",
-            "accounts":[{"account_id":"not-listed","credential_id":"not-listed"}]});
-        request
-    };
-    // Without a competing admission the candidate list is refused.
+    let store = direct.fixture.store().clone();
+    let mut first = admitted(direct.admitter(direct.request("closed", "closed"))());
+    let (principal, now) = (direct.principal.clone(), direct.now);
+    crate::account_writer::execute(
+        &store,
+        striatum_store::AccountCommandKind::Release,
+        move |tx| tx.mark_admission_released(&principal, "closed", now),
+    )
+    .unwrap();
+    for i in 0..6 {
+        store
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: "cpu-provider-0".into(),
+                credential_id: format!("oauth:cpu-{i}"),
+                model: "model-0".into(),
+                until_ms: now + 3_600_000,
+                recorded_at: now,
+                decision_id: format!("fence-{i}"),
+            })
+            .unwrap();
+    }
+    // A new id is refused without reaching the writer.
+    let admits = store.account_command_count_for_test(Admit);
     assert!(matches!(
-        direct.admitter(excluding("unclaimed"))(),
+        direct.admitter(direct.request("unclaimed", "unclaimed"))(),
         crate::account_selection::OpReply::Error { .. }
     ));
-    let competing = std::sync::Arc::new(std::sync::Mutex::new(None));
-    {
-        let (admit, competing) = (
-            direct.admitter(direct.request("taken", "taken")),
-            competing.clone(),
-        );
-        crate::account_selection::after_roster_prepared("taken", move || {
-            *competing.lock().unwrap() = Some(admit());
-        });
-    }
-    let refused = admitted(direct.admitter(excluding("taken"))());
-    let competing = admitted(competing.lock().unwrap().take().expect("the hook ran"));
-    assert_eq!(refused, competing);
+    assert_eq!(store.account_command_count_for_test(Admit), admits);
+    let replayed = admitted(direct.admitter(direct.request("closed", "closed"))());
+    first["admission"]["state"] = json!("released");
+    assert_eq!(replayed, first);
 }
 
 /// A command whose working state disagrees with SQL fails, rolls back and

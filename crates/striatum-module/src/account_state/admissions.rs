@@ -24,29 +24,33 @@ use striatum_store::{
     LatestAdmissionRow, PrunedAdmission, PrunedContinuation, ReservationRef,
 };
 
-/// At the live size (about 200,000 conversations) a shard holds about 50
-/// entries, so a command copies a few dozen rows per shard it writes, and a
-/// 256-row retention batch copies at most 256 small shards.
-const SHARDS: usize = 4096;
+/// Shards are grouped [`GROUP`] to a group, [`GROUP`] groups to a map. At the
+/// live size (about 200,000 conversations) a shard holds about 50 entries.
+const GROUP: usize = 64;
+const SHARDS: usize = GROUP * GROUP;
 
-/// A map whose clone copies one pointer and whose first write after a clone
-/// copies the shard pointers and one shard of [`SHARDS`], so a savepoint fork
-/// never copies all rows.
 /// A hash map keyed with [`KeyHasher`], for the loader's grouping and the shards.
 type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<KeyHasher>>;
 type Shard<K, V> = FastMap<K, V>;
+type Group<K, V> = Vec<Arc<Shard<K, V>>>;
 
+/// A map whose clone copies one pointer. Its first write after a clone copies
+/// the 64 group pointers, the 64 shard pointers of one group and one shard of
+/// about 50 entries, so a savepoint fork never copies all rows, a command
+/// copies a few dozen rows per shard it writes, and a 256-row retention batch
+/// copies at most 256 small shards.
 #[derive(Clone)]
 pub(crate) struct ShardedMap<K, V> {
-    shards: Arc<Vec<Arc<Shard<K, V>>>>,
+    groups: Arc<Vec<Arc<Group<K, V>>>>,
     len: usize,
 }
 
 impl<K, V> Default for ShardedMap<K, V> {
     fn default() -> Self {
+        // Empty shards and groups share one value until their first write.
+        let group: Arc<Group<K, V>> = Arc::new(vec![Arc::new(Shard::default()); GROUP]);
         Self {
-            // Empty shards share one map until their first write.
-            shards: Arc::new(vec![Arc::new(Shard::default()); SHARDS]),
+            groups: Arc::new(vec![group; GROUP]),
             len: 0,
         }
     }
@@ -87,7 +91,8 @@ fn shard_of<K: Hash>(key: &K) -> usize {
 
 impl<K: Eq + Hash + Clone, V: Clone> ShardedMap<K, V> {
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
-        self.shards[shard_of(key)].get(key)
+        let shard = shard_of(key);
+        self.groups[shard / GROUP][shard % GROUP].get(key)
     }
 
     pub(crate) fn contains_key(&self, key: &K) -> bool {
@@ -96,7 +101,8 @@ impl<K: Eq + Hash + Clone, V: Clone> ShardedMap<K, V> {
 
     fn shard_mut(&mut self, key: &K) -> &mut Shard<K, V> {
         let shard = shard_of(key);
-        Arc::make_mut(&mut Arc::make_mut(&mut self.shards)[shard])
+        let group = Arc::make_mut(&mut Arc::make_mut(&mut self.groups)[shard / GROUP]);
+        Arc::make_mut(&mut group[shard % GROUP])
     }
 
     /// Copies a shard only when the key is present.
@@ -130,13 +136,18 @@ impl<K: Eq + Hash + Clone, V: Clone> ShardedMap<K, V> {
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
-        self.shards.iter().flat_map(|shard| shard.iter())
+        // An empty map skips its 4,096 empty shards.
+        let groups = if self.len == 0 { 0 } else { GROUP };
+        self.groups[..groups]
+            .iter()
+            .flat_map(|group| group.iter())
+            .flat_map(|shard| shard.iter())
     }
 
     /// Whether `other` shares every shard with this map, so a fork copied no rows.
     #[cfg(test)]
     pub(crate) fn shares_storage_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.shards, &other.shards)
+        Arc::ptr_eq(&self.groups, &other.groups)
     }
 }
 
