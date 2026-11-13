@@ -8,6 +8,9 @@ use striatum_core::RouteStateStore;
 use super::{harness_facts::PARSES, parse_declaration, DescribeCache, Registry, RunnerDeclaration};
 use crate::routing_v1::{describe, dispatch_tests::configured};
 
+#[path = "harness_choice_tests.rs"]
+mod harness_choice_tests;
+
 const GROUP: &str = cortexkit_role_routing::capabilities::RUNNER_HARNESS_FACTS;
 
 fn slot(limits: Value) -> Value {

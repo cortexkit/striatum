@@ -61,13 +61,6 @@ impl RunnerDeclaration {
         self.facts.as_ref().and_then(|facts| facts.as_ref().err())
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Harness-choice filtering consumes this read-side API separately."
-        )
-    )]
     pub(crate) fn declares_harness_facts(&self) -> bool {
         self.facts
             .as_ref()
@@ -107,13 +100,6 @@ impl RunnerDeclaration {
     /// Legacy runners retain today's task support until that runner declares
     /// facts. Unknown capability tokens remain in the parsed harness facts,
     /// but do not grant a known capability.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Harness-choice filtering consumes this read-side API separately."
-        )
-    )]
     pub(crate) fn harness_supports(&self, harness: &str, capability: &HarnessCapability) -> bool {
         if !self.declares_harness_facts() {
             return true;
@@ -130,13 +116,6 @@ impl RunnerDeclaration {
             .is_some_and(|capabilities| capabilities.contains(capability))
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Harness-choice filtering consumes this read-side API separately."
-        )
-    )]
     pub(crate) fn harness_excludes(&self, harness: &str, route: &str) -> bool {
         self.limits_for_harness(Some(harness))
             .ok()
