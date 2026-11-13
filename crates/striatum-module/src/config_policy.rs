@@ -565,6 +565,9 @@ pub struct ConsumerPolicy {
     pub ladder: Option<Vec<String>>,
     pub variants: Option<BTreeMap<String, String>>,
     pub runner: Option<String>,
+    /// Replaces the global placement list, including when explicitly empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runners: Option<Vec<RunnerPolicy>>,
     pub owner: Option<String>,
     pub pay_per_token: Option<bool>,
     #[serde(
@@ -611,6 +614,11 @@ pub fn resolve_consumer_policy(
         result.insert("below_bar".into(), serde_json::json!("refuse"));
     }
     let mut overlay = |entry: &ConsumerPolicy| {
+        // Loaded legacy entries carry their expanded list and original module.
+        // A child's own list must clear that module as well as replace the list.
+        if entry.runners.is_some() {
+            result.remove("runner");
+        }
         for (key, value) in serde_json::to_value(entry).unwrap().as_object().unwrap() {
             if !value.is_null() && value != &serde_json::json!({}) {
                 result.insert(key.clone(), value.clone());

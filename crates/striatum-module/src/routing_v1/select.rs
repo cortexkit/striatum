@@ -848,7 +848,7 @@ async fn prepare_selection(
                     .unwrap_or_default();
             }
             super::runners::Registry::build_for_task(
-                operator_config.as_ref(),
+                super::runners::RunnerPolicies::for_consumer(operator_config, &consumer_policy),
                 &credentials,
                 &facts,
                 now as u64,
@@ -873,7 +873,12 @@ async fn prepare_selection(
             refusal.message = format!("no session-starting runner declares harness {harness}");
             refusal
         } else {
-            Refusal::no_route(NoRouteReason::NoAvailableModel, None)
+            let reason = if consumer_policy.runners.is_some() && consumer_policy.runner.is_none() {
+                NoRouteReason::HarnessUnavailable
+            } else {
+                NoRouteReason::NoAvailableModel
+            };
+            Refusal::no_route(reason, None)
         });
     }
     let runners: Vec<RunnerPolicy> = runners

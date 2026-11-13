@@ -154,6 +154,28 @@ pub(crate) struct RunnerPolicies<'a> {
     config: Option<&'a crate::config_overrides::LiveConfig>,
 }
 
+impl<'a> RunnerPolicies<'a> {
+    pub(crate) fn for_consumer(
+        config: &'a crate::config_overrides::LiveConfig,
+        consumer: &crate::config_policy::ConsumerPolicy,
+    ) -> Self {
+        let global = config.v1_runners();
+        Self {
+            policies: consumer.runners.as_ref().map_or_else(
+                || global.clone(),
+                |entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| global.iter().any(|allowed| allowed.module == entry.module))
+                        .cloned()
+                        .collect()
+                },
+            ),
+            config: Some(config),
+        }
+    }
+}
+
 impl<'a> From<&'a crate::config_overrides::LiveConfig> for RunnerPolicies<'a> {
     fn from(config: &'a crate::config_overrides::LiveConfig) -> Self {
         Self {
