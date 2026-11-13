@@ -1568,7 +1568,6 @@ const NOT_APPLICABLE: &[&str] = &[
 // removing it from this list.
 const PENDING_READERS: &[(&str, &str)] = &[
     ("consumer_declarations", "placement_consumer_declarations"),
-    ("runner_harness_facts", "placement_harness_facts"),
     ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
     ("report_attempt_outcomes", "placement_attempt_outcomes"),

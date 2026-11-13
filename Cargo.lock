@@ -357,9 +357,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing-conformance"
-version = "0.10.23"
+version = "0.10.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a62faf1414d7829ce708bb029e0d358496ea0e2d1e23c3562d7b0f184ad7243e"
+checksum = "0c10775e3397eba72bbafe5c8ae95b4861136104e9db6939d49684b590307b4f"
 dependencies = [
  "async-trait",
  "cortexkit-role-routing",
