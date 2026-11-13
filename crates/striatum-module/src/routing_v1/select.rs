@@ -38,11 +38,16 @@ use crate::{
     DecisionProvenance, SelectionPolicySources,
 };
 
+mod eligible_routes;
+#[cfg(test)]
+mod eligible_routes_tests;
+
 /// The members a v1 select may carry.
 const MEMBERS: &[&str] = &[
     "settings",
     "pin_slot",
     "available_routes",
+    "eligible_routes",
     "prefer_prompt_cache",
     "consumer",
     "requirements",
@@ -701,6 +706,9 @@ async fn prepare_selection(
         &crate::tier_settings::without_context(&effective_params),
         &super::describe::capabilities(),
     )?;
+    if request.eligible_routes.as_ref().is_some_and(Vec::is_empty) {
+        return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
+    }
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
     {
@@ -1047,8 +1055,13 @@ async fn select_at_tier_attempt(
     // has no input for. Routing records no fact for PDF or audio input or for
     // structured output, so it cannot confirm a route serves them and answers
     // none.
+    let eligible_catalog_empty = request.eligible_routes.is_some()
+        && !facts.iter().any(|fact| {
+            eligible_routes::includes_model(request.eligible_routes.as_deref(), fact)
+        });
     let reachable: Vec<&ModelFact> = facts
         .iter()
+        .filter(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact))
         .filter(|fact| {
             request.available_routes.as_ref().is_none_or(|routes| {
                 routes.contains(&format!("{}/{}", fact.provider_id, fact.model_id))
@@ -1179,7 +1192,7 @@ async fn select_at_tier_attempt(
     if capable.is_empty() && !reachable.is_empty() {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
-    if capable.is_empty() && pair_rejections.is_empty() {
+    if capable.is_empty() && pair_rejections.is_empty() && !eligible_catalog_empty {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
@@ -1197,7 +1210,7 @@ async fn select_at_tier_attempt(
                 .then_some(route.route_key)
         })
         .collect();
-    if available.is_empty() && pair_rejections.is_empty() {
+    if available.is_empty() && pair_rejections.is_empty() && !eligible_catalog_empty {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if let Some(classes) = &priced.classes {
@@ -1357,6 +1370,7 @@ async fn select_at_tier_attempt(
         .cloned()
         .collect();
     let selection = Selection {
+        eligible_routes: request.eligible_routes.as_deref(),
         classifier_order,
         prefer_prompt_cache: request.prefer_prompt_cache.unwrap_or(false),
         consumer: &consumer,
@@ -1420,6 +1434,15 @@ async fn select_at_tier_attempt(
     };
     let continuing = previous
         .as_ref()
+        .filter(|previous| {
+            request.eligible_routes.as_ref().is_none_or(|routes| {
+                routes.contains(&RouteRef {
+                    provider: previous.provider.clone(),
+                    model: previous.model.clone(),
+                    variant: previous.variant.clone(),
+                })
+            })
+        })
         .map(|previous| format!("{}/{}", previous.provider, previous.model));
     // Request pin, then project pin, then the continuing model, then the mode.
     // A pin does not fall through unless the request asks for it with
@@ -1909,6 +1932,7 @@ async fn select_at_tier_attempt(
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    eligible_routes: Option<&'a [RouteRef]>,
     classifier_order: Option<Vec<String>>,
     prefer_prompt_cache: bool,
     hold_ok: bool,
@@ -2062,12 +2086,13 @@ impl<'a> Selection<'a> {
                 let recovery_input = self
                     .pass()
                     .input(&recovery_available, self.scoring_snapshot());
+                let recovery_rejections = self.eligible_rejections(&recovery_input.facts, None);
                 (error.earliest_reset, error.earliest_reset_route) =
                     striatum_core::model_router::earliest_admissible_recovery(
                         &recovery_input,
                         &self.pass().routing_config(),
                         self.consumer_exclude,
-                        self.rejections,
+                        &recovery_rejections,
                         &account_resets,
                     );
                 error
@@ -2096,6 +2121,7 @@ impl<'a> Selection<'a> {
         evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
         let catalog = config_overrides::reasoning_catalog_for(self.sources.operator_config_path);
+        let rejections = self.eligible_rejections(&input.facts, explicit_variant);
         let groups = self.sources.operator_config.variant_groups();
         let mut identities = Vec::new();
         let mut shortlist = Vec::new();
@@ -2147,7 +2173,7 @@ impl<'a> Selection<'a> {
             &self.pass().routing_config(),
             self.slots,
             consumer_exclude,
-            self.rejections,
+            &rejections,
             &profiles,
             evaluation,
         )
@@ -2250,6 +2276,7 @@ impl<'a> Selection<'a> {
             self.rejections,
         )
         .map_err(|refusal| refused(&refusal.code, refusal.message))?;
+        self.check_eligible_pin(pin, &selected, parsed.variant.as_deref())?;
         // Hard pin admission remains shared with legacy selection. Reprice only
         // the admitted route, retaining its real demand's profile bucket.
         let mut input = self.pass().input(available, snapshot.clone());
