@@ -1,5 +1,6 @@
 use super::{prepare_selects, read, GROUP};
 use crate::routing_v1::{describe, dispatch_tests::configured};
+use cortexkit_role_routing::capabilities::DECISION_HARNESS;
 use serde_json::{json, Value};
 use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
@@ -65,210 +66,228 @@ fn legacy_unbound_slot(limits: Value) -> Value {
 
 #[tokio::test]
 async fn decision_harness_binds_first_admitting_legacy_harness_without_changing_other_evidence() {
-    let _clock = crate::InjectedClock::set(1_792_000_000_000);
-    let (harness, route) = configured().await;
-    setup(&harness, json!([{"module":"legacy"}]));
-    let mut value = legacy_unbound_slot(json!({
-        "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
-        "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]}
-    }));
-    install(&harness, "legacy", &value);
-    let params = request(json!({"iq":0}));
-    let baseline = describe::without_decision_harness(async {
-        selected(route.call("route.select", &params).await)
+    describe::with_candidate_capabilities(&[DECISION_HARNESS], async {
+        let _clock = crate::InjectedClock::set(1_792_000_000_000);
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"legacy"}]));
+        let mut value = legacy_unbound_slot(json!({
+            "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
+            "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]}
+        }));
+        install(&harness, "legacy", &value);
+        let params = request(json!({"iq":0}));
+        let baseline = describe::without_capability(DECISION_HARNESS, async {
+            selected(route.call("route.select", &params).await)
+        })
+        .await;
+        assert!(baseline["runner"].get("harness").is_none(), "{baseline}");
+        let answer = selected(route.call("route.select", &params).await);
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        let baseline_id = baseline["decision_id"].as_str().unwrap();
+        let answer_id = answer["decision_id"].as_str().unwrap();
+        let mut expected = baseline.clone();
+        expected["decision_id"] = answer["decision_id"].clone();
+        expected["runner"]["harness"] = json!("secondary");
+        assert_eq!(answer, expected);
+        let retained: Value = serde_json::from_str(
+            &harness
+                .store()
+                .v1_selection_json(answer_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(retained, expected);
+        let old_retained: Value = serde_json::from_str(
+            &harness
+                .store()
+                .v1_selection_json(baseline_id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(old_retained, baseline);
+        let old_row = harness
+            .store()
+            .get_decision_by_id(baseline_id)
+            .unwrap()
+            .unwrap();
+        let mut new_row = harness
+            .store()
+            .get_decision_by_id(answer_id)
+            .unwrap()
+            .unwrap();
+        assert!(old_row.catalog_fingerprint.is_some());
+        new_row.id = old_row.id.clone();
+        // The stored decision row uses its own wall clock for created_at, not the request clock.
+        new_row.created_at = old_row.created_at;
+        assert_eq!(new_row, old_row);
+        let old_binding = harness.store().v1_decision(baseline_id).unwrap().unwrap();
+        let mut new_binding = harness.store().v1_decision(answer_id).unwrap().unwrap();
+        new_binding.decision_id = old_binding.decision_id.clone();
+        assert_eq!(new_binding, old_binding);
+
+        value["runner"]["harness_limits"]["primary"]["pairs"] =
+            value["runner"]["harness_limits"]["secondary"]["pairs"].clone();
+        install(&harness, "legacy", &value);
+        let first = selected(route.call("route.select", &params).await);
+        assert_eq!(first["runner"]["harness"], "primary", "{first}");
+        assert_eq!(first["route"], baseline["route"]);
     })
     .await;
-    assert!(baseline["runner"].get("harness").is_none(), "{baseline}");
-    let answer = selected(route.call("route.select", &params).await);
-    assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
-    let baseline_id = baseline["decision_id"].as_str().unwrap();
-    let answer_id = answer["decision_id"].as_str().unwrap();
-    let mut expected = baseline.clone();
-    expected["decision_id"] = answer["decision_id"].clone();
-    expected["runner"]["harness"] = json!("secondary");
-    assert_eq!(answer, expected);
-    let retained: Value = serde_json::from_str(
-        &harness
-            .store()
-            .v1_selection_json(answer_id)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(retained, expected);
-    let old_retained: Value = serde_json::from_str(
-        &harness
-            .store()
-            .v1_selection_json(baseline_id)
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(old_retained, baseline);
-    let old_row = harness
-        .store()
-        .get_decision_by_id(baseline_id)
-        .unwrap()
-        .unwrap();
-    let mut new_row = harness
-        .store()
-        .get_decision_by_id(answer_id)
-        .unwrap()
-        .unwrap();
-    assert!(old_row.catalog_fingerprint.is_some());
-    new_row.id = old_row.id.clone();
-    // The stored decision row uses its own wall clock for created_at, not the request clock.
-    new_row.created_at = old_row.created_at;
-    assert_eq!(new_row, old_row);
-    let old_binding = harness.store().v1_decision(baseline_id).unwrap().unwrap();
-    let mut new_binding = harness.store().v1_decision(answer_id).unwrap().unwrap();
-    new_binding.decision_id = old_binding.decision_id.clone();
-    assert_eq!(new_binding, old_binding);
-
-    value["runner"]["harness_limits"]["primary"]["pairs"] =
-        value["runner"]["harness_limits"]["secondary"]["pairs"].clone();
-    install(&harness, "legacy", &value);
-    let first = selected(route.call("route.select", &params).await);
-    assert_eq!(first["runner"]["harness"], "primary", "{first}");
-    assert_eq!(first["route"], baseline["route"]);
 }
 
 #[tokio::test]
 async fn decision_harness_legacy_runner_loses_route_when_no_harness_admits_it() {
-    let (harness, route) = configured().await;
-    setup(&harness, json!([{"module":"legacy"},{"module":"fallback"}]));
-    install(
-        &harness,
-        "legacy",
-        &legacy_unbound_slot(json!({
-            "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
-            "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]}
-        })),
-    );
-    install(&harness, "fallback", &slot(json!({})));
-    let params = request(json!({"iq":0}));
-    let baseline = describe::without_decision_harness(async {
-        selected(route.call("route.select", &params).await)
+    describe::with_candidate_capabilities(&[DECISION_HARNESS], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"legacy"},{"module":"fallback"}]));
+        install(
+            &harness,
+            "legacy",
+            &legacy_unbound_slot(json!({
+                "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
+                "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]}
+            })),
+        );
+        install(&harness, "fallback", &slot(json!({})));
+        let params = request(json!({"iq":0}));
+        let baseline = describe::without_capability(DECISION_HARNESS, async {
+            selected(route.call("route.select", &params).await)
+        })
+        .await;
+        assert_eq!(baseline["runner"]["module"], "legacy", "{baseline}");
+        let answer = selected(route.call("route.select", &params).await);
+        assert_eq!(answer["runner"]["module"], "fallback", "{answer}");
+        assert_eq!(answer["runner"]["harness"], "primary", "{answer}");
+        assert_eq!(answer["route"], baseline["route"]);
+        let mut only_legacy = params;
+        only_legacy["runners"] = json!(["legacy"]);
+        only_legacy["available_routes"] = json!([format!(
+            "{}/{}",
+            baseline["route"]["provider"].as_str().unwrap(),
+            baseline["route"]["model"].as_str().unwrap()
+        )]);
+        let reply = route.call("route.select", &only_legacy).await;
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+        assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
     })
     .await;
-    assert_eq!(baseline["runner"]["module"], "legacy", "{baseline}");
-    let answer = selected(route.call("route.select", &params).await);
-    assert_eq!(answer["runner"]["module"], "fallback", "{answer}");
-    assert_eq!(answer["runner"]["harness"], "primary", "{answer}");
-    assert_eq!(answer["route"], baseline["route"]);
-    let mut only_legacy = params;
-    only_legacy["runners"] = json!(["legacy"]);
-    only_legacy["available_routes"] = json!([format!(
-        "{}/{}",
-        baseline["route"]["provider"].as_str().unwrap(),
-        baseline["route"]["model"].as_str().unwrap()
-    )]);
-    let reply = route.call("route.select", &only_legacy).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
 }
 
 #[tokio::test]
 async fn decision_harness_advertisement_preserves_harnessless_runner_wire_shape() {
-    let _clock = crate::InjectedClock::set(1_792_000_000_000);
-    for declared in [false, true] {
-        let (harness, route) = configured().await;
-        setup(&harness, json!([{"module":"harnessless"}]));
-        if declared {
-            let mut value = slot(json!({}));
-            let runner = value["runner"].as_object_mut().unwrap();
-            runner.remove("harnesses");
-            runner.remove("default_harness");
-            install(&harness, "harnessless", &value);
-        }
-        let params = request(json!({"iq":0}));
-        let mut named = params.clone();
-        named["harness"] = json!("harnessless");
-        let baseline = describe::without_decision_harness(async {
+    describe::with_candidate_capabilities(&[DECISION_HARNESS], async {
+        let _clock = crate::InjectedClock::set(1_792_000_000_000);
+        for declared in [false, true] {
+            let (harness, route) = configured().await;
+            setup(&harness, json!([{"module":"harnessless"}]));
+            if declared {
+                let mut value = slot(json!({}));
+                let runner = value["runner"].as_object_mut().unwrap();
+                runner.remove("harnesses");
+                runner.remove("default_harness");
+                install(&harness, "harnessless", &value);
+            }
+            let params = request(json!({"iq":0}));
+            let mut named = params.clone();
+            named["harness"] = json!("harnessless");
+            let baseline = describe::without_capability(DECISION_HARNESS, async {
+                let described = route.call("role.describe", &json!({})).await;
+                assert!(!described.1["result"]["capabilities"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("decision_harness")));
+                refused(
+                    route.call("route.select", &named).await,
+                    "harness_unavailable",
+                );
+                selected(route.call("route.select", &params).await)
+            })
+            .await;
             let described = route.call("role.describe", &json!({})).await;
-            assert!(!described.1["result"]["capabilities"]
+            assert!(described.1["result"]["capabilities"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("decision_harness")));
+            let answer = selected(route.call("route.select", &params).await);
+            assert_eq!(answer["runner"]["module"], "harnessless");
+            assert!(answer["runner"].get("harness").is_none(), "{answer}");
+            assert!(baseline["runner"].get("harness").is_none(), "{baseline}");
+            let mut expected = baseline;
+            expected["decision_id"] = answer["decision_id"].clone();
+            assert_eq!(answer, expected);
             refused(
                 route.call("route.select", &named).await,
                 "harness_unavailable",
             );
-            selected(route.call("route.select", &params).await)
-        })
-        .await;
-        let described = route.call("role.describe", &json!({})).await;
-        assert!(described.1["result"]["capabilities"]
-            .as_array()
-            .unwrap()
-            .contains(&json!("decision_harness")));
-        let answer = selected(route.call("route.select", &params).await);
-        assert_eq!(answer["runner"]["module"], "harnessless");
-        assert!(answer["runner"].get("harness").is_none(), "{answer}");
-        assert!(baseline["runner"].get("harness").is_none(), "{baseline}");
-        let mut expected = baseline;
-        expected["decision_id"] = answer["decision_id"].clone();
-        assert_eq!(answer, expected);
-        refused(
-            route.call("route.select", &named).await,
-            "harness_unavailable",
-        );
-    }
+        }
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn decision_harness_panel_seat_binds_the_same_harness_as_select() {
-    let (harness, route) = configured().await;
-    setup(&harness, json!([{"module":"legacy"}]));
-    install(
-        &harness,
-        "legacy",
-        &legacy_unbound_slot(json!({
-            "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
-            "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]}
-        })),
-    );
-    harness.edit_config(|config| {
-        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
-    });
-    let select = selected(route.call("route.select", &request(json!({"iq":0}))).await);
-    let key = format!(
-        "{}/{}",
-        select["route"]["provider"].as_str().unwrap(),
-        select["route"]["model"].as_str().unwrap()
-    );
-    let params = json!({"class":"audit","consumer":"harness_choice_test","available_routes":[key],"seed":"fixed"});
-    let before =
-        describe::without_decision_harness(route.call("route.select_panel", &params)).await;
-    assert_eq!(before.0, FrameType::Response, "{}", before.1);
-    assert!(before.1["result"]["seats"][0]["answer"]["runner"]
-        .get("harness")
-        .is_none());
-    let panel = route.call("route.select_panel", &params).await;
-    assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
-    assert_eq!(panel.1["result"]["seats"].as_array().unwrap().len(), 1);
-    let answer = &panel.1["result"]["seats"][0]["answer"];
-    assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
-    assert_eq!(answer["runner"], select["runner"]);
-    let request = cortexkit_role_routing::panel::parse_select_panel_request_serving(
-        &params,
-        describe::CAPABILITIES,
-    )
-    .unwrap();
-    cortexkit_role_routing::panel::check_panel_answer(
-        &request,
-        &serde_json::from_value(panel.1["result"].clone()).unwrap(),
-    )
-    .unwrap();
-    let retained: Value = serde_json::from_str(
-        &harness
-            .store()
-            .v1_selection_json(answer["decision_id"].as_str().unwrap())
-            .unwrap()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(&retained, answer);
+    describe::with_candidate_capabilities(&[DECISION_HARNESS], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"legacy"}]));
+        install(
+            &harness,
+            "legacy",
+            &legacy_unbound_slot(json!({
+                "primary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
+                "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]}
+            })),
+        );
+        harness.edit_config(|config| {
+            config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+        });
+        let select = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        let key = format!(
+            "{}/{}",
+            select["route"]["provider"].as_str().unwrap(),
+            select["route"]["model"].as_str().unwrap()
+        );
+        let params = json!({
+            "class":"audit", "consumer":"harness_choice_test",
+            "available_routes":[key], "seed":"fixed"
+        });
+        let before = describe::without_capability(
+            DECISION_HARNESS,
+            route.call("route.select_panel", &params),
+        )
+        .await;
+        assert_eq!(before.0, FrameType::Response, "{}", before.1);
+        assert!(before.1["result"]["seats"][0]["answer"]["runner"]
+            .get("harness")
+            .is_none());
+        let panel = route.call("route.select_panel", &params).await;
+        assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
+        assert_eq!(panel.1["result"]["seats"].as_array().unwrap().len(), 1);
+        let answer = &panel.1["result"]["seats"][0]["answer"];
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        assert_eq!(answer["runner"], select["runner"]);
+        let request = cortexkit_role_routing::panel::parse_select_panel_request_serving(
+            &params,
+            &describe::capabilities(),
+        )
+        .unwrap();
+        cortexkit_role_routing::panel::check_panel_answer(
+            &request,
+            &serde_json::from_value(panel.1["result"].clone()).unwrap(),
+        )
+        .unwrap();
+        let retained: Value = serde_json::from_str(
+            &harness
+                .store()
+                .v1_selection_json(answer["decision_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(&retained, answer);
+    })
+    .await;
 }
 
 #[tokio::test]

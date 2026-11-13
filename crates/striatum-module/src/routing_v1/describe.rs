@@ -98,16 +98,6 @@ pub(super) async fn without_capability<T>(
     CANDIDATE_CAPABILITIES.scope(groups, future).await
 }
 
-#[cfg(test)]
-pub(super) async fn without_decision_harness<T>(future: impl std::future::Future<Output = T>) -> T {
-    let groups = capabilities()
-        .iter()
-        .copied()
-        .filter(|group| *group != cortexkit_role_routing::capabilities::DECISION_HARNESS)
-        .collect();
-    CANDIDATE_CAPABILITIES.scope(groups, future).await
-}
-
 /// Capture the test request's scope before dispatch moves it to another task
 /// or the blocking pool. Unrelated requests keep their own capability list.
 #[cfg(test)]

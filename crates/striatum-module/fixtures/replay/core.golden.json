@@ -166,7 +166,6 @@
               },
               "capabilities": [
                 "select_harness",
-                "decision_harness",
                 "select_hold_control",
                 "select_prefer",
                 "select_exclude_providers",

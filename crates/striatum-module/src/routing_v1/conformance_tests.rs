@@ -1556,7 +1556,6 @@ const NOT_APPLICABLE: &[&str] = &[
     "continue_undeclared_group_refuses_mode",
     "continue_signed_out_undeclared_refuses_window",
     "undeclared_harness_group_refuses_member",
-    "unrequested_harness_uses_declaration",
     "undeclared_prefer_group_refuses_member",
     "undeclared_exclude_providers_group_refuses_member",
     "questions_requirement_honoured",
@@ -1637,7 +1636,6 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "warm_credential_admission_conflict",
         "warm_credential_non_admit_refused",
         "placement_eligible_routes",
-        "placement_decision_harness",
     ] {
         assert_eq!(
             report.outcome(check),
