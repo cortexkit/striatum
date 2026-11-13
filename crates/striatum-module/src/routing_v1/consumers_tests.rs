@@ -33,6 +33,323 @@ fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
 }
 
+fn selected_input(h: &Harness, reply: &(FrameType, Value)) -> Value {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    let id = reply.1["result"]["decision_id"].as_str().unwrap();
+    let row = h.store().get_decision_by_id(id).unwrap().unwrap();
+    serde_json::from_str(&row.requirements_json).unwrap()
+}
+
+#[tokio::test]
+async fn declared_defaults_iq_precedence_refusals_and_production_hold() {
+    let h = harness();
+    let modules = json!([{
+        "module_id": "magic-context", "nonce_verified": true,
+        "role_declarations": {"routing/v1": {"consumers": [
+            {"name": "magic-context.summary", "iq": 40},
+            {"name": "magic-context.no-default"}
+        ]}}
+    }]);
+    let owner = h.bind(reserved("magic-context"), None).await;
+    let stranger = h.bind(reserved("stranger"), None).await;
+    let omitted = json!({"consumer":"magic-context.summary", "requirements":{}});
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        consumers::replace_catalog(&modules);
+        let parsed = consumers::declared::parse_count();
+        for (iq, expected) in [(None, 40), (Some(0), 0), (Some(25), 25)] {
+            let mut request = omitted.clone();
+            if let Some(iq) = iq {
+                request["requirements"]["iq"] = json!(iq);
+            }
+            for _ in 0..2 {
+                let reply = owner.call("route.select", &request).await;
+                assert_eq!(
+                    selected_input(&h, &reply)["iq"].as_f64(),
+                    Some(f64::from(expected)),
+                    "{}",
+                    reply.1
+                );
+            }
+            admission_refused(
+                stranger.call("route.select", &request).await,
+                "consumer_not_owned",
+                "magic-context.summary",
+            );
+        }
+        assert_eq!(
+            consumers::declared::parse_count(),
+            parsed,
+            "repeated selects must not parse declarations"
+        );
+        h.edit_config(|config| config["consumers"]["magic-context"]["iq"] = json!(55.5));
+        for request in [
+            omitted.clone(),
+            json!({"consumer":"magic-context.summary", "requirements":{"iq":0}}),
+        ] {
+            let reply = owner.call("route.select", &request).await;
+            assert_eq!(selected_input(&h, &reply)["iq"], 55.5);
+        }
+        for (request, field) in [
+            (
+                json!({"consumer":"magic-context.no-default", "requirements":{}}),
+                "iq",
+            ),
+            (json!({"consumer":"unknown", "requirements":{}}), "iq"),
+            (json!({"consumer":"magic-context.summary"}), "requirements"),
+        ] {
+            let reply = owner.call("route.select", &request).await;
+            assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+            assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+            assert_eq!(reply.1["detail"]["field"], field, "{}", reply.1);
+        }
+    })
+    .await;
+    // Even an already-read candidate catalog cannot enable defaults for a
+    // production request whose advertised capabilities still hold them back.
+    let reply = owner.call("route.select", &omitted).await;
+    assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+    consumers::replace_catalog(&modules);
+    let reply = owner.call("route.select", &omitted).await;
+    assert_eq!(reply.1["code"], "invalid_requirements", "{}", reply.1);
+}
+
+#[tokio::test]
+async fn declared_defaults_inherit_by_member_only_for_the_same_owner() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.summary.settings"] =
+                json!({"owner":"magic-context"});
+            config["consumers"]["magic-context.summary.ownerless"] = json!({});
+            config["consumers"]["magic-context.summary.foreign"] = json!({"owner":"other"});
+            config["consumers"]["legacy.settings"] = json!({});
+        });
+        consumers::replace_catalog(&json!([{
+            "module_id":"magic-context", "nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[
+                {"name":"magic-context.summary", "iq":40, "eq":10, "selectors":["selector"],
+                 "ladder":["example-provider/model-a"], "max_output_tokens":4096},
+                {"name":"magic-context.summary.child"},
+                {"name":"magic-context.summary.child.own", "iq":20, "eq":0,
+                 "ladder":["example-provider/model-b"]},
+                {"name":"legacy", "eq":17}
+            ]}}
+        }]));
+        let owner = h.bind(reserved("magic-context"), None).await;
+        let selector = h.bind(reserved("selector"), None).await;
+        let config = h.operator_config();
+        let registry = consumers::effective(&config);
+        for (name, iq, eq, model) in [
+            ("magic-context.summary.child", 40, 10, "model-a"),
+            ("magic-context.summary.settings", 40, 10, "model-a"),
+            ("magic-context.summary.ownerless", 40, 10, "model-a"),
+            ("magic-context.summary.child.unlisted", 40, 10, "model-a"),
+            ("magic-context.summary.child.own", 20, 0, "model-b"),
+            ("magic-context.summary.child.own.unlisted", 20, 0, "model-b"),
+        ] {
+            for route in [&owner, &selector] {
+                let reply = route
+                    .call("route.select", &json!({"consumer":name,"requirements":{}}))
+                    .await;
+                let input = selected_input(&h, &reply);
+                assert_eq!(input["iq"].as_f64(), Some(f64::from(iq)), "{name}: {input}");
+                assert_eq!(input["eq"].as_f64(), Some(f64::from(eq)), "{name}: {input}");
+                assert_eq!(
+                    registry.with_defaults(name, &json!({"requirements":{}}), &config)
+                        ["requirements"]["max_output_tokens"],
+                    4096,
+                    "{name}"
+                );
+                assert_eq!(reply.1["result"]["route"]["model"], model, "{}", reply.1);
+            }
+        }
+        let other = h.bind(reserved("other"), None).await;
+        for (name, route) in [
+            ("magic-context.summary.foreign", &other),
+            ("legacy.settings", &other),
+        ] {
+            let missing = route
+                .call("route.select", &json!({"consumer":name,"requirements":{}}))
+                .await;
+            assert_eq!(missing.1["code"], "invalid_requirements", "{}", missing.1);
+            let reply = route.call("route.select", &select(name)).await;
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            assert_eq!(
+                reply.1["result"]["route"]["model"], "model-b",
+                "{}",
+                reply.1
+            );
+            let input = registry.with_defaults(name, &select(name), &config);
+            assert!(
+                input["requirements"]
+                    .get("max_output_tokens")
+                    .is_none_or(Value::is_null),
+                "{input}"
+            );
+        }
+        let legacy = owner.call("route.select", &select("legacy.unlisted")).await;
+        assert_eq!(selected_input(&h, &legacy)["eq"].as_f64(), Some(17.0));
+        let underscore = owner
+            .call("route.select", &select("magic-context.summary_child"))
+            .await;
+        assert_eq!(underscore.1["code"], "unknown_consumer");
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn declared_defaults_ladder_mode_operator_overrides_and_empty_ladder_refusal() {
+    let h = harness();
+    let owner = h.bind(reserved("magic-context"), None).await;
+    let request = select("magic-context.summary");
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        consumers::replace_catalog(&json!([{
+            "module_id":"magic-context", "nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[
+                {"name":"magic-context.summary", "ladder":["example-provider/model-a"]},
+                {"name":"magic-context.empty"}
+            ]}}
+        }]));
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["route"]["model"], "model-a");
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.summary"] = json!({"mode":"demand"})
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-b",
+            "{}",
+            reply.1
+        );
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.summary"] = json!({"mode":"ladder"})
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-a",
+            "{}",
+            reply.1
+        );
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.summary"]["ladder"] =
+                json!(["example-provider/model-b"])
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-b",
+            "{}",
+            reply.1
+        );
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.empty"] = json!({"mode":"ladder"})
+        });
+        let reply = owner
+            .call("route.select", &select("magic-context.empty"))
+            .await;
+        assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+        assert_eq!(
+            reply.1["detail"]["reason"], "no_available_model",
+            "{}",
+            reply.1
+        );
+        h.edit_config(|config| {
+            config["consumers"]
+                .as_object_mut()
+                .unwrap()
+                .remove("magic-context.summary");
+        });
+    })
+    .await;
+    let reply = owner.call("route.select", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["route"]["model"], "model-b",
+        "{}",
+        reply.1
+    );
+}
+
+#[tokio::test]
+async fn declared_defaults_ladder_never_widens_operator_model_provider_key_or_runner_policy() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        consumers::replace_catalog(&json!([{
+            "module_id":"magic-context", "nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[
+                {"name":"magic-context.summary", "iq":0, "ladder":[
+                    "example-provider/model-a", "example-provider/model-b",
+                    "example-subscription/model-c", "example-subscription/model-d"
+                ]}
+            ]}}
+        }]));
+        let owner = h.bind(reserved("magic-context"), None).await;
+        let request = json!({"consumer":"magic-context.summary", "requirements":{}});
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["route"]["model"], "model-a");
+        for restriction in ["pin_only", "not_for"] {
+            h.edit_config(|config| {
+                config["models"]["example-provider/model-a"] = json!({});
+                match restriction {
+                    "pin_only" => {
+                        config["models"]["example-provider/model-a"]["pin_only"] = json!(true)
+                    }
+                    "not_for" => {
+                        config["models"]["example-provider/model-a"]["not_for"] =
+                            json!(["magic-context"])
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            let reply = owner.call("route.select", &request).await;
+            assert_eq!(reply.0, FrameType::Response, "{restriction}: {}", reply.1);
+            assert_eq!(
+                reply.1["result"]["route"]["model"], "model-b",
+                "{restriction}: {}",
+                reply.1
+            );
+        }
+        h.edit_config(|config| {
+            config["consumers"]["magic-context.summary"]["pay_per_token"] = json!(false);
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let id = reply.1["result"]["decision_id"].as_str().unwrap();
+        assert_eq!(
+            h.store()
+                .v1_decision(id)
+                .unwrap()
+                .unwrap()
+                .allowed_account_class,
+            striatum_core::accounts::AllowedAccountClass::NotPayPerToken
+        );
+        h.edit_config(|config| {
+            config["providers"]["example-provider"]["not_for"] = json!(["magic-context"]);
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["route"]["provider"], "example-subscription",
+            "{}",
+            reply.1
+        );
+        h.edit_config(|config| {
+            config["runners"] = json!([
+                {"module":"runner-one", "routes":["example-provider"]}
+            ])
+        });
+        let reply = owner.call("route.select", &request).await;
+        assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+        assert_eq!(
+            reply.1["detail"]["reason"], "no_available_model",
+            "{}",
+            reply.1
+        );
+    })
+    .await;
+}
+
 fn admission_refused(reply: (FrameType, Value), code: &str, consumer: &str) {
     refused(reply.clone(), code, consumer);
     assert_eq!(reply.1["detail"], json!({"consumer": consumer}));

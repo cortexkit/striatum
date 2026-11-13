@@ -283,15 +283,9 @@ impl Registry {
             .collect()
     }
 
-    /// Defaults inherit only within the owning module's namespace. Request
-    /// members and then operator policy override the inherited demand fields.
-    pub(crate) fn with_defaults(
-        &self,
-        consumer: &str,
-        params: &Value,
-        config: &LiveConfig,
-    ) -> Value {
-        let mut requirements = serde_json::Map::new();
+    /// Resolve each member independently, without crossing an ownership boundary.
+    pub(crate) fn defaults_for(&self, consumer: &str) -> DemandDefaults {
+        let mut result = DemandDefaults::default();
         let mut chain: Vec<_> = self
             .defaults
             .iter()
@@ -302,10 +296,44 @@ impl Registry {
             .collect();
         chain.sort_by_key(|(name, _)| name.len());
         for (_, defaults) in chain {
-            let mut demand = serde_json::to_value(defaults).unwrap();
-            // Selectors authorize callers; they are not model requirements.
-            demand.as_object_mut().unwrap().remove("selectors");
-            requirements.extend(demand.as_object().unwrap().clone());
+            macro_rules! inherit {
+                ($($field:ident),+ $(,)?) => {
+                    $(if defaults.$field.is_some() {
+                        result.$field = defaults.$field.clone();
+                    })+
+                };
+            }
+            inherit!(
+                iq,
+                ladder,
+                placement,
+                selectors,
+                kind,
+                eq,
+                context_window,
+                max_output_tokens,
+                tools,
+                tool_capabilities,
+                modalities,
+                structured_output
+            );
+        }
+        result
+    }
+
+    /// Request members and then operator policy override inherited demand fields.
+    pub(crate) fn with_defaults(
+        &self,
+        consumer: &str,
+        params: &Value,
+        config: &LiveConfig,
+    ) -> Value {
+        let mut demand = serde_json::to_value(self.defaults_for(consumer)).unwrap();
+        let mut requirements = demand.as_object_mut().unwrap().clone();
+        // parse_select_request_with_defaults resolves IQ after admission. The
+        // remaining declaration members describe policy or authority, not requirements.
+        for member in ["iq", "ladder", "placement", "selectors", "kind"] {
+            requirements.remove(member);
         }
         if let Some(request) = params.get("requirements").and_then(Value::as_object) {
             requirements.extend(
