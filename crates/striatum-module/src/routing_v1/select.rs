@@ -38,6 +38,10 @@ use crate::{
     DecisionProvenance, SelectionPolicySources,
 };
 
+mod price_answer;
+#[cfg(test)]
+mod price_answer_tests;
+
 /// The members a v1 select may carry.
 const MEMBERS: &[&str] = &[
     "settings",
@@ -1872,6 +1876,19 @@ async fn select_at_tier_attempt(
     );
     if let Some(tier) = service_tier {
         answer = answer.with_service_tier_chosen(tier);
+    }
+    if let Some(price) = price_answer::for_selection(
+        &selected,
+        &inputs.facts,
+        priced.classes.as_ref(),
+        live_config,
+        priced_per_token,
+        request,
+        demand.iq,
+        service_tier,
+        profile_lookup,
+    ) {
+        answer = answer.with_price(price);
     }
     let mut detail = (request.detail == Some(true)).then(|| {
         json!({

@@ -29,6 +29,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "select_available_routes",
     "select_prefer_prompt_cache",
     "select_settings",
+    cortexkit_role_routing::capabilities::SELECT_PRICE,
     "observe_backoff",
     "observe_credential_refused",
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
@@ -73,6 +74,16 @@ pub(super) async fn with_candidate_capabilities<T>(
         }
     }
     CANDIDATE_CAPABILITIES.scope(candidate, future).await
+}
+
+#[cfg(test)]
+pub(super) async fn without_price<T>(future: impl std::future::Future<Output = T>) -> T {
+    let groups = capabilities()
+        .iter()
+        .copied()
+        .filter(|group| *group != cortexkit_role_routing::capabilities::SELECT_PRICE)
+        .collect();
+    CANDIDATE_CAPABILITIES.scope(groups, future).await
 }
 
 /// Capture the test request's scope before dispatch moves it to another task
