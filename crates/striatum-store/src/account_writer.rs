@@ -161,6 +161,8 @@ pub(crate) struct AccountWriter {
     batch_sizes: Arc<Mutex<Vec<usize>>>,
     #[cfg(any(test, feature = "test-support"))]
     commands: [AtomicU64; 10],
+    #[cfg(any(test, feature = "test-support"))]
+    command_changes: Arc<Mutex<Vec<(AccountCommandKind, u64)>>>,
 }
 
 impl AccountWriter {
@@ -248,6 +250,8 @@ impl AccountWriter {
             batch_sizes,
             #[cfg(any(test, feature = "test-support"))]
             commands: std::array::from_fn(|_| AtomicU64::new(0)),
+            #[cfg(any(test, feature = "test-support"))]
+            command_changes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -314,10 +318,20 @@ impl SqliteRouteStateStore {
         });
         #[cfg(any(test, feature = "test-support"))]
         let inputs = crate::replay::current();
+        #[cfg(any(test, feature = "test-support"))]
+        let command_changes = writer.command_changes.clone();
         let reply = writer.enqueue(move |tx| {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
-            f(tx)
+            #[cfg(any(test, feature = "test-support"))]
+            let before = evaluation_snapshot::account_rows_changed();
+            let result = f(tx);
+            #[cfg(any(test, feature = "test-support"))]
+            command_changes
+                .lock()
+                .unwrap()
+                .push((kind, evaluation_snapshot::account_rows_changed() - before));
+            result
         })?;
         #[cfg(any(test, feature = "test-support"))]
         writer.commands[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -348,6 +362,21 @@ impl SqliteRouteStateStore {
     pub fn account_command_count_for_test(&self, kind: AccountCommandKind) -> u64 {
         self.account_writer.get().map_or(0, |writer| {
             writer.commands[kind as usize].load(Ordering::Relaxed)
+        })
+    }
+
+    /// Account row-change counts in command execution order, including rolled-back
+    /// attempts. Await successful replies before using them as commit evidence.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn account_command_row_changes_for_test(&self, kind: AccountCommandKind) -> Vec<u64> {
+        self.account_writer.get().map_or_else(Vec::new, |writer| {
+            writer
+                .command_changes
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|(command, rows)| (*command == kind).then_some(*rows))
+                .collect()
         })
     }
 }

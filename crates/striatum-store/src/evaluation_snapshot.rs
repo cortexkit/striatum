@@ -60,6 +60,12 @@ pub const ACCOUNT_TABLES: &[&str] = &[
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static IN_ACCOUNT_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACCOUNT_ROWS_CHANGED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn account_rows_changed() -> u64 {
+    ACCOUNT_ROWS_CHANGED.with(|rows| rows.get())
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -206,12 +212,14 @@ impl ConnectionStore {
                 }));
                 let changes = Arc::clone(&metrics);
                 conn.update_hook(Some(move |_, _: &str, table: &str, _| {
-                    if ACCOUNT_TABLES.contains(&table)
-                        && !IN_ACCOUNT_BATCH.with(|inside| inside.get())
-                    {
-                        changes
-                            .outside_account_writer
-                            .fetch_add(1, Ordering::Relaxed);
+                    if ACCOUNT_TABLES.contains(&table) {
+                        if IN_ACCOUNT_BATCH.with(|inside| inside.get()) {
+                            ACCOUNT_ROWS_CHANGED.with(|rows| rows.set(rows.get() + 1));
+                        } else {
+                            changes
+                                .outside_account_writer
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }));
             }

@@ -331,76 +331,6 @@ mod account_fact_tests {
     }
 
     #[test]
-    fn reconciliation_writes_once_and_rechecks_new_facts_with_the_same_listing() {
-        let scratch = cortexkit_test_support::ScratchDir::new("account-eligibility-single-flight");
-        let store = std::sync::Arc::new(
-            SqliteRouteStateStore::open(&crate::dev_descriptor(
-                "account-eligibility-single-flight",
-                scratch.path().join("store.db").to_string_lossy(),
-            ))
-            .unwrap(),
-        );
-        let fact = AccountEligibilityFact {
-            provider: "p".into(),
-            credential_id: "c".into(),
-            model: "m".into(),
-            listing_fingerprint: None,
-            code: "ineligible".into(),
-            observed_at: 1,
-        };
-        store.record_account_eligibility(&fact).unwrap();
-        let writes = store.account_write_transaction_count_for_test();
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
-        let readers: Vec<_> = (0..8)
-            .map(|_| {
-                let store = store.clone();
-                let barrier = barrier.clone();
-                std::thread::spawn(move || {
-                    barrier.wait();
-                    store
-                        .reconcile_account_eligibility(&[("c".into(), "v1".into())])
-                        .unwrap();
-                })
-            })
-            .collect();
-        for reader in readers {
-            reader.join().unwrap();
-        }
-        assert_eq!(store.account_write_transaction_count_for_test() - writes, 1);
-        assert_eq!(
-            store.account_eligibility().unwrap()[0]
-                .listing_fingerprint
-                .as_deref(),
-            Some("v1")
-        );
-
-        store
-            .record_account_eligibility(&AccountEligibilityFact {
-                observed_at: 2,
-                ..fact
-            })
-            .unwrap();
-        let writes = store.account_write_transaction_count_for_test();
-        store
-            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
-            .unwrap();
-        assert_eq!(
-            store.account_write_transaction_count_for_test() - writes,
-            1,
-            "a new fact without a fingerprint must adopt even an unchanged listing"
-        );
-        store
-            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
-            .unwrap();
-        assert_eq!(store.account_write_transaction_count_for_test() - writes, 1);
-        store
-            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
-            .unwrap();
-        assert_eq!(store.account_write_transaction_count_for_test() - writes, 2);
-        assert!(store.account_eligibility().unwrap().is_empty());
-    }
-
-    #[test]
     fn eligibility_survives_restart_and_clears_only_on_listing_change() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-eligibility-clear");
         let descriptor = crate::dev_descriptor(
@@ -421,11 +351,15 @@ mod account_fact_tests {
         drop(store);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         store
-            .reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            .account_transaction(|tx| {
+                tx.reconcile_account_eligibility(&[("c".into(), "v1".into())])
+            })
             .unwrap();
         assert_eq!(store.account_eligibility().unwrap().len(), 1);
         store
-            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .account_transaction(|tx| {
+                tx.reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            })
             .unwrap();
         assert!(store.account_eligibility().unwrap().is_empty());
         store
@@ -439,7 +373,9 @@ mod account_fact_tests {
             })
             .unwrap();
         store
-            .reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            .account_transaction(|tx| {
+                tx.reconcile_account_eligibility(&[("c".into(), "v2".into())])
+            })
             .unwrap();
         assert_eq!(
             store.account_eligibility().unwrap()[0]
@@ -447,7 +383,9 @@ mod account_fact_tests {
                 .as_deref(),
             Some("v2")
         );
-        store.reconcile_account_eligibility(&[]).unwrap();
+        store
+            .account_transaction(|tx| tx.reconcile_account_eligibility(&[]))
+            .unwrap();
         assert!(store.account_eligibility().unwrap().is_empty());
     }
 
@@ -902,29 +840,6 @@ impl AccountTx<'_> {
 }
 
 impl SqliteRouteStateStore {
-    /// Reconcile facts only after a successful vault listing. Unknown listing
-    /// state must not erase a previously established eligibility restriction.
-    pub fn reconcile_account_eligibility(
-        &self,
-        listings: &[(String, String)],
-    ) -> RouteStateResult<()> {
-        let fingerprints: std::collections::HashMap<_, _> = listings
-            .iter()
-            .map(|(id, value)| (id.as_str(), value.as_str()))
-            .collect();
-        if !self.account_eligibility()?.iter().any(|fact| {
-            fact.listing_fingerprint.as_deref().is_none()
-                || fact.listing_fingerprint.as_deref()
-                    != fingerprints.get(fact.credential_id.as_str()).copied()
-        }) {
-            return Ok(());
-        }
-        let listings = listings.to_owned();
-        self.account_command(crate::AccountCommandKind::Repair, move |tx| {
-            tx.reconcile_account_eligibility(&listings)
-        })
-    }
-
     pub fn account_eligibility(&self) -> RouteStateResult<Vec<AccountEligibilityFact>> {
         self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(Vec::new()); }

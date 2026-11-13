@@ -7,7 +7,6 @@ direct_account_transaction
 account_transaction
 account_repair
 record_account_eligibility
-reconcile_account_eligibility
 record_account_size_refusal
 clear_account_size_refusal
 record_account_route_fence

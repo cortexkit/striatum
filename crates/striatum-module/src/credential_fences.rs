@@ -484,6 +484,16 @@ pub(crate) fn record(
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LISTING_REPAIR: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn before_listing_repair_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_LISTING_REPAIR.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
 /// Read listing repairs first, then commit all changes for that listing in one
 /// command. Eligibility and credential fingerprints describe the same listing,
 /// so publishing them together avoids a second commit on the request path.
@@ -586,6 +596,10 @@ pub(crate) fn live_with_eligibility(
         }
     }
     if !repairs.is_empty() || eligibility_changed {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_LISTING_REPAIR.with(|slot| slot.borrow_mut().take()) {
+            hook();
+        }
         let now = crate::account_selection::now_ms();
         crate::account_writer::repair(store, move |tx| {
             for repair in repairs {
