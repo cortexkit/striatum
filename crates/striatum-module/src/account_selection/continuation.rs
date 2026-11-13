@@ -30,7 +30,7 @@ fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refu
 
 fn record_signed_out(
     tx: &AccountTx<'_>,
-    ctx: &Ctx<'_>,
+    ctx: &CommandContext,
     principal: &str,
     runner: &str,
     provider: &str,
@@ -79,12 +79,20 @@ pub(crate) fn continue_account(
     project: Option<&str>,
     ctx: &Ctx<'_>,
 ) -> Result<Value, Refusal> {
+    let now_ms = ctx.now_ms;
+    if ctx
+        .store
+        .account_read(|tx| tx.has_expired_continuations(now_ms))
+        .map_err(unavailable)?
+    {
+        crate::account_writer::repair(ctx.store, move |tx| {
+            tx.release_expired_continuations(now_ms)
+        })
+        .map_err(unavailable)?;
+    }
     if let Some(first) = ctx
         .store
-        .account_transaction(|tx| {
-            tx.release_expired_continuations(ctx.now_ms)?;
-            tx.continuation(principal, &request.selection_id)
-        })
+        .account_read(|tx| tx.continuation(principal, &request.selection_id))
         .map_err(unavailable)?
     {
         return standing(first, request);
@@ -194,7 +202,18 @@ pub(crate) fn continue_account(
         })
         .collect();
     let body_json = serde_json::to_string(request).map_err(unavailable)?;
-    ctx.store.account_transaction(|tx| {
+    let store = ctx.store;
+    let ctx = ctx.command_context();
+    let request = request.clone();
+    let principal = principal.to_owned();
+    let runner = runner.to_owned();
+    let project = project.map(str::to_owned);
+    crate::account_writer::repair(store, move |tx| {
+        let ctx = &ctx;
+        let request = &request;
+        let principal = principal.as_str();
+        let runner = runner.as_str();
+        let project = project.as_deref();
         tx.release_expired_continuations(ctx.now_ms)?;
         if let Some(first) = tx.continuation(principal, &request.selection_id)? {
             return Ok(standing(first, request));
@@ -230,7 +249,7 @@ pub(crate) fn continue_account(
             }
             let provider = &previous.provider;
             let policy = ctx.provider_policy(provider);
-            let scoped = Ctx { policy:&policy, ..Ctx {store:ctx.store,accounts:ctx.accounts,flags:ctx.flags,policy:ctx.policy,now_ms:ctx.now_ms,classes:ctx.classes.clone()} };
+            let scoped = CommandContext { policy: policy.clone(), ..ctx.clone() };
             let mut signed_out = tx.signed_out_credentials(principal, &request.admission_id, &request.run_id)?;
             // The stored admission authenticates this sign-in signal. It is not
             // quota exhaustion or a provider's refusal of a key for every use.
@@ -246,7 +265,7 @@ pub(crate) fn continue_account(
                     "resets_at_ms":request.exhausted.resets_at_ms, "retry_after_s":request.exhausted.retry_after_s,
                     "observed_at_ms":request.exhausted.observed_at_ms});
                 let observation: ObserveParams = serde_json::from_value(raw.clone()).map_err(|e|RouteStateStoreError(e.to_string()))?;
-                record_observation(tx,&scoped.command_context(),principal,principal,false,&observation,&raw,&roster_facts)?;
+                record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
             }
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {
@@ -305,7 +324,7 @@ pub(crate) fn continue_account(
             // Bind the offered account only after creating its model decision, so the
             // previous decision keeps the credential and account that actually served it.
             params.model_decision_id = None;
-            let result = serve(tx,&scoped.command_context(),principal,params,provider,&roster,&fingerprint(params))?;
+            let result = serve(tx,&scoped,principal,params,provider,&roster,&fingerprint(params))?;
             match result {
                 OpReply::Result(result) => {
                     let id = result["reason"]["decision_id"].as_str().unwrap();

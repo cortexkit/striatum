@@ -642,7 +642,10 @@ impl SqliteRouteStateStore {
         &self,
         fact: &AccountEligibilityFact,
     ) -> RouteStateResult<()> {
-        self.account_transaction(|tx| tx.record_eligibility(fact))
+        let fact = fact.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.record_account_eligibility(&fact)
+        })
     }
 }
 
@@ -905,76 +908,21 @@ impl SqliteRouteStateStore {
         &self,
         listings: &[(String, String)],
     ) -> RouteStateResult<()> {
-        let mut fingerprints = std::collections::HashMap::with_capacity(listings.len());
-        for (credential, fingerprint) in listings {
-            fingerprints
-                .entry(credential.as_str())
-                .or_insert(fingerprint.as_str());
-        }
-        let changed_credentials =
-            |conn: &Connection| -> rusqlite::Result<std::collections::BTreeSet<String>> {
-                let mut changed = std::collections::BTreeSet::new();
-                if !account_fact_table_exists(conn, "account_eligibility")? {
-                    return Ok(changed);
-                }
-                let mut statement = conn.prepare(
-                    "SELECT DISTINCT credential_id,listing_fingerprint FROM account_eligibility",
-                )?;
-                for row in statement.query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-                })? {
-                    let (credential, recorded) = row?;
-                    if recorded.as_deref().is_none()
-                        || recorded.as_deref() != fingerprints.get(credential.as_str()).copied()
-                    {
-                        changed.insert(credential);
-                    }
-                }
-                Ok(changed)
-            };
-        let changed = self
-            .store
-            .with_read(|conn: &Connection| {
-                // A connection in autocommit mode needs its own read transaction
-                // to keep the comparison on one view.
-                let read = if conn.is_autocommit() {
-                    Some(Transaction::new_unchecked(
-                        conn,
-                        TransactionBehavior::Deferred,
-                    )?)
-                } else {
-                    None
-                };
-                let changed = changed_credentials(conn)?;
-                if let Some(read) = read {
-                    read.commit()?;
-                }
-                Ok(changed)
-            })
-            .map_err(err)?;
-        if changed.is_empty() {
+        let fingerprints: std::collections::HashMap<_, _> = listings
+            .iter()
+            .map(|(id, value)| (id.as_str(), value.as_str()))
+            .collect();
+        if !self.account_eligibility()?.iter().any(|fact| {
+            fact.listing_fingerprint.as_deref().is_none()
+                || fact.listing_fingerprint.as_deref()
+                    != fingerprints.get(fact.credential_id.as_str()).copied()
+        }) {
             return Ok(());
         }
-        self.store.with_conn(|conn: &Connection| {
-            // Another caller may have reconciled while this caller waited for
-            // the connection gate. Do not open an empty write transaction.
-            if changed_credentials(conn)?.is_empty() { return Ok(()); }
-            let tx = self.begin_account_write(conn)?;
-            // Inspect current rows again, including restrictions reported after
-            // the read snapshot. No remembered listing can hide a new row.
-            let credentials = changed_credentials(&tx)?;
-            if credentials.is_empty() { return Ok(()); }
-            for credential in credentials {
-                match fingerprints.get(credential.as_str()) {
-                    Some(fingerprint) => {
-                        tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1 AND listing_fingerprint IS NOT NULL AND listing_fingerprint<>?2", params![credential, fingerprint])?;
-                        tx.execute("UPDATE account_eligibility SET listing_fingerprint=?2 WHERE credential_id=?1 AND listing_fingerprint IS NULL", params![credential, fingerprint])?;
-                    }
-                    None => { tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1", [&credential])?; }
-                }
-            }
-            crate::evaluation_snapshot::timed_commit(tx)
-        }).map_err(err)
+        let listings = listings.to_owned();
+        self.account_command(crate::AccountCommandKind::Repair, move |tx| {
+            tx.reconcile_account_eligibility(&listings)
+        })
     }
 
     pub fn account_eligibility(&self) -> RouteStateResult<Vec<AccountEligibilityFact>> {
@@ -990,25 +938,10 @@ impl SqliteRouteStateStore {
     }
 
     pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                conn.execute(
-                    "INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6) \
-                ON CONFLICT (provider,credential_id,model,size_class) DO UPDATE SET \
-                expires_at=excluded.expires_at,observed_at=excluded.observed_at \
-                WHERE excluded.observed_at >= account_size_refusal.observed_at",
-                    params![
-                        fact.provider,
-                        fact.credential_id,
-                        fact.model,
-                        fact.size_class,
-                        fact.expires_at,
-                        fact.observed_at
-                    ],
-                )
-                .map(|_| ())
-            })
-            .map_err(err)
+        let fact = fact.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.record_account_size_refusal(&fact)
+        })
     }
 
     /// Size-specific quota evidence remains until fresh headroom or success;
@@ -1035,30 +968,41 @@ impl SqliteRouteStateStore {
         size_class: u32,
         observed_at: i64,
     ) -> RouteStateResult<()> {
-        self.store.with_conn(|conn: &Connection| {
-            conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
-                params![provider,credential,model,size_class,observed_at]).map(|_| ())
-        }).map_err(err)
+        let provider = provider.to_owned();
+        let credential = credential.to_owned();
+        let model = model.to_owned();
+        self.account_command(crate::AccountCommandKind::Repair, move |tx| {
+            tx.clear_account_size_refusal(&provider, &credential, &model, size_class, observed_at)
+        })
     }
 
     /// Record quota evidence; the reported reset schedules an extra check, not
     /// an expiry. New evidence replaces the old reset without extending a hold.
     pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
-        self.record_classified_account_route_fence(fence, "quota")
+        let fence = fence.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.record_account_route_fence(&fence)
+        })
     }
 
     pub fn record_transient_account_route_fence(
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
-        self.account_transaction(|tx| tx.record_account_route_backoff(fence, "transient"))
+        let fence = fence.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.record_transient_account_route_fence(&fence)
+        })
     }
 
     pub fn record_billing_account_route_fence(
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
-        self.account_transaction(|tx| tx.record_non_quota_route_fence(fence))
+        let fence = fence.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.record_billing_account_route_fence(&fence)
+        })
     }
 
     pub fn non_quota_account_route_fences(
@@ -1066,41 +1010,6 @@ impl SqliteRouteStateStore {
         now: i64,
     ) -> RouteStateResult<Vec<AccountRouteFence>> {
         self.classified_account_route_fences(now, "billing")
-    }
-
-    fn record_classified_account_route_fence(
-        &self,
-        fence: &AccountRouteFence,
-        class: &str,
-    ) -> RouteStateResult<()> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                let conn=crate::write_transaction(conn)?;
-                conn.execute(
-                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
-                ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at) THEN excluded.until_ms ELSE account_route_fence.until_ms END, \
-                wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
-                  WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
-                recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
-                last_reported_at=CASE \
-                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' AND account_route_fence.until_ms>excluded.recorded_at \
-                    THEN account_route_fence.last_reported_at \
-                  ELSE MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at) END",
-                    params![
-                        fence.provider,
-                        fence.credential_id,
-                        fence.model,
-                        fence.until_ms,
-                        fence.decision_id,
-                        fence.recorded_at,
-                        class
-                    ],
-                )?;
-                if crate::fence_rechecks::enabled(&conn)? {conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;}
-                conn.commit()
-            })
-            .map_err(err)
     }
 
     /// Replace a quota horizon without reporting another refusal. Compare the
@@ -1111,10 +1020,10 @@ impl SqliteRouteStateStore {
         until_ms: i64,
         last_reported_at: i64,
     ) -> RouteStateResult<()> {
-        self.store.with_conn(|conn: &Connection| {
-            conn.execute("UPDATE account_route_fence SET until_ms=?1 WHERE provider=?2 AND credential_id=?3 AND model=?4 AND wall_class='quota' AND until_ms=?5 AND COALESCE(last_reported_at,recorded_at)=?6",
-                params![until_ms, fence.provider, fence.credential_id, fence.model, fence.until_ms, last_reported_at]).map(|_| ())
-        }).map_err(err)
+        let fence = fence.to_owned();
+        self.account_command(crate::AccountCommandKind::Repair, move |tx| {
+            tx.reconcile_account_route_fence(&fence, until_ms, last_reported_at)
+        })
     }
 
     /// Latest evidence per credential, separate from the fence's first receipt.
@@ -1167,8 +1076,10 @@ impl SqliteRouteStateStore {
         credential: &str,
         reading_at: i64,
     ) -> RouteStateResult<usize> {
-        self.account_transaction(|tx| {
-            tx.clear_account_route_fences_before(provider, credential, reading_at)
+        let provider = provider.to_owned();
+        let credential = credential.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.clear_account_route_fences_before(&provider, &credential, reading_at)
         })
     }
 
@@ -1178,29 +1089,10 @@ impl SqliteRouteStateStore {
         &self,
         credential_id: &str,
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                let tx = crate::write_transaction(conn)?;
-                let mut cleared = 0;
-                for table in ["account_route_fence", "account_non_quota_route_fence"] {
-                    if account_fact_table_exists(&tx, table)? {
-                        cleared += tx.execute(
-                            &format!("DELETE FROM {table} WHERE credential_id=?1"),
-                            [credential_id],
-                        )?;
-                    }
-                }
-                if crate::fence_rechecks::enabled(&tx)? {
-                    tx.execute(
-                        "DELETE FROM fence_recheck WHERE credential_id=?1
-                    AND kind IN ('account_route','non_quota_route','transient_route')",
-                        [credential_id],
-                    )?;
-                }
-                crate::evaluation_snapshot::timed_commit(tx)?;
-                Ok(cleared)
-            })
-            .map_err(err)
+        let credential_id = credential_id.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.clear_all_account_route_fences_for_credential(&credential_id)
+        })
     }
 }
 
@@ -2443,10 +2335,23 @@ impl SqliteRouteStateStore {
     /// tables. `Ok` commits before this returns, so a reply built from the
     /// result is sent only once the decision is durable; `Err` rolls every
     /// write back.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn account_transaction<T>(
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
+        self.direct_account_transaction(f)
+    }
+
+    pub(crate) fn direct_account_transaction<T>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
+    ) -> RouteStateResult<T> {
+        #[cfg(not(any(test, feature = "test-support")))]
+        assert!(
+            self.store.is_projection(),
+            "live account writes require a writer command"
+        );
         self.store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
@@ -2462,6 +2367,7 @@ impl SqliteRouteStateStore {
     /// Revalidate a read-path repair under the IMMEDIATE writer. A competing
     /// writer may already have fixed the rows; commit only if the callback
     /// actually changed durable state, otherwise release the transaction.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn account_repair(
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<bool>,
@@ -2663,5 +2569,215 @@ mod transient_fence_tests {
         assert!(!store
             .account_transaction(|tx| tx.claim_fence_rechecks(&clocks, 16_000))
             .unwrap());
+    }
+}
+
+impl crate::AccountTx<'_> {
+    pub fn record_account_eligibility(
+        &self,
+        fact: &AccountEligibilityFact,
+    ) -> RouteStateResult<()> {
+        self.command_scope(|tx| tx.record_eligibility(fact))
+    }
+
+    pub fn reconcile_account_eligibility(
+        &self,
+        listings: &[(String, String)],
+    ) -> RouteStateResult<()> {
+        let mut fingerprints = std::collections::HashMap::with_capacity(listings.len());
+        for (credential, fingerprint) in listings {
+            fingerprints
+                .entry(credential.as_str())
+                .or_insert(fingerprint.as_str());
+        }
+        let changed_credentials =
+            |conn: &Connection| -> rusqlite::Result<std::collections::BTreeSet<String>> {
+                let mut changed = std::collections::BTreeSet::new();
+                if !account_fact_table_exists(conn, "account_eligibility")? {
+                    return Ok(changed);
+                }
+                let mut statement = conn.prepare(
+                    "SELECT DISTINCT credential_id,listing_fingerprint FROM account_eligibility",
+                )?;
+                for row in statement.query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })? {
+                    let (credential, recorded) = row?;
+                    if recorded.as_deref().is_none()
+                        || recorded.as_deref() != fingerprints.get(credential.as_str()).copied()
+                    {
+                        changed.insert(credential);
+                    }
+                }
+                Ok(changed)
+            };
+        let changed = self
+            .command_sql(|conn: &Connection| {
+                // A connection in autocommit mode needs its own read transaction
+                // to keep the comparison on one view.
+                let read = if conn.is_autocommit() {
+                    Some(Transaction::new_unchecked(
+                        conn,
+                        TransactionBehavior::Deferred,
+                    )?)
+                } else {
+                    None
+                };
+                let changed = changed_credentials(conn)?;
+                if let Some(read) = read {
+                    read.commit()?;
+                }
+                Ok(changed)
+            })
+            .map_err(err)?;
+        if changed.is_empty() {
+            return Ok(());
+        }
+        self.command_sql(|conn: &Connection| {
+            // Another caller may have reconciled while this caller waited for
+            // the connection gate. Do not open an empty write transaction.
+            if changed_credentials(conn)?.is_empty() { return Ok(()); }
+            let tx = conn;
+            // Inspect current rows again, including restrictions reported after
+            // the read snapshot. No remembered listing can hide a new row.
+            let credentials = changed_credentials(&tx)?;
+            if credentials.is_empty() { return Ok(()); }
+            for credential in credentials {
+                match fingerprints.get(credential.as_str()) {
+                    Some(fingerprint) => {
+                        tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1 AND listing_fingerprint IS NOT NULL AND listing_fingerprint<>?2", params![credential, fingerprint])?;
+                        tx.execute("UPDATE account_eligibility SET listing_fingerprint=?2 WHERE credential_id=?1 AND listing_fingerprint IS NULL", params![credential, fingerprint])?;
+                    }
+                    None => { tx.execute("DELETE FROM account_eligibility WHERE credential_id=?1", [&credential])?; }
+                }
+            }
+            Ok(())
+        }).map_err(err)
+    }
+
+    pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
+        self.command_sql(|conn: &Connection| {
+            conn.execute(
+                "INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6) \
+                ON CONFLICT (provider,credential_id,model,size_class) DO UPDATE SET \
+                expires_at=excluded.expires_at,observed_at=excluded.observed_at \
+                WHERE excluded.observed_at >= account_size_refusal.observed_at",
+                params![
+                    fact.provider,
+                    fact.credential_id,
+                    fact.model,
+                    fact.size_class,
+                    fact.expires_at,
+                    fact.observed_at
+                ],
+            )
+            .map(|_| ())
+        })
+        .map_err(err)
+    }
+
+    pub fn clear_account_size_refusal(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        size_class: u32,
+        observed_at: i64,
+    ) -> RouteStateResult<()> {
+        self.command_sql(|conn: &Connection| {
+            conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
+                params![provider,credential,model,size_class,observed_at]).map(|_| ())
+        }).map_err(err)
+    }
+
+    pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        self.record_classified_account_route_fence(fence, "quota")
+    }
+
+    pub fn record_transient_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+    ) -> RouteStateResult<()> {
+        self.command_scope(|tx| tx.record_account_route_backoff(fence, "transient"))
+    }
+
+    pub fn record_billing_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+    ) -> RouteStateResult<()> {
+        self.command_scope(|tx| tx.record_non_quota_route_fence(fence))
+    }
+
+    fn record_classified_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+        class: &str,
+    ) -> RouteStateResult<()> {
+        self.command_sql(|conn: &Connection| {
+                conn.execute(
+                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
+                ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
+                until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at) THEN excluded.until_ms ELSE account_route_fence.until_ms END, \
+                wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
+                  WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
+                recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
+                last_reported_at=CASE \
+                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' AND account_route_fence.until_ms>excluded.recorded_at \
+                    THEN account_route_fence.last_reported_at \
+                  ELSE MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at) END",
+                    params![
+                        fence.provider,
+                        fence.credential_id,
+                        fence.model,
+                        fence.until_ms,
+                        fence.decision_id,
+                        fence.recorded_at,
+                        class
+                    ],
+                )?;
+                if crate::fence_rechecks::enabled(&conn)? {conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;}
+                Ok(())
+            })
+            .map_err(err)
+    }
+
+    pub fn reconcile_account_route_fence(
+        &self,
+        fence: &AccountRouteFence,
+        until_ms: i64,
+        last_reported_at: i64,
+    ) -> RouteStateResult<()> {
+        self.command_sql(|conn: &Connection| {
+            conn.execute("UPDATE account_route_fence SET until_ms=?1 WHERE provider=?2 AND credential_id=?3 AND model=?4 AND wall_class='quota' AND until_ms=?5 AND COALESCE(last_reported_at,recorded_at)=?6",
+                params![until_ms, fence.provider, fence.credential_id, fence.model, fence.until_ms, last_reported_at]).map(|_| ())
+        }).map_err(err)
+    }
+
+    pub fn clear_all_account_route_fences_for_credential(
+        &self,
+        credential_id: &str,
+    ) -> RouteStateResult<usize> {
+        self.command_sql(|conn: &Connection| {
+            let tx = conn;
+            let mut cleared = 0;
+            for table in ["account_route_fence", "account_non_quota_route_fence"] {
+                if account_fact_table_exists(&tx, table)? {
+                    cleared += tx.execute(
+                        &format!("DELETE FROM {table} WHERE credential_id=?1"),
+                        [credential_id],
+                    )?;
+                }
+            }
+            if crate::fence_rechecks::enabled(&tx)? {
+                tx.execute(
+                    "DELETE FROM fence_recheck WHERE credential_id=?1
+                    AND kind IN ('account_route','non_quota_route','transient_route')",
+                    [credential_id],
+                )?;
+            }
+
+            Ok(cleared)
+        })
+        .map_err(err)
     }
 }

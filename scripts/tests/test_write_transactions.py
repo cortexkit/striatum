@@ -75,6 +75,61 @@ fn production() { c.unchecked_transaction(); }
         _, errors = GUARD["scan"](ROOT, GUARD["read_allowlist"](GUARD["ALLOWLIST"]))
         self.assertEqual(errors, [])
 
+    def test_account_entry_points_require_the_adapter(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            source = root / "crates/striatum-module/src"
+            source.mkdir(parents=True)
+            main = source / "main.rs"
+            main.write_text("mod account_writer; fn handler() { account_writer::record(store); }")
+            (source / "account_writer.rs").write_text("fn record() { store.record_account_eligibility(fact); }")
+            entries = {"record_account_eligibility"}
+            self.assertEqual(GUARD["account_writer_violations"](root, entries), [])
+            main.write_text("fn handler() { arbitrary_name.\nrecord_account_eligibility(fact); }")
+            errors = GUARD["account_writer_violations"](root, entries)
+            self.assertEqual(len(errors), 1)
+            self.assertIn("record_account_eligibility must be submitted", errors[0])
+
+    def test_transaction_methods_and_test_modules_are_not_live_store_calls(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            source = root / "crates/striatum-module/src"
+            source.mkdir(parents=True)
+            main = source / "main.rs"
+            main.write_text('''
+#[cfg(all(test, target_os="linux"))] mod seeds;
+fn operation(tx: &AccountTx<'_>) { tx.clear_account_route_fences_before(p,c,now); }
+fn handler() { crate::account_writer::repair(store, move |tx| {
+    tx.clear_account_route_fences_before(p,c,now)
+}); }
+''')
+            (source / "seeds.rs").write_text("fn seed() { store.account_transaction(seed); }")
+            entries = {"account_transaction", "clear_account_route_fences_before"}
+            self.assertEqual(GUARD["account_writer_violations"](root, entries), [])
+            main.write_text("#[cfg(test)] mod seeds;\nfn handler() { tx.account_transaction(seed); }")
+            self.assertEqual(len(GUARD["account_writer_violations"](root, entries)), 1)
+
+    def test_repository_account_writers_use_the_adapter(self):
+        entries = GUARD["read_account_entries"](GUARD["ACCOUNT_ENTRIES"])
+        self.assertEqual(GUARD["account_writer_violations"](ROOT, entries), [])
+
+    def test_projection_allowance_is_one_exact_function(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            projection = root / "crates/striatum-store/src/evaluation_snapshot.rs"
+            projection.parent.mkdir(parents=True)
+            projection.write_text("fn projection_command() { self.direct_account_transaction(command); }")
+            entries = {"direct_account_transaction"}
+            self.assertEqual(GUARD["account_writer_violations"](root, entries), [])
+            projection.write_text("fn ordinary_request() { self.direct_account_transaction(command); }")
+            self.assertEqual(len(GUARD["account_writer_violations"](root, entries)), 1)
+
     def test_a_test_filename_does_not_exempt_production_code(self):
         scratch = ROOT / "target/scratch"
         scratch.mkdir(parents=True, exist_ok=True)

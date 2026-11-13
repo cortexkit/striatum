@@ -7,11 +7,43 @@ use std::time::Instant;
 
 const MAX_BATCH: usize = 32;
 
+impl AccountTx<'_> {
+    pub(crate) fn pool_sql<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        f(self.conn).map_err(err)
+    }
+    // SQL operations receive the batch connection, never a store handle. The
+    // engine owns commit and rollback, including the command's savepoint.
+    pub(crate) fn command_sql<T>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, cortexkit_store::StoreError> {
+        f(self.conn).map_err(|error| cortexkit_store::StoreError::Backend(error.to_string()))
+    }
+
+    pub(crate) fn command_scope<T>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
+    ) -> RouteStateResult<T> {
+        f(self)
+    }
+
+    pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
+        self.release_expired_admission_probes(now_ms)?;
+        self.release_expired_continuations(now_ms)?;
+        crate::fence_rechecks::sync(self.conn).map_err(err)
+    }
+}
+
 fn write_batch(
     conn: &Connection,
     batch: &mut [Queued],
     #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
 ) -> rusqlite::Result<()> {
+    #[cfg(any(test, feature = "test-support"))]
+    let _batch = evaluation_snapshot::AccountBatchGuard::enter();
     let transaction = crate::write_transaction(conn)?;
     #[cfg(any(test, feature = "test-support"))]
     transactions.fetch_add(1, Ordering::Relaxed);
@@ -54,6 +86,10 @@ pub enum AccountCommandKind {
     Report,
     QuotaDelta,
     Release,
+    Maintenance,
+    Tick,
+    Repair,
+    Selection,
 }
 
 fn stopped() -> RouteStateStoreError {
@@ -124,7 +160,7 @@ pub(crate) struct AccountWriter {
     #[cfg(any(test, feature = "test-support"))]
     batch_sizes: Arc<Mutex<Vec<usize>>>,
     #[cfg(any(test, feature = "test-support"))]
-    commands: [AtomicU64; 6],
+    commands: [AtomicU64; 10],
 }
 
 impl AccountWriter {
@@ -259,6 +295,11 @@ impl SqliteRouteStateStore {
         kind: AccountCommandKind,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
+        if self.store.is_projection() {
+            return Err(err(
+                "private projections cannot enqueue account writer commands",
+            ));
+        }
         let writer = self.account_writer.get_or_init(|| {
             AccountWriter::start(
                 self.store.clone(),
@@ -271,7 +312,13 @@ impl SqliteRouteStateStore {
                 }),
             )
         });
-        let reply = writer.enqueue(f)?;
+        #[cfg(any(test, feature = "test-support"))]
+        let inputs = crate::replay::current();
+        let reply = writer.enqueue(move |tx| {
+            #[cfg(any(test, feature = "test-support"))]
+            let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
+            f(tx)
+        })?;
         #[cfg(any(test, feature = "test-support"))]
         writer.commands[kind as usize].fetch_add(1, Ordering::Relaxed);
         #[cfg(not(any(test, feature = "test-support")))]
@@ -285,7 +332,7 @@ impl SqliteRouteStateStore {
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<T> {
         if self.store.is_projection() {
-            return self.account_transaction(f);
+            return self.projection_command(f);
         }
         self.enqueue_account_command(kind, f)?.wait()
     }

@@ -1900,7 +1900,7 @@ pub async fn account_quota_loop(
 
 /// The listing view is the vault's digest, not its poll time. Remember only
 /// successful writes so an unchanged listing retries after a store failure.
-async fn persist_roster_if_changed(
+pub(crate) async fn persist_roster_if_changed(
     store: &Arc<SqliteRouteStateStore>,
     row: PersistedVaultRoster,
     persisted_view: &mut Option<String>,
@@ -1910,10 +1910,12 @@ async fn persist_roster_if_changed(
     }
     let view = row.view.clone();
     let store = Arc::clone(store);
-    tokio::task::spawn_blocking(move || store.put_account_vault_roster(&row))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+    tokio::task::spawn_blocking(move || {
+        crate::account_writer::put_account_vault_roster(&store, &row)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
     *persisted_view = Some(view);
     Ok(())
 }

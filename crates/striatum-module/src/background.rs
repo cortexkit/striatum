@@ -130,6 +130,7 @@ pub(super) fn start(
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
     let mut loops = BackgroundLoops::default();
+    loops.spawn("account maintenance", account_tick_loop(Arc::clone(store)));
     loops.spawn(
         "WAL checkpoints",
         checkpoint_loop(Arc::clone(store), std::time::Duration::from_secs(15)),
@@ -250,6 +251,17 @@ pub(super) fn start(
         override_path,
         operator_config_path,
     })
+}
+
+async fn account_tick_loop(store: SharedStore) {
+    let period = std::time::Duration::from_secs(10);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    loop {
+        ticks.tick().await;
+        if let Err(error) = crate::account_writer::tick(&store, crate::now_ms() as i64) {
+            tracing::warn!(%error, "account maintenance failed");
+        }
+    }
 }
 
 async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {

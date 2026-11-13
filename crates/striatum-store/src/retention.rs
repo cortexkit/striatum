@@ -77,24 +77,6 @@ pub struct V1DecisionRetentionBatch {
 }
 
 impl SqliteRouteStateStore {
-    /// Delete at most `limit` retired shadow decisions, oldest first. A shadow
-    /// row never had a pin, admission or hold; one that somehow does is kept
-    /// rather than failing the batch.
-    pub fn purge_shadow_decisions(&self, limit: usize) -> RouteStateResult<usize> {
-        self.delete_unreferenced_decisions(RETIRED_SHADOW_MODE, i64::MAX, limit)
-    }
-
-    /// Delete at most `limit` serve decisions created before `created_before`
-    /// (Unix milliseconds), oldest first, skipping any a pin, admission or
-    /// hold still references.
-    pub fn prune_serve_decisions(
-        &self,
-        created_before: i64,
-        limit: usize,
-    ) -> RouteStateResult<usize> {
-        self.delete_unreferenced_decisions(DECISION_MODE_SERVE, created_before, limit)
-    }
-
     fn delete_unreferenced_decisions(
         &self,
         mode: &str,
@@ -116,28 +98,47 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    fn retention_write<T>(
+        &self,
+        batch: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        self.store
+            .with_conn(|conn: &Connection| {
+                let tx = crate::write_transaction(conn)?;
+                let result = batch(&tx)?;
+                tx.commit()?;
+                Ok(result)
+            })
+            .map_err(err)
+    }
+
+    /// Delete at most `limit` retired shadow decisions, oldest first. A shadow
+    /// row never had a pin, admission or hold; one that somehow does is kept
+    /// rather than failing the batch.
+    pub fn purge_shadow_decisions(&self, limit: usize) -> RouteStateResult<usize> {
+        self.delete_unreferenced_decisions(RETIRED_SHADOW_MODE, i64::MAX, limit)
+    }
+
+    /// Delete at most `limit` serve decisions created before `created_before`
+    /// (Unix milliseconds), oldest first, skipping any a pin, admission or
+    /// hold still references.
+    pub fn prune_serve_decisions(
+        &self,
+        created_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.delete_unreferenced_decisions(DECISION_MODE_SERVE, created_before, limit)
+    }
+
     /// Delete at most `limit` admissions whose every time (commit, validity,
     /// lease, start, release and finish) is before `before` (Unix
     /// milliseconds), oldest first. Demand only counts an admission committed
     /// after its account's latest reading, so an admission this old charges
     /// nothing a fresh reading could still need.
     pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                conn.execute(
-                    "DELETE FROM account_admission WHERE rowid IN ( \
-                       SELECT rowid FROM account_admission \
-                         INDEXED BY account_admission_by_committed \
-                       WHERE committed_at < ?1 \
-                         AND admission_valid_until < ?1 AND lease_valid_until < ?1 \
-                         AND COALESCE(started_at, 0) < ?1 \
-                         AND COALESCE(released_at, 0) < ?1 \
-                         AND COALESCE(finished_at, 0) < ?1 \
-                       ORDER BY committed_at LIMIT ?2)",
-                    params![before, limit_param(limit)],
-                )
-            })
-            .map_err(err)
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_account_admissions(before, limit)
+        })
     }
 
     /// Delete at most `limit` holds created before `before` (Unix
@@ -166,53 +167,9 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<AffinityRetentionBatch> {
-        if limit == 0 {
-            return Ok(AffinityRetentionBatch::default());
-        }
-        self.store
-            .with_conn(|conn: &Connection| {
-                let tx = crate::write_transaction(conn)?;
-                let keys: Vec<(String, String, String)> = {
-                    let mut statement = tx.prepare(
-                        "SELECT principal, conversation_hash, provider FROM account_affinity \
-                           INDEXED BY account_affinity_by_expiry \
-                         WHERE expires_at < ?1 AND COALESCE(lease_valid_until, 0) < ?1 \
-                           AND NOT EXISTS (SELECT 1 FROM account_pin p \
-                             JOIN account_admission a ON a.pin_id = p.pin_id \
-                             WHERE p.principal = account_affinity.principal \
-                               AND p.conversation_hash = account_affinity.conversation_hash \
-                               AND p.provider = account_affinity.provider) \
-                         ORDER BY expires_at LIMIT ?2",
-                    )?;
-                    let rows = statement.query_map(params![before, limit_param(limit)], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })?;
-                    rows.collect::<rusqlite::Result<_>>()?
-                };
-                let mut batch = AffinityRetentionBatch::default();
-                {
-                    let mut delete_pins = tx.prepare(
-                        "DELETE FROM account_pin \
-                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
-                    )?;
-                    let mut delete_affinity = tx.prepare(
-                        "DELETE FROM account_affinity \
-                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
-                    )?;
-                    for (principal, conversation_hash, provider) in &keys {
-                        batch.pins +=
-                            delete_pins.execute(params![principal, conversation_hash, provider])?;
-                        batch.affinities += delete_affinity.execute(params![
-                            principal,
-                            conversation_hash,
-                            provider
-                        ])?;
-                    }
-                }
-                tx.commit()?;
-                Ok(batch)
-            })
-            .map_err(err)
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_account_affinities(before, limit)
+        })
     }
 
     /// Delete at most `limit` runner observations received before
@@ -226,32 +183,9 @@ impl SqliteRouteStateStore {
         received_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                conn.execute(
-                    "DELETE FROM account_observation WHERE rowid IN ( \
-                       SELECT rowid FROM account_observation \
-                         INDEXED BY account_observation_by_received \
-                       WHERE received_at < ?1 \
-                         AND NOT EXISTS (SELECT 1 FROM account_fence f \
-                           WHERE f.observation_id = account_observation.observation_id) \
-                          AND NOT EXISTS (SELECT 1 FROM account_principal_exclusion x \
-                            WHERE x.observation_id = account_observation.observation_id) \
-                          AND NOT (kind='signed_out' AND bound=1 AND EXISTS ( \
-                            SELECT 1 FROM account_admission a \
-                            WHERE a.principal=account_observation.principal \
-                              AND a.admission_id=account_observation.admission_id \
-                              AND a.run_id=json_extract(account_observation.observation_json,'$.run_id') \
-                              AND a.state='started')) \
-                          AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN kind='transient_backoff' \
-                            AND bound=1 AND json_valid(effects_json) THEN effects_json ELSE '[]' END) e \
-                            WHERE json_extract(e.value,'$.effect')='transient_backoff' \
-                            AND json_extract(e.value,'$.retry_at_ms')>?1) \
-                       ORDER BY received_at LIMIT ?2)",
-                    params![received_before, limit_param(limit)],
-                )
-            })
-            .map_err(err)
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_account_observations(received_before, limit)
+        })
     }
 
     /// Delete at most `limit` runner-event keys (`account_observation_event`)
@@ -263,17 +197,9 @@ impl SqliteRouteStateStore {
         received_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                conn.execute(
-                    "DELETE FROM account_observation_event WHERE rowid IN ( \
-                       SELECT rowid FROM account_observation_event \
-                         INDEXED BY account_observation_event_by_received \
-                       WHERE received_at < ?1 ORDER BY received_at LIMIT ?2)",
-                    params![received_before, limit_param(limit)],
-                )
-            })
-            .map_err(err)
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_observation_events(received_before, limit)
+        })
     }
 
     /// Delete at most `limit` rows of `model_route_parent_failures` whose
@@ -325,19 +251,6 @@ impl SqliteRouteStateStore {
 impl SqliteRouteStateStore {
     /// Run one retention batch in the store's write transaction
     /// ([`crate::write_transaction`]), committing it when the batch succeeds.
-    fn retention_write<T>(
-        &self,
-        batch: impl FnOnce(&Transaction<'_>) -> rusqlite::Result<T>,
-    ) -> RouteStateResult<T> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                let tx = crate::write_transaction(conn)?;
-                let result = batch(&tx)?;
-                tx.commit()?;
-                Ok(result)
-            })
-            .map_err(err)
-    }
 
     /// Delete at most `limit` routing/v1 decision bindings created and expired
     /// before `before` (Unix milliseconds), oldest first, together with their
@@ -351,40 +264,8 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<V1DecisionRetentionBatch> {
-        if limit == 0 {
-            return Ok(V1DecisionRetentionBatch::default());
-        }
-        self.retention_write(|tx| {
-            let ids: Vec<String> = {
-                let mut statement = tx.prepare(&format!(
-                    "SELECT decision_id FROM routing_v1_decision \
-                       INDEXED BY routing_v1_decision_by_created \
-                     WHERE created_at_ms < ?1 AND expires_at_ms < ?1 \
-                       AND NOT EXISTS (SELECT 1 FROM account_admission a \
-                         WHERE a.model_decision_id = routing_v1_decision.decision_id \
-                           AND a.state IN {LIVE_ADMISSION_STATES}) \
-                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
-                         WHERE c.decision_id = routing_v1_decision.decision_id) \
-                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
-                         WHERE c.previous_decision_id = routing_v1_decision.decision_id) \
-                     ORDER BY created_at_ms LIMIT ?2"
-                ))?;
-                let rows = statement
-                    .query_map(params![before, limit_param(limit)], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
-            let mut batch = V1DecisionRetentionBatch::default();
-            let mut deliveries =
-                tx.prepare("DELETE FROM routing_v1_report_delivery WHERE decision_id = ?1")?;
-            let mut reports = tx.prepare("DELETE FROM routing_v1_report WHERE decision_id = ?1")?;
-            let mut decisions =
-                tx.prepare("DELETE FROM routing_v1_decision WHERE decision_id = ?1")?;
-            for id in &ids {
-                batch.deliveries += deliveries.execute([id])?;
-                batch.reports += reports.execute([id])?;
-                batch.decisions += decisions.execute([id])?;
-            }
-            Ok(batch)
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_v1_decisions(before, limit)
         })
     }
 
@@ -434,24 +315,8 @@ impl SqliteRouteStateStore {
     /// the model decision its body cites, so a runner re-sending an admission
     /// for a run still in flight gets the first answer back.
     pub fn prune_v1_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
-        self.retention_write(|tx| {
-            tx.execute(
-                &format!(
-                    "DELETE FROM routing_v1_admission WHERE rowid IN ( \
-                       SELECT v.rowid FROM routing_v1_admission v \
-                         INDEXED BY routing_v1_admission_by_created \
-                       WHERE v.created_at_ms < ?1 \
-                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
-                           WHERE a.principal = v.principal AND a.admission_id = v.admission_id \
-                             AND a.state IN {LIVE_ADMISSION_STATES}) \
-                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
-                           WHERE a.model_decision_id = CASE WHEN json_valid(v.body_json) \
-                               THEN json_extract(v.body_json, '$.decision_id') END \
-                             AND a.state IN {LIVE_ADMISSION_STATES}) \
-                       ORDER BY v.created_at_ms LIMIT ?2)"
-                ),
-                params![before, limit_param(limit)],
-            )
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_v1_admissions(before, limit)
         })
     }
 
@@ -459,13 +324,8 @@ impl SqliteRouteStateStore {
     /// before `before`, oldest first. The row only steers the next selection
     /// for its key back to a warm prompt cache, which is long gone by then.
     pub fn prune_v1_affinities(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
-        self.retention_write(|tx| {
-            tx.execute(
-                "DELETE FROM routing_v1_affinity WHERE rowid IN ( \
-                   SELECT rowid FROM routing_v1_affinity INDEXED BY routing_v1_affinity_by_updated \
-                   WHERE updated_at_ms < ?1 ORDER BY updated_at_ms LIMIT ?2)",
-                params![before, limit_param(limit)],
-            )
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_v1_affinities(before, limit)
         })
     }
 
@@ -480,24 +340,8 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.retention_write(|tx| {
-            tx.execute(
-                &format!(
-                    "DELETE FROM account_continue WHERE rowid IN ( \
-                       SELECT c.rowid FROM account_continue c \
-                       WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
-                         AND COALESCE(c.used_at_ms, 0) < ?1 \
-                         AND COALESCE(c.released_at_ms, 0) < ?1 \
-                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
-                           WHERE a.principal = c.principal \
-                             AND a.admission_id IN (c.admission_id, c.reservation_id) \
-                             AND (a.state IN {LIVE_ADMISSION_STATES} \
-                               OR COALESCE(a.finished_at, 0) >= ?1 \
-                               OR COALESCE(a.released_at, 0) >= ?1)) \
-                       ORDER BY c.rowid LIMIT ?2)"
-                ),
-                params![before, limit_param(limit)],
-            )
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_account_continuations(before, limit)
         })
     }
 
@@ -576,13 +420,8 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.retention_write(|tx| {
-            tx.execute(
-                "DELETE FROM fence_retired_origin WHERE rowid IN ( \
-                   SELECT rowid FROM fence_retired_origin INDEXED BY fence_retired_origin_by_retired \
-                   WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)",
-                params![before, limit_param(limit)],
-            )
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_retired_fence_origins(before, limit)
         })
     }
 
@@ -615,6 +454,254 @@ impl SqliteRouteStateStore {
                    SELECT account_key, window_key, observed_at FROM quota_reading_log \
                      INDEXED BY quota_reading_log_observed_idx \
                    WHERE observed_at < ?1 ORDER BY observed_at LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+}
+
+impl crate::AccountTx<'_> {
+    pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.command_sql(|conn: &Connection| {
+            conn.execute(
+                "DELETE FROM account_admission WHERE rowid IN ( \
+                       SELECT rowid FROM account_admission \
+                         INDEXED BY account_admission_by_committed \
+                       WHERE committed_at < ?1 \
+                         AND admission_valid_until < ?1 AND lease_valid_until < ?1 \
+                         AND COALESCE(started_at, 0) < ?1 \
+                         AND COALESCE(released_at, 0) < ?1 \
+                         AND COALESCE(finished_at, 0) < ?1 \
+                       ORDER BY committed_at LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+        .map_err(err)
+    }
+
+    pub fn prune_account_affinities(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<AffinityRetentionBatch> {
+        if limit == 0 {
+            return Ok(AffinityRetentionBatch::default());
+        }
+        self.command_sql(|conn: &Connection| {
+            let tx = conn;
+            let keys: Vec<(String, String, String)> = {
+                let mut statement = tx.prepare(
+                    "SELECT principal, conversation_hash, provider FROM account_affinity \
+                           INDEXED BY account_affinity_by_expiry \
+                         WHERE expires_at < ?1 AND COALESCE(lease_valid_until, 0) < ?1 \
+                           AND NOT EXISTS (SELECT 1 FROM account_pin p \
+                             JOIN account_admission a ON a.pin_id = p.pin_id \
+                             WHERE p.principal = account_affinity.principal \
+                               AND p.conversation_hash = account_affinity.conversation_hash \
+                               AND p.provider = account_affinity.provider) \
+                         ORDER BY expires_at LIMIT ?2",
+                )?;
+                let rows = statement.query_map(params![before, limit_param(limit)], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut batch = AffinityRetentionBatch::default();
+            {
+                let mut delete_pins = tx.prepare(
+                    "DELETE FROM account_pin \
+                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
+                )?;
+                let mut delete_affinity = tx.prepare(
+                    "DELETE FROM account_affinity \
+                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
+                )?;
+                for (principal, conversation_hash, provider) in &keys {
+                    batch.pins +=
+                        delete_pins.execute(params![principal, conversation_hash, provider])?;
+                    batch.affinities +=
+                        delete_affinity.execute(params![principal, conversation_hash, provider])?;
+                }
+            }
+
+            Ok(batch)
+        })
+        .map_err(err)
+    }
+
+    pub fn prune_account_observations(
+        &self,
+        received_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.command_sql(|conn: &Connection| {
+                conn.execute(
+                    "DELETE FROM account_observation WHERE rowid IN ( \
+                       SELECT rowid FROM account_observation \
+                         INDEXED BY account_observation_by_received \
+                       WHERE received_at < ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM account_fence f \
+                           WHERE f.observation_id = account_observation.observation_id) \
+                          AND NOT EXISTS (SELECT 1 FROM account_principal_exclusion x \
+                            WHERE x.observation_id = account_observation.observation_id) \
+                          AND NOT (kind='signed_out' AND bound=1 AND EXISTS ( \
+                            SELECT 1 FROM account_admission a \
+                            WHERE a.principal=account_observation.principal \
+                              AND a.admission_id=account_observation.admission_id \
+                              AND a.run_id=json_extract(account_observation.observation_json,'$.run_id') \
+                              AND a.state='started')) \
+                          AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN kind='transient_backoff' \
+                            AND bound=1 AND json_valid(effects_json) THEN effects_json ELSE '[]' END) e \
+                            WHERE json_extract(e.value,'$.effect')='transient_backoff' \
+                            AND json_extract(e.value,'$.retry_at_ms')>?1) \
+                       ORDER BY received_at LIMIT ?2)",
+                    params![received_before, limit_param(limit)],
+                )
+            })
+            .map_err(err)
+    }
+
+    pub fn prune_observation_events(
+        &self,
+        received_before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.command_sql(|conn: &Connection| {
+            conn.execute(
+                "DELETE FROM account_observation_event WHERE rowid IN ( \
+                       SELECT rowid FROM account_observation_event \
+                         INDEXED BY account_observation_event_by_received \
+                       WHERE received_at < ?1 ORDER BY received_at LIMIT ?2)",
+                params![received_before, limit_param(limit)],
+            )
+        })
+        .map_err(err)
+    }
+
+    fn retention_write<T>(
+        &self,
+        batch: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> RouteStateResult<T> {
+        self.command_sql(|conn: &Connection| {
+            let tx = conn;
+            let result = batch(&tx)?;
+
+            Ok(result)
+        })
+        .map_err(err)
+    }
+
+    pub fn prune_v1_decisions(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<V1DecisionRetentionBatch> {
+        if limit == 0 {
+            return Ok(V1DecisionRetentionBatch::default());
+        }
+        self.retention_write(|tx| {
+            let ids: Vec<String> = {
+                let mut statement = tx.prepare(&format!(
+                    "SELECT decision_id FROM routing_v1_decision \
+                       INDEXED BY routing_v1_decision_by_created \
+                     WHERE created_at_ms < ?1 AND expires_at_ms < ?1 \
+                       AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                         WHERE a.model_decision_id = routing_v1_decision.decision_id \
+                           AND a.state IN {LIVE_ADMISSION_STATES}) \
+                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
+                         WHERE c.decision_id = routing_v1_decision.decision_id) \
+                       AND NOT EXISTS (SELECT 1 FROM account_continue c \
+                         WHERE c.previous_decision_id = routing_v1_decision.decision_id) \
+                     ORDER BY created_at_ms LIMIT ?2"
+                ))?;
+                let rows =
+                    statement.query_map(params![before, limit_param(limit)], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            let mut batch = V1DecisionRetentionBatch::default();
+            let mut deliveries =
+                tx.prepare("DELETE FROM routing_v1_report_delivery WHERE decision_id = ?1")?;
+            let mut reports = tx.prepare("DELETE FROM routing_v1_report WHERE decision_id = ?1")?;
+            let mut decisions =
+                tx.prepare("DELETE FROM routing_v1_decision WHERE decision_id = ?1")?;
+            for id in &ids {
+                batch.deliveries += deliveries.execute([id])?;
+                batch.reports += reports.execute([id])?;
+                batch.decisions += decisions.execute([id])?;
+            }
+            Ok(batch)
+        })
+    }
+
+    pub fn prune_v1_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                &format!(
+                    "DELETE FROM routing_v1_admission WHERE rowid IN ( \
+                       SELECT v.rowid FROM routing_v1_admission v \
+                         INDEXED BY routing_v1_admission_by_created \
+                       WHERE v.created_at_ms < ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.principal = v.principal AND a.admission_id = v.admission_id \
+                             AND a.state IN {LIVE_ADMISSION_STATES}) \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.model_decision_id = CASE WHEN json_valid(v.body_json) \
+                               THEN json_extract(v.body_json, '$.decision_id') END \
+                             AND a.state IN {LIVE_ADMISSION_STATES}) \
+                       ORDER BY v.created_at_ms LIMIT ?2)"
+                ),
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    pub fn prune_v1_affinities(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM routing_v1_affinity WHERE rowid IN ( \
+                   SELECT rowid FROM routing_v1_affinity INDEXED BY routing_v1_affinity_by_updated \
+                   WHERE updated_at_ms < ?1 ORDER BY updated_at_ms LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    pub fn prune_account_continuations(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                &format!(
+                    "DELETE FROM account_continue WHERE rowid IN ( \
+                       SELECT c.rowid FROM account_continue c \
+                       WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
+                         AND COALESCE(c.used_at_ms, 0) < ?1 \
+                         AND COALESCE(c.released_at_ms, 0) < ?1 \
+                         AND NOT EXISTS (SELECT 1 FROM account_admission a \
+                           WHERE a.principal = c.principal \
+                             AND a.admission_id IN (c.admission_id, c.reservation_id) \
+                             AND (a.state IN {LIVE_ADMISSION_STATES} \
+                               OR COALESCE(a.finished_at, 0) >= ?1 \
+                               OR COALESCE(a.released_at, 0) >= ?1)) \
+                       ORDER BY c.rowid LIMIT ?2)"
+                ),
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
+    pub fn prune_retired_fence_origins(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM fence_retired_origin WHERE rowid IN ( \
+                   SELECT rowid FROM fence_retired_origin INDEXED BY fence_retired_origin_by_retired \
+                   WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)",
                 params![before, limit_param(limit)],
             )
         })

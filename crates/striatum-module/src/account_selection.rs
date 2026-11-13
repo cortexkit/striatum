@@ -1102,39 +1102,26 @@ impl ClassContext {
             .account_read(|tx| tx.has_expired_admission_probes(now_ms))
             .map_err(|error| error.to_string())?
         {
-            store
-                .account_transaction(|tx| tx.release_expired_admission_probes(now_ms))
-                .map_err(|error| error.to_string())?;
+            crate::account_writer::repair(store, move |tx| {
+                tx.release_expired_admission_probes(now_ms)
+            })
+            .map_err(|error| error.to_string())?;
         }
         if store
             .account_read(|tx| tx.has_expired_continuations(now_ms))
             .map_err(|error| error.to_string())?
         {
-            store
-                .account_transaction(|tx| tx.release_expired_continuations(now_ms))
-                .map_err(|error| error.to_string())?;
+            crate::account_writer::repair(store, move |tx| {
+                tx.release_expired_continuations(now_ms)
+            })
+            .map_err(|error| error.to_string())?;
         }
-        let refusals = crate::credential_fences::live(store, credentials)?;
+        let refusals = crate::credential_fences::live_with_eligibility(store, credentials, true)?;
         let probe_scope = std::sync::Arc::downgrade(credentials);
         let credentials = credentials
             .lock()
             .map_err(|error| error.to_string())?
             .snapshot();
-        if credentials.listing_version().is_some() {
-            let listings = credentials
-                .listed_credentials()
-                .iter()
-                .filter_map(|row| match credentials.listing_fingerprint(&row.id) {
-                    crate::broca_credentials::ListingLookup::Listed(fingerprint) => {
-                        Some((row.id.clone(), fingerprint))
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            store
-                .reconcile_account_eligibility(&listings)
-                .map_err(|error| error.to_string())?;
-        }
         let eligibility = store
             .account_eligibility()
             .map_err(|error| error.to_string())?;
@@ -1166,7 +1153,7 @@ impl ClassContext {
             .chain(media_providers.iter())
             .collect::<BTreeSet<_>>()
         {
-            let read_states = || store.pool_key_states(provider, now_ms);
+            let read_states = || crate::account_writer::pool_key_states(store, provider, now_ms);
             #[cfg(test)]
             let read_states = || {
                 if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
@@ -1214,15 +1201,15 @@ impl ClassContext {
             if recovered {
                 // Compare evidence time so a concurrently reported refusal is
                 // never erased by the older recovery snapshot.
-                store
-                    .clear_account_size_refusal(
-                        &fact.provider,
-                        &fact.credential_id,
-                        &fact.model,
-                        fact.size_class,
-                        fact.observed_at.saturating_add(1),
-                    )
-                    .map_err(|error| error.to_string())?;
+                crate::account_writer::clear_account_size_refusal(
+                    store,
+                    &fact.provider,
+                    &fact.credential_id,
+                    &fact.model,
+                    fact.size_class,
+                    fact.observed_at.saturating_add(1),
+                )
+                .map_err(|error| error.to_string())?;
             }
         }
         size_refusals = store
@@ -1268,13 +1255,13 @@ impl ClassContext {
                     reset.max(fence.until_ms)
                 };
                 if until != fence.until_ms {
-                    store
-                        .reconcile_account_route_fence(
-                            fence,
-                            until,
-                            latest_reports[&fence.credential_id],
-                        )
-                        .map_err(|error| error.to_string())?;
+                    crate::account_writer::reconcile_account_route_fence(
+                        store,
+                        fence,
+                        until,
+                        latest_reports[&fence.credential_id],
+                    )
+                    .map_err(|error| error.to_string())?;
                     fence.until_ms = until;
                 }
             }
@@ -1349,19 +1336,18 @@ impl ClassContext {
             })
             .collect();
         if !recovered.is_empty() {
-            store
-                .account_transaction(|tx| {
-                    for id in &recovered {
-                        tx.clear_fence(id, now_ms, "fresh_headroom")?;
-                    }
-                    let mut fences = context.fences.clone();
-                    for (provider, fences) in &mut fences {
-                        *fences = load_fences(tx, provider)?;
-                    }
-                    context.replace_fences(fences);
-                    Ok(())
-                })
-                .map_err(|error| error.to_string())?;
+            let mut fences = context.fences.clone();
+            let fences = crate::account_writer::repair(store, move |tx| {
+                for id in &recovered {
+                    tx.clear_fence(id, now_ms, "fresh_headroom")?;
+                }
+                for (provider, fences) in &mut fences {
+                    *fences = load_fences(tx, provider)?;
+                }
+                Ok(fences)
+            })
+            .map_err(|error| error.to_string())?;
+            context.replace_fences(fences);
             context.replace_rechecks(store.fence_rechecks().map_err(|error| error.to_string())?);
         }
         Ok(context)
@@ -1435,28 +1421,37 @@ impl ClassContext {
         if self.probe_eligible(provider, model, &admission.credential_id) {
             #[cfg(test)]
             run_before_probe_bind_hook(&self.probe_scope, store);
-            let (claimed, retry_at) = store.account_transaction(|tx| {
+            let context = self.clone();
+            let owned_provider = provider.to_owned();
+            let owned_model = model.to_owned();
+            let decision = decision.to_owned();
+            let owner = hold.owner.clone();
+            let claimed_admission = admission.clone();
+            let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
+                let provider = owned_provider.as_str();
+                let model = owned_model.as_str();
+                let admission = claimed_admission;
                 let origins: Vec<_> = tx
                     .fence_rechecks()?
                     .into_iter()
                     .filter(|origin| {
-                        self.origin_applies(
+                        context.origin_applies(
                             origin,
-                            provider,
+                            &provider,
                             &admission.account_id,
                             &admission.credential_id,
-                            model,
-                        ) && !self.origin_recovered(origin, &admission.account_id)
+                            &model,
+                        ) && !context.origin_recovered(origin, &admission.account_id)
                     })
                     .collect();
                 let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
                 let claimed = tx.bind_decision_probe(
                     &origins,
-                    &hold.owner,
-                    decision,
+                    &owner,
+                    &decision,
                     &admission.account_id,
                     &admission.credential_id,
-                    self.now_ms,
+                    context.now_ms,
                 )?;
                 Ok((claimed, retry_at))
             })?;
@@ -2598,26 +2593,33 @@ impl ClassContext {
                     && origin.size_class.is_none()
             })
         {
-            let granted = store
-                .account_transaction(|tx| {
-                    let origins: Vec<_> = tx
-                        .fence_rechecks()?
-                        .into_iter()
-                        .filter(|origin| {
-                            origin.account_id.is_none()
-                                && origin.credential_id.is_none()
-                                && origin.principal.is_none()
-                                && origin.size_class.is_none()
-                                && origin.applies(provider, "", "", model)
-                        })
-                        .collect();
-                    tx.grant_fence_rechecks(
-                        &origins,
-                        self.now_ms,
-                        owner.or(self.probe_owner.as_deref()),
-                    )
-                })
-                .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
+            let context = self.clone();
+            let owned_provider = provider.to_owned();
+            let owned_model = model.to_owned();
+            let owned_owner = owner.map(str::to_owned);
+            let granted = crate::account_writer::repair(store, move |tx| {
+                let provider = owned_provider.as_str();
+                let model = owned_model.as_str();
+                let owner = owned_owner.as_deref();
+
+                let origins: Vec<_> = tx
+                    .fence_rechecks()?
+                    .into_iter()
+                    .filter(|origin| {
+                        origin.account_id.is_none()
+                            && origin.credential_id.is_none()
+                            && origin.principal.is_none()
+                            && origin.size_class.is_none()
+                            && origin.applies(provider, "", "", model)
+                    })
+                    .collect();
+                tx.grant_fence_rechecks(
+                    &origins,
+                    context.now_ms,
+                    owner.or(context.probe_owner.as_deref()),
+                )
+            })
+            .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
             return if granted {
                 Ok(String::new())
             } else {
@@ -2631,37 +2633,45 @@ impl ClassContext {
         let account =
             crate::credential_fences::credential_account_id(&self.account_ids, &credential)
                 .unwrap_or_else(|| credential.clone());
-        let claimed = store
-            .account_transaction(|tx| {
-                let origins: Vec<_> = tx
-                    .fence_rechecks()?
-                    .into_iter()
-                    .filter(|origin| {
-                        self.origin_applies(origin, provider, &account, &credential, model)
-                            && !self.origin_recovered(origin, &account)
-                    })
-                    .collect();
-                if !pinnable
-                    && origins
-                        .iter()
-                        .any(|origin| origin.account_id.is_some() || origin.credential_id.is_some())
-                {
-                    return Ok(false);
-                }
-                if !origins
+        let context = self.clone();
+        let owned_provider = provider.to_owned();
+        let owned_model = model.to_owned();
+        let owned_owner = owner.map(str::to_owned);
+        let owned_credential = credential.clone();
+        let claimed = crate::account_writer::repair(store, move |tx| {
+            let provider = owned_provider.as_str();
+            let model = owned_model.as_str();
+            let owner = owned_owner.as_deref();
+            let credential = owned_credential;
+
+            let origins: Vec<_> = tx
+                .fence_rechecks()?
+                .into_iter()
+                .filter(|origin| {
+                    context.origin_applies(origin, provider, &account, &credential, model)
+                        && !context.origin_recovered(origin, &account)
+                })
+                .collect();
+            if !pinnable
+                && origins
                     .iter()
-                    .all(|origin| self.origin_due(origin, &account, model)
-                        || owner.is_some() && origin.claim_owner.as_deref() == owner)
-                {
-                    return Ok(false);
-                }
-                tx.grant_fence_rechecks(
-                    &origins,
-                    self.now_ms,
-                    owner.or(self.probe_owner.as_deref()),
-                )
-            })
-            .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
+                    .any(|origin| origin.account_id.is_some() || origin.credential_id.is_some())
+            {
+                return Ok(false);
+            }
+            if !origins.iter().all(|origin| {
+                context.origin_due(origin, &account, model)
+                    || owner.is_some() && origin.claim_owner.as_deref() == owner
+            }) {
+                return Ok(false);
+            }
+            tx.grant_fence_rechecks(
+                &origins,
+                context.now_ms,
+                owner.or(context.probe_owner.as_deref()),
+            )
+        })
+        .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
         if claimed {
             Ok(credential)
         } else {
@@ -3635,7 +3645,11 @@ pub(crate) fn refresh_all_blocks(
     config: &crate::config_overrides::LiveConfig,
     now: EpochMs,
 ) -> RouteStateResult<()> {
-    store.account_transaction(|tx| {
+    let state = state.to_owned();
+    let config = config.to_owned();
+    crate::account_writer::repair(store, move |tx| {
+        let state = &state;
+
         tx.release_expired_continuations(now)?;
         for provider in tx.active_fence_providers()? {
             let accounts = allocator_roster_for_model(state, &provider, None, now, &[])
@@ -3740,19 +3754,24 @@ pub(crate) fn repair_route_fences(
         return Ok(());
     }
     after_read();
-    store
-        .account_repair(|tx| {
-            // Re-read reports and pool requirements under the IMMEDIATE writer.
-            // A newer report can invalidate the read snapshot's recovery entirely.
-            let mut changed = false;
-            for (provider, credential, at) in
-                route_fence_recoveries(tx, account_ids, quota, config, now_ms)?
-            {
-                changed |= tx.clear_account_route_fences_before(&provider, &credential, at)? > 0;
-            }
-            Ok(changed)
-        })
-        .map_err(|error| error.to_string())
+    let account_ids = account_ids.to_owned();
+    let quota = quota.to_owned();
+    let config = config.to_owned();
+    crate::account_writer::repair(store, move |tx| {
+        let account_ids = &account_ids;
+        let quota = &quota;
+        let config = &config;
+
+        // Re-read reports and pool requirements under the IMMEDIATE writer.
+        // A newer report can invalidate the read snapshot's recovery entirely.
+        for (provider, credential, at) in
+            route_fence_recoveries(tx, account_ids, quota, config, now_ms)?
+        {
+            tx.clear_account_route_fences_before(&provider, &credential, at)?;
+        }
+        Ok(())
+    })
+    .map_err(|error| error.to_string())
 }
 
 // Independent pre-read-first recovery path used only by the differential test.
@@ -3857,41 +3876,65 @@ pub(crate) fn refresh_credential_quota_holds(
     }
     let captured_refusals = refusals.clone();
     let mut changed = false;
-    let kept = store.account_read(|tx| {
-        reconcile_credential_quota_holds(
-            tx, credentials, quota, config, refusals, route_fences, now, false, &mut changed,
-        )
-    }).map_err(|error| error.to_string())?;
-    if !changed { return Ok(kept); }
-    // The read pass is only a hint to acquire the writer. Re-read evidence and
-    // holds inside it, so a newer refusal or an admission's reservation of a
-    // fenced credential's next probe cannot be overwritten by the earlier read.
-    store
-        .account_transaction(|tx| {
-            let current_refusals = tx.report_credential_refusals()?;
-            let mut current_routes = tx.report_route_fences(now)?;
-            // Context loading may already have cleared the route fence using
-            // the same fresh reading. That fence still proves the refusal was
-            // quota-related, so headroom can heal the credential refusal too.
-            // Reuse that evidence only if the refusal itself has not changed.
-            current_routes.extend(route_fences.iter().filter(|route| {
-                current_refusals.iter().any(|refusal| {
-                    refusal.provider_id == route.provider
-                        && refusal.credential_id == route.credential_id
-                        && captured_refusals.contains(refusal)
-                })
-            }).cloned());
-            refresh_credential_quota_holds_in(
+    let kept = store
+        .account_read(|tx| {
+            reconcile_credential_quota_holds(
                 tx,
                 credentials,
                 quota,
                 config,
-                current_refusals,
-                &current_routes,
+                refusals,
+                route_fences,
                 now,
+                false,
+                &mut changed,
             )
         })
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if !changed {
+        return Ok(kept);
+    }
+    // The read pass is only a hint to acquire the writer. Re-read evidence and
+    // holds inside it, so a newer refusal or an admission's reservation of a
+    // fenced credential's next probe cannot be overwritten by the earlier read.
+    let credentials = credentials.to_owned();
+    let quota = quota.to_owned();
+    let config = config.to_owned();
+    let route_fences = route_fences.to_owned();
+    crate::account_writer::repair(store, move |tx| {
+        let credentials = &credentials;
+        let quota = &quota;
+        let config = &config;
+
+        let current_refusals = tx.report_credential_refusals()?;
+        let mut current_routes = tx.report_route_fences(now)?;
+        // Context loading may already have cleared the route fence using
+        // the same fresh reading. That fence still proves the refusal was
+        // quota-related, so headroom can heal the credential refusal too.
+        // Reuse that evidence only if the refusal itself has not changed.
+        current_routes.extend(
+            route_fences
+                .iter()
+                .filter(|route| {
+                    current_refusals.iter().any(|refusal| {
+                        refusal.provider_id == route.provider
+                            && refusal.credential_id == route.credential_id
+                            && captured_refusals.contains(refusal)
+                    })
+                })
+                .cloned(),
+        );
+        refresh_credential_quota_holds_in(
+            tx,
+            credentials,
+            quota,
+            config,
+            current_refusals,
+            &current_routes,
+            now,
+        )
+    })
+    .map_err(|error| error.to_string())
 }
 
 /// Reconcile both newly reported and persisted credential refusals. Once an

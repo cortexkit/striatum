@@ -811,7 +811,8 @@ fn record_cooldown_update(
         let Some((provider, model)) = params.capacity_key.split_once('/') else {
             return Ok(());
         };
-        return store.record_transient_account_route_fence(
+        return crate::account_writer::record_transient_account_route_fence(
+            store,
             &striatum_store::AccountRouteFence {
                 provider: provider.into(),
                 model: model.into(),
@@ -844,14 +845,20 @@ fn record_cooldown_update(
                     "provider-wide cooldown has no canonical provider key".into(),
                 )
             })?;
-        return store.record_provider_cooldown(
+        return crate::account_writer::record_provider_cooldown(
+            store,
             provider_key,
             &params.route_key,
             &params.capacity_key,
             &update,
         );
     }
-    store.update_route_state(&params.route_key, &params.capacity_key, &update)
+    crate::account_writer::update_route_state(
+        store,
+        &params.route_key,
+        &params.capacity_key,
+        &update,
+    )
 }
 
 /// Why a `route.record_cooldown` request must not reach the store, if it must not.
@@ -2241,7 +2248,9 @@ async fn handle_model_upsert(
     };
     // A placement can make this route the winner at some demand tier (or unseat
     // one), so compare the winner ladder after the write and announce a move.
-    if let Err(error) = store.upsert_fact(&fact, FactSource::Override) {
+    if let Err(error) =
+        crate::account_writer::upsert_fact(store.as_ref(), &fact, FactSource::Override)
+    {
         return send_route_error(
             writer,
             ver,
@@ -2405,7 +2414,9 @@ async fn handle_canonical_model_upsert(
         if params.notes.is_some() {
             fact.notes = params.notes.clone();
         }
-        if let Err(error) = store.upsert_fact(&fact, FactSource::Override) {
+        if let Err(error) =
+            crate::account_writer::upsert_fact(store.as_ref(), &fact, FactSource::Override)
+        {
             return store_error(format!("model_upsert write: {error}")).await;
         }
     }
@@ -3491,9 +3502,9 @@ fn record_provider_reset_fence(
         recorded_at: now,
     };
     if non_quota {
-        store.record_billing_account_route_fence(&fence)
+        crate::account_writer::record_billing_account_route_fence(store, &fence)
     } else {
-        store.record_account_route_fence(&fence)
+        crate::account_writer::record_account_route_fence(store, &fence)
     }
     .map_err(|e| e.to_string())
 }
@@ -4019,7 +4030,7 @@ async fn handle_clear_failure_backoff(
         )
         .await;
     }
-    let prior = match store.clear_failure_backoff(&params.route_key) {
+    let prior = match crate::account_writer::clear_failure_backoff(store, &params.route_key) {
         Ok(prior) => prior,
         Err(error) => {
             return send_route_error(
@@ -4095,7 +4106,7 @@ async fn handle_clear_cooldown(
         )
         .await;
     }
-    let prior = match store.clear_route_cooldowns(&params.route_key) {
+    let prior = match crate::account_writer::clear_route_cooldowns(store, &params.route_key) {
         Ok(Some(prior)) => prior,
         Ok(None) => {
             return send_route_error(
@@ -4359,9 +4370,9 @@ async fn handle_record_cooldown(
             recorded_at: now,
         };
         if contradicted {
-            store.record_billing_account_route_fence(&fence)
+            crate::account_writer::record_billing_account_route_fence(store, &fence)
         } else {
-            store.record_account_route_fence(&fence)
+            crate::account_writer::record_account_route_fence(store, &fence)
         }
     } else {
         record_cooldown_update(store.as_ref(), &params)

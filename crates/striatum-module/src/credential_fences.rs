@@ -27,7 +27,7 @@
 //! Entitlement refusals always keep the timed probe: quota utilization says
 //! nothing about entitlement, so a reading cannot lift or convert that fence.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use striatum_core::route_state_store::{CredentialEntitlementFence, CredentialRefusal};
 use striatum_core::{
@@ -365,11 +365,13 @@ pub(crate) fn clear_quota_holds(
     fence: &CredentialEntitlementFence,
     reason: &str,
 ) -> Result<(), String> {
-    store
-        .account_transaction(|tx| {
-            clear_quota_holds_in(tx, fence, reason, crate::account_selection::now_ms())
-        })
-        .map_err(|error| error.to_string())
+    let fence = fence.clone();
+    let reason = reason.to_owned();
+    let now = crate::account_selection::now_ms();
+    crate::account_writer::repair(store, move |tx| {
+        clear_quota_holds_in(tx, &fence, &reason, now)
+    })
+    .map_err(|error| error.to_string())
 }
 
 fn clear_quota_holds_in(
@@ -468,9 +470,13 @@ pub(crate) fn record(
             ListingLookup::Unknown | ListingLookup::Absent => None,
         }
     });
-    store
-        .record_credential_entitlement_fence(refusal, fingerprint.as_deref(), observed_at_ms)
-        .map_err(|e| e.to_string())?;
+    crate::account_writer::record_credential_entitlement_fence(
+        store,
+        refusal,
+        fingerprint.as_deref(),
+        observed_at_ms,
+    )
+    .map_err(|e| e.to_string())?;
     eprintln!(
         "[striatum] credential entitlement fence recorded provider={} credential={} code={}",
         refusal.provider_id, refusal.credential_id, refusal.code
@@ -478,36 +484,73 @@ pub(crate) fn record(
     Ok(())
 }
 
-/// The fences still in force. A fence whose credential's listing changed since
-/// the refusal is deleted here; one recorded before routing knew the listing
-/// takes the first listing it is seen against. With no listing read yet,
-/// every fence stays.
-pub(crate) fn live(
+/// Read listing repairs first, then commit all changes for that listing in one
+/// command. Eligibility and credential fingerprints describe the same listing,
+/// so publishing them together avoids a second commit on the request path.
+pub(crate) fn live_with_eligibility(
     store: &SqliteRouteStateStore,
     credentials: &SharedBrocaCredentials,
+    reconcile_eligibility: bool,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
     let fences = store
         .credential_entitlement_fences()
         .map_err(|e| e.to_string())?;
-    if fences.is_empty() {
-        return Ok(fences);
-    }
-    let lookups: Vec<_> = match credentials.lock() {
-        Ok(guard) => fences
-            .iter()
-            .map(|fence| {
-                if fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
-                    let inactive = guard.listed_credentials().iter().any(|row| {
-                        row.id == fence.credential_id && row.state != "active"
-                    });
-                    (guard.signed_out_fingerprint(&fence.credential_id), inactive)
-                } else {
-                    (guard.listing_fingerprint(&fence.credential_id), false)
-                }
-            })
-            .collect(),
+    let (lookups, listings) = match credentials.lock() {
+        Ok(guard) => {
+            let lookups: Vec<_> = fences
+                .iter()
+                .map(|fence| {
+                    if fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
+                        let inactive = guard
+                            .listed_credentials()
+                            .iter()
+                            .any(|row| row.id == fence.credential_id && row.state != "active");
+                        (guard.signed_out_fingerprint(&fence.credential_id), inactive)
+                    } else {
+                        (guard.listing_fingerprint(&fence.credential_id), false)
+                    }
+                })
+                .collect();
+            let listings =
+                (reconcile_eligibility && guard.listing_version().is_some()).then(|| {
+                    guard
+                        .listed_credentials()
+                        .iter()
+                        .filter_map(|row| match guard.listing_fingerprint(&row.id) {
+                            ListingLookup::Listed(fingerprint) => {
+                                Some((row.id.clone(), fingerprint))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                });
+            (lookups, listings)
+        }
         Err(_) => return Ok(fences),
     };
+    let eligibility_changed = if let Some(listings) = &listings {
+        let fingerprints: BTreeMap<_, _> = listings
+            .iter()
+            .map(|(id, fp)| (id.as_str(), fp.as_str()))
+            .collect();
+        store
+            .account_eligibility()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|fact| {
+                fact.listing_fingerprint.is_none()
+                    || fact.listing_fingerprint.as_deref()
+                        != fingerprints.get(fact.credential_id.as_str()).copied()
+            })
+    } else {
+        false
+    };
+    enum ListingRepair {
+        SignedOut(CredentialEntitlementFence, String),
+        Adopt(String, String),
+        Clear(CredentialEntitlementFence),
+    }
+    let mut repairs = Vec::new();
     let mut live = Vec::with_capacity(fences.len());
     for (mut fence, (lookup, inactive)) in fences.into_iter().zip(lookups) {
         let current = match lookup {
@@ -520,43 +563,65 @@ pub(crate) fn live(
         };
         if inactive {
             if current != fence.listing_fingerprint {
-                store
-                    .account_transaction(|tx| {
-                        tx.update_signed_out_fingerprint(&fence, current.as_deref().unwrap())
-                    })
-                    .map_err(|e| e.to_string())?;
+                repairs.push(ListingRepair::SignedOut(
+                    fence.clone(),
+                    current.clone().unwrap(),
+                ));
                 fence.listing_fingerprint = current;
             }
-            // Vault usability is independent of the routing fence's probe clock.
             live.push(fence);
             continue;
         }
         match (fence.listing_fingerprint.as_deref(), current.as_deref()) {
             (Some(recorded), Some(current)) if recorded == current => live.push(fence),
             (None, Some(current)) => {
-                store
-                    .adopt_credential_entitlement_fingerprint(&fence.credential_id, current)
-                    .map_err(|e| e.to_string())?;
-                fence.listing_fingerprint = Some(current.to_string());
+                repairs.push(ListingRepair::Adopt(
+                    fence.credential_id.clone(),
+                    current.to_owned(),
+                ));
+                fence.listing_fingerprint = Some(current.to_owned());
                 live.push(fence);
             }
-            // The listing changed (or no longer names the credential): lift.
-            _ => {
-                clear_quota_holds(store, &fence, "vault_listing_changed")?;
-                store
-                    .clear_credential_entitlement_fences(
-                        &fence.credential_id,
-                        fence.listing_fingerprint.as_deref(),
-                    )
-                    .map_err(|e| e.to_string())?;
-                eprintln!(
-                    "[striatum] credential fence lifted provider={} credential={}: its vault listing changed",
-                    fence.provider_id, fence.credential_id
-                );
-            }
+            _ => repairs.push(ListingRepair::Clear(fence)),
         }
     }
+    if !repairs.is_empty() || eligibility_changed {
+        let now = crate::account_selection::now_ms();
+        crate::account_writer::repair(store, move |tx| {
+            for repair in repairs {
+                match repair {
+                    ListingRepair::SignedOut(fence, fingerprint) => {
+                        tx.update_signed_out_fingerprint(&fence, &fingerprint)?
+                    }
+                    ListingRepair::Adopt(credential, fingerprint) => {
+                        tx.adopt_credential_entitlement_fingerprint(&credential, &fingerprint)?
+                    }
+                    ListingRepair::Clear(fence) => {
+                        clear_quota_holds_in(tx, &fence, "vault_listing_changed", now)?;
+                        tx.clear_credential_entitlement_fences(
+                            &fence.credential_id,
+                            fence.listing_fingerprint.as_deref(),
+                        )?;
+                    }
+                }
+            }
+            if let Some(listings) = listings {
+                tx.reconcile_account_eligibility(&listings)?;
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    }
     Ok(live)
+}
+
+/// Fences that survive the current vault listing. Unknown listings leave them
+/// unchanged; a changed listing durably lifts them before this read returns.
+pub(crate) fn live(
+    store: &SqliteRouteStateStore,
+    credentials: &SharedBrocaCredentials,
+) -> Result<Vec<CredentialEntitlementFence>, String> {
+    live_with_eligibility(store, credentials, false)
 }
 
 /// A fence whose refusal is older than the recheck interval: the next
@@ -634,17 +699,13 @@ pub(crate) fn lift_after_success(
     credential_id: &str,
     admitted_at: i64,
 ) -> Result<bool, String> {
-    let lifted = store
-        .account_transaction(|tx| {
-            lift_after_success_in(
-                tx,
-                provider_id,
-                credential_id,
-                crate::now_ms() as i64,
-                admitted_at,
-            )
-        })
-        .map_err(|error| error.to_string())?;
+    let provider = provider_id.to_owned();
+    let credential = credential_id.to_owned();
+    let now = crate::now_ms() as i64;
+    let lifted = crate::account_writer::repair(store, move |tx| {
+        lift_after_success_in(tx, &provider, &credential, now, admitted_at)
+    })
+    .map_err(|error| error.to_string())?;
     if lifted {
         eprintln!("[striatum] credential entitlement fence lifted provider={provider_id} credential={credential_id}: the probe run succeeded");
     }
@@ -657,17 +718,19 @@ pub(crate) fn lift_for_operator(
     store: &SqliteRouteStateStore,
     credential_id: &str,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
-    let route_fences = store
-        .clear_all_account_route_fences_for_credential(credential_id)
-        .map_err(|e| e.to_string())?;
+    let route_fences =
+        crate::account_writer::clear_all_account_route_fences_for_credential(store, credential_id)
+            .map_err(|e| e.to_string())?;
     if route_fences > 0 {
         eprintln!(
             "[striatum] account route fences lifted credential={credential_id} count={route_fences}: operator lift after top-up"
         );
     }
-    let lifted = store
-        .clear_credential_entitlement_fences_for_credential(credential_id)
-        .map_err(|e| e.to_string())?;
+    let lifted = crate::account_writer::clear_credential_entitlement_fences_for_credential(
+        store,
+        credential_id,
+    )
+    .map_err(|e| e.to_string())?;
     for fence in &lifted {
         clear_quota_holds(store, fence, "operator_lift")?;
         eprintln!(

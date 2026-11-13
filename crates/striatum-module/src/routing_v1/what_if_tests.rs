@@ -24,6 +24,45 @@ async fn evaluate(route: &Route, extra: Value) -> Value {
     reply["result"].clone()
 }
 
+#[tokio::test]
+async fn s8a3_what_if_matches_recorded_base_response_without_live_commands() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let (harness, _) = configured().await;
+    prepare_runner_preview(&harness);
+    let operator = operator(&harness).await;
+    Connection::open(harness.store_path()).unwrap().execute_batch(
+        "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
+         INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
+    ).unwrap();
+    let batches = harness.store().account_writer_batch_sizes_for_test();
+    let rows_before = rows(&harness);
+    let mut answer = evaluate(
+        &operator,
+        json!({
+            "iqs": [0, 5, 50, 100],
+            "policy_patch": {"models": {"example-provider/model-b": {"pin_only":true}}},
+            "runner_declarations":{"broca":broad_runner_slot()},
+            "head_choices":{"runner_module":"broca"}
+        }),
+    )
+    .await;
+    // These are timings of the evaluation itself, not routing decisions.
+    answer.as_object_mut().unwrap().remove("snapshot_ms");
+    answer.as_object_mut().unwrap().remove("elapsed_ms");
+    assert_eq!(rows(&harness), rows_before);
+    assert_eq!(
+        harness.store().account_writer_batch_sizes_for_test(),
+        batches
+    );
+    if std::env::var_os("STRIATUM_RECORD_WHAT_IF").is_some() {
+        println!("WHAT_IF_BASE={}", serde_json::to_string(&answer).unwrap());
+    } else {
+        let recorded: Value =
+            serde_json::from_str(include_str!("../../fixtures/s8a3-what-if-base.json")).unwrap();
+        assert_eq!(answer, recorded);
+    }
+}
+
 fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
     let connection = Connection::open(harness.store_path()).unwrap();
     let tables: Vec<String> = connection

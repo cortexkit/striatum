@@ -13,16 +13,213 @@ use cortexkit_role_routing_conformance::wire::select::{
     check_answer, parse_select_request, SelectAnswer,
 };
 use cortexkit_role_routing_conformance::CatalogModel;
+use serde_json::{json, Value};
 use striatum_core::billing::{BillingPlane, BillingRate};
 use striatum_core::ModelFact;
 use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
-use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{catalog_fact, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
 mod credential_refused_tests;
+
+mod account_writer {
+    use super::*;
+
+    async fn ok(
+        route: &super::super::conformance_tests::Route,
+        method: &str,
+        params: Value,
+    ) -> Value {
+        let reply = route.call(method, &params).await;
+        assert_eq!(reply.0, FrameType::Response, "{method}: {}", reply.1);
+        reply.1["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn handler_and_background_coverage_has_no_outside_writer_changes() {
+        let now = 1_800_000_000_000;
+        let _clock = crate::InjectedClock::set(now);
+        let harness = harness_with_routed_accounts(Some(&["apikey"]));
+        let owner = harness.bind(reserved("example-consumer"), None).await;
+        let runner = harness.bind(reserved("zeta-runner"), None).await;
+        let operator = harness.bind(json!({"kind":"direct"}), None).await;
+        let store = harness.store();
+        let outside = store.outside_account_writer_count_for_test();
+        let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}")})).await;
+        let admission = json!({"provider":POOL,"model":POOL_MODEL_SHORT,"decision_id":selected["decision_id"],"conversation_key":"writer-coverage","admission_id":"writer-coverage"});
+        let admitted = ok(&runner, "route.account_for", admission.clone()).await;
+        assert_eq!(ok(&runner, "route.account_for", admission).await, admitted);
+        ok(&runner, "route.account_observe", json!({"kind":"admission_started","event_id":"writer-start","admission_id":"writer-coverage","run_id":"writer-run"})).await;
+        let lease = ok(
+            &operator,
+            "route.pool_acquire",
+            json!({"provider":POOL,"model":POOL_MODEL_SHORT,"session":"writer-session"}),
+        )
+        .await;
+        ok(&operator, "route.pool_renew", json!({"provider":POOL,"session":"writer-session","leaseId":lease["leaseId"],"credentialId":lease["credentialId"]})).await;
+        ok(&operator, "route.pool_wall", json!({"provider":POOL,"credentialId":lease["credentialId"],"kind":"rate_limited","untilMs":now+60_000})).await;
+        ok(&operator, "route.pool_release", json!({"provider":POOL,"session":"writer-session","leaseId":lease["leaseId"],"endSession":true})).await;
+        ok(&runner, "route.account_for", json!({"mode":"continue","run_id":"writer-run","admission_id":"writer-coverage","conversation_key":"writer-coverage","previous_decision_id":selected["decision_id"],"selection_id":"writer-continuation",
+            "exhausted":{"credential_id":admitted["account"]["credential_id"],"account":admitted["account"]["account_id"],"limit_window":"five_hour","observed_at_ms":now,"resets_at_ms":now+300_000}})).await;
+        ok(&runner, "route.account_observe", json!({"kind":"run_finished","event_id":"writer-finish","admission_id":"writer-coverage","run_id":"writer-run"})).await;
+        ok(
+            &runner,
+            "route.account_release",
+            json!({"admission_id":"writer-coverage"}),
+        )
+        .await;
+        ok(
+            &owner,
+            "route.report",
+            json!({"decision_id":selected["decision_id"],"outcome":"completed"}),
+        )
+        .await;
+        ok(
+            &operator,
+            "route.clear_credential_fences",
+            json!({"credentialId":"apikey:pool-vendor:main"}),
+        )
+        .await;
+
+        let plain = ok(
+            &owner,
+            "route.select",
+            json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+        )
+        .await;
+        let plain_admission = ok(&runner, "route.account_for", json!({"provider":BORROWED,"model":"model-a","decision_id":plain["decision_id"],"conversation_key":"writer-plain","admission_id":"writer-plain"})).await;
+        let plain_key = plain_admission["account"]["credential_id"].clone();
+        ok(&runner, "route.account_observe", json!({"event_id":"writer-ineligible","kind":"scoped_not_found","admission_id":"writer-plain","credential_id":plain_key,"view_digest":"key-pool-listing"})).await;
+        assert!(!store.account_eligibility().unwrap().is_empty());
+        ok(&runner, "route.account_observe", json!({"event_id":"writer-credit","kind":"account_limit_exhausted","admission_id":"writer-plain","limit_window":"credit"})).await;
+        ok(&operator, "route.clear_cooldown", json!({"routeKey":PLAIN})).await;
+        ok(&runner, "route.account_observe", json!({"event_id":"writer-credential","kind":"credential_refused","admission_id":"writer-plain","provider_code":"ENTITLEMENT_ERROR"})).await;
+        assert!(!store.credential_entitlement_fences().unwrap().is_empty());
+        ok(&owner, "route.report", json!({"decision_id":plain["decision_id"],"outcome":"refused","credential_id":plain_key,"runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":now+60_000})).await;
+        assert!(store
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .any(|origin| origin.kind == "size" || origin.kind == "non_quota_size"));
+        let credentials = harness.credentials();
+        let original_listing = credentials.lock().unwrap().listed_credentials().to_vec();
+        let mut replaced_listing = original_listing.clone();
+        for row in &mut replaced_listing {
+            row.plan_tier = Some("writer-replaced-plan".into());
+        }
+        for (view, rows) in [
+            ("writer-replaced", replaced_listing),
+            ("writer-restored", original_listing),
+        ] {
+            credentials.lock().unwrap().apply_listing(
+                &ScopedCredentialListing {
+                    view: view.into(),
+                    credentials: rows,
+                    ..Default::default()
+                },
+                now,
+            );
+            ok(
+                &owner,
+                "route.select",
+                json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+            )
+            .await;
+            assert!(store.account_eligibility().unwrap().is_empty());
+            assert!(store.credential_entitlement_fences().unwrap().is_empty());
+        }
+        let mut persisted = None;
+        let roster = striatum_store::PersistedVaultRoster {
+            view: "writer-roster".into(),
+            roster_json: "{}".into(),
+            fetched_at: now as i64,
+        };
+        crate::account_quota::persist_roster_if_changed(store, roster.clone(), &mut persisted)
+            .await
+            .unwrap();
+        let roster_commands =
+            store.account_command_count_for_test(striatum_store::AccountCommandKind::Maintenance);
+        crate::account_quota::persist_roster_if_changed(store, roster, &mut persisted)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.account_command_count_for_test(striatum_store::AccountCommandKind::Maintenance),
+            roster_commands
+        );
+        let mut quota = crate::quota_events::bench::QuotaBurst::new(store.clone(), 1).await;
+        quota.next().await;
+        assert_eq!(quota.applied_bodies(), 2);
+        for provider_wide in [false, true] {
+            ok(&operator, "route.record_cooldown", json!({"routeKey":PLAIN,"capacityKey":PLAIN,"cooldownUntil":now+60_000,"providerWide":provider_wide,"lastError":"HTTP 503 provider maintenance"})).await;
+        }
+
+        let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+            "catalog_version":100,"resolved_at_ms":now,
+            "models":{format!("{BORROWED}/writer-new-model"):{"existence":"present","capability.tool_call":true},PLAIN:{"existence":"present"},POOL_ROUTE:{"existence":"present"}}
+        })).unwrap()).unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(
+            store,
+            &snapshot,
+            Some(&harness.credentials()),
+            Some(BORROWED),
+        )
+        .unwrap();
+        let inherited: bool = store.with_reader_for_test(|conn| conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM model_route_state WHERE route_key=?1 AND cooldown_until>?2)",
+            rusqlite::params![format!("{BORROWED}/writer-new-model"), now as i64], |row| row.get(0)
+        )).unwrap();
+        assert!(
+            inherited,
+            "the catalogue insert must create inherited route state"
+        );
+        ok(
+            &operator,
+            "route.model_upsert",
+            json!({"providerID":BORROWED,"modelID":"writer-new-model","elo":1000,"eq":1000}),
+        )
+        .await;
+        ok(&operator, "route.clear_cooldown", json!({"routeKey":PLAIN})).await;
+        ok(
+            &operator,
+            "route.clear_failure_backoff",
+            json!({"routeKey":PLAIN}),
+        )
+        .await;
+        crate::fusiform_catalog::report_unserved_routes(
+            store,
+            &Arc::new(std::sync::Mutex::new(
+                crate::fusiform_catalog::CatalogReachHealth::new(600_000),
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            store.account_command_count_for_test(striatum_store::AccountCommandKind::Tick),
+            0
+        );
+        crate::account_writer::tick(store, now as i64 + 120_000).unwrap();
+        let budget = crate::retention::PassBudget {
+            batch_rows: 64,
+            detail_batch_rows: 64,
+            max_detail_batches: 1,
+            max_batches_per_table: 1,
+            max_shadow_purge_batches: 1,
+            pause: Duration::ZERO,
+        };
+        let report = crate::retention::run_retention_pass(
+            store,
+            &crate::retention::RetentionWindows::default(),
+            now as i64 + 40 * 86_400_000,
+            &budget,
+        );
+        assert!(
+            report.account_admissions + report.account_continuations > 0,
+            "{report:?}"
+        );
+        assert_eq!(store.outside_account_writer_count_for_test(), outside);
+    }
+}
 
 /// The catalog provider whose rows the key pool borrows.
 const BORROWED: &str = "catalog-provider";

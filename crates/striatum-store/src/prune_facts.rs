@@ -5,7 +5,9 @@ use std::collections::HashSet;
 use rusqlite::{params, Connection};
 use striatum_core::RouteStateResult;
 
-use crate::{err, transactions::write_transaction, SqliteRouteStateStore};
+#[cfg(test)]
+use crate::transactions::write_transaction;
+use crate::{err, SqliteRouteStateStore};
 
 struct PrunePlan {
     unserved: Vec<String>,
@@ -455,34 +457,39 @@ impl SqliteRouteStateStore {
         // Small transactions limit how long the writer is held when many
         // retired routes disappear together. Most polls need no writer at all.
         for batch in plan.candidates.chunks(16) {
-            self.store
-                .with_conn(|connection| {
-                    let tx = write_transaction(connection)?;
-                    for route in batch {
-                        // Timestamps are assigned before writer acquisition, so
-                        // a queued selection may predate the reader snapshot.
-                        // Rowids are assigned at insertion; retention removes old
-                        // rows, not the recent high-water mark. Scan only the tail.
-                        let eligible = tx.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM model_facts
+            let batch = batch.to_vec();
+            let watermark = plan.last_decision_rowid;
+            self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+                tx.prune_unserved_batch(&batch, watermark)
+            })?;
+        }
+        Ok(plan.unserved)
+    }
+}
+
+impl crate::AccountTx<'_> {
+    fn prune_unserved_batch(&self, batch: &[String], watermark: i64) -> RouteStateResult<()> {
+        self.command_sql(|tx| {
+            for route in batch {
+                // Timestamps are assigned before writer acquisition, so
+                // a queued selection may predate the reader snapshot.
+                // Rowids are assigned at insertion; retention removes old
+                // rows, not the recent high-water mark. Scan only the tail.
+                let eligible = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM model_facts
                          WHERE route_key=?1 AND fusiform_present=0 AND source<>'override')
                          AND NOT EXISTS(SELECT 1 FROM model_route_decisions
                           WHERE rowid > ?2 AND selected_route_key=?1)",
-                            params![route, plan.last_decision_rowid],
-                            |row| row.get::<_, bool>(0),
-                        )?;
-                        if eligible {
-                            tx.execute(
-                                "DELETE FROM model_route_state WHERE route_key=?1",
-                                [route],
-                            )?;
-                            tx.execute("DELETE FROM model_facts WHERE route_key=?1", [route])?;
-                        }
-                    }
-                    crate::evaluation_snapshot::timed_commit(tx)
-                })
-                .map_err(err)?;
-        }
-        Ok(plan.unserved)
+                    params![route, watermark],
+                    |row| row.get::<_, bool>(0),
+                )?;
+                if eligible {
+                    tx.execute("DELETE FROM model_route_state WHERE route_key=?1", [route])?;
+                    tx.execute("DELETE FROM model_facts WHERE route_key=?1", [route])?;
+                }
+            }
+            Ok(())
+        })
+        .map_err(err)
     }
 }

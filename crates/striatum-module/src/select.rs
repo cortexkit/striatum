@@ -2434,9 +2434,12 @@ async fn handle_select_request_attempt(
                 if let Some((runner, grant)) = runner {
                     result["runner"] = json!(runner);
                     if let Some(grant) = grant {
-                        store
-                            .bind_fence_probe_owner(&grant.lease_id, &decision_id)
-                            .map_err(|error| ModuleError::Message(error.to_string()))?;
+                        crate::account_writer::bind_fence_probe_owner(
+                            store,
+                            &grant.lease_id,
+                            &decision_id,
+                        )
+                        .map_err(|error| ModuleError::Message(error.to_string()))?;
                         result["poolLease"] = grant.lease_json();
                     }
                 }
@@ -3170,8 +3173,7 @@ fn runner_for_route(
     )
     .map_err(|refusal| (refusal.code, refusal.message))?;
     if let Some(owner) = owner {
-        store
-            .bind_fence_probe_owner(&grant.lease_id, owner)
+        crate::account_writer::bind_fence_probe_owner(store, &grant.lease_id, owner)
             .map_err(|error| ("store_error".into(), error.to_string()))?;
     }
     Ok((grant.runner.clone(), Some(grant)))
@@ -3707,9 +3709,14 @@ async fn handle_select_panel(
         // A discarded panel must not keep leases for seats that may move or vanish
         // on reselection. Keep affinity so a surviving seat can reuse its workspace.
         for (provider, session, lease_id) in leases {
-            if let Err(error) =
-                store.pool_release(&provider, &session, Some(&lease_id), false, now_ms() as i64)
-            {
+            if let Err(error) = crate::account_writer::pool_release(
+                store,
+                &provider,
+                &session,
+                Some(&lease_id),
+                false,
+                now_ms() as i64,
+            ) {
                 return send_route_error(
                     writer,
                     ver,

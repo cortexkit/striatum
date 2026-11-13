@@ -1886,40 +1886,68 @@ async fn unchanged_quota_hold_reads_without_reserving_the_writer() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     oauth_weekly_reading_at(100.0, NOW as i64 + 3_600_000, NOW as i64);
-    harness.store().record_credential_entitlement_fence(
-        &striatum_core::route_state_store::CredentialRefusal {
-            provider_id: "synthetic".into(), credential_id: "oauth:test".into(),
-            code: "billing_exhausted".into(),
-        }, None, NOW as i64,
-    ).unwrap();
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "synthetic".into(),
+                credential_id: "oauth:test".into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            NOW as i64,
+        )
+        .unwrap();
     let credentials = harness.credentials();
-    let load = || crate::account_selection::ClassContext::load(
-        harness.store(), &credentials, harness.operator_config(), crate::ACCOUNT_QUOTA.get(), NOW as i64,
-    );
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &credentials,
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            NOW as i64,
+        )
+    };
     assert_eq!(load().unwrap().refusals.len(), 1);
-    assert_eq!(harness.store().account_read(|tx| tx.active_pool_fences("synthetic")).unwrap().len(), 1);
+    assert_eq!(
+        harness
+            .store()
+            .account_read(|tx| tx.active_pool_fences("synthetic"))
+            .unwrap()
+            .len(),
+        1
+    );
     let writer = rusqlite::Connection::open(harness.store_path()).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let before = harness.store().account_write_transaction_count_for_test();
     let result = load();
     writer.execute_batch("ROLLBACK").unwrap();
-    assert!(result.is_ok(), "unchanged hold reserved the writer: {:?}", result.err());
-    assert_eq!(harness.store().account_write_transaction_count_for_test(), before);
+    assert!(
+        result.is_ok(),
+        "unchanged hold reserved the writer: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        harness.store().account_write_transaction_count_for_test(),
+        before
+    );
 }
 
 #[tokio::test]
 async fn selection_reuses_one_read_only_context_across_ladder_entries() {
-    let (loads, _) = select_past_held_ladder_entry().await;
+    let (loads, _, _, _) = select_past_held_ladder_entry().await;
     assert_eq!(loads, 1);
 }
 
 #[tokio::test]
-async fn selection_with_unchanged_context_opens_no_account_write_transactions() {
-    let (_, writes) = select_past_held_ladder_entry().await;
-    assert_eq!(writes, 0);
+async fn selection_with_unchanged_context_sends_no_repairs_and_one_affinity_command() {
+    let (_, batches, repairs, selections) = select_past_held_ladder_entry().await;
+    assert_eq!(repairs, 0);
+    assert_eq!(selections, 1);
+    assert_eq!(batches, selections);
 }
 
-async fn select_past_held_ladder_entry() -> (u64, u64) {
+async fn select_past_held_ladder_entry() -> (u64, u64, u64, u64) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);
     let first = crate::tests::fact("synthetic", "model");
@@ -1948,6 +1976,12 @@ async fn select_past_held_ladder_entry() -> (u64, u64) {
     let caller = harness.bind(reserved(OWNER), None).await;
     let loads = crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get());
     let writes = harness.store().account_write_transaction_count_for_test();
+    let repairs = harness
+        .store()
+        .account_command_count_for_test(striatum_store::AccountCommandKind::Repair);
+    let selections = harness
+        .store()
+        .account_command_count_for_test(striatum_store::AccountCommandKind::Selection);
     let serving = harness.store().account_serving_counts().unwrap();
     let selected = caller
         .select_with_profiles(
@@ -1971,6 +2005,14 @@ async fn select_past_held_ladder_entry() -> (u64, u64) {
     (
         crate::account_selection::CONTEXT_LOADS.with(|loads| loads.get()) - loads,
         harness.store().account_write_transaction_count_for_test() - writes,
+        harness
+            .store()
+            .account_command_count_for_test(striatum_store::AccountCommandKind::Repair)
+            - repairs,
+        harness
+            .store()
+            .account_command_count_for_test(striatum_store::AccountCommandKind::Selection)
+            - selections,
     )
 }
 
@@ -4915,9 +4957,10 @@ fn s4b_seed_trigger(
                 now as u64,
             );
             harness.set_credentials(credentials.clone());
-            // Clearing a listing-bound entitlement also checks its quota holds
-            // in one transaction, in addition to the three listing row repairs.
-            return 4;
+            // One Repair command holds fingerprint adoption or clear, the
+            // quota-hold clear and eligibility reconciliation. It replaces
+            // one transaction plus three autocommits for this listing.
+            return 1;
         }
         "pool_deadline" => {
             let mut rows = credentials.listed_credentials().to_vec();

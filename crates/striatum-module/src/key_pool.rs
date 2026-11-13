@@ -293,23 +293,22 @@ pub fn acquire(
     if keys.is_empty() && !refused.is_empty() {
         return Err(exhausted(provider, &refused));
     }
-    let outcome = ctx
-        .store
-        .pool_acquire_for_route(
-            &PoolAcquire {
-                provider,
-                session_id: session,
-                keys: &keys,
-                now_ms: ctx.now_ms,
-                lease_ms: LEASE_MS,
-                affinity_idle_ms: AFFINITY_IDLE_MS,
-            },
-            &[provider, &target],
-            model,
-            &recovered,
-            &accounts,
-        )
-        .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+    let outcome = crate::account_writer::pool_acquire_for_route(
+        ctx.store,
+        &PoolAcquire {
+            provider,
+            session_id: session,
+            keys: &keys,
+            now_ms: ctx.now_ms,
+            lease_ms: LEASE_MS,
+            affinity_idle_ms: AFFINITY_IDLE_MS,
+        },
+        &[provider, &target],
+        model,
+        &recovered,
+        &accounts,
+    )
+    .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
     let lease = match outcome {
         PoolAcquireOutcome::Leased(lease) => lease,
         PoolAcquireOutcome::Exhausted(mut blocked) => {
@@ -413,42 +412,36 @@ pub fn handle(method: &str, body: &[u8], ctx: &PoolCtx<'_>) -> Result<Value, Poo
         }
         POOL_RENEW_OP => {
             let params: RenewParams = decode(method, body)?;
-            let renewed = ctx
-                .store
-                .pool_renew(
-                    &params.provider,
-                    &params.session,
-                    &params.lease_id,
-                    params.credential_id.as_deref(),
-                    ctx.now_ms,
-                    LEASE_MS,
-                )
-                .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+            let renewed = crate::account_writer::pool_renew(
+                ctx.store,
+                &params.provider,
+                &params.session,
+                &params.lease_id,
+                params.credential_id.as_deref(),
+                ctx.now_ms,
+                LEASE_MS,
+            )
+            .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
             Ok(json!({"live": renewed.is_some(), "validUntilMs": renewed}))
         }
         POOL_RELEASE_OP => {
             let params: ReleaseParams = decode(method, body)?;
-            let released = ctx
-                .store
-                .pool_release(
-                    &params.provider,
-                    &params.session,
-                    params.lease_id.as_deref(),
-                    params.end_session,
-                    ctx.now_ms,
-                )
-                .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+            let released = crate::account_writer::pool_release(
+                ctx.store,
+                &params.provider,
+                &params.session,
+                params.lease_id.as_deref(),
+                params.end_session,
+                ctx.now_ms,
+            )
+            .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
             Ok(json!({"released": released}))
         }
         POOL_WALL_OP => {
             let params: WallParams = decode(method, body)?;
             let kind = match params.kind.as_str() {
-                striatum_core::key_pool::POOL_KEY_BILLING_EXHAUSTED => {
-                    PoolWallKind::Billing
-                }
-                striatum_core::key_pool::POOL_KEY_RATE_LIMITED => {
-                    PoolWallKind::RateLimited
-                }
+                striatum_core::key_pool::POOL_KEY_BILLING_EXHAUSTED => PoolWallKind::Billing,
+                striatum_core::key_pool::POOL_KEY_RATE_LIMITED => PoolWallKind::RateLimited,
                 other => {
                     return Err(refusal(
                         "invalid_request",
@@ -458,16 +451,16 @@ pub fn handle(method: &str, body: &[u8], ctx: &PoolCtx<'_>) -> Result<Value, Poo
                     ))
                 }
             };
-            ctx.store
-                .pool_wall(
-                    &params.provider,
-                    &params.credential_id,
-                    kind,
-                    params.until_ms,
-                    params.reason.as_deref().unwrap_or(&params.kind),
-                    ctx.now_ms,
-                )
-                .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
+            crate::account_writer::pool_wall(
+                ctx.store,
+                &params.provider,
+                &params.credential_id,
+                kind,
+                params.until_ms,
+                params.reason.as_deref().unwrap_or(&params.kind),
+                ctx.now_ms,
+            )
+            .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
             Ok(json!({"ok": true}))
         }
         other => Err(refusal(

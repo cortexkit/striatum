@@ -1642,12 +1642,11 @@ fn report_dormant_config_models(
     Ok(())
 }
 
-fn report_unserved_routes(
+pub(crate) fn report_unserved_routes(
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
 ) -> Result<(), FusiformCatalogError> {
-    let routes = store
-        .prune_unserved_unpicked_facts()
+    let routes = crate::account_writer::prune_unserved_unpicked_facts(store)
         .map_err(|reason| error(format!("list and prune absent routes: {reason}")))?;
     if let Ok(mut health) = health.lock() {
         let newly_reported = health.note_unserved_routes(routes);
@@ -1674,14 +1673,14 @@ pub(crate) fn apply_mapped_catalog(
         providers.insert(provider.to_string());
     }
     let retained: HashSet<(String, String)> = snapshot.retained.iter().cloned().collect();
-    store
-        .apply_fusiform_catalog_snapshot_for_providers(
-            &snapshot.facts,
-            snapshot.cursor,
-            &providers,
-            &retained,
-        )
-        .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
+    crate::account_writer::apply_fusiform_catalog_snapshot_for_providers(
+        store,
+        &snapshot.facts,
+        snapshot.cursor,
+        &providers,
+        &retained,
+    )
+    .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     let mut grades = snapshot.grades.clone();
     // Cache grades for provider aliases resolved from credential metadata,
     // using the same catalog targets as pricing for coverage and shadow notices.

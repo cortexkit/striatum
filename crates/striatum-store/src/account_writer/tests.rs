@@ -47,6 +47,94 @@ fn insert(tx: &AccountTx<'_>, id: &str) -> RouteStateResult<String> {
 }
 
 #[test]
+fn outside_writer_counter_detects_each_account_table_bypass() {
+    let (_scratch, store) = fixture("account-writer-bypass");
+    // Disable constraints and trigger fan-out only on this disposable database:
+    // each insert must exercise the hook for its own real schema table, rather
+    // than accidentally being counted through another table's trigger.
+    store
+        .store
+        .with_conn(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;")?;
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,
+                false,
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    for table in evaluation_snapshot::ACCOUNT_TABLES {
+        let before = store.outside_account_writer_count_for_test();
+        store
+            .store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+                let columns = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(!columns.is_empty(), "missing account table {table}");
+                let names = columns
+                    .iter()
+                    .map(|(name, _)| format!("\"{name}\""))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let values = columns
+                    .iter()
+                    .map(|(_, ty)| {
+                        if ty.contains("INT") || ty.contains("REAL") {
+                            "1"
+                        } else {
+                            "'bypass'"
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                conn.execute(
+                    &format!("INSERT OR REPLACE INTO {table} ({names}) VALUES ({values})"),
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap_or_else(|error| panic!("bypass {table}: {error}"));
+        assert!(
+            store.outside_account_writer_count_for_test() > before,
+            "uncounted bypass of {table}"
+        );
+        let before_delete = store.outside_account_writer_count_for_test();
+        store
+            .store
+            .with_conn(|conn| conn.execute(&format!("DELETE FROM {table}"), []))
+            .unwrap();
+        assert!(
+            store.outside_account_writer_count_for_test() > before_delete,
+            "uncounted whole-table delete of {table}"
+        );
+    }
+}
+
+#[test]
+fn batch_scope_is_not_counted_and_projection_never_starts_a_writer() {
+    let (_scratch, store) = fixture("account-writer-scope");
+    let before = store.outside_account_writer_count_for_test();
+    store.account_command(AccountCommandKind::Maintenance, |tx| {
+        tx.conn.execute("INSERT INTO account_selection_salt(singleton,salt,created_at) VALUES (1,'batch',1)", []).map_err(err)?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(store.outside_account_writer_count_for_test(), before);
+    let projection = store.account_evaluation_snapshot(1).unwrap();
+    projection
+        .account_command(AccountCommandKind::Tick, |tx| tx.tick(1))
+        .unwrap();
+    assert!(projection.account_writer.get().is_none());
+    assert_eq!(
+        projection.account_command_count_for_test(AccountCommandKind::Tick),
+        0
+    );
+}
+
+#[test]
 fn held_commit_groups_64_admits_into_bounded_batches_and_idle_is_immediate() {
     let (_scratch, store) = fixture("account-writer-burst");
     let before = store.writer_commit_count_for_test();
