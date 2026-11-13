@@ -23,12 +23,21 @@ fn queued<T: Send + 'static>(
         Queued {
             enqueued: Instant::now(),
             initialize_only: false,
-            command: Box::new(TypedCommand {
-                run: Some(f),
-                result: None,
-                reply,
-                timing: Arc::new(Mutex::new(StoreStageTiming::default())),
-            }),
+            command:
+                Box::new(
+                    TypedCommand {
+                        run:
+                            Some(
+                                move |tx: &AccountTx<'_>,
+                                      _: Option<
+                                    &mut (dyn crate::AccountWorkingState + 'static),
+                                >| f(tx),
+                            ),
+                        result: None,
+                        reply,
+                        timing: Arc::new(Mutex::new(StoreStageTiming::default())),
+                    },
+                ),
         },
         receiver,
     )

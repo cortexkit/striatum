@@ -90,7 +90,7 @@ impl SqliteRouteStateStore {
                 params![decision_id, report_id, recorded.body_json, recorded.answer_json, now],
             )? == 1;
             if first {
-                let account = AccountTx { conn: &tx, state: account.state };
+                let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
                 let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
                 let settle = account.probe_report_matches(
@@ -234,8 +234,7 @@ impl AccountTx<'_> {
 
     pub fn report_credential_refusals(
         &self,
-    ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>>
-    {
+    ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
         let mut statement=self.conn.prepare("SELECT provider_id,credential_id,code,listing_fingerprint,observed_at_ms FROM credential_entitlement_fences ORDER BY provider_id,credential_id").map_err(err)?;
         let rows = statement
             .query_map([], |r| {

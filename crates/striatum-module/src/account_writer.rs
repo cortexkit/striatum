@@ -2,12 +2,13 @@
 //! Preparing a roster stays on the caller; commands only use transaction data
 //! and the immutable inputs captured when the request was prepared.
 
+use crate::account_state::AccountCommand;
 use striatum_core::route_state_store::RouteStateResult;
 use striatum_store::{AccountCommandKind, AccountTx, SqliteRouteStateStore};
 
 pub(crate) fn repair<T: Send + 'static>(
     store: &SqliteRouteStateStore,
-    command: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
     execute(store, AccountCommandKind::Repair, command)
 }
@@ -45,18 +46,24 @@ pub(crate) fn prune_unserved_unpicked_facts(
 pub(crate) fn execute<T: Send + 'static>(
     store: &SqliteRouteStateStore,
     kind: AccountCommandKind,
-    command: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
     if !store.is_account_evaluation_projection() {
         crate::account_state::initialize(store)?;
     }
     #[cfg(test)]
     let inputs = crate::TestThreadState::capture();
-    store.account_command(kind, move |tx| {
+    let command = move |tx: &AccountTx<'_>,
+                        state: Option<&mut (dyn AccountWorkingState + 'static)>| {
         #[cfg(test)]
         let _inputs = inputs.install();
-        command(tx)
-    })
+        command(&mut AccountCommand::new(tx, state))
+    };
+    if store.is_account_evaluation_projection() {
+        store.account_command(kind, move |tx| command(tx, None))
+    } else {
+        store.enqueue_account_state_command(kind, command)?.wait()
+    }
 }
 
 use std::collections::{BTreeMap, HashSet};

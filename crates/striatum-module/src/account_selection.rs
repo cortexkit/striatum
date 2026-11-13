@@ -6201,7 +6201,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// compare-and-set, the decision and its commit. The transaction commits
 /// before the reply leaves, so a reply always describes a durable decision.
 fn serve(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
@@ -9243,7 +9243,7 @@ mod tests {
             .store()
             .account_transaction(|tx| {
                 serve(
-                    tx,
+                    &mut crate::account_state::AccountCommand::new(tx, None),
                     &ctx.command_context(),
                     BROCA,
                     &parsed,
@@ -9509,7 +9509,7 @@ mod tests {
             .store()
             .account_transaction(|tx| {
                 serve(
-                    tx,
+                    &mut crate::account_state::AccountCommand::new(tx, None),
                     &ctx.command_context(),
                     "runner",
                     &parsed,

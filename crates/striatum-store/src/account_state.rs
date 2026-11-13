@@ -10,8 +10,7 @@ use crate::{AccountTx, RouteStateResult};
 pub trait AccountWorkingState: Send {
     fn fork(&self) -> Box<dyn AccountWorkingState>;
     fn as_any(&self) -> &dyn Any;
-    fn selection_salt(&self) -> Option<String>;
-    fn set_selection_salt(&self, salt: String);
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 /// Implemented by the module's snapshot publisher, without a store-to-module
@@ -19,7 +18,7 @@ pub trait AccountWorkingState: Send {
 pub trait AccountStateBridge: Send + Sync {
     fn load(&self, tx: &AccountTx<'_>) -> RouteStateResult<Box<dyn AccountWorkingState>>;
     fn publish(&self, state: &dyn AccountWorkingState, generation: u64);
-    fn snapshot(&self) -> RouteStateResult<Box<dyn AccountWorkingState>>;
+    fn snapshot(&self) -> RouteStateResult<std::sync::Arc<dyn Any + Send + Sync>>;
     fn failed(&self, error: &str);
     fn reload_requested(&self) -> bool {
         false
@@ -62,10 +61,7 @@ impl WriterAccountState {
             let tx =
                 rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)
                     .map_err(crate::err)?;
-            let state = bridge.load(&AccountTx {
-                conn: &tx,
-                state: None,
-            })?;
+            let state = bridge.load(&AccountTx { conn: &tx })?;
             tx.commit().map_err(crate::err)?;
             Ok(Some((state, version)))
         };

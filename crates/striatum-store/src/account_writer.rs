@@ -49,10 +49,12 @@ fn write_batch(
         for queued in batch {
             queued
                 .command
-                .run(&AccountTx {
-                    conn,
-                    state: state.as_deref(),
-                })
+                .run(
+                    &AccountTx { conn },
+                    state
+                        .as_mut()
+                        .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
+                )
                 .expect("initialization barrier cannot fail");
         }
         return Ok(false);
@@ -65,10 +67,12 @@ fn write_batch(
     for queued in batch {
         conn.execute_batch("SAVEPOINT account_command")?;
         let before = state.as_ref().map(|state| state.fork());
-        let status = queued.command.run(&AccountTx {
-            conn,
-            state: state.as_deref(),
-        });
+        let status = queued.command.run(
+            &AccountTx { conn },
+            state
+                .as_mut()
+                .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
+        );
         if let Err(error) = status {
             *state = before;
             // A full rollback requested by a SQLite trigger, disk-full and
@@ -117,7 +121,11 @@ fn stopped() -> RouteStateStoreError {
 }
 
 trait Command: Send {
-    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()>;
+    fn run(
+        &mut self,
+        tx: &AccountTx<'_>,
+        state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+    ) -> RouteStateResult<()>;
     fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming);
 }
 
@@ -130,11 +138,19 @@ struct TypedCommand<F, T> {
 
 impl<F, T> Command for TypedCommand<F, T>
 where
-    F: FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send,
+    F: FnOnce(
+            &AccountTx<'_>,
+            Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+        ) -> RouteStateResult<T>
+        + Send,
     T: Send,
 {
-    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()> {
-        let result = self.run.take().expect("command runs once")(tx);
+    fn run(
+        &mut self,
+        tx: &AccountTx<'_>,
+        state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+    ) -> RouteStateResult<()> {
+        let result = self.run.take().expect("command runs once")(tx, state);
         let status = result.as_ref().map(|_| ()).map_err(err);
         self.result = Some(result);
         status
@@ -297,14 +313,24 @@ impl AccountWriter {
 
     fn enqueue<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        f: impl FnOnce(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
         self.enqueue_inner(f, false)
     }
 
     fn enqueue_inner<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        f: impl FnOnce(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
         initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T>> {
         if self.dead.load(Ordering::Acquire) {
@@ -345,7 +371,7 @@ impl Drop for AccountWriter {
 impl SqliteRouteStateStore {
     pub(crate) fn initialize_account_writer_state(&self) -> RouteStateResult<()> {
         self.account_writer_engine()
-            .enqueue_inner(|_| Ok(()), true)?
+            .enqueue_inner(|_, _| Ok(()), true)?
             .wait()
     }
 
@@ -370,6 +396,21 @@ impl SqliteRouteStateStore {
         kind: AccountCommandKind,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_account_state_command(kind, move |tx, _| f(tx))
+    }
+
+    /// The store transports opaque module-owned state only. Domain computation
+    /// belongs to the callback; SQL helpers do not inspect the working copy.
+    pub fn enqueue_account_state_command<T: Send + 'static>(
+        &self,
+        kind: AccountCommandKind,
+        f: impl FnOnce(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
         if self.store.is_projection() {
             return Err(err(
                 "private projections cannot enqueue account writer commands",
@@ -380,12 +421,12 @@ impl SqliteRouteStateStore {
         let inputs = crate::replay::current();
         #[cfg(any(test, feature = "test-support"))]
         let command_changes = writer.command_changes.clone();
-        let reply = writer.enqueue(move |tx| {
+        let reply = writer.enqueue(move |tx, state| {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
             #[cfg(any(test, feature = "test-support"))]
             let before = evaluation_snapshot::account_rows_changed();
-            let result = f(tx);
+            let result = f(tx, state);
             #[cfg(any(test, feature = "test-support"))]
             command_changes
                 .lock()

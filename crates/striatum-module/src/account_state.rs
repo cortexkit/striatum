@@ -1,7 +1,6 @@
 //! Immutable account snapshots. Each migrated table group is authoritative in
 //! this state; unmigrated groups continue to use their existing SQL path.
 
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -25,23 +24,17 @@ impl AccountState {
     }
 }
 
-struct WorkingState(RefCell<AccountState>);
-
-impl AccountWorkingState for WorkingState {
+impl AccountWorkingState for AccountState {
     fn fork(&self) -> Box<dyn AccountWorkingState> {
-        Box::new(Self(RefCell::new(self.0.borrow().clone())))
+        Box::new(self.clone())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 
-    fn selection_salt(&self) -> Option<String> {
-        self.0.borrow().selection_salt.as_deref().cloned()
-    }
-
-    fn set_selection_salt(&self, salt: String) {
-        self.0.borrow_mut().selection_salt = Some(Arc::new(salt));
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
 
@@ -68,16 +61,14 @@ impl AccountStateBridge for StateOwner {
                 hook()?;
             }
         }
-        AccountState::load(tx).map(|state| Box::new(WorkingState(RefCell::new(state))) as _)
+        AccountState::load(tx).map(|state| Box::new(state) as _)
     }
 
     fn publish(&self, state: &dyn AccountWorkingState, generation: u64) {
         let mut state = state
             .as_any()
-            .downcast_ref::<WorkingState>()
+            .downcast_ref::<AccountState>()
             .unwrap()
-            .0
-            .borrow()
             .clone();
         state.generation = generation;
         *self.published.write().unwrap() = Some(Arc::new(state));
@@ -85,9 +76,24 @@ impl AccountStateBridge for StateOwner {
         self.ready.1.notify_all();
     }
 
-    fn snapshot(&self) -> RouteStateResult<Box<dyn AccountWorkingState>> {
+    fn snapshot(&self) -> RouteStateResult<Arc<dyn std::any::Any + Send + Sync>> {
+        self.published_snapshot().map(|snapshot| snapshot as _)
+    }
+
+    fn failed(&self, error: &str) {
+        *self.ready.0.lock().unwrap() = Some(Err(error.to_owned()));
+        self.ready.1.notify_all();
+    }
+
+    fn reload_requested(&self) -> bool {
+        self.reload.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl StateOwner {
+    fn published_snapshot(&self) -> RouteStateResult<Arc<AccountState>> {
         if let Some(snapshot) = self.published.read().unwrap().clone() {
-            return Ok(Box::new(WorkingState(RefCell::new((*snapshot).clone()))));
+            return Ok(snapshot);
         }
         let mut ready = self.ready.0.lock().unwrap();
         while ready.is_none() {
@@ -103,16 +109,72 @@ impl AccountStateBridge for StateOwner {
             .unwrap()
             .clone()
             .expect("ready state must be published");
-        Ok(Box::new(WorkingState(RefCell::new((*snapshot).clone()))))
+        Ok(snapshot)
+    }
+}
+
+pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
+    initialize(store)?;
+    store
+        .account_state_bridge()
+        .unwrap()
+        .snapshot()?
+        .downcast::<AccountState>()
+        .map_err(|_| RouteStateStoreError("account state publisher has the wrong type".into()))
+}
+
+/// A module command computes on typed working state, then persists its effects
+/// through the store transaction. Only private SQL projections omit the state.
+pub(crate) struct AccountCommand<'a> {
+    sql: &'a AccountTx<'a>,
+    state: Option<&'a mut AccountState>,
+}
+
+impl<'a> AccountCommand<'a> {
+    pub(crate) fn new(
+        sql: &'a AccountTx<'a>,
+        state: Option<&'a mut (dyn AccountWorkingState + 'static)>,
+    ) -> Self {
+        Self {
+            sql,
+            state: state.map(|state| {
+                state
+                    .as_any_mut()
+                    .downcast_mut::<AccountState>()
+                    .expect("module working state")
+            }),
+        }
     }
 
-    fn failed(&self, error: &str) {
-        *self.ready.0.lock().unwrap() = Some(Err(error.to_owned()));
-        self.ready.1.notify_all();
+    pub(crate) fn existing_salt(&self) -> RouteStateResult<Option<String>> {
+        match &self.state {
+            Some(state) => Ok(state.selection_salt.as_deref().cloned()),
+            None => self.sql.existing_salt(),
+        }
     }
 
-    fn reload_requested(&self) -> bool {
-        self.reload.swap(false, Ordering::AcqRel)
+    pub(crate) fn salt(
+        &mut self,
+        now: i64,
+        fresh: impl FnOnce() -> String,
+    ) -> RouteStateResult<String> {
+        let Some(state) = self.state.as_deref_mut() else {
+            return self.sql.salt(now, fresh);
+        };
+        if let Some(salt) = &state.selection_salt {
+            return Ok(salt.as_ref().clone());
+        }
+        let salt = fresh();
+        self.sql.insert_selection_salt(&salt, now)?;
+        state.selection_salt = Some(Arc::new(salt.clone()));
+        Ok(salt)
+    }
+}
+
+impl<'a> std::ops::Deref for AccountCommand<'a> {
+    type Target = AccountTx<'a>;
+    fn deref(&self) -> &Self::Target {
+        self.sql
     }
 }
 

@@ -67,16 +67,19 @@ fn salt_is_authoritative_and_its_sql_read_negative_control_moves_the_counter() {
         .unwrap();
     for i in 0..8 {
         let value = store
-            .account_command(AccountCommandKind::Admit, move |tx| {
-                tx.salt(i, || format!("salt-{i}"))
+            .enqueue_account_state_command(AccountCommandKind::Admit, move |tx, state| {
+                AccountCommand::new(tx, state).salt(i, || format!("salt-{i}"))
             })
+            .unwrap()
+            .wait()
             .unwrap();
         assert_eq!(value, "salt-0");
         assert_eq!(
-            store
-                .account_read(|tx| tx.existing_salt())
+            super::snapshot(&store)
                 .unwrap()
-                .as_deref(),
+                .selection_salt
+                .as_deref()
+                .map(String::as_str),
             Some("salt-0")
         );
     }
@@ -248,14 +251,15 @@ fn command_rollback_restores_the_working_copy_for_its_batch_sibling() {
         .unwrap();
     running.recv_timeout(Duration::from_secs(2)).unwrap();
     let failed = store
-        .enqueue_account_command::<()>(AccountCommandKind::Admit, |tx| {
+        .enqueue_account_state_command::<()>(AccountCommandKind::Admit, |tx, state| {
+            let mut tx = AccountCommand::new(tx, state);
             tx.salt(1, || "rolled-back".into())?;
             Err(RouteStateStoreError("forced command failure".into()))
         })
         .unwrap();
     let sibling = store
-        .enqueue_account_command(AccountCommandKind::Admit, |tx| {
-            tx.salt(2, || "committed".into())
+        .enqueue_account_state_command(AccountCommandKind::Admit, |tx, state| {
+            AccountCommand::new(tx, state).salt(2, || "committed".into())
         })
         .unwrap();
     resume.send(()).unwrap();
@@ -296,8 +300,8 @@ fn commit_publishes_exactly_once_before_reply_and_never_while_commit_is_held() {
         })
         .unwrap();
     let queued = store
-        .enqueue_account_command(AccountCommandKind::Admit, |tx| {
-            tx.salt(1, || "durable".into())
+        .enqueue_account_state_command(AccountCommandKind::Admit, |tx, state| {
+            AccountCommand::new(tx, state).salt(1, || "durable".into())
         })
         .unwrap();
     let (replied, reply) = mpsc::channel();
@@ -336,7 +340,7 @@ fn commit_failure_keeps_publication_and_reloads_before_next_batch() {
          CREATE TRIGGER state_fail AFTER INSERT ON account_selection_salt BEGIN \
            INSERT INTO state_child VALUES (1); END;"
     )).unwrap();
-    let failed = store.account_command(AccountCommandKind::Admit, |tx| {
+    let failed = crate::account_writer::execute(&store, AccountCommandKind::Admit, |tx| {
         tx.salt(1, || "uncommitted".into())
     });
     assert!(failed.unwrap_err().to_string().contains("store_error"));
@@ -345,10 +349,9 @@ fn commit_failure_keeps_publication_and_reloads_before_next_batch() {
         .with_writer_for_test(|conn| conn.execute_batch("DROP TRIGGER state_fail"))
         .unwrap();
     assert_eq!(
-        store
-            .account_command(AccountCommandKind::Admit, |tx| tx
-                .salt(2, || "fresh".into()))
-            .unwrap(),
+        crate::account_writer::execute(&store, AccountCommandKind::Admit, |tx| tx
+            .salt(2, || "fresh".into()))
+        .unwrap(),
         "fresh"
     );
     assert_eq!(owner.loads.load(Ordering::Relaxed), 2);
@@ -421,7 +424,7 @@ fn generated_salt_sequences_match_sql_replies_and_round_trip() {
         let owner = install(&store);
         for (step, op) in operations.into_iter().enumerate() {
             let step = step as i64;
-            let run = move |tx: &AccountTx<'_>| {
+            let run = move |tx: &mut AccountCommand<'_>| {
                 if op == 0 {
                     return tx.existing_salt();
                 }
@@ -434,11 +437,12 @@ fn generated_salt_sequences_match_sql_replies_and_round_trip() {
             if op == 4 {
                 owner.reload.store(true, Ordering::Release);
             }
-            let actual = store
-                .account_command(AccountCommandKind::Admit, run)
+            let actual = crate::account_writer::execute(&store, AccountCommandKind::Admit, run)
                 .map_err(|e| e.to_string());
             let expected = oracle
-                .account_command(AccountCommandKind::Admit, run)
+                .account_command(AccountCommandKind::Admit, move |tx| {
+                    run(&mut AccountCommand::new(tx, None))
+                })
                 .map_err(|e| e.to_string());
             assert_eq!(actual, expected, "seed={seed}, step={step}");
             if op == 3 {
@@ -456,32 +460,24 @@ fn generated_salt_sequences_match_sql_replies_and_round_trip() {
 fn working_copy_shares_immutable_salt_and_reports_clone_and_load_cpu() {
     let (_scratch, store) = fixture("state-copy-cost");
     let owner = install(&store);
-    store
-        .account_command(AccountCommandKind::Admit, |tx| {
-            tx.salt(1, || "shared".into())
-        })
-        .unwrap();
-    let original = owner.snapshot().unwrap();
+    crate::account_writer::execute(&store, AccountCommandKind::Admit, |tx| {
+        tx.salt(1, || "shared".into())
+    })
+    .unwrap();
+    let original = owner.published_snapshot().unwrap();
+    assert!(
+        Arc::ptr_eq(&original, &owner.published_snapshot().unwrap()),
+        "readers must receive the publication, not a cloned working copy"
+    );
     let copy = original.fork();
-    let original = original
-        .as_any()
-        .downcast_ref::<WorkingState>()
-        .unwrap()
-        .0
-        .borrow();
-    let copy = copy
-        .as_any()
-        .downcast_ref::<WorkingState>()
-        .unwrap()
-        .0
-        .borrow();
+    let copy = copy.as_any().downcast_ref::<AccountState>().unwrap();
     assert!(Arc::ptr_eq(
         original.selection_salt.as_ref().unwrap(),
         copy.selection_salt.as_ref().unwrap()
     ));
     let start = Instant::now();
     for _ in 0..100_000 {
-        std::hint::black_box(owner.snapshot().unwrap().fork());
+        std::hint::black_box(owner.published_snapshot().unwrap().fork());
     }
     let clone_ns = start.elapsed().as_nanos() / 100_000;
     let start = Instant::now();
