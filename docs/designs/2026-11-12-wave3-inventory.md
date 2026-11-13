@@ -151,6 +151,14 @@ Evidence: `S/lib.rs::record_usage` (3644–3782),
 `record_account_service_tier` (790–800). This is the owner's disposition under W1,
 not an assumption that usage is append-only.
 
+The owner applied the same ruling to **`routing_call_window` and
+`routing_call_count`**: both remain whole in `state.db` at S9a and join S9b's
+aging list. S9b-1 derives the closed-bucket window from the point after which no
+increment can land in a bucket, including buffered increments. Only buckets
+past that derived window may age. Plan §3.4 assigns call-count history to
+`history.db`; aging closed buckets at S9b fulfills that placement goal without
+introducing cross-file updates to a live counter.
+
 ## T membership and enforcement boundaries
 
 T initially contains the 21 account tables copied by
@@ -445,14 +453,14 @@ schema/index bookkeeping is rebuilt/copied with its owning file, not treated as
 an application-history table.
 
 **S9a does not age the six mandatory tables.** They remain whole in state, as do
-the two additional mutable-history tables in the owner's placement ruling.
+the four additional mutable-history tables in the owner's placement ruling.
 S9b-1 later adds the live windows, retention predicates, triggers/foreign keys,
 decision column readers and NOT NULL placeholders; no unverified duration is
 being frozen by this inventory. New S7b tables `block`, `probe_authorization`
 and `success_proof`, and S9a's new outbox, are not part of the 54-table base
 census; all are assigned to state as writer/loader state.
 
-History-reader codes H1–H5 are expanded immediately below. **Audit** means no
+History-reader codes H1–H6 are expanded immediately below. **Audit** means no
 production reader and no outbox merge; offline parity/rehearsal readers read the
 frozen copy directly. A state table outside T names the lookup/command that
 keeps it there, not just a generic “state” label.
@@ -507,8 +515,8 @@ keeps it there, not just a generic “state” label.
 | `routing_unscored_admissible_models` | `state.db` | `operator_quality.rs::observe_decision` UPSERTs current sightings; `unscored_admissible_models` reads them and retention prunes them. |
 | `routing_engine_eval` | `state.db` | `record_engine_evaluation` latest-value UPSERT; `engine_measurements` selection read. |
 | `model_route_decision_detail_cursor` | `state.db` | `strip_decision_detail` reads/advances cursor while whole decision table remains in state at S9a; moves with record stripping at S9b. |
-| `routing_call_window` | `state.db` | Mutable current-window keyed counters: `flush_routing_calls` and `routing_call_counts`. See placement conflict below. |
-| `routing_call_count` | `state.db` | Mutable keyed aggregate: same flush/read/prune command, not an append-only answer log. |
+| `routing_call_window` | `state.db` | Owner ruling: mutable current-window keyed counters (`flush_routing_calls`, `routing_call_counts`) remain whole at S9a; S9b ages only buckets past the closed-bucket window derived by S9b-1. |
+| `routing_call_count` | `state.db` | Owner ruling: same flush/read/prune paths, not an append-only answer log; remains whole at S9a and joins S9b closed-bucket aging. |
 | `account_hold` | `history.db` | H1; append-only diagnostic answer, not admission replay authority. |
 | `quota_reading_log` | `history.db` | H2; append-only quota time series. |
 | `model_route_speed_samples` | `history.db` | H3; observed-speed history, freshest sample affects next selection. |
@@ -531,6 +539,7 @@ than wait for that copy.
 | H3 | `model_route_speed_samples`: `lib.rs::get_observed_speed_aggregates` → `get_observed_speeds` → `overlay_observed_speed` → `get_facts_with_observed_speed_and_generation`, used by `M/select.rs::prepare_selection_inputs` and `M/routing_v1/select.rs::RequestInputs::read_with_config`; also `get_observed_speed_for_tier` and `get_observed_speed`; retention `prune_speed_samples` | **Yes** for every speed getter/aggregate/overlay: report-to-next-selection freshness cannot wait for mover. History-side prune on mover connection. |
 | H4 | `routing_engine_speed`: `engine_measurements.rs::engine_measurements` → `M/routing_v1/engines.rs::select_inner`; `engine_speed_samples` → `M/main.rs::handle_model_facts`; retention `prune_speed_samples` | **Yes** for both readers: the next selection/inspection must see the preceding report's sample. History-side prune on mover connection. |
 | H5 (after S9b only) | `model_route_usage`: H3's usage branch plus `compute_class_vector`/`get_class_vector`, `task_usage.rs::{provider_token_reporting,closed_task_usage}` → `M/task_profile_refresh.rs`; usage keyed replay/enrichment paths retain live-window rows in state. `account_decision`: `account_decision`, `account_decisions`, `account_decision_service_tier`, `decision_context`; current-tier rows remain live until the derived window permits aging. | **Yes** for history readers after aging: merge history → outbox → state by key; state supplies mutable live fields while present. Class-vector invalidation on report commit must rebuild over the merged population. S9b-1 must derive windows for both added tables and settle late enrichment/update behaviour before moving rows. |
+| H6 (after S9b only) | `routing_call_window`, `routing_call_count`: `call_counts.rs::routing_call_counts`; `flush_routing_calls` updates live buckets and `prune_routing_call_counts` enforces retention. | **Yes** when reading aged buckets: merge history → outbox → state by bucket key without double-counting copies, and preserve today's pending-buffer overlay. The closed-bucket window must ensure no later flush can increment an aged bucket. |
 
 No other table assigned to history above has a production reader at S9a: the
 thirteen audit tables are intentionally frozen and not kept in step. Offline
@@ -541,10 +550,7 @@ S9a, slim-row marker and merged-record rules at S9b. They are not daemon readers
 covered by this inventory's counter. The split script must still
 copy audit tables and preserve their evidence for parity/backup verification.
 
-**Another explicit-history conflict:** plan §3.4 includes call counts in history,
-but `routing_call_window` and `routing_call_count` are mutable keyed aggregates
-(`S/call_counts.rs:69–158`). Under the same in-place rule they stay in state at
-S9a. S9b-1 must identify whether closed buckets can age, derive their live/update
-window and guard against late increments before claiming the plan's history
-goal is met. The inventory does not authorize a new cross-file counter-update
-protocol. This is flagged for owner acceptance alongside the usage ruling.
+The owner's call-count placement ruling follows the in-place update paths in
+`S/call_counts.rs:69–158`. S9b-1 must cite the closed-bucket boundary before S9b
+ages either counter table. As with usage, this inventory authorizes aging only
+after the live/update window, not a new cross-file counter-update protocol.
