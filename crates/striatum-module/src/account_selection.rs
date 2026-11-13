@@ -939,10 +939,10 @@ impl ClassContext {
                     }
                     if !runners.iter().any(|runner| {
                         registry.runs(
-                            &runner.module,
+                            runner,
                             &striatum_core::fact_to_route(fact).route_key,
                             &key,
-                        ) && registry.get(&runner.module).is_some_and(|runner| {
+                        ) && registry.get(runner).is_some_and(|runner| {
                             crate::service_tiers::runner_supports(
                                 &self.credentials,
                                 runner,

@@ -63,6 +63,7 @@ fn credentials(facts: &[ModelFact], row: ListedCredential, now: u64) -> BrocaCre
 
 fn policy(routes: Option<Vec<&str>>) -> RunnerPolicy {
     RunnerPolicy {
+        harness: None,
         module: "fixture-runner".into(),
         routes: routes.map(|routes| routes.into_iter().map(str::to_owned).collect()),
         tool_capabilities: vec!["interim/v1".into()],

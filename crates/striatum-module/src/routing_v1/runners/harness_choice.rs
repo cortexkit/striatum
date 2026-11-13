@@ -3,7 +3,7 @@
 use cortexkit_role_routing::placement::HarnessCapability;
 use cortexkit_role_routing::select::{Requirements, ToolsRequirement};
 
-use super::{EffectiveRunner, Registry, RunnerPolicies};
+use super::{EffectiveRunner, Registry, RunnerKey, RunnerPolicies};
 
 #[derive(Clone, Debug)]
 pub(super) struct Candidate {
@@ -23,16 +23,25 @@ fn task_needs(requirements: &Requirements) -> Vec<HarnessCapability> {
 }
 
 impl Registry {
-    pub(crate) fn excluded_by_harness(&self, module: &str, route: &str, capacity: &str) -> bool {
-        self.get(module).is_some_and(|runner| {
-            !self.can_run(module, route, capacity)
-                && runner.harness_choices.as_ref().is_some_and(|choices| {
+    pub(crate) fn excluded_by_harness(
+        &self,
+        key: &(impl RunnerKey + ?Sized),
+        route: &str,
+        capacity: &str,
+    ) -> bool {
+        self.get(key).is_some_and(|runner| {
+            !self.can_run(key, route, capacity)
+                && (runner.placement_baseline.as_ref().is_some_and(|baseline| {
+                    baseline.matches_route(route, capacity, |runner| {
+                        &runner.statically_reachable_models
+                    })
+                }) || runner.harness_choices.as_ref().is_some_and(|choices| {
                     choices.iter().any(|candidate| {
                         candidate.runner.matches_route(route, capacity, |runner| {
                             &runner.statically_reachable_models
                         })
                     })
-                })
+                }))
         })
     }
 
@@ -58,9 +67,30 @@ impl Registry {
         let source = policies.into();
         let config = source.config;
         let original = source.policies.clone();
-        let mut registry = Self::build_for_selection(source, credentials, facts, now_ms, requested);
+        let source_policies = original.clone();
+        // Entry harnesses constrain new sessions only. Picker registries keep
+        // using runner-wide offers, even for a harness-bound settings entry.
+        let mut registry = Self {
+            entries: original
+                .iter()
+                .flat_map(|policy| {
+                    Self::build_for_selection(
+                        RunnerPolicies {
+                            policies: vec![policy.clone()],
+                            config,
+                        },
+                        credentials,
+                        facts,
+                        now_ms,
+                        requested.or(policy.harness.as_deref()),
+                    )
+                    .entries
+                })
+                .collect(),
+        };
         let needs = task_needs(requirements);
         for (entry, policy) in registry.entries.iter_mut().zip(original) {
+            let requested = requested.or(policy.harness.as_deref());
             let declaring = entry
                 .wire_declaration
                 .as_ref()
@@ -124,7 +154,7 @@ impl Registry {
             // transport/auth pairs and providers, never a union of their limits.
             let mut parent = Self::build_for_harness(
                 RunnerPolicies {
-                    policies: vec![policy],
+                    policies: vec![policy.clone()],
                     config,
                 },
                 credentials,
@@ -155,6 +185,23 @@ impl Registry {
                     .collect(),
             );
             *entry = parent;
+        }
+        for (entry, policy) in registry.entries.iter_mut().zip(source_policies) {
+            if policy.harness.is_some() {
+                entry.placement_baseline = Self::build_for_harness(
+                    RunnerPolicies {
+                        policies: vec![policy],
+                        config,
+                    },
+                    credentials,
+                    facts,
+                    now_ms,
+                    None,
+                )
+                .entries
+                .pop()
+                .map(Box::new);
+            }
         }
         registry
     }
@@ -198,7 +245,7 @@ impl EffectiveRunner {
                     candidate.admits(route, capacity, |runner| &runner.reachable_models)
                 })
                 .map(|candidate| candidate.harness.clone()),
-            None => self.selection_harness(requested),
+            None => self.selection_harness(requested.or(self.policy.harness.as_deref())),
         }
     }
 }

@@ -1,0 +1,489 @@
+use super::placements;
+use crate::routing_v1::conformance_tests::{install_catalog, reserved, Harness};
+use cortexkit_role_routing_conformance::fixture;
+use serde_json::{json, Value};
+use subc_protocol::FrameType;
+
+fn selected(reply: (FrameType, Value)) -> Value {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert!(reply.1["result"]["runner"].is_object(), "{}", reply.1);
+    reply.1["result"].clone()
+}
+
+fn refused(reply: (FrameType, Value), reason: &str) {
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+    assert_eq!(reply.1["detail"]["reason"], reason, "{}", reply.1);
+}
+
+fn install(harness: &Harness) {
+    let mut catalog = fixture::catalog();
+    for (index, model) in catalog.models.iter_mut().enumerate() {
+        model.provider = if index < 2 { "anthropic" } else { "openai" }.into();
+        model.priced_per_token = true;
+    }
+    catalog.accounts.clear();
+    for runner in &mut catalog.runners {
+        runner.route_keys = catalog.models.iter().map(|m| m.route_key()).collect();
+    }
+    catalog.runners[0].module = "thalamus-harness".into();
+    catalog.runners[0].harnesses = Some(vec!["opencode2".into(), "claude-code".into()]);
+    catalog.runners[0].default_harness = Some("opencode2".into());
+    catalog.runners[1].module = "broca".into();
+    install_catalog(harness, &catalog);
+}
+
+fn request(pin: &str) -> Value {
+    json!({"consumer":"mason","requirements":{"iq":0},"pin":pin})
+}
+
+fn entries(harness: &Harness, entries: Value) {
+    // Refuse a bad document here rather than letting a retained settings
+    // snapshot hide a parsing error from the selection assertions.
+    crate::config_overrides::validate_document(&json!({"runners":entries}).to_string()).unwrap();
+    harness.edit_config(|config| config["runners"] = entries);
+}
+
+#[test]
+fn settings_placement_pairs_are_unique_including_absence() {
+    for entries in [
+        json!([{"module":"r","harness":"a"},{"module":"r","harness":"b"}]),
+        json!([{"module":"r","harness":"a"},{"module":"r"}]),
+    ] {
+        crate::config_overrides::validate_document(&json!({"runners":entries}).to_string())
+            .unwrap();
+    }
+    for entries in [
+        json!([{"module":"duplicate-module"},{"module":"duplicate-module"}]),
+        json!([{"module":"duplicate-module","harness":"a"},{"module":"duplicate-module","harness":"a"}]),
+    ] {
+        let error =
+            crate::config_overrides::validate_document(&json!({"runners":entries}).to_string())
+                .unwrap_err();
+        assert!(error.contains("duplicate-module"), "{error}");
+        assert!(error.contains("listed once"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn settings_placement_routes_harness_and_caller_intersect_in_list_order() {
+    let harness = Harness::new("entry-order");
+    install(&harness);
+    entries(
+        &harness,
+        json!([
+            {"module":"thalamus-harness","harness":"claude-code","routes":["anthropic"]},
+            {"module":"broca"}
+        ]),
+    );
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let answer = selected(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["module"], "thalamus-harness");
+    assert_eq!(answer["runner"]["harness"], "claude-code");
+    let answer = selected(
+        caller
+            .call("route.select", &request("openai/model-c"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["module"], "broca");
+    let mut params = request("anthropic/model-a");
+    params["harness"] = json!("opencode2");
+    refused(
+        caller.call("route.select", &params).await,
+        "harness_unavailable",
+    );
+    entries(
+        &harness,
+        json!([
+            {"module":"thalamus-harness","harness":"claude-code","routes":["anthropic/model-b"]},
+            {"module":"thalamus-harness","harness":"opencode2","routes":["anthropic/model-a"]},
+            {"module":"broca"}
+        ]),
+    );
+    let answer = selected(caller.call("route.select", &params).await);
+    assert_eq!(answer["runner"]["harness"], "opencode2");
+    let answer = selected(
+        caller
+            .call("route.select", &request("anthropic/model-b"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["harness"], "claude-code");
+    let answer = selected(
+        caller
+            .call("route.select", &request("openai/model-c"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["module"], "broca");
+    harness
+        .edit_config(|config| config["consumers"]["mason"]["runner"] = json!("thalamus-harness"));
+    let answer = selected(caller.call("route.select", &params).await);
+    assert_eq!(answer["runner"]["harness"], "opencode2");
+    harness.edit_config(|config| config["consumers"]["mason"]["runner"] = json!("absent-module"));
+    refused(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+        "no_available_model",
+    );
+}
+
+fn declaration(harnesses: Value, limits: Value) -> super::RunnerDeclaration {
+    super::parse_declaration(&json!({"runner":{
+        "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}, {"wire_api":"anthropic.messages","auth_method":"oauth"}],
+        "harnesses":harnesses,
+        "harness_limits":limits,
+        "follows_account_choice":true
+    }}))
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn settings_placement_refusals_warn_once_and_recheck_both_inputs() {
+    let harness = Harness::new("entry-refused");
+    install(&harness);
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let mut monitor = placements::Monitor::default();
+    let mut warnings = Vec::new();
+    for (names, limits) in [
+        (json!(["other"]), json!({})),
+        (
+            json!(["claude-code"]),
+            json!({"claude-code":{"starts_sessions":false}}),
+        ),
+    ] {
+        harness
+            .credentials()
+            .lock()
+            .unwrap()
+            .runner_declarations
+            .insert("thalamus-harness".into(), declaration(names, limits));
+        let declarations = harness
+            .credentials()
+            .lock()
+            .unwrap()
+            .runner_declarations
+            .clone();
+        monitor.declarations(&declarations, |warning| warnings.push(warning));
+        entries(
+            &harness,
+            json!([
+                {"module":"thalamus-harness","harness":"claude-code"}, {"module":"broca"}
+            ]),
+        );
+        let policies = harness.operator_config().v1_runners();
+        monitor.settings(policies.clone(), |warning| warnings.push(warning));
+        monitor.settings(policies, |warning| warnings.push(warning));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("thalamus-harness") && warnings[0].contains("refused"));
+        let answer = selected(
+            caller
+                .call("route.select", &request("anthropic/model-a"))
+                .await,
+        );
+        assert_eq!(answer["runner"]["module"], "broca");
+    }
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(
+            "thalamus-harness".into(),
+            declaration(json!(["claude-code"]), json!({})),
+        );
+    monitor.declarations(
+        &harness.credentials().lock().unwrap().runner_declarations,
+        |warning| warnings.push(warning),
+    );
+    let answer = selected(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["harness"], "claude-code");
+    entries(
+        &harness,
+        json!([{ "module":"thalamus-harness","harness":"missing" }]),
+    );
+    monitor.settings(harness.operator_config().v1_runners(), |warning| {
+        warnings.push(warning)
+    });
+    assert_eq!(
+        warnings.len(),
+        2,
+        "a settings change must also be rechecked"
+    );
+    refused(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+        "harness_unavailable",
+    );
+}
+
+#[tokio::test]
+async fn settings_placement_pending_declaration_is_kept_then_activated() {
+    let harness = Harness::new("entry-pending");
+    install(&harness);
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .remove("thalamus-harness");
+    entries(
+        &harness,
+        json!([{ "module":"thalamus-harness","harness":"claude-code" }]),
+    );
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let mut monitor = placements::Monitor::default();
+    let mut warnings = Vec::new();
+    let policies = harness.operator_config().v1_runners();
+    assert_eq!(policies.len(), 1, "unannounced placements are retained");
+    monitor.settings(policies.clone(), |warning| warnings.push(warning));
+    monitor.settings(policies, |warning| warnings.push(warning));
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("kept but skipped"));
+    refused(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+        "harness_unavailable",
+    );
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(
+            "thalamus-harness".into(),
+            declaration(json!(["claude-code"]), json!({})),
+        );
+    monitor.declarations(
+        &harness.credentials().lock().unwrap().runner_declarations,
+        |warning| warnings.push(warning),
+    );
+    assert_eq!(warnings.len(), 1);
+    let answer = selected(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["harness"], "claude-code");
+}
+
+#[tokio::test]
+async fn settings_placement_exclusion_is_warning_only_and_limits_explain_empty_routes() {
+    let harness = Harness::new("entry-exclude");
+    install(&harness);
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(
+            "thalamus-harness".into(),
+            declaration(
+                json!(["claude-code"]),
+                json!({"claude-code":{"exclude":["anthropic","-openai"]}}),
+            ),
+        );
+    entries(
+        &harness,
+        json!([{ "module":"thalamus-harness","harness":"claude-code","routes":["anthropic"] }]),
+    );
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let mut monitor = placements::Monitor::default();
+    let mut warnings = Vec::new();
+    monitor.declarations(
+        &harness.credentials().lock().unwrap().runner_declarations,
+        |warning| warnings.push(warning),
+    );
+    monitor.settings(harness.operator_config().v1_runners(), |warning| {
+        warnings.push(warning)
+    });
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].contains("all configured routes are excluded; kept"));
+    assert!(placements::usable(
+        &harness.operator_config().v1_runners()[0],
+        harness
+            .credentials()
+            .lock()
+            .unwrap()
+            .runner_declarations
+            .get("thalamus-harness")
+    ));
+    refused(
+        caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":0}}),
+            )
+            .await,
+        "harness_unavailable",
+    );
+    let pin = caller
+        .call("route.select", &request("anthropic/model-a"))
+        .await;
+    assert_eq!(pin.0, FrameType::Error, "{pin:?}");
+    assert_eq!(pin.1["code"], "pin_unavailable", "{pin:?}");
+    let reopened = declaration(
+        json!(["claude-code"]),
+        json!({"claude-code":{"exclude":["anthropic","-anthropic/model-a"]}}),
+    );
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert("thalamus-harness".into(), reopened);
+    let mut monitor = placements::Monitor::default();
+    let mut warnings = Vec::new();
+    monitor.declarations(
+        &harness.credentials().lock().unwrap().runner_declarations,
+        |warning| warnings.push(warning),
+    );
+    monitor.settings(harness.operator_config().v1_runners(), |warning| {
+        warnings.push(warning)
+    });
+    assert!(
+        warnings.is_empty(),
+        "an admitted descendant keeps the placement open"
+    );
+    let answer = selected(
+        caller
+            .call("route.select", &request("anthropic/model-a"))
+            .await,
+    );
+    assert_eq!(answer["runner"]["harness"], "claude-code");
+    harness.credentials().lock().unwrap().runner_declarations.insert("thalamus-harness".into(), declaration(json!(["claude-code"]), json!({"claude-code":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]}})));
+    refused(
+        caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","requirements":{"iq":0}}),
+            )
+            .await,
+        "harness_unavailable",
+    );
+}
+
+#[tokio::test]
+async fn settings_placement_describe_uses_first_entry_and_pickers_ignore_harness() {
+    let harness = Harness::new("entry-describe");
+    install(&harness);
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .clear();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({
+            "catalog_version":41, "resolved_at_ms":123, "models":{
+                "anthropic/model-a":{"existence":"present","capability.tool_call":true},
+                "anthropic/model-b":{"existence":"present","capability.tool_call":true}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    entries(
+        &harness,
+        json!([{ "module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"] }]),
+    );
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    let baseline = caller.call("role.describe", &json!({})).await;
+    let bytes = serde_json::to_string(&baseline.1["result"]["runners"]).unwrap();
+    assert_eq!(
+        bytes,
+        r#"[{"follows_account_choice":false,"module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"],"via_vault":false}]"#
+    );
+    let head_params = json!({"runner_module":"thalamus-harness"});
+    let before = caller.call("route.head_choices", &head_params).await;
+    assert_eq!(before.0, FrameType::Response, "{before:?}");
+    entries(
+        &harness,
+        json!([
+            { "module":"thalamus-harness","harness":"claude-code","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"] },
+            { "module":"thalamus-harness","harness":"opencode2","routes":["openai"],"via_vault":true,"tool_capabilities":["second/v1"] }
+        ]),
+    );
+    let describe = caller.call("role.describe", &json!({})).await;
+    assert_eq!(
+        serde_json::to_string(&describe.1["result"]["runners"]).unwrap(),
+        bytes
+    );
+    assert_eq!(
+        caller.call("route.head_choices", &head_params).await,
+        before
+    );
+}
+
+#[tokio::test]
+async fn settings_placement_selects_never_reparse_loaded_rules() {
+    let harness = Harness::new("entry-parses");
+    install(&harness);
+    entries(
+        &harness,
+        json!([
+            {"module":"thalamus-harness","harness":"claude-code","routes":["anthropic/model-a"]},
+            {"module":"thalamus-harness","harness":"opencode2","routes":["anthropic/model-b"]}
+        ]),
+    );
+    let config = harness.operator_config();
+    let before = placements::PARSES.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(before > 0);
+    let caller = harness.bind(reserved(fixture::CONSUMER), None).await;
+    for _ in 0..3 {
+        for (model, expected) in [("model-a", "claude-code"), ("model-b", "opencode2")] {
+            let answer = selected(
+                caller
+                    .call("route.select", &request(&format!("anthropic/{model}")))
+                    .await,
+            );
+            assert_eq!(answer["runner"]["harness"], expected);
+        }
+    }
+    assert!(std::sync::Arc::ptr_eq(&config, &harness.operator_config()));
+    assert_eq!(
+        placements::PARSES.load(std::sync::atomic::Ordering::Relaxed),
+        before
+    );
+}
+
+#[tokio::test]
+async fn settings_placement_later_entry_keeps_its_nonstandard_tier_reach() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let (harness, mut credentials) =
+        crate::routing_v1::service_tier_tests::setup(&["pro_500"], true, true);
+    credentials.runner_declarations.insert(
+        "tier-runner".into(),
+        super::parse_declaration(&json!({"runner":{
+            "pairs":[{"wire_api":"openai.responses","auth_method":"oauth"}],
+            "harnesses":["early","later"], "follows_account_choice":true
+        }}))
+        .unwrap()
+        .unwrap(),
+    );
+    harness.set_credentials(credentials);
+    entries(
+        &harness,
+        json!([
+            {"module":"tier-runner","harness":"early","routes":["openai/not-sol"],"via_vault":true},
+            {"module":"tier-runner","harness":"later","routes":["openai/gpt-6.1-sol"],"via_vault":true}
+        ]),
+    );
+    let caller = harness.bind(reserved("tier-owner"), None).await;
+    let answer = selected(caller.call("route.select", &json!({
+        "consumer":"mason", "requirements":{"iq":30}, "service_tier":"ultrafast", "harness":"later"
+    })).await);
+    assert_eq!(answer["runner"]["harness"], "later");
+    assert_eq!(answer["service_tier_chosen"], "ultrafast");
+}

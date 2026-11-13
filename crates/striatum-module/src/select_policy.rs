@@ -1104,6 +1104,7 @@ mod order_unit_tests {
         modules
             .iter()
             .map(|module| RunnerPolicy {
+                harness: None,
                 module: (*module).to_owned(),
                 routes: None,
                 tool_capabilities: Vec::new(),

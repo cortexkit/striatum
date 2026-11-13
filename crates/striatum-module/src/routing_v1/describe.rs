@@ -153,7 +153,19 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
                 .map(|field| Value::String((*field).into())),
         );
     }
-    value["runners"] = serde_json::to_value(super::runners::effective(deps).entries)
+    // Describe lists runner modules, not placements. Retain the first entry's
+    // policy when several placements name the same module.
+    let mut seen = std::collections::HashSet::new();
+    let runners: Vec<_> = super::runners::effective(deps)
+        .entries
+        .into_iter()
+        .filter(|runner| seen.insert(runner.policy.module.clone()))
+        .map(|mut runner| {
+            runner.policy.harness = None;
+            runner
+        })
+        .collect();
+    value["runners"] = serde_json::to_value(runners)
         .map_err(|error| super::provider_refusal("internal_error", error.to_string()))?;
     value["account_policies"] = config.effective_account_policies();
     Ok(value)

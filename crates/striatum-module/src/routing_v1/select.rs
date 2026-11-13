@@ -876,6 +876,17 @@ async fn prepare_selection(
             Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
     }
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|policy| {
+            registry.get(policy).is_some_and(|runner| {
+                super::runners::placements::usable(policy, runner.wire_declaration())
+            })
+        })
+        .collect();
+    if runners.is_empty() {
+        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+    }
     // Declarations narrow the configured placements before any caller filters.
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -898,8 +909,8 @@ async fn prepare_selection(
         })
         .filter(|runner| {
             request.harness.as_deref().is_none_or(|harness| {
-                registry
-                    .get(&runner.module)
+                runner.harness.as_deref().is_none_or(|entry| entry == harness) && registry
+                    .get(runner)
                     .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
             })
         })
@@ -915,7 +926,7 @@ async fn prepare_selection(
         .into_iter()
         .filter(|runner| {
             registry
-                .get(&runner.module)
+                .get(runner)
                 .is_some_and(|runner| runner.hosts_task())
         })
         .collect();
@@ -1123,7 +1134,7 @@ async fn select_at_tier_attempt(
         );
     }
     let runs = |runner: &RunnerPolicy, route_key: &str, capacity_key: &str| -> bool {
-        registry.runs(&runner.module, route_key, capacity_key)
+        registry.runs(runner, route_key, capacity_key)
             && service_tier
                 .or_else(|| configured_tiers.get(capacity_key).copied())
                 .filter(|tier| !tier.is_standard())
@@ -1136,7 +1147,7 @@ async fn select_at_tier_attempt(
                             // while registry.runs above still checks the exact route.
                             .find(|fact| fact_to_route(fact).capacity_key == capacity_key)
                             .is_some_and(|fact| {
-                                registry.get(&runner.module).is_some_and(|runner| {
+                                registry.get(runner).is_some_and(|runner| {
                                     classes.tier_runner_serves(runner, fact, tier.as_str())
                                 })
                             })
@@ -1163,9 +1174,9 @@ async fn select_at_tier_attempt(
         .filter(|fact| {
             let route = fact_to_route(fact);
             runners.iter().any(|runner| {
-                registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+                registry.can_run(runner, &route.route_key, &route.capacity_key)
                     || registry.excluded_by_harness(
-                        &runner.module,
+                        runner,
                         &route.route_key,
                         &route.capacity_key,
                     )
@@ -1187,7 +1198,7 @@ async fn select_at_tier_attempt(
                     routes.contains(&route.capacity_key)
                 })
                 && runners.iter().any(|runner| {
-                    registry.provider_limit(&runner.module, &route.route_key, &route.capacity_key)
+                    registry.provider_limit(runner, &route.route_key, &route.capacity_key)
                 })
             {
                 return Some((route.route_key, RUNNER_PROVIDER_LIMIT.into()));
@@ -1197,7 +1208,7 @@ async fn select_at_tier_attempt(
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
                     registry.requires_wire_api(
-                        &runner.module,
+                        runner,
                         &route.route_key,
                         &route.capacity_key,
                     )
@@ -1213,7 +1224,7 @@ async fn select_at_tier_attempt(
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
                     registry.no_runner_account(
-                        &runner.module,
+                        runner,
                         &route.route_key,
                         &route.capacity_key,
                     )
@@ -1226,7 +1237,7 @@ async fn select_at_tier_attempt(
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
                     registry.wire_family_unverified(
-                        &runner.module,
+                        runner,
                         &route.route_key,
                         &route.capacity_key,
                     )
@@ -1301,7 +1312,7 @@ async fn select_at_tier_attempt(
         .filter_map(|fact| {
             let route = fact_to_route(fact);
             (!runners.iter().any(|runner| {
-                registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+                registry.can_run(runner, &route.route_key, &route.capacity_key)
             }))
             .then_some(route.route_key)
         })
@@ -1881,7 +1892,7 @@ async fn select_at_tier_attempt(
             .map_err(store_refusal)?;
     }
     if registry
-        .get(&runner.module)
+        .get(runner)
         .is_some_and(|runner| runner.follows_account_choice)
     {
         // The decision stands without the serving identity: an outcome for
@@ -1943,7 +1954,7 @@ async fn select_at_tier_attempt(
                 .is_some_and(|plane| plane.auth_method == "gateway")
         })
     {
-        let runner_admits_keys = registry.get(&runner.module).is_some_and(|runner| {
+        let runner_admits_keys = registry.get(runner).is_some_and(|runner| {
             runner
                 .routed_accounts
                 .iter()
@@ -1996,7 +2007,7 @@ async fn select_at_tier_attempt(
         }
         runner_ref = runner_ref.with_auth(auth);
     }
-    if let Some(harness) = registry.get(&runner.module).and_then(|runner| {
+    if let Some(harness) = registry.get(runner).and_then(|runner| {
         runner.harness_for_route(
             request.harness.as_deref(),
             &selected.route_key,
