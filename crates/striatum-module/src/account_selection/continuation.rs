@@ -92,12 +92,8 @@ pub(crate) fn continue_account(
         })
         .map_err(unavailable)?;
     }
-    if let Some(first) =
-        crate::account_state::preflight_continuation(ctx.store, principal, &request.selection_id)
-            .map_err(unavailable)?
-    {
-        return standing(first, request);
-    }
+    // A recorded selection replays inside the writer command below, where
+    // the keyed lookup sees every earlier command, including this batch's.
     for (field, value) in [
         (
             "exhausted.observed_at_ms",
@@ -161,7 +157,10 @@ pub(crate) fn continue_account(
             body["expected_pin"] = Value::Null;
             body["admission_id"] = json!(new_id("continue"));
             body["pool"] = json!(request.exhausted.pool);
-            serde_json::from_value::<AccountForParams>(body)
+            serde_json::from_value::<AccountForParams>(body).map(|mut params| {
+                params.admission_id_generated = true;
+                params
+            })
         })
         .transpose()
         .map_err(unavailable)?;

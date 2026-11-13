@@ -44,6 +44,9 @@ impl SqliteRouteStateStore {
         reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
+        // Its continuation use runs SQL alone; the module reports through
+        // `v1_commit_report_with_continuation` with its state.
+        self.refuse_state_blind_admission_write("v1_commit_report")?;
         self.v1_commit_report_with_continuation(
             decision_id,
             delivery_key,

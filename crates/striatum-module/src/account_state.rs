@@ -48,65 +48,53 @@ pub(crate) fn maintenance_reads() -> u64 {
 /// The sanctioned request-path SQL reads of the admission group: a primary-key
 /// lookup of an admission the state does not hold because it is closed or
 /// absent, or of a continuation's stored bodies, which the state never holds.
-/// Their SQL carries `striatum_store::KEYED_EXCEPTION`. Every other request
-/// read of the group is answered from the state.
-static KEYED_EXCEPTION_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-fn keyed_exception_reads() -> u64 {
-    KEYED_EXCEPTION_READS.load(Ordering::Relaxed)
-}
-
+/// Their SQL carries `striatum_store::KEYED_EXCEPTION`, and the store keeps
+/// their count. Every other request read of the group is answered from the
+/// state.
 fn keyed_exception() {
-    KEYED_EXCEPTION_READS.fetch_add(1, Ordering::Relaxed);
+    striatum_store::note_keyed_exception();
 }
 
-/// Before an account request runs, look its admission up in the published
-/// state. An open admission answers from memory. Otherwise one keyed SQL
-/// exception tells a closed admission (whose body only SQL keeps) from an
-/// absent one. Returns the row and whether it was open. A private projection
-/// has no state and reads SQL.
-///
-/// The keyed read runs here, on a pooled reader, not inside the admission's
-/// writer command: a replay must answer before roster preparation (which may
-/// refuse), and probing inside the writer would cost a second command. The
-/// command itself checks only open admissions in memory. If an identical
-/// request admits and closes the id in between, the late INSERT conflicts on
-/// the primary key and fails, and the retry replays the closed admission.
-pub(crate) fn preflight_admission(
+/// The error a command returns when SQL and its working state disagree. The
+/// writer recognises it, rolls the command back and reloads the state.
+fn diverged(detail: String) -> RouteStateStoreError {
+    tracing::error!(%detail, "account state diverged from SQL; reloading");
+    RouteStateStoreError(format!("{}: {detail}", striatum_store::STATE_DIVERGED))
+}
+
+/// The admission an account request names, if the published state holds it
+/// open. No SQL read: an id that is not open is checked by key later, inside
+/// the writer command or, if the request is refused before reaching the
+/// writer, by [`closed_admission`]. A private projection has no state and
+/// reads SQL, returning the row in any state.
+pub(crate) fn open_preflight_admission(
     store: &SqliteRouteStateStore,
     principal: &str,
     admission_id: &str,
-) -> RouteStateResult<Option<(AccountAdmissionRow, bool)>> {
+) -> RouteStateResult<Option<AccountAdmissionRow>> {
     if store.is_account_evaluation_projection() {
-        return store
-            .account_read(|tx| tx.admission(principal, admission_id))
-            .map(|row| row.map(|row| (row, false)));
+        return store.account_read(|tx| tx.admission(principal, admission_id));
     }
-    if let Some(open) = snapshot(store)?
+    Ok(snapshot(store)?
         .admissions
         .open_admission(principal, admission_id)
-    {
-        return Ok(Some((open.row.clone(), true)));
-    }
-    keyed_exception();
-    store
-        .account_read(|tx| tx.admission_by_key(principal, admission_id))
-        .map(|row| row.map(|row| (row, false)))
+        .map(|open| open.row.clone()))
 }
 
-/// A continuation's stored request and answer, read before its command: the
-/// bodies live only in SQL, so this is always one keyed exception.
-pub(crate) fn preflight_continuation(
+/// Keyed exception for a request refused before its writer command: a
+/// closed admission of the same id must still replay its stored answer. One
+/// primary-key read on a pooled reader. A projection already read SQL in
+/// [`open_preflight_admission`].
+pub(crate) fn closed_admission(
     store: &SqliteRouteStateStore,
     principal: &str,
-    selection: &str,
-) -> RouteStateResult<Option<V1Recorded>> {
+    admission_id: &str,
+) -> RouteStateResult<Option<AccountAdmissionRow>> {
     if store.is_account_evaluation_projection() {
-        return store.account_read(|tx| tx.continuation(principal, selection));
+        return Ok(None);
     }
     keyed_exception();
-    store.account_read(|tx| tx.continuation_by_key(principal, selection))
+    store.account_read(|tx| tx.admission_by_key(principal, admission_id))
 }
 
 /// The published state's answer to `has_expired_continuations`.
@@ -332,22 +320,6 @@ impl AccountCommand<'_> {
         }
     }
 
-    /// Serve's idempotency check. The caller looked the admission up before
-    /// its command, so with a state only an admission opened since then (a
-    /// concurrent identical request) can be found here; a closed one would
-    /// make the new row's INSERT fail and the retry replay it. Without a
-    /// state, the SQL row in any state.
-    pub(crate) fn existing_admission(
-        &self,
-        principal: &str,
-        admission_id: &str,
-    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
-        match self.admission_state() {
-            Some(_) => self.open_admission(principal, admission_id),
-            None => self.sql.admission(principal, admission_id),
-        }
-    }
-
     /// The size class an open admission's probe was scoped to. A caller
     /// finishing the admission reads it first, while it is still open.
     pub(crate) fn admission_size_class(
@@ -407,19 +379,17 @@ impl AccountCommand<'_> {
         }
     }
 
-    /// A continuation's stored bodies. With a state, only an open offer can
-    /// have appeared since the caller's keyed preflight read; another record
-    /// would make the new row's INSERT fail and the retry replay it.
+    /// A continuation's stored request and answer. The state holds no
+    /// bodies, and an answer that made no offer (a hold or refusal) or an
+    /// offer already used or released is not in memory at all, so with a
+    /// state this is always one keyed exception, inside the writer command.
     pub(crate) fn continuation(
         &self,
         principal: &str,
         selection: &str,
     ) -> RouteStateResult<Option<V1Recorded>> {
-        let Some(state) = self.admission_state() else {
+        if self.admission_state().is_none() {
             return self.sql.continuation(principal, selection);
-        };
-        if !state.offers.contains_key(&(principal.to_owned(), selection.to_owned())) {
-            return Ok(None);
         }
         keyed_exception();
         self.sql.continuation_by_key(principal, selection)
@@ -493,6 +463,28 @@ impl AccountCommand<'_> {
         }
     }
 
+    /// As [`Self::mirror`], for a change SQL reported as applied or not. The
+    /// state must agree; if it does not, the command fails, so SQL and the
+    /// state's fork both roll back, and the writer reloads the state.
+    fn mirror_checked(
+        &mut self,
+        sql_changed: bool,
+        writer: &str,
+        change: impl FnOnce(&mut AdmissionState) -> bool,
+    ) -> RouteStateResult<()> {
+        let Some(state) = self.admissions() else {
+            return Ok(());
+        };
+        let applied = change(state);
+        state.pending.clear();
+        if applied != sql_changed {
+            return Err(diverged(format!(
+                "{writer}: SQL changed {sql_changed}, state changed {applied}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Decide a change on the state, then persist the writes it decided.
     fn decide<T>(&mut self, change: impl FnOnce(&mut AdmissionState) -> T) -> RouteStateResult<T> {
         let sql = self.sql;
@@ -502,20 +494,26 @@ impl AccountCommand<'_> {
             match effect {
                 admissions::Effect::Admission { row, from } => {
                     if !sql.set_admission_lifecycle(&row, &from)? {
-                        tracing::warn!(
-                            admission = %row.admission_id,
-                            "account state expected admission in state {from}; SQL row differs"
-                        );
+                        return Err(diverged(format!(
+                            "admission {} was not {from} in SQL",
+                            row.admission_id
+                        )));
                     }
                 }
                 admissions::Effect::LeaseEnded { conversation, at } => {
-                    sql.set_affinity_lease_end(&conversation.0, &conversation.1, &conversation.2, at)?
+                    if !sql.set_affinity_lease_end(&conversation.0, &conversation.1, &conversation.2, at)? {
+                        return Err(diverged(format!("affinity {conversation:?} is missing in SQL")));
+                    }
                 }
                 admissions::Effect::Offer {
                     selection,
                     used_at,
                     released_at,
-                } => sql.settle_continuation_offer(&selection.0, &selection.1, used_at, released_at)?,
+                } => {
+                    if !sql.settle_continuation_offer(&selection.0, &selection.1, used_at, released_at)? {
+                        return Err(diverged(format!("offer {selection:?} is not open in SQL")));
+                    }
+                }
             }
         }
         Ok(decided)
@@ -550,9 +548,9 @@ impl AccountCommand<'_> {
         admission_id: &str,
     ) -> RouteStateResult<bool> {
         let changed = self.sql.mark_admission_expired(principal, admission_id)?;
-        self.mirror(|state| {
-            state.expire(principal, admission_id);
-        });
+        self.mirror_checked(changed, "mark_admission_expired", |state| {
+            state.expire(principal, admission_id)
+        })?;
         Ok(changed)
     }
 
@@ -567,9 +565,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_started(principal, admission_id, run_id, at, late)?;
-        self.mirror(|state| {
-            state.start(principal, admission_id, run_id, at, late);
-        });
+        self.mirror_checked(changed, "mark_admission_started", |state| {
+            state.start(principal, admission_id, run_id, at, late)
+        })?;
         Ok(changed)
     }
 
@@ -582,9 +580,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_released(principal, admission_id, at)?;
-        self.mirror(|state| {
-            state.release(principal, admission_id, at);
-        });
+        self.mirror_checked(changed, "mark_admission_released", |state| {
+            state.release(principal, admission_id, at)
+        })?;
         Ok(changed)
     }
 
@@ -597,9 +595,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_finished(principal, admission_id, at)?;
-        self.mirror(|state| {
-            state.finish(principal, admission_id, at);
-        });
+        self.mirror_checked(changed, "mark_admission_finished", |state| {
+            state.finish(principal, admission_id, at)
+        })?;
         Ok(changed)
     }
 
@@ -609,9 +607,9 @@ impl AccountCommand<'_> {
         expected: Option<(&str, u64)>,
     ) -> RouteStateResult<bool> {
         let changed = self.sql.put_affinity(row, expected)?;
-        self.mirror(|state| {
-            state.put_affinity(row, expected);
-        });
+        self.mirror_checked(changed, "put_affinity", |state| {
+            state.put_affinity(row, expected)
+        })?;
         Ok(changed)
     }
 
@@ -635,7 +633,7 @@ impl AccountCommand<'_> {
             expires_at,
             lease_valid_until,
         )?;
-        self.mirror(|state| {
+        self.mirror_checked(changed, "touch_affinity", |state| {
             state.touch_affinity(
                 principal,
                 conversation_hash,
@@ -644,16 +642,16 @@ impl AccountCommand<'_> {
                 last_used_at,
                 expires_at,
                 lease_valid_until,
-            );
-        });
+            )
+        })?;
         Ok(changed)
     }
 
     pub(crate) fn end_lease(&mut self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
         let changed = self.sql.end_lease(pin_id, at)?;
-        self.mirror(|state| {
-            state.end_lease(pin_id, at);
-        });
+        self.mirror_checked(changed, "end_lease", |state| {
+            state.end_lease(pin_id, at)
+        })?;
         Ok(changed)
     }
 
@@ -822,11 +820,18 @@ impl<'a> std::ops::Deref for AccountCommand<'a> {
     }
 }
 
+/// Make sure the state is loaded and published. If an earlier load failed and
+/// nothing has been published yet, load again: a failed load must leave the
+/// module serving (and retrying), not exiting into a restart loop.
 pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> {
-    if let Some(bridge) = store.account_state_bridge() {
-        return bridge.snapshot().map(|_| ());
+    let Some(bridge) = store.account_state_bridge() else {
+        return store.install_account_state_bridge(Arc::new(StateOwner::default()));
+    };
+    if bridge.snapshot().is_ok() {
+        return Ok(());
     }
-    store.install_account_state_bridge(Arc::new(StateOwner::default()))
+    store.retry_account_state_load()?;
+    bridge.snapshot().map(|_| ())
 }
 
 /// After a request mix: the published admission state must equal a fresh
@@ -864,7 +869,7 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         state.offers.len(),
         state.chains.len(),
         start.elapsed().as_micros() / 10,
-        keyed_exception_reads(),
+        striatum_store::keyed_exception_reads(),
         maintenance_reads(),
     );
 }

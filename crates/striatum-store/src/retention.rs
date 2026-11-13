@@ -136,6 +136,7 @@ impl SqliteRouteStateStore {
     /// after its account's latest reading, so an admission this old charges
     /// nothing a fresh reading could still need.
     pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.refuse_state_blind_admission_write("prune_account_admissions")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_admissions(before, limit)
         })
@@ -167,6 +168,7 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<AffinityRetentionBatch> {
+        self.refuse_state_blind_admission_write("prune_account_affinities")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_affinities(before, limit)
         })
@@ -340,6 +342,7 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        self.refuse_state_blind_admission_write("prune_account_continuations")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_continuations(before, limit)
         })

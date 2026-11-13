@@ -489,3 +489,103 @@ fn working_copy_shares_immutable_salt_and_reports_clone_and_load_cpu() {
         start.elapsed().as_micros() / 100
     );
 }
+
+/// A failed state load fails its batch, not the process: the writer stays up
+/// and the next account command loads again.
+#[test]
+fn a_failed_load_is_retried_by_the_next_command_instead_of_stopping_the_writer() {
+    let (_scratch, store) = fixture("state-load-retry");
+    let owner = Arc::new(StateOwner::default());
+    let failures = Arc::new(AtomicU64::new(1));
+    let remaining = failures.clone();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        if remaining.load(Ordering::Relaxed) > 0 {
+            remaining.fetch_sub(1, Ordering::Relaxed);
+            return Err(RouteStateStoreError("transient load failure".into()));
+        }
+        Ok(())
+    }));
+    assert!(store.install_account_state_bridge(owner.clone()).is_err());
+    assert_eq!(
+        crate::account_writer::execute(&store, AccountCommandKind::Admit, |tx| tx
+            .salt(1, || "after-retry".into()))
+        .unwrap(),
+        "after-retry"
+    );
+    assert!(owner.published.read().unwrap().is_some());
+}
+
+/// The schema allows a continuation with a decision but no reservation or
+/// deadline. The SQL writers never treat such a row as an offer, so the load
+/// must not either, rather than failing on it.
+#[test]
+fn a_continuation_with_a_decision_but_no_reservation_loads_as_no_offer() {
+    let (_scratch, store) = fixture("state-null-offer");
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute(
+                "INSERT INTO account_continue (principal, selection_id, request_json, \
+                   answer_json, run_id, admission_id, previous_decision_id, decision_id) \
+                 VALUES ('p', 's', '{}', '{}', 'run', 'original', 'root', 'decision')",
+                [],
+            )
+        })
+        .unwrap();
+    let owner = install(&store);
+    assert_eq!(snapshot(&owner).admissions.offers.len(), 0);
+}
+
+/// Once the module's state is installed, the store-level writers that change
+/// admission-group rows without it refuse, and the module never calls them.
+#[test]
+fn state_blind_admission_writers_refuse_once_state_is_installed() {
+    let (_scratch, store) = fixture("state-blind-writers");
+    let _owner = install(&store);
+    assert!(store.prune_account_admissions(1, 1).is_err());
+    assert!(store.prune_account_affinities(1, 1).is_err());
+    assert!(store.prune_account_continuations(1, 1).is_err());
+    assert!(store
+        .v1_commit_report(
+            "decision",
+            "outcome",
+            "report",
+            &V1Recorded {
+                body_json: "{}".into(),
+                answer_json: "{}".into(),
+            },
+            striatum_core::RouteOutcome::Completed,
+            None,
+            false,
+            &Default::default(),
+            None,
+            |_| Ok(()),
+            1,
+        )
+        .is_err());
+
+    // Source check: no module code reaches them by name.
+    let forbidden = [
+        "store.prune_account_admissions(",
+        "store.prune_account_affinities(",
+        "store.prune_account_continuations(",
+        ".v1_commit_report(",
+    ];
+    let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut offenders = Vec::new();
+    while let Some(path) = pending.pop() {
+        for entry in std::fs::read_dir(&path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let text = std::fs::read_to_string(&path).unwrap();
+                for name in forbidden {
+                    if text.contains(name) && !path.ends_with("account_state/tests.rs") {
+                        offenders.push(format!("{}: {name}", path.display()));
+                    }
+                }
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "state-blind writers called: {offenders:?}");
+}

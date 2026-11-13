@@ -34,26 +34,16 @@ pub struct LatestAdmissionRow {
     pub account_id: String,
 }
 
-/// One charged, unreleased admission's demand, in any other state.
+/// The columns of one admission row that the derived indexes need. The
+/// loader reads every admission once and the module derives the newest row
+/// per conversation, the charged demand and the started rows on each
+/// conversation's current pin from this single scan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DemandStateRow {
-    pub provider: String,
-    pub account_id: String,
-    pub committed_at: i64,
-    pub principal: String,
-    pub admission_id: String,
-    pub state: String,
+pub struct AdmissionScanRow {
+    pub latest: LatestAdmissionRow,
+    pub charged: bool,
     pub request_bytes: u64,
-}
-
-/// Started admissions on a conversation's current affinity pin and
-/// generation, finished ones included.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PinStartedRow {
-    pub principal: String,
-    pub conversation_hash: String,
-    pub provider: String,
-    pub started: u64,
+    pub started: bool,
 }
 
 /// Identity of the admission a continuation offer reserved, read from that
@@ -118,10 +108,9 @@ pub struct PrunedContinuation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdmissionGroupRows {
     pub open: Vec<AdmissionStateRow>,
-    pub latest: Vec<LatestAdmissionRow>,
-    pub demand: Vec<DemandStateRow>,
+    /// Every admission row, in no particular order.
+    pub admissions: Vec<AdmissionScanRow>,
     pub affinities: Vec<AccountAffinityRow>,
-    pub pin_started: Vec<PinStartedRow>,
     /// Offers that are neither used nor released.
     pub offers: Vec<ContinuationStateRow>,
     /// Every offer row whose original admission is still open, in rowid order.
@@ -149,6 +138,12 @@ fn latest_from_row(row: &Row<'_>) -> rusqlite::Result<LatestAdmissionRow> {
         account_id: row.get(11)?,
     })
 }
+
+/// A continuation row that carries a whole offer. The schema allows a
+/// decision without a reservation or deadline; the SQL writers never treat
+/// such a row as an offer (their filters need both), so neither does the state.
+const OFFER_ROW: &str = "c.decision_id IS NOT NULL AND c.reservation_id IS NOT NULL \
+     AND c.valid_until_ms IS NOT NULL";
 
 const CONTINUATION_COLUMNS: &str = "c.rowid, c.principal, c.selection_id, c.run_id, \
      c.admission_id, c.previous_decision_id, c.decision_id, c.reservation_id, c.valid_until_ms, \
@@ -234,33 +229,19 @@ impl AccountTx<'_> {
                     })
                 },
             )?;
-            let latest = collect(
+            let admissions = collect(
                 conn,
                 &format!(
-                    "SELECT {LATEST_COLUMNS} FROM (SELECT {LATEST_COLUMNS}, ROW_NUMBER() OVER ( \
-                       PARTITION BY principal, conversation_hash, provider \
-                       ORDER BY committed_at DESC, rowid DESC) AS position \
-                     FROM account_admission) WHERE position = 1"
+                    "SELECT {LATEST_COLUMNS}, charged, request_bytes, started_at IS NOT NULL \
+                     FROM account_admission"
                 ),
                 [],
-                latest_from_row,
-            )?;
-            let demand = collect(
-                conn,
-                "SELECT provider, account_id, committed_at, principal, admission_id, state, \
-                   request_bytes FROM account_admission \
-                 WHERE charged = 1 AND state != 'released' \
-                 ORDER BY provider, account_id, committed_at, principal, admission_id",
-                [],
                 |row| {
-                    Ok(DemandStateRow {
-                        provider: row.get(0)?,
-                        account_id: row.get(1)?,
-                        committed_at: row.get(2)?,
-                        principal: row.get(3)?,
-                        admission_id: row.get(4)?,
-                        state: row.get(5)?,
-                        request_bytes: to_u64(row.get(6)?),
+                    Ok(AdmissionScanRow {
+                        latest: latest_from_row(row)?,
+                        charged: row.get::<_, i64>(12)? != 0,
+                        request_bytes: to_u64(row.get(13)?),
+                        started: row.get(14)?,
                     })
                 },
             )?;
@@ -270,24 +251,6 @@ impl AccountTx<'_> {
                 [],
                 affinity_from_row,
             )?;
-            let pin_started = collect(
-                conn,
-                "SELECT f.principal, f.conversation_hash, f.provider, COUNT(*) \
-                 FROM account_affinity f JOIN account_admission a \
-                   ON a.principal = f.principal AND a.conversation_hash = f.conversation_hash \
-                  AND a.provider = f.provider AND a.pin_id = f.pin_id \
-                  AND a.pin_generation = f.pin_generation AND a.started_at IS NOT NULL \
-                 GROUP BY f.principal, f.conversation_hash, f.provider",
-                [],
-                |row| {
-                    Ok(PinStartedRow {
-                        principal: row.get(0)?,
-                        conversation_hash: row.get(1)?,
-                        provider: row.get(2)?,
-                        started: to_u64(row.get(3)?),
-                    })
-                },
-            )?;
             let (offers, chains) = if continuations_exist(conn)? {
                 let offers = collect(
                     conn,
@@ -295,7 +258,7 @@ impl AccountTx<'_> {
                         "SELECT {CONTINUATION_COLUMNS} FROM account_continue c \
                          LEFT JOIN account_admission r \
                            ON r.principal = c.principal AND r.admission_id = c.reservation_id \
-                         WHERE c.decision_id IS NOT NULL AND c.used_at_ms IS NULL \
+                         WHERE {OFFER_ROW} AND c.used_at_ms IS NULL \
                            AND c.released_at_ms IS NULL ORDER BY c.rowid"
                     ),
                     [],
@@ -310,7 +273,7 @@ impl AccountTx<'_> {
                           AND o.state IN {OPEN_STATES} \
                          LEFT JOIN account_admission r \
                            ON r.principal = c.principal AND r.admission_id = c.reservation_id \
-                         WHERE c.decision_id IS NOT NULL ORDER BY c.rowid"
+                         WHERE {OFFER_ROW} ORDER BY c.rowid"
                     ),
                     [],
                     continuation_from_row,
@@ -321,10 +284,8 @@ impl AccountTx<'_> {
             };
             Ok(AdmissionGroupRows {
                 open,
-                latest,
-                demand,
+                admissions,
                 affinities,
-                pin_started,
                 offers,
                 chains,
             })
@@ -366,7 +327,8 @@ impl AccountTx<'_> {
             .query_row(
                 "SELECT rowid, reservation_id FROM account_continue \
                  WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
-                   AND decision_id IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                   AND decision_id IS NOT NULL AND reservation_id IS NOT NULL \
+                   AND valid_until_ms IS NOT NULL ORDER BY rowid DESC LIMIT 1",
                 params![principal, admission_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -383,6 +345,18 @@ impl AccountTx<'_> {
 /// counted apart from ordinary ones. The marker lets a statement trace tell
 /// them apart.
 pub const KEYED_EXCEPTION: &str = "/* keyed exception */";
+
+static KEYED_EXCEPTION_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Count one keyed-exception read, whether the store or the module made it.
+pub fn note_keyed_exception() {
+    KEYED_EXCEPTION_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Keyed-exception reads made by this process so far.
+pub fn keyed_exception_reads() -> u64 {
+    KEYED_EXCEPTION_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 impl AccountTx<'_> {
     /// Keyed exception: one admission by primary key, for a caller whose
@@ -459,40 +433,43 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// End one conversation's lease at `at`, by primary key.
+    /// End one conversation's lease at `at`, by primary key. Returns whether
+    /// the row existed.
     pub fn set_affinity_lease_end(
         &self,
         principal: &str,
         conversation_hash: &str,
         provider: &str,
         at: i64,
-    ) -> RouteStateResult<()> {
+    ) -> RouteStateResult<bool> {
         self.conn
             .execute(
                 "UPDATE account_affinity SET lease_valid_until = ?4 \
                  WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
                 params![principal, conversation_hash, provider, at],
             )
-            .map(|_| ())
+            .map(|changed| changed == 1)
             .map_err(err)
     }
 
-    /// Mark one continuation offer used or released, by primary key.
+    /// Mark one continuation offer used or released, by primary key. Returns
+    /// whether it was still an open offer.
     pub fn settle_continuation_offer(
         &self,
         principal: &str,
         selection: &str,
         used_at: Option<i64>,
         released_at: Option<i64>,
-    ) -> RouteStateResult<()> {
+    ) -> RouteStateResult<bool> {
         self.conn
             .execute(
                 "UPDATE account_continue SET used_at_ms = COALESCE(?3, used_at_ms), \
                    released_at_ms = COALESCE(?4, released_at_ms) \
-                 WHERE principal = ?1 AND selection_id = ?2",
+                 WHERE principal = ?1 AND selection_id = ?2 \
+                   AND used_at_ms IS NULL AND released_at_ms IS NULL",
                 params![principal, selection, used_at, released_at],
             )
-            .map(|_| ())
+            .map(|changed| changed == 1)
             .map_err(err)
     }
 }

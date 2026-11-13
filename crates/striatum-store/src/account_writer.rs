@@ -7,6 +7,11 @@ use std::time::Instant;
 
 const MAX_BATCH: usize = 32;
 
+/// Error text a module command returns when SQL changed a different number of
+/// rows than its working state expected. The writer then discards the working
+/// state and reloads it before the next batch.
+pub const STATE_DIVERGED: &str = "account state diverged from SQL";
+
 impl AccountTx<'_> {
     pub(crate) fn pool_sql<T>(
         &self,
@@ -81,6 +86,13 @@ fn write_batch(
         );
         if let Err(error) = status {
             *state = before;
+            // The command found its working state disagreeing with SQL. Its
+            // own changes roll back below; drop the state too, so the rest of
+            // the batch runs on SQL alone and the next batch loads afresh,
+            // instead of every later command repeating the same mismatch.
+            if error.to_string().contains(STATE_DIVERGED) {
+                *state = None;
+            }
             // A full rollback requested by a SQLite trigger, disk-full and
             // I/O failures can destroy the
             // transaction, including savepoints. Never run a sibling in
@@ -250,26 +262,30 @@ impl AccountWriter {
                                 );
                             }
                             let before = SqliteRouteStateStore::thread_stage_timing();
-                            let result = store
+                            // A failed state load or connection fails this batch
+                            // only: its callers get the error, the writer keeps
+                            // running, and the next batch loads again. Exiting
+                            // here would turn one bad read into a restart loop.
+                            let result: Result<bool, String> = store
                                 .with_conn(|conn| {
-                                    Ok((|| -> RouteStateResult<_> {
-                                        state.refresh(conn)?;
-                                        let result = write_batch(
-                                            conn,
-                                            &mut batch,
-                                            &mut state.working,
-                                            #[cfg(any(test, feature = "test-support"))]
-                                            &transactions,
-                                        );
-                                        match result {
-                                            Ok(true) => state.publish(),
-                                            Ok(false) => {}
-                                            Err(_) => state.invalidate(),
-                                        }
-                                        Ok(result)
-                                    })())
+                                    if let Err(error) = state.refresh(conn) {
+                                        return Ok(Err(format!("load account state: {error}")));
+                                    }
+                                    let result = write_batch(
+                                        conn,
+                                        &mut batch,
+                                        &mut state.working,
+                                        #[cfg(any(test, feature = "test-support"))]
+                                        &transactions,
+                                    );
+                                    match &result {
+                                        Ok(true) => state.publish(),
+                                        Ok(false) => {}
+                                        Err(_) => state.invalidate(),
+                                    }
+                                    Ok(result.map_err(|error| error.to_string()))
                                 })
-                                .map_err(err)??;
+                                .unwrap_or_else(|error| Err(error.to_string()));
                             let after = SqliteRouteStateStore::thread_stage_timing();
                             let timing = StoreStageTiming {
                                 writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
@@ -280,7 +296,7 @@ impl AccountWriter {
                             if matches!(result, Ok(true)) {
                                 crash_for_test("after_commit");
                             }
-                            let failure = result.err().map(|error| error.to_string());
+                            let failure = result.err();
                             for queued in batch {
                                 queued.command.publish(failure.as_deref(), timing);
                             }

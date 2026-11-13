@@ -13,44 +13,79 @@
 //! rows on the current pin, and the continuation chains of open originals).
 //! Finished and released admission bodies stay in SQL.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use striatum_store::{
-    AccountAdmissionRow, AccountAffinityRow, AccountDemandRow, AdmissionGroupRows, ContinuationStateRow,
+    AccountAdmissionRow, AccountAffinityRow, AccountDemandRow, AdmissionGroupRows,
+    AdmissionScanRow, ContinuationStateRow,
     LatestAdmissionRow, PrunedAdmission, PrunedContinuation, ReservationRef,
 };
 
-const SHARDS: usize = 64;
+/// At the live size (about 200,000 conversations) a shard holds about 50
+/// entries, so a command copies a few dozen rows per shard it writes, and a
+/// 256-row retention batch copies at most 256 small shards.
+const SHARDS: usize = 4096;
 
 /// A map whose clone copies one pointer and whose first write after a clone
-/// copies one shard of 64, so a savepoint fork never copies all rows.
+/// copies the shard pointers and one shard of [`SHARDS`], so a savepoint fork
+/// never copies all rows.
+/// A hash map keyed with [`KeyHasher`], for the loader's grouping and the shards.
+type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<KeyHasher>>;
+type Shard<K, V> = FastMap<K, V>;
+
 #[derive(Clone)]
 pub(crate) struct ShardedMap<K, V> {
-    shards: Arc<Vec<Arc<BTreeMap<K, V>>>>,
+    shards: Arc<Vec<Arc<Shard<K, V>>>>,
     len: usize,
 }
 
 impl<K, V> Default for ShardedMap<K, V> {
     fn default() -> Self {
         Self {
-            shards: Arc::new((0..SHARDS).map(|_| Arc::new(BTreeMap::new())).collect()),
+            // Empty shards share one map until their first write.
+            shards: Arc::new(vec![Arc::new(Shard::default()); SHARDS]),
             len: 0,
         }
     }
 }
 
-fn shard_of<K: Hash>(key: &K) -> usize {
-    // A fixed-key hasher, so two maps built independently place a key in the
-    // same shard.
-    #[allow(deprecated)]
-    let mut hasher = std::hash::SipHasher::new();
-    key.hash(&mut hasher);
-    (hasher.finish() % SHARDS as u64) as usize
+/// FNV-1a with a final bit mix: fixed keys, so two maps built independently
+/// place a key in the same shard, and far cheaper than SipHash for the short
+/// string keys these maps hold. The mix spreads every input bit over the
+/// whole hash, which plain FNV-1a does not do for its low bits.
+#[derive(Default)]
+pub(crate) struct KeyHasher(u64);
+
+impl Hasher for KeyHasher {
+    fn finish(&self) -> u64 {
+        let mut x = self.0 ^ 0xcbf2_9ce4_8422_2325;
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        x ^= x >> 33;
+        x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        x ^ (x >> 33)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0 ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
 }
 
-impl<K: Ord + Hash + Clone, V: Clone> ShardedMap<K, V> {
+/// The shard index takes bits 40-51 of the hash. A shard's own table uses
+/// the low bits to place a key and the top seven as its tag, so keys that
+/// share a shard still spread within it.
+fn shard_of<K: Hash>(key: &K) -> usize {
+    let mut hasher = KeyHasher::default();
+    key.hash(&mut hasher);
+    ((hasher.finish() >> 40) % SHARDS as u64) as usize
+}
+
+impl<K: Eq + Hash + Clone, V: Clone> ShardedMap<K, V> {
     pub(crate) fn get(&self, key: &K) -> Option<&V> {
         self.shards[shard_of(key)].get(key)
     }
@@ -59,7 +94,7 @@ impl<K: Ord + Hash + Clone, V: Clone> ShardedMap<K, V> {
         self.get(key).is_some()
     }
 
-    fn shard_mut(&mut self, key: &K) -> &mut BTreeMap<K, V> {
+    fn shard_mut(&mut self, key: &K) -> &mut Shard<K, V> {
         let shard = shard_of(key);
         Arc::make_mut(&mut Arc::make_mut(&mut self.shards)[shard])
     }
@@ -105,7 +140,7 @@ impl<K: Ord + Hash + Clone, V: Clone> ShardedMap<K, V> {
     }
 }
 
-impl<K: Ord + Hash + Clone, V: Clone + PartialEq> PartialEq for ShardedMap<K, V> {
+impl<K: Eq + Hash + Clone, V: Clone + PartialEq> PartialEq for ShardedMap<K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.len == other.len
             && self
@@ -114,7 +149,7 @@ impl<K: Ord + Hash + Clone, V: Clone + PartialEq> PartialEq for ShardedMap<K, V>
     }
 }
 
-impl<K: Ord + Hash + Clone, V: Clone + Eq> Eq for ShardedMap<K, V> {}
+impl<K: Eq + Hash + Clone, V: Clone + Eq> Eq for ShardedMap<K, V> {}
 
 impl<K: Ord + Hash + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::fmt::Debug
     for ShardedMap<K, V>
@@ -154,8 +189,65 @@ pub(crate) struct Demand {
     pub(crate) request_bytes: u64,
 }
 
-/// Demand of one (provider, account), in `ACCOUNT_DEMAND_SQL` order.
-pub(crate) type AccountDemand = BTreeMap<(i64, String, String), Demand>;
+/// Commit-time span of one demand bucket. An account can hold tens of
+/// thousands of demand entries; bucketing by hour makes a write copy only the
+/// bucket pointers and one hour's entries, never the whole account.
+const DEMAND_BUCKET_MS: i64 = 3_600_000;
+
+/// One demand entry's key: (commit time, principal, admission id), the order
+/// of `ACCOUNT_DEMAND_SQL`.
+pub(crate) type DemandKey = (i64, String, String);
+
+/// Demand of one (provider, account), in `ACCOUNT_DEMAND_SQL` order: hour
+/// buckets of entries, so iterating buckets then entries keeps that order.
+/// Buckets are never empty, so equal entries mean equal structure.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccountDemand {
+    buckets: BTreeMap<i64, Arc<BTreeMap<DemandKey, Demand>>>,
+    len: usize,
+}
+
+impl AccountDemand {
+    fn bucket(committed_at: i64) -> i64 {
+        committed_at.div_euclid(DEMAND_BUCKET_MS)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    fn insert(&mut self, key: DemandKey, demand: Demand) {
+        let bucket = Arc::make_mut(self.buckets.entry(Self::bucket(key.0)).or_default());
+        if bucket.insert(key, demand).is_none() {
+            self.len += 1;
+        }
+    }
+
+    fn remove(&mut self, key: &DemandKey) {
+        let bucket = Self::bucket(key.0);
+        let Some(entries) = self.buckets.get_mut(&bucket) else {
+            return;
+        };
+        if !entries.contains_key(key) {
+            return;
+        }
+        let entries = Arc::make_mut(entries);
+        entries.remove(key);
+        self.len -= 1;
+        if entries.is_empty() {
+            self.buckets.remove(&bucket);
+        }
+    }
+
+    /// Entries committed after `floor`, in order.
+    fn after(&self, floor: i64) -> impl Iterator<Item = (&DemandKey, &Demand)> {
+        // A bucket ending at or before the floor holds nothing newer.
+        self.buckets
+            .range(Self::bucket(floor)..)
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(move |(key, _)| key.0 > floor)
+    }
+}
 
 /// An offer that is neither used nor released.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -264,8 +356,15 @@ struct Contribution<'a> {
 
 impl AdmissionState {
     pub(crate) fn from_rows(rows: AdmissionGroupRows) -> Self {
+        let AdmissionGroupRows {
+            open,
+            admissions,
+            affinities,
+            offers,
+            chains,
+        } = rows;
         let mut state = Self::default();
-        for row in rows.open {
+        for row in open {
             let open = OpenAdmission {
                 input_size_class: row.input_size_class,
                 model_decision_id: row.model_decision_id,
@@ -280,50 +379,140 @@ impl AdmissionState {
                 Arc::new(open),
             );
         }
-        for row in rows.latest {
-            state.latest.insert(
-                conversation(&row.principal, &row.conversation_hash, &row.provider),
-                Arc::new(row),
-            );
+        // The affinity indexes and the pass over every admission row are
+        // independent, so they are built on two threads; a live-sized load is
+        // about 200,000 rows of each. Started rows are matched to their
+        // conversation's current pin afterwards.
+        let ((affinity, affinity_by_pin), (conversations, demand)) =
+            std::thread::scope(|scope| {
+                let affinity = scope.spawn(move || Self::affinity_indexes(affinities));
+                let scanned = Self::scan_admissions(admissions);
+                (affinity.join().expect("affinity index build"), scanned)
+            });
+        state.affinity = affinity;
+        state.affinity_by_pin = affinity_by_pin;
+        state.demand = demand;
+        for (conversation, (newest, started)) in conversations {
+            // A started row counts toward `pin_has_started` only while it
+            // names its conversation's current pin and generation.
+            let count = state.affinity.get(&conversation).map_or(0, |affinity| {
+                started
+                    .iter()
+                    .filter(|(pin, generation)| {
+                        *pin == affinity.pin_id && *generation == affinity.pin_generation
+                    })
+                    .count() as u64
+            });
+            if count > 0 {
+                state.pin_started.insert(conversation.clone(), count);
+            }
+            state.latest.insert(conversation, Arc::new(newest));
         }
-        for row in rows.demand {
-            let account = (row.provider, row.account_id);
-            let mut entries = state
-                .demand
-                .remove(&account)
-                .map(|entries| (*entries).clone())
-                .unwrap_or_default();
-            entries.insert(
-                (row.committed_at, row.principal, row.admission_id),
-                Demand {
-                    state: row.state,
-                    request_bytes: row.request_bytes,
-                },
-            );
-            state.demand.insert(account, Arc::new(entries));
+        state.load_continuations(offers, chains);
+        state
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn affinity_indexes(
+        affinities: Vec<AccountAffinityRow>,
+    ) -> (
+        ShardedMap<ConversationKey, Arc<AccountAffinityRow>>,
+        ShardedMap<String, Arc<BTreeSet<ConversationKey>>>,
+    ) {
+        let mut by_pin: FastMap<String, BTreeSet<ConversationKey>> =
+            FastMap::with_capacity_and_hasher(affinities.len(), Default::default());
+        let mut affinity = ShardedMap::default();
+        for row in affinities {
+            let conversation = conversation_of(&row);
+            match by_pin.get_mut(&row.pin_id) {
+                Some(conversations) => {
+                    conversations.insert(conversation.clone());
+                }
+                None => {
+                    by_pin.insert(row.pin_id.clone(), BTreeSet::from([conversation.clone()]));
+                }
+            }
+            affinity.insert(conversation, Arc::new(row));
         }
-        for row in rows.affinities {
-            state.index_pin(&row.pin_id, conversation_of(&row));
-            state.affinity.insert(conversation_of(&row), Arc::new(row));
+        let mut affinity_by_pin = ShardedMap::default();
+        for (pin, conversations) in by_pin {
+            affinity_by_pin.insert(pin, Arc::new(conversations));
         }
-        for row in rows.pin_started {
-            if row.started > 0 {
-                state.pin_started.insert(
-                    conversation(&row.principal, &row.conversation_hash, &row.provider),
-                    row.started,
+        (affinity, affinity_by_pin)
+    }
+
+    /// One pass over every admission row: per conversation, its newest row
+    /// and the (pin, generation) of each of its started rows; and the charged
+    /// demand. Indexes are built in plain maps and wrapped once, so loading
+    /// is linear in the rows read.
+    #[allow(clippy::type_complexity)]
+    fn scan_admissions(
+        admissions: Vec<AdmissionScanRow>,
+    ) -> (
+        FastMap<ConversationKey, (LatestAdmissionRow, Vec<(String, u64)>)>,
+        ShardedMap<(String, String), Arc<AccountDemand>>,
+    ) {
+        let mut conversations: FastMap<ConversationKey, (LatestAdmissionRow, Vec<(String, u64)>)> =
+            FastMap::with_capacity_and_hasher(admissions.len(), Default::default());
+        let mut demand: HashMap<String, HashMap<String, AccountDemand>> = HashMap::new();
+        for scanned in admissions {
+            let row = scanned.latest;
+            let conversation = conversation(&row.principal, &row.conversation_hash, &row.provider);
+            let started = scanned.started.then(|| (row.pin_id.clone(), row.pin_generation));
+            if scanned.charged && row.state != "released" {
+                // Look the account up by reference; its key strings are
+                // copied only for the first row of each account.
+                if !demand.contains_key(&row.provider) {
+                    demand.insert(row.provider.clone(), HashMap::new());
+                }
+                let accounts = demand.get_mut(&row.provider).expect("inserted above");
+                if !accounts.contains_key(&row.account_id) {
+                    accounts.insert(row.account_id.clone(), AccountDemand::default());
+                }
+                accounts.get_mut(&row.account_id).expect("inserted above").insert(
+                    (row.committed_at, row.principal.clone(), row.admission_id.clone()),
+                    Demand {
+                        state: row.state.clone(),
+                        request_bytes: scanned.request_bytes,
+                    },
                 );
             }
+            match conversations.entry(conversation) {
+                Entry::Occupied(mut entry) => {
+                    let (newest, pins) = entry.get_mut();
+                    pins.extend(started);
+                    if (row.committed_at, row.rowid) > (newest.committed_at, newest.rowid) {
+                        *newest = row;
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert((row, started.into_iter().collect()));
+                }
+            }
         }
-        for row in rows.offers {
-            state.insert_offer(&row);
+        let mut charged = ShardedMap::default();
+        for (provider, accounts) in demand {
+            for (account, entries) in accounts {
+                charged.insert((provider.clone(), account), Arc::new(entries));
+            }
         }
-        for row in rows.chains {
-            let original = key(&row.principal, &row.admission_id);
-            let mut chain = state
-                .chains
-                .remove(&original)
-                .map(|chain| (*chain).clone())
-                .unwrap_or_default();
+        (conversations, charged)
+    }
+
+    /// Open offers and the offer chains of open originals.
+    fn load_continuations(
+        &mut self,
+        offers: Vec<ContinuationStateRow>,
+        chains: Vec<ContinuationStateRow>,
+    ) {
+        for row in offers {
+            self.insert_offer(&row);
+        }
+        let mut grouped: BTreeMap<RowKey, Chain> = BTreeMap::new();
+        for row in chains {
+            let chain = grouped
+                .entry(key(&row.principal, &row.admission_id))
+                .or_default();
             if row.used_at_ms.is_some() {
                 chain.latest_used = Some((row.rowid, row.reservation_id.clone()));
             }
@@ -338,9 +527,10 @@ impl AdmissionState {
                     reservation: row.reservation,
                 },
             );
-            state.chains.insert(original, Arc::new(chain));
         }
-        state
+        for (original, chain) in grouped {
+            self.chains.insert(original, Arc::new(chain));
+        }
     }
 
     fn insert_offer(&mut self, row: &ContinuationStateRow) {
@@ -363,28 +553,31 @@ impl AdmissionState {
     }
 
     fn index_pin(&mut self, pin_id: &str, conversation: ConversationKey) {
-        let mut keys = self
-            .affinity_by_pin
-            .remove(&pin_id.to_owned())
-            .map(|keys| (*keys).clone())
-            .unwrap_or_default();
-        keys.insert(conversation);
-        self.affinity_by_pin.insert(pin_id.to_owned(), Arc::new(keys));
+        let pin = pin_id.to_owned();
+        match self.affinity_by_pin.get_mut(&pin) {
+            Some(keys) => {
+                Arc::make_mut(keys).insert(conversation);
+            }
+            None => {
+                self.affinity_by_pin
+                    .insert(pin, Arc::new(BTreeSet::from([conversation])));
+            }
+        }
     }
 
     fn unindex_pin(&mut self, pin_id: &str, conversation: &ConversationKey) {
         let pin = pin_id.to_owned();
-        let Some(keys) = self.affinity_by_pin.remove(&pin) else {
+        let Some(keys) = self.affinity_by_pin.get_mut(&pin) else {
             return;
         };
-        let mut keys = (*keys).clone();
+        let keys = Arc::make_mut(keys);
         keys.remove(conversation);
-        if !keys.is_empty() {
-            self.affinity_by_pin.insert(pin, Arc::new(keys));
+        if keys.is_empty() {
+            self.affinity_by_pin.remove(&pin);
         }
     }
 
-    fn add_count<K: Ord + Hash + Clone>(map: &mut ShardedMap<K, u64>, key: K, delta: i64) {
+    fn add_count<K: Eq + Hash + Clone>(map: &mut ShardedMap<K, u64>, key: K, delta: i64) {
         let current = map.get(&key).copied().unwrap_or(0) as i64;
         let next = current + delta;
         debug_assert!(next >= 0, "derived count below zero");
@@ -418,24 +611,28 @@ impl AdmissionState {
         entry: (i64, String, String),
         demand: Option<Demand>,
     ) {
+        // Copy on write: an account shared with the published snapshot copies
+        // its bucket pointers and one bucket, once per command.
         let account = key(provider, account_id);
-        let mut entries = self
-            .demand
-            .get(&account)
-            .map(|entries| (**entries).clone())
-            .unwrap_or_default();
         match demand {
-            Some(demand) => {
-                entries.insert(entry, demand);
-            }
+            Some(demand) => match self.demand.get_mut(&account) {
+                Some(entries) => Arc::make_mut(entries).insert(entry, demand),
+                None => {
+                    let mut entries = AccountDemand::default();
+                    entries.insert(entry, demand);
+                    self.demand.insert(account, Arc::new(entries));
+                }
+            },
             None => {
+                let Some(entries) = self.demand.get_mut(&account) else {
+                    return;
+                };
+                let entries = Arc::make_mut(entries);
                 entries.remove(&entry);
+                if entries.len() == 0 {
+                    self.demand.remove(&account);
+                }
             }
-        }
-        if entries.is_empty() {
-            self.demand.remove(&account);
-        } else {
-            self.demand.insert(account, Arc::new(entries));
         }
     }
 
@@ -1224,8 +1421,7 @@ impl AdmissionState {
         self.demand
             .get(&key(provider, account_id))
             .into_iter()
-            .flat_map(|entries| entries.iter())
-            .filter(|((committed_at, _, _), _)| *committed_at > floor)
+            .flat_map(|entries| entries.after(floor))
             .map(|((committed_at, _, _), demand)| AccountDemandRow {
                 account_id: account_id.to_owned(),
                 state: demand.state.clone(),

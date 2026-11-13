@@ -809,3 +809,120 @@ fn working_copy_fork_shares_admission_shards_and_reports_cost() {
         start.elapsed().as_micros() / 20
     );
 }
+
+/// Cost of the admission state at the live installation's size: 223,437
+/// admissions (charged and finished, so all of them are demand) over 191,244
+/// conversations with an affinity each, across 40 accounts and 30 days.
+/// Prints the startup load, one admission command, and 256-row retention
+/// batches as writer wall time. Run with `--ignored --nocapture` in release.
+#[test]
+#[ignore]
+fn live_sized_admission_state_costs() {
+    const CONVERSATIONS: i64 = 191_244;
+    const ADMISSIONS: i64 = 223_437;
+    const BASE: i64 = 1_000_000_000_000;
+    const STEP: i64 = 11_600;
+    let (_scratch, store) = fixture("admission-state-live-size");
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute_batch(&format!(
+                "BEGIN;
+                 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < {last_conversation})
+                 INSERT INTO account_pin (pin_id, principal, conversation_hash, provider, pin_generation,
+                   affinity_model, account_id, credential_id, pin_mode, previous_pin_id, decision_id, created_at)
+                 SELECT 'pin-' || i, 'p' || (i % 7), 'h' || i, 'prov', 1, 'model', 'a' || (i % 40),
+                   'a' || (i % 40) || '-key', 'conversation_lease', NULL, 'd' || i, {BASE} + i * {STEP} FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < {last_conversation})
+                 INSERT INTO account_affinity (principal, conversation_hash, provider, affinity_model, pin_id,
+                   pin_generation, account_id, credential_id, credential_binding_revision, policy_version,
+                   initial_demand_bytes, created_at, last_used_at, expires_at, lease_valid_until)
+                 SELECT 'p' || (i % 7), 'h' || i, 'prov', 'model', 'pin-' || i, 1, 'a' || (i % 40),
+                   'a' || (i % 40) || '-key', 1, 1, 10, {BASE} + i * {STEP}, {BASE} + i * {STEP},
+                   {BASE} + i * {STEP} + 60000, {BASE} + i * {STEP} + 60000 FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM n WHERE i < {last_admission})
+                 INSERT INTO account_admission (principal, admission_id, request_fingerprint, request_mode,
+                   decision_id, conversation_hash, provider, model, account_id, credential_id, pin_id,
+                   pin_generation, state, charged, request_bytes, request_bytes_estimated, committed_at,
+                   admission_valid_until, lease_valid_until, reply_json, run_id, started_at, started_late,
+                   released_at, finished_at)
+                 SELECT 'p' || ((i % {CONVERSATIONS}) % 7), 'adm-' || i, 'fp', 'admit', 'd' || i,
+                   'h' || (i % {CONVERSATIONS}), 'prov', 'model', 'a' || ((i % {CONVERSATIONS}) % 40),
+                   'a' || ((i % {CONVERSATIONS}) % 40) || '-key', 'pin-' || (i % {CONVERSATIONS}), 1,
+                   CASE WHEN i >= {last_admission} - 200 THEN 'started' ELSE 'finished' END, 1, 100, 0,
+                   {BASE} + i * {STEP}, {BASE} + i * {STEP} + 60000, {BASE} + i * {STEP} + 60000, '{{}}',
+                   'run-' || i, {BASE} + i * {STEP} + 10, 0, NULL,
+                   CASE WHEN i >= {last_admission} - 200 THEN NULL ELSE {BASE} + i * {STEP} + 1000 END
+                 FROM n;
+                 COMMIT;",
+                last_conversation = CONVERSATIONS - 1,
+                last_admission = ADMISSIONS - 1,
+            ))
+        })
+        .unwrap();
+    // Three loads in the writer's way (one read transaction, then the index
+    // build), each with its wall and process CPU time; the host is shared, so
+    // the least of the three is the cost.
+    for attempt in 1..=3 {
+        let cpu = crate::routing_v1::request_cpu_bench::cpu_us();
+        let start = std::time::Instant::now();
+        let rows = store.account_transaction(|tx| tx.load_admission_group()).unwrap();
+        let read = start.elapsed();
+        let state = AdmissionState::from_rows(rows);
+        let built = start.elapsed();
+        let cpu = crate::routing_v1::request_cpu_bench::cpu_us() - cpu;
+        drop(state);
+        println!(
+            "live-size load {attempt}: {built:?} wall (SQL read {read:?}), {} ms process CPU",
+            cpu / 1000
+        );
+    }
+    let start = std::time::Instant::now();
+    let owner = install(&store);
+    let load = start.elapsed();
+    let state = published(&owner);
+    let demand: usize = state.demand.iter().map(|(_, rows)| rows.len()).sum();
+    println!(
+        "live-size startup load: {:?} (open={} latest={} affinity={} demand_accounts={} demand_entries={demand})",
+        load,
+        state.open.len(),
+        state.latest.len(),
+        state.affinity.len(),
+        state.demand.len(),
+    );
+    let now = BASE + ADMISSIONS * STEP;
+    let mut admits = Vec::new();
+    for i in 0..20 {
+        let mut fresh = admission("p0", &format!("fresh-{i}"), &format!("fresh-pin-{i}"), 1, now, 60_000);
+        fresh.hash = format!("fresh-{i}");
+        fresh.account = format!("a{}", i % 40);
+        fresh.credential = format!("a{}-key", i % 40);
+        let start = std::time::Instant::now();
+        run(&store, move |tx| admit(tx, &fresh, true)).unwrap();
+        admits.push(start.elapsed());
+    }
+    admits.sort();
+    println!(
+        "live-size admission command: median {:?} max {:?} (20 commands, writer wall time)",
+        admits[10], admits[19]
+    );
+    for (name, prune) in [
+        ("admissions", 0),
+        ("affinities", 1),
+        ("continuations", 2),
+    ] {
+        let before = BASE + 2_000 * STEP;
+        let start = std::time::Instant::now();
+        let pruned = match prune {
+            0 => crate::account_writer::prune_account_admissions(&store, before, 256).unwrap(),
+            1 => crate::account_writer::prune_account_affinities(&store, before, 256)
+                .unwrap()
+                .affinities,
+            _ => crate::account_writer::prune_account_continuations(&store, before, 256).unwrap(),
+        };
+        println!(
+            "live-size prune {name}: {pruned} rows in {:?} (one retention batch, writer wall time)",
+            start.elapsed()
+        );
+    }
+    assert_equivalent(&store, &owner, "after live-size commands");
+}

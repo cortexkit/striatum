@@ -648,9 +648,13 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(None);
         }
-        self.conn.query_row("SELECT input_size_class,committed_at FROM account_admission
+        // Keyed exception: a report reaches this after its admission has
+        // usually finished, and closed admissions stay in SQL only. The model
+        // decision id is indexed, so this never scans.
+        note_keyed_exception();
+        self.conn.query_row(&format!("SELECT input_size_class,committed_at FROM account_admission {KEYED_EXCEPTION}
             WHERE model_decision_id=?1 AND provider=?2 AND credential_id=?3 AND model=?4 AND input_size_class IS NOT NULL
-            ORDER BY committed_at DESC LIMIT 1",params![decision,provider,credential,model],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(err)
+            ORDER BY committed_at DESC LIMIT 1"),params![decision,provider,credential,model],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(err)
     }
 
     pub fn admission_size_class(&self, principal: &str, id: &str) -> RouteStateResult<Option<u32>> {

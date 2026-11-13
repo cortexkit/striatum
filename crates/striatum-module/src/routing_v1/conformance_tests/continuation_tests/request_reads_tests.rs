@@ -4,10 +4,12 @@
 //! while every statement SQLite runs on the store's writer and pooled readers
 //! is traced, and assert that none of them reads those tables.
 //!
-//! One read is sanctioned: a primary-key lookup of an admission or
-//! continuation that the memory state does not hold because it is closed or
-//! absent (the state keeps open rows only). Each operation may do at most one
-//! such keyed-exception read, and none when its admission is open.
+//! One kind of read is sanctioned, the keyed exception: a lookup by key of an
+//! admission or continuation the memory state does not hold, because it is
+//! closed or absent (the state keeps open rows only) or because it is a stored
+//! body. Each admission or observation may do at most one, and none when its
+//! admission is open. A completed report may look its decision's admissions up
+//! by model decision id.
 
 use super::*;
 
@@ -36,7 +38,7 @@ fn assert_reads(op: &str, ordinary: &[String], keyed: &[String], max_keyed: usiz
 
 #[tokio::test]
 async fn account_for_continue_and_observe_read_no_admission_group_sql() {
-    let (subject, _consumer, runner, request) = paused().await;
+    let (subject, consumer, runner, request) = paused().await;
     let reads = subject
         .harness()
         .store()
@@ -124,6 +126,25 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
         &keyed,
         1,
     );
+
+    // A completed report lifts the fences (temporary bans on routing to a
+    // credential after it failed) that its success disproves, scoped by the
+    // size class its admission recorded; that admission has finished by now.
+    let (reply, ordinary, keyed) = traced(
+        reads,
+        consumer.call(
+            "route.report",
+            &json!({"decision_id":request["previous_decision_id"],"outcome":"completed",
+                "usage":{"input_tokens":100,"output_tokens":20}}),
+        ),
+    )
+    .await;
+    result(reply);
+    assert_reads("completed report", &ordinary, &keyed, 2);
+    assert!(
+        keyed.iter().any(|sql| sql.contains("model_decision_id=?1")),
+        "the report did not reach its admission size lookup: {keyed:#?}"
+    );
 }
 
 /// Run one `route.account_for` the way the frame handler does, outside the
@@ -165,38 +186,51 @@ fn admit_directly(
     )
 }
 
-/// The keyed existence check runs before the admission's writer command, and
-/// inside the command only open admissions are visible from memory. If an
-/// identical request admits and closes the same admission id in between, the
-/// late request must not admit twice: its INSERT conflicts on the primary key
-/// and fails, and the retry finds the closed admission and replays it.
-#[test]
-fn an_admission_closed_after_the_keyed_check_fails_the_insert_and_the_retry_replays_it() {
-    use crate::account_selection::OpReply;
-    use crate::routing_v1::request_cpu_bench as bench;
-    let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
-    let fixture = bench::representative_fixture(bench::FixtureCounts {
-        subscription_rules: 7,
-        exclusion_rules: 5,
-        runner_route_rules: 3,
-        catalog_facts: 12,
-        listed_credentials: 6,
-    });
-    let now = bench::FIXTURE_NOW as i64;
-    let module = fixture.catalog.runners[0]
-        .module
-        .trim_start_matches("reserved:")
-        .to_owned();
-    let principal = format!("reserved:{module}");
-    let request = json!({"provider":"cpu-provider-0","model":"model-0",
-        "conversation_key":"raced","admission_id":"raced","caller":{"runner":module}});
-    let admit = {
+struct Direct {
+    fixture: crate::routing_v1::request_cpu_bench::RequestFixture,
+    principal: String,
+    module: String,
+    now: i64,
+}
+
+impl Direct {
+    fn new() -> Self {
+        use crate::routing_v1::request_cpu_bench as bench;
+        let fixture = bench::representative_fixture(bench::FixtureCounts {
+            subscription_rules: 7,
+            exclusion_rules: 5,
+            runner_route_rules: 3,
+            catalog_facts: 12,
+            listed_credentials: 6,
+        });
+        let module = fixture.catalog.runners[0]
+            .module
+            .trim_start_matches("reserved:")
+            .to_owned();
+        Self {
+            principal: format!("reserved:{module}"),
+            module,
+            fixture,
+            now: bench::FIXTURE_NOW as i64,
+        }
+    }
+
+    fn request(&self, admission: &str, conversation: &str) -> Value {
+        json!({"provider":"cpu-provider-0","model":"model-0","conversation_key":conversation,
+            "admission_id":admission,"caller":{"runner":self.module}})
+    }
+
+    /// A closure that admits `request` as this principal, for test hooks.
+    fn admitter(
+        &self,
+        request: Value,
+    ) -> impl Fn() -> crate::account_selection::OpReply + Clone + Send + 'static {
         let (store, credentials, config) = (
-            fixture.store().clone(),
-            fixture.credentials(),
-            fixture.operator_config(),
+            self.fixture.store().clone(),
+            self.fixture.credentials(),
+            self.fixture.operator_config(),
         );
-        let (principal, request) = (principal.clone(), request.clone());
+        let (principal, now) = (self.principal.clone(), self.now);
         move || {
             admit_directly(
                 &store,
@@ -207,14 +241,32 @@ fn an_admission_closed_after_the_keyed_check_fails_the_insert_and_the_retry_repl
                 now,
             )
         }
-    };
+    }
+}
+
+fn admitted(reply: crate::account_selection::OpReply) -> Value {
+    match reply {
+        crate::account_selection::OpReply::Result(result) => result,
+        other => panic!("expected an admission, got {other:?}"),
+    }
+}
+
+/// The writer command checks an admission id that is not open in memory
+/// against SQL by key before allocating. If an identical request admits and
+/// closes the same admission id after this one passed its pre-writer checks,
+/// this one replays that closed admission instead of admitting again.
+#[test]
+fn a_late_duplicate_replays_an_admission_closed_meanwhile() {
+    let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
+    let direct = Direct::new();
+    let admit = direct.admitter(direct.request("raced", "raced"));
     let competing = std::sync::Arc::new(std::sync::Mutex::new(None));
     {
-        let (admit, competing, store, principal) = (
-            admit.clone(),
-            competing.clone(),
-            fixture.store().clone(),
-            principal.clone(),
+        let (admit, competing) = (admit.clone(), competing.clone());
+        let (store, principal, now) = (
+            direct.fixture.store().clone(),
+            direct.principal.clone(),
+            direct.now,
         );
         crate::account_selection::after_roster_prepared("raced", move || {
             let reply = admit();
@@ -227,17 +279,180 @@ fn an_admission_closed_after_the_keyed_check_fails_the_insert_and_the_retry_repl
             *competing.lock().unwrap() = Some(reply);
         });
     }
-    let late = admit();
-    assert!(
-        matches!(late, OpReply::Error { .. }),
-        "the late request admitted a second time: {late:?}"
-    );
-    let Some(OpReply::Result(mut competing)) = competing.lock().unwrap().take() else {
-        panic!("the competing admission did not run or was refused");
-    };
-    let OpReply::Result(retried) = admit() else {
-        panic!("the retry did not replay the closed admission");
-    };
+    let late = admitted(admit());
+    let mut competing = admitted(competing.lock().unwrap().take().expect("the hook ran"));
     competing["admission"]["state"] = json!("released");
-    assert_eq!(retried, competing);
+    assert_eq!(late, competing);
+}
+
+/// The same race on a reassignment, where the conversation's pin also moved
+/// after the competing admission: without the keyed check before the pin
+/// check, the late request answers `pin_generation_conflict` and never
+/// reaches an INSERT, instead of replaying.
+#[test]
+fn a_late_duplicate_reassignment_replays_instead_of_reporting_a_pin_conflict() {
+    let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
+    let direct = Direct::new();
+    let base = admitted(direct.admitter(direct.request("base", "moved"))());
+    let mut request = direct.request("reassigned", "moved");
+    request["mode"] = json!("reassign");
+    request["expected_pin"] = base["pin"].clone();
+    let admit = direct.admitter(request);
+    let competing = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let (admit, competing) = (admit.clone(), competing.clone());
+        let (store, principal, now) = (
+            direct.fixture.store().clone(),
+            direct.principal.clone(),
+            direct.now,
+        );
+        crate::account_selection::after_roster_prepared("reassigned", move || {
+            let reply = admit();
+            crate::account_writer::execute(
+                &store,
+                striatum_store::AccountCommandKind::Observe,
+                move |tx| {
+                    tx.mark_admission_finished(&principal, "reassigned", now)?;
+                    // A later reassignment moves the conversation's pin on.
+                    let admission = tx.admission(&principal, "reassigned")?.unwrap();
+                    let mut moved = tx
+                        .affinity(
+                            &principal,
+                            &admission.conversation_hash,
+                            &admission.provider,
+                        )?
+                        .unwrap();
+                    let current = (moved.pin_id.clone(), moved.pin_generation);
+                    moved.pin_generation += 1;
+                    assert!(tx.put_affinity(&moved, Some((&current.0, current.1)))?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            *competing.lock().unwrap() = Some(reply);
+        });
+    }
+    let late = admitted(admit());
+    let mut competing = admitted(competing.lock().unwrap().take().expect("the hook ran"));
+    competing["admission"]["state"] = json!("finished");
+    assert_eq!(late, competing);
+}
+
+/// A request refused before its writer command must still replay an
+/// admission of the same id: here an identical request without a candidate
+/// list took the id meanwhile (candidates are not part of the request's
+/// identity), so the refused one replays that admission.
+#[test]
+fn a_request_refused_before_the_writer_replays_an_admission_made_meanwhile() {
+    let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
+    let direct = Direct::new();
+    let excluding = |id: &str| {
+        let mut request = direct.request(id, id);
+        request["candidates"] = json!({"view_digest":"runner-view",
+            "accounts":[{"account_id":"not-listed","credential_id":"not-listed"}]});
+        request
+    };
+    // Without a competing admission the candidate list is refused.
+    assert!(matches!(
+        direct.admitter(excluding("unclaimed"))(),
+        crate::account_selection::OpReply::Error { .. }
+    ));
+    let competing = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let (admit, competing) = (
+            direct.admitter(direct.request("taken", "taken")),
+            competing.clone(),
+        );
+        crate::account_selection::after_roster_prepared("taken", move || {
+            *competing.lock().unwrap() = Some(admit());
+        });
+    }
+    let refused = admitted(direct.admitter(excluding("taken"))());
+    let competing = admitted(competing.lock().unwrap().take().expect("the hook ran"));
+    assert_eq!(refused, competing);
+}
+
+/// A command whose working state disagrees with SQL fails, rolls back and
+/// makes the writer reload, so the next request on that conversation is
+/// served instead of failing on the same mismatch forever.
+#[test]
+fn a_state_and_sql_mismatch_fails_one_command_and_the_next_one_is_served() {
+    let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
+    let direct = Direct::new();
+    admitted(direct.admitter(direct.request("first", "diverged"))());
+    // A write the state never saw, as a bug or an outside writer would make.
+    direct
+        .fixture
+        .store()
+        .with_writer_for_test(|conn| {
+            conn.execute(
+                "UPDATE account_affinity SET pin_generation = pin_generation + 1000",
+                [],
+            )?;
+            conn.execute(
+                "UPDATE account_pin SET pin_generation = pin_generation + 1000",
+                [],
+            )
+        })
+        .unwrap();
+    let _ = direct.admitter(direct.request("second", "diverged"))();
+    admitted(direct.admitter(direct.request("third", "diverged"))());
+}
+
+/// Two identical continuation requests that both pass their pre-writer
+/// checks before either is recorded: the second must replay the first's
+/// stored answer even when that answer made no offer (here a refusal), which
+/// the memory state never holds.
+#[tokio::test]
+async fn a_duplicate_continuation_replays_a_recorded_refusal() {
+    let (subject, _consumer, runner, mut request) = paused().await;
+    request["selection_id"] = json!("duplicate");
+    request["previous_decision_id"] = json!("no-such-decision");
+    let harness = subject.harness();
+    let store = harness.store().clone();
+    let queued = store.account_command_count_for_test(striatum_store::AccountCommandKind::Repair);
+    // Hold the writer until both requests have queued their commands, so both
+    // finish every check before the first answer is recorded.
+    let (locked, holding) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        store
+            .with_writer_for_test(|_| {
+                locked.send(()).unwrap();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while store
+                    .account_command_count_for_test(striatum_store::AccountCommandKind::Repair)
+                    < queued + 2
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Ok(())
+            })
+            .unwrap();
+    });
+    holding.recv().unwrap();
+    let mut pending = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let (harness, frame) = (
+            harness.clone(),
+            runner.request_frame("route.account_for", &request),
+        );
+        pending.spawn(async move {
+            let reply = harness.handle(frame).await;
+            (
+                reply.header.ty,
+                serde_json::from_slice::<Value>(&reply.body).unwrap(),
+            )
+        });
+    }
+    let mut replies = Vec::new();
+    while let Some(reply) = pending.join_next().await {
+        replies.push(reply.unwrap());
+    }
+    holder.join().unwrap();
+    for (ty, body) in &replies {
+        assert_eq!(*ty, FrameType::Response, "{body}");
+    }
+    assert_eq!(replies[0].1, replies[1].1);
+    assert_eq!(replies[0].1["result"]["kind"], "refuse", "{}", replies[0].1);
 }

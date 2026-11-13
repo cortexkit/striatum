@@ -98,8 +98,9 @@ pub use account_selection::{
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
     AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountRouteFence,
     AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionStateRow, ContinuationStateRow,
-    CredentialProbeClaim, DemandStateRow, LatestAdmissionRow, PinStartedRow, PrunedAdmission,
+    AdmissionScanRow, CredentialProbeClaim, LatestAdmissionRow, PrunedAdmission,
     PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, KEYED_EXCEPTION,
+    keyed_exception_reads, note_keyed_exception,
     OBSERVATION_BACKOFFS_SQL,
 };
 
@@ -1162,7 +1163,7 @@ pub struct SqliteRouteStateStore {
 
 mod evaluation_snapshot;
 mod account_writer;
-pub use account_writer::{AccountCommandKind, AccountReply};
+pub use account_writer::{AccountCommandKind, AccountReply, STATE_DIVERGED};
 mod account_state;
 pub use account_state::{AccountStateBridge, AccountWorkingState};
 #[cfg(any(test, feature = "test-support"))]
@@ -7982,8 +7983,11 @@ impl crate::AccountTx<'_> {
                 match transition {
                     FailureBackoffTransition::Unchanged => {}
                     FailureBackoffTransition::Reset => {
+                        // Keyed exception: the admissions of one model decision,
+                        // found through its index; closed ones stay in SQL only.
+                        account_selection::note_keyed_exception();
                         let admitted_at:i64=tx.query_row("SELECT COALESCE(
-                            (SELECT MAX(committed_at) FROM account_admission a WHERE a.model_decision_id=d.id
+                            (SELECT MAX(committed_at) FROM account_admission /* keyed exception */ a WHERE a.model_decision_id=d.id
                              AND a.provider=?2 AND a.model=?3 AND a.input_size_class IS NOT NULL),
                             (SELECT created_at_ms FROM routing_v1_decision v WHERE v.decision_id=d.id),d.created_at)
                             FROM model_route_decisions d WHERE d.id=?1",params![decision_id,provider_id,model_id],|row|row.get(0))?;

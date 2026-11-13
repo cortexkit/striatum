@@ -76,6 +76,9 @@ impl WriterAccountState {
             }
             Ok(None) => Ok(()),
             Err(error) => {
+                // Never compute on a copy the failed load meant to replace:
+                // without a working state the next batch loads again.
+                self.working = None;
                 bridge.failed(&error.to_string());
                 Err(error)
             }
@@ -120,6 +123,29 @@ impl crate::SqliteRouteStateStore {
 
     pub fn account_state_bridge(&self) -> Option<&std::sync::Arc<dyn AccountStateBridge>> {
         self.account_state.get()
+    }
+
+    /// Load the module's state again after an earlier load failed, through
+    /// the same read-only barrier as the first load. The writer stays alive
+    /// across load failures, so a caller can retry instead of restarting.
+    pub fn retry_account_state_load(&self) -> RouteStateResult<()> {
+        if let Some(bridge) = self.account_state.get() {
+            bridge.request_reload();
+        }
+        self.initialize_account_writer_state()
+    }
+
+    /// Refuse a store-level writer that changes the admission group's tables
+    /// without the module's in-memory state. Once the module has installed
+    /// its state, those rows change only through its state-aware commands.
+    pub(crate) fn refuse_state_blind_admission_write(&self, writer: &str) -> RouteStateResult<()> {
+        if self.account_state.get().is_some() {
+            return Err(crate::err(format!(
+                "{writer} writes admission, affinity or continuation rows without the module's \
+                 account state; use the module's state-aware writer command"
+            )));
+        }
+        Ok(())
     }
 
     /// Test seeds may write account rows directly on the writer connection,

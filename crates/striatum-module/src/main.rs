@@ -1321,8 +1321,20 @@ where
     // HELLO negotiates the storage descriptor supplied by HELLO_ACK, so it
     // cannot wait for loading. Do not start background tasks or dispatch queued
     // requests until account state is published; early requests wait, not fail.
-    account_state::initialize(store.as_ref())
-        .map_err(|error| ModuleError::Message(format!("load account state: {error}")))?;
+    // The load blocks on the account writer, so it runs on the blocking pool,
+    // never on a runtime worker. A failed load does not stop the module: the
+    // writer stays up, and each account request or Tick loads again.
+    let loading = Arc::clone(&store);
+    match tokio::task::spawn_blocking(move || account_state::initialize(loading.as_ref())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
+            %error,
+            "account state did not load; account requests retry the load"
+        ),
+        Err(error) => {
+            return Err(ModuleError::Message(format!("load account state: {error}")));
+        }
+    }
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.
