@@ -492,15 +492,24 @@ pub(crate) fn live(
     if fences.is_empty() {
         return Ok(fences);
     }
-    let lookups: Vec<ListingLookup> = match credentials.lock() {
+    let lookups: Vec<_> = match credentials.lock() {
         Ok(guard) => fences
             .iter()
-            .map(|fence| guard.listing_fingerprint(&fence.credential_id))
+            .map(|fence| {
+                if fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
+                    let inactive = guard.listed_credentials().iter().any(|row| {
+                        row.id == fence.credential_id && row.state != "active"
+                    });
+                    (guard.signed_out_fingerprint(&fence.credential_id), inactive)
+                } else {
+                    (guard.listing_fingerprint(&fence.credential_id), false)
+                }
+            })
             .collect(),
         Err(_) => return Ok(fences),
     };
     let mut live = Vec::with_capacity(fences.len());
-    for (mut fence, lookup) in fences.into_iter().zip(lookups) {
+    for (mut fence, (lookup, inactive)) in fences.into_iter().zip(lookups) {
         let current = match lookup {
             ListingLookup::Unknown => {
                 live.push(fence);
@@ -509,6 +518,19 @@ pub(crate) fn live(
             ListingLookup::Absent => None,
             ListingLookup::Listed(fingerprint) => Some(fingerprint),
         };
+        if inactive {
+            if current != fence.listing_fingerprint {
+                store
+                    .account_transaction(|tx| {
+                        tx.update_signed_out_fingerprint(&fence, current.as_deref().unwrap())
+                    })
+                    .map_err(|e| e.to_string())?;
+                fence.listing_fingerprint = current;
+            }
+            // Vault usability is independent of the routing fence's probe clock.
+            live.push(fence);
+            continue;
+        }
         match (fence.listing_fingerprint.as_deref(), current.as_deref()) {
             (Some(recorded), Some(current)) if recorded == current => live.push(fence),
             (None, Some(current)) => {
@@ -528,7 +550,7 @@ pub(crate) fn live(
                     )
                     .map_err(|e| e.to_string())?;
                 eprintln!(
-                    "[striatum] credential entitlement fence lifted provider={} credential={}: its vault listing changed",
+                    "[striatum] credential fence lifted provider={} credential={}: its vault listing changed",
                     fence.provider_id, fence.credential_id
                 );
             }
@@ -748,7 +770,8 @@ pub(crate) fn apply(
 
 /// The rejection reason for a route whose serving credentials `refused` are all
 /// fenced: `credential_billing_exhausted` when every one of them ran out of
-/// balance, otherwise `credential_unentitled`. Each fence's reason follows the
+/// balance, `no_eligible_account` for sign-in loss alone, otherwise
+/// `credential_unentitled`. Each fence's reason follows the
 /// provider code it was reported with; a code routing does not know reads as
 /// an entitlement refusal, since it was reported as a permanent refusal of the
 /// credential.
@@ -757,6 +780,19 @@ pub(crate) fn rejection_reason(
     provider_id: &str,
     refused: &[String],
 ) -> &'static str {
+    // Sign-in loss is an eligibility problem, not a revoked key or missing
+    // provider entitlement. Do not label it as a credential refusal in findings.
+    if !refused.is_empty()
+        && refused.iter().all(|credential| {
+            fences.iter().any(|fence| {
+                fence.provider_id == provider_id
+                    && &fence.credential_id == credential
+                    && fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE
+            })
+        })
+    {
+        return "no_eligible_account";
+    }
     let all_billing = refused.iter().all(|credential| {
         fences.iter().any(|fence| {
             fence.provider_id == provider_id

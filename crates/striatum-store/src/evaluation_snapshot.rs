@@ -281,8 +281,9 @@ impl SqliteRouteStateStore {
             ),
             (
                 "account_observation",
+                // A run's sign-in exclusions survive global fence recovery.
                 format!(
-                    "bound=1 AND kind='transient_backoff' AND received_at>{}",
+                    "bound=1 AND (kind='signed_out' OR (kind='transient_backoff' AND received_at>{}))",
                     now_ms.saturating_sub(24 * 60 * 60_000)
                 ),
             ),

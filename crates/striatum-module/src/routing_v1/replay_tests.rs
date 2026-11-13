@@ -596,6 +596,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "engine_reports",
                                 "engine_evals",
                                 "account_continue_resume",
+                                "account_continue_signed_out",
                             ][..],
                         ),
                         (
@@ -697,6 +698,23 @@ fn additive_resume_projection_preserves_continuation_and_serving_identity() {
         "capabilities":["account_continue"],"ops":[],"requirement_fields":[],
         "account":{"account_id":"current-account","credential_id":"current-credential"}
     }}}));
+}
+
+#[test]
+fn additive_signed_out_projection_keeps_legacy_capabilities_and_sign_in_evidence() {
+    let evidence = json!({"method":"route.account_for","params":{
+        "mode":"continue","exhausted":{"credential_id":"signed-out","limit_window":"signed_out"}
+    }});
+    let mut observed = json!({
+        "describe":{"method":"role.describe","reply":{"result":{
+            "capabilities":["account_continue","account_continue_signed_out"],
+            "ops":[],"requirement_fields":[]
+        }}},
+        "continuation":evidence
+    });
+    project_additive_shape_members(&mut observed);
+    assert_eq!(observed["describe"]["reply"]["result"]["capabilities"], json!(["account_continue"]));
+    assert_eq!(observed["continuation"], evidence);
 }
 
 #[test]

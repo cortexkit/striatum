@@ -450,6 +450,22 @@ impl CredentialData {
             })
     }
 
+    /// A new sign-in can replace a token without changing plan or provider
+    /// entitlement, so sign-in evidence also watches the vault record version.
+    pub(crate) fn signed_out_fingerprint(&self, credential_id: &str) -> ListingLookup {
+        if self.view.is_none() {
+            return ListingLookup::Unknown;
+        }
+        self.listed
+            .iter()
+            .find(|row| row.id == credential_id)
+            .map_or(ListingLookup::Absent, |row| {
+                ListingLookup::Listed(
+                    serde_json::json!([listing_fingerprint_of(row), row.record_version]).to_string(),
+                )
+            })
+    }
+
     /// The credentials a launch on `fact` may run on, in listing order: the
     /// serving identities provider-reset and entitlement fences are judged
     /// against, and the only credentials routing may pin a launch to.

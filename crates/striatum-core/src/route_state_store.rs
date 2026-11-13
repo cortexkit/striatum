@@ -222,8 +222,12 @@ pub struct ProviderOutcome {
     pub provider_code: Option<String>,
 }
 
-/// A provider's permanent refusal of one vault credential, as the run that hit it
-/// reported it. Routing stops choosing the provider through that credential until
+/// Internal sign-in evidence, not a provider's refusal of a key for every use.
+pub const SIGNED_OUT_FENCE_CODE: &str = "signed_out";
+
+/// A provider's refusal of one vault credential, as the run that hit it
+/// reported it. Also carries internal `SIGNED_OUT_FENCE_CODE` sign-in evidence.
+/// Routing stops choosing the provider through that credential until
 /// the credential's vault listing changes; see [`CredentialEntitlementFence`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
