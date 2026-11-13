@@ -1412,11 +1412,13 @@ const PENDING_READERS: &[(&str, &str)] = &[
     ("report_attempt_outcomes", "placement_attempt_outcomes"),
 ];
 
-// The contract's KNOWN list does not include routing's extensions: tier
-// settings in operator configuration and resuming an existing account session.
+// Capabilities routing advertises that the contract crate's list of known
+// groups doesn't define: tier settings in operator configuration, and resuming
+// an account session that already moved.
 const ROUTING_EXTENSIONS: &[&str] = &["service_tier_settings", "account_continue_resume"];
 
-/// Every served check passes; the inapplicable checks are pinned explicitly.
+/// Every kit check that applies to routing passes; the checks that don't apply
+/// are pinned explicitly in `NOT_APPLICABLE`.
 /// A failing check names the contract rule it holds the provider to.
 #[tokio::test]
 async fn routing_v1_conformance_kit_matches_served_checks() {
