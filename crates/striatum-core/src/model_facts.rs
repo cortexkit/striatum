@@ -368,6 +368,10 @@ pub struct ModelFact {
     /// placeholder would look like a measurement on the next read.
     #[serde(skip)]
     pub speed_is_fleet_median: bool,
+    /// Current operator withdrawal, overlaid from the catalog rather than
+    /// persisted in a model row so a later poll can restore the route.
+    #[serde(skip)]
+    pub decommissioned: bool,
     /// Subscription subsidy multiplier applied at read time (see
     /// [`RoutePricing::subscription_multiplier`]). Divides `cost_per_m_tok_out` to yield the
     /// effective price. `None` (or a non-positive/non-finite value) means "no

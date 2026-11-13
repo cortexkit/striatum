@@ -410,6 +410,7 @@ fn candidate_quality_scores(
 ) -> Vec<CandidateQualityScore> {
     let mut candidates = facts
         .iter()
+        .filter(|fact| !fact.decommissioned)
         .map(|fact| {
             let route_key = fact_to_route(fact).route_key;
             CandidateQualityScore::from_fact(
@@ -903,6 +904,17 @@ pub fn admit_routes_with_availability(
 
     for fact in facts {
         let route = fact_to_route(fact);
+        // Operator withdrawal is a hard wall, before scores or availability:
+        // neither a high grade nor an explicit pin can make it routable.
+        if fact.decommissioned {
+            rejected.push(RejectedRoute {
+                detail: None,
+                route_key: route.route_key,
+                reason: "decommissioned".into(),
+                credential_ids: Vec::new(),
+            });
+            continue;
+        }
         if fact.is_deprecated_upstream() {
             rejected.push(RejectedRoute {
                 detail: Some(format!(
@@ -2662,7 +2674,8 @@ fn adequate_blockers(
         .filter_map(|fact| {
             let route = fact_to_route(fact);
             let reason = reasons.get(route.route_key.as_str())?;
-            if fact.is_deprecated_upstream()
+            if fact.decommissioned
+                || fact.is_deprecated_upstream()
                 || fact.score_provenance == ScoreProvenance::Unscored
                 || capability_rejection_reason(fact, input.required_capabilities).is_some()
                 || !score_adequacy(fact, &input.requirements, top_routable, config)
@@ -3471,6 +3484,7 @@ mod abundance_tests {
             cache_write_rate: None,
             reasoning_rate: None,
             speed_is_fleet_median: false,
+            decommissioned: false,
             provider_id: provider.into(),
             model_id: model.into(),
             variant: None,

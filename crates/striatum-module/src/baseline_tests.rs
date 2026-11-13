@@ -299,6 +299,7 @@ fn install_catalog(
             billing_plane: None,
             auth_methods: list("auth_methods"),
             speed_is_fleet_median: false,
+            decommissioned: false,
             provider_id: provider.clone(),
             model_id: model.clone(),
             variant: None,

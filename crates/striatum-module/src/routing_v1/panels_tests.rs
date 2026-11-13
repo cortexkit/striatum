@@ -58,6 +58,25 @@ async fn panel(route: &Route, request: &Value) -> SelectPanelAnswer {
 }
 
 #[tokio::test]
+async fn decommissioned_panel_candidate_is_not_seated_or_named_in_shortfall() {
+    let (harness, route, mut request) = configured().await;
+    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":5,"by":"iq","extra":0,"floor":0}));
+    request.as_object_mut().unwrap().remove("temperatures");
+    assert_eq!(panel(&route, &request).await.seats.len(),5);
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+        "catalog_version":93,"resolved_at_ms":123,"models":{
+            "example-provider/panel-0":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
+        }
+    })).unwrap()).unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("example-provider")).unwrap();
+    let answer = panel(&route, &request).await;
+    assert_eq!(answer.seats.len(),4, "{answer:?}");
+    assert!(answer.seats.iter().all(|seat|seat.answer.route.model != "panel-0"));
+    let shortfall = serde_json::to_value(answer.shortfall.expect("missing fifth family")).unwrap();
+    assert!(!shortfall.to_string().contains("panel-0"), "{shortfall}");
+}
+
+#[tokio::test]
 async fn new_panel_inserts_final_state_without_update() {
     let (h, route, request) = configured().await;
     let connection = rusqlite::Connection::open(h.store_path()).unwrap();
