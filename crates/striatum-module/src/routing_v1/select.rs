@@ -39,6 +39,8 @@ use crate::{
     DecisionProvenance, SelectionPolicySources,
 };
 
+#[cfg(test)]
+mod declared_samples_tests;
 mod eligible_routes;
 #[cfg(test)]
 mod eligible_routes_tests;
