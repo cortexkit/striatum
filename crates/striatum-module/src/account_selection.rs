@@ -202,6 +202,10 @@ pub(crate) struct ClassContext {
     selection_probes: Option<std::sync::Arc<probe_reservations::Selection>>,
 }
 
+#[cfg(test)]
+#[path = "account_selection/block_parity_tests.rs"]
+mod block_parity_tests;
+
 type ClassMemo = std::collections::HashMap<
     String,
     std::collections::HashMap<String, [Option<ClassMemoEntry>; 4]>,
@@ -1588,23 +1592,19 @@ impl ClassContext {
                 &fact.model_id,
             )
             .any(|origin| {
-                !matches!(
-                    origin.kind.as_str(),
-                    "account"
-                        | "account_route"
-                        | "non_quota_route"
-                        | "transient_route"
-                        | "observation"
-                        | "route"
-                        | "provider"
-                        | "failure"
-                ) && self.origin_applies(
-                    origin,
-                    &fact.provider_id,
-                    self.account_id(row),
-                    &row.id,
-                    &fact.model_id,
-                ) && !self.indexed_origin_due(origin, self.account_id(row), &fact.model_id)
+                !striatum_core::blocks::eligible(
+                    &origin.origin(),
+                    || {
+                        self.origin_applies(
+                            origin,
+                            &fact.provider_id,
+                            self.account_id(row),
+                            &row.id,
+                            &fact.model_id,
+                        )
+                    },
+                    || self.indexed_origin_due(origin, self.account_id(row), &fact.model_id),
+                )
             })
             && (!self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id)
                 || self
@@ -1638,8 +1638,10 @@ impl ClassContext {
                 .unwrap_or_else(|| credential.into());
         self.indexed_origins(provider, &account, credential, model)
             .any(|origin| {
-                self.origin_applies(origin, provider, &account, credential, model)
-                    && self.indexed_origin_due(origin, &account, model)
+                striatum_core::blocks::probe_eligible(
+                    self.origin_applies(origin, provider, &account, credential, model),
+                    || self.indexed_origin_due(origin, &account, model),
+                )
             })
     }
 
@@ -1651,11 +1653,11 @@ impl ClassContext {
         credential: &str,
         model: &str,
     ) -> bool {
-        origin.principal.is_none()
-            && origin.size_class.is_none()
-            && self.origin_targets(origin, provider, account, credential, model)
-            && (origin.kind != "account"
-                || self.fences.get(provider).is_some_and(|fences| {
+        striatum_core::blocks::origin_applies(
+            &origin.origin(),
+            || self.origin_targets(origin, provider, account, credential, model),
+            || {
+                self.fences.get(provider).is_some_and(|fences| {
                     fences.iter().any(|fence| {
                         fence.account_id == account
                             && fence.observed_at_ms == origin.evidence_at
@@ -1667,7 +1669,9 @@ impl ClassContext {
                                 request_pool(None, provider, model).as_deref(),
                             )
                     })
-                }))
+                })
+            },
+        )
     }
 
     fn origin_targets(

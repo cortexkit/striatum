@@ -62,8 +62,10 @@ mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
+#[cfg(any(test, feature = "test-support"))]
+mod block_parity_fixture;
 mod key_pool;
-pub use fence_rechecks::{FenceRecheck, QuotaSuccessScope};
+pub use fence_rechecks::{BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope};
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
