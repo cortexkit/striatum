@@ -306,7 +306,10 @@ fn panel_shortfall(
         };
     let mut detail = PanelShortfallDetail::new(message);
     detail.package_tokens = package_tokens;
-    detail.causes = rejected;
+    detail.causes = rejected
+        .into_iter()
+        .filter(|cause| cause.reason.as_str() != "decommissioned")
+        .collect();
     PanelShortfall::new(code).with_typed_detail(detail)
 }
 
@@ -698,6 +701,11 @@ async fn candidates(
     let mut facts = prepared.facts;
     let mut rejected = Vec::new();
     facts.retain(|fact| {
+        // Keep withdrawn facts until core admission can count their rejection
+        // before runner or capability shortfalls in the candidate funnel.
+        if fact.decommissioned {
+            return true;
+        }
         let route = fact_to_route(fact);
         if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(fact, false)
         {

@@ -57,6 +57,10 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     (
+        "routing_operator_decommissioned",
+        "operator withdrawals must survive restore; an empty cache would route withdrawn models before the next catalog poll",
+    ),
+    (
         "model_route_decision_detail_cursor",
         "one row saying how far decision-detail compaction has walked the ledger; restored \
          empty, compaction walks the whole ledger again, re-reading every compacted \

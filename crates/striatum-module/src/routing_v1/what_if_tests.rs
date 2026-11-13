@@ -25,6 +25,26 @@ async fn evaluate(route: &Route, extra: Value) -> Value {
 }
 
 #[tokio::test]
+async fn decommissioned_what_if_excludes_route_from_adequacy_and_keeps_reason() {
+    let (harness, _) = configured().await;
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+        "catalog_version":95,"resolved_at_ms":123,"models":{
+            "example-provider/model-b":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
+        }
+    })).unwrap()).unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("example-provider")).unwrap();
+    let before = rows(&harness);
+    let direct = operator(&harness).await;
+    let answer = evaluate(&direct, json!({"iqs":[0]})).await;
+    let row = &answer["results"][0];
+    assert!(row["excluded"].as_array().unwrap().iter().any(|entry|
+        entry["route"]=="example-provider/model-b" && entry["reason"]=="decommissioned"), "{answer}");
+    assert!(!row["adequate"].to_string().contains("example-provider/model-b"), "{answer}");
+    assert_ne!(row["pick"]["route"]["model"],"model-b", "{answer}");
+    assert_eq!(rows(&harness),before);
+}
+
+#[tokio::test]
 async fn s8a3_what_if_matches_recorded_base_response_without_live_commands() {
     let _clock = crate::InjectedClock::set(1_800_000_000_000);
     let (harness, _) = configured().await;

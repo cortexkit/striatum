@@ -34,6 +34,7 @@ fn fact(provider: &str, model: &str, family: Option<&str>, elo: f64, cost: f64) 
         billing_plane: None,
         auth_methods: None,
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         variant: None,

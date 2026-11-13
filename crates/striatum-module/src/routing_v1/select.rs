@@ -2516,6 +2516,17 @@ impl<'a> Selection<'a> {
     fn pin(&self, pin: &str, available: &HashSet<String>) -> Result<SelectedModelRoute, Refusal> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
+        if self.facts.iter().any(|fact| {
+            fact.decommissioned
+                && fact.provider_id == parsed.provider
+                && fact.model_id == parsed.model
+        }) {
+            return Err(Refusal::pin_unavailable(
+                pin,
+                PinUnavailableReason::parse("decommissioned"),
+                None,
+            ));
+        }
         if self.exclude.contains(&parsed.route_key())
             || self.exclude.contains(&parsed.provider)
             || !self
@@ -2922,6 +2933,7 @@ fn pin_reason(
     };
     match code {
         "invalid_model_pin" => (PinUnavailableReason::Invalid, None),
+        "decommissioned" => (PinUnavailableReason::parse("decommissioned"), None),
         "unknown_model_provider" => (PinUnavailableReason::UnknownProvider, None),
         "unknown_model" => (PinUnavailableReason::UnknownModel, None),
         "invalid_model_variant" => (PinUnavailableReason::InvalidVariant, None),

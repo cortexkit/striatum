@@ -372,6 +372,7 @@ impl SqliteRouteStateStore {
     pub fn account_evaluation_snapshot(&self, now_ms: i64) -> RouteStateResult<Self> {
         let tables = [
             ("model_facts", "1".to_string()),
+            ("routing_operator_decommissioned", "1".to_string()),
             ("fence_recheck", "1".to_string()),
             ("fence_recheck_route_clear", "1".to_string()),
             ("fence_success_pool", "1".to_string()),

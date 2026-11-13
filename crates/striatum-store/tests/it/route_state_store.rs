@@ -63,6 +63,7 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         billing_plane: None,
         auth_methods: None,
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: provider.into(),
         model_id: model.into(),
         variant: None,

@@ -207,6 +207,19 @@ fn ids(reply: &Value) -> Vec<String> {
         .collect()
 }
 
+#[tokio::test]
+async fn decommissioned_models_are_absent_from_head_choices() {
+    let (harness, _) = fixture();
+    assert!(ids(&query(&harness, RUNNER).await).contains(&"openai/a-head".into()));
+    let snapshot = fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+        "catalog_version":92,"resolved_at_ms":123,"models":{
+            "openai/a-head":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
+        }
+    })).unwrap()).unwrap();
+    fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("openai")).unwrap();
+    assert!(!ids(&query(&harness, RUNNER).await).contains(&"openai/a-head".into()));
+}
+
 fn declare_harness_limits(credentials: &mut BrocaCredentials, limits: Value) {
     credentials.runner_declarations.insert(
         RUNNER.into(),
