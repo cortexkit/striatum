@@ -130,14 +130,27 @@ pub(crate) fn continue_account(
         .transpose()
         .map_err(unavailable)?;
     let prepared = parsed.as_ref().map(|params| prepare_roster(params, ctx));
-    // Quota holds remove credentials before allocation. Keep their compatible roster
-    // for wake times without reopening them in the roster that can receive an offer.
+    // Quota holds and sign-in fences remove credentials before allocation. Keep
+    // their compatible roster for wake times, never for allocating an offer.
     let reset_roster = match (&ctx.classes, &parsed) {
         (Some(classes), Some(params)) => {
             let mut classes = classes.clone();
-            classes
+            let sign_in: BTreeSet<_> = classes
                 .refusals
-                .retain(|fence| !crate::credential_fences::is_billing_code(&fence.code));
+                .iter()
+                .filter(|fence| fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE)
+                .map(|fence| (fence.provider_id.clone(), fence.credential_id.clone()))
+                .collect();
+            let rechecks = classes.rechecks.iter().filter(|origin| {
+                !(origin.kind == "credential" && origin.credential_id.as_ref()
+                    .is_some_and(|credential| sign_in.contains(&(origin.provider.clone(), credential.clone()))))
+            }).cloned().collect();
+            let refusals = classes.refusals.iter().filter(|fence| {
+                !crate::credential_fences::is_billing_code(&fence.code)
+                    && !sign_in.contains(&(fence.provider_id.clone(), fence.credential_id.clone()))
+            }).cloned().collect();
+            classes.replace_refusals(refusals);
+            classes.replace_rechecks(rechecks);
             classes.route_fences.clear();
             let reset_ctx = Ctx {
                 store: ctx.store,
@@ -264,9 +277,19 @@ pub(crate) fn continue_account(
                 .filter(|a|a.account_id!=current.account_id).flat_map(|a|a.credentials.iter().map(move|c|(a,c)))
                 .filter(|(a,c)|classes.method(&c.credential_id)==method && !signed_out.contains(&c.credential_id) && candidates.as_ref().is_none_or(|candidates|candidates.contains(&a.account_id,&c.credential_id))).collect();
             let mut until = route_fenced.iter().filter(|(a,_)|compatible.iter().any(|(candidate,_)|candidate.account_id==**a)).map(|(_,at)|*at).filter(|at|*at>ctx.now_ms).min();
-            for (_,credential) in compatible {
+            for (account,credential) in compatible {
                 if let Some(at)=classes.quota_hold_reset(provider,&credential.credential_id) {
                     until=Some(until.map_or(at,|old|old.min(at)));
+                }
+                if classes.refusals.iter().any(|fence| fence.provider_id == *provider
+                    && fence.credential_id == credential.credential_id
+                    && fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE) {
+                    for at in classes.rechecks.iter().filter(|origin| origin.kind == "credential"
+                        && origin.provider == *provider && origin.credential_id.as_deref() == Some(&credential.credential_id))
+                        .map(|origin| classes.recheck_hint(origin, &account.account_id, &previous.model))
+                        .filter(|at| *at > ctx.now_ms) {
+                        until = Some(until.map_or(at, |old| old.min(at)));
+                    }
                 }
             }
             if let Some(roster) = &mut roster.roster {

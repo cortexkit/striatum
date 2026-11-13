@@ -386,6 +386,45 @@ async fn signed_out_hold_uses_only_alternate_accounts_known_reset() {
 }
 
 #[tokio::test]
+async fn signed_out_hold_wakes_for_an_alternate_credentials_recovery_probe() {
+    let (subject, _, runner, request) = paused().await;
+    subject
+        .configure_continue_credentials(&fixture::continue_credentials()[..2])
+        .await
+        .unwrap();
+    let harness = subject.harness();
+    let credential = &fixture::continue_credentials()[1].account.credential_id;
+    let crate::broca_credentials::ListingLookup::Listed(fingerprint) = harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .signed_out_fingerprint(credential)
+    else {
+        panic!("listed credential");
+    };
+    let observed = account_selection::now_ms() - 1000;
+    harness
+        .store()
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                credential_id: credential.clone(),
+                code: "signed_out".into(),
+            },
+            Some(&fingerprint),
+            observed,
+        )
+        .unwrap();
+    let held = result(runner.call("route.account_for", &signed_out(request)).await);
+    assert_eq!(held["kind"], "hold", "{held}");
+    assert_eq!(
+        held["until_ms"],
+        observed + 3_600_000,
+        "the alternate's probe is a known wake target: {held}"
+    );
+}
+
+#[tokio::test]
 async fn signed_out_rejects_quota_members_even_when_null() {
     let (_, _, runner, request) = paused().await;
     for field in ["pool", "resets_at_ms", "retry_after_s"] {
