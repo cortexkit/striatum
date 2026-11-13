@@ -352,6 +352,155 @@ async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
     }
 }
 
+#[test]
+fn broca_scoring_remembers_a_competing_probe_before_its_first_eligibility_check() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &harness.credentials(),
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            FENCE_NOW as i64,
+        )
+        .unwrap()
+    };
+    let mut first = load();
+    first
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    let mut second = load();
+    second
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+
+    // Both snapshots still see a due fence. The winner binds and releases
+    // its temporary hold before the loser first asks whether it is eligible.
+    let _binding = first
+        .bind_selected_probe(harness.store(), "inception", "mercury-3", true, "winner")
+        .unwrap();
+    assert_eq!(
+        harness.store().fence_rechecks().unwrap()[0]
+            .claim_owner
+            .as_deref(),
+        Some("winner")
+    );
+    for context in [&second, &second.clone()] {
+        let probe = context.probe("inception", "mercury-3", true, false, None, "loser");
+        assert!(probe.admission().is_none(), "{probe:?}");
+        assert_eq!(
+            context.blocked_reset("inception", "mercury-3", true),
+            Some(Some(FENCE_NOW as i64 + 120_000))
+        );
+        assert!(context
+            .probe("muse", "model", true, false, None, "fallback")
+            .admission()
+            .is_some());
+    }
+}
+
+fn steal_selected_probe(harness: &Harness) {
+    crate::account_selection::before_probe_bind(&harness.credentials(), |store| {
+        store
+            .account_transaction(|tx| {
+                let origins = tx.fence_rechecks()?;
+                assert_eq!(origins.len(), 1);
+                assert!(tx.grant_fence_rechecks(&origins, FENCE_NOW as i64, Some("contender"))?);
+                Ok(())
+            })
+            .unwrap();
+    });
+}
+
+#[tokio::test]
+async fn broca_v1_lost_probe_binding_falls_back() {
+    lost_probe_binding_fallback_case(false).await;
+}
+
+#[tokio::test]
+async fn broca_legacy_lost_probe_binding_falls_back() {
+    lost_probe_binding_fallback_case(true).await;
+}
+
+async fn lost_probe_binding_fallback_case(legacy: bool) {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    steal_selected_probe(&harness);
+    let reply = broca_select(&harness, legacy).await;
+    assert_eq!(broca_selected_route(&reply, legacy), "muse/model");
+    assert_eq!(
+        harness.store().fence_rechecks().unwrap()[0]
+            .claim_owner
+            .as_deref(),
+        Some("contender")
+    );
+}
+
+#[tokio::test]
+async fn broca_v1_lost_probe_binding_without_fallback_returns_the_durable_reset() {
+    lost_probe_binding_wait_case(false).await;
+}
+
+#[tokio::test]
+async fn broca_legacy_lost_probe_binding_without_fallback_returns_the_durable_reset() {
+    lost_probe_binding_wait_case(true).await;
+}
+
+async fn lost_probe_binding_wait_case(legacy: bool) {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["ladder"] = json!(["inception/mercury-3"]);
+    });
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    steal_selected_probe(&harness);
+    let reply = broca_select(&harness, legacy).await;
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    assert_eq!(reply.1["code"], "no_route", "{reply:?}");
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        FENCE_NOW + 3_600_000,
+        "legacy={legacy}: {reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn broca_panel_lost_probe_binding_is_a_timed_seat_refusal() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"topK":1,"by":"iq","extra":0,"floor":0});
+    });
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    steal_selected_probe(&harness);
+    let route = harness.bind(reserved("example-consumer"), None).await;
+    let reply = route
+        .call(
+            "route.select_panel",
+            &json!({
+                "class":"audit", "consumer":"mason", "seed":"fixed",
+                "available_routes":["inception/mercury-3"],
+            }),
+        )
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert!(
+        reply.1["result"]["seats"].as_array().unwrap().is_empty(),
+        "{reply:?}"
+    );
+    let causes = reply.1["result"]["shortfall"]["detail"]["causes"]
+        .as_array()
+        .unwrap();
+    let lost = causes
+        .iter()
+        .find(|cause| cause["model"] == "inception/mercury-3")
+        .unwrap();
+    assert_eq!(lost["reset_at_ms"], FENCE_NOW + 3_600_000, "{lost:?}");
+}
+
 #[tokio::test]
 async fn broca_unstarted_probe_admission_expires_after_one_minute() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
