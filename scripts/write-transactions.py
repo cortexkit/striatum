@@ -90,9 +90,30 @@ def account_writer_violations(root: Path, entries: set[str]) -> list[str]:
             declarations[path.resolve()] = declared
             if test_only:
                 test_files.add(path.resolve())
-            lines = path.read_text().splitlines()
+            source = path.read_text()
+            masked = RUST["mask_non_code"](source)
+            line_offsets = [0]
+            for line in source.splitlines(keepends=True):
+                line_offsets.append(line_offsets[-1] + len(line))
+            opening_for = {end: start for start, end in RUST["delimiter_pairs"](masked).items()}
             for declaration in declared:
-                attributes = "\n".join(lines[max(0, declaration.line - 4):declaration.line])
+                start = line_offsets[declaration.line - 1]
+                attributes = [masked[start:line_offsets[declaration.line]]]
+                cursor = start
+                # Only attributes attached to this declaration apply to it;
+                # the previous module's cfg must not hide a live sibling.
+                while cursor:
+                    end = cursor - 1
+                    while end >= 0 and masked[end].isspace():
+                        end -= 1
+                    if end < 0 or masked[end] != "]":
+                        break
+                    opening = opening_for.get(end)
+                    if opening is None or opening == 0 or masked[opening - 1] != "#":
+                        break
+                    attributes.append(masked[opening - 1:end + 1])
+                    cursor = opening - 1
+                attributes = "\n".join(attributes)
                 if declaration.target and re.search(r"#\[\s*cfg\s*\(\s*all\s*\(\s*test\b", attributes):
                     test_files.add(declaration.target)
     finally:

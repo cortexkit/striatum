@@ -117,6 +117,26 @@ fn handler() { crate::account_writer::repair(store, move |tx| {
         entries = GUARD["read_account_entries"](GUARD["ACCOUNT_ENTRIES"])
         self.assertEqual(GUARD["account_writer_violations"](ROOT, entries), [])
 
+    def test_cfg_test_attribute_does_not_hide_the_following_live_module(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        for attribute in (
+            '#[cfg(all(test, target_os="linux"))]',
+            '#[cfg(all(\n    test,\n    target_os="linux",\n))]',
+        ):
+            with tempfile.TemporaryDirectory(dir=scratch) as directory:
+                root = Path(directory)
+                source = root / "crates/striatum-module/src"
+                source.mkdir(parents=True)
+                (source / "main.rs").write_text(
+                    attribute + '\n#[path="seeds.rs"]\nmod seeds;\nmod live;\n'
+                )
+                (source / "seeds.rs").write_text("fn seed() { store.account_transaction(seed); }")
+                (source / "live.rs").write_text("fn handler() { store.account_transaction(write); }")
+                errors = GUARD["account_writer_violations"](root, {"account_transaction"})
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("/live.rs:", errors[0])
+
     def test_projection_allowance_is_one_exact_function(self):
         scratch = ROOT / "target/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
