@@ -3764,6 +3764,12 @@ fn backoff_fixture() -> Arc<Harness> {
         })
         .collect();
     harness.install_facts(&facts);
+    // install_facts sets operator scores but does not update stored auth_methods.
+    // Publish both OAuth allowlists through the catalog so this fixture tests
+    // account-wide backoff rather than whether a model permits the sign-in.
+    for fact in &facts {
+        catalog_fact(&harness, fact);
+    }
     credentials.apply_listing(
         &ScopedCredentialListing {
             view: "two-accounts".into(),

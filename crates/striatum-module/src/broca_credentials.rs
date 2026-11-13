@@ -556,8 +556,14 @@ impl CredentialData {
     fn serving_method(&self, fact: &ModelFact, catalog: &AuthCatalog) -> ServingMethod {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
         self.serving.get(&key).filter(|serving| {
-            self.catalog_providers.signins == catalog.signins
-                && serving.auth_method.as_deref().is_none_or(|method| catalog.allows(fact, Some(method)))
+            match serving.auth_method.as_deref() {
+                Some(method) => catalog.allows(fact, Some(method)),
+                // Removing the provider's last listing for a sign-in lets that
+                // sign-in reach unlisted models again. Recompute unresolved
+                // methods when coverage changes before the next roster refresh.
+                None => self.catalog_providers.signins.get(&fact.provider_id)
+                    == catalog.signins.get(&fact.provider_id),
+            }
         }).cloned().unwrap_or_else(|| {
             choose_method(
                 BTreeSet::new(),
@@ -1179,6 +1185,26 @@ impl CredentialData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn positive_listing_keeps_a_still_allowed_roster_method() {
+        let mut credentials = super::BrocaCredentials::default();
+        let mut fact = crate::tests::fact("vendor", "listed");
+        credentials.catalog_providers = [&fact].into_iter().collect();
+        credentials.serving.insert("vendor/listed".into(), super::ServingMethod {
+            auth_method: Some("custom-signin".into()), reason: "roster".into(),
+        });
+        fact.auth_methods = Some(vec!["apikey".into(), "custom-signin".into()]);
+        let catalog = [&fact].into_iter().collect();
+        assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
+            "new positive coverage must not discard a valid quota roster choice");
+
+        let mut other = crate::tests::fact("other-vendor", "listed");
+        other.auth_methods = Some(vec!["another-signin".into()]);
+        let catalog = [&fact, &other].into_iter().collect();
+        assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
+            "a different provider's coverage must not affect this model's pricing");
+    }
+
     #[test]
     fn serving_generation_compares_values_and_preserves_old_snapshots() {
         let mut credentials = super::BrocaCredentials::api_test_credentials(&facts());
