@@ -68,8 +68,9 @@ impl Registry {
         let config = source.config;
         let original = source.policies.clone();
         let source_policies = original.clone();
-        // Entry harnesses constrain new sessions only. Picker registries keep
-        // using runner-wide offers, even for a harness-bound settings entry.
+        // A settings entry's harness narrows only where new sessions start.
+        // The head-choice picker still lists every model the runner can open
+        // on any harness, even when the settings entry names one harness.
         let mut registry = Self {
             entries: original
                 .iter()
