@@ -15,6 +15,7 @@ use crate::{
 
 mod admission;
 mod describe_cache;
+mod harness_choice;
 mod harness_facts;
 #[cfg(test)]
 mod harness_facts_tests;
@@ -57,6 +58,8 @@ pub(crate) struct EffectiveRunner {
     no_account_models: BTreeSet<String>,
     #[serde(skip)]
     provider_limit_models: BTreeSet<String>,
+    #[serde(skip)]
+    harness_choices: Option<Vec<harness_choice::Candidate>>,
 }
 
 pub(crate) fn can_offer_account(
@@ -191,6 +194,7 @@ impl Registry {
                 missing_wire_api_models: BTreeSet::new(),
                 no_account_models: BTreeSet::new(),
                 provider_limit_models: BTreeSet::new(),
+                harness_choices: None,
             }],
         }
     }
@@ -471,6 +475,7 @@ impl Registry {
                     missing_wire_api_models,
                     no_account_models,
                     provider_limit_models,
+                    harness_choices: None,
                 }
             })
             .collect();
@@ -497,58 +502,39 @@ impl Registry {
         self.get(module).is_some_and(|runner| {
             // Variants share their model's transport and credential reach, but
             // operator route rules still judge the exact requested variant.
-            runner.reachable_models.contains(capacity)
-                && runner
-                    .route_policy
-                    .as_ref()
-                    .is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| &runner.reachable_models)
         })
     }
 
     pub(crate) fn can_run(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
-            runner.statically_reachable_models.contains(capacity)
-                && runner
-                    .route_policy
-                    .as_ref()
-                    .is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| {
+                &runner.statically_reachable_models
+            })
         })
     }
 
     pub(crate) fn no_runner_account(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
-            runner.no_account_models.contains(capacity)
-                && runner
-                    .route_policy
-                    .as_ref()
-                    .is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| &runner.no_account_models)
         })
     }
 
     pub(crate) fn provider_limit(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
-            runner.provider_limit_models.contains(capacity)
-                && runner.route_policy.as_ref().is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| &runner.provider_limit_models)
         })
     }
 
     pub(crate) fn wire_family_unverified(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
-            runner.unverified_wire_models.contains(capacity)
-                && runner
-                    .route_policy
-                    .as_ref()
-                    .is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| &runner.unverified_wire_models)
         })
     }
 
     pub(crate) fn requires_wire_api(&self, module: &str, route: &str, capacity: &str) -> bool {
         self.get(module).is_some_and(|runner| {
-            runner.missing_wire_api_models.contains(capacity)
-                && runner
-                    .route_policy
-                    .as_ref()
-                    .is_none_or(|specs| specs.resolve(route, false))
+            runner.matches_route(route, capacity, |runner| &runner.missing_wire_api_models)
         })
     }
 }

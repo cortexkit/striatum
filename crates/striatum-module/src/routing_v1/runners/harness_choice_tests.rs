@@ -1,0 +1,400 @@
+use super::{prepare_selects, read, GROUP};
+use crate::routing_v1::{describe, dispatch_tests::configured};
+use serde_json::{json, Value};
+use striatum_core::RouteStateStore;
+use subc_protocol::FrameType;
+
+fn slot(limits: Value) -> Value {
+    let mut value = super::slot(limits);
+    value["runner"]
+        .as_object_mut()
+        .unwrap()
+        .remove("standing_limits");
+    value
+}
+
+fn install(harness: &crate::routing_v1::conformance_tests::Harness, module: &str, value: &Value) {
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(module.into(), read(value));
+}
+
+fn request(requirements: Value) -> Value {
+    json!({"consumer":"harness_choice_test", "requirements":requirements})
+}
+
+fn setup(harness: &crate::routing_v1::conformance_tests::Harness, runners: Value) {
+    for mut fact in harness.store().get_facts().unwrap() {
+        fact.max_output_tokens = Some(32000);
+        harness
+            .store()
+            .upsert_fact(&fact, striatum_core::FactSource::Override)
+            .unwrap();
+    }
+    prepare_selects(harness);
+    harness.edit_config(|config| {
+        config["runners"] = runners;
+        config["consumers"]["harness_choice_test"] = json!({});
+    });
+}
+
+fn selected(reply: (FrameType, Value)) -> Value {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert!(reply.1["result"]["runner"].is_object(), "{}", reply.1);
+    reply.1["result"].clone()
+}
+
+fn refused(reply: (FrameType, Value), reason: &str) {
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+    assert_eq!(reply.1["detail"]["reason"], reason, "{}", reply.1);
+}
+
+#[tokio::test]
+async fn harness_choice_capability_needs_are_per_runner_and_do_not_require_fork_answer() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(
+            &harness,
+            json!([{"module":"declaring"}, {"module":"legacy"}]),
+        );
+        install(
+            &harness,
+            "declaring",
+            &slot(json!({"primary":{"capabilities":["one_off"]}})),
+        );
+        install(&harness, "legacy", &slot(json!({})));
+        let limited = selected(
+            route
+                .call(
+                    "route.select",
+                    &request(json!({"iq":0,"max_output_tokens":1})),
+                )
+                .await,
+        );
+        assert_eq!(limited["runner"]["module"], "legacy", "{limited}");
+        let one_off = selected(
+            route
+                .call("route.select", &request(json!({"iq":0,"tools":"none"})))
+                .await,
+        );
+        assert_eq!(one_off["runner"]["module"], "declaring", "{one_off}");
+        for limits in [
+            json!({"starts_sessions":true}),
+            json!({"capabilities":[]}),
+            json!({"capabilities":["future_token"]}),
+        ] {
+            install(&harness, "declaring", &slot(json!({"primary":limits})));
+            for requirement in [
+                json!({"iq":0,"tools":"none"}),
+                json!({"iq":0,"max_output_tokens":1}),
+            ] {
+                let answer = selected(route.call("route.select", &request(requirement)).await);
+                assert_eq!(answer["runner"]["module"], "legacy", "{answer}");
+            }
+            for requirement in [json!({"iq":0}), json!({"iq":0,"tools":"required"})] {
+                let answer = selected(route.call("route.select", &request(requirement)).await);
+                assert_eq!(answer["runner"]["module"], "declaring", "{answer}");
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_choice_fact_step_precedes_tool_tags_and_distinguishes_route_filtering() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({"primary":{"starts_sessions":false}, "secondary":{"starts_sessions":false}, "inherited":{"starts_sessions":false}})));
+        refused(route.call("route.select", &request(json!({"iq":0,"tool_capabilities":["test:absent/v1"]}))).await, "harness_unavailable");
+        install(&harness, "declaring", &slot(json!({"primary":{"capabilities":[]}})));
+        for requirement in [json!({"iq":0,"tools":"none"}), json!({"iq":0,"max_output_tokens":1})] {
+            refused(route.call("route.select", &request(requirement)).await, "harness_unavailable");
+        }
+        let mut stopped = slot(json!({"primary":{"starts_sessions":true}}));
+        stopped["runner"]["starts_sessions"] = json!(false);
+        install(&harness, "declaring", &stopped);
+        refused(route.call("route.select", &request(json!({"iq":0}))).await, "harness_unavailable");
+        harness.edit_config(|config| config["runners"] = json!([{"module":"declaring"}, {"module":"legacy"}]));
+        let mut legacy = slot(json!({}));
+        legacy["runner"]["tool_capabilities"] = json!([]);
+        install(&harness, "legacy", &legacy);
+        refused(route.call("route.select", &request(json!({"iq":0,"max_output_tokens":1,"tool_capabilities":["test:absent/v1"]}))).await, "missing_capability");
+    }).await;
+}
+
+#[tokio::test]
+async fn harness_choice_candidate_facts_do_not_leak_into_held_legacy_picks_or_reparse() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"declaring"}]));
+    install(&harness, "declaring", &slot(json!({})));
+    let params = request(json!({"iq":0}));
+    let baseline = selected(route.call("route.select", &params).await);
+    let fingerprint = harness
+        .store()
+        .get_decision_by_id(baseline["decision_id"].as_str().unwrap())
+        .unwrap()
+        .unwrap()
+        .catalog_fingerprint;
+    let bad = request(json!({"iq":0,"tool_capabilities":["test:absent/v1"]}));
+    let baseline_refusal = route.call("route.select", &bad).await;
+    let value = slot(json!({"primary":{"starts_sessions":false}}));
+    describe::with_candidate_capabilities(&[GROUP], async {
+        install(&harness, "declaring", &value);
+        let parsed = super::PARSES.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..3 {
+            let answer = selected(route.call("route.select", &params).await);
+            assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        }
+        assert_eq!(
+            super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
+            parsed
+        );
+    })
+    .await;
+    assert!(!describe::capabilities().contains(&GROUP));
+    install(&harness, "declaring", &value);
+    let parsed = super::PARSES.load(std::sync::atomic::Ordering::Relaxed);
+    for _ in 0..3 {
+        let answer = selected(route.call("route.select", &params).await);
+        assert_eq!(answer["route"], baseline["route"]);
+        assert_eq!(answer["runner"], baseline["runner"]);
+        assert_eq!(
+            harness
+                .store()
+                .get_decision_by_id(answer["decision_id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .catalog_fingerprint,
+            fingerprint
+        );
+        assert_eq!(route.call("route.select", &bad).await, baseline_refusal);
+    }
+    assert_eq!(
+        super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
+        parsed
+    );
+}
+
+#[tokio::test]
+async fn harness_choice_tries_default_then_declared_order_for_task_and_route() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        let providers: Vec<_> = harness.store().get_facts().unwrap().into_iter().map(|fact| fact.provider_id).collect();
+        for primary in [json!({"starts_sessions":false,"capabilities":["output_cap"]}), json!({"exclude":providers,"capabilities":["output_cap"]}), json!({"capabilities":["one_off"]})] {
+            install(&harness, "declaring", &slot(json!({"primary":primary,"secondary":{"capabilities":["output_cap"]},"inherited":{"capabilities":["output_cap"]}})));
+            let answer = selected(route.call("route.select", &request(json!({"iq":0,"max_output_tokens":1}))).await);
+            assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        }
+        let mut value = slot(json!({"primary":{"capabilities":["output_cap"]},"secondary":{"capabilities":["output_cap"]}}));
+        value["runner"]["default_harness"] = json!("secondary");
+        install(&harness, "declaring", &value);
+        let answer = selected(route.call("route.select", &request(json!({"iq":0,"max_output_tokens":1}))).await);
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+    }).await;
+}
+
+#[tokio::test]
+async fn harness_choice_request_is_the_only_candidate_and_unhosted_runners_are_removed() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(
+            &harness,
+            json!([{"module":"declaring"}, {"module":"legacy"}]),
+        );
+        install(
+            &harness,
+            "declaring",
+            &slot(json!({"primary":{"starts_sessions":false}})),
+        );
+        let mut legacy = slot(json!({}));
+        legacy["runner"]["harnesses"] = json!(["secondary"]);
+        legacy["runner"]["default_harness"] = json!("secondary");
+        install(&harness, "legacy", &legacy);
+        let mut params = request(json!({"iq":0}));
+        params["harness"] = json!("primary");
+        refused(
+            route.call("route.select", &params).await,
+            "harness_unavailable",
+        );
+        params["harness"] = json!("secondary");
+        let answer = selected(route.call("route.select", &params).await);
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        params["harness"] = json!("absent");
+        refused(
+            route.call("route.select", &params).await,
+            "harness_unavailable",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_choice_exclusions_remove_routes_before_ranking_not_runners() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({})));
+        let first = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        let excluded = format!("{}/{}", first["route"]["provider"].as_str().unwrap(), first["route"]["model"].as_str().unwrap());
+        install(&harness, "declaring", &slot(json!({"primary":{"exclude":[excluded]},"secondary":{"exclude":[excluded]},"inherited":{"exclude":[excluded]}})));
+        let next = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        assert_ne!(next["route"], first["route"], "{next}");
+        assert_eq!(next["runner"]["module"], "declaring", "{next}");
+        assert_eq!(next["runner"]["harness"], "primary", "{next}");
+    }).await;
+}
+
+#[tokio::test]
+async fn harness_choice_own_limits_allow_fallback_only_after_a_fact_is_declared() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        let mut value = slot(json!({"primary":{"explicit_providers":["unreachable"]}}));
+        let mut providers: std::collections::BTreeSet<_> = harness
+            .store()
+            .get_facts()
+            .unwrap()
+            .into_iter()
+            .map(|fact| fact.provider_id)
+            .collect();
+        providers.insert("unreachable".into());
+        value["runner"]["standing_limits"] = json!({"explicit_providers":providers});
+        install(&harness, "declaring", &value);
+        let legacy = route.call("route.select", &request(json!({"iq":0}))).await;
+        assert_eq!(legacy.0, FrameType::Error, "{}", legacy.1);
+        value["runner"]["harness_limits"]["primary"]["exclude"] = json!([]);
+        install(&harness, "declaring", &value);
+        let answer = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+        let config = harness.operator_config();
+        let credentials = harness.credentials();
+        let credentials = credentials.lock().unwrap();
+        let facts = harness.store().get_facts().unwrap();
+        let registry = super::super::Registry::build_for_selection(
+            config.as_ref(),
+            &credentials,
+            &facts,
+            crate::now_ms(),
+            Some("primary"),
+        );
+        let key = format!(
+            "{}/{}",
+            answer["route"]["provider"].as_str().unwrap(),
+            answer["route"]["model"].as_str().unwrap()
+        );
+        assert!(!registry.can_run("declaring", &key, &key));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_choice_pair_limits_are_not_cross_combined_between_candidates() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({})));
+        let baseline = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        let key = format!("{}/{}", baseline["route"]["provider"].as_str().unwrap(), baseline["route"]["model"].as_str().unwrap());
+        let value = slot(json!({
+            "primary":{"exclude":[],"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]},
+            "secondary":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]},
+            "inherited":{"pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"}]}
+        }));
+        install(&harness, "declaring", &value);
+        {
+            let config = harness.operator_config();
+            let shared = harness.credentials();
+            let credentials = shared.lock().unwrap();
+            let facts = harness.store().get_facts().unwrap();
+            for (name, admitted) in [("primary", false), ("secondary", true)] {
+                let registry = super::super::Registry::build_for_selection(config.as_ref(), &credentials, &facts, crate::now_ms(), Some(name));
+                assert_eq!(registry.can_run("declaring", &key, &key), admitted, "{name}: {key}");
+            }
+        }
+        let mut params = request(json!({"iq":0}));
+        params["available_routes"] = json!([key]);
+        let answer = selected(route.call("route.select", &params).await);
+        assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+    }).await;
+}
+
+#[tokio::test]
+async fn harness_choice_output_need_uses_declared_and_operator_defaults() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}, {"module":"legacy"}]));
+        install(&harness, "declaring", &slot(json!({"primary":{"capabilities":["one_off"]}})));
+        install(&harness, "legacy", &slot(json!({})));
+        let owner = cortexkit_role_routing_conformance::fixture::CONSUMER.trim_start_matches("reserved:");
+        crate::routing_v1::consumers::replace_catalog(&json!([{
+            "module_id":owner,"nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"harness_choice_test","max_output_tokens":1}]}}
+        }]));
+        let declared = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        assert_eq!(declared["runner"]["module"], "legacy", "{declared}");
+        crate::routing_v1::consumers::replace_catalog(&json!([]));
+        harness.edit_config(|config| config["consumers"]["harness_choice_test"]["max_output_tokens"] = json!(1));
+        let operator = selected(route.call("route.select", &request(json!({"iq":0}))).await);
+        assert_eq!(operator["runner"]["module"], "legacy", "{operator}");
+    }).await;
+}
+
+#[tokio::test]
+async fn harness_choice_broca_fixture_never_hosts_output_limited_tasks() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"broca"}, {"module":"legacy"}]));
+        let fixture =
+            serde_json::from_slice(include_bytes!("broca-runner-slot.after.json")).unwrap();
+        install(&harness, "broca", &fixture);
+        install(&harness, "legacy", &slot(json!({})));
+        let answer = selected(
+            route
+                .call(
+                    "route.select",
+                    &request(json!({"iq":0,"max_output_tokens":1})),
+                )
+                .await,
+        );
+        assert_eq!(answer["runner"]["module"], "legacy", "{answer}");
+        harness.edit_config(|config| config["runners"] = json!([{"module":"broca"}]));
+        refused(
+            route
+                .call(
+                    "route.select",
+                    &request(json!({"iq":0,"max_output_tokens":1})),
+                )
+                .await,
+            "harness_unavailable",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn harness_choice_what_if_exclusion_filters_only_the_disposable_overlay() {
+    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"broca"}]));
+        install(&harness, "broca", &slot(json!({})));
+        let params = request(json!({"iq":0}));
+        let live = selected(route.call("route.select", &params).await);
+        let key = format!("{}/{}", live["route"]["provider"].as_str().unwrap(), live["route"]["model"].as_str().unwrap());
+        let operator = harness.bind(json!({"kind":"direct"}), None).await;
+        let overlay = slot(json!({"primary":{"exclude":[key]},"secondary":{"exclude":[key]},"inherited":{"exclude":[key]}}));
+        let reply = operator.call("route.what_if", &json!({"consumer":"harness_choice_test","iqs":[0],"runner":"broca","runner_declarations":{"broca":overlay}})).await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        let pick = &reply.1["result"]["results"][0]["pick"]["route"];
+        assert!(pick.is_string(), "{}", reply.1);
+        assert_ne!(pick, &json!(key), "{}", reply.1);
+        let after = selected(route.call("route.select", &params).await);
+        assert_eq!(after["route"], live["route"]);
+        assert_eq!(after["runner"], live["runner"]);
+    }).await;
+}

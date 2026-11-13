@@ -788,17 +788,18 @@ async fn prepare_selection(
                     })
                     .unwrap_or_default();
             }
-            super::runners::Registry::build_for_selection(
+            super::runners::Registry::build_for_task(
                 operator_config.as_ref(),
                 &credentials,
                 &facts,
                 now as u64,
                 request.harness.as_deref(),
+                &request.requirements,
             )
         })
         .unwrap_or_default();
     let runners: Vec<RunnerPolicy> = registry
-        .policies()
+        .task_policies()
         .into_iter()
         .filter(|runner| {
             consumer_policy
@@ -831,6 +832,17 @@ async fn prepare_selection(
         } else {
             Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
+    }
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|runner| {
+            registry
+                .get(&runner.module)
+                .is_some_and(|runner| runner.hosts_task())
+        })
+        .collect();
+    if runners.is_empty() {
+        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1880,10 +1892,13 @@ async fn select_at_tier_attempt(
         }
         runner_ref = runner_ref.with_auth(auth);
     }
-    if let Some(harness) = registry
-        .get(&runner.module)
-        .and_then(|runner| runner.selection_harness(request.harness.as_deref()))
-    {
+    if let Some(harness) = registry.get(&runner.module).and_then(|runner| {
+        runner.harness_for_route(
+            request.harness.as_deref(),
+            &selected.route_key,
+            &selected.capacity_key,
+        )
+    }) {
         runner_ref = runner_ref.with_harness(harness);
     }
     let mut answer = SelectAnswer::new(
