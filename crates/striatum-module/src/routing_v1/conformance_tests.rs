@@ -1424,10 +1424,25 @@ const ROUTING_EXTENSIONS: &[&str] = &["service_tier_settings", "account_continue
 async fn routing_v1_conformance_kit_matches_served_checks() {
     let advertised: std::collections::BTreeSet<_> =
         super::describe::CAPABILITIES.iter().copied().collect();
-    let known: std::collections::BTreeSet<_> =
-        cortexkit_role_routing::capabilities::KNOWN.iter().copied().collect();
+    let known: std::collections::BTreeSet<_> = cortexkit_role_routing::capabilities::KNOWN
+        .iter()
+        .copied()
+        .collect();
+    let expected: std::collections::BTreeSet<_> = known
+        .iter()
+        .copied()
+        .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
+        .chain(ROUTING_EXTENSIONS.iter().copied())
+        .collect();
+    assert_eq!(
+        advertised, expected,
+        "only the named pending readers may be unadvertised"
+    );
     for group in ROUTING_EXTENSIONS {
-        assert!(!known.contains(group), "extension {group} is now a contract group");
+        assert!(
+            !known.contains(group),
+            "extension {group} is now a contract group"
+        );
     }
     for (group, _) in PENDING_READERS {
         assert!(known.contains(group), "unknown pending group {group}");
@@ -1436,12 +1451,6 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
             "served group {group} still marked pending"
         );
     }
-    let expected: std::collections::BTreeSet<_> = known
-        .into_iter()
-        .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
-        .chain(ROUTING_EXTENSIONS.iter().copied())
-        .collect();
-    assert_eq!(advertised, expected);
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("kit")),
     };
@@ -1474,11 +1483,112 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         );
     }
     assert!(report.failing().is_empty(), "{}", report.render());
-    let expected_not_applicable: Vec<_> = NOT_APPLICABLE.iter().copied()
-        .chain(PENDING_READERS.iter().map(|(_, case)| *case)).collect();
+    let expected_not_applicable: Vec<_> = NOT_APPLICABLE
+        .iter()
+        .copied()
+        .chain(PENDING_READERS.iter().map(|(_, case)| *case))
+        .collect();
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
     assert_eq!(actual, expected, "{}", report.render());
+}
+
+#[tokio::test]
+async fn candidate_capabilities_reach_readers_without_leaking_to_production_calls() {
+    use cortexkit_role_routing::capabilities::{
+        CONSUMER_DECLARATIONS, REPORT_ATTEMPT_OUTCOMES, SELECT_ELIGIBLE_ROUTES,
+    };
+    let groups = [
+        CONSUMER_DECLARATIONS,
+        SELECT_ELIGIBLE_ROUTES,
+        REPORT_ATTEMPT_OUTCOMES,
+    ];
+    let harness = Harness::new("candidate-capabilities");
+    let slot = json!({
+        "consumers": [{"name":"example-consumer.task", "iq":40}],
+        "runner": {"pairs":[{"wire_api":"openai.chat", "auth_method":"apikey"}]}
+    });
+    let catalog = json!([{
+        "module_id":"example-consumer", "nonce_verified":true,
+        "role_declarations":{"routing/v1":slot}
+    }]);
+    let select =
+        json!({"consumer":"example-consumer.task", "requirements":{"iq":40}, "eligible_routes":[]});
+    let report = json!({"decision_id":"missing", "outcome":"cancelled", "attempt_outcome":{"status":"rejected"}});
+    let production = || {
+        assert_eq!(
+            super::describe::capabilities().as_ref(),
+            super::describe::CAPABILITIES
+        );
+        assert!(!super::consumers::Catalog::from_catalog(&catalog)
+            .effective(&harness.operator_config())
+            .knows("example-consumer.task"));
+        assert!(super::runners::parse_declaration(&slot).is_err());
+        assert!(
+            cortexkit_role_routing::select::parse_select_request_serving(
+                &select,
+                &super::describe::capabilities()
+            )
+            .is_err()
+        );
+        assert!(
+            cortexkit_role_routing::report::parse_report_request_serving(
+                &report,
+                &super::describe::capabilities()
+            )
+            .is_err()
+        );
+    };
+    production();
+    super::describe::with_candidate_capabilities(&groups, async {
+        assert!(super::consumers::Catalog::from_catalog(&catalog)
+            .effective(&harness.operator_config())
+            .knows("example-consumer.task"));
+        // Live runner catalogs and route.what_if's runner_declarations overlay
+        // use this same slot decoder to read a proposed runner declaration.
+        assert!(super::runners::parse_declaration(&slot).unwrap().is_some());
+        assert!(
+            cortexkit_role_routing::select::parse_select_request_serving(
+                &select,
+                &super::describe::capabilities()
+            )
+            .is_ok()
+        );
+        assert!(
+            cortexkit_role_routing::report::parse_report_request_serving(
+                &report,
+                &super::describe::capabilities()
+            )
+            .is_ok()
+        );
+        let candidate_route = harness.bind(reserved("example-consumer"), None).await;
+        let candidate = candidate_route.call("role.describe", &json!({})).await;
+        assert_eq!(candidate.0, FrameType::Response, "{candidate:?}");
+        for group in groups {
+            assert!(candidate.1["result"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(group)));
+        }
+        let harness = harness.clone();
+        let served = tokio::spawn(async move {
+            assert_eq!(
+                super::describe::capabilities().as_ref(),
+                super::describe::CAPABILITIES
+            );
+            let route = harness.bind(reserved("example-consumer"), None).await;
+            route.call("role.describe", &json!({})).await
+        })
+        .await
+        .unwrap();
+        assert_eq!(served.0, FrameType::Response, "{served:?}");
+        let advertised = served.1["result"]["capabilities"].as_array().unwrap();
+        for group in groups {
+            assert!(!advertised.contains(&json!(group)), "{served:?}");
+        }
+    })
+    .await;
+    production();
 }
 
 #[tokio::test]

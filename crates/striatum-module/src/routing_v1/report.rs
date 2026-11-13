@@ -49,7 +49,7 @@ pub(super) fn report_at(
 ) -> Result<Value, Refusal> {
     super::refuse_unknown_members(params, MEMBERS)?;
     super::shapes::closed(params, "eligibility", &["scope", "code"])?;
-    let request = parse_report_request_serving(params, super::describe::CAPABILITIES)?;
+    let request = parse_report_request_serving(params, &super::describe::capabilities())?;
     let decision = deps
         .store
         .v1_decision(&request.decision_id)

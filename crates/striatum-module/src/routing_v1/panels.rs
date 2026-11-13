@@ -47,7 +47,7 @@ pub(super) async fn select_panel(
     }
     super::shapes::settings(params)?;
     super::shapes::closed(params, "requirements", &["context_window", "modalities"])?;
-    let request = parse_select_panel_request_serving(params, super::describe::CAPABILITIES)?;
+    let request = parse_select_panel_request_serving(params, &super::describe::capabilities())?;
     let config = operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
     let policy = request_policy(&request, &config)?;

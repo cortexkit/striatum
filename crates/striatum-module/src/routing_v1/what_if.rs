@@ -290,7 +290,7 @@ fn panel_requests(
                 params["seed"] = seed.clone();
             }
             let request =
-                parse_select_panel_request_serving(&params, super::describe::CAPABILITIES)?;
+                parse_select_panel_request_serving(&params, &super::describe::capabilities())?;
             let policy = super::panels::request_policy(&request, operator)?;
             let configured = crate::panel_policy::configured_class_policy(
                 operator.panels(),

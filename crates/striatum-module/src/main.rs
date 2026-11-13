@@ -1512,7 +1512,7 @@ async fn handle_frame(
             let operator_config_path = operator_config_path.to_path_buf();
             let broca_credentials = Arc::clone(broca_credentials);
             let (ver, channel, corr) = (frame.header.ver, frame.header.channel, frame.header.corr);
-            tokio::spawn(async move {
+            let handler = async move {
                 answer_route_request(&writer, ver, channel, route_epoch, corr, |reply| {
                     run_route_handler_off_async_workers(async move {
                         routing_v1::record_call(&frame.body, channel, route_epoch, &store)?;
@@ -1592,7 +1592,10 @@ async fn handle_frame(
                     })
                 })
                 .await;
-            });
+            };
+            #[cfg(test)]
+            let handler = routing_v1::inherit_capabilities(handler);
+            tokio::spawn(handler);
             Ok(true)
         }
         _ => Ok(true),
@@ -1683,6 +1686,8 @@ where
     F: std::future::Future<Output = Result<(), ModuleError>> + Send + 'static,
 {
     let runtime = tokio::runtime::Handle::current();
+    #[cfg(test)]
+    let handler = routing_v1::inherit_capabilities(handler);
     #[cfg(test)]
     let test_thread = TestThreadState::capture();
     let outcome = tokio::task::spawn_blocking(move || {

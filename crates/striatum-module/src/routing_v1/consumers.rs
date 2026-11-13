@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock, RwLock};
 
-use cortexkit_role_routing::declarations::{parse_consumer_declarations, DemandDefaults};
+use cortexkit_role_routing::declarations::{parse_consumer_declarations_serving, DemandDefaults};
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::Value;
 
@@ -124,7 +124,7 @@ impl Catalog {
             else {
                 continue;
             };
-            match parse_consumer_declarations(slot) {
+            match parse_consumer_declarations_serving(slot, &super::describe::capabilities()) {
                 Ok(declarations) => {
                     catalog.modules.insert(
                         module.to_owned(),

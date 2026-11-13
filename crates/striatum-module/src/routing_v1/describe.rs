@@ -44,6 +44,52 @@ pub(super) const CAPABILITIES: &[&str] = &[
     ACCOUNT_CONTINUE_RESUME,
 ];
 
+/// Advertisement and serving validation share the same list. Production always
+/// borrows the advertised groups; candidate readers can only be enabled by tests.
+pub(crate) fn capabilities() -> std::borrow::Cow<'static, [&'static str]> {
+    #[cfg(test)]
+    if let Ok(candidate) = CANDIDATE_CAPABILITIES.try_with(Clone::clone) {
+        return std::borrow::Cow::Owned(candidate);
+    }
+    std::borrow::Cow::Borrowed(CAPABILITIES)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static CANDIDATE_CAPABILITIES: Vec<&'static str>;
+}
+
+/// A task-local scope cannot change another request's groups, even when the
+/// requests run on the same thread. Dropping the future also drops the override.
+#[cfg(test)]
+pub(super) async fn with_candidate_capabilities<T>(
+    groups: &[&'static str],
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let mut candidate = capabilities().into_owned();
+    for group in groups {
+        if !candidate.contains(group) {
+            candidate.push(group);
+        }
+    }
+    CANDIDATE_CAPABILITIES.scope(candidate, future).await
+}
+
+/// Capture the test request's scope before dispatch moves it to another task
+/// or the blocking pool. Unrelated requests keep their own capability list.
+#[cfg(test)]
+pub(crate) fn inherit_capabilities<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let candidate = CANDIDATE_CAPABILITIES.try_with(Clone::clone).ok();
+    async move {
+        match candidate {
+            Some(candidate) => CANDIDATE_CAPABILITIES.scope(candidate, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Params are ignored: the role defines `{}` and no refusal for this op.
 pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
     let config = operator_config(deps);
@@ -63,12 +109,13 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .collect();
     // A `detail: true` select is answered with the selection's explanation
     // lines, rejections and score.
-    let mut describe = CAPABILITIES.iter().fold(
+    let capabilities = capabilities();
+    let mut describe = capabilities.iter().fold(
         RoleDescribe::new(consumers, true),
         |describe, capability| describe.with_capability(*capability),
     );
     for &(op, group) in cortexkit_role_routing::capabilities::OP_GROUPS {
-        if CAPABILITIES.contains(&group) && !describe.ops.iter().any(|name| name == op) {
+        if capabilities.contains(&group) && !describe.ops.iter().any(|name| name == op) {
             describe.ops.push(op.into());
         }
     }
