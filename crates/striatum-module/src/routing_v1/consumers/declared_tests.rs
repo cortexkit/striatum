@@ -13,29 +13,29 @@ async fn declared_names_check_identity_after_schema_and_keep_null_transition_def
             json!({"kind": "llm"}),
         ] {
             let mut outside = member.clone();
-            outside["name"] = json!("owner_task");
+            outside["name"] = json!("callosum_task");
             outside["eq"] = json!(17);
             let catalog = Catalog::from_catalog(&json!([{
-                "module_id": "owner", "nonce_verified": true,
+                "module_id": "callosum", "nonce_verified": true,
                 "role_declarations": {"routing/v1": {"consumers": [
                     outside,
-                    {"name": "owner", "iq": 0},
-                    {"name": "owner.task", "selectors": []},
-                    {"name": "legacy", "eq": 22},
+                    {"name": "callosum", "iq": 0},
+                    {"name": "callosum.task", "selectors": []},
+                    {"name": "phone.media", "eq": 22},
                     {"name": "null-legacy", "eq": 33, "iq": null, "ladder": null,
                      "placement": null, "selectors": null, "kind": null}
                 ]}}
             }]));
-            let names = &catalog.modules["owner"];
-            assert!(!names.contains_key("owner_task"), "{member}");
-            assert!(names.contains_key("owner"));
-            assert!(names.contains_key("owner.task"));
-            for (name, eq) in [("legacy", 22), ("null-legacy", 33)] {
+            let names = &catalog.modules["callosum"];
+            assert!(!names.contains_key("callosum_task"), "{member}");
+            assert!(names.contains_key("callosum"));
+            assert!(names.contains_key("callosum.task"));
+            for (name, eq) in [("phone.media", 22), ("null-legacy", 33)] {
                 assert!(
                     catalog.issues.iter().any(|issue| {
                         issue.contains("transitional")
                             && issue.contains(&format!("consumer {name:?}"))
-                            && issue.contains("from module \"owner\"")
+                            && issue.contains("from module \"callosum\"")
                     }),
                     "{name}: {:?}",
                     catalog.issues
@@ -52,8 +52,8 @@ async fn declared_names_check_identity_after_schema_and_keep_null_transition_def
             assert!(catalog
                 .issues
                 .iter()
-                .any(|issue| issue.contains("ignored consumer \"owner_task\"")
-                    && issue.contains("owner")));
+                .any(|issue| issue.contains("ignored consumer \"callosum_task\"")
+                    && issue.contains("callosum")));
             assert_eq!(
                 catalog
                     .issues
@@ -65,9 +65,9 @@ async fn declared_names_check_identity_after_schema_and_keep_null_transition_def
         }
         // An invalid schema still refuses the whole slot before identity checks.
         let invalid = Catalog::from_catalog(&json!([{
-            "module_id": "owner", "nonce_verified": true,
+            "module_id": "callosum", "nonce_verified": true,
             "role_declarations": {"routing/v1": {"consumers": [
-                {"name": "outside", "iq": 101}, {"name": "owner.task", "iq": 40}
+                {"name": "outside", "iq": 101}, {"name": "callosum.task", "iq": 40}
             ]}}
         }]));
         assert!(invalid.modules.is_empty());
