@@ -61,16 +61,22 @@ impl Registry {
         let mut registry = Self::build_for_selection(source, credentials, facts, now_ms, requested);
         let needs = task_needs(requirements);
         for (entry, policy) in registry.entries.iter_mut().zip(original) {
-            let Some(declaration) = entry
+            let declaring = entry
                 .wire_declaration
                 .as_ref()
-                .filter(|declaration| declaration.declares_harness_facts())
-            else {
-                // Without declared facts, route reachability uses the default
-                // harness alone. Trying another harness after the default
-                // refuses a route would change existing picks.
+                .is_some_and(|declaration| declaration.declares_harness_facts());
+            let unbound_legacy = !declaring
+                && requested.is_none()
+                && !entry.harnesses.is_empty()
+                && entry.selection_harness(None).is_none()
+                && super::super::describe::capabilities()
+                    .contains(&cortexkit_role_routing::capabilities::DECISION_HARNESS);
+            if !declaring && !unbound_legacy {
+                // A legacy default keeps its existing reach: another harness
+                // must not rescue a route that the default refuses. A runner
+                // declaring no harnesses also keeps its unnamed wire shape.
                 continue;
-            };
+            }
             let mut names = Vec::new();
             if let Some(requested) = requested {
                 if entry.harnesses.iter().any(|name| name == requested) {
@@ -87,12 +93,15 @@ impl Registry {
             let candidates = names
                 .into_iter()
                 .filter(|name| {
-                    declaration
-                        .limits_for_harness(Some(name))
-                        .is_ok_and(|limits| limits.starts_sessions == Some(true))
-                        && needs
-                            .iter()
-                            .all(|need| declaration.harness_supports(name, need))
+                    !declaring
+                        || entry.wire_declaration.as_ref().is_some_and(|declaration| {
+                            declaration
+                                .limits_for_harness(Some(name))
+                                .is_ok_and(|limits| limits.starts_sessions == Some(true))
+                                && needs
+                                    .iter()
+                                    .all(|need| declaration.harness_supports(name, need))
+                        })
                 })
                 .map(|harness| Candidate {
                     runner: Self::build_for_harness(

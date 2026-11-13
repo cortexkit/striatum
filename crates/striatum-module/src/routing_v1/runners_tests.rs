@@ -1337,26 +1337,38 @@ async fn unrequested_harness_uses_declared_default_or_single_program() {
 }
 
 #[tokio::test]
-async fn multiple_programs_without_default_never_guess_the_first() {
-    let harness = Harness::new("ambiguous-program");
-    let mut catalog = fixture::catalog();
-    catalog.runners[0].default_harness = None;
-    install_catalog(&harness, &catalog);
-    let caller = harness.bind(reserved("example-consumer"), None).await;
-    let reply = caller
-        .call(
-            "route.select",
-            &json!({
+async fn ambiguous_legacy_program_is_unnamed_until_decision_harness_then_uses_declared_order() {
+    super::describe::with_candidate_capabilities(
+        &[cortexkit_role_routing::capabilities::DECISION_HARNESS],
+        async {
+            let harness = Harness::new("ambiguous-program");
+            let mut catalog = fixture::catalog();
+            catalog.runners[0].default_harness = None;
+            install_catalog(&harness, &catalog);
+            let caller = harness.bind(reserved("example-consumer"), None).await;
+            // Harness-order ruling R2: only decision_harness binds the first admitting declared harness.
+            let params = json!({
                 "consumer":"mason", "requirements":{"iq":0}, "runners":["runner-one"]
-            }),
-        )
-        .await;
-    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
-    assert_eq!(reply.1["result"]["runner"]["module"], "runner-one");
-    assert!(
-        reply.1["result"]["runner"].get("harness").is_none(),
-        "{reply:?}"
-    );
+            });
+            let reply = super::describe::without_capability(
+                cortexkit_role_routing::capabilities::DECISION_HARNESS,
+                caller.call("route.select", &params),
+            )
+            .await;
+            assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+            assert_eq!(reply.1["result"]["runner"]["module"], "runner-one");
+            assert!(
+                reply.1["result"]["runner"].get("harness").is_none(),
+                "{reply:?}"
+            );
+            let bound = caller.call("route.select", &params).await;
+            assert_eq!(bound.0, FrameType::Response, "{bound:?}");
+            assert_eq!(bound.1["result"]["runner"]["module"], "runner-one");
+            assert_eq!(bound.1["result"]["runner"]["harness"], "alpha");
+            assert_eq!(bound.1["result"]["route"], reply.1["result"]["route"]);
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
