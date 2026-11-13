@@ -47,7 +47,20 @@ mod account_writer {
         let operator = harness.bind(json!({"kind":"direct"}), None).await;
         let store = harness.store();
         let outside = store.outside_account_writer_count_for_test();
-        let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}")})).await;
+        let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}"),"affinity":"writer-coverage"})).await;
+        let affinities: i64 = store
+            .with_reader_for_test(|conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM routing_v1_affinity WHERE decision_id=?1",
+                    [selected["decision_id"].as_str().unwrap()],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            affinities, 1,
+            "selection coverage must include a real account affinity write"
+        );
         let admission = json!({"provider":POOL,"model":POOL_MODEL_SHORT,"decision_id":selected["decision_id"],"conversation_key":"writer-coverage","admission_id":"writer-coverage"});
         let admitted = ok(&runner, "route.account_for", admission.clone()).await;
         assert_eq!(ok(&runner, "route.account_for", admission).await, admitted);
