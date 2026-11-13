@@ -140,6 +140,7 @@ async fn estimate_maps_reasoning_and_zero_cache_buckets_without_role_fallbacks()
         .await
         .unwrap();
     assert_eq!(answer["price"]["estimated_task_usd"], json!(18.4));
+    checked(&params, &answer);
     assert!(answer["price"]["rates_per_mtok"]
         .get("cache_read")
         .is_none());
@@ -152,6 +153,7 @@ async fn estimate_maps_reasoning_and_zero_cache_buckets_without_role_fallbacks()
         .unwrap();
     assert!(no_rate.get("price").is_some());
     assert!(no_rate["price"].get("estimated_task_usd").is_none());
+    checked(&params, &no_rate);
     input.list_rates.insert(
         A.into(),
         RatesPerMtok::new(4.into(), 20.into())
@@ -190,6 +192,7 @@ async fn kit_estimate_facts_become_tokens_not_an_echoed_reserve() {
     let params = request(C);
     let first = route.select_with_profiles(&params, &lookup).await.unwrap();
     assert_eq!(first["price"]["estimated_task_usd"], 1, "{first}");
+    checked(&params, &first);
     input
         .list_rates
         .insert(C.into(), RatesPerMtok::new(20.into(), 200.into()));
@@ -515,6 +518,8 @@ async fn panel_seats_share_select_price_and_capability_gate() {
     .unwrap();
     let off =
         super::super::describe::without_price(route.call("route.select_panel", &params)).await;
+    assert_eq!(off.0, FrameType::Response, "{off:?}");
+    assert_eq!(off.1["result"]["seats"].as_array().unwrap().len(), 1);
     assert!(off.1["result"]["seats"][0]["answer"].get("price").is_none());
 }
 
@@ -594,4 +599,5 @@ async fn answer_thresholds_use_request_size_before_context_and_profile() {
         .unwrap();
     assert_eq!(answer["price"]["rates_per_mtok"]["input"], 40);
     assert_eq!(answer["price"]["estimated_task_usd"], 12);
+    checked(&params, &answer);
 }
