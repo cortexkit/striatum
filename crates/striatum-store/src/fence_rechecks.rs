@@ -2,14 +2,15 @@
 //! consuming them; admission claims every applicable clock in one transaction.
 
 use crate::{err, AccountTx, SqliteRouteStateStore};
-use striatum_core::RouteStateResult;
 use rusqlite::{params, Connection, OptionalExtension};
+use striatum_core::blocks::{Block, Cause, LifetimeClass, Origin, Scope};
+use striatum_core::RouteStateResult;
 
 pub use striatum_core::fence_lifetimes::{
     NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRecheck {
     pub evidence: String,
     pub kind: String,
@@ -49,6 +50,23 @@ impl QuotaSuccessScope {
 }
 
 impl FenceRecheck {
+    pub fn origin(&self) -> Origin<'_> {
+        Origin {
+            kind: &self.kind,
+            scope: Scope {
+                provider: &self.provider,
+                account_id: self.account_id.as_deref(),
+                credential_id: self.credential_id.as_deref(),
+                model: self.model.as_deref(),
+                size_class: self.size_class,
+                principal: self.principal.as_deref(),
+                admission_id: self.admission_id.as_deref(),
+            },
+            lifetime: LifetimeClass::from_quota(self.quota),
+            cleared_models: &self.cleared_models,
+        }
+    }
+
     pub fn quota_group_due<'a>(
         origins: impl IntoIterator<Item = &'a Self>,
         now: i64,
@@ -233,7 +251,7 @@ fn upsert_clocks(conn: &Connection, kind: Option<&str>, key: Option<&str>) -> ru
     Ok(())
 }
 
-fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
+pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     let mut quarantined = Vec::new();
     for (table, key, kind) in [
         ("model_route_state", "route_key", "route"),
@@ -312,6 +330,10 @@ pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
 /// Overlay newly written evidence for scoring without opening a writer.
 /// Admission materializes and claims their durable schedules atomically.
 pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
+    read_effective_at(conn, crate::now_ms())
+}
+
+fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
     if !enabled(conn)? {
         return Ok(Vec::new());
     }
@@ -358,7 +380,7 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
         let quota = row.get::<_, Option<bool>>(11)?.unwrap_or(false);
         let deadline = row.get::<_, Option<f64>>(12)?.map(|at| at as i64);
         let reset = row.get::<_, Option<f64>>(13)?.map(|at| at as i64);
-        if !quota && deadline.is_some_and(|at| at < crate::now_ms()) {
+        if !quota && deadline.is_some_and(|at| at < now) {
             continue;
         }
         let last_claimed_at = prior.and_then(|(_, claimed, _)| *claimed);
@@ -400,6 +422,187 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
             .filter(|origin| origin.kind == "observation"),
     );
     Ok(effective)
+}
+
+/// Source evidence and clocks loaded without modifying either. Cleared evidence
+/// is kept separately so a rehearsal can account for cleared entries as well.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedBlocks {
+    pub blocks: Vec<Block>,
+    pub cleared_evidence: Vec<Block>,
+}
+
+impl From<&Block> for FenceRecheck {
+    fn from(block: &Block) -> Self {
+        Self {
+            kind: block.kind.clone(),
+            origin_key: block.origin_key.clone(),
+            provider: block.scope.provider.clone(),
+            account_id: block.scope.account_id.clone(),
+            credential_id: block.scope.credential_id.clone(),
+            model: block.scope.model.clone(),
+            size_class: block.scope.size_class,
+            principal: block.scope.principal.clone(),
+            admission_id: block.scope.admission_id.clone(),
+            evidence: block.evidence.clone(),
+            evidence_at: block.evidence_at,
+            quota: block.lifetime == LifetimeClass::Quota,
+            classified: block.classified,
+            next_recheck_at: block.next_recheck_at,
+            reset_check_at: block.reset_check_at,
+            last_claimed_at: block.last_claimed_at,
+            claim_owner: block.claim_owner.clone(),
+            cleared_models: block.cleared_models.clone(),
+        }
+    }
+}
+
+fn cause(kind: &str) -> rusqlite::Result<Cause> {
+    Cause::for_kind(kind)
+        .ok_or_else(|| rusqlite::Error::InvalidParameterName(format!("unknown block kind {kind}")))
+}
+
+fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
+    if !enabled(conn)? {
+        return Ok(LoadedBlocks::default());
+    }
+    let mut clocks = std::collections::BTreeMap::new();
+    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at FROM fence_recheck")?;
+    for row in statement.query_map([], |r| {
+        let kind: String = r.get(0)?;
+        Ok((
+            Block {
+                cause: cause(&kind)?,
+                kind,
+                origin_key: r.get(1)?,
+                scope: Scope {
+                    provider: r.get(2)?,
+                    account_id: r.get(3)?,
+                    credential_id: r.get(4)?,
+                    model: r.get(5)?,
+                    size_class: r.get(6)?,
+                    principal: r.get(7)?,
+                    admission_id: r.get(8)?,
+                },
+                evidence: r.get(9)?,
+                evidence_at: r.get(10)?,
+                lifetime: LifetimeClass::from_quota(r.get(11)?),
+                classified: r.get(12)?,
+                next_recheck_at: r.get(13)?,
+                reset_check_at: r.get(14)?,
+                last_claimed_at: r.get(15)?,
+                claim_owner: r.get(16)?,
+                claim_generation: r.get(17)?,
+                cleared_models: Vec::new(),
+            },
+            r.get::<_, Option<i64>>(18)?,
+        ))
+    })? {
+        let (block, cleared) = row?;
+        clocks.insert(
+            (block.kind.clone(), block.origin_key.clone()),
+            (block, cleared),
+        );
+    }
+    let mut statement = conn.prepare(
+        "SELECT kind,origin_key,evidence,model FROM fence_recheck_route_clear ORDER BY model",
+    )?;
+    for row in statement.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })? {
+        let (kind, key, evidence, model) = row?;
+        if let Some((block, _)) = clocks.get_mut(&(kind, key)) {
+            if block.evidence == evidence {
+                block.cleared_models.push(model);
+            }
+        }
+    }
+    let quarantined = quarantined_origins(conn)?;
+    let mut loaded = LoadedBlocks::default();
+    loaded.cleared_evidence = clocks
+        .values()
+        .filter(|(_, cleared)| cleared.is_some())
+        .map(|(block, _)| block.clone())
+        .collect();
+    // The view projects the source tables, not the clock. An unchanged source
+    // signature selects the stored class and schedule; a new one derives them.
+    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
+    let mut rows = statement.query([])?;
+    while let Some(r) = rows.next()? {
+        let kind: String = r.get(0)?;
+        let key: String = r.get(1)?;
+        if quarantined.contains(&(kind.clone(), key.clone())) {
+            continue;
+        }
+        let prior = clocks.remove(&(kind.clone(), key.clone()));
+        let evidence: String = r.get(9)?;
+        if let Some((block, cleared)) = &prior {
+            if block.evidence == evidence {
+                if cleared.is_none() {
+                    loaded.blocks.push(block.clone());
+                }
+                continue;
+            }
+        }
+        let evidence_at: i64 = r.get(10)?;
+        let quota = r.get::<_, Option<bool>>(11)?.unwrap_or(false);
+        let deadline = r.get::<_, Option<f64>>(12)?.map(|at| at as i64);
+        if !quota && deadline.is_some_and(|at| at < now) {
+            continue;
+        }
+        let last_claimed_at = prior.as_ref().and_then(|(b, _)| b.last_claimed_at);
+        let mut next = if quota {
+            evidence_at.saturating_add(QUOTA_FENCE_RECHECK_MS)
+        } else {
+            let cap = evidence_at.saturating_add(NON_QUOTA_FENCE_MAX_MS);
+            deadline.unwrap_or(cap).min(cap)
+        };
+        if last_claimed_at.is_some_and(|at| evidence_at < at) {
+            next = next.max(prior.as_ref().unwrap().0.next_recheck_at);
+        }
+        let reset = r
+            .get::<_, Option<f64>>(13)?
+            .map(|at| at as i64)
+            .filter(|at| {
+                quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
+            });
+        loaded.blocks.push(Block {
+            cause: cause(&kind)?,
+            kind,
+            origin_key: key,
+            scope: Scope {
+                provider: r.get(2)?,
+                account_id: r.get(3)?,
+                credential_id: r.get(4)?,
+                model: r.get(5)?,
+                size_class: r.get(6)?,
+                principal: r.get(7)?,
+                admission_id: r.get(8)?,
+            },
+            lifetime: LifetimeClass::from_quota(quota),
+            classified: false,
+            evidence,
+            evidence_at,
+            next_recheck_at: next,
+            reset_check_at: reset,
+            last_claimed_at,
+            claim_owner: None,
+            claim_generation: 0,
+            cleared_models: Vec::new(),
+        });
+    }
+    loaded.blocks.extend(
+        clocks
+            .into_values()
+            .filter(|(block, cleared)| block.kind == "observation" && cleared.is_none())
+            .map(|(block, _)| block),
+    );
+    Ok(loaded)
 }
 
 pub(crate) fn claim(
@@ -525,6 +728,70 @@ fn claim_owned(
 }
 
 impl SqliteRouteStateStore {
+    pub fn load_blocks(&self, now: i64) -> RouteStateResult<LoadedBlocks> {
+        self.store
+            .with_read(|conn| load_blocks(conn, now))
+            .map_err(err)
+    }
+
+    /// Boundary domain includes source deadlines even when a stored clock has
+    /// capped them, and all persisted probe clocks, each with its neighbours.
+    pub fn block_parity_times(&self, now: i64) -> RouteStateResult<Vec<i64>> {
+        self.store
+            .with_read(|conn| Ok(parity_times(conn, now)?.into_iter().collect()))
+            .map_err(err)
+    }
+
+    pub fn block_parity_identities(&self) -> RouteStateResult<Vec<[String; 4]>> {
+        self.store.with_read(parity_identities).map_err(err)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn effective_blocks_oracle_for_test(
+        &self,
+        now: i64,
+    ) -> RouteStateResult<Vec<FenceRecheck>> {
+        self.store
+            .with_read(|conn| read_effective_at(conn, now))
+            .map_err(err)
+    }
+
+    /// Compare in one read snapshot, so a concurrent report cannot produce a
+    /// false difference between the adapter and the SQL oracle.
+    pub fn block_parity(&self, now: i64) -> RouteStateResult<BlockParity> {
+        self.store.with_read(|conn| {
+            let tx = conn;
+            let started = std::time::Instant::now();
+            let loaded = load_blocks(&tx, now)?;
+            let load_time = started.elapsed();
+            let rows = read_effective_at(&tx, now)?;
+            let mut report = BlockParity { load_time, active: loaded.blocks.len(), cleared_evidence: loaded.cleared_evidence.len(), identities: 0, combinations_per_identity: 0, function_comparisons: 0, differences: Vec::new() };
+            let canonical = |rows: Vec<FenceRecheck>| -> std::collections::BTreeMap<_,_> {
+                rows.into_iter().map(|mut row| {
+                    row.cleared_models.sort();
+                    ((row.kind.clone(), row.origin_key.clone()),row)
+                }).collect()
+            };
+            let expected = canonical(rows);
+            let actual = canonical(loaded.blocks.iter().map(FenceRecheck::from).collect());
+            for key in expected.keys().chain(actual.keys()).collect::<std::collections::BTreeSet<_>>() {
+                if expected.get(key) != actual.get(key) {
+                    report.differences.push(format!("row {key:?}: SQL={:?}, block={:?}", expected.get(key), actual.get(key)));
+                }
+            }
+            for block in &loaded.blocks {
+                let clock: Option<(String,i64)> = tx.query_row("SELECT evidence,claim_generation FROM fence_recheck WHERE kind=?1 AND origin_key=?2", params![block.kind,block.origin_key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                if let Some((evidence,generation)) = clock {
+                    if evidence == block.evidence && generation != block.claim_generation {
+                        report.differences.push(format!("claim generation {} {}: clock={generation}, block={}",block.kind,block.origin_key,block.claim_generation));
+                    }
+                }
+            }
+            compare_block_functions(&tx, now, &expected, &loaded.blocks, &mut report)?;
+            Ok(report)
+        }).map_err(err)
+    }
+
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
         self.account_transaction(|tx| {
             tx.transfer_probe_authorization(from, to)?;
@@ -542,6 +809,193 @@ impl SqliteRouteStateStore {
         // Admission resyncs and claims the durable schedules atomically.
         self.store.with_read(read_effective).map_err(err)
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct BlockParity {
+    pub load_time: std::time::Duration,
+    pub active: usize,
+    pub cleared_evidence: usize,
+    pub identities: usize,
+    pub combinations_per_identity: usize,
+    pub function_comparisons: u64,
+    pub differences: Vec<String>,
+}
+
+fn parity_times(conn: &Connection, now: i64) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
+    let mut times = std::collections::BTreeSet::from([now]);
+    let mut statement = conn.prepare("SELECT next_recheck_at FROM fence_recheck UNION SELECT reset_check_at FROM fence_recheck UNION SELECT last_claimed_at FROM fence_recheck UNION SELECT deadline FROM fence_origin UNION SELECT reset_at FROM fence_origin")?;
+    for at in statement.query_map([], |r| r.get::<_, Option<f64>>(0))? {
+        if let Some(at) = at? {
+            let at = at as i64;
+            times.extend([at.saturating_sub(1), at, at.saturating_add(1)]);
+        }
+    }
+    Ok(times)
+}
+
+fn parity_identities(conn: &Connection) -> rusqlite::Result<Vec<[String; 4]>> {
+    use std::collections::BTreeSet;
+    let mut statement = conn.prepare("SELECT provider,account_id,credential_id,model FROM fence_origin UNION SELECT provider,account_id,credential_id,model FROM fence_recheck UNION SELECT provider,NULL,NULL,model FROM fence_recheck_route_clear")?;
+    let scopes: Vec<(String, Option<String>, Option<String>, Option<String>)> = statement
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut identities = BTreeSet::new();
+    for provider in scopes.iter().map(|s| &s.0).collect::<BTreeSet<_>>() {
+        let related: Vec<_> = scopes
+            .iter()
+            .filter(|s| s.0.is_empty() || &s.0 == provider)
+            .collect();
+        let accounts: BTreeSet<_> = related
+            .iter()
+            .filter_map(|s| s.1.as_deref())
+            .chain([""])
+            .collect();
+        let credentials: BTreeSet<_> = related
+            .iter()
+            .filter_map(|s| s.2.as_deref())
+            .chain([""])
+            .collect();
+        let models: BTreeSet<_> = related
+            .iter()
+            .filter_map(|s| s.3.as_deref())
+            .chain([""])
+            .collect();
+        for account in accounts {
+            for credential in &credentials {
+                for model in &models {
+                    identities.insert([
+                        provider.clone(),
+                        account.to_owned(),
+                        (*credential).to_owned(),
+                        (*model).to_owned(),
+                    ]);
+                }
+            }
+        }
+    }
+    Ok(identities.into_iter().collect())
+}
+
+fn compare_block_functions(
+    conn: &Connection,
+    now: i64,
+    rows: &std::collections::BTreeMap<(String, String), FenceRecheck>,
+    blocks: &[Block],
+    report: &mut BlockParity,
+) -> rusqlite::Result<()> {
+    use striatum_core::blocks::{self, Target};
+    let identities = parity_identities(conn)?;
+    let times = parity_times(conn, now)?;
+    report.identities = identities.len();
+    // Alias mapping, account-pool applicability, recovery and binding reading:
+    // all 16 boolean combinations, three owners and both continuation/media
+    // flags. The last two flags are deliberately inert in per-origin decisions.
+    report.combinations_per_identity = times.len() * 16 * 3 * 2 * 2;
+    let pairs: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| {
+            rows.get(&(block.kind.clone(), block.origin_key.clone()))
+                .map(|row| (block, row))
+        })
+        .collect();
+    for [provider, account, credential, model] in &identities {
+        let (provider, account, credential, model) = (
+            provider.as_str(),
+            account.as_str(),
+            credential.as_str(),
+            model.as_str(),
+        );
+        let target = Target {
+            provider,
+            account,
+            credential,
+            model,
+        };
+        for at in &times {
+            for mask in 0..16 {
+                for owner in 0..3 {
+                    for continuation in [false, true] {
+                        for media in [false, true] {
+                            let alias = mask & 1 != 0;
+                            let pool = mask & 2 != 0;
+                            let recovered = mask & 4 != 0;
+                            let binding = mask & 8 != 0;
+                            for (block, row) in &pairs {
+                                let named = row
+                                    .credential_id
+                                    .as_deref()
+                                    .filter(|_| {
+                                        (row.quota
+                                            || matches!(
+                                                row.kind.as_str(),
+                                                "account_route"
+                                                    | "non_quota_route"
+                                                    | "transient_route"
+                                            ))
+                                            && alias
+                                    })
+                                    .unwrap_or(credential);
+                                let old_targets = row.applies(provider, account, named, model);
+                                let new_targets = blocks::targets(
+                                    &block.origin(),
+                                    target,
+                                    alias.then_some(account),
+                                );
+                                let old_applies = row.principal.is_none()
+                                    && row.size_class.is_none()
+                                    && old_targets
+                                    && (row.kind != "account" || pool);
+                                let new_applies = blocks::origin_applies(
+                                    &block.origin(),
+                                    || new_targets,
+                                    || pool,
+                                );
+                                let owned = owner == 1 && row.claim_owner.is_some();
+                                let old_due = recovered
+                                    || ((row.due_at() <= *at || owned) && (!row.quota || !binding));
+                                let new_due = blocks::due(
+                                    block.lifetime,
+                                    recovered,
+                                    block.reset_check_at.map_or(block.next_recheck_at, |reset| {
+                                        reset.min(block.next_recheck_at)
+                                    }),
+                                    *at,
+                                    owned,
+                                    || binding,
+                                );
+                                let old_eligible = matches!(
+                                    row.kind.as_str(),
+                                    "account"
+                                        | "account_route"
+                                        | "non_quota_route"
+                                        | "transient_route"
+                                        | "observation"
+                                        | "route"
+                                        | "provider"
+                                        | "failure"
+                                ) || !old_applies
+                                    || old_due;
+                                let new_eligible =
+                                    blocks::eligible(&block.origin(), || new_applies, || new_due);
+                                let old_probe = old_applies && old_due;
+                                let new_probe = blocks::probe_eligible(new_applies, || new_due);
+                                report.function_comparisons += 3;
+                                if old_targets != new_targets
+                                    || old_applies != new_applies
+                                    || old_eligible != new_eligible
+                                    || old_probe != new_probe
+                                {
+                                    report.differences.push(format!("functions origin=({}, {}) identity={target:?} now={at} mask={mask} owner={owner} continuation={continuation} media={media}: targets {old_targets}/{new_targets}, applies {old_applies}/{new_applies}, eligible {old_eligible}/{new_eligible}, probe {old_probe}/{new_probe}",block.kind,block.origin_key));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // Start from the sparse authorization table, then look up each admission by
@@ -647,9 +1101,20 @@ impl AccountTx<'_> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        let expired = self.conn.prepare(EXPIRED_ADMISSION_PROBES).map_err(err)?
-            .query_map([now], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
-            .map_err(err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(err)?;
+        let expired = self
+            .conn
+            .prepare(EXPIRED_ADMISSION_PROBES)
+            .map_err(err)?
+            .query_map([now], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
         if expired.is_empty() {
             return Ok(());
         }
@@ -1060,6 +1525,70 @@ impl AccountTx<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn blocks_parity_rows_cover_all_kinds_states_and_lifetimes() {
+        let scratch = cortexkit_test_support::ScratchDir::new("block-parity");
+        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "block-parity",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let now = 1_900_000_000_000;
+        store.seed_block_parity_fixture_for_test(now);
+        store.assert_block_parity_fixture_coverage_for_test(now);
+        let report = store.block_parity(now).unwrap();
+        assert!(report.differences.is_empty(), "{report:#?}");
+        assert!(report.identities > 0 && report.function_comparisons > 0);
+        assert_eq!(
+            report.combinations_per_identity,
+            store.block_parity_times(now).unwrap().len() * 192
+        );
+    }
+
+    #[test]
+    fn blocks_parity_new_evidence_and_orphan_observation() {
+        let scratch = cortexkit_test_support::ScratchDir::new("block-parity-overlay");
+        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "block-parity-overlay",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let now = 1_900_000_000_000;
+        store.seed_block_parity_fixture_for_test(now);
+        store.with_writer_for_test(|conn| conn.execute_batch(&format!(r#"
+            UPDATE fence_recheck SET last_claimed_at={now},next_recheck_at={now}+900000 WHERE kind='credential' AND credential_id='oauth:cpu-0';
+            UPDATE credential_entitlement_fences SET code='new-refusal' WHERE credential_id='oauth:cpu-0';
+            DELETE FROM account_transient_backoff;
+            UPDATE pool_key_state SET wall_reason='new-evidence',walled_until={now}-1;
+        "#))).unwrap();
+        let loaded = store.load_blocks(now).unwrap();
+        let credential = loaded
+            .blocks
+            .iter()
+            .find(|b| {
+                b.kind == "credential" && b.scope.credential_id.as_deref() == Some("oauth:cpu-0")
+            })
+            .unwrap();
+        assert_eq!(
+            credential.lifetime,
+            striatum_core::blocks::LifetimeClass::NonQuota
+        );
+        assert!(!credential.classified);
+        assert_eq!(credential.claim_generation, 0);
+        assert_eq!(credential.last_claimed_at, Some(now));
+        assert_eq!(credential.next_recheck_at, now + 3_599_000);
+        assert!(
+            loaded.blocks.iter().any(|b| b.kind == "observation"),
+            "source-less observation clock remains effective"
+        );
+        assert!(
+            !loaded.blocks.iter().any(|b| b.kind == "pool_billing"),
+            "expired unscheduled evidence is not revived"
+        );
+        let report = store.block_parity(now).unwrap();
+        assert!(report.differences.is_empty(), "{report:#?}");
+    }
+
     use super::*;
 
     #[test]
