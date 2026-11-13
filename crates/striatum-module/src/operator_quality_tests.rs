@@ -1,5 +1,101 @@
 use striatum_core::{FactSource, ModelFact, ScoreProvenance};
 
+fn decommissioned_poll(store: &SqliteRouteStateStore, flag: Option<bool>) {
+    let mut retired = json!({"existence":"present", "model.canonical_id":"lab/retired",
+        "quality.future_member":{"ignored":true}, "capability.tool_call":true});
+    if let Some(flag) = flag {
+        retired["quality.decommissioned"] = json!(flag);
+    }
+    let snapshot = decode_catalog_get(&serde_json::to_vec(&json!({
+        "catalog_version":11, "resolved_at_ms":123, "future_catalog_member":true,
+        "quality_scores":{"graded_by":"operator", "graded_at_ms":123, "future_member":true},
+        "models":{
+            "vendor/retired":retired,
+            "reseller/retired":{"existence":"present", "model.canonical_id":"lab/retired", "capability.tool_call":true}
+        }
+    })).unwrap()).unwrap();
+    apply_mapped_catalog(store, &snapshot, None, Some("vendor")).unwrap();
+}
+
+fn decommissioned_select(facts: Vec<ModelFact>) -> Result<striatum_core::SelectedModelRoute, striatum_core::NoRouteError> {
+    striatum_core::select_model_route(striatum_core::SelectModelRouteInput {
+        target_agent:"withdrawal-test".into(), target_is_head:false,
+        requirements:striatum_core::ModelRequirements {iq:1.0,eq:1.0},
+        available_models:facts.iter().map(|fact|format!("{}/{}",fact.provider_id,fact.model_id)).collect(),
+        facts, runtime_snapshot:None, exclude_route_keys:Vec::new(), operator_exclude_keys:Vec::new(),
+        required_capabilities:None, is_subscription_route:None, min_best_effort_adequacy:None,
+        prefer_prompt_cache:false, providers_without_prompt_cache:Default::default(),
+        providers_without_cache_write_reports:Default::default(),
+    })
+}
+
+#[test]
+fn decommissioned_served_payload_excludes_select_and_canonical_resellers() {
+    let rig = Rig::new("decommissioned-canonical");
+    let store = rig.store();
+    for provider in ["vendor", "reseller"] {
+        store.upsert_fact(&quality_fact(provider,"retired"), FactSource::Override).unwrap();
+    }
+    decommissioned_poll(&store, Some(true));
+    let facts:Vec<_> = store.get_facts().unwrap().into_iter().filter(|f|f.model_id=="retired").collect();
+    assert_eq!(facts.len(),2);
+    let error = decommissioned_select(facts).expect_err("operator withdrawal must gate both routes");
+    for provider in ["vendor", "reseller"] {
+        assert!(error.rejected.iter().any(|r|r.route_key==format!("{provider}/retired") && r.reason=="decommissioned"), "{error:?}");
+    }
+}
+
+#[test]
+fn decommissioned_later_poll_without_flag_or_with_false_restores_routing() {
+    let rig = Rig::new("decommissioned-current-state");
+    let store = rig.store();
+    store.upsert_fact(&quality_fact("vendor","retired"), FactSource::Override).unwrap();
+    let facts = || store.get_facts().unwrap().into_iter().filter(|f|f.provider_id=="vendor" && f.model_id=="retired").collect();
+    for restored in [None, Some(false)] {
+        decommissioned_poll(&store, Some(true));
+        assert!(decommissioned_select(facts()).is_err(), "flag must withdraw route before restoration");
+        let withdrawn_fingerprint = store.catalog_fingerprint().unwrap();
+        decommissioned_poll(&store, restored);
+        assert!(decommissioned_select(facts()).is_ok(), "missing or false flag must restore routing");
+        assert_ne!(store.catalog_fingerprint().unwrap(), withdrawn_fingerprint);
+    }
+}
+
+#[test]
+fn decommissioned_core_panel_gate_counts_withdrawals_before_scoring_and_rosters() {
+    use striatum_core::panel::*;
+    let rig = Rig::new("decommissioned-panel-funnel");
+    let store = rig.store();
+    for (provider,model) in [("vendor","retired"),("reseller","retired"),("vendor","active")] {
+        let mut fact = quality_fact(provider,model);
+        fact.family=Some(format!("{provider}-{model}"));
+        store.upsert_fact(&fact,FactSource::Override).unwrap();
+    }
+    decommissioned_poll(&store,Some(true));
+    for selection in [PanelSelection::NPick,PanelSelection::Roster] {
+        let facts:Vec<_> = store.get_facts().unwrap().into_iter().filter(|f|["vendor","reseller"].contains(&f.provider_id.as_str())).collect();
+        let automatic = selection==PanelSelection::NPick;
+        let panel = select_panel_with_policy(SelectPanelInput {
+            package_tokens:None,
+            panel_spec:PanelSpec {class:PanelClass::Audit,size:3,iq_floor:0.0,diversity:PanelDiversity::Family,temperature_spread:None},
+            selection, roster:if automatic {Vec::new()} else {vec![PanelRosterEntry {model:"vendor/retired".into(),prompt_params:Default::default()}]},
+            available_models:facts.iter().map(|f|format!("{}/{}",f.provider_id,f.model_id)).collect(),
+            facts,runtime_snapshot:None,exclude_route_keys:Vec::new(),operator_exclude_keys:Vec::new(),
+            required_capabilities:None,availability_substrate:AvailabilitySubstrate::Broca,
+            availability_label:"test".into(),is_subscription_route:None,
+        }, &striatum_core::RoutingConfig::default(), &ClassPanelPolicy {top_k:3,by:PanelOrder::Iq,extra:0,extra_by:None,floor:None}).unwrap();
+        assert_eq!(panel.members.len(),usize::from(automatic));
+        assert!(panel.members.iter().all(|m|!m.route_key.contains("retired")));
+        assert!(panel.candidates.iter().all(|c|!c.model.contains("retired")));
+        assert!(panel.rejected_causes.iter().any(|c|c.model=="vendor/retired" && serde_json::to_value(c.reason).unwrap()=="decommissioned"));
+        assert!(!serde_json::to_string(&panel.shortfall).unwrap().contains("retired"));
+        if automatic {
+            let funnel=panel.policy.unwrap().funnel.unwrap();
+            assert_eq!((funnel.catalog,funnel.scored),(3,1));
+        }
+    }
+}
+
 fn quality_fact(provider: &str, model: &str) -> ModelFact {
     serde_json::from_value(json!({
         "providerID": provider, "modelID": model,

@@ -287,6 +287,7 @@ pub enum PanelCauseReason {
     /// The upstream catalog marks the route deprecated: the provider no longer
     /// serves it, so it is never seated.
     DeprecatedUpstream,
+    Decommissioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -827,6 +828,7 @@ fn select_panel_admitted_inner(
             .count()
     };
     let scored = considered_facts.len().saturating_sub(rejected_count(&[
+        "decommissioned",
         REASON_DEPRECATED_UPSTREAM,
         "unscored_awaiting_placement",
     ]));
@@ -878,6 +880,7 @@ fn select_panel_admitted_inner(
             .map(|until| until.ceil() as i64);
         PanelCause {
             reason: match rejected.reason.as_str() {
+                "decommissioned" => PanelCauseReason::Decommissioned,
                 REASON_EXCLUDED => PanelCauseReason::Excluded,
                 REASON_EXCLUDED_BY_OPERATOR => PanelCauseReason::ExcludedByOperator,
                 REASON_DEPRECATED_UPSTREAM => PanelCauseReason::DeprecatedUpstream,
@@ -1316,7 +1319,13 @@ fn select_panel_admitted_inner(
         PanelShortfall {
             code,
             detail,
-            causes: causes.clone(),
+            // Withdrawn models cannot help fill a missing seat. Keep their
+            // rejection for explain, not among the shortfall's alternatives.
+            causes: causes
+                .iter()
+                .filter(|cause| cause.reason != PanelCauseReason::Decommissioned)
+                .cloned()
+                .collect(),
             funnel: automatic.then(|| funnel.clone()),
         }
     });
@@ -1380,6 +1389,7 @@ fn select_panel_admitted_inner(
 
     let mut quality_candidates = considered_facts
         .iter()
+        .filter(|fact| !fact.decommissioned)
         .map(|fact| {
             let route_key = crate::model_facts::fact_to_route(fact).route_key;
             crate::model_router::CandidateQualityScore::from_fact(

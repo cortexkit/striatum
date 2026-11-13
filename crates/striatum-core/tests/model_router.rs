@@ -71,6 +71,7 @@ fn fact(b: FactBuilder) -> ModelFact {
         billing_plane: None,
         auth_methods: None,
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: b.provider_id,
         model_id: b.model_id,
         variant: b.variant,

@@ -315,6 +315,7 @@ pub(crate) struct CatalogSnapshot {
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, striatum_store::OperatorQuality>,
+    decommissioned: BTreeMap<String, String>,
     /// `(provider_id, model_id)` of entries served under a well-formed
     /// `provider/model` key whose facts could not be decoded. Applying the
     /// snapshot leaves their stored rows and cached base rates as they were:
@@ -323,6 +324,9 @@ pub(crate) struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    pub(crate) fn is_decommissioned(&self, route: &str) -> bool {
+        self.decommissioned.contains_key(route)
+    }
     pub(crate) fn engine_cost(
         &self,
         request: &cortexkit_role_routing::select_engine::SelectEngineRequest,
@@ -986,9 +990,21 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut model_kinds = BTreeMap::new();
     let mut audio_input_prices = BTreeMap::new();
     let mut grades = BTreeMap::new();
+    let mut decommissioned = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
     let mut unreadable: Vec<(String, String)> = Vec::new();
     for (served_key, entry) in reply.models {
+        // The operator's withdrawal is independent of whether this model has
+        // been graded. The canonical model ID makes the withdrawal apply to
+        // reseller routes for the same model too.
+        if entry.get("quality.decommissioned").and_then(Value::as_bool) == Some(true) {
+            let model = entry
+                .get("model.canonical_id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or(&served_key);
+            decommissioned.insert(served_key.clone(), model.to_owned());
+        }
         if reply
             .quality_scores
             .as_ref()
@@ -1065,6 +1081,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         audio_input_prices,
         quality_scores: reply.quality_scores,
         grades,
+        decommissioned,
     })
 }
 
@@ -1682,6 +1699,7 @@ pub(crate) fn apply_mapped_catalog(
     )
     .map_err(|reason| error(format!("apply mapped catalog: {reason}")))?;
     let mut grades = snapshot.grades.clone();
+    let mut decommissioned = snapshot.decommissioned.clone();
     // Cache grades for provider aliases resolved from credential metadata,
     // using the same catalog targets as pricing for coverage and shadow notices.
     if let Some(credentials) = credentials {
@@ -1699,15 +1717,21 @@ pub(crate) fn apply_mapped_catalog(
             if let Some(grade) = snapshot.grades.get(&catalog_key) {
                 grades.entry(route).or_insert_with(|| grade.clone());
             }
+            if let Some(model) = snapshot.decommissioned.get(&catalog_key) {
+                decommissioned
+                    .entry(format!("{}/{}", fact.provider_id, fact.model_id))
+                    .or_insert_with(|| model.clone());
+            }
         }
     }
     store
-        .replace_operator_quality(
+        .replace_operator_quality_snapshot(
             snapshot
                 .quality_scores
                 .as_ref()
                 .is_some_and(|scores| scores.graded_by == "operator"),
             &grades,
+            &decommissioned,
         )
         .map_err(|reason| error(format!("apply operator quality: {reason}")))?;
     if let Some(credentials) = credentials {

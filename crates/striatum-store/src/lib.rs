@@ -326,7 +326,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 84] {
+fn route_state_migrations() -> [Migration; 85] {
     [
         Migration {
             version: 1,
@@ -664,6 +664,10 @@ fn route_state_migrations() -> [Migration; 84] {
             version: 85,
             statements: include_str!("../migrations/085_observation_principal_event.sql"),
         },
+        Migration {
+            version: 86,
+            statements: include_str!("../migrations/086_operator_decommissioned.sql"),
+        },
     ]
 }
 
@@ -935,8 +939,16 @@ fn calculate_catalog_fingerprint(connection: &Connection) -> rusqlite::Result<St
     })?;
     let rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let grades = operator_quality::fingerprint_rows(connection)?;
-    let bytes = serde_json::to_vec(&(rows, grades))
-        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let decommissioned = operator_quality::decommissioned_rows(connection)?;
+    // Creating an empty withdrawal table changes no routing facts, so keep the
+    // catalog fingerprint unchanged. Nonempty withdrawals affect routing and
+    // must participate in the hash.
+    let bytes = if decommissioned.is_empty() {
+        serde_json::to_vec(&(rows, grades))
+    } else {
+        serde_json::to_vec(&(rows, grades, decommissioned))
+    }
+    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let hex = blake3::hash(&bytes).to_hex().to_string();
     Ok(hex[..16].to_string())
 }
@@ -996,6 +1008,23 @@ fn install_catalog_change_tracking(connection: &Connection) -> rusqlite::Result<
              BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
              CREATE TEMP TRIGGER IF NOT EXISTS catalog_quality_writes_on_delete
              AFTER DELETE ON routing_operator_quality
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;",
+        )?;
+    }
+    let has_decommissioned: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM main.sqlite_schema WHERE type = 'table' AND name = 'routing_operator_decommissioned')",
+        [], |row| row.get(0),
+    )?;
+    if has_decommissioned {
+        connection.execute_batch(
+            "CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_insert
+             AFTER INSERT ON routing_operator_decommissioned
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_update
+             AFTER UPDATE ON routing_operator_decommissioned
+             BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;
+             CREATE TEMP TRIGGER IF NOT EXISTS catalog_decommissioned_writes_on_delete
+             AFTER DELETE ON routing_operator_decommissioned
              BEGIN UPDATE catalog_facts_writes SET writes = writes + 1 WHERE singleton = 1; END;",
         )?;
     }
@@ -3071,6 +3100,7 @@ fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
         // Read-time provenance, never stored: a fact loaded from the row has whatever
         // speed the row holds, and the median stand-in is applied above this.
         speed_is_fleet_median: false,
+        decommissioned: false,
         provider_id: row.get("provider_id")?,
         model_id: row.get("model_id")?,
         variant: row.get::<_, Option<String>>("variant")?,

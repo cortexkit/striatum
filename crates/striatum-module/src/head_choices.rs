@@ -186,6 +186,7 @@ pub(crate) fn choices_for_harness(
         rows.sort_by(|a, b| a.variant.cmp(&b.variant));
         let fact = rows[0];
         if striatum_core::model_facts::llm_classification_rejection(fact, false).is_some()
+            || fact.decommissioned
             || fact.is_deprecated_upstream()
             || fact.score_provenance == striatum_core::ScoreProvenance::Unscored
             || fact.supports_tool_use != Some(true)

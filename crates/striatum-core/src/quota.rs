@@ -858,6 +858,7 @@ mod tests {
             cache_write_rate: None,
             reasoning_rate: None,
             speed_is_fleet_median: false,
+            decommissioned: false,
             provider_id: provider.into(),
             model_id: model.into(),
             variant: None,

@@ -1892,8 +1892,10 @@ pub async fn account_quota_loop(
             }
         }
 
-        // Readings that arrived since the last admission still end blocks and
-        // grow whole-account recovery sets. Account selection and pricing must
+        // Readings that arrived since the last admission still end blocks. For a
+        // block on a whole account, a reading that reports more quota windows
+        // adds them to the windows that must all show headroom before the block
+        // ends (its recovery set). Account selection and pricing must
         // also agree on the serving login, so the method map is built after both
         // roster and readings have been refreshed.
         //

@@ -2492,6 +2492,17 @@ async fn handle_select_request_attempt(
                 return reply;
             }
             Err(mut refusal) => {
+                if refusal.code == "decommissioned" {
+                    let refusal = cortexkit_role_routing::errors::Refusal::pin_unavailable(
+                        pin,
+                        cortexkit_role_routing::errors::PinUnavailableReason::parse("decommissioned"),
+                        None,
+                    );
+                    return send_route_error_body(writer, ver, channel, epoch, corr, ErrorBody {
+                        code: refusal.code.as_str().into(), message: refusal.message,
+                        detail: Some(serde_json::Value::Object(refusal.detail)),
+                    }).await;
+                }
                 if let Some(until) = *lost_probe_until {
                     return send_route_error_body(
                         writer, ver, channel, epoch, corr, lost_probe_wait(until),

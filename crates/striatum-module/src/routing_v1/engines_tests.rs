@@ -34,6 +34,24 @@ fn request() -> Value {
     json!({"consumer":"colliculus","kind":"transcribe","requirements":{},"privacy":"remote_allowed"})
 }
 
+#[tokio::test]
+async fn decommissioned_media_engine_is_skipped_even_when_it_is_local() {
+    for local in [false,true] {
+        let harness = setup(vec![engine("retired",local)]);
+        let route = harness.bind(reserved("colliculus"), None).await;
+        assert_eq!(route.call("route.select_engine", &request()).await.0, FrameType::Response);
+        let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
+            "catalog_version":94,"resolved_at_ms":123,"models":{
+                "media-vendor/retired":{"existence":"present","quality.decommissioned":true,"model.kind":"transcribe"}
+            }
+        })).unwrap()).unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("media-vendor")).unwrap();
+        let refused = route.call("route.select_engine", &request()).await;
+        assert_eq!(refused.0, FrameType::Error, "{refused:?}");
+        assert_eq!(refused.1["code"],"no_engine");
+    }
+}
+
 async fn selected(route: &Route, request: &Value) -> Value {
     let (kind, value) = route.call("route.select_engine", request).await;
     assert_eq!(kind, FrameType::Response, "{value}");

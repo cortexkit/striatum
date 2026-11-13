@@ -250,6 +250,21 @@ impl AccountTx<'_> {
         Ok(())
     }
 
+    /// Keep an account-only offer under the run's original admission, not its reservation.
+    pub fn bind_continued_account_decision(
+        &self,
+        decision: &str,
+        admission: &str,
+    ) -> RouteStateResult<()> {
+        self.conn
+            .execute(
+                "UPDATE account_decision SET admission_id=?2 WHERE decision_id=?1",
+                params![decision, admission],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
     /// Copy selection provenance and frozen pricing; only identity and lifecycle are new.
     pub fn link_continued_decision(
         &self,
