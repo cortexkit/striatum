@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 
-pub(crate) use cortexkit_role_routing::declarations::RunnerDeclaration;
 use cortexkit_role_routing::declarations::{RunnerPair, StandingLimits};
 use cortexkit_role_routing::spellings::{AUTH_METHODS, WIRE_APIS};
 use serde::Serialize;
@@ -16,8 +15,12 @@ use crate::{
 
 mod admission;
 mod describe_cache;
+mod harness_facts;
+#[cfg(test)]
+mod harness_facts_tests;
 pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
+pub(crate) use harness_facts::RunnerDeclaration;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct EffectiveRunner {
@@ -258,7 +261,7 @@ impl Registry {
                                     })
                                     .flatten()
                             });
-                            let mut resolved = declaration.clone();
+                            let mut resolved = declaration.as_contract().clone();
                             match declaration.limits_for_harness(selected) {
                                 Ok(limits) => {
                                     resolved.pairs = limits.pairs.unwrap_or_default();
@@ -357,6 +360,7 @@ impl Registry {
                                         // membership; the original pair still determines
                                         // whether an endpoint is required.
                                         let admitted = wire_declaration
+                                            .map(RunnerDeclaration::as_contract)
                                             .unwrap_or(declaration)
                                             .admits_pair_row(
                                                 pair,
@@ -702,8 +706,8 @@ pub(crate) fn parse_declaration(
         slot,
         &super::describe::capabilities(),
     )
-        .map(|declaration| declaration.runner)
-        .map_err(|error| error.to_string())
+    .map(|declaration| declaration.runner.map(RunnerDeclaration::read))
+    .map_err(|error| error.to_string())
 }
 
 fn known_pair(pair: &RunnerPair) -> bool {
@@ -725,7 +729,10 @@ fn report_harness_limits_once(
     }
 }
 
-fn report_unknown_pair_tokens_once(module: &str, declaration: &RunnerDeclaration) {
+fn report_unknown_pair_tokens_once(
+    module: &str,
+    declaration: &cortexkit_role_routing::declarations::RunnerDeclaration,
+) {
     use std::sync::Mutex;
     static REPORTED: Mutex<BTreeSet<(String, &'static str, String)>> = Mutex::new(BTreeSet::new());
     let Ok(mut reported) = REPORTED.lock() else {
@@ -768,6 +775,9 @@ pub(crate) fn declarations_from_catalog(
                 .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)?;
             match parse_declaration(slot) {
                 Ok(Some(declaration)) => {
+                    if let Some(error) = declaration.harness_limits_error() {
+                        report_harness_limits_once(module, error);
+                    }
                     report_unknown_pair_tokens_once(module, &declaration);
                     Some((module.to_owned(), declaration))
                 }
