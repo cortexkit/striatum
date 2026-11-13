@@ -24,6 +24,8 @@ use super::{now_ms, provider_refusal, store_refusal, Caller, Deps};
 
 mod attempt;
 #[cfg(test)]
+mod attempt_samples_tests;
+#[cfg(test)]
 mod attempt_tests;
 
 const MEMBERS: &[&str] = &[
