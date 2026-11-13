@@ -244,9 +244,25 @@ async fn mixed_credentials_quote_subscription_or_metered_and_fallback_uses_list_
         )
         .unwrap();
     let credentials = h.credentials();
-    credentials.lock().unwrap().publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription]),
+    let mut credentials = credentials.lock().unwrap();
+    credentials.runner_declarations.insert(
+        "class-runner".into(),
+        super::super::runners::parse_declaration(&json!({"runner":{
+            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"},
+                     {"wire_api":"anthropic.messages","auth_method":"oauth"}],
+            "harnesses":["price-test"], "follows_account_choice":true
+        }}))
+        .unwrap()
+        .unwrap(),
     );
+    credentials
+        .wire_apis
+        .insert("synthetic/model".into(), "anthropic.messages".into());
+    let catalog =
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact, subscription])
+            .with_wire_apis(&credentials.wire_apis);
+    credentials.publish_billing_catalog(catalog);
+    drop(credentials);
     h.edit_config(|config| {
         config["providers"]["synthetic"]["subscription_multiplier"] = json!(22);
     });
@@ -550,9 +566,19 @@ async fn answer_thresholds_use_request_size_before_context_and_profile() {
         .map(|(key, rate)| (key.into(), BillingRate::Priced { rate }))
         .collect(),
     });
+    let (declarations, wire_apis) = {
+        let shared = h.credentials();
+        let credentials = shared.lock().unwrap();
+        (
+            credentials.runner_declarations.clone(),
+            credentials.wire_apis.clone(),
+        )
+    };
     h.install_facts(&[fact.clone()]);
     let credentials = h.credentials();
     let mut credentials = credentials.lock().unwrap();
+    credentials.runner_declarations = declarations;
+    credentials.wire_apis = wire_apis;
     let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact])
         .with_wire_apis(&credentials.wire_apis);
     credentials.publish_billing_catalog(catalog);
