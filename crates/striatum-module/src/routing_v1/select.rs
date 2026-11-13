@@ -807,22 +807,6 @@ async fn prepare_selection(
                 .as_ref()
                 .is_none_or(|module| module == &runner.module)
         })
-        .filter(|runner| {
-            request
-                .runners
-                .as_ref()
-                .is_none_or(|listed| listed.contains(&runner.module))
-        })
-        .collect();
-    let runners: Vec<RunnerPolicy> = runners
-        .into_iter()
-        .filter(|runner| {
-            request.harness.as_deref().is_none_or(|harness| {
-                registry
-                    .get(&runner.module)
-                    .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
-            })
-        })
         .collect();
     if runners.is_empty() {
         return Err(if let Some(harness) = &request.harness {
@@ -832,6 +816,29 @@ async fn prepare_selection(
         } else {
             Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
+    }
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|runner| {
+            request
+                .runners
+                .as_ref()
+                .is_none_or(|listed| listed.contains(&runner.module))
+        })
+        .filter(|runner| {
+            request.harness.as_deref().is_none_or(|harness| {
+                registry
+                    .get(&runner.module)
+                    .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
+            })
+        })
+        .collect();
+    if runners.is_empty() {
+        let mut refusal = Refusal::no_route(NoRouteReason::HarnessUnavailable, None);
+        if let Some(harness) = &request.harness {
+            refusal.message = format!("no session-starting runner declares harness {harness}");
+        }
+        return Err(refusal);
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()
@@ -1086,6 +1093,11 @@ async fn select_at_tier_attempt(
             let route = fact_to_route(fact);
             runners.iter().any(|runner| {
                 registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+                    || registry.excluded_by_harness(
+                        &runner.module,
+                        &route.route_key,
+                        &route.capacity_key,
+                    )
             })
         })
         .collect();
@@ -1211,9 +1223,22 @@ async fn select_at_tier_attempt(
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
 
+    // Keep exclusion-only routes long enough to check task requirements and
+    // policy, but never make them available to a pin or automatic selection.
+    let harness_excluded: HashSet<String> = capable
+        .iter()
+        .filter_map(|fact| {
+            let route = fact_to_route(fact);
+            (!runners.iter().any(|runner| {
+                registry.can_run(&runner.module, &route.route_key, &route.capacity_key)
+            }))
+            .then_some(route.route_key)
+        })
+        .collect();
     let statically_available: HashSet<String> = capable
         .iter()
         .map(|fact| fact_to_route(fact).route_key)
+        .filter(|key| !harness_excluded.contains(key))
         .collect();
     let available: HashSet<String> = capable
         .iter()
@@ -1225,7 +1250,11 @@ async fn select_at_tier_attempt(
                 .then_some(route.route_key)
         })
         .collect();
-    if available.is_empty() && pair_rejections.is_empty() && !eligible_catalog_empty {
+    if available.is_empty()
+        && pair_rejections.is_empty()
+        && !eligible_catalog_empty
+        && harness_excluded.is_empty()
+    {
         return Err(Refusal::no_route(NoRouteReason::MissingCapability, None));
     }
     if let Some(classes) = &priced.classes {
@@ -1609,6 +1638,10 @@ async fn select_at_tier_attempt(
         }
         Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
         Err(select_policy::OrderFailure::Score(no_route)) => {
+            if selection.harness_exclusions_emptied_routes(&harness_excluded, &statically_available)
+            {
+                return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
+            }
             if evaluation.is_none() {
                 selection.record_refusal(&no_route, &priced.provenance);
             }
@@ -2001,6 +2034,52 @@ struct Selection<'a> {
 }
 
 impl<'a> Selection<'a> {
+    fn harness_exclusions_emptied_routes(
+        &self,
+        excluded: &HashSet<String>,
+        hostable: &HashSet<String>,
+    ) -> bool {
+        if excluded.is_empty() {
+            return false;
+        }
+        let allowed = excluded
+            .union(hostable)
+            .filter(|key| {
+                self.sources
+                    .operator_config
+                    .route_allowed(self.consumer, key, false)
+            })
+            .cloned()
+            .collect();
+        let input = self.pass().input(&allowed, Default::default());
+        let rejections = self.eligible_rejections(&input.facts, None);
+        // Reuse static admission so exclusions cannot hide a policy or capability
+        // refusal. Ignore runtime walls here: a hostable route behind a cooldown
+        // still belongs to ranking and keeps the scorer's timed refusal.
+        let admission = striatum_core::model_router::admit_routes_with_availability(
+            &input.facts,
+            None,
+            striatum_core::provider_model_spec::ExclusionPolicy {
+                operator: &input.operator_exclude_keys,
+                caller: &input.exclude_route_keys,
+            },
+            self.consumer_exclude,
+            input.required_capabilities,
+            &input.available_models,
+            &input.requirements,
+            &self.pass().routing_config(),
+            &rejections,
+        );
+        !admission
+            .admitted
+            .iter()
+            .any(|entry| hostable.contains(&entry.route.route_key))
+            && admission
+                .admitted
+                .iter()
+                .any(|entry| excluded.contains(&entry.route.route_key))
+    }
+
     fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
         if let Some(order) = &self.classifier_order {
             // Classifier order uses input price, not chat workload profiles or

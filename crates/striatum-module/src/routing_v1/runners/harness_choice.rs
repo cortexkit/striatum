@@ -23,6 +23,19 @@ fn task_needs(requirements: &Requirements) -> Vec<HarnessCapability> {
 }
 
 impl Registry {
+    pub(crate) fn excluded_by_harness(&self, module: &str, route: &str, capacity: &str) -> bool {
+        self.get(module).is_some_and(|runner| {
+            !self.can_run(module, route, capacity)
+                && runner.harness_choices.as_ref().is_some_and(|choices| {
+                    choices.iter().any(|candidate| {
+                        candidate.runner.matches_route(route, capacity, |runner| {
+                            &runner.statically_reachable_models
+                        })
+                    })
+                })
+        })
+    }
+
     pub(crate) fn task_policies(&self) -> Vec<crate::config_policy::RunnerPolicy> {
         self.entries
             .iter()

@@ -1074,5 +1074,155 @@
         ]
       }
     ]
+  },
+  {
+    "row": "unsupported-runner",
+    "reason": "Contract §16.3 requires harness_unavailable when the caller's runners remove the last allowed placement.",
+    "changes": [
+      {
+        "op": "replace",
+        "path": "/launches/0/reply/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/0/reply/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/after_select/model_route_decisions/1/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/after_select/model_route_decisions/1/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/after_select/model_route_decisions/1/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/reply/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/state/model_route_decisions/1/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/state/model_route_decisions/1/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/1/state/model_route_decisions/1/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/1/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/1/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/1/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/2/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/2/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/after_select/model_route_decisions/2/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/reply/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/1/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/1/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/1/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/2/explanation_json/failureReason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/2/explanation_json/refusal/detail/reason",
+        "before": "no_available_model",
+        "after": "harness_unavailable"
+      },
+      {
+        "op": "replace",
+        "path": "/launches/2/state/model_route_decisions/2/explanation_json/refusal/message",
+        "before": "no route meets the request: no_available_model",
+        "after": "no route meets the request: harness_unavailable"
+      }
+    ]
   }
 ]
