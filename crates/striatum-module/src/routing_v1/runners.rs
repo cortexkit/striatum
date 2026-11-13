@@ -698,7 +698,10 @@ mod compiled_registry_tests {
 pub(crate) fn parse_declaration(
     slot: &serde_json::Value,
 ) -> Result<Option<RunnerDeclaration>, String> {
-    cortexkit_role_routing::declarations::parse_consumer_declarations(slot)
+    cortexkit_role_routing::declarations::parse_consumer_declarations_serving(
+        slot,
+        &super::describe::capabilities(),
+    )
         .map(|declaration| declaration.runner)
         .map_err(|error| error.to_string())
 }

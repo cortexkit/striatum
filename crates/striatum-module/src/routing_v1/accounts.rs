@@ -245,7 +245,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         refusal
     })?;
     checking("account_for_parse");
-    let mut request = parse_account_for_request_serving(params, super::describe::CAPABILITIES)?;
+    let mut request = parse_account_for_request_serving(params, &super::describe::capabilities())?;
     let media_caller = super::consumers::is_media_provider(authority.module);
     if media_caller
         && !super::consumers::media_pair(authority.module, &request.provider, &request.model)
@@ -753,7 +753,7 @@ fn account_observe_inner(
     }
     checking("account_observe_parse");
     super::refuse_unknown_members(params, OBSERVE_MEMBERS)?;
-    let request = parse_account_observe_request_serving(params, super::describe::CAPABILITIES)?;
+    let request = parse_account_observe_request_serving(params, &super::describe::capabilities())?;
     let owner_decision;
     let admission_principal;
     let authority = match runner_authority {

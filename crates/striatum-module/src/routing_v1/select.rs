@@ -249,7 +249,7 @@ async fn select_with_profile_lookup_kind(
     )?;
     let request = parse_select_request_serving(
         &crate::tier_settings::without_context(params),
-        super::describe::CAPABILITIES,
+        &super::describe::capabilities(),
     )?;
     let (settings_layers, project_settings) = if let Some(settings) = &request.settings {
         settings.check_project_stamp(
@@ -687,7 +687,7 @@ async fn prepare_selection(
     }
     let request = parse_select_request_serving(
         &crate::tier_settings::without_context(params),
-        super::describe::CAPABILITIES,
+        &super::describe::capabilities(),
     )?;
     let live_config = &shared.live_config;
     let operator_config = &shared.operator_config;
@@ -699,7 +699,7 @@ async fn prepare_selection(
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
     let request = parse_select_request_serving(
         &crate::tier_settings::without_context(&effective_params),
-        super::describe::CAPABILITIES,
+        &super::describe::capabilities(),
     )?;
     if !crate::broca_credentials::wait_for_billing_catalog(deps.broca_credentials, BILLING_WAIT)
         .await
