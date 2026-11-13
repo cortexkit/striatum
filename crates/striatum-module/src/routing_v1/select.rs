@@ -731,6 +731,17 @@ async fn prepare_selection(
     if evaluation.is_none() {
         consumers.admit(&consumer, caller)?;
     }
+    let declared = super::describe::capabilities()
+        .contains(&"consumer_declarations")
+        .then(|| consumers.defaults_for(&consumer))
+        .unwrap_or_default();
+    let kind =
+        super::consumers::kind::resolve(declared.kind.as_ref().map(|kind| kind.as_str()), None)?;
+    if kind != "llm" {
+        let mut refusal = Refusal::no_route(NoRouteReason::NoAvailableModel, None);
+        refusal.message = format!("consumer kind {kind} must use route.select_engine");
+        return Err(refusal);
+    }
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
     let request =
         parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
@@ -805,6 +816,17 @@ async fn prepare_selection(
         .clone()
         .unwrap_or_default();
     let classifier = consumer == "classifier";
+    let placement = if declared.placement.is_some() {
+        let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+        super::consumers::declared::placement_module(
+            declared.placement.as_ref(),
+            caller,
+            request.runners.as_deref(),
+            |module| credentials.runner_declarations.contains_key(module),
+        )?
+    } else {
+        None
+    };
     let registry = deps
         .broca_credentials
         .lock()
@@ -851,6 +873,18 @@ async fn prepare_selection(
         } else {
             Refusal::no_route(NoRouteReason::NoAvailableModel, None)
         });
+    }
+    // Declarations narrow the configured placements before any caller filters.
+    let runners: Vec<RunnerPolicy> = runners
+        .into_iter()
+        .filter(|runner| {
+            placement
+                .as_ref()
+                .is_none_or(|module| module == &runner.module)
+        })
+        .collect();
+    if runners.is_empty() && placement.is_some() {
+        return Err(Refusal::no_route(NoRouteReason::HarnessUnavailable, None));
     }
     let runners: Vec<RunnerPolicy> = runners
         .into_iter()

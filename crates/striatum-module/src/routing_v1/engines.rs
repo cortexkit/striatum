@@ -5,9 +5,9 @@ use cortexkit_role_routing::{
     errors::{Refusal, RefusalCode},
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
 };
+use serde_json::Value;
 use striatum_core::{accounts::AllowedAccountClass, route_state_store::DecisionInput};
 use striatum_store::{EngineEvaluation, EngineSpeedSample, V1Decision};
-use serde_json::Value;
 
 use super::{store_refusal, Caller, Deps};
 
@@ -62,9 +62,17 @@ pub(super) fn select(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
 
 fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let request = wire::parse_select_engine_request(params)?;
-    super::consumers::effective(&super::operator_config(deps)).admit(&request.consumer, caller)?;
-    let now = now(deps);
     let config = super::operator_config(deps);
+    let consumers = super::consumers::effective(&config);
+    consumers.admit(&request.consumer, caller)?;
+    if super::describe::capabilities().contains(&"consumer_declarations") {
+        let declared = consumers.defaults_for(&request.consumer);
+        super::consumers::kind::resolve(
+            declared.kind.as_ref().map(|kind| kind.as_str()),
+            Some(request.kind.as_str()),
+        )?;
+    }
+    let now = now(deps);
     let inputs = crate::prepare_selection_inputs(
         deps.quota_cache,
         deps.store,

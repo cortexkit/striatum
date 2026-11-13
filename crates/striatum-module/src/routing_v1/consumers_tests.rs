@@ -40,6 +40,322 @@ fn selected_input(h: &Harness, reply: &(FrameType, Value)) -> Value {
     serde_json::from_str(&row.requirements_json).unwrap()
 }
 
+fn placement_catalog(h: &Harness, declarations: Value) {
+    consumers::replace_catalog(&json!([{
+        "module_id":"basal", "nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":declarations}}
+    }]));
+    let models: serde_json::Map<_, _> = h
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .map(|mut fact| {
+            fact.supports_tool_use = Some(true);
+            h.store()
+                .upsert_fact(&fact, striatum_core::FactSource::Override)
+                .unwrap();
+            (
+                format!("{}/{}", fact.provider_id, fact.model_id),
+                json!({"existence":"present","capability.tool_call":true}),
+            )
+        })
+        .collect();
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({"catalog_version":41,"resolved_at_ms":123,"models":models}))
+            .unwrap(),
+    )
+    .unwrap();
+    let shared = h.credentials();
+    let mut credentials = shared.lock().unwrap();
+    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    let runner = credentials.runner_declarations[fixture::RUNNER_ONE].clone();
+    credentials
+        .runner_declarations
+        .insert("broca".into(), runner);
+}
+
+fn no_route(reply: &(FrameType, Value), reason: &str) {
+    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+    assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
+    assert_eq!(reply.1["detail"]["reason"], reason, "{}", reply.1);
+    assert!(
+        reply.1["detail"].get("reset_at_ms").is_none(),
+        "{}",
+        reply.1
+    );
+}
+
+fn on_runner(reply: &(FrameType, Value), module: &str) {
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+    assert_eq!(reply.1["result"]["runner"]["module"], module, "{}", reply.1);
+}
+
+#[tokio::test]
+async fn declared_placement_module_narrows_settings_and_caller_filters() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        placement_catalog(
+            &h,
+            json!([{"name":"basal.task", "placement":{"module":"broca"}}]),
+        );
+        h.edit_config(|config| {
+            config["runners"] = json!([
+                {"module":fixture::RUNNER_ONE}, {"module":"broca"}
+            ])
+        });
+        let owner = h.bind(reserved("basal"), None).await;
+        on_runner(
+            &owner.call("route.select", &select("basal.task")).await,
+            "broca",
+        );
+        let mut request = select("basal.task");
+        request["runners"] = json!([fixture::RUNNER_ONE]);
+        no_route(
+            &owner.call("route.select", &request).await,
+            "harness_unavailable",
+        );
+        h.edit_config(|config| {
+            config["consumers"]["basal.task"]["runner"] = json!(fixture::RUNNER_ONE)
+        });
+        no_route(
+            &owner.call("route.select", &select("basal.task")).await,
+            "harness_unavailable",
+        );
+        h.edit_config(|config| {
+            config["consumers"]
+                .as_object_mut()
+                .unwrap()
+                .remove("basal.task");
+            config["runners"] = json!([{"module":fixture::RUNNER_ONE}]);
+        });
+        no_route(
+            &owner.call("route.select", &select("basal.task")).await,
+            "harness_unavailable",
+        );
+        // Empty settings fail before declared placement, preserving the existing reason.
+        h.edit_config(|config| config["runners"] = json!([]));
+        no_route(
+            &owner.call("route.select", &select("basal.task")).await,
+            "no_available_model",
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn declared_placement_inherits_only_same_owner_and_nearest_member() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        placement_catalog(&h, json!([
+            {"name":"basal.task", "placement":{"module":"broca"}, "kind":"llm"},
+            {"name":"basal.task.child"},
+            {"name":"basal.task.child.own", "placement":{"module":fixture::RUNNER_ONE}, "kind":"search"}
+        ]));
+        h.edit_config(|config| {
+            config["runners"] = json!([{"module":fixture::RUNNER_ONE}, {"module":"broca"}]);
+            config["consumers"]["basal.task.settings"] = json!({"owner":"basal"});
+            config["consumers"]["basal.task.ownerless"] = json!({});
+            config["consumers"]["basal.task.foreign"] = json!({"owner":"other"});
+            config["consumers"]["basal.task_underscore"] = json!({});
+        });
+        let owner = h.bind(reserved("basal"), None).await;
+        for name in ["basal.task.child", "basal.task.settings", "basal.task.ownerless", "basal.task.unlisted"] {
+            on_runner(&owner.call("route.select", &select(name)).await, "broca");
+        }
+        let registry = consumers::effective(&h.operator_config());
+        let inherited = registry.defaults_for("basal.task.child.own.unlisted");
+        assert_eq!(serde_json::to_value(inherited.placement).unwrap(), json!({"module":fixture::RUNNER_ONE}));
+        assert_eq!(inherited.kind.unwrap().as_str(), "search");
+        no_route(&owner.call("route.select", &select("basal.task.child.own.unlisted")).await, "no_available_model");
+        let other = h.bind(reserved("other"), None).await;
+        for name in ["basal.task.foreign", "basal.task_underscore"] {
+            assert!(registry.defaults_for(name).placement.is_none());
+            assert!(registry.defaults_for(name).kind.is_none());
+            on_runner(&other.call("route.select", &select(name)).await, fixture::RUNNER_ONE);
+        }
+    }).await;
+}
+
+#[tokio::test]
+async fn declared_placement_caller_runner_resolution_and_catalog_validation() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        placement_catalog(&h, json!([{
+            "name":"basal.task", "placement":"caller_runner", "selectors":["broca",fixture::RUNNER_ONE]
+        }]));
+        h.edit_config(|config| config["runners"] = json!([
+            {"module":fixture::RUNNER_ONE}, {"module":"broca"}, {"module":"settings-only"}
+        ]));
+        let owner = h.bind(reserved("basal"), None).await;
+        for runners in [None, Some(json!(["broca",fixture::RUNNER_ONE])), Some(json!(["settings-only"])), Some(json!(["unknown"]))] {
+            let mut request = select("basal.task");
+            if let Some(runners) = runners { request["runners"] = runners; }
+            no_route(&owner.call("route.select", &request).await, "caller_runner_unresolved");
+        }
+        for module in ["broca", fixture::RUNNER_ONE] {
+            let mut request = select("basal.task");
+            request["runners"] = json!([module]);
+            let reply = owner.call("route.select", &request).await;
+            on_runner(&reply, module);
+            assert!(reply.1["result"]["runner"]["harness"].is_string(), "{}", reply.1);
+            let runner = h.bind(reserved(module), None).await;
+            on_runner(&runner.call("route.select", &select("basal.task")).await, module);
+            let mut other_harness = select("basal.task");
+            other_harness["harness"] = json!("beta");
+            let reply = runner.call("route.select", &other_harness).await;
+            on_runner(&reply, module);
+            assert_eq!(reply.1["result"]["runner"]["harness"], "beta", "{}", reply.1);
+            let mut contradicted = select("basal.task");
+            contradicted["runners"] = json!([if module == "broca" {fixture::RUNNER_ONE} else {"broca"}]);
+            no_route(&runner.call("route.select", &contradicted).await, "harness_unavailable");
+        }
+        h.edit_config(|config| config["runners"] = json!([{"module":fixture::RUNNER_ONE}]));
+        let mut request = select("basal.task");
+        request["runners"] = json!(["broca"]);
+        no_route(&owner.call("route.select", &request).await, "harness_unavailable");
+    }).await;
+}
+
+#[tokio::test]
+async fn declared_placement_what_if_uses_unchanged_broca_parameter() {
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        let h = harness();
+        placement_catalog(
+            &h,
+            json!([{"name":"basal.task", "placement":"caller_runner"}]),
+        );
+        h.edit_config(|config| {
+            config["runners"] = json!([
+                {"module":fixture::RUNNER_ONE,"routes":["example-provider/model-a"]},
+                {"module":"broca","routes":["example-provider/model-b"]}
+            ])
+        });
+        let operator = h.bind(reserved("callosum"), None).await;
+        let mut request = json!({"consumer":"basal.task", "iqs":[30]});
+        let unresolved = operator.call("route.what_if", &request).await;
+        assert_eq!(unresolved.0, FrameType::Response, "{}", unresolved.1);
+        assert_eq!(
+            unresolved.1["result"]["results"][0]["refusal"]["detail"]["reason"],
+            "caller_runner_unresolved",
+            "{}",
+            unresolved.1
+        );
+        request["runner"] = json!("broca");
+        let selected = operator.call("route.what_if", &request).await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        assert_eq!(
+            selected.1["result"]["results"][0]["pick"]["route"], "example-provider/model-b",
+            "{}",
+            selected.1
+        );
+        request["runner"] = json!(fixture::RUNNER_ONE);
+        let invalid = operator.call("route.what_if", &request).await;
+        assert_eq!(invalid.1["code"], "invalid_request", "{}", invalid.1);
+        assert_eq!(invalid.1["detail"]["field"], "runner", "{}", invalid.1);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn declared_kind_select_retains_media_and_unknown_kinds_and_production_hold() {
+    let h = harness();
+    h.edit_config(|config| {
+        config["runners"] = json!([{"module":fixture::RUNNER_ONE}, {"module":"broca"}]);
+        config["consumers"]["basal"] = json!({"owner":"basal"});
+    });
+    let owner = h.bind(reserved("basal"), None).await;
+    let declarations = json!([
+        {"name":"basal.media", "kind":"transcribe", "placement":{"module":"broca"}},
+        {"name":"basal.media.child"},
+        {"name":"basal.future", "kind":"future-engine"}
+    ]);
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        placement_catalog(&h, declarations.clone());
+        for (name, kind) in [
+            ("basal.media", "transcribe"),
+            ("basal.media.child.unlisted", "transcribe"),
+            ("basal.future", "future-engine"),
+        ] {
+            let reply = owner.call("route.select", &select(name)).await;
+            no_route(&reply, "no_available_model");
+            let message = reply.1["message"].as_str().unwrap();
+            assert!(
+                message.contains("route.select_engine") && message.contains(kind),
+                "{}",
+                reply.1
+            );
+        }
+        let mut request = select("basal.media");
+        request["kind"] = json!("transcribe");
+        let invalid = owner.call("route.select", &request).await;
+        assert_eq!(invalid.1["code"], "invalid_request", "{}", invalid.1);
+        assert_eq!(invalid.1["detail"]["field"], "kind", "{}", invalid.1);
+        assert!(!super::describe::capabilities().contains(&"select_kind"));
+    })
+    .await;
+    // A cached candidate declaration cannot activate either constraint in production.
+    on_runner(
+        &owner.call("route.select", &select("basal.media")).await,
+        fixture::RUNNER_ONE,
+    );
+    consumers::replace_catalog(&json!([{"module_id":"basal","nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":declarations}}}]));
+    on_runner(
+        &owner.call("route.select", &select("basal.media")).await,
+        fixture::RUNNER_ONE,
+    );
+    assert!(!super::describe::capabilities().contains(&"consumer_declarations"));
+}
+
+#[tokio::test]
+async fn declared_kind_engine_matches_or_refuses_crossing() {
+    let h = harness();
+    let owner = h.bind(reserved("basal"), None).await;
+    let mut request = json!({"consumer":"basal.transcribe", "kind":"transcribe",
+    "requirements":{}, "privacy":"local_only", "caller_local":[{
+        "kind":"transcribe", "provider":"media-vendor", "model":"local-engine",
+        "local":true, "formats":["audio/wav"], "languages":["en"], "latency_class":"interactive"
+    }]});
+    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        placement_catalog(
+            &h,
+            json!([
+                {"name":"basal.transcribe","kind":"transcribe"},
+                {"name":"basal.synthesize","kind":"synthesize"},
+                {"name":"basal.llm","kind":"llm"},
+                {"name":"basal.undeclared"}
+            ]),
+        );
+        for name in [
+            "basal.transcribe",
+            "basal.transcribe.child",
+            "basal.undeclared",
+        ] {
+            request["consumer"] = json!(name);
+            let reply = owner.call("route.select_engine", &request).await;
+            assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+            assert_eq!(
+                reply.1["result"]["engine"]["model"], "local-engine",
+                "{}",
+                reply.1
+            );
+        }
+        for name in ["basal.synthesize", "basal.llm"] {
+            request["consumer"] = json!(name);
+            let reply = owner.call("route.select_engine", &request).await;
+            assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+            assert_eq!(reply.1["code"], "invalid_request", "{}", reply.1);
+            assert_eq!(reply.1["detail"]["field"], "kind", "{}", reply.1);
+        }
+    })
+    .await;
+    // An already decoded declaration still cannot restrict engines when the group is off.
+    request["consumer"] = json!("basal.synthesize");
+    let reply = owner.call("route.select_engine", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+}
+
 #[tokio::test]
 async fn declared_defaults_iq_precedence_refusals_and_production_hold() {
     let h = harness();
