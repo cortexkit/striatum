@@ -68,6 +68,7 @@ pub(super) struct Harness {
     config_generation: AtomicU64,
     route_epochs: tokio::sync::Mutex<RouteEpochs>,
     next_channel: AtomicU16,
+    selection_profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
 }
 
 impl Drop for Harness {
@@ -133,6 +134,7 @@ impl Harness {
             config_generation: AtomicU64::new(0),
             route_epochs: tokio::sync::Mutex::new(RouteEpochs::new()),
             next_channel: AtomicU16::new(100),
+            selection_profiles: Default::default(),
             dir,
         });
         harness.edit_config(|config| {
@@ -818,6 +820,153 @@ struct KitSubject {
     harness: Mutex<Arc<Harness>>,
 }
 
+struct KitRoute {
+    route: Route,
+    profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
+}
+
+#[async_trait]
+impl RoutingRoute for KitRoute {
+    async fn request(&self, method: &str, params: &Value) -> Result<Reply, RouteFailure> {
+        let profiles = self.profiles.lock().unwrap().clone();
+        if method == "route.select" && !profiles.is_empty() {
+            let lookup =
+                move |_: &str, _: f64, facts: &[ModelFact]| crate::select::TaskProfileLookup {
+                    profiles: facts
+                        .iter()
+                        .filter_map(|fact| {
+                            let key = striatum_core::fact_to_route(fact).route_key;
+                            profiles.get(&key).cloned().map(|profile| (key, profile))
+                        })
+                        .collect(),
+                    providers_without_cache_write_reports: Default::default(),
+                };
+            return match self.route.select_with_profiles(params, &lookup).await {
+                Ok(answer) => Ok(Reply::Response(json!({"result":answer}).to_string())),
+                Err(refusal) => Ok(Reply::Error(
+                    serde_json::from_value(serde_json::to_value(refusal).unwrap()).unwrap(),
+                )),
+            };
+        }
+        self.route.request(method, params).await
+    }
+}
+
+/// The kit supplies isolated route estimates, not a shared history of completed
+/// tasks from which profiles can be borrowed across models. Convert estimates to
+/// tokens once; the serving code must compute prices and reserves.
+pub(super) fn selection_facts(
+    harness: &Harness,
+    input: &cortexkit_role_routing_conformance::SelectionFacts,
+) -> striatum_core::model_router::RouteTaskProfiles {
+    use striatum_core::task_profile::{ProfileLevel, TaskProfile, TokenVector};
+    let mut facts = harness.store().get_facts().unwrap();
+    for fact in &mut facts {
+        let key = format!("{}/{}", fact.provider_id, fact.model_id);
+        if let Some(kind) = input.kinds.get(&key) {
+            fact.model_kind = Some(kind.clone());
+        }
+        if let Some(rates) = input.list_rates.get(&key) {
+            fact.input_rate = rates.input.as_f64();
+            fact.cost_per_m_tok_out = rates.output.as_f64();
+            fact.cache_read_rate = rates
+                .cache_read
+                .as_ref()
+                .and_then(serde_json::Number::as_f64);
+            fact.cache_write_rate = rates
+                .cache_write
+                .as_ref()
+                .and_then(serde_json::Number::as_f64);
+            let mut plane = striatum_core::BillingPlane {
+                provider_id: fact.provider_id.clone(),
+                auth_method: "apikey".into(),
+                kind: "upstream".into(),
+                selection_reason: "selection facts".into(),
+                rates: Default::default(),
+            };
+            for (key, rate) in [
+                ("rate.input", Some(&rates.input)),
+                ("rate.output", Some(&rates.output)),
+                ("rate.cache_read", rates.cache_read.as_ref()),
+                ("rate.cache_write", rates.cache_write.as_ref()),
+            ] {
+                if let Some(rate) = rate {
+                    plane.rates.insert(
+                        key.into(),
+                        striatum_core::billing::BillingRate::Priced {
+                            rate: rate.as_f64().unwrap(),
+                        },
+                    );
+                }
+            }
+            for (ttl, rate) in rates.cache_write_ttl.iter().flatten() {
+                plane.rates.insert(
+                    format!("rate.cache_write.ttl.{ttl}"),
+                    striatum_core::billing::BillingRate::Priced {
+                        rate: rate.as_f64().unwrap(),
+                    },
+                );
+            }
+            fact.billing_plane = Some(plane);
+        }
+    }
+    for fact in &facts {
+        harness
+            .store()
+            .upsert_fact(fact, FactSource::Override)
+            .unwrap();
+    }
+    harness.edit_config(|config| {
+        for (key, multiplier) in &input.multipliers {
+            let provider = key.split_once('/').unwrap().0;
+            config["providers"][provider]["subscription_multiplier"] = json!(multiplier);
+        }
+    });
+    let billing_facts: Vec<_> = facts
+        .iter()
+        .filter(|fact| fact.billing_plane.is_some())
+        .flat_map(|fact| {
+            ["apikey", "oauth"].into_iter().map(move |method| {
+                let mut fact = fact.clone();
+                fact.billing_plane.as_mut().unwrap().auth_method = method.into();
+                fact
+            })
+        })
+        .collect();
+    let credentials = harness.credentials();
+    let mut credentials = credentials.lock().unwrap();
+    let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&billing_facts)
+        .with_wire_apis(&credentials.wire_apis);
+    credentials.publish_billing_catalog(catalog);
+    input
+        .estimates
+        .iter()
+        .map(|(key, estimate)| {
+            let output = input.list_rates[key].output.as_f64().unwrap()
+                / input
+                    .multipliers
+                    .get(key)
+                    .and_then(serde_json::Number::as_f64)
+                    .unwrap_or(1.0);
+            (
+                key.clone(),
+                TaskProfile {
+                    tokens: TokenVector {
+                        output_excluding_reasoning: estimate.as_f64().unwrap() * 1_000_000.0
+                            / output,
+                        ..Default::default()
+                    },
+                    level: ProfileLevel::OwnCell,
+                    task_count: 20,
+                    own_task_count: 20,
+                    own_weight: 1.0,
+                    keeps_tokenizer: true,
+                },
+            )
+        })
+        .collect()
+}
+
 impl KitSubject {
     fn harness(&self) -> Arc<Harness> {
         Arc::clone(&self.harness.lock().unwrap())
@@ -826,10 +975,19 @@ impl KitSubject {
 
 #[async_trait]
 impl RoutingSubject for KitSubject {
-    type Route = Route;
+    type Route = KitRoute;
 
     async fn reset(&self) -> Result<(), String> {
         *self.harness.lock().unwrap() = Harness::new("kit");
+        Ok(())
+    }
+
+    async fn configure_selection_facts(
+        &self,
+        facts: &cortexkit_role_routing_conformance::SelectionFacts,
+    ) -> Result<(), String> {
+        let harness = self.harness();
+        *harness.selection_profiles.lock().unwrap() = selection_facts(&harness, facts);
         Ok(())
     }
 
@@ -1356,7 +1514,7 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
-    async fn route(&self, stamp: &RouteStamp) -> Result<Route, String> {
+    async fn route(&self, stamp: &RouteStamp) -> Result<KitRoute, String> {
         if let Some(scope) = &stamp.scope {
             let harness = self.harness();
             let channel = harness.reserve_channel();
@@ -1367,12 +1525,18 @@ impl RoutingSubject for KitSubject {
                 "principal": reserved(&stamp.principal),
                 "scope": { "owner": reserved(&scope.owner), "ref": scope.scope_ref, "scope_epoch": scope.scope_epoch, "kind": "ephemeral", "project_id": stamp.project_id, "owner_authorized": true },
             });
-            return Ok(harness.bind_frame(bind, channel, 1).await);
+            return Ok(KitRoute {
+                route: harness.bind_frame(bind, channel, 1).await,
+                profiles: harness.selection_profiles.clone(),
+            });
         }
-        Ok(self
-            .harness()
-            .bind(reserved(&stamp.principal), stamp.project_id.as_deref())
-            .await)
+        Ok(KitRoute {
+            route: self
+                .harness()
+                .bind(reserved(&stamp.principal), stamp.project_id.as_deref())
+                .await,
+            profiles: self.harness().selection_profiles.clone(),
+        })
     }
 }
 
@@ -1407,7 +1571,6 @@ const PENDING_READERS: &[(&str, &str)] = &[
     ("runner_harness_facts", "placement_harness_facts"),
     ("decision_harness", "placement_decision_harness"),
     ("select_kind", "placement_select_kind"),
-    ("select_price", "placement_select_price"),
     ("report_attempt_outcomes", "placement_attempt_outcomes"),
 ];
 

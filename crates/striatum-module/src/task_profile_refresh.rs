@@ -70,7 +70,7 @@ impl ProfileSnapshot {
     }
 }
 
-fn build_snapshot(rows: &[ClosedTaskUsage], facts: &[ModelFact]) -> ProfileSnapshot {
+pub(crate) fn build_snapshot(rows: &[ClosedTaskUsage], facts: &[ModelFact]) -> ProfileSnapshot {
     let tasks = closed_tasks(rows, facts);
     let index = TaskProfileIndex::new(&tasks);
     build_cells(&tasks, facts, |fact, workload, bucket| {

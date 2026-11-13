@@ -598,6 +598,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "engine_evals",
                                 "account_continue_resume",
                                 "account_continue_signed_out",
+                                "select_price",
                             ][..],
                         ),
                         (

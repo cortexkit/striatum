@@ -26,7 +26,7 @@ fn served() -> Value {
     .unwrap()
 }
 
-fn setup(
+pub(super) fn setup(
     plans: &[&str],
     model_ultrafast: bool,
     runner_ultrafast: bool,
@@ -40,7 +40,7 @@ fn setup(
     )
 }
 
-fn setup_for_method(
+pub(super) fn setup_for_method(
     plans: &[&str],
     model_ultrafast: bool,
     runner_ultrafast: bool,
