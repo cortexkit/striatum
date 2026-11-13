@@ -13,6 +13,7 @@ use crate::config_policy::ConsumerPolicy;
 use super::Caller;
 
 pub(super) mod declared;
+pub(super) mod kind;
 
 /// Claims stay keyed by their declaring module until the effective view is
 /// built. No module can overwrite another module's claim to the same name.
