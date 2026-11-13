@@ -586,6 +586,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "report_usage_run_id",
                                 "select_pin_slot",
                                 "select_available_routes",
+                                "select_eligible_routes",
                                 "select_prefer_prompt_cache",
                                 "select_settings",
                                 "observe_backoff",
