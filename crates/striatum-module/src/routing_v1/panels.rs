@@ -51,6 +51,38 @@ pub(super) async fn select_panel(
     let config = operator_config(deps);
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
     let policy = request_policy(&request, &config)?;
+    if request.estimate == Some(true) {
+        // Account loading can reconcile stale evidence. Keep those writes on a
+        // disposable snapshot, and never reserve a live probe or recovery test.
+        let account_store = Arc::new(
+            deps.store
+                .account_evaluation_snapshot(super::now_ms() as i64)
+                .map_err(store_refusal)?,
+        );
+        let dry = DryRun {
+            live_config: crate::config_overrides::live_config(deps.routing_config_path),
+            operator_config: config,
+            account_store: &account_store,
+            profile_lookup: &super::select::live_profile_lookup,
+        };
+        let evaluated = evaluate_panel(&request, policy, caller, deps, &dry).await?;
+        let seats = evaluated
+            .seats
+            .into_iter()
+            .map(|seat| {
+                let mut estimated = PanelEstimateSeat::new(seat.slot, seat.phase, seat.answer);
+                estimated.family = seat.family;
+                estimated.temperature = request
+                    .temperatures
+                    .as_ref()
+                    .and_then(|values| values.get(seat.slot as usize).copied());
+                estimated
+            })
+            .collect();
+        let mut answer = SelectPanelEstimate::new(answer_policy(&request, policy), seats);
+        answer.shortfall = evaluated.shortfall;
+        return serde_json::to_value(answer).map_err(store_refusal);
+    }
     let (_, seats, shortfall) = seat_panel(&request, policy, caller, deps, None).await?;
     // A live pass admits every seat through `route.select`, so each is `Live`.
     let seats = seats
@@ -62,17 +94,9 @@ pub(super) async fn select_panel(
         .collect();
     let mut answer = SelectPanelAnswer::new(
         striatum_store::new_decision_id(),
-        PanelPolicy::new(
-            policy.width() as u64,
-            policy.top_k as u64,
-            policy.extra as u64,
-        ),
+        answer_policy(&request, policy),
         seats,
     );
-    answer.policy.ranking = Some(json!(policy.by));
-    answer.policy.extra_ranking = policy.extra_by.map(|order| json!(order));
-    answer.policy.floor = policy.floor.map(|floor| json!(floor));
-    answer.policy.seed = request.seed.as_ref().map(|seed| json!(seed));
     answer.shortfall = shortfall;
     let state = StoredPanel {
         request,
@@ -94,6 +118,19 @@ pub(super) async fn select_panel(
     serde_json::to_value(state.answer).map_err(store_refusal)
 }
 
+fn answer_policy(request: &SelectPanelRequest, policy: scoring::ClassPanelPolicy) -> PanelPolicy {
+    let mut answer = PanelPolicy::new(
+        policy.width() as u64,
+        policy.top_k as u64,
+        policy.extra as u64,
+    );
+    answer.ranking = Some(json!(policy.by));
+    answer.extra_ranking = policy.extra_by.map(|order| json!(order));
+    answer.floor = policy.floor.map(|floor| json!(floor));
+    answer.seed = request.seed.as_ref().map(|seed| json!(seed));
+    answer
+}
+
 /// The class policy a new panel runs under, refusing a class routing has no
 /// policy for and a configured width outside 1-8.
 pub(super) fn request_policy(
@@ -111,7 +148,7 @@ pub(super) fn request_policy(
     Ok(policy)
 }
 
-/// The call-local inputs an operator what-if seats a panel with: patched
+/// Call-local inputs for read-only panel sizing or an operator what-if:
 /// configuration and a disposable account-evidence store. Seats are checked by
 /// select's evaluation path, which returns before recording a decision, taking
 /// a hold or acquiring a pool key, and no panel row is written.
@@ -129,6 +166,7 @@ pub(super) struct EvaluatedSeat {
     pub route: Value,
     pub variant: Value,
     pub cost_usd: Value,
+    pub answer: PanelEstimateSelection,
     pub family: Option<String>,
     /// The scorer's rank within the seat's phase; absent for a random extra draw.
     pub rank: Option<usize>,
@@ -141,8 +179,8 @@ pub(super) struct PanelEvaluation {
     pub funnel: Option<scoring::PanelCandidateFunnel>,
 }
 
-/// Seat a new panel exactly as `route.select_panel` does, against a what-if's
-/// call-local configuration and account snapshot, and record nothing.
+/// Seat a new panel exactly as live selection does, against call-local
+/// configuration and an account snapshot, and record nothing.
 pub(super) async fn evaluate_panel(
     request: &SelectPanelRequest,
     policy: scoring::ClassPanelPolicy,
@@ -434,6 +472,7 @@ async fn evaluate_seat(
         &view,
         dry.profile_lookup,
         shared,
+        true,
     )
     .await
     {
@@ -450,6 +489,7 @@ async fn evaluate_seat(
         route: answer["route"].clone(),
         variant: answer["variant"].clone(),
         cost_usd: answer["cost_usd"].clone(),
+        answer: serde_json::from_value(answer["selection"].clone()).map_err(store_refusal)?,
         family: member.family.clone(),
         rank,
     }))

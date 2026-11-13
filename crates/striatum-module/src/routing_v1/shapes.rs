@@ -60,6 +60,7 @@ const PANEL_LEGACY: &[&str] = &[
 ];
 const PANEL_CONTRACT: &[&str] = &[
     "class",
+    "estimate",
     "consumer",
     "replace",
     "requirements",

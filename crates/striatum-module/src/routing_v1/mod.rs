@@ -40,6 +40,8 @@ mod engines;
 mod engines_tests;
 mod panels;
 #[cfg(test)]
+mod panels_estimate_tests;
+#[cfg(test)]
 mod panels_tests;
 mod reads;
 mod report;

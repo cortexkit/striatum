@@ -19,6 +19,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "engine_reports",
     "engine_evals",
     "select_panel",
+    cortexkit_role_routing::capabilities::SELECT_PANEL_ESTIMATE,
     "consumer_models",
     "explain",
     "budget_quote",
