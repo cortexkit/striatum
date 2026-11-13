@@ -66,6 +66,13 @@ fn keyed_exception() {
 /// exception tells a closed admission (whose body only SQL keeps) from an
 /// absent one. Returns the row and whether it was open. A private projection
 /// has no state and reads SQL.
+///
+/// The keyed read runs here, on a pooled reader, not inside the admission's
+/// writer command: a replay must answer before roster preparation (which may
+/// refuse), and probing inside the writer would cost a second command. The
+/// command itself checks only open admissions in memory. If an identical
+/// request admits and closes the id in between, the late INSERT conflicts on
+/// the primary key and fails, and the retry replays the closed admission.
 pub(crate) fn preflight_admission(
     store: &SqliteRouteStateStore,
     principal: &str,

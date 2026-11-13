@@ -125,3 +125,119 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
         1,
     );
 }
+
+/// Run one `route.account_for` the way the frame handler does, outside the
+/// async harness, so a test hook can run a competing request inside it.
+fn admit_directly(
+    store: &crate::SharedStore,
+    credentials: &crate::SharedBrocaCredentials,
+    config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+    principal: &str,
+    request: &Value,
+    now: i64,
+) -> crate::account_selection::OpReply {
+    let policy = config.allocator_policy(request["provider"].as_str().unwrap());
+    let ctx = crate::account_selection::Ctx {
+        store,
+        accounts: crate::ACCOUNT_QUOTA.get(),
+        flags: crate::config_overrides::AccountSelectionFlags { enabled: true },
+        policy: &policy,
+        now_ms: now,
+        classes: Some(
+            crate::account_selection::ClassContext::load(
+                store,
+                credentials,
+                config,
+                crate::ACCOUNT_QUOTA.get(),
+                now,
+            )
+            .unwrap(),
+        ),
+    };
+    crate::account_selection::handle(
+        crate::account_selection::ACCOUNT_FOR_OP,
+        &serde_json::to_vec(
+            &json!({"method":crate::account_selection::ACCOUNT_FOR_OP,"params":request}),
+        )
+        .unwrap(),
+        principal,
+        &ctx,
+    )
+}
+
+/// The keyed existence check runs before the admission's writer command, and
+/// inside the command only open admissions are visible from memory. If an
+/// identical request admits and closes the same admission id in between, the
+/// late request must not admit twice: its INSERT conflicts on the primary key
+/// and fails, and the retry finds the closed admission and replays it.
+#[test]
+fn an_admission_closed_after_the_keyed_check_fails_the_insert_and_the_retry_replays_it() {
+    use crate::account_selection::OpReply;
+    use crate::routing_v1::request_cpu_bench as bench;
+    let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+    let fixture = bench::representative_fixture(bench::FixtureCounts {
+        subscription_rules: 7,
+        exclusion_rules: 5,
+        runner_route_rules: 3,
+        catalog_facts: 12,
+        listed_credentials: 6,
+    });
+    let now = bench::FIXTURE_NOW as i64;
+    let module = fixture.catalog.runners[0]
+        .module
+        .trim_start_matches("reserved:")
+        .to_owned();
+    let principal = format!("reserved:{module}");
+    let request = json!({"provider":"cpu-provider-0","model":"model-0",
+        "conversation_key":"raced","admission_id":"raced","caller":{"runner":module}});
+    let admit = {
+        let (store, credentials, config) = (
+            fixture.store().clone(),
+            fixture.credentials(),
+            fixture.operator_config(),
+        );
+        let (principal, request) = (principal.clone(), request.clone());
+        move || {
+            admit_directly(
+                &store,
+                &credentials,
+                config.clone(),
+                &principal,
+                &request,
+                now,
+            )
+        }
+    };
+    let competing = std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let (admit, competing, store, principal) = (
+            admit.clone(),
+            competing.clone(),
+            fixture.store().clone(),
+            principal.clone(),
+        );
+        crate::account_selection::after_roster_prepared("raced", move || {
+            let reply = admit();
+            crate::account_writer::execute(
+                &store,
+                striatum_store::AccountCommandKind::Release,
+                move |tx| tx.mark_admission_released(&principal, "raced", now),
+            )
+            .unwrap();
+            *competing.lock().unwrap() = Some(reply);
+        });
+    }
+    let late = admit();
+    assert!(
+        matches!(late, OpReply::Error { .. }),
+        "the late request admitted a second time: {late:?}"
+    );
+    let Some(OpReply::Result(mut competing)) = competing.lock().unwrap().take() else {
+        panic!("the competing admission did not run or was refused");
+    };
+    let OpReply::Result(retried) = admit() else {
+        panic!("the retry did not replay the closed admission");
+    };
+    competing["admission"]["state"] = json!("released");
+    assert_eq!(retried, competing);
+}

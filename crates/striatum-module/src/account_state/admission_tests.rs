@@ -505,6 +505,10 @@ fn apply(
             };
             let mut reservation = world.new_admission(rng, now);
             reservation.principal = principal.clone();
+            // As serving does, a reservation can become its conversation's
+            // affinity pin (`install`); releasing or finishing the reservation
+            // then ends that affinity row's lease, a write the state decides.
+            let install = rng.below(2) == 0;
             world.admissions.push(reservation.clone());
             let previous = if rng.below(2) == 0 {
                 rng.pick(&world.decisions).cloned().unwrap_or_else(|| "root".into())
@@ -516,7 +520,7 @@ fn apply(
             let selection = world.fresh("selection");
             let valid_until = now + rng.below(30) as i64;
             both(store, oracle, move |tx| {
-                admit(tx, &reservation, false)?;
+                admit(tx, &reservation, install)?;
                 tx.record_continuation(
                     &principal,
                     &selection,
