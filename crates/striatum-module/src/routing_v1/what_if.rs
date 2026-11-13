@@ -152,12 +152,10 @@ pub(super) async fn what_if_with_profile_lookup(
         .unwrap_or_default();
     // Keep declaration overlays and all credential reads on a disposable copy.
     // Never publish the proposed slot or copy reconciled state back to the cache.
-    let mut credentials = deps
-        .broca_credentials
-        .lock()
-        .map_err(store_refusal)?
-        .clone();
-    credentials.runner_declarations.extend(declarations);
+    let credentials = overlay_runner_declarations(
+        &*deps.broca_credentials.lock().map_err(store_refusal)?,
+        declarations,
+    );
     let credentials = Arc::new(Mutex::new(credentials));
     let deps = Deps {
         broca_credentials: &credentials,
@@ -243,6 +241,17 @@ pub(super) async fn what_if_with_profile_lookup(
         result["head_choices"] = choices;
     }
     Ok(result)
+}
+
+pub(super) fn overlay_runner_declarations(
+    live: &crate::broca_credentials::BrocaCredentials,
+    declarations: BTreeMap<String, super::runners::RunnerDeclaration>,
+) -> crate::broca_credentials::BrocaCredentials {
+    let mut proposed = live.clone();
+    // Copy-on-write rotates the credential generation with the runner declarations.
+    // Serving indexes for the live snapshot cannot answer the proposed view.
+    proposed.runner_declarations.extend(declarations);
+    proposed
 }
 
 /// One class's dry-run panel, validated before any snapshot is taken.
