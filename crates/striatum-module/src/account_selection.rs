@@ -1098,8 +1098,7 @@ impl ClassContext {
     ) -> Result<Self, String> {
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
-        if store
-            .account_read(|tx| tx.has_expired_admission_probes(now_ms))
+        if crate::account_state::has_expired_admission_probes(store, now_ms)
             .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
@@ -1107,8 +1106,7 @@ impl ClassContext {
             })
             .map_err(|error| error.to_string())?;
         }
-        if store
-            .account_read(|tx| tx.has_expired_continuations(now_ms))
+        if crate::account_state::has_expired_continuations(store, now_ms)
             .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
@@ -4234,6 +4232,24 @@ fn load_demand(
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> RouteStateResult<Vec<AdmissionDemand>> {
+    demand_with(
+        |provider, account, floor| tx.demand(provider, account, floor),
+        provider,
+        roster,
+        policy,
+        context,
+    )
+}
+
+/// [`load_demand`] over any source of `ACCOUNT_DEMAND_SQL` rows: SQL, or the
+/// account state, which keeps the same rows in memory.
+fn demand_with(
+    mut read: impl FnMut(&str, &str, Option<i64>) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
+    provider: &str,
+    roster: Option<&Roster>,
+    policy: &AllocatorPolicy,
+    context: &striatum_core::accounts::AllocationContext,
+) -> RouteStateResult<Vec<AdmissionDemand>> {
     // One read per account; a repeated account keeps its lowest floor.
     let mut floors: BTreeMap<&str, Option<EpochMs>> = BTreeMap::new();
     for view in roster.map_or(&[][..], |roster| &roster.accounts) {
@@ -4246,7 +4262,7 @@ fn load_demand(
     let mut demand = Vec::new();
     for (account_id, floor) in floors {
         demand.extend(
-            tx.demand(provider, account_id, floor)?
+            read(provider, account_id, floor)?
                 .into_iter()
                 .filter_map(|row| {
                     let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
@@ -5030,22 +5046,24 @@ pub(crate) fn account_for_parsed(
     };
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
-    match ctx
-        .store
-        .account_read(|tx| tx.admission(principal, &parsed.admission_id))
-    {
-        Ok(Some(_)) => {
+    match crate::account_state::preflight_admission(ctx.store, principal, &parsed.admission_id) {
+        Ok(Some((preflight, open))) => {
             let principal = principal.to_owned();
             let now = ctx.now_ms;
             return crate::account_writer::execute(
                 ctx.store,
                 striatum_store::AccountCommandKind::Replay,
                 move |tx| {
-                    let row = tx
-                        .admission(&principal, &parsed.admission_id)?
-                        .ok_or_else(|| {
-                            RouteStateStoreError("admission disappeared; retry".into())
-                        })?;
+                    // A closed admission never changes again, so the row the
+                    // preflight read is current; an open one may have moved on.
+                    let row = if open {
+                        tx.admission(&principal, &parsed.admission_id)?
+                            .ok_or_else(|| {
+                                RouteStateStoreError("admission disappeared; retry".into())
+                            })?
+                    } else {
+                        preflight
+                    };
                     let reply = replay(tx, &principal, row, &request_fingerprint, now)?;
                     finish_reply(tx, reply, finish.as_ref(), now)
                 },
@@ -6127,6 +6145,19 @@ pub(crate) fn preflight_model_for_class_with_reset(
         .map_or_else(Default::default, |classes| {
             classes.allocation_context(provider, model)
         });
+    // Demand comes from the published account state; a private projection
+    // has none and reads SQL.
+    let state = if ctx.store.is_account_evaluation_projection() {
+        None
+    } else {
+        Some(
+            crate::account_state::snapshot(ctx.store).map_err(|error| PreflightRefusal {
+                code: "account_selection_unavailable".into(),
+                message: error.to_string(),
+                reset_at_ms: None,
+            })?,
+        )
+    };
     let (decision, fences) = ctx
         .store
         .account_read(|tx| {
@@ -6138,8 +6169,11 @@ pub(crate) fn preflight_model_for_class_with_reset(
                     affinity: None,
                     fences: fences.clone(),
                     principal_exclusions: Vec::new(),
-                    admissions: load_demand(
-                        tx,
+                    admissions: demand_with(
+                        |provider, account, floor| match &state {
+                            Some(state) => Ok(state.admissions.demand(provider, account, floor)),
+                            None => tx.demand(provider, account, floor),
+                        },
                         provider,
                         roster.roster.as_ref(),
                         &policy,
@@ -6249,7 +6283,7 @@ fn serve(
     checking("admission_transaction");
     let now = ctx.now_ms;
     let policy = ctx.provider_policy(provider);
-    if let Some(existing) = tx.admission(principal, &params.admission_id)? {
+    if let Some(existing) = tx.existing_admission(principal, &params.admission_id)? {
         return replay(tx, principal, existing, request_fingerprint, now);
     }
     let salt = tx.salt(now, fresh_salt)?;
@@ -6316,7 +6350,13 @@ fn serve(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
-    let admissions = load_demand(tx, provider, roster.roster.as_ref(), &policy, &inputs)?;
+    let admissions = demand_with(
+        |provider, account, floor| tx.demand(provider, account, floor),
+        provider,
+        roster.roster.as_ref(),
+        &policy,
+        &inputs,
+    )?;
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
     let origins: Vec<_> = tx
@@ -7540,6 +7580,8 @@ fn apply_bound_observation(
             }
         }
         "run_finished" => {
+            // Read while the admission is still open: finishing closes it.
+            let size_class = tx.admission_size_class(principal, id)?;
             if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
@@ -7579,7 +7621,7 @@ fn apply_bound_observation(
                         &admission.account_id,
                         &admission.credential_id,
                         &admission.model,
-                        tx.admission_size_class(principal, &admission.admission_id)?,
+                        size_class,
                         admission.committed_at,
                         now,
                         Some(&striatum_store::QuotaSuccessScope {

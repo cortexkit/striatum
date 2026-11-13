@@ -23,6 +23,8 @@ pub trait AccountStateBridge: Send + Sync {
     fn reload_requested(&self) -> bool {
         false
     }
+    /// Ask the writer to reload before its next batch.
+    fn request_reload(&self) {}
 }
 
 pub(crate) struct WriterAccountState {
@@ -118,5 +120,21 @@ impl crate::SqliteRouteStateStore {
 
     pub fn account_state_bridge(&self) -> Option<&std::sync::Arc<dyn AccountStateBridge>> {
         self.account_state.get()
+    }
+
+    /// Test seeds may write account rows directly on the writer connection,
+    /// which `PRAGMA data_version` does not report to that same connection.
+    /// After such a write, reload and republish the module's state before
+    /// anything reads it, as a restart would. Runs as a read-only barrier, so
+    /// it adds no write transaction or command count.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn reload_account_state_after_direct_write(&self) -> RouteStateResult<()> {
+        let Some(bridge) = self.account_state.get() else {
+            return Ok(());
+        };
+        bridge.request_reload();
+        self.account_writer_engine()
+            .enqueue_inner(|_, _| Ok(()), true)?
+            .wait()
     }
 }

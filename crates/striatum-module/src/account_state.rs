@@ -6,8 +6,8 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use striatum_core::route_state_store::{RouteStateResult, RouteStateStoreError};
 use striatum_store::{
-    AccountAdmissionRow, AccountAffinityRow, AccountStateBridge, AccountTx, AccountWorkingState,
-    AffinityRetentionBatch, SqliteRouteStateStore, V1Recorded,
+    AccountAdmissionRow, AccountAffinityRow, AccountDemandRow, AccountStateBridge, AccountTx,
+    AccountWorkingState, AffinityRetentionBatch, SqliteRouteStateStore, V1Recorded,
 };
 
 mod admissions;
@@ -18,8 +18,8 @@ pub(crate) use admissions::AdmissionState;
 pub(crate) struct AccountState {
     pub(crate) generation: u64,
     selection_salt: Option<Arc<String>>,
-    /// Maintained by every admission, affinity and continuation writer; not
-    /// yet read by request paths.
+    /// Maintained by every admission, affinity and continuation writer and
+    /// read by request paths instead of those tables.
     pub(crate) admissions: AdmissionState,
 }
 
@@ -43,6 +43,89 @@ static MAINTENANCE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[cfg(test)]
 pub(crate) fn maintenance_reads() -> u64 {
     MAINTENANCE_READS.load(Ordering::Relaxed)
+}
+
+/// The sanctioned request-path SQL reads of the admission group: a primary-key
+/// lookup of an admission the state does not hold because it is closed or
+/// absent, or of a continuation's stored bodies, which the state never holds.
+/// Their SQL carries `striatum_store::KEYED_EXCEPTION`. Every other request
+/// read of the group is answered from the state.
+static KEYED_EXCEPTION_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+fn keyed_exception_reads() -> u64 {
+    KEYED_EXCEPTION_READS.load(Ordering::Relaxed)
+}
+
+fn keyed_exception() {
+    KEYED_EXCEPTION_READS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Before an account request runs, look its admission up in the published
+/// state. An open admission answers from memory. Otherwise one keyed SQL
+/// exception tells a closed admission (whose body only SQL keeps) from an
+/// absent one. Returns the row and whether it was open. A private projection
+/// has no state and reads SQL.
+pub(crate) fn preflight_admission(
+    store: &SqliteRouteStateStore,
+    principal: &str,
+    admission_id: &str,
+) -> RouteStateResult<Option<(AccountAdmissionRow, bool)>> {
+    if store.is_account_evaluation_projection() {
+        return store
+            .account_read(|tx| tx.admission(principal, admission_id))
+            .map(|row| row.map(|row| (row, false)));
+    }
+    if let Some(open) = snapshot(store)?
+        .admissions
+        .open_admission(principal, admission_id)
+    {
+        return Ok(Some((open.row.clone(), true)));
+    }
+    keyed_exception();
+    store
+        .account_read(|tx| tx.admission_by_key(principal, admission_id))
+        .map(|row| row.map(|row| (row, false)))
+}
+
+/// A continuation's stored request and answer, read before its command: the
+/// bodies live only in SQL, so this is always one keyed exception.
+pub(crate) fn preflight_continuation(
+    store: &SqliteRouteStateStore,
+    principal: &str,
+    selection: &str,
+) -> RouteStateResult<Option<V1Recorded>> {
+    if store.is_account_evaluation_projection() {
+        return store.account_read(|tx| tx.continuation(principal, selection));
+    }
+    keyed_exception();
+    store.account_read(|tx| tx.continuation_by_key(principal, selection))
+}
+
+/// The published state's answer to `has_expired_continuations`.
+pub(crate) fn has_expired_continuations(
+    store: &SqliteRouteStateStore,
+    now: i64,
+) -> RouteStateResult<bool> {
+    if store.is_account_evaluation_projection() {
+        return store.account_read(|tx| tx.has_expired_continuations(now));
+    }
+    Ok(snapshot(store)?.admissions.has_expired_offers(now))
+}
+
+/// The published state's answer to `has_expired_admission_probes`. The probe
+/// authorizations are not in memory, so their owners come from SQL; whether
+/// each owner is an expired unstarted admission comes from the state.
+pub(crate) fn has_expired_admission_probes(
+    store: &SqliteRouteStateStore,
+    now: i64,
+) -> RouteStateResult<bool> {
+    if store.is_account_evaluation_projection() {
+        return store.account_read(|tx| tx.has_expired_admission_probes(now));
+    }
+    let state = snapshot(store)?;
+    let owners = store.account_read(|tx| tx.probe_authorization_owners())?;
+    Ok(!state.admissions.expired_probe_admissions(owners, now).is_empty())
 }
 
 
@@ -109,6 +192,10 @@ impl AccountStateBridge for StateOwner {
 
     fn reload_requested(&self) -> bool {
         self.reload.swap(false, Ordering::AcqRel)
+    }
+
+    fn request_reload(&self) {
+        self.reload.store(true, Ordering::Release);
     }
 }
 
@@ -193,22 +280,244 @@ impl<'a> AccountCommand<'a> {
     }
 }
 
+// Reads of the admission group. These shadow the `AccountTx` methods of the
+// same name reached through `Deref`, so a command answers them from its
+// working state, which already holds every earlier change of its batch.
+// Without a state (private SQL projections) they are the SQL reads.
+impl AccountCommand<'_> {
+    fn admission_state(&self) -> Option<&AdmissionState> {
+        self.state.as_deref().map(|state| &state.admissions)
+    }
+
+    /// An open admission from the state; a closed or absent one costs one
+    /// keyed exception.
+    pub(crate) fn admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        let Some(state) = self.admission_state() else {
+            return self.sql.admission(principal, admission_id);
+        };
+        if let Some(open) = state.open_admission(principal, admission_id) {
+            return Ok(Some(open.row.clone()));
+        }
+        keyed_exception();
+        self.sql.admission_by_key(principal, admission_id)
+    }
+
+    /// The admission only if it is open (`reserved`, `started`, `expired`),
+    /// for a caller that has already handled closed ones, or for whom a
+    /// closed one means the same as none. No SQL read with a state.
+    pub(crate) fn open_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        match self.admission_state() {
+            Some(state) => Ok(state
+                .open_admission(principal, admission_id)
+                .map(|open| open.row.clone())),
+            None => Ok(self
+                .sql
+                .admission(principal, admission_id)?
+                .filter(|row| matches!(row.state.as_str(), "reserved" | "started" | "expired"))),
+        }
+    }
+
+    /// Serve's idempotency check. The caller looked the admission up before
+    /// its command, so with a state only an admission opened since then (a
+    /// concurrent identical request) can be found here; a closed one would
+    /// make the new row's INSERT fail and the retry replay it. Without a
+    /// state, the SQL row in any state.
+    pub(crate) fn existing_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        match self.admission_state() {
+            Some(_) => self.open_admission(principal, admission_id),
+            None => self.sql.admission(principal, admission_id),
+        }
+    }
+
+    /// The size class an open admission's probe was scoped to. A caller
+    /// finishing the admission reads it first, while it is still open.
+    pub(crate) fn admission_size_class(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<u32>> {
+        match self.admission_state() {
+            Some(state) => Ok(state
+                .open_admission(principal, admission_id)
+                .and_then(|open| open.input_size_class)),
+            None => self.sql.admission_size_class(principal, admission_id),
+        }
+    }
+
+    pub(crate) fn affinity(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+    ) -> RouteStateResult<Option<AccountAffinityRow>> {
+        match self.admission_state() {
+            Some(state) => Ok(state.affinity(principal, hash, provider).cloned()),
+            None => self.sql.affinity(principal, hash, provider),
+        }
+    }
+
+    pub(crate) fn pin_has_started(&self, affinity: &AccountAffinityRow) -> RouteStateResult<bool> {
+        match self.admission_state() {
+            Some(state) => Ok(state.pin_has_started(affinity)),
+            None => self.sql.pin_has_started(affinity),
+        }
+    }
+
+    pub(crate) fn parent_used_account(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+        now: i64,
+    ) -> RouteStateResult<Option<String>> {
+        match self.admission_state() {
+            Some(state) => Ok(state.parent_used_account(principal, hash, provider, now)),
+            None => self.sql.parent_used_account(principal, hash, provider, now),
+        }
+    }
+
+    pub(crate) fn demand(
+        &self,
+        provider: &str,
+        account_id: &str,
+        committed_after: Option<i64>,
+    ) -> RouteStateResult<Vec<AccountDemandRow>> {
+        match self.admission_state() {
+            Some(state) => Ok(state.demand(provider, account_id, committed_after)),
+            None => self.sql.demand(provider, account_id, committed_after),
+        }
+    }
+
+    /// A continuation's stored bodies. With a state, only an open offer can
+    /// have appeared since the caller's keyed preflight read; another record
+    /// would make the new row's INSERT fail and the retry replay it.
+    pub(crate) fn continuation(
+        &self,
+        principal: &str,
+        selection: &str,
+    ) -> RouteStateResult<Option<V1Recorded>> {
+        let Some(state) = self.admission_state() else {
+            return self.sql.continuation(principal, selection);
+        };
+        if !state.offers.contains_key(&(principal.to_owned(), selection.to_owned())) {
+            return Ok(None);
+        }
+        keyed_exception();
+        self.sql.continuation_by_key(principal, selection)
+    }
+
+    pub(crate) fn continued_reservation(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+        decision: &str,
+    ) -> RouteStateResult<Option<String>> {
+        match self.admission_state() {
+            Some(state) => Ok(state.continued_reservation(principal, admission_id, run_id, decision)),
+            None => self
+                .sql
+                .continued_reservation(principal, admission_id, run_id, decision),
+        }
+    }
+
+    pub(crate) fn continuation_has_used_successor(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+        previous: &str,
+    ) -> RouteStateResult<bool> {
+        match self.admission_state() {
+            Some(state) => Ok(state.has_used_successor(principal, admission_id, run_id, previous)),
+            None => self
+                .sql
+                .continuation_has_used_successor(principal, admission_id, run_id, previous),
+        }
+    }
+
+    /// The reservation admission of the original's newest used offer. The
+    /// chain names it; an open reservation comes from the state and a closed
+    /// one costs one keyed exception.
+    pub(crate) fn latest_used_continuation(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        let Some(state) = self.admission_state() else {
+            return self.sql.latest_used_continuation(principal, admission_id);
+        };
+        match state.latest_used_reservation(principal, admission_id) {
+            Some(reservation) => self.admission(principal, &reservation),
+            None => Ok(None),
+        }
+    }
+}
+
 // Each admission, affinity and continuation writer runs its SQL and then the
 // same change on the working state, inside one writer command. These methods
 // shadow the `AccountTx` methods of the same name reached through `Deref`, so a
 // module command cannot write those tables without maintaining the state.
-// Without a state (private SQL projections) they are the SQL writers alone.
+// The continuation transitions are the reverse: the state decides them and its
+// decided writes are persisted by key. Without a state (private SQL
+// projections) they are the SQL writers alone.
 impl AccountCommand<'_> {
     fn admissions(&mut self) -> Option<&mut AdmissionState> {
         self.state.as_deref_mut().map(|state| &mut state.admissions)
     }
 
+    /// Apply a change SQL has already made to the state.
+    fn mirror(&mut self, change: impl FnOnce(&mut AdmissionState)) {
+        if let Some(state) = self.admissions() {
+            change(state);
+            state.pending.clear();
+        }
+    }
+
+    /// Decide a change on the state, then persist the writes it decided.
+    fn decide<T>(&mut self, change: impl FnOnce(&mut AdmissionState) -> T) -> RouteStateResult<T> {
+        let sql = self.sql;
+        let state = self.admissions().expect("decide needs a working state");
+        let decided = change(state);
+        for effect in std::mem::take(&mut state.pending) {
+            match effect {
+                admissions::Effect::Admission { row, from } => {
+                    if !sql.set_admission_lifecycle(&row, &from)? {
+                        tracing::warn!(
+                            admission = %row.admission_id,
+                            "account state expected admission in state {from}; SQL row differs"
+                        );
+                    }
+                }
+                admissions::Effect::LeaseEnded { conversation, at } => {
+                    sql.set_affinity_lease_end(&conversation.0, &conversation.1, &conversation.2, at)?
+                }
+                admissions::Effect::Offer {
+                    selection,
+                    used_at,
+                    released_at,
+                } => sql.settle_continuation_offer(&selection.0, &selection.1, used_at, released_at)?,
+            }
+        }
+        Ok(decided)
+    }
+
     pub(crate) fn insert_admission(&mut self, row: &AccountAdmissionRow) -> RouteStateResult<()> {
         self.sql.insert_admission(row)?;
         let rowid = self.sql.last_insert_rowid();
-        if let Some(state) = self.admissions() {
-            state.insert_admission(row, rowid);
-        }
+        self.mirror(|state| state.insert_admission(row, rowid));
         Ok(())
     }
 
@@ -223,9 +532,7 @@ impl AccountCommand<'_> {
             .sql
             .record_admission_probe_scope(principal, id, size, decision)?
         {
-            if let Some(state) = self.admissions() {
-                state.set_probe_scope(principal, id, size, decision);
-            }
+            self.mirror(|state| state.set_probe_scope(principal, id, size, decision));
         }
         Ok(())
     }
@@ -236,9 +543,9 @@ impl AccountCommand<'_> {
         admission_id: &str,
     ) -> RouteStateResult<bool> {
         let changed = self.sql.mark_admission_expired(principal, admission_id)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.expire(principal, admission_id);
-        }
+        });
         Ok(changed)
     }
 
@@ -253,9 +560,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_started(principal, admission_id, run_id, at, late)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.start(principal, admission_id, run_id, at, late);
-        }
+        });
         Ok(changed)
     }
 
@@ -268,9 +575,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_released(principal, admission_id, at)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.release(principal, admission_id, at);
-        }
+        });
         Ok(changed)
     }
 
@@ -283,9 +590,9 @@ impl AccountCommand<'_> {
         let changed = self
             .sql
             .mark_admission_finished(principal, admission_id, at)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.finish(principal, admission_id, at);
-        }
+        });
         Ok(changed)
     }
 
@@ -295,9 +602,9 @@ impl AccountCommand<'_> {
         expected: Option<(&str, u64)>,
     ) -> RouteStateResult<bool> {
         let changed = self.sql.put_affinity(row, expected)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.put_affinity(row, expected);
-        }
+        });
         Ok(changed)
     }
 
@@ -321,7 +628,7 @@ impl AccountCommand<'_> {
             expires_at,
             lease_valid_until,
         )?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.touch_affinity(
                 principal,
                 conversation_hash,
@@ -331,15 +638,15 @@ impl AccountCommand<'_> {
                 expires_at,
                 lease_valid_until,
             );
-        }
+        });
         Ok(changed)
     }
 
     pub(crate) fn end_lease(&mut self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
         let changed = self.sql.end_lease(pin_id, at)?;
-        if let Some(state) = self.admissions() {
+        self.mirror(|state| {
             state.end_lease(pin_id, at);
-        }
+        });
         Ok(changed)
     }
 
@@ -357,26 +664,24 @@ impl AccountCommand<'_> {
         self.sql
             .record_continuation(principal, selection, record, run, admission, previous, offer)?;
         let rowid = self.sql.last_insert_rowid();
-        if let Some(state) = self.admissions() {
-            state.record_continuation(principal, selection, run, admission, previous, offer, rowid);
-        }
+        self.mirror(|state| {
+            state.record_continuation(principal, selection, run, admission, previous, offer, rowid)
+        });
         Ok(())
     }
 
     pub(crate) fn release_expired_continuations(&mut self, now: i64) -> RouteStateResult<()> {
-        self.sql.release_expired_continuations(now)?;
-        if let Some(state) = self.admissions() {
-            state.release_expired_continuations(now);
+        if self.state.is_none() {
+            return self.sql.release_expired_continuations(now);
         }
-        Ok(())
+        self.decide(|state| state.release_expired_continuations(now))
     }
 
     pub(crate) fn use_continuation(&mut self, decision: &str, now: i64) -> RouteStateResult<()> {
-        self.sql.use_continuation(decision, now)?;
-        if let Some(state) = self.admissions() {
-            state.use_continuation(decision, now);
+        if self.state.is_none() {
+            return self.sql.use_continuation(decision, now);
         }
-        Ok(())
+        self.decide(|state| state.use_continuation(decision, now))
     }
 
     pub(crate) fn use_observed_continuation(
@@ -388,20 +693,18 @@ impl AccountCommand<'_> {
         credential: Option<&str>,
         now: i64,
     ) -> RouteStateResult<bool> {
-        let chosen = self.state.as_deref().and_then(|state| {
-            state
-                .admissions
-                .observed_continuation(principal, admission, run, account, credential, now)
-        });
-        let used = self
-            .sql
-            .use_observed_continuation(principal, admission, run, account, credential, now)?;
-        if let Some(state) = self.admissions() {
-            if let Some(decision) = chosen {
-                state.use_continuation(&decision, now);
-            }
-        }
-        Ok(used)
+        let Some(state) = self.admission_state() else {
+            return self
+                .sql
+                .use_observed_continuation(principal, admission, run, account, credential, now);
+        };
+        let Some(decision) =
+            state.observed_continuation(principal, admission, run, account, credential, now)
+        else {
+            return Ok(false);
+        };
+        self.decide(|state| state.use_continuation(&decision, now))?;
+        Ok(true)
     }
 
     pub(crate) fn finish_continuations(
@@ -411,24 +714,27 @@ impl AccountCommand<'_> {
         run: &str,
         now: i64,
     ) -> RouteStateResult<()> {
-        self.sql
-            .finish_continuations(principal, admission, run, now)?;
-        if let Some(state) = self.admissions() {
-            state.finish_continuations(principal, admission, run, now);
+        if self.state.is_none() {
+            return self.sql.finish_continuations(principal, admission, run, now);
         }
-        Ok(())
+        self.decide(|state| state.finish_continuations(principal, admission, run, now))
     }
 
-    /// Which admissions expire depends on fence probe authorizations, which
-    /// are not in memory yet, so SQL decides and returns the admissions it
-    /// expired; the state applies the same expiry to each.
+    /// Fence probe authorizations are not in memory yet, so SQL supplies
+    /// their owners; the state decides which name expired unstarted
+    /// admissions, and SQL releases those probes and expires the admissions.
     pub(crate) fn release_expired_admission_probes(&mut self, now: i64) -> RouteStateResult<()> {
-        let expired = self.sql.release_expired_admission_probes(now)?;
-        if let Some(state) = self.admissions() {
-            for (principal, admission) in expired {
+        let Some(state) = self.admission_state() else {
+            self.sql.release_expired_admission_probes(now)?;
+            return Ok(());
+        };
+        let expired = state.expired_probe_admissions(self.sql.probe_authorization_owners()?, now);
+        let marked = self.sql.release_admission_probes(expired, now)?;
+        self.mirror(|state| {
+            for (principal, admission) in marked {
                 state.expire(&principal, &admission);
             }
-        }
+        });
         Ok(())
     }
 
@@ -455,6 +761,7 @@ impl AccountCommand<'_> {
                 )?;
                 state.set_latest(conversation, latest);
             }
+            state.pending.clear();
         }
         Ok(deleted.len())
     }
@@ -467,6 +774,7 @@ impl AccountCommand<'_> {
         let (batch, deleted) = self.sql.prune_account_affinities_returning(before, limit)?;
         if let Some(state) = self.admissions() {
             state.prune_affinities(&deleted);
+            state.pending.clear();
         }
         Ok(batch)
     }
@@ -486,6 +794,7 @@ impl AccountCommand<'_> {
                 let latest = sql.latest_used_continuation_row(&original.0, &original.1)?;
                 state.set_latest_used(&original, latest);
             }
+            state.pending.clear();
         }
         Ok(deleted.len())
     }
@@ -538,7 +847,7 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
     println!(
         "account_state admissions: open={} demand_accounts={} demand_entries={demand_entries} \
          latest={} affinity={} pin_started={} started_pins={} offers={} chains={} \
-         fork_ns/op={fork_ns} load_us/op={}",
+         fork_ns/op={fork_ns} load_us/op={} keyed_exception_reads={} maintenance_reads={}",
         state.open.len(),
         state.demand.len(),
         state.latest.len(),
@@ -548,6 +857,8 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         state.offers.len(),
         state.chains.len(),
         start.elapsed().as_micros() / 10,
+        keyed_exception_reads(),
+        maintenance_reads(),
     );
 }
 

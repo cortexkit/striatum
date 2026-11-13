@@ -560,7 +560,7 @@ fn replay_admission(
 }
 
 fn replay_admission_tx(
-    tx: &striatum_store::AccountTx<'_>,
+    tx: &crate::account_state::AccountCommand<'_>,
     first: V1Recorded,
     body_json: &str,
     request: &AccountForRequest,
@@ -572,8 +572,9 @@ fn replay_admission_tx(
         return Ok(original);
     }
     let current = (|| {
+        // A started admission is open, so the state answers without SQL.
         if !tx
-            .admission(principal, id)?
+            .open_admission(principal, id)?
             .is_some_and(|row| row.state == "started")
         {
             return Ok(None);

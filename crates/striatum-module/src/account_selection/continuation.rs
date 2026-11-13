@@ -80,20 +80,15 @@ pub(crate) fn continue_account(
     ctx: &Ctx<'_>,
 ) -> Result<Value, Refusal> {
     let now_ms = ctx.now_ms;
-    if ctx
-        .store
-        .account_read(|tx| tx.has_expired_continuations(now_ms))
-        .map_err(unavailable)?
-    {
+    if crate::account_state::has_expired_continuations(ctx.store, now_ms).map_err(unavailable)? {
         crate::account_writer::repair(ctx.store, move |tx| {
             tx.release_expired_continuations(now_ms)
         })
         .map_err(unavailable)?;
     }
-    if let Some(first) = ctx
-        .store
-        .account_read(|tx| tx.continuation(principal, &request.selection_id))
-        .map_err(unavailable)?
+    if let Some(first) =
+        crate::account_state::preflight_continuation(ctx.store, principal, &request.selection_id)
+            .map_err(unavailable)?
     {
         return standing(first, request);
     }

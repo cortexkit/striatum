@@ -1082,6 +1082,23 @@ impl AccountTx<'_> {
         Ok(())
     }
 
+    /// Every owner holding a probe authorization, without joining admissions:
+    /// a caller that holds the admission rows in memory decides which owners
+    /// are expired unstarted admissions, then passes them to
+    /// [`Self::release_admission_probes`].
+    pub fn probe_authorization_owners(&self) -> RouteStateResult<Vec<String>> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(Vec::new());
+        }
+        self.conn
+            .prepare("SELECT DISTINCT owner FROM fence_probe_authorization ORDER BY owner")
+            .map_err(err)?
+            .query_map([], |row| row.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(err)
+    }
+
     /// Preview cleanup without acquiring a writer. The write path checks again
     /// because a runner may start the admission after this snapshot is read.
     pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
@@ -1119,6 +1136,17 @@ impl AccountTx<'_> {
             .map_err(err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
+        self.release_admission_probes(expired, now)
+    }
+
+    /// Release the probes of unstarted admissions already found expired, each
+    /// given as (principal, admission id, authorization owner). Returns the
+    /// admissions it moved from `reserved` to `expired`.
+    pub fn release_admission_probes(
+        &self,
+        expired: Vec<(String, String, String)>,
+        now: i64,
+    ) -> RouteStateResult<Vec<(String, String)>> {
         if expired.is_empty() {
             return Ok(Vec::new());
         }

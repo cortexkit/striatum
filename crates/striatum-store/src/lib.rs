@@ -63,6 +63,8 @@ pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
 #[cfg(any(test, feature = "test-support"))]
+pub mod group_reads;
+#[cfg(any(test, feature = "test-support"))]
 mod block_parity_fixture;
 mod key_pool;
 pub use fence_rechecks::{BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope};
@@ -97,7 +99,7 @@ pub use account_selection::{
     AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountRouteFence,
     AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionStateRow, ContinuationStateRow,
     CredentialProbeClaim, DemandStateRow, LatestAdmissionRow, PinStartedRow, PrunedAdmission,
-    PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, KEYED_EXCEPTION,
     OBSERVATION_BACKOFFS_SQL,
 };
 

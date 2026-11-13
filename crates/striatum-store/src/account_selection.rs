@@ -2271,16 +2271,29 @@ impl SqliteRouteStateStore {
             self.store.is_projection(),
             "live account writes require a writer command"
         );
-        self.store
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            allow(unused_variables, unused_assignments, unused_mut)
+        )]
+        let mut wrote = false;
+        let result = self
+            .store
             .with_conn(|conn: &Connection| {
+                let before = conn.total_changes();
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if result.is_ok() {
                     crate::evaluation_snapshot::timed_commit(tx)?;
+                    wrote = conn.total_changes() != before;
                 }
                 Ok(result)
             })
-            .map_err(err)?
+            .map_err(err)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if wrote {
+            self.reload_account_state_after_direct_write()?;
+        }
+        result
     }
 
     /// Revalidate a read-path repair under the IMMEDIATE writer. A competing
@@ -2291,16 +2304,21 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<bool>,
     ) -> RouteStateResult<()> {
-        self.store
+        let result = self
+            .store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if matches!(result, Ok(true)) {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }
-                Ok(result.map(|_| ()))
+                Ok(result)
             })
-            .map_err(err)?
+            .map_err(err)??;
+        if result {
+            self.reload_account_state_after_direct_write()?;
+        }
+        Ok(())
     }
 
     /// The newest decisions recorded in `mode`, newest first.

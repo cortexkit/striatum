@@ -374,3 +374,125 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 }
+
+/// Marks the SQL text of a keyed-exception read. The module serves the
+/// admission group from memory, which holds open admissions and open
+/// continuation offers only; finished and released admissions and every
+/// continuation's request and answer bodies stay in SQL. A request that names
+/// one of those reads it by primary key, never by scan, and these reads are
+/// counted apart from ordinary ones. The marker lets a statement trace tell
+/// them apart.
+pub const KEYED_EXCEPTION: &str = "/* keyed exception */";
+
+impl AccountTx<'_> {
+    /// Keyed exception: one admission by primary key, for a caller whose
+    /// memory state does not hold it because it is closed or absent.
+    pub fn admission_by_key(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {ADMISSION_COLUMNS} FROM account_admission {KEYED_EXCEPTION} \
+                     WHERE principal = ?1 AND admission_id = ?2"
+                ),
+                params![principal, admission_id],
+                admission_from_row,
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Keyed exception: a continuation's stored request and answer, which the
+    /// memory state never holds.
+    pub fn continuation_by_key(
+        &self,
+        principal: &str,
+        selection: &str,
+    ) -> RouteStateResult<Option<crate::V1Recorded>> {
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT request_json, answer_json FROM account_continue {KEYED_EXCEPTION} \
+                     WHERE principal = ?1 AND selection_id = ?2"
+                ),
+                params![principal, selection],
+                |row| {
+                    Ok(crate::V1Recorded {
+                        body_json: row.get(0)?,
+                        answer_json: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
+    /// Write the lifecycle columns of one admission exactly as the module's
+    /// state computed them. Keyed by primary key and guarded by the state the
+    /// row had, so a row the state misjudged is left alone and reported.
+    pub fn set_admission_lifecycle(
+        &self,
+        row: &AccountAdmissionRow,
+        from_state: &str,
+    ) -> RouteStateResult<bool> {
+        self.conn
+            .execute(
+                "UPDATE account_admission SET state = ?3, run_id = ?4, started_at = ?5, \
+                   started_late = ?6, released_at = ?7, finished_at = ?8 \
+                 WHERE principal = ?1 AND admission_id = ?2 AND state = ?9",
+                params![
+                    row.principal,
+                    row.admission_id,
+                    row.state,
+                    row.run_id,
+                    row.started_at,
+                    i64::from(row.started_late),
+                    row.released_at,
+                    row.finished_at,
+                    from_state,
+                ],
+            )
+            .map(|changed| changed == 1)
+            .map_err(err)
+    }
+
+    /// End one conversation's lease at `at`, by primary key.
+    pub fn set_affinity_lease_end(
+        &self,
+        principal: &str,
+        conversation_hash: &str,
+        provider: &str,
+        at: i64,
+    ) -> RouteStateResult<()> {
+        self.conn
+            .execute(
+                "UPDATE account_affinity SET lease_valid_until = ?4 \
+                 WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
+                params![principal, conversation_hash, provider, at],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
+    /// Mark one continuation offer used or released, by primary key.
+    pub fn settle_continuation_offer(
+        &self,
+        principal: &str,
+        selection: &str,
+        used_at: Option<i64>,
+        released_at: Option<i64>,
+    ) -> RouteStateResult<()> {
+        self.conn
+            .execute(
+                "UPDATE account_continue SET used_at_ms = COALESCE(?3, used_at_ms), \
+                   released_at_ms = COALESCE(?4, released_at_ms) \
+                 WHERE principal = ?1 AND selection_id = ?2",
+                params![principal, selection, used_at, released_at],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+}

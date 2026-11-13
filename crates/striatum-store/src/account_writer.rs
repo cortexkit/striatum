@@ -329,7 +329,7 @@ impl AccountWriter {
         self.enqueue_inner(f, false)
     }
 
-    fn enqueue_inner<T: Send + 'static>(
+    pub(crate) fn enqueue_inner<T: Send + 'static>(
         &self,
         f: impl FnOnce(
                 &AccountTx<'_>,
@@ -381,7 +381,7 @@ impl SqliteRouteStateStore {
             .wait()
     }
 
-    fn account_writer_engine(&self) -> &AccountWriter {
+    pub(crate) fn account_writer_engine(&self) -> &AccountWriter {
         self.account_writer.get_or_init(|| {
             AccountWriter::start(
                 self.store.clone(),

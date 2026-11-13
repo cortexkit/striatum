@@ -2,9 +2,10 @@
 //!
 //! Every writer of `account_admission`, `account_affinity` and
 //! `account_continue` applies the same change here, in the same writer command
-//! as its SQL. Request paths do not read this state yet; until they do, the
-//! load-equivalence tests prove that maintaining it in step with SQL leaves it
-//! equal to a fresh load.
+//! as its SQL. Request paths read this state instead of those tables; the
+//! continuation transitions are decided here and persisted as keyed writes
+//! (see [`Effect`]). The load-equivalence tests prove the state stays equal
+//! to a fresh load, and that every read answers what its SQL query would.
 //!
 //! Only bounded data is kept: open admissions, one demand entry per charged
 //! unreleased admission, every affinity row, and small derived indexes for
@@ -17,7 +18,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use striatum_store::{
-    AccountAdmissionRow, AccountAffinityRow, AdmissionGroupRows, ContinuationStateRow,
+    AccountAdmissionRow, AccountAffinityRow, AccountDemandRow, AdmissionGroupRows, ContinuationStateRow,
     LatestAdmissionRow, PrunedAdmission, PrunedContinuation, ReservationRef,
 };
 
@@ -175,7 +176,36 @@ pub(crate) struct ChainReservation {
     pub(crate) previous_decision_id: String,
     pub(crate) decision_id: String,
     pub(crate) used: bool,
+    /// The offer was released unused (`released_at_ms` is set). A released
+    /// offer no longer names its run's current reservation.
+    pub(crate) released: bool,
     pub(crate) reservation: Option<ReservationRef>,
+}
+
+/// A SQL write the state decided. The continuation transitions are computed
+/// on the working state, then persisted as keyed writes, so deciding them
+/// never reads the tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Effect {
+    /// Write the admission's lifecycle columns; it was in state `from`.
+    Admission { row: AccountAdmissionRow, from: String },
+    /// End one conversation's lease.
+    LeaseEnded { conversation: ConversationKey, at: i64 },
+    /// An offer was used or released.
+    Offer {
+        selection: RowKey,
+        used_at: Option<i64>,
+        released_at: Option<i64>,
+    },
+}
+
+/// How an offer stops being an offer.
+#[derive(Clone, Copy)]
+enum Settle {
+    Used(i64),
+    Released(i64),
+    /// Retention deleted the row: nothing to persist.
+    Deleted,
 }
 
 /// Every offer row of one original admission that is still open, grouped by
@@ -217,6 +247,9 @@ pub(crate) struct AdmissionState {
     /// chains are dropped when the command settles, because finishing a run
     /// closes the original before its continuations are finished.
     pub(crate) closing: Vec<RowKey>,
+    /// Writes decided since the command last drained them; empty whenever a
+    /// state is published.
+    pub(crate) pending: Vec<Effect>,
 }
 
 /// The index state an admission row contributes, before and after a change.
@@ -301,6 +334,7 @@ impl AdmissionState {
                     previous_decision_id: row.previous_decision_id,
                     decision_id: row.decision_id,
                     used: row.used_at_ms.is_some(),
+                    released: row.released_at_ms.is_some(),
                     reservation: row.reservation,
                 },
             );
@@ -523,6 +557,7 @@ impl AdmissionState {
             return false;
         }
         let mut row = open.row.clone();
+        let from = row.state.clone();
         let was_started = row.started_at.is_some();
         let was_state_started = row.state == "started";
         change(&mut row);
@@ -543,6 +578,10 @@ impl AdmissionState {
             );
         }
         self.restate(&row);
+        self.pending.push(Effect::Admission {
+            row: row.clone(),
+            from,
+        });
         if matches!(row.state.as_str(), "released" | "finished") {
             self.open.remove(&id);
             self.closing.push(id);
@@ -661,6 +700,10 @@ impl AdmissionState {
                 if row.lease_valid_until.is_none_or(|until| until > at) {
                     Arc::make_mut(row).lease_valid_until = Some(at);
                     changed = true;
+                    self.pending.push(Effect::LeaseEnded {
+                        conversation: conversation.clone(),
+                        at,
+                    });
                 }
             }
         }
@@ -723,6 +766,7 @@ impl AdmissionState {
                     previous_decision_id: previous.to_owned(),
                     decision_id: decision.to_owned(),
                     used: false,
+                    released: false,
                     reservation: reservation_ref,
                 },
             );
@@ -730,9 +774,31 @@ impl AdmissionState {
         }
     }
 
-    fn remove_offer(&mut self, selection: &RowKey) -> Option<Arc<Offer>> {
+    fn remove_offer(&mut self, selection: &RowKey, settle: Settle) -> Option<Arc<Offer>> {
         let offer = self.offers.remove(selection)?;
         self.offer_by_decision.remove(&offer.decision_id);
+        let (used_at, released_at) = match settle {
+            Settle::Used(at) => (Some(at), None),
+            Settle::Released(at) => (None, Some(at)),
+            Settle::Deleted => return Some(offer),
+        };
+        if released_at.is_some() {
+            let original = key(&selection.0, &offer.admission_id);
+            if let Some(chain) = self.chains.get_mut(&original) {
+                if let Some(row) = Arc::make_mut(chain)
+                    .runs
+                    .get_mut(&offer.run_id)
+                    .and_then(|rows| rows.get_mut(&offer.rowid))
+                {
+                    row.released = true;
+                }
+            }
+        }
+        self.pending.push(Effect::Offer {
+            selection: selection.clone(),
+            used_at,
+            released_at,
+        });
         Some(offer)
     }
 
@@ -753,7 +819,7 @@ impl AdmissionState {
             });
         }
         for (selection, _) in &expired {
-            self.remove_offer(selection);
+            self.remove_offer(selection, Settle::Released(now));
         }
     }
 
@@ -784,7 +850,7 @@ impl AdmissionState {
         // offers are released.
         let mut used = None;
         if let Some(selection) = self.offer_by_decision.get(&decision.to_owned()).cloned() {
-            if let Some(offer) = self.remove_offer(&selection) {
+            if let Some(offer) = self.remove_offer(&selection, Settle::Used(now)) {
                 self.transition(&selection.0, &offer.reservation_id, &["reserved"], |row| {
                     row.state = "started".into();
                     row.started_at = Some(now);
@@ -875,7 +941,7 @@ impl AdmissionState {
             .map(|(selection, _)| selection.clone())
             .collect();
         for selection in released {
-            self.remove_offer(&selection);
+            self.remove_offer(&selection, Settle::Released(now));
         }
     }
 
@@ -1083,7 +1149,7 @@ impl AdmissionState {
                 .get(&key(&row.principal, &row.selection_id))
                 .is_some_and(|offer| offer.rowid == row.rowid)
             {
-                self.remove_offer(&key(&row.principal, &row.selection_id));
+                self.remove_offer(&key(&row.principal, &row.selection_id), Settle::Deleted);
             }
             let original = key(&row.principal, &row.admission_id);
             let Some(chain) = self.chains.get_mut(&original) else {
@@ -1124,6 +1190,162 @@ impl AdmissionState {
                 self.chains.remove(&original);
             }
         }
+    }
+}
+
+// Request-path reads. Each answers exactly what the named SQL query answers
+// over the rows this state mirrors.
+impl AdmissionState {
+    pub(crate) fn open_admission(&self, principal: &str, admission_id: &str) -> Option<&OpenAdmission> {
+        self.open.get(&key(principal, admission_id)).map(Arc::as_ref)
+    }
+
+    pub(crate) fn affinity(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+    ) -> Option<&AccountAffinityRow> {
+        self.affinity
+            .get(&conversation(principal, hash, provider))
+            .map(Arc::as_ref)
+    }
+
+    /// `ACCOUNT_DEMAND_SQL`: charged, unreleased admissions of one account
+    /// committed after `committed_after`, in (commit time, principal,
+    /// admission id) order.
+    pub(crate) fn demand(
+        &self,
+        provider: &str,
+        account_id: &str,
+        committed_after: Option<i64>,
+    ) -> Vec<AccountDemandRow> {
+        let floor = committed_after.unwrap_or(i64::MIN);
+        self.demand
+            .get(&key(provider, account_id))
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .filter(|((committed_at, _, _), _)| *committed_at > floor)
+            .map(|((committed_at, _, _), demand)| AccountDemandRow {
+                account_id: account_id.to_owned(),
+                state: demand.state.clone(),
+                committed_at: *committed_at,
+                request_bytes: demand.request_bytes,
+            })
+            .collect()
+    }
+
+    /// `pin_has_started`: whether an admission on `affinity`'s pin and
+    /// generation has started. The index counts started rows on each
+    /// conversation's current pin, so another pin has none here.
+    pub(crate) fn pin_has_started(&self, affinity: &AccountAffinityRow) -> bool {
+        let conversation = conversation_of(affinity);
+        let current = self.affinity.get(&conversation).is_some_and(|current| {
+            current.pin_id == affinity.pin_id && current.pin_generation == affinity.pin_generation
+        });
+        current && self.pin_started.contains_key(&conversation)
+    }
+
+    /// `parent_used_account`: the account of the conversation's newest
+    /// admission while it holds the conversation's current pin, until that pin
+    /// lapses (the admission deadline before start, the lease deadline after).
+    pub(crate) fn parent_used_account(
+        &self,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+        now: i64,
+    ) -> Option<String> {
+        let conversation = conversation(principal, hash, provider);
+        let latest = self.latest.get(&conversation)?;
+        let affinity = self.affinity.get(&conversation)?;
+        if affinity.pin_id != latest.pin_id || affinity.pin_generation != latest.pin_generation {
+            return None;
+        }
+        let holds = (latest.state == "reserved" && latest.admission_valid_until > now)
+            || (latest.state == "started" && latest.lease_valid_until > now);
+        holds.then(|| latest.account_id.clone())
+    }
+
+    /// `has_expired_continuations`: an unused, unreleased offer past its deadline.
+    pub(crate) fn has_expired_offers(&self, now: i64) -> bool {
+        self.offers
+            .iter()
+            .any(|(_, offer)| offer.valid_until_ms <= now)
+    }
+
+    /// `continued_reservation`: the reservation of the run's offer that
+    /// `decision` names, unless that offer was released.
+    pub(crate) fn continued_reservation(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+        decision: &str,
+    ) -> Option<String> {
+        self.chains
+            .get(&key(principal, admission_id))?
+            .runs
+            .get(run_id)?
+            .values()
+            .find(|row| row.decision_id == decision && !row.released)
+            .map(|row| row.reservation_id.clone())
+    }
+
+    /// `continuation_has_used_successor`.
+    pub(crate) fn has_used_successor(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+        previous: &str,
+    ) -> bool {
+        self.chains
+            .get(&key(principal, admission_id))
+            .is_some_and(|chain| chain.used_successors(run_id, previous))
+    }
+
+    /// The reservation id of the original's newest used offer.
+    pub(crate) fn latest_used_reservation(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> Option<String> {
+        self.chains
+            .get(&key(principal, admission_id))?
+            .latest_used
+            .as_ref()
+            .map(|(_, reservation)| reservation.clone())
+    }
+
+    /// Of the probe-authorization `owners`, the admissions whose probe
+    /// `EXPIRED_ADMISSION_PROBES` releases: an admission owner that names an
+    /// unstarted `reserved` or `expired` admission past its deadline. Closed
+    /// admissions never qualify, so the open rows answer it exactly.
+    pub(crate) fn expired_probe_admissions(
+        &self,
+        owners: Vec<String>,
+        now: i64,
+    ) -> Vec<(String, String, String)> {
+        owners
+            .into_iter()
+            .filter_map(|owner| {
+                let parts: Vec<String> = serde_json::from_str(&owner).ok()?;
+                let [kind, principal, admission_id] = parts.as_slice() else {
+                    return None;
+                };
+                if kind != "account_admission"
+                    || owner != serde_json::json!([kind, principal, admission_id]).to_string()
+                {
+                    return None;
+                }
+                let open = self.open_admission(principal, admission_id)?;
+                let expired = matches!(open.row.state.as_str(), "reserved" | "expired")
+                    && open.row.started_at.is_none()
+                    && open.row.admission_valid_until <= now;
+                expired.then(|| (principal.clone(), admission_id.clone(), owner.clone()))
+            })
+            .collect()
     }
 }
 
