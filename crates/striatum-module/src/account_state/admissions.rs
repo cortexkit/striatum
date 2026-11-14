@@ -392,6 +392,7 @@ impl AdmissionState {
             affinities,
             offers,
             chains,
+            continuation_sources: _,
         } = rows;
         let mut state = Self::default();
         for row in open {

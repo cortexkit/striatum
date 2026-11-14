@@ -73,6 +73,19 @@ pub struct ContinuationStateRow {
     pub reservation: Option<ReservationRef>,
 }
 
+/// The row an offer leaves, independent of that row's lifecycle state or
+/// the retention of routing/v1 request records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationSourceRow {
+    pub principal: String,
+    pub selection_id: String,
+    pub run_id: String,
+    pub left_admission_id: String,
+    pub provider: String,
+    pub account_id: String,
+    pub used_at_ms: Option<i64>,
+}
+
 /// An admission row a retention pass deleted, with the fields the derived
 /// indexes are keyed by.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +128,7 @@ pub struct AdmissionGroupRows {
     pub offers: Vec<ContinuationStateRow>,
     /// Every offer row whose original admission is still open, in rowid order.
     pub chains: Vec<ContinuationStateRow>,
+    pub continuation_sources: Vec<ContinuationSourceRow>,
 }
 
 const OPEN_STATES: &str = "('reserved', 'started', 'expired')";
@@ -277,7 +291,7 @@ impl AccountTx<'_> {
                 [],
                 affinity_from_row,
             )?;
-            let (offers, chains) = if continuations_exist(conn)? {
+            let (offers, chains, continuation_sources) = if continuations_exist(conn)? {
                 let offers = collect(
                     conn,
                     &format!(
@@ -304,9 +318,37 @@ impl AccountTx<'_> {
                     [],
                     continuation_from_row,
                 )?;
-                (offers, chains)
+                // A predecessor decision identifies another offer only within
+                // the same admission and run. Otherwise the offer left its
+                // original admission. Closed rows still supply this evidence.
+                let continuation_sources = collect(
+                    conn,
+                    "SELECT c.principal, c.selection_id, c.run_id, l.admission_id,
+                            l.provider, l.account_id, c.used_at_ms
+                     FROM account_continue c
+                     LEFT JOIN account_continue p
+                       ON p.principal=c.principal AND p.admission_id=c.admission_id
+                      AND p.run_id=c.run_id AND p.decision_id=c.previous_decision_id
+                     JOIN account_admission l ON l.principal=c.principal
+                      AND l.admission_id=COALESCE(p.reservation_id, c.admission_id)
+                     WHERE c.decision_id IS NOT NULL
+                       AND (c.used_at_ms IS NOT NULL OR c.released_at_ms IS NULL)",
+                    [],
+                    |row| {
+                        Ok(ContinuationSourceRow {
+                            principal: row.get(0)?,
+                            selection_id: row.get(1)?,
+                            run_id: row.get(2)?,
+                            left_admission_id: row.get(3)?,
+                            provider: row.get(4)?,
+                            account_id: row.get(5)?,
+                            used_at_ms: row.get(6)?,
+                        })
+                    },
+                )?;
+                (offers, chains, continuation_sources)
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
             Ok(AdmissionGroupRows {
                 open,
@@ -314,6 +356,7 @@ impl AccountTx<'_> {
                 affinities,
                 offers,
                 chains,
+                continuation_sources,
             })
         })()
         .map_err(err)
