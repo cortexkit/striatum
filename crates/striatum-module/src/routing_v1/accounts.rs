@@ -115,7 +115,9 @@ impl AccountCaller<'_> {
 /// child can look up its parent's reported use without sharing admission ids.
 fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCaller<'a>, Refusal> {
     checking("caller_check");
-    let runners = super::operator_config(deps).v1_runners();
+    let runners = deps.broca_credentials.lock().map(|credentials| {
+        super::runners::enrollment::policies(&super::operator_config(deps).v1_runners(), &credentials)
+    }).unwrap_or_else(|_| super::operator_config(deps).v1_runners());
     if caller.binding_is_current() {
         if let Some(module) = caller.attested_module().filter(|module| {
             runners.iter().any(|runner| runner.module == *module)

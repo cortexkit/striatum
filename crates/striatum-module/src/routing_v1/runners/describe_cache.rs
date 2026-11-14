@@ -13,6 +13,7 @@ pub(super) const LAST_GOOD_MS: i64 = 5 * 60_000;
 pub(crate) struct DescribeCache {
     modules: BTreeSet<String>,
     failed: BTreeSet<String>,
+    auto_enrolled: BTreeSet<String>,
 }
 
 impl DescribeCache {
@@ -24,6 +25,22 @@ impl DescribeCache {
         now: i64,
     ) -> BTreeSet<String> {
         credentials.runner_declarations = super::declarations_from_catalog(modules);
+        super::enrollment::replace_catalog(modules, credentials);
+        let auto_enrolled: BTreeSet<_> = credentials
+            .first_party_runners
+            .keys()
+            .filter(|module| !policies.iter().any(|policy| policy.module == **module))
+            .cloned()
+            .collect();
+        for module in auto_enrolled.difference(&self.auto_enrolled) {
+            crate::warn_operator(format!("runner auto-enrolled: module={module:?}"));
+        }
+        for module in self.auto_enrolled.difference(&auto_enrolled) {
+            crate::warn_operator(format!("runner auto-enrollment left: module={module:?}"));
+        }
+        self.auto_enrolled = auto_enrolled;
+        let policies = super::enrollment::policies(policies, credentials);
+        let policies = policies.as_slice();
         self.modules =
             super::tier_discovery_modules(modules, &credentials.runner_declarations, policies);
         self.expire(credentials, now);

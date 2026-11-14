@@ -484,7 +484,7 @@ async fn draining_runner_failed_fresh_describe_open_and_catalog_gap_keep_fast_ad
     let consumer = subc_client_rs::SubcConsumer::connect(path, Default::default())
         .await
         .unwrap();
-    let reply = runners::fetch_describe(&consumer, path, "broca").await;
+    let reply = runners::fetch_describe(&consumer, path, "broca", &[], &Default::default()).await;
     assert!(
         reply.is_none(),
         "a failed route open is not a successful describe"

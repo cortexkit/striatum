@@ -5749,18 +5749,15 @@ fn prepare_service_tier(
             })
             .cloned()
             .collect();
-        let runners: Vec<_> = classes
-            .config
-            .v1_runners()
-            .into_iter()
-            .filter(|runner| runner.module == parsed.caller.runner)
-            .collect();
         let registry = crate::routing_v1::runners::Registry::build(
             classes.config.as_ref(),
             &classes.credentials,
             &classes.facts,
             classes.now_ms.max(0) as u64,
         );
+        let runners: Vec<_> = registry.policies().into_iter()
+            .filter(|runner| runner.module == parsed.caller.runner)
+            .collect();
         classes.apply_service_tier(
             &mut facts,
             tier.as_str(),
