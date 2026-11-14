@@ -18,28 +18,26 @@ pub(crate) fn tier_view_unknown(credentials: &BrocaCredentials, module: &str, no
 
 pub(crate) async fn fetch_describe(
     consumer: &SubcConsumer,
-    connection_file: &Path,
+    _connection_file: &Path,
     module: &str,
+    settings: &[crate::config_policy::RunnerPolicy],
+    credentials: &crate::SharedBrocaCredentials,
 ) -> Option<Value> {
-    consumer
-        .call(
-            subc_protocol::RouteTarget::ManagementSurface {
-                module_id: module.to_owned(),
-            },
-            subc_protocol::BindIdentity::new(
-                connection_file.parent().unwrap_or(Path::new(".")),
-                crate::DEFAULT_MODULE_ID,
-                "runner-service-tiers",
-            ),
-            br#"{"method":"role.describe","params":{}}"#.to_vec(),
-            CallOptions {
-                timeout: Duration::from_secs(1),
-                ..Default::default()
-            },
-        )
-        .await
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+    super::enrollment::describe(
+        consumer,
+        module,
+        subc_protocol::BindIdentity::new(crate::DEFAULT_MODULE_ID, "runner-service-tiers"),
+        br#"{"method":"role.describe","params":{}}"#.to_vec(),
+        CallOptions {
+            timeout: Duration::from_secs(1),
+            ..Default::default()
+        },
+        settings,
+        credentials,
+    )
+    .await
+    .ok()
+    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
 }
 
 /// Poll unknown tier views before admission. A cold cache cannot establish
@@ -81,7 +79,14 @@ pub(crate) async fn refresh_admission_tiers(body: &[u8], caller: &Caller, deps: 
         let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
             .await
             .ok()?;
-        fetch_describe(&consumer, &path, &module).await
+        fetch_describe(
+            &consumer,
+            &path,
+            &module,
+            &super::super::operator_config(deps).v1_runners(),
+            deps.broca_credentials,
+        )
+        .await
     })
     .await
     .ok()

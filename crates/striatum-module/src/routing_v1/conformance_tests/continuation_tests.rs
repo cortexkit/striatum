@@ -1,6 +1,8 @@
 use super::*;
 
 mod account_decision_tests;
+mod enforcement_tests;
+mod head_turn_tests;
 mod inflight_tests;
 mod request_reads_tests;
 mod shadow_lines_tests;
@@ -347,6 +349,52 @@ async fn continuation_first_usageless_report_consumes_reservation_for_every_end_
             })
             .unwrap();
     }
+}
+
+#[tokio::test]
+async fn continuation_preparation_unknown_decision_refuses_with_original_detail() {
+    let (_subject, _, runner, mut request) = paused().await;
+    request["selection_id"] = json!("preparation-unknown-decision");
+    account_selection::inject_continuation_preparation_failure(
+        "preparation-unknown-decision",
+        account_selection::OpReply::Error {
+            code: "unknown_decision".into(),
+            message: "selection decision does not exist".into(),
+            detail: None,
+        },
+    );
+    let answer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(answer["kind"], "refuse", "{answer}");
+    assert_eq!(answer["routing_code"], "unknown_decision", "{answer}");
+    assert_eq!(answer["detail"], json!({}));
+    assert_eq!(result(runner.call("route.account_for", &request).await), answer);
+}
+
+#[tokio::test]
+async fn continuation_preparation_store_unavailable_holds_with_original_detail() {
+    let (_subject, _, runner, mut request) = paused().await;
+    request["selection_id"] = json!("preparation-store-unavailable");
+    let detail = json!({
+        "code":"account_selection_unavailable", "retry_after_s":null,
+        "decision_id":null, "exclusions":[],
+    });
+    account_selection::inject_continuation_preparation_failure(
+        "preparation-store-unavailable",
+        account_selection::OpReply::typed(
+            "account_selection_unavailable",
+            "routing could not read or commit account state: unavailable store",
+            detail.clone(),
+        ),
+    );
+    let answer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(answer["kind"], "hold", "{answer}");
+    assert_eq!(answer["routing_code"], "account_selection_unavailable", "{answer}");
+    assert_eq!(answer["detail"], detail);
+    assert!(answer.get("until_ms").is_none(), "{answer}");
+    assert_eq!(result(runner.call("route.account_for", &request).await), answer);
+    request["selection_id"] = json!("preparation-input-ready");
+    let ready = result(runner.call("route.account_for", &request).await);
+    assert_eq!(ready["kind"], "offer", "{ready}");
 }
 
 #[tokio::test]

@@ -39,8 +39,12 @@ fn served_row(route: &str) -> Value {
 }
 
 fn fixture() -> Arc<Harness> {
+    fixture_for_phone(false)
+}
+
+fn fixture_for_phone(with_phone_languages: bool) -> Arc<Harness> {
     let harness = super::super::setup(vec![]);
-    consumers::replace_catalog(&json!([{
+    let mut declarations = json!([{
         "module_id":"colliculus", "nonce_verified":true, "role_declarations":{
             "routing/v1":{"consumers":[
                 {"name":VOICE,"kind":"transcribe","selectors":["callosum"]},
@@ -55,7 +59,12 @@ fn fixture() -> Arc<Harness> {
                     "local":false,"formats":["audio/wav"],"max_input_bytes":10000,"latency_class":"interactive"}
             ]}
         }
-    }]));
+    }]);
+    if with_phone_languages {
+        declarations[0]["role_declarations"]["media-provider/v1"]["engines"][0]["languages"] =
+            json!(["fr"]);
+    }
+    consumers::replace_catalog(&declarations);
     harness.edit_config(|config| {
         config["consumers"][VOICE] = json!({"mode":"demand","iq":40});
         config["consumers"]["colliculus.speech"] = json!({"mode":"demand","iq":40});
@@ -64,24 +73,27 @@ fn fixture() -> Arc<Harness> {
     audio["quality.grade"] = json!(80);
     let mut speech = served_row("elevenlabs/eleven_flash_v2_5");
     speech["quality.grade"] = json!(80);
-    let snapshot = crate::fusiform_catalog::decode_catalog_get(
-        &serde_json::to_vec(&json!({
-            "catalog_version":41,"resolved_at_ms":NOW,
-            "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
-            "models":{
-                "media-vendor/fixture-transcribe":audio,
-                "media-vendor/fixture-speech":speech,
-                "media-vendor/phone-transcriber":{
-                    "existence":"present","model.type":"transcription","quality.grade":80
-                },
-                "media-vendor/fixture-premium":{
-                    "existence":"present","model.type":"transcription","quality.grade":100
-                }
+    let mut catalog = json!({
+        "catalog_version":41,"resolved_at_ms":NOW,
+        "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
+        "models":{
+            "media-vendor/fixture-transcribe":audio,
+            "media-vendor/fixture-speech":speech,
+            "media-vendor/phone-transcriber":{
+                "existence":"present","model.type":"transcription","quality.grade":80
+            },
+            "media-vendor/fixture-premium":{
+                "existence":"present","model.type":"transcription","quality.grade":100
             }
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+        }
+    });
+    if with_phone_languages {
+        catalog["models"]["apple/phone-transcriber"] =
+            json!({"existence":"present","model.type":"transcription","quality.grade":80});
+    }
+    let snapshot =
+        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
+            .unwrap();
     harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
     harness
 }
@@ -286,7 +298,48 @@ async fn serving_bytes_match_media_vectors() {
     capture_redemption(&mut samples, &harness, &colliculus, &decision).await;
     capture_refusals(&mut samples).await;
     capture_unavailable(&mut samples).await;
+    capture_phone_languages(&mut samples).await;
     samples.verify();
+}
+
+async fn capture_phone_languages(samples: &mut Samples) {
+    let harness = fixture_for_phone(true);
+    let phone = harness.bind(reserved("callosum"), None).await;
+    let mut request = voice_request();
+    request["caller_local"] = json!([{
+        "formats":["audio/wav"],"kind":"transcribe","languages":["en-US"],
+        "latency_class":"realtime","local":true,"max_duration_ms":600000,
+        "model":"phone-transcriber","provider":"apple"
+    }]);
+    request["requirements"]["language"] = json!("en-US");
+    let selected = samples
+        .capture(
+            "voice-message-caller-local-en",
+            &harness,
+            &phone,
+            &request,
+            Some("phone-transcriber"),
+        )
+        .await;
+    assert_eq!(selected["result"]["engine"]["provider"], "apple");
+    assert_eq!(selected["result"]["engine"]["caller_local"], true);
+    assert_eq!(selected["result"]["engine"]["index"], 0);
+    assert!(selected["result"]["engine"].get("module").is_none());
+    assert!(selected["result"].get("price").is_none());
+
+    request["requirements"]["language"] = json!("fr-FR");
+    let selected = samples
+        .capture(
+            "voice-message-caller-local-fr",
+            &harness,
+            &phone,
+            &request,
+            Some("fixture-transcribe"),
+        )
+        .await;
+    assert_eq!(selected["result"]["engine"]["caller_local"], false);
+    assert_eq!(selected["result"]["engine"]["module"], "colliculus");
+    assert_eq!(selected["result"]["engine"]["provider"], "media-vendor");
 }
 
 async fn capture_phone_voice(samples: &mut Samples, harness: &Harness, phone: &Route) {

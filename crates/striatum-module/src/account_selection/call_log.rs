@@ -13,7 +13,35 @@ pub(crate) struct AccountCall {
 }
 
 impl AccountCall {
-    pub(crate) fn legacy(params: &Value, principal: &str, store: &SqliteRouteStateStore) -> Self {
+    /// A body declaration is trusted only when the daemon-stamped principal is
+    /// `reserved:<module>` and that module is enrolled through settings or the
+    /// daemon's first-party runner catalog; never from caller.runner or another
+    /// module authorized to allocate accounts.
+    pub(crate) fn head_turn_source(
+        params: &Value,
+        principal: &str,
+        config: &crate::config_overrides::LiveConfig,
+        credentials: &crate::broca_credentials::BrocaCredentials,
+    ) -> Option<&'static str> {
+        (params["head_turn"].as_bool() == Some(true)
+            && principal.strip_prefix("reserved:").is_some_and(|module| {
+                crate::routing_v1::runners::enrollment::policies(&config.v1_runners(), credentials)
+                    .iter()
+                    .any(|runner| runner.module == module)
+            }))
+        .then_some("head_turn")
+    }
+
+    /// Reading `head_turn` on the older caller-bearing `account_for` shape is
+    /// routing's own extension (the contract defines it only on routing/v1);
+    /// it goes when that shape is retired. It uses the same trust rule as v1.
+    pub(crate) fn legacy(
+        params: &Value,
+        principal: &str,
+        config: Option<&crate::config_overrides::LiveConfig>,
+        credentials: Option<&crate::broca_credentials::BrocaCredentials>,
+        store: &SqliteRouteStateStore,
+    ) -> Self {
         Self::record(
             "route.account_for",
             params,
@@ -21,7 +49,9 @@ impl AccountCall {
             params["caller"]["runner"].as_str(),
             None,
             None,
-            false,
+            config.zip(credentials).and_then(|(config, credentials)| {
+                Self::head_turn_source(params, principal, config, credentials)
+            }),
             params["caller"]["harness"].as_str(),
             store,
         )
@@ -31,7 +61,7 @@ impl AccountCall {
         params: &Value,
         caller: &crate::routing_v1::Caller,
         runner: Option<&str>,
-        head_call: bool,
+        head_call_source: Option<&'static str>,
         store: &SqliteRouteStateStore,
     ) -> Self {
         let scope = caller.scope_authority.as_ref();
@@ -42,7 +72,7 @@ impl AccountCall {
             runner,
             scope.map(|scope| wire(&scope.kind)),
             scope.map(|scope| scope.owner.as_str()),
-            head_call,
+            head_call_source,
             None,
             store,
         )
@@ -56,7 +86,7 @@ impl AccountCall {
         runner: Option<&str>,
         scope_kind: Option<Value>,
         scope_owner: Option<&str>,
-        head_call: bool,
+        head_call_source: Option<&'static str>,
         harness: Option<&str>,
         store: &SqliteRouteStateStore,
     ) -> Self {
@@ -86,11 +116,12 @@ impl AccountCall {
                     })
                     .flatten()
             });
+        let head_call = head_call_source.is_some();
         crate::info_operator(format!(
             "routing account call {}",
             json!({"surface":surface,"principal":principal,"runner_module":runner,
                 "scope_kind":scope_kind,"scope_owner":scope_owner,"consumer":consumer,
-                "harness":harness,"head_call":head_call})
+                "harness":harness,"head_call":head_call,"head_call_source":head_call_source})
         ));
         Self {
             surface,
@@ -204,9 +235,14 @@ impl AccountCall {
         *self.would_refuse.lock().unwrap() = Some(line);
     }
 
-    fn pressure(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) -> Value {
-        let class = self
-            .consumer
+    /// The priority class of the consumer on the decision this call is bound
+    /// to, never of the runner module that makes it; `worker` when the call
+    /// is bound to none.
+    pub(super) fn class(
+        &self,
+        ctx: &CommandContext,
+    ) -> cortexkit_role_routing::declarations::ConsumerPriority {
+        self.consumer
             .as_deref()
             .zip(ctx.classes.as_ref())
             .and_then(|(consumer, classes)| {
@@ -214,7 +250,11 @@ impl AccountCall {
                     .defaults_for(consumer)
                     .priority
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn pressure(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) -> Value {
+        let class = self.class(ctx);
         json!({
             "surface":self.surface,"consumer":self.consumer.as_ref().or(self.runner_module.as_ref()),
             "class":class,"model":model,"accounts":accounts

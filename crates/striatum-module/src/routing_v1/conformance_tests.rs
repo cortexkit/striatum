@@ -46,6 +46,7 @@ static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod continuation_tests;
 mod zero_config_tests;
+mod first_party_tests;
 mod warm_credential_tests;
 #[path = "media_conformance.rs"]
 mod media_conformance;
@@ -164,6 +165,13 @@ impl Harness {
 
     pub(super) fn operator_config(&self) -> Arc<crate::config_overrides::LiveConfig> {
         crate::config_overrides::live_config(&self.config_path.lock().unwrap())
+    }
+
+    pub(super) fn attach_reasoning_catalog(&self, catalog: striatum_store::ReasoningCatalog) {
+        crate::config_overrides::attach_reasoning_catalog(
+            &self.config_path.lock().unwrap(),
+            Arc::new(move || Ok(catalog.clone())),
+        ).unwrap();
     }
 
     pub(crate) fn settings_source(&self, source: Arc<dyn crate::project_settings::Source>) {
@@ -1146,6 +1154,30 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_account_concurrency(
+        &self,
+        account_id: &str,
+        cap: u64,
+    ) -> Result<(), String> {
+        let harness = self.harness();
+        let shared = harness.broca_credentials.lock().unwrap().clone();
+        let credentials = shared.lock().unwrap();
+        let provider = credentials
+            .listed_credentials()
+            .iter()
+            .find(|row| row.account_id.as_deref() == Some(account_id))
+            .and_then(|row| row.provider_ids.first())
+            .ok_or_else(|| format!("no catalog provider for account {account_id}"))?
+            .clone();
+        drop(credentials);
+        harness.edit_config(|config| {
+            config["concurrency"]["enforcement_enabled"] = json!(true);
+            config["concurrency"]["accounts"][format!("{provider}/{account_id}")] =
+                json!({"limit":cap});
+        });
+        Ok(())
+    }
+
     async fn configure_runner_route_facts(
         &self,
         routes: &[cortexkit_role_routing_conformance::RunnerRouteFacts],
@@ -1435,7 +1467,13 @@ impl RoutingSubject for KitSubject {
             .values()
             .flat_map(|slot| slot.engines.iter().map(|engine| engine.provider.clone()))
             .collect();
+        // A media key for a catalog provider belongs to that provider's fixture
+        // account, so media and LLM admissions share its real concurrency cap.
+        let account_ids: std::collections::BTreeMap<_, _> = rows.iter().filter_map(|row| {
+            Some((row.provider_ids.first()?.clone(), row.account_id.clone()?))
+        }).collect();
         rows.extend(providers.into_iter().map(|provider| ListedCredential {
+            account_id: account_ids.get(&provider).cloned(),
             id: format!("synthetic-media-{provider}"),
             categories: vec!["media-provider".into()],
             credential_type: "apikey".into(),
@@ -1894,6 +1932,8 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "continue_account_decision_preserves_route",
         "continue_account_decision_wrong_admission_refused",
         "continue_account_decision_chain",
+        "account_head_turn_runner",
+        "account_head_turn_non_runner",
     ] {
         assert_eq!(
             report.outcome(check),

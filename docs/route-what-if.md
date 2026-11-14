@@ -214,9 +214,25 @@ the enforcement switch:
 ```
 
 `enforcement_enabled` is the captured `concurrency.enforcement_enabled` setting
-(default `false`). It does not yet change picks or refusals with either value,
-and no waiters are created. The report shows counts and caps, not a refusal;
-it never refuses a caller for concurrency.
+(default `false`). The report shows counts and caps, not a refusal; it never
+refuses a caller for concurrency.
+
+With enforcement on, a count that live waiters wait on also carries
+`waiters`, ordered by `order`:
+
+```json
+{"scope": "account", "model": null, "holds_in_flight": 0, "effective_cap": 1,
+ "waiters": [{"class": "blocking", "order": 3}, {"class": "worker", "order": 5}]}
+```
+
+A waiter is a conversation that `account_for` refused `concurrency_full`.
+`class` is the priority class it was refused with (`interactive`, `blocking`,
+`worker` or `background`) and `order` the writer's counter for new waiters,
+which ranks waiters of one class. A waiter is listed on every count of its
+latest refusal and lasts until it takes a slot on one of them or until 30 s
+after the retry time it was given. A count no one waits on has no `waiters`
+member, and with enforcement off none is listed. Waiters are held in memory
+only, so a routing restart forgets them.
 
 `accounts` is ordered by `provider`, then `account_id`. It includes known cap
 accounts, listed credential accounts and accounts retained by the in-flight
@@ -236,10 +252,10 @@ grouped and lapsed by the ledger's rules. Each row contributes to only its
 effective cap count, never both the shared and a per-model count.
 
 The report retains an immutable published account-state snapshot (including
-its in-flight ledger) and a resolved-cap snapshot before the sweep. Counts
-are evaluated at one captured routing-clock instant, not reloaded from SQL or
-recalculated from the eligibility projection. Reporting changes neither the
-published ledger nor cap policy.
+its in-flight ledger and waiters) and a resolved-cap snapshot before the
+sweep. Counts and waiters are evaluated at one captured routing-clock instant,
+not reloaded from SQL or recalculated from the eligibility projection.
+Reporting changes neither the published ledger nor cap policy.
 
 ## Panel dry run
 

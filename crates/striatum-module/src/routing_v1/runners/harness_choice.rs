@@ -66,7 +66,7 @@ impl Registry {
     ) -> Self {
         let source = policies.into();
         let config = source.config;
-        let original = source.policies.clone();
+        let original = source.enrolled(credentials);
         let source_policies = original.clone();
         // A settings entry's harness narrows only where new sessions start.
         // The head-choice picker still lists every model the runner can open
@@ -79,6 +79,8 @@ impl Registry {
                         RunnerPolicies {
                             policies: vec![policy.clone()],
                             config,
+                            consumer: None,
+                            auto_enroll: false,
                         },
                         credentials,
                         facts,
@@ -139,6 +141,8 @@ impl Registry {
                         RunnerPolicies {
                             policies: vec![policy.clone()],
                             config,
+                            consumer: None,
+                            auto_enroll: false,
                         },
                         credentials,
                         facts,
@@ -157,6 +161,8 @@ impl Registry {
                 RunnerPolicies {
                     policies: vec![policy.clone()],
                     config,
+                    consumer: None,
+                    auto_enroll: false,
                 },
                 credentials,
                 facts,
@@ -193,6 +199,8 @@ impl Registry {
                     RunnerPolicies {
                         policies: vec![policy],
                         config,
+                        consumer: None,
+                        auto_enroll: false,
                     },
                     credentials,
                     facts,

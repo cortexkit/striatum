@@ -3186,6 +3186,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
         #[serde(skip_serializing_if = "Option::is_none")]
         warm_credential: Option<&'a str>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        head_turn: bool,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -3207,6 +3209,7 @@ fn fingerprint(params: &AccountForParams) -> String {
         parent_conversation_key: params.parent_conversation_key.as_deref(),
         service_tier: params.service_tier,
         warm_credential: params.warm_credential.as_deref(),
+        head_turn: params.head_turn,
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -4652,6 +4655,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(default)]
+    head_turn: bool,
     #[serde(skip)]
     pub(crate) call: Option<call_log::AccountCall>,
     #[serde(default)]
@@ -4725,6 +4730,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
             service_tier_chosen: None,
@@ -4916,8 +4922,15 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 #[cfg(test)]
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
     let params = decode_params(body).unwrap_or(Value::Null);
-    let call = (method == ACCOUNT_FOR_OP)
-        .then(|| call_log::AccountCall::legacy(&params, principal, ctx.store));
+    let call = (method == ACCOUNT_FOR_OP).then(|| {
+        call_log::AccountCall::legacy(
+            &params,
+            principal,
+            ctx.classes.as_ref().map(|classes| classes.config.as_ref()),
+            ctx.classes.as_ref().map(|classes| &classes.credentials),
+            ctx.store,
+        )
+    });
     let reply = handle_with_call(method, body, principal, ctx, call.clone());
     if let Some(call) = call {
         call.finish();
@@ -5183,6 +5196,8 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
 }
 
 mod continuation;
+#[cfg(test)]
+pub(crate) use continuation::inject_continuation_preparation_failure;
 #[cfg(test)]
 pub(crate) use continuation::continue_account;
 pub(crate) use continuation::continue_account_with_call;
@@ -5768,18 +5783,15 @@ fn prepare_service_tier(
             })
             .cloned()
             .collect();
-        let runners: Vec<_> = classes
-            .config
-            .v1_runners()
-            .into_iter()
-            .filter(|runner| runner.module == parsed.caller.runner)
-            .collect();
         let registry = crate::routing_v1::runners::Registry::build(
             classes.config.as_ref(),
             &classes.credentials,
             &classes.facts,
             classes.now_ms.max(0) as u64,
         );
+        let runners: Vec<_> = registry.policies().into_iter()
+            .filter(|runner| runner.module == parsed.caller.runner)
+            .collect();
         classes.apply_service_tier(
             &mut facts,
             tier.as_str(),
@@ -7015,7 +7027,9 @@ fn serve(
         }
     };
     if gate.refused() {
-        return gate.refuse(tx, ctx, params, principal, provider, &decision, roster);
+        return gate.refuse(
+            tx, ctx, params, principal, &hash, provider, &decision, roster,
+        );
     }
     // An account the class context left out because another selection holds
     // its probe reserved is a lost race as well.
@@ -7121,20 +7135,39 @@ fn serve(
         )?;
     }
     match &decision.outcome {
-        Outcome::Admit(admission) => commit_admission(
-            tx,
-            ctx,
-            principal,
-            params,
-            provider,
-            &hash,
-            affinity_row.as_ref(),
-            &decision_id,
-            &decision,
-            admission,
-            request_fingerprint,
-            roster,
-        ),
+        Outcome::Admit(admission) => {
+            // Read before the insert: afterwards every request of the
+            // conversation would look like a renewal of a holder.
+            let taken = gate.slot_taken(
+                tx,
+                ctx,
+                params,
+                principal,
+                &hash,
+                provider,
+                &admission.account_id,
+            );
+            let reply = commit_admission(
+                tx,
+                ctx,
+                principal,
+                params,
+                provider,
+                &hash,
+                affinity_row.as_ref(),
+                &decision_id,
+                &decision,
+                admission,
+                request_fingerprint,
+                roster,
+            )?;
+            // Taking a slot on a count it waits on ends the conversation's
+            // wait; a slot elsewhere leaves it waiting.
+            if let (Some(count), OpReply::Result(_)) = (&taken, &reply) {
+                tx.took_slot(&(principal.to_owned(), hash.clone()), count);
+            }
+            Ok(reply)
+        }
         Outcome::Hold(hold) => {
             tx.insert_hold(&AccountHoldRow {
                 decision_id: decision_id.clone(),
