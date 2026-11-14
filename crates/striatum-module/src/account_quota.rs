@@ -621,6 +621,9 @@ pub struct VaultRoster {
     pub grants: Vec<RosterGrant>,
 }
 
+mod listing;
+pub(crate) use listing::restore_credential_listing;
+
 /// Vault account ids are the join key. Ambiguous ids across adapters are not
 /// selectable: choosing the first would silently bind the wrong credential.
 pub fn identity_for_reading<'a>(
@@ -1610,13 +1613,16 @@ pub fn apply_roster_listing(
     at_ms: i64,
 ) -> Option<PersistedVaultRoster> {
     let roster = build_roster(listing, state.roster.as_ref(), at_ms);
-    let row = serde_json::to_string(&roster)
-        .ok()
-        .map(|roster_json| PersistedVaultRoster {
+    let row = serde_json::to_value(&roster).ok().map(|mut value| {
+        // Quota identities omit API keys without account ids. Persist the
+        // full non-secret view too, for admission immediately after restart.
+        value["listing"] = listing::encode(listing);
+        PersistedVaultRoster {
             view: roster.view.clone(),
-            roster_json,
+            roster_json: value.to_string(),
             fetched_at: at_ms,
-        });
+        }
+    });
     state.roster = Some(roster);
     state.roster_poll = RosterPoll::Listed { at_ms };
     row
@@ -1858,6 +1864,12 @@ pub async fn account_quota_loop(
             .ok()
             .and_then(Result::ok)
             .flatten()
+            // Save the full listing even when its view matches an older snapshot
+            // that persisted only quota identities.
+            .filter(|row| {
+                serde_json::from_str::<Value>(&row.roster_json)
+                    .is_ok_and(|roster| roster.get("listing").is_some_and(Value::is_object))
+            })
             .map(|row| row.view);
     loop {
         let listing = resolver.list_scoped().await;

@@ -193,6 +193,7 @@ pub struct CredentialData {
     pub(crate) billing_catalog: crate::fusiform_catalog::PlaneCatalog,
     subscription_plan_providers: Option<HashSet<String>>,
     billing_loaded: Arc<tokio::sync::Notify>,
+    listing_loaded: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
@@ -275,6 +276,32 @@ fn choose_method(roster: BTreeSet<String>, listed: BTreeSet<String>) -> ServingM
 }
 
 pub type SharedBrocaCredentials = Arc<Mutex<BrocaCredentials>>;
+
+/// Called on the route handler's blocking pool, before taking a request snapshot.
+/// A fresh store gets the same 1.5 s startup allowance as selection's catalog.
+/// Persisted listings are restored before serving, so only a fresh store (or an
+/// older store without a full listing) whose vault is unreachable should time out.
+pub(crate) fn wait_for_first_listing(credentials: &SharedBrocaCredentials) -> bool {
+    let Ok(loaded) = credentials.lock().map(|guard| Arc::clone(&guard.listing_loaded)) else {
+        // Let context loading report a poisoned cache, not a missing listing.
+        return true;
+    };
+    let ready = loaded.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (ready, _) = loaded.1
+        .wait_timeout_while(ready, std::time::Duration::from_millis(1500), |ready| !*ready)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *ready
+}
+
+pub(crate) fn listing_not_ready() -> crate::account_selection::OpReply {
+    crate::account_selection::OpReply::typed(
+        "account_selection_unavailable",
+        "Routing is awaiting its first credential listing; retry shortly.",
+        serde_json::json!({"code": "account_selection_unavailable", "retry_after_s": 1,
+            "cause": "credential_listing_not_loaded",
+            "decision_id": null, "exclusions": []}),
+    )
+}
 
 /// What routing's last vault listing says about one credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -688,6 +715,8 @@ impl CredentialData {
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
         self.reached_at_ms = Some(at_ms);
         self.last_error = None;
+        *self.listing_loaded.0.lock().unwrap() = true;
+        self.listing_loaded.1.notify_all();
         if !self.gateway_grant_warned
             && !listing.grant_tuples.iter().any(|grant| {
                 grant.selector_kind == "category"

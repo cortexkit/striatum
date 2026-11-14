@@ -1367,7 +1367,7 @@ where
         broca_credentials,
         override_path,
         operator_config_path,
-    } = background::start(config, &store, &quota_cache, &catalog_health)?;
+    } = background::start(config, &store, &quota_cache, &catalog_health).await?;
 
     let min_band: SharedMinBand = Arc::new(std::sync::Mutex::new(
         config_overrides::live_config(&override_path).min_band(),
