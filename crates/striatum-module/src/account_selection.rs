@@ -7416,7 +7416,9 @@ fn record_observation(
                 "id": existing.observation_id,
                 "duplicate": true,
                 "bound": existing.bound,
-                "effects": [],
+                "effects": if parsed.attempt_outcome.is_some() { json!([]) } else {
+                    serde_json::from_str::<Value>(&existing.effects_json).unwrap_or(Value::Null)
+                },
             }
         })));
     }
