@@ -15,8 +15,8 @@ pub(crate) async fn read_application_frame(
         {
             return Ok(Some(request));
         }
-        // The SDK opts route.open into typed close reasons after this advertised
-        // capability, just as it does against a current daemon.
+        // Advertising this capability makes the SDK request structured reasons
+        // when routes close, just as it does against a current daemon.
         let reply = Frame::build(FrameType::Response,
             Flags::new(false, Priority::Interactive, false),
             0, request.header.epoch, request.header.corr,
