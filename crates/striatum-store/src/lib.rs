@@ -62,6 +62,10 @@ mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
+mod block_state;
+pub use block_state::{
+    block_read_backs, block_reconcile_reloads, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub mod group_reads;
 #[cfg(any(test, feature = "test-support"))]
@@ -69,6 +73,7 @@ mod block_parity_fixture;
 mod key_pool;
 pub use fence_rechecks::{
     BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope, ReleasedAdmissionProbes,
+    ViewOrigin,
 };
 #[cfg(test)]
 mod continuation_migration_tests;
@@ -334,7 +339,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 90] {
+fn route_state_migrations() -> [Migration; 91] {
     [
         Migration {
             version: 1,
@@ -695,6 +700,10 @@ fn route_state_migrations() -> [Migration; 90] {
         Migration {
             version: 91,
             statements: include_str!("../migrations/091_admission_conversation_lookup.sql"),
+        },
+        Migration {
+            version: 92,
+            statements: include_str!("../migrations/092_triggers_without_replace.sql"),
         },
     ]
 }
@@ -1203,7 +1212,7 @@ mod evaluation_snapshot;
 mod account_writer;
 pub use account_writer::{AccountCommandKind, AccountReply, STATE_DIVERGED};
 mod account_state;
-pub use account_state::{AccountStateBridge, AccountWorkingState};
+pub use account_state::{AccountStateBridge, AccountWorkingState, ACCOUNT_STATE_LOAD_PENDING};
 #[cfg(any(test, feature = "test-support"))]
 pub use evaluation_snapshot::record_stage_timing_for_test;
 pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
@@ -1541,6 +1550,7 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
+        let _seeding = crate::block_state::Seeding::begin();
         self.store.with_conn(f).map_err(err)
     }
 
@@ -2604,15 +2614,7 @@ impl SqliteRouteStateStore {
                      FROM credential_entitlement_fences ORDER BY provider_id, credential_id",
                 )?;
                 let rows = stmt.query_map([], |row| {
-                    Ok(
-                        striatum_core::route_state_store::CredentialEntitlementFence {
-                            provider_id: row.get(0)?,
-                            credential_id: row.get(1)?,
-                            code: row.get(2)?,
-                            listing_fingerprint: row.get(3)?,
-                            observed_at_ms: row.get(4)?,
-                        },
-                    )
+                    crate::account_selection::rows::entitlement_at(row, 0)
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
             })
@@ -4078,7 +4080,9 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let clock_schema=fence_rechecks::enabled(c)?;
-                let rechecks=fence_rechecks::read_effective(c)?;
+                // The route-state snapshot still overlays clocks read from
+                // SQL, not the account state's blocks.
+                let rechecks=crate::group_reads::declared_exception("route-state snapshot", || fence_rechecks::read_effective(c))?;
                 let mut by_route: HashMap<String, RouteRuntimeState> = HashMap::new();
                 let mut by_capacity: HashMap<String, RouteRuntimeState> = HashMap::new();
 
@@ -7559,7 +7563,7 @@ impl crate::AccountTx<'_> {
         let update = &bounded;
         // Old callers can still send an account failure as a route cooldown.
         // Keep account evidence in the account allocator, never fan it out to
-        // every model or replace an independent model wall's cause.
+        // every model, nor swap out an independent model wall's cause.
         if !update.unscoped_wall
             && striatum_core::account_wall::account_scoped_wall(
                 update.last_error.as_deref(),

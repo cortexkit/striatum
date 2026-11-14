@@ -401,6 +401,69 @@ fn broca_scoring_remembers_a_competing_probe_before_its_first_eligibility_check(
     }
 }
 
+/// A legacy launch whose route's probe another selection bound after this
+/// one scored is told when to retry, as a lost probe binding is, never an
+/// untimed `no_eligible_account`.
+#[test]
+fn a_legacy_launch_whose_probe_another_selection_bound_is_told_when_to_retry() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &harness.credentials(),
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            FENCE_NOW as i64,
+        )
+        .unwrap()
+    };
+    let mut first = load();
+    first
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    let mut second = load();
+    second
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    let _binding = first
+        .bind_selected_probe(harness.store(), "inception", "mercury-3", true, "winner")
+        .unwrap();
+    let launched =
+        second.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, Some("loser"));
+    // Compared through Debug, so the check also compiles against a refusal
+    // type that carries only a code and a message, and fails there.
+    let shown = format!("{launched:?}");
+    assert!(shown.starts_with("Err(Lost { retry_at: "), "{shown}");
+}
+
+/// A selection that names no owner claims a launch's probe for its own
+/// reservation owner; claiming the same launch again (route.select checks a
+/// runner, then launches it) finds that claim its own, not a lost race.
+#[test]
+fn a_selection_claiming_its_launch_probe_twice_keeps_it() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let mut context = crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        FENCE_NOW as i64,
+    )
+    .unwrap();
+    context
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    for attempt in ["first", "second"] {
+        let launched =
+            context.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, None);
+        assert!(launched.is_ok(), "{attempt}: {launched:?}");
+    }
+}
+
 fn steal_selected_probe(harness: &Harness) {
     crate::account_selection::before_probe_bind(&harness.credentials(), |store| {
         store
@@ -752,6 +815,29 @@ async fn decision_probe_reset_check_cannot_bypass_a_held_slot() {
     let clock = quota_probe_clock(&harness);
     assert_eq!(clock.last_claimed_at, Some(FENCE_NOW as i64));
     assert_eq!(clock.next_recheck_at, FENCE_NOW as i64 + 900_000);
+}
+
+#[tokio::test]
+async fn a_held_quota_probe_answers_a_reset_time_racer_with_its_interval() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = quota_probe_harness();
+    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
+        provider: "inception".into(), credential_id: "apikey:inception".into(), model: "mercury-3".into(),
+        until_ms: FENCE_NOW as i64 + 60_000, decision_id: "earlier-reset".into(),
+        recorded_at: FENCE_NOW as i64 - 900_000,
+    }).unwrap();
+    let selected = broca_select(&harness, false).await;
+    assert_eq!(broca_selected_route(&selected, false), "inception/mercury-3");
+    // The provider's reset is past, but the selected decision still holds
+    // the quota probe: another admission loses the race for it, and is told
+    // when the holder's interval ends.
+    let _reset = crate::InjectedClock::set(FENCE_NOW + 120_000);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let lost = runner.call("route.account_for", &broca_account_request(&Value::Null, "reset-racer", false)).await;
+    assert_eq!(lost.0, FrameType::Error, "{}", lost.1);
+    assert_eq!(lost.1["code"], "account_pool_exhausted", "{}", lost.1);
+    assert_eq!(lost.1["detail"]["reset_at_ms"], FENCE_NOW + 900_000, "{}", lost.1);
+    assert_eq!(lost.1["detail"]["retry_after_s"], 780, "{}", lost.1);
 }
 
 #[tokio::test]

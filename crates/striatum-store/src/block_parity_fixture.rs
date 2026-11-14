@@ -72,17 +72,33 @@ impl SqliteRouteStateStore {
     }
 
     pub fn seed_block_parity_fixture_for_test(&self, now: i64) {
-        self.with_writer_for_test(|conn| {
-            let at = now - 1_000;
-            let until = now + 60_000;
-            let fence = striatum_core::accounts::Fence {
-                account_id: "account-0".into(), pool: None, recovery_set: Vec::new(),
-                observed_at_ms: at, reset: striatum_core::accounts::ResetTime::Missing,
-                retry_hint_ms: None, source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
-            };
-            conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-fence','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,'[]')", params![serde_json::to_string(&fence).unwrap(),at])?;
-            conn.execute_batch(&format!(r#"
-                INSERT OR REPLACE INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at});
+        self.with_writer_for_test(|conn| seed_block_parity_fixture(conn, now))
+            .unwrap();
+    }
+}
+
+/// The fixture's statements, for a caller that runs them on its own
+/// connection or inside an account command.
+pub(crate) fn seed_block_parity_fixture(
+    conn: &rusqlite::Connection,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let at = now - 1_000;
+    let until = now + 60_000;
+    let fence = striatum_core::accounts::Fence {
+        account_id: "account-0".into(),
+        pool: None,
+        recovery_set: Vec::new(),
+        observed_at_ms: at,
+        reset: striatum_core::accounts::ResetTime::Missing,
+        retry_hint_ms: None,
+        source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
+    };
+    conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-fence','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,'[]')", params![serde_json::to_string(&fence).unwrap(),at])?;
+    conn.execute_batch(&format!(r#"
+                INSERT INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at})
+                  ON CONFLICT(provider_id,credential_id) DO UPDATE SET code=excluded.code,
+                  listing_fingerprint=excluded.listing_fingerprint,observed_at_ms=excluded.observed_at_ms;
                 INSERT INTO account_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'quota');
                 INSERT INTO account_non_quota_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'billing');
                 INSERT INTO account_non_quota_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'transient');
@@ -100,8 +116,8 @@ impl SqliteRouteStateStore {
                 INSERT INTO credential_entitlement_fences VALUES ('parity-retired','retired','billing_exhausted',NULL,{at});
                 INSERT INTO fence_retired_origin SELECT kind,origin_key,evidence,evidence_at,{now} FROM fence_origin WHERE provider='parity-retired';
             "#))?;
-            fence_rechecks::sync(conn)?;
-            conn.execute_batch(&format!(r#"
+    fence_rechecks::sync(conn)?;
+    conn.execute_batch(&format!(r#"
                 UPDATE fence_recheck SET quota=1,classified=1,claim_generation=7 WHERE kind='credential' AND credential_id='oauth:cpu-0';
                 UPDATE fence_recheck SET claim_owner='parity-owner',claim_generation=3,last_claimed_at={now},next_recheck_at={now}+900000 WHERE kind='account_route';
                 UPDATE fence_recheck SET next_recheck_at={now}-1 WHERE kind='pool_rate';
@@ -109,7 +125,5 @@ impl SqliteRouteStateStore {
                 INSERT INTO fence_recheck(kind,origin_key,provider,evidence,evidence_at,quota,next_recheck_at,cleared_at,claim_generation)
                 VALUES ('credential','["parity-cleared","cleared"]','parity-cleared','cleared-evidence',{at},0,{until},{now},2);
             "#))?;
-            Ok(())
-        }).unwrap();
-    }
+    Ok(())
 }

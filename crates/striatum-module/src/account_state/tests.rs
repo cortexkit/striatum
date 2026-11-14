@@ -162,6 +162,132 @@ fn failed_initial_load_never_publishes_or_allows_serving() {
 }
 
 #[test]
+fn a_writer_that_stops_during_the_first_load_wakes_waiting_readers() {
+    let (_scratch, store) = fixture("state-startup-writer-stops");
+    let owner = Arc::new(StateOwner::default());
+    let (entered, loading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel::<()>();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        let _ = paused.recv();
+        panic!("forced writer stop during the first load");
+    }));
+    let installing = store.clone();
+    let driver = owner.clone();
+    let loader = std::thread::spawn(move || installing.install_account_state_bridge(driver));
+    loading.recv_timeout(Duration::from_secs(2)).unwrap();
+    // A reader arrives while the first load runs and waits for it.
+    let waiting = owner.clone();
+    let (answered, answer) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        answered.send(waiting.snapshot().map(|_| ())).unwrap();
+    });
+    resume.send(()).unwrap();
+    assert!(loader.join().unwrap().is_err());
+    let answer = answer
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the waiting reader is woken when the writer stops");
+    assert!(answer.is_err(), "{answer:?}");
+    reader.join().unwrap();
+}
+
+/// A first load that takes longer than the readers' bound answers the
+/// timeout to a request that arrives meanwhile, within the bound. The
+/// request does not queue a second load behind the first, which it would
+/// then wait for without a bound.
+#[test]
+fn a_stalled_first_load_answers_a_request_within_the_bound() {
+    let (_scratch, store) = fixture("state-startup-stalled-load");
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(200, Ordering::Relaxed);
+    let owner = Arc::new(StateOwner::default());
+    let (entered, loading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel::<()>();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        let _ = paused.recv();
+        Ok(())
+    }));
+    let installing = store.clone();
+    let driver = owner.clone();
+    let loader = std::thread::spawn(move || installing.install_account_state_bridge(driver));
+    loading.recv_timeout(Duration::from_secs(2)).unwrap();
+    let requesting = store.clone();
+    let (answered, answer) = mpsc::channel();
+    let request = std::thread::spawn(move || {
+        answered.send(super::initialize(&requesting)).unwrap();
+    });
+    let answer = answer
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request is answered while the first load still runs");
+    let error = answer.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    resume.send(()).unwrap();
+    // The installer waits within the same bound: it may have answered that
+    // the load is still running before the load was resumed.
+    if let Err(error) = loader.join().unwrap() {
+        assert!(error.to_string().contains(super::FIRST_LOAD_PENDING), "{error}");
+    }
+    request.join().unwrap();
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
+    super::initialize(&store).unwrap();
+    assert_eq!(
+        owner.loads.load(Ordering::Relaxed),
+        1,
+        "the request queued no second load"
+    );
+}
+
+/// The installing caller and a retry after a failed first load wait on the
+/// load within the same bound as a reader; the load keeps running and
+/// publishes when it ends, without a second load.
+#[test]
+fn a_stalled_load_answers_its_installer_and_its_retry_within_the_bound() {
+    let (_scratch, store) = fixture("state-startup-stalled-installer");
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(200, Ordering::Relaxed);
+    let owner = Arc::new(StateOwner::default());
+    let (resume, paused) = mpsc::channel::<()>();
+    let paused = std::sync::Mutex::new(paused);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        if first.swap(false, Ordering::Relaxed) {
+            return Err(RouteStateStoreError("first load failed".into()));
+        }
+        let _ = paused.lock().unwrap().recv();
+        Ok(())
+    }));
+    let bounded = |what: &str, call: Box<dyn FnOnce() -> RouteStateResult<()> + Send>| {
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || answered.send(call()).unwrap());
+        answer
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{what} waited past the bound"))
+    };
+    let installing = store.clone();
+    let driver = owner.clone();
+    let installed = bounded(
+        "the installer",
+        Box::new(move || installing.install_account_state_bridge(driver)),
+    );
+    assert!(installed.unwrap_err().to_string().contains("first load failed"));
+    let retrying = store.clone();
+    let retried = bounded("the retry", Box::new(move || super::initialize(&retrying)));
+    let error = retried.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    let asking = store.clone();
+    let asked = bounded("a reader during the retry", Box::new(move || super::initialize(&asking)));
+    let error = asked.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    resume.send(()).unwrap();
+    let ready = store.clone();
+    bounded("the reader after the load", Box::new(move || {
+        super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
+        super::initialize(&ready)
+    }))
+    .unwrap();
+    assert_eq!(owner.loads.load(Ordering::Relaxed), 2, "one failed load, one retry");
+}
+
+#[test]
 fn account_for_frame_sent_during_load_is_answered_after_publication() {
     let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
     let fixture = crate::routing_v1::request_cpu_bench::production_fixture();
@@ -641,4 +767,85 @@ fn concurrent_retries_after_a_failed_load_share_one_reload() {
         assert!(caller.join().unwrap().is_err());
     }
     assert_eq!(loads.load(Ordering::Relaxed) - initial, 1);
+}
+
+#[test]
+#[should_panic(expected = "block tables written outside an account command")]
+fn a_block_write_that_bypasses_the_account_writer_fails_the_next_state_read() {
+    let (_scratch, store) = fixture("state-block-bypass");
+    install(&store);
+    // Not a seeding seam: this stands for production code writing a block
+    // table without a writer command.
+    store
+        .bypass_account_writer_for_test(
+            "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+        )
+        .unwrap();
+    let _ = super::snapshot(&store);
+}
+
+#[test]
+fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
+    let (_scratch, store) = fixture("state-block-seed");
+    let owner = install(&store);
+    let loads = owner.loads.load(Ordering::Relaxed);
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute_batch(
+                "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+            )
+        })
+        .unwrap();
+    assert!(store.block_seed_writes_for_test() > 0);
+    assert_eq!(store.block_writes_outside_command(), 0, "seeding is no violation");
+    let state = super::snapshot(&store).unwrap();
+    assert_eq!(owner.loads.load(Ordering::Relaxed), loads + 1);
+    let fresh = store.account_transaction(AccountState::load).unwrap();
+    assert_eq!(state.blocks, fresh.blocks);
+    assert_eq!(state.blocks.table_sizes()[10], ("account_transient_backoff", 1));
+}
+
+/// A command that writes a block row and then reads the block tables sees
+/// its own write, though the writer copies the row into the working state
+/// only when the command ends. Its batch sibling sees it too, and both match
+/// SQL.
+#[test]
+fn a_command_reads_its_own_block_writes_from_the_working_state() {
+    let (_scratch, store) = fixture("state-own-block-writes");
+    install(&store);
+    let fence = striatum_store::AccountPoolFenceRow {
+        evidence: striatum_store::AccountFenceRow {
+            fence_id: "own-write".into(),
+            provider: "p".into(),
+            account_id: "a".into(),
+            scope_json: "{}".into(),
+            fence_json: "{}".into(),
+            source: "broca_account_limit".into(),
+            observed_at: 1_000,
+            principal: "x".into(),
+            admission_id: None,
+            observation_id: None,
+            created_at: 1_000,
+            cleared_at: None,
+            cleared_reason: None,
+        },
+        pool_key: None,
+        recovery_set: Vec::new(),
+    };
+    let (own, sql) = crate::account_writer::repair(&store, move |tx| {
+        assert!(tx.active_fences("p")?.is_empty());
+        tx.insert_pool_fence(&fence)?;
+        let own = tx.active_fences("p")?;
+        Ok((own, tx.sql.active_fences("p")?))
+    })
+    .unwrap();
+    assert_eq!(own.len(), 1, "the command must see its own fence");
+    assert_eq!(own, sql);
+    let (later, sql) = crate::account_writer::repair(&store, |tx| {
+        tx.clear_fence("own-write", 2_000, "test")?;
+        Ok((tx.active_fences("p")?, tx.sql.active_fences("p")?))
+    })
+    .unwrap();
+    assert!(later.is_empty(), "a cleared fence must leave the command's view");
+    assert_eq!(later, sql);
 }

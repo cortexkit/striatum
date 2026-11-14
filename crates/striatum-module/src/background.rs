@@ -276,8 +276,21 @@ const ACCOUNT_TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(
 
 async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    let mut bypasses = 0;
     loop {
         ticks.tick().await;
+        // Production writes block tables only through account commands. A
+        // write outside one makes the writer reload its whole state; report
+        // the running count each time it grows, so the live log shows it.
+        let outside = store.block_writes_outside_command();
+        if outside > bypasses {
+            bypasses = outside;
+            tracing::warn!(
+                block_writes_outside_command = outside,
+                tables = ?store.block_tables_written_outside_command(),
+                "block tables were written outside an account command"
+            );
+        }
         // Tick waits on a thread until the account writer commits it, which can
         // take as long as every batch queued ahead of it. This task is woken by
         // its own timer, so it runs on the worker that was driving Tokio's IO and

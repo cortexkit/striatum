@@ -46,6 +46,9 @@ fn age_fence(subject: &KitSubject) {
         [account_selection::now_ms() - 3_600_001],
     )
     .unwrap();
+    // Readers answer from the published account state, which picks up
+    // another connection's commit at the next writer batch; reload it now.
+    harness.store().reload_account_state_for_test().unwrap();
 }
 
 fn target_original(request: &Value, id: &str) -> Value {

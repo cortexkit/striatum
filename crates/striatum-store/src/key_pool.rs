@@ -388,10 +388,14 @@ impl SqliteRouteStateStore {
         let (states, needs_sync) = self
             .store
             .with_read(|conn: &Connection| {
-                Ok((
-                    read_key_states(conn, provider, now_ms, None)?,
-                    crate::fence_rechecks::needs_sync(conn)?,
-                ))
+                // Key states join the probe clocks, read here from SQL: the
+                // pool lease tables are not held in the account state.
+                crate::group_reads::declared_exception("pool key states", || {
+                    Ok((
+                        read_key_states(conn, provider, now_ms, None)?,
+                        crate::fence_rechecks::needs_sync(conn)?,
+                    ))
+                })
             })
             .map_err(err)?;
         if !needs_sync {
@@ -437,7 +441,7 @@ impl crate::AccountTx<'_> {
             };
             // A new refusal supersedes its earlier horizon, including uncapped
             // raw deadlines retained during migration. Delayed older reports
-            // must not extend or replace the newer evidence.
+            // must not extend or supersede the newer evidence.
             self.conn.execute(&format!("INSERT INTO pool_key_state(provider,credential_id,{deadline},{why},updated_at,{observed})
                 VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(provider,credential_id) DO UPDATE SET
                 {deadline}=excluded.{deadline},{why}=excluded.{why},{observed}=excluded.{observed},
@@ -647,7 +651,7 @@ impl crate::AccountTx<'_> {
                 }
                 if still_admissible {
                     let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,workspace,credential)).cloned().collect();
-                    if !crate::fence_rechecks::claim_with_authorization(conn,&origins,now,lease)? {return Err(rusqlite::Error::InvalidQuery);}
+                    if !self.claim_for_lease(&origins,now,lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
                     if !origins.is_empty() {conn.execute("UPDATE pool_key_lease SET fence_probe=1 WHERE lease_id=?1",[lease])?;}
                     let valid_until = now.saturating_add(request.lease_ms);
                     conn.execute(
@@ -685,7 +689,7 @@ impl crate::AccountTx<'_> {
             };
             let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,&pick.workspace,&pick.credential_id)).cloned().collect();
             let lease = lease_id(now);
-            if !crate::fence_rechecks::claim_with_authorization(conn,&origins,now,&lease)? {return Err(rusqlite::Error::InvalidQuery);}
+            if !self.claim_for_lease(&origins,now,&lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
             let valid_until = now.saturating_add(request.lease_ms);
             conn.execute(
                 "INSERT INTO pool_key_lease
