@@ -11,8 +11,10 @@ use striatum_store::{
 };
 
 mod admissions;
+mod blocks;
 
 pub(crate) use admissions::AdmissionState;
+pub(crate) use blocks::{published, writer, BlockReads};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AccountState {
@@ -23,7 +25,7 @@ pub(crate) struct AccountState {
     pub(crate) admissions: AdmissionState,
     /// The block tables as SQL holds them. The writer copies every row a
     /// command changes into this state, so it always equals a fresh load.
-    /// Request paths do not read it yet.
+    /// Request paths read it through `blocks::BlockReads` and `published`.
     pub(crate) blocks: striatum_store::BlockState,
 }
 
@@ -113,9 +115,9 @@ pub(crate) fn has_expired_continuations(
     Ok(snapshot(store)?.admissions.has_expired_offers(now))
 }
 
-/// The published state's answer to `has_expired_admission_probes`. The probe
-/// authorizations are not in memory, so their owners come from SQL; whether
-/// each owner is an expired unstarted admission comes from the state.
+/// The published state's answer to `has_expired_admission_probes`: the
+/// probe authorizations' owners and whether each is an expired unstarted
+/// admission both come from the state.
 pub(crate) fn has_expired_admission_probes(
     store: &SqliteRouteStateStore,
     now: i64,
@@ -124,7 +126,11 @@ pub(crate) fn has_expired_admission_probes(
         return store.account_read(|tx| tx.has_expired_admission_probes(now));
     }
     let state = snapshot(store)?;
-    let owners = store.account_read(|tx| tx.probe_authorization_owners())?;
+    let owners = if state.blocks.enabled() {
+        state.blocks.authorization_owners()
+    } else {
+        store.account_read(|tx| tx.probe_authorization_owners())?
+    };
     Ok(!state.admissions.expired_probe_admissions(owners, now).is_empty())
 }
 
@@ -778,15 +784,15 @@ impl AccountCommand<'_> {
         self.decide(|state| state.finish_continuations(principal, admission, run, now))
     }
 
-    /// Fence probe authorizations are not in memory yet, so SQL supplies
-    /// their owners; the state decides which name expired unstarted
-    /// admissions, and SQL releases those probes and expires the admissions.
+    /// The working state supplies the probe authorizations' owners and
+    /// decides which name expired unstarted admissions; SQL releases those
+    /// probes and expires the admissions.
     pub(crate) fn release_expired_admission_probes(&mut self, now: i64) -> RouteStateResult<()> {
         let Some(state) = self.admission_state() else {
             self.sql.release_expired_admission_probes(now)?;
             return Ok(());
         };
-        let expired = state.expired_probe_admissions(self.sql.probe_authorization_owners()?, now);
+        let expired = state.expired_probe_admissions(self.probe_authorization_owners()?, now);
         let chosen: Vec<(String, String)> = expired
             .iter()
             .map(|(principal, admission, _)| (principal.clone(), admission.clone()))

@@ -5016,6 +5016,9 @@ fn s4b_route_recovery_unchanged_does_not_acquire_writer() {
         .unwrap();
     let quota = crate::account_quota::AccountQuotaState::default();
     let ids = credentials.quota_account_ids(&quota);
+    // The recovery check reads the published account state; load it before
+    // counting, so its one-time load barrier is not counted as the check's.
+    crate::account_state::initialize(harness.store()).unwrap();
     let commits = harness.store().writer_commit_count_for_test();
     let acquisitions = harness.store().writer_acquisition_count_for_test();
     crate::account_selection::repair_route_fences(

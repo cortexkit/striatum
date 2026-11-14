@@ -34,7 +34,7 @@ use striatum_core::{
     CredentialRefusalMark, ModelFact, ModelRouteStateSnapshot, RouteStateResult,
     REASON_CREDENTIAL_BILLING_EXHAUSTED, REASON_CREDENTIAL_UNENTITLED,
 };
-use striatum_store::{AccountTx, SqliteRouteStateStore};
+use striatum_store::SqliteRouteStateStore;
 
 use crate::broca_credentials::{ListingLookup, SharedBrocaCredentials};
 
@@ -375,7 +375,7 @@ pub(crate) fn clear_quota_holds(
 }
 
 fn clear_quota_holds_in(
-    tx: &AccountTx<'_>,
+    tx: &crate::account_state::AccountCommand<'_>,
     fence: &CredentialEntitlementFence,
     reason: &str,
     now: i64,
@@ -391,7 +391,7 @@ fn clear_quota_holds_in(
 
 /// Lift a successful media probe's fence without leaving its observation transaction.
 pub(crate) fn lift_after_success_in(
-    tx: &AccountTx<'_>,
+    tx: &crate::account_state::AccountCommand<'_>,
     provider: &str,
     credential: &str,
     now: i64,
@@ -502,8 +502,9 @@ pub(crate) fn live_with_eligibility(
     credentials: &SharedBrocaCredentials,
     reconcile_eligibility: bool,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
-    let fences = store
-        .credential_entitlement_fences()
+    let blocks = crate::account_state::published(store).map_err(|e| e.to_string())?;
+    let fences = blocks
+        .report_credential_refusals()
         .map_err(|e| e.to_string())?;
     let (lookups, listings) = match credentials.lock() {
         Ok(guard) => {
@@ -543,7 +544,7 @@ pub(crate) fn live_with_eligibility(
             .iter()
             .map(|(id, fp)| (id.as_str(), fp.as_str()))
             .collect();
-        store
+        blocks
             .account_eligibility()
             .map_err(|e| e.to_string())?
             .iter()
@@ -555,6 +556,7 @@ pub(crate) fn live_with_eligibility(
     } else {
         false
     };
+    drop(blocks);
     enum ListingRepair {
         SignedOut(CredentialEntitlementFence, String),
         Adopt(String, String),

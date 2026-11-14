@@ -22,6 +22,7 @@ use subc_protocol::FrameType;
 use super::conformance_tests::{catalog_fact, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
+mod block_reads_tests;
 mod credential_refused_tests;
 
 mod account_writer {

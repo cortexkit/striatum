@@ -169,8 +169,10 @@ pub(super) fn report_at(
             usage.as_ref(),
             move |tx| {
                 if reconcile {
+                    // This report hook receives no working state, so the
+                    // command reads SQL here.
                     crate::account_selection::refresh_credential_quota_holds_in(
-                        tx,
+                        &crate::account_state::AccountCommand::new(tx, None),
                         &account_ids,
                         &quota,
                         &config,

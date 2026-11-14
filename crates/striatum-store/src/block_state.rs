@@ -247,13 +247,17 @@ const SELECTS: [&str; 16] = [
      FROM account_eligibility",
 ];
 
+/// Marks the block state's own statements, its load and its read-backs, so
+/// a read trace can tell them from request reads.
+pub(crate) const MAINTENANCE_READ: &str = "/* block state maintenance */";
+
 /// The read-back form of [`SELECTS`]: one row by rowid.
 fn select_one(table: usize) -> &'static str {
     static ONE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     &ONE.get_or_init(|| {
         SELECTS
             .iter()
-            .map(|select| format!("{select} WHERE rowid=?1"))
+            .map(|select| format!("{MAINTENANCE_READ} {select} WHERE rowid=?1"))
             .collect()
     })[table]
 }
@@ -721,7 +725,7 @@ impl BlockState {
             tables: vec![Table::default(); BLOCK_TABLES.len()],
         };
         for (index, select) in SELECTS.iter().enumerate() {
-            let mut statement = conn.prepare(select)?;
+            let mut statement = conn.prepare(&format!("{MAINTENANCE_READ} {select}"))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let (rowid, key, held) = decode(index, row)?;
@@ -1266,17 +1270,15 @@ impl crate::AccountTx<'_> {
     }
 
     /// The block rows the running command has changed so far, read back so
-    /// the command can apply them to its working state and read its own
-    /// writes. A row changed again later is captured again, and the writer
-    /// reads back the rest when the command ends.
-    pub fn read_back_blocks(&self) -> striatum_core::RouteStateResult<BlockRows> {
-        let captured = CAPTURE.with(|capture| {
-            capture
-                .borrow_mut()
-                .as_mut()
-                .map(std::mem::take)
-                .unwrap_or_default()
-        });
+    /// the command can lay them over its working state and read its own
+    /// writes. The capture keeps them: the writer reads every captured row
+    /// back again when the command ends, so a row changed again later is
+    /// not missed.
+    pub fn pending_block_rows(&self) -> striatum_core::RouteStateResult<BlockRows> {
+        let captured = CAPTURE.with(|capture| capture.borrow().clone().unwrap_or_default());
+        if captured.is_empty() {
+            return Ok(BlockRows::default());
+        }
         read_back(self.conn, &captured).map_err(crate::err)
     }
 }

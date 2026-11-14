@@ -4056,7 +4056,9 @@ impl RouteStateStore for SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let clock_schema=fence_rechecks::enabled(c)?;
-                let rechecks=fence_rechecks::read_effective(c)?;
+                // The route-state snapshot still overlays clocks read from
+                // SQL, not the account state's blocks.
+                let rechecks=crate::group_reads::declared_exception("route-state snapshot", || fence_rechecks::read_effective(c))?;
                 let mut by_route: HashMap<String, RouteRuntimeState> = HashMap::new();
                 let mut by_capacity: HashMap<String, RouteRuntimeState> = HashMap::new();
 

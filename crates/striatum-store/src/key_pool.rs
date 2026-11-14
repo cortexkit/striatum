@@ -388,10 +388,14 @@ impl SqliteRouteStateStore {
         let (states, needs_sync) = self
             .store
             .with_read(|conn: &Connection| {
-                Ok((
-                    read_key_states(conn, provider, now_ms, None)?,
-                    crate::fence_rechecks::needs_sync(conn)?,
-                ))
+                // Key states join the probe clocks, read here from SQL: the
+                // pool lease tables are not held in the account state.
+                crate::group_reads::declared_exception("pool key states", || {
+                    Ok((
+                        read_key_states(conn, provider, now_ms, None)?,
+                        crate::fence_rechecks::needs_sync(conn)?,
+                    ))
+                })
             })
             .map_err(err)?;
         if !needs_sync {
