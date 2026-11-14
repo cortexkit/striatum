@@ -13,7 +13,7 @@ const STARTED_WINDOW_MS: i64 = 30 * 60 * 1_000;
 type AccountKey = (String, String);
 
 /// A model contributes either to the shared account count or its own count.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(
     not(test),
     expect(dead_code, reason = "cap resolution will supply the count scope")
@@ -261,6 +261,41 @@ impl InflightLedger {
         scope: InflightScope<'_>,
         now: i64,
     ) -> usize {
+        self.count_matching(provider, account, now, |entry| match scope {
+            InflightScope::Account => true,
+            InflightScope::AccountModel(model) => entry.model == model,
+        })
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "admission enforcement consumes resolved caps in a later change"
+        )
+    )]
+    pub(crate) fn count_for_model(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        now: i64,
+    ) -> usize {
+        let model = crate::account_selection::normalize(model);
+        let count = caps.cap_count(provider, account, &model);
+        self.count_matching(provider, account, now, |entry| {
+            caps.cap_count(provider, account, &entry.model) == count
+        })
+    }
+
+    fn count_matching(
+        &self,
+        provider: &str,
+        account: &str,
+        now: i64,
+        includes: impl Fn(&InflightEntry) -> bool,
+    ) -> usize {
         let Some(entries) = self
             .accounts
             .get(&(provider.to_owned(), account.to_owned()))
@@ -271,13 +306,10 @@ impl InflightLedger {
         let mut conversations = BTreeSet::new();
         let mut renewals = BTreeSet::new();
         let mut ungrouped = 0;
-        for entry in entries.values().filter(|entry| {
-            now < entry.until_ms
-                && match scope {
-                    InflightScope::Account => true,
-                    InflightScope::AccountModel(model) => entry.model == model,
-                }
-        }) {
+        for entry in entries
+            .values()
+            .filter(|entry| now < entry.until_ms && includes(entry))
+        {
             let conversation = (&entry.principal, &entry.conversation_hash);
             if entry.renewal {
                 renewals.insert(conversation);

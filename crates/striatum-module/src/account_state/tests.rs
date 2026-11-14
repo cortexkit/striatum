@@ -619,7 +619,7 @@ fn a_continuation_with_a_partial_offer_is_refused_at_load_naming_the_row() {
 fn state_blind_admission_writers_refuse_once_state_is_installed() {
     let (_scratch, store) = fixture("state-blind-writers");
     let _owner = install(&store);
-    assert!(store.prune_account_admissions(1, 1).is_err());
+    assert!(store.prune_account_admissions(1, 1, 1).is_err());
     assert!(store.prune_account_affinities(1, 1).is_err());
     assert!(store.prune_account_continuations(1, 1).is_err());
     assert!(store

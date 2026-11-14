@@ -3124,7 +3124,7 @@ fn fingerprint(params: &AccountForParams) -> String {
     hex(&Sha256::digest(&encoded))
 }
 
-fn normalize(value: &str) -> String {
+pub(crate) fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 

@@ -108,6 +108,18 @@ fn decimal(value: &Value, units_key: &str) -> Option<f64> {
     (result.is_finite() && result > 0.0).then_some(result)
 }
 
+/// Login adapters and catalog plan providers can differ. Pricing and caps must
+/// use the same join, while admissions keep their actual serving provider.
+pub(crate) fn plan_price_key<'a>(
+    reading: &'a crate::account_quota::StoredReading,
+    identity: Option<&'a crate::account_quota::RosterIdentity>,
+) -> Option<(&'a str, Option<&'a str>)> {
+    Some((
+        reading.routing_provider()?,
+        identity.and_then(|row| row.plan_tier.as_deref()),
+    ))
+}
+
 fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Value> {
     prices["prices"]
         .as_array()?
@@ -302,9 +314,6 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         {
             continue;
         }
-        let Some(provider) = reading.routing_provider() else {
-            continue;
-        };
         let roster = state
             .roster
             .as_ref()
@@ -312,7 +321,10 @@ fn build(state: &AccountQuotaState, report: &Value, prices: &Value, now: i64) ->
         if roster.is_some_and(|r| r.active_credential_ids.is_empty()) {
             continue;
         }
-        let tier = roster.and_then(|r| r.plan_tier.clone());
+        let Some((provider, tier)) = plan_price_key(reading, roster) else {
+            continue;
+        };
+        let tier = tier.map(str::to_owned);
         let joined = match account_plan(report, &reading.account_id) {
             Ok(row) => row,
             Err(()) => {

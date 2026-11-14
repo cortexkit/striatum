@@ -1,6 +1,104 @@
 use super::*;
 
 #[tokio::test]
+async fn retention_after_recent_report_use_keeps_the_original_observation_path() {
+    const START: u64 = 1_790_683_200_000;
+    const NOW: u64 = START + 40 * 24 * 60 * 60_000;
+    let _clock = crate::InjectedClock::set(START);
+    let (subject, consumer, runner, mut request) = paused().await;
+    let _use_clock = crate::InjectedClock::set(NOW - 60_000);
+    subject
+        .configure_continue_credentials(&fixture::continue_credentials())
+        .await
+        .unwrap();
+    request["exhausted"]["observed_at_ms"] = json!(NOW - 60_000);
+    request["exhausted"]["resets_at_ms"] = json!(NOW + 240_000);
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(offer["kind"], "offer", "{offer}");
+    result(consumer.call("route.report", &json!({"decision_id":offer["decision_id"],"outcome":"completed","usage":{"input_tokens":100,"output_tokens":20}})).await);
+    let assert_counts = |harness: &Harness, now, expected, stage| {
+        let state = crate::account_state::snapshot(harness.store()).unwrap();
+        let scope = crate::account_state::InflightScope::Account;
+        assert_eq!(
+            state
+                .inflight
+                .count(fixture::SUBSCRIPTION_PROVIDER, "account-1", scope, now),
+            0
+        );
+        assert_eq!(
+            state.inflight.count(
+                fixture::SUBSCRIPTION_PROVIDER,
+                offer["account"].as_str().unwrap(),
+                scope,
+                now
+            ),
+            expected,
+            "{stage} at {now}"
+        );
+    };
+    let _pass_clock = crate::InjectedClock::set(NOW);
+    assert_counts(&subject.harness(), NOW as i64, 1, "before retention");
+    let harness = subject.harness();
+    let report = tokio::task::spawn_blocking(move || {
+        let _clock = crate::InjectedClock::set(NOW);
+        crate::retention::run_retention_pass(
+            harness.store(),
+            &crate::retention::RetentionWindows::default(),
+            NOW as i64,
+            &crate::retention::PassBudget::default(),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        report.account_admissions, 0,
+        "a moved run still reports under its old admission"
+    );
+    assert_counts(&subject.harness(), NOW as i64, 1, "after retention");
+    drop(consumer);
+    drop(runner);
+    let harness = subject.harness.into_inner().unwrap();
+    let previous = request["previous_decision_id"].as_str().unwrap().to_owned();
+    let (harness, runner_module) = tokio::task::spawn_blocking(move || {
+        let _clock = crate::InjectedClock::set(NOW);
+        let harness = upgrade_harness(harness);
+        crate::account_state::initialize_at(harness.store(), NOW as i64).unwrap();
+        let runner_module = harness
+            .store()
+            .v1_decision(&previous)
+            .unwrap()
+            .unwrap()
+            .runner_module;
+        (harness, runner_module)
+    })
+    .await
+    .unwrap();
+    assert_counts(&harness, NOW as i64, 1, "after restart");
+    let runner = harness.bind(reserved(&runner_module), None).await;
+    let _later = crate::InjectedClock::set(NOW + 31 * 60_000);
+    let later = (NOW + 31 * 60_000) as i64;
+    assert_counts(&harness, later, 0, "lapsed");
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&offer, "attempt", "retained-attempt"),
+            )
+            .await,
+    );
+    assert_counts(&harness, later, 1, "late attempt");
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&offer, "run_finished", "retained-finish"),
+            )
+            .await,
+    );
+    assert_counts(&harness, later, 0, "finished");
+}
+
+#[tokio::test]
 async fn report_delivery_succeeds_left_account_and_unbound_attempt_refreshes_moved_run() {
     const NOW: u64 = 1_790_683_200_000;
     let _clock = crate::InjectedClock::set(NOW);

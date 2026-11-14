@@ -373,6 +373,32 @@ impl<'a> AccountCommand<'a> {
 // working state, which already holds every earlier change of its batch.
 // Without a state (private SQL projections) they are the SQL reads.
 impl AccountCommand<'_> {
+    /// Counts only holds assigned to the requested model's effective count.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "admission enforcement consumes resolved caps in a later change"
+        )
+    )]
+    pub(crate) fn inflight_count_for_model(
+        &mut self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        now: i64,
+    ) -> usize {
+        let state = self
+            .state
+            .as_deref_mut()
+            .expect("ledger needs module state");
+        state.inflight.touch(provider, account, now);
+        state
+            .inflight
+            .count_for_model(caps, provider, account, model, now)
+    }
+
     // A replay or a read-only writer command can visit an account without a
     // lifecycle effect. Remember its key so command cleanup still drops lapsed
     // entries without scanning any other account or changing durable rows.
@@ -1040,8 +1066,9 @@ impl AccountCommand<'_> {
         &mut self,
         before: i64,
         limit: usize,
+        now_ms: i64,
     ) -> RouteStateResult<usize> {
-        let deleted = self.sql.prune_account_admissions_returning(before, limit)?;
+        let deleted = self.sql.prune_account_admissions_returning(before, limit, now_ms)?;
         if let Some(state) = self.state.as_deref_mut() {
             for row in &deleted {
                 state.inflight.remove(
@@ -1140,6 +1167,16 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
             bridge.snapshot().map(|_| ())
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_at(store: &SqliteRouteStateStore, now_ms: i64) -> RouteStateResult<()> {
+    // The loader runs on the writer thread, where a test's thread-local clock
+    // is not installed. Pin its clock before starting that thread's load.
+    store.install_account_state_bridge(Arc::new(StateOwner {
+        load_now_ms: Some(now_ms),
+        ..StateOwner::default()
+    }))
 }
 
 /// After a request mix: the published admission state must equal a fresh

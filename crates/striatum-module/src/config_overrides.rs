@@ -154,6 +154,9 @@ pub(crate) struct PricingPatch {
 }
 
 impl LiveConfig {
+    pub(crate) fn concurrency_caps(&self) -> &crate::concurrency_caps::CapSettings {
+        &self.config.concurrency
+    }
     pub(crate) fn scoring_anchor_version(&self) -> u32 {
         self.config
             .model_routing
@@ -698,6 +701,7 @@ fn live_config_at_with_reporter(
 }
 
 fn validate_live_config(config: &RoutingConfigFile) -> Result<(), String> {
+    config.concurrency.validate()?;
     if config.accounts.metered_fallback {
         return Err(
             "metered_fallback must be explicitly enabled under providers.<id>.accounts".into(),
@@ -1100,15 +1104,28 @@ impl LiveConfig {
     }
 }
 
-pub async fn config_refresh_loop(path: PathBuf, catalog_wake: Arc<tokio::sync::Notify>) {
+pub async fn config_refresh_loop(
+    path: PathBuf,
+    credentials: crate::broca_credentials::SharedBrocaCredentials,
+) {
     let mut active = live_config(&path);
+    if let Ok(mut credentials) = credentials.lock() {
+        credentials
+            .concurrency_caps
+            .publish_settings(active.concurrency_caps());
+    }
     loop {
         tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
         let next = live_config(&path);
         if !Arc::ptr_eq(&active, &next) {
             eprintln!("[striatum] routing-config-reloaded: {}", path.display());
             active = next;
-            catalog_wake.notify_one();
+            if let Ok(mut credentials) = credentials.lock() {
+                credentials
+                    .concurrency_caps
+                    .publish_settings(active.concurrency_caps());
+                credentials.catalog_wake.notify_one();
+            }
         }
     }
 }
@@ -1230,6 +1247,8 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
+    #[serde(default)]
+    concurrency: crate::concurrency_caps::CapSettings,
     #[serde(flatten)]
     model_routing: ModelRoutingSection,
     #[serde(default)]
