@@ -3170,6 +3170,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
         #[serde(skip_serializing_if = "Option::is_none")]
         warm_credential: Option<&'a str>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        head_turn: bool,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -3191,6 +3193,7 @@ fn fingerprint(params: &AccountForParams) -> String {
         parent_conversation_key: params.parent_conversation_key.as_deref(),
         service_tier: params.service_tier,
         warm_credential: params.warm_credential.as_deref(),
+        head_turn: params.head_turn,
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -4636,6 +4639,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(default)]
+    head_turn: bool,
     #[serde(skip)]
     pub(crate) call: Option<call_log::AccountCall>,
     #[serde(default)]
@@ -4709,6 +4714,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
             service_tier_chosen: None,
@@ -4900,8 +4906,14 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 #[cfg(test)]
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
     let params = decode_params(body).unwrap_or(Value::Null);
-    let call = (method == ACCOUNT_FOR_OP)
-        .then(|| call_log::AccountCall::legacy(&params, principal, ctx.store));
+    let call = (method == ACCOUNT_FOR_OP).then(|| {
+        call_log::AccountCall::legacy(
+            &params,
+            principal,
+            ctx.classes.as_ref().map(|classes| classes.config.as_ref()),
+            ctx.store,
+        )
+    });
     let reply = handle_with_call(method, body, principal, ctx, call.clone());
     if let Some(call) = call {
         call.finish();
