@@ -372,11 +372,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<LatestAdmissionRow>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {LATEST_COLUMNS} FROM account_admission \
-                     WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3 \
-                     ORDER BY committed_at DESC, rowid DESC LIMIT 1"
-                ),
+                &latest_admission_for_conversation_sql(),
                 params![principal, conversation_hash, provider],
                 latest_from_row,
             )
@@ -394,14 +390,75 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<(i64, String)>> {
         self.conn
             .query_row(
-                "SELECT rowid, reservation_id FROM account_continue \
-                 WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
-                 ORDER BY rowid DESC LIMIT 1",
+                LATEST_USED_CONTINUATION_SQL,
                 params![principal, admission_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(err)
+    }
+}
+
+// Both run under the account writer for every conversation retention prunes,
+// so each must be an indexed lookup (migration 91), never a principal scan.
+fn latest_admission_for_conversation_sql() -> String {
+    format!(
+        "SELECT {LATEST_COLUMNS} FROM account_admission \
+         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3 \
+         ORDER BY committed_at DESC, rowid DESC LIMIT 1"
+    )
+}
+
+const LATEST_USED_CONTINUATION_SQL: &str = "SELECT rowid, reservation_id FROM account_continue \
+     WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
+     ORDER BY rowid DESC LIMIT 1";
+
+#[cfg(test)]
+mod lookup_plan_tests {
+    use super::*;
+
+    fn plan(sql: &str) -> Vec<String> {
+        let scratch = cortexkit_test_support::ScratchDir::new("maintenance-lookup-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "maintenance-lookup-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .with_writer_for_test(|conn| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params_from_iter(
+                            ["p", "c", "x"].into_iter().take(sql.matches('?').count()),
+                        ),
+                        |row| row.get::<_, String>(3),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn retention_conversation_recheck_uses_an_index_without_sorting() {
+        let plan = plan(&latest_admission_for_conversation_sql());
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("account_admission_by_conversation")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    #[test]
+    fn retention_continuation_recheck_uses_an_index() {
+        let plan = plan(LATEST_USED_CONTINUATION_SQL);
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("account_continue_by_admission")),
+            "{plan:?}"
+        );
     }
 }
 
