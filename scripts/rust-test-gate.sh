@@ -20,5 +20,8 @@ python3 -m unittest scripts/tests/test_write_transactions.py
 python3 scripts/write-transactions.py
 python3 -m unittest scripts/tests/test_convert_consumer_names.py
 
+# The tests build with test-support features, which hide code that only
+# compiles there. Check the shipped binary as it is built for deploy.
+cargo check --locked -p striatum-module --bin ck-striatum
 cargo nextest run --locked --lib --bins --tests
 printf 'gate summary: source checks and routing tests passed\n'
