@@ -461,3 +461,52 @@ pub(super) fn seed_open_offer(
         })
         .unwrap();
 }
+
+#[tokio::test]
+async fn s8c_capped_sweep_reuses_the_account_snapshot() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (harness, _, routes) = panel_harness().await;
+    let provider = routes[0].split_once('/').unwrap().0;
+    harness.edit_config(|config| {
+        config["concurrency"]["enforcement_enabled"] = json!(true);
+        config["concurrency"]["providers"][provider] = json!({"limit":1});
+    });
+    let operator = operator(&harness).await;
+    crate::account_state::snapshot(harness.store()).unwrap();
+    let before = rows(&harness);
+    let trace = harness.store().trace_account_reads_for_test().unwrap();
+    trace.take();
+    let commands = harness.store().account_writer_batch_sizes_for_test();
+    let snapshots = crate::account_state::SNAPSHOT_COUNT.load(Ordering::Relaxed);
+    let answer = evaluate(
+        &operator,
+        json!({"iqs":[0,50], "panel":{"class":"audit","seed":"capped"}}),
+    )
+    .await;
+    let reads = trace.take();
+    assert!(answer["results"][0]["pick"].is_object(), "{answer}");
+    assert!(
+        answer["concurrency"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["provider"] == provider
+                && row["cap_counts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|count| count["effective_cap"] == 1)),
+        "{answer}"
+    );
+    assert_eq!(
+        crate::account_state::SNAPSHOT_COUNT.load(Ordering::Relaxed) - snapshots,
+        1
+    );
+    assert!(reads.reader.is_empty(), "{:?}", reads.reader);
+    assert!(reads.writer.is_empty(), "{:?}", reads.writer);
+    assert_eq!(
+        commands,
+        harness.store().account_writer_batch_sizes_for_test()
+    );
+    assert_eq!(before, rows(&harness));
+}

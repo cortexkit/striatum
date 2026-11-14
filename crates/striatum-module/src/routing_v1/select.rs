@@ -1642,12 +1642,13 @@ async fn select_at_tier_attempt(
         })
         .filter(|_| request.pin_fallback != Some(PinFallback::Route))
         .map(|pin| crate::select_concurrency::pin_capacity(&pin, &facts));
-    let concurrency = crate::select_concurrency::capture(
+    let concurrency = crate::select_concurrency::capture_with_snapshot(
         deps.store,
         priced.classes.as_ref(),
         &facts,
         priced_per_token,
         now as i64,
+        evaluation.map(|view| view.accounts.initial.as_ref()),
         |fact| {
             crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref())
                 && request.eligible_routes.as_ref().is_none_or(|routes| {

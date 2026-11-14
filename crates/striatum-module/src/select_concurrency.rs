@@ -33,6 +33,21 @@ pub(crate) fn capture(
     now: i64,
     consider: impl Fn(&striatum_core::ModelFact) -> bool,
 ) -> striatum_core::RouteStateResult<ConcurrencyAvailability> {
+    capture_with_snapshot(store, classes, facts, priced, now, None, consider)
+}
+
+/// An operator preview supplies its captured account-state snapshot. Live
+/// requests load account state lazily only when a considered route has a cap
+/// and at least one eligible account.
+pub(crate) fn capture_with_snapshot(
+    store: &striatum_store::SqliteRouteStateStore,
+    classes: Option<&crate::account_selection::ClassContext>,
+    facts: &[striatum_core::ModelFact],
+    priced: bool,
+    now: i64,
+    snapshot: Option<&crate::account_state::AccountState>,
+    consider: impl Fn(&striatum_core::ModelFact) -> bool,
+) -> striatum_core::RouteStateResult<ConcurrencyAvailability> {
     let mut availability = ConcurrencyAvailability::default();
     let Some(classes) = classes else {
         return Ok(availability);
@@ -71,10 +86,14 @@ pub(crate) fn capture(
         if accounts.is_empty() {
             continue;
         }
-        if state.is_none() {
-            state = Some(crate::account_state::snapshot(store)?);
-        }
-        let state = state.as_ref().unwrap();
+        let state = if let Some(snapshot) = snapshot {
+            snapshot
+        } else {
+            if state.is_none() {
+                state = Some(crate::account_state::snapshot(store)?);
+            }
+            state.as_deref().unwrap()
+        };
         let mut full = Vec::new();
         for account in &accounts {
             let Some(cap) = caps.cap(provider, account, &model).limit else {
