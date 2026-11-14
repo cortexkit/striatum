@@ -190,6 +190,32 @@ async fn paged_three_pages_apply_together_with_retired_models_and_auth_policies(
 }
 
 #[tokio::test]
+async fn paged_quality_disclosures_merge_across_the_read_and_apply() {
+    let mut first = paged_payload(7, 700, "alpha", Some("first"));
+    first["quality_scores"] = json!({"graded_by": "operator", "graded_at_ms": 100});
+    let middle = paged_payload(7, 700, "beta", Some("second"));
+    let mut last = paged_payload(7, 700, "zulu", None);
+    last["quality_scores"] = json!({"graded_by": "operator", "graded_at_ms": 200});
+    last["models"]["zulu/m"]["quality.elo"] = json!(1400.0);
+    last["models"]["zulu/m"]["quality.eq"] = json!(120.0);
+    let (mut client, peer) = paged_wire(vec![
+        (paged_request(None), FrameType::Response, first),
+        (paged_request(Some("first")), FrameType::Response, middle),
+        (paged_request(Some("second")), FrameType::Response, last),
+    ])
+    .await;
+    let snapshot = client.catalog_get().await.unwrap();
+    client.close().await.unwrap();
+    paged_finish(peer, 3).await;
+    assert_eq!(snapshot.quality_scores.as_ref().unwrap().graded_at_ms, 200);
+    assert_eq!(snapshot.facts.len(), 3);
+    let rig = Rig::new("paged-quality");
+    let store = rig.store();
+    apply_mapped_catalog(&store, &snapshot, None, Some("zulu")).unwrap();
+    assert!(store.operator_quality().unwrap().contains_key("zulu/m"));
+}
+
+#[tokio::test]
 async fn paged_catalog_changed_discards_partial_pages_and_restarts_from_page_one() {
     for (ty, refusal) in [
         (

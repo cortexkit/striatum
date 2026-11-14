@@ -241,12 +241,20 @@ impl CatalogPage {
         if self.source != page.source
             || self.catalog_version != page.catalog_version
             || self.resolved_at_ms != page.resolved_at_ms
-            || self.quality_scores != page.quality_scores
+            || matches!((&self.quality_scores, &page.quality_scores),
+                (Some(first), Some(next)) if first.graded_by != next.graded_by)
         {
             return Err(error("Fusiform catalog page identity changed during read"));
         }
         if page.models.keys().any(|key| self.models.contains_key(key)) {
             return Err(error("Fusiform catalog pages repeated a model"));
+        }
+        match (&mut self.quality_scores, page.quality_scores.take()) {
+            (Some(first), Some(next)) => {
+                first.graded_at_ms = first.graded_at_ms.max(next.graded_at_ms);
+            }
+            (scores @ None, Some(next)) => *scores = Some(next),
+            _ => {}
         }
         self.models.append(&mut page.models);
         self.withheld.append(&mut page.withheld);
@@ -4230,6 +4238,72 @@ mod tests {
             "limit.context": context,
             "rate.output": {"state": "priced", "currency": "USD", "exponent": 0, "units": 2},
         })
+    }
+
+    fn catalog_page(model: &str, quality_scores: Option<Value>) -> CatalogPage {
+        let mut entry = readable_entry(32_000);
+        entry["quality.elo"] = json!(1400.0);
+        entry["quality.eq"] = json!(120.0);
+        serde_json::from_value(json!({
+            "source": "fusiform",
+            "catalog_version": 42,
+            "resolved_at_ms": 42000,
+            "models": {format!("test/{model}"): entry},
+            "quality_scores": quality_scores,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn catalog_pages_merge_quality_disclosures_and_apply() {
+        let scores = |time| Some(json!({"graded_by": "operator", "graded_at_ms": time}));
+        let mut whole = catalog_page("first", scores(100));
+        whole.append(catalog_page("second", None)).unwrap();
+        whole.append(catalog_page("third", scores(200))).unwrap();
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&whole).unwrap()).unwrap();
+        assert_eq!(snapshot.quality_scores.as_ref().unwrap().graded_at_ms, 200);
+        assert_eq!(snapshot.facts.len(), 3);
+        let rig = Rig::new("page-quality");
+        let store = rig.store();
+        apply_mapped_catalog(&store, &snapshot, None, Some("test")).unwrap();
+        assert_eq!(
+            store.get_catalog_facts().unwrap().iter()
+                .filter(|row| row.fact.provider_id == "test").count(),
+            3
+        );
+        let quality = store.operator_quality().unwrap();
+        assert_eq!(quality.len(), 3);
+        assert!(quality.contains_key("test/third"));
+
+        let mut no_disclosure = catalog_page("first", None);
+        no_disclosure
+            .append(catalog_page("second", scores(200)))
+            .unwrap();
+        no_disclosure
+            .append(catalog_page("third", scores(100)))
+            .unwrap();
+        assert_eq!(no_disclosure.quality_scores.unwrap().graded_at_ms, 200);
+    }
+
+    #[test]
+    fn catalog_pages_reject_identity_and_grader_changes() {
+        for field in ["source", "catalog_version", "resolved_at_ms", "graded_by"] {
+            let scores = Some(json!({"graded_by": "operator", "graded_at_ms": 100}));
+            let mut whole = catalog_page("first", scores.clone());
+            let mut page = catalog_page("second", scores);
+            match field {
+                "source" => page.source = "other".into(),
+                "catalog_version" => page.catalog_version += 1,
+                "resolved_at_ms" => page.resolved_at_ms += 1,
+                "graded_by" => page.quality_scores.as_mut().unwrap().graded_by = "other".into(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                whole.append(page).unwrap_err().to_string(),
+                "Fusiform catalog page identity changed during read",
+                "{field}"
+            );
+        }
     }
 
     #[test]
