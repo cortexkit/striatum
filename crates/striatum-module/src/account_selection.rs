@@ -3973,6 +3973,14 @@ pub(crate) fn refresh_credential_quota_holds_in(
     reconcile_credential_quota_holds(tx, credentials, quota, config, refusals, route_fences, now, true, &mut false)
 }
 
+/// End a credential refusal that fresh quota evidence has lifted.
+fn clear_lifted_refusal(
+    tx: &AccountTx<'_>,
+    refusal: &striatum_core::route_state_store::CredentialEntitlementFence,
+) -> RouteStateResult<()> {
+    tx.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)
+}
+
 fn reconcile_credential_quota_holds(
     tx: &(impl BlockReads + ?Sized),
     credentials: &crate::broca_credentials::CredentialAccounts,
@@ -4206,7 +4214,7 @@ fn reconcile_credential_quota_holds(
         })()?;
         if lifted {
             *changed = true;
-            if write { writer(tx)?.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)?; }
+            if write { clear_lifted_refusal(writer(tx)?, &refusal)?; }
         } else {
             kept.push(refusal);
         }
