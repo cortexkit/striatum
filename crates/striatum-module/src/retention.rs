@@ -6,10 +6,11 @@
 //!   its `account_pin` generations, `account_hold`, and serve
 //!   `account_decision` rows): admissions are read back for a duplicate
 //!   request, a runner's report and pending demand, all within minutes of the
-//!   commit; affinity is live for seven idle days; holds lapse within
-//!   minutes. A row is deleted once its last activity is past the
-//!   `account_selection_days` window and nothing still in the store
-//!   references it (see the store's `retention.rs`).
+//!   commit; affinity is live for seven idle days, followed by a one-hour
+//!   grace period and any remaining lease; holds lapse within minutes.
+//!   Affinity and its pins go after that grace once no admission or hold
+//!   references them. Other history uses the `account_selection_days` window
+//!   (see the store's `retention.rs`).
 //! - Shadow `account_decision` rows, left by the retired shadow mode, are
 //!   read by nothing and purged whatever their age.
 //! - `account_observation`: read back only to recognise a runner re-sending
@@ -122,6 +123,55 @@ pub const V1_REPLAY_WINDOW_MS: i64 = 7 * DAY_MS;
 /// How long a continuation answer outlives the end of its run (the run's
 /// finish, or the offer's release or deadline).
 pub const CONTINUATION_WINDOW_MS: i64 = 7 * DAY_MS;
+/// Idle affinity has no prompt-cache value after its seven-day expiry. Keep
+/// the expired row for one extra hour so near-boundary retries retain their
+/// pin checks and binding. After that hour, an unreferenced conversation starts
+/// at generation 1 again, may import a preferred account again, and no longer
+/// carries its former service-tier binding or operator-override pin identity.
+pub const ACCOUNT_AFFINITY_GRACE_MS: i64 = HOUR_MS;
+/// Affinity deletion also copies the admission state's sharded affinity
+/// indexes. Smaller writer commands leave room for those copies and the keyed
+/// reference rechecks; the reader still scans the ordinary per-pass row budget.
+/// Eight-key commands took at most 6.3 ms end to end on a live-sized fixture
+/// in release mode, including queueing, commit and state publication.
+pub const AFFINITY_DELETE_BATCH_ROWS: usize = 8;
+
+/// One bounded expiry sweep across passes. Protected conversations need not
+/// be reconsidered until admission history ages out; a completed sweep restarts
+/// no sooner than one hour after it began. Restarting routing loses only this
+/// optimization, not any retention state or reference protection.
+#[derive(Debug, Clone, Default)]
+struct AffinitySweep {
+    after: Option<striatum_store::AffinityRetentionPosition>,
+    started_at: Option<i64>,
+    complete: bool,
+}
+
+impl AffinitySweep {
+    fn plan(
+        &mut self,
+        store: &SqliteRouteStateStore,
+        before: i64,
+        now_ms: i64,
+        scan_limit: usize,
+    ) -> Result<Option<striatum_store::AffinityRetentionPlan>, striatum_core::RouteStateStoreError>
+    {
+        if scan_limit == 0 {
+            return Ok(None);
+        }
+        if self.complete {
+            if now_ms.saturating_sub(self.started_at.unwrap_or(now_ms)) < HOUR_MS {
+                return Ok(None);
+            }
+            *self = Self::default();
+        }
+        self.started_at.get_or_insert(now_ms);
+        let plan = store.plan_account_affinities(before, now_ms, self.after, scan_limit)?;
+        self.after = plan.last.or(self.after);
+        self.complete = plan.examined < scan_limit;
+        Ok(Some(plan))
+    }
+}
 /// The oldest a generation-speed sample may be.
 pub const SPEED_SAMPLE_CAP_MS: i64 = 30 * DAY_MS;
 /// Samples kept per route and served population once they are older than the
@@ -296,7 +346,7 @@ pub struct RetentionPassReport {
     pub account_admissions: usize,
     pub account_holds: usize,
     pub account_affinities: usize,
-    /// Pin generations deleted with their conversation's affinity row.
+    /// Unneeded pin generations, including those deleted with an affinity row.
     pub account_pins: usize,
     /// Serve decisions.
     pub account_decisions: usize,
@@ -454,13 +504,30 @@ fn window_ms(count: u64, unit_ms: i64) -> i64 {
 
 /// One retention pass over every log, synchronous. Run it on a blocking
 /// thread: it sleeps between batches. Account-selection history goes leaf
-/// first (admissions, holds, then affinity with its pins, then the decisions
+/// first (admissions, holds, affinity and unneeded pins, then the decisions
 /// they referenced), so one pass can retire a whole expired conversation.
+#[cfg(test)]
 pub fn run_retention_pass(
     store: &SqliteRouteStateStore,
     windows: &RetentionWindows,
     now_ms: i64,
     budget: &PassBudget,
+) -> RetentionPassReport {
+    run_retention_pass_with_affinity_sweep(
+        store,
+        windows,
+        now_ms,
+        budget,
+        &mut AffinitySweep::default(),
+    )
+}
+
+fn run_retention_pass_with_affinity_sweep(
+    store: &SqliteRouteStateStore,
+    windows: &RetentionWindows,
+    now_ms: i64,
+    budget: &PassBudget,
+    affinity_sweep: &mut AffinitySweep,
 ) -> RetentionPassReport {
     let rows = budget.batch_rows;
     let per_table = budget.max_batches_per_table;
@@ -493,15 +560,51 @@ pub fn run_retention_pass(
         counted(store.prune_account_holds(history_before, rows))
     });
     let mut pins = 0;
-    let (affinities, affinities_drained) =
-        drain("account_affinity", budget, per_table, batches, || {
-            crate::account_writer::prune_account_affinities(store, history_before, rows)
-                .map(|batch| {
-                    pins += batch.pins;
-                    (batch.affinities, batch.affinities)
-                })
-                .map_err(|error| error.0)
-        });
+    let affinity_before = before(now_ms, ACCOUNT_AFFINITY_GRACE_MS);
+    let scan_limit = rows.saturating_mul(per_table);
+    let checkpoint = affinity_sweep.clone();
+    let (mut affinities, mut affinities_drained) = (0, true);
+    match affinity_sweep.plan(store, affinity_before, now_ms, scan_limit) {
+        Ok(Some(plan)) => {
+            affinities_drained = plan.examined < scan_limit;
+            for (round, keys) in plan
+                .keys
+                .chunks(rows.min(AFFINITY_DELETE_BATCH_ROWS).max(1))
+                .enumerate()
+            {
+                if round > 0 && !budget.pause.is_zero() {
+                    std::thread::sleep(budget.pause);
+                }
+                *batches += 1;
+                match crate::account_writer::prune_account_affinities(
+                    store,
+                    keys.to_vec(),
+                    affinity_before,
+                    now_ms,
+                ) {
+                    Ok(batch) => {
+                        affinities += batch.affinities;
+                        pins += batch.pins;
+                    }
+                    Err(error) => {
+                        *affinity_sweep = checkpoint;
+                        tracing::warn!(error=%error, "affinity retention command failed");
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error=%error, "affinity retention planning failed"),
+    }
+    let (unneeded_pins, pins_drained) = drain("account_pin", budget, per_table, batches, || {
+        counted(crate::account_writer::prune_account_pins(
+            store,
+            history_before,
+            rows,
+        ))
+    });
+    pins += unneeded_pins;
     let (decisions, decisions_drained) =
         drain("account_decision", budget, per_table, batches, || {
             counted(store.prune_serve_decisions(history_before, rows))
@@ -697,6 +800,7 @@ pub fn run_retention_pass(
         && admissions_drained
         && holds_drained
         && affinities_drained
+        && pins_drained
         && decisions_drained
         && observations_drained
         && observation_events_drained
@@ -723,6 +827,7 @@ pub fn run_retention_pass(
 /// never wait on it except for one short batch at a time.
 pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: PathBuf) {
     let mut last_warnings: Vec<String> = Vec::new();
+    let mut affinity_sweep = AffinitySweep::default();
     loop {
         // The first pass waits one interval, so it never competes with boot.
         tokio::time::sleep(RETENTION_INTERVAL).await;
@@ -734,17 +839,21 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
             last_warnings = warnings;
         }
         let pass_store = Arc::clone(&store);
+        let mut pass_sweep = std::mem::take(&mut affinity_sweep);
         let outcome = tokio::task::spawn_blocking(move || {
-            run_retention_pass(
+            let report = run_retention_pass_with_affinity_sweep(
                 &pass_store,
                 &windows,
                 crate::account_selection::now_ms(),
                 &PassBudget::default(),
-            )
+                &mut pass_sweep,
+            );
+            (report, pass_sweep)
         })
         .await;
         match outcome {
-            Ok(report) => {
+            Ok((report, next_sweep)) => {
+                affinity_sweep = next_sweep;
                 if report.total() > 0 {
                     tracing::info!(
                         shadow_decisions = report.shadow_decisions,
@@ -1055,6 +1164,166 @@ mod tests {
             pause: Duration::ZERO,
             ..PassBudget::default()
         }
+    }
+
+    fn seed_pin_affinity(path: &Path, store: &SqliteRouteStateStore, id: &str, expires_at: i64) {
+        let old = NOW - 31 * DAY_MS;
+        let mut decision = shadow_admit(id.into(), old);
+        decision.mode = striatum_store::DECISION_MODE_SERVE.into();
+        store
+            .account_transaction(|tx| tx.insert_decision(&decision))
+            .unwrap();
+        let connection = seeding_connection(path);
+        connection
+            .execute(
+                "INSERT INTO account_pin (pin_id,principal,conversation_hash,provider, \
+               pin_generation,affinity_model,account_id,credential_id,pin_mode, \
+               decision_id,created_at) \
+             VALUES (?1,'runner',?1,'p',1,'pick','acct','cred','conversation_lease',?1,?2)",
+                rusqlite::params![id, old],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO account_affinity (principal,conversation_hash,provider,affinity_model, \
+               pin_id,pin_generation,account_id,credential_id,credential_binding_revision, \
+               policy_version,initial_demand_bytes,created_at,last_used_at,expires_at,lease_valid_until) \
+             VALUES ('runner',?1,'p','pick',?1,1,'acct','cred',1,1,0,?2,?2,?3,NULL)",
+            rusqlite::params![id, old, expires_at],
+        ).unwrap();
+    }
+
+    #[test]
+    fn affinity_retention_frees_expired_pins_and_decisions_in_the_same_pass() {
+        let (dir, path, store) = scratch_store("expired-pin");
+        seed_pin_affinity(&path, &store, "expired", NOW - HOUR_MS - 1);
+        let connection = seeding_connection(&path);
+        connection.execute("INSERT INTO account_pin SELECT 'predecessor',principal,conversation_hash,provider,2,affinity_model,account_id,credential_id,'run_frozen',pin_id,decision_id,created_at FROM account_pin WHERE pin_id='expired'", []).unwrap();
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(report.account_affinities, 1);
+        assert_eq!(report.account_pins, 2);
+        assert_eq!(report.account_decisions, 1);
+        assert_eq!(count(&path, "SELECT count(*) FROM account_affinity"), 0);
+        assert_eq!(count(&path, "SELECT count(*) FROM account_pin"), 0);
+        assert_eq!(count(&path, "SELECT count(*) FROM account_decision"), 0);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn affinity_retention_keeps_live_grace_open_admission_unused_continuation_and_hold_pins() {
+        let (dir, path, store) = scratch_store("needed-pins");
+        for id in ["dead", "open", "offer", "held"] {
+            seed_pin_affinity(&path, &store, id, NOW - HOUR_MS - 1);
+        }
+        seed_pin_affinity(&path, &store, "current", NOW + DAY_MS);
+        seed_pin_affinity(&path, &store, "grace", NOW - HOUR_MS);
+        seed_pin_affinity(&path, &store, "leased", NOW - HOUR_MS - 1);
+        let connection = seeding_connection(&path);
+        connection
+            .execute(
+                "UPDATE account_affinity SET lease_valid_until=?1 WHERE pin_id='leased'",
+                [NOW + 1],
+            )
+            .unwrap();
+        for (id, pin) in [("open-admission", "open"), ("reservation", "offer")] {
+            insert_admission(&connection, id, "reserved", None, (NOW, None, None));
+            connection.execute(
+                "UPDATE account_admission SET pin_id=?1, conversation_hash=?1, decision_id=?1 WHERE admission_id=?2",
+                rusqlite::params![pin, id],
+            ).unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO account_continue (principal,selection_id,request_json,answer_json, \
+               run_id,admission_id,previous_decision_id,decision_id,reservation_id,valid_until_ms) \
+             VALUES ('runner','offer-selection','{}','{}','run','open-admission','root', \
+               'model-offer','reservation',?1)",
+                [NOW + DAY_MS],
+            )
+            .unwrap();
+        connection.execute(
+            "INSERT INTO account_hold (decision_id,principal,conversation_hash,provider,pin_id, \
+               pin_generation,account_id,credential_id,basis,reset_at,retry_after_s,created_at) \
+             VALUES ('held','runner','held','p','held',1,'acct','cred','five_hour',?1,60,?1)",
+            [NOW],
+        ).unwrap();
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
+        assert_eq!(
+            report.account_affinities, 1,
+            "only the unreferenced expired conversation goes"
+        );
+        assert_eq!(report.account_pins, 1);
+        for pin in ["current", "grace", "leased", "open", "offer", "held"] {
+            assert_eq!(
+                count(
+                    &path,
+                    &format!("SELECT count(*) FROM account_pin WHERE pin_id='{pin}'")
+                ),
+                1,
+                "{pin}"
+            );
+        }
+        assert_eq!(
+            count(&path, "SELECT count(*) FROM pragma_foreign_key_check"),
+            0
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn affinity_sweep_resumes_past_protected_rows_and_waits_an_hour_to_restart() {
+        let (dir, path, store) = scratch_store("affinity-sweep");
+        for id in ["a", "b", "c", "d"] {
+            seed_pin_affinity(&path, &store, id, NOW - 2 * HOUR_MS);
+        }
+        let conn = seeding_connection(&path);
+        conn.execute(
+            "UPDATE account_affinity SET lease_valid_until=?1 WHERE pin_id IN ('a','b')",
+            [NOW + HOUR_MS],
+        )
+        .unwrap();
+        let mut sweep = AffinitySweep::default();
+        let first = sweep.plan(&store, NOW - HOUR_MS, NOW, 2).unwrap().unwrap();
+        assert_eq!(first.examined, 2);
+        assert!(first.keys.is_empty());
+        let second = sweep.plan(&store, NOW - HOUR_MS, NOW, 2).unwrap().unwrap();
+        assert_eq!(second.examined, 2);
+        assert_eq!(
+            second
+                .keys
+                .iter()
+                .map(|key| key.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+        assert_eq!(
+            sweep
+                .plan(&store, NOW - HOUR_MS, NOW, 2)
+                .unwrap()
+                .unwrap()
+                .examined,
+            0
+        );
+        conn.execute(
+            "UPDATE account_affinity SET lease_valid_until=?1",
+            [NOW - 1],
+        )
+        .unwrap();
+        assert!(sweep
+            .plan(&store, NOW - HOUR_MS, NOW + HOUR_MS - 1, 2)
+            .unwrap()
+            .is_none());
+        let next = sweep
+            .plan(&store, NOW - HOUR_MS, NOW + HOUR_MS, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.keys
+                .iter()
+                .map(|key| key.1.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn count(path: &std::path::Path, sql: &str) -> i64 {

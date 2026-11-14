@@ -1,0 +1,1 @@
+{"request":{"method":"route.select","params":{"consumer":"colliculus.video","kind":"video","privacy":"remote_allowed","requirements":{"output_duration_ms":1000}}},"reply":{"code":"no_route","message":"catalog fact limit.output_duration_ms does not satisfy the request","detail":{"reason":"missing_capability"}}}

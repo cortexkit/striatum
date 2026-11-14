@@ -1,0 +1,1 @@
+{"request":{"method":"route.select","params":{"consumer":"colliculus.voice_message","kind":"synthesize","privacy":"remote_allowed","requirements":{"duration_ms":30000,"format":"audio/wav"}}},"reply":{"code":"invalid_request","message":"consumer kind transcribe cannot be selected as synthesize","detail":{"field":"kind"}}}

@@ -9708,6 +9708,156 @@ mod tests {
         })
     }
 
+    fn affinity_grace_fixture(label: &str) -> Fixture {
+        let rig = fixture(label);
+        crate::account_writer::execute(
+            rig.store(),
+            striatum_store::AccountCommandKind::Repair,
+            |tx| {
+                let salt = tx.salt(NOW, || "grace-test-salt".into())?;
+                let hash = conversation_hash(&salt, BROCA, "grace-conversation");
+                for (hash, pin, generation, expires_at) in [
+                    (hash, "grace-pin", 7, NOW - 30 * 60_000),
+                    (
+                        "dead-conversation".into(),
+                        "dead-pin",
+                        1,
+                        NOW - 2 * 60 * 60_000,
+                    ),
+                ] {
+                    tx.insert_pin(&AccountPinRow {
+                        pin_id: pin.into(),
+                        principal: BROCA.into(),
+                        conversation_hash: hash.clone(),
+                        provider: "anthropic".into(),
+                        pin_generation: generation,
+                        affinity_model: "claude-opus-5-5".into(),
+                        account_id: ACCOUNT_A.into(),
+                        credential_id: "oauth:anthropic".into(),
+                        pin_mode: "conversation_lease".into(),
+                        previous_pin_id: None,
+                        decision_id: "history".into(),
+                        created_at: NOW - AFFINITY_IDLE_MS,
+                    })?;
+                    tx.put_affinity(
+                        &AccountAffinityRow {
+                            principal: BROCA.into(),
+                            conversation_hash: hash,
+                            provider: "anthropic".into(),
+                            affinity_model: "claude-opus-5-5".into(),
+                            pin_id: pin.into(),
+                            pin_generation: generation,
+                            account_id: ACCOUNT_A.into(),
+                            credential_id: "oauth:anthropic".into(),
+                            credential_binding_revision: 1,
+                            policy_version: 2,
+                            initial_demand_bytes: 12_000,
+                            created_at: expires_at - AFFINITY_IDLE_MS,
+                            last_used_at: expires_at - AFFINITY_IDLE_MS,
+                            expires_at,
+                            lease_valid_until: Some(NOW - 1),
+                        },
+                        None,
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let report = crate::retention::run_retention_pass(
+            rig.store(),
+            &Default::default(),
+            NOW,
+            &crate::retention::PassBudget {
+                pause: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            report.account_affinities, 1,
+            "only the conversation beyond the grace hour goes"
+        );
+        rig
+    }
+
+    #[test]
+    fn affinity_retention_grace_preserves_expected_pin_compare_and_set() {
+        let rig = affinity_grace_fixture("grace-cas");
+        let mut params = admit_params("renew", "grace-conversation", "anthropic-auth");
+        params["mode"] = json!("renew");
+        params["expected_pin"] = json!({"id":"grace-pin","generation":6});
+        let reply = rig.call(&rig.ctx(true, NOW), ACCOUNT_FOR_OP, BROCA, params);
+        assert_eq!(reply.code(), Some("pin_generation_conflict"));
+        let OpReply::Error { detail, .. } = reply else {
+            unreachable!()
+        };
+        assert_eq!(
+            detail.unwrap()["current_pin"],
+            json!({"id":"grace-pin","generation":7,
+            "account_id":ACCOUNT_A,"credential_id":"oauth:anthropic"})
+        );
+    }
+
+    #[test]
+    fn affinity_retention_grace_preserves_bound_service_tier_refusal() {
+        let rig = affinity_grace_fixture("grace-tier");
+        let ctx = rig.ctx(true, NOW);
+        let mut request = admit_params("tier", "grace-conversation", "anthropic-auth");
+        request["candidates"] = json!({"view_digest":"tier-view","accounts":[{"account_id":ACCOUNT_B,"credential_id":"oauth:anthropic-b"}]});
+        let mut params = parse_account_for(&request).unwrap();
+        params.service_tier_bound = true;
+        let mut roster = roster_for_model(&ctx, "anthropic", Some("claude-opus-5-5"));
+        roster
+            .roster
+            .as_mut()
+            .unwrap()
+            .accounts
+            .retain(|account| account.account_id != ACCOUNT_A);
+        let reply = crate::account_writer::execute(
+            rig.store(),
+            striatum_store::AccountCommandKind::Repair,
+            {
+                let command = ctx.command_context();
+                move |tx| {
+                    serve(
+                        tx,
+                        &command,
+                        BROCA,
+                        &params,
+                        "anthropic",
+                        &roster,
+                        "tier-fingerprint",
+                    )
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.code(), Some("account_selection_unavailable"));
+        let OpReply::Error { detail, .. } = reply else {
+            unreachable!()
+        };
+        assert_eq!(
+            detail.unwrap()["exclusions"][0]["reason"],
+            "bound_service_tier_unavailable"
+        );
+    }
+
+    #[test]
+    fn affinity_retention_grace_still_suppresses_import_preference() {
+        let rig = affinity_grace_fixture("grace-import");
+        let mut params = admit_params("import", "grace-conversation", "anthropic-auth");
+        params["preferred_existing_account"] = json!({"account_id":ACCOUNT_B});
+        let reply = result(rig.call(&rig.ctx(true, NOW), ACCOUNT_FOR_OP, BROCA, params));
+        assert_eq!(
+            reply["pin"]["generation"], 8,
+            "expired affinity still supplies the previous generation"
+        );
+        assert_ne!(reply["reason"]["code"], "imported_affinity");
+        let decision: Value =
+            serde_json::from_str(&rig.serve_rows().last().unwrap().decision_json).unwrap();
+        assert!(decision["explanation"]["import"].is_null());
+    }
+
     fn result(reply: OpReply) -> Value {
         match reply {
             OpReply::Result(value) => value,

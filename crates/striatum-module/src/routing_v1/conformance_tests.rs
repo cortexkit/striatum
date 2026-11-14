@@ -166,6 +166,13 @@ impl Harness {
         crate::config_overrides::live_config(&self.config_path.lock().unwrap())
     }
 
+    pub(super) fn attach_reasoning_catalog(&self, catalog: striatum_store::ReasoningCatalog) {
+        crate::config_overrides::attach_reasoning_catalog(
+            &self.config_path.lock().unwrap(),
+            Arc::new(move || Ok(catalog.clone())),
+        ).unwrap();
+    }
+
     pub(crate) fn settings_source(&self, source: Arc<dyn crate::project_settings::Source>) {
         crate::project_settings::set_test_source(&self.config_path.lock().unwrap(), source);
     }
