@@ -2590,15 +2590,7 @@ impl SqliteRouteStateStore {
                      FROM credential_entitlement_fences ORDER BY provider_id, credential_id",
                 )?;
                 let rows = stmt.query_map([], |row| {
-                    Ok(
-                        striatum_core::route_state_store::CredentialEntitlementFence {
-                            provider_id: row.get(0)?,
-                            credential_id: row.get(1)?,
-                            code: row.get(2)?,
-                            listing_fingerprint: row.get(3)?,
-                            observed_at_ms: row.get(4)?,
-                        },
-                    )
+                    crate::account_selection::rows::entitlement_at(row, 0)
                 })?;
                 rows.collect::<Result<Vec<_>, _>>()
             })

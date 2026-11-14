@@ -704,17 +704,7 @@ impl AccountTx<'_> {
                 "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
              FROM credential_entitlement_fences WHERE provider_id = ?1 AND credential_id = ?2",
                 params![provider, credential],
-                |row| {
-                    Ok(
-                        striatum_core::route_state_store::CredentialEntitlementFence {
-                            provider_id: row.get(0)?,
-                            credential_id: row.get(1)?,
-                            code: row.get(2)?,
-                            listing_fingerprint: row.get(3)?,
-                            observed_at_ms: row.get(4)?,
-                        },
-                    )
-                },
+                |row| rows::entitlement_at(row, 0),
             )
             .optional()
             .map_err(err)
@@ -850,10 +840,7 @@ impl SqliteRouteStateStore {
         self.store.with_read(|conn: &Connection| {
             if !account_fact_table_exists(conn, "account_eligibility")? { return Ok(Vec::new()); }
             let mut statement = conn.prepare("SELECT provider,credential_id,model,listing_fingerprint,code,observed_at FROM account_eligibility ORDER BY provider,credential_id,model")?;
-            let rows = statement.query_map([], |row| Ok(AccountEligibilityFact {
-                provider: row.get(0)?, credential_id: row.get(1)?, model: row.get(2)?,
-                listing_fingerprint: row.get(3)?, code: row.get(4)?, observed_at: row.get(5)?,
-            }))?;
+            let rows = statement.query_map([], |row| rows::eligibility_at(row, 0))?;
             rows.collect()
         }).map_err(err)
     }
@@ -874,9 +861,7 @@ impl SqliteRouteStateStore {
                 " UNION ALL SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_non_quota_size_refusal"
             }else{""};
             let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal{extra}"))?;
-            let rows = statement.query_map([], |row| Ok(AccountSizeRefusal {
-                provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,size_class: row.get(3)?,expires_at: row.get(4)?,observed_at: row.get(5)?,
-            }))?;
+            let rows = statement.query_map([], |row| rows::size_refusal_at(row, 0))?;
             rows.collect()
         }).map_err(err)
     }
@@ -982,9 +967,7 @@ impl SqliteRouteStateStore {
             let table=if class!="quota" {"account_non_quota_route_fence"} else {"account_route_fence"};
             let filter=if class=="transient" {"WHERE wall_kind='transient'"} else if class=="billing" {"WHERE wall_kind='billing'"} else {"WHERE wall_class='quota'"};
             let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM {table} {filter} ORDER BY provider,credential_id,model"))?;
-            let rows = statement.query_map([], |row| Ok(AccountRouteFence {
-                provider: row.get(0)?,credential_id: row.get(1)?,model: row.get(2)?,until_ms: row.get(3)?,decision_id: row.get(4)?,recorded_at: row.get(5)?,
-            }))?;
+            let rows = statement.query_map([], |row| rows::route_fence_at(row, 0))?;
             rows.collect()
         }).map_err(err)
     }
@@ -1333,21 +1316,114 @@ const FENCE_COLUMNS: &str = "fence_id, provider, account_id, scope_json, fence_j
      observed_at, principal, admission_id, observation_id, created_at, cleared_at, cleared_reason";
 
 fn fence_from_row(row: &Row<'_>) -> rusqlite::Result<AccountFenceRow> {
-    Ok(AccountFenceRow {
-        fence_id: row.get(0)?,
-        provider: row.get(1)?,
-        account_id: row.get(2)?,
-        scope_json: row.get(3)?,
-        fence_json: row.get(4)?,
-        source: row.get(5)?,
-        observed_at: row.get(6)?,
-        principal: row.get(7)?,
-        admission_id: row.get(8)?,
-        observation_id: row.get(9)?,
-        created_at: row.get(10)?,
-        cleared_at: row.get(11)?,
-        cleared_reason: row.get(12)?,
-    })
+    rows::fence_at(row, 0)
+}
+
+/// Row decoders shared by the SQL readers and the in-memory block state,
+/// which reads the same columns back after each write. Each decodes its
+/// reader's columns, in that reader's order, starting at column `at`.
+pub(crate) mod rows {
+    use super::{
+        AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountRouteFence,
+        AccountSizeRefusal,
+    };
+    use rusqlite::Row;
+    use striatum_core::route_state_store::CredentialEntitlementFence;
+
+    /// `FENCE_COLUMNS`.
+    pub(crate) fn fence_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountFenceRow> {
+        Ok(AccountFenceRow {
+            fence_id: row.get(at)?,
+            provider: row.get(at + 1)?,
+            account_id: row.get(at + 2)?,
+            scope_json: row.get(at + 3)?,
+            fence_json: row.get(at + 4)?,
+            source: row.get(at + 5)?,
+            observed_at: row.get(at + 6)?,
+            principal: row.get(at + 7)?,
+            admission_id: row.get(at + 8)?,
+            observation_id: row.get(at + 9)?,
+            created_at: row.get(at + 10)?,
+            cleared_at: row.get(at + 11)?,
+            cleared_reason: row.get(at + 12)?,
+        })
+    }
+
+    /// `provider,credential_id,model,listing_fingerprint,code,observed_at`.
+    pub(crate) fn eligibility_at(
+        row: &Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<AccountEligibilityFact> {
+        Ok(AccountEligibilityFact {
+            provider: row.get(at)?,
+            credential_id: row.get(at + 1)?,
+            model: row.get(at + 2)?,
+            listing_fingerprint: row.get(at + 3)?,
+            code: row.get(at + 4)?,
+            observed_at: row.get(at + 5)?,
+        })
+    }
+
+    /// `provider,credential_id,model,size_class,expires_at,observed_at`.
+    pub(crate) fn size_refusal_at(
+        row: &Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<AccountSizeRefusal> {
+        Ok(AccountSizeRefusal {
+            provider: row.get(at)?,
+            credential_id: row.get(at + 1)?,
+            model: row.get(at + 2)?,
+            size_class: row.get(at + 3)?,
+            expires_at: row.get(at + 4)?,
+            observed_at: row.get(at + 5)?,
+        })
+    }
+
+    /// `provider,credential_id,model,until_ms,decision_id,recorded_at`.
+    pub(crate) fn route_fence_at(
+        row: &Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<AccountRouteFence> {
+        Ok(AccountRouteFence {
+            provider: row.get(at)?,
+            credential_id: row.get(at + 1)?,
+            model: row.get(at + 2)?,
+            until_ms: row.get(at + 3)?,
+            decision_id: row.get(at + 4)?,
+            recorded_at: row.get(at + 5)?,
+        })
+    }
+
+    /// `principal,admission_id,credential_id,runner_view_digest,
+    /// roster_view_digest,observation_id,recorded_at`.
+    pub(crate) fn exclusion_at(
+        row: &Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<AccountExclusionRow> {
+        Ok(AccountExclusionRow {
+            principal: row.get(at)?,
+            admission_id: row.get(at + 1)?,
+            credential_id: row.get(at + 2)?,
+            runner_view_digest: row.get(at + 3)?,
+            roster_view_digest: row.get(at + 4)?,
+            observation_id: row.get(at + 5)?,
+            recorded_at: row.get(at + 6)?,
+        })
+    }
+
+    /// `provider_id,credential_id,code,listing_fingerprint,observed_at_ms`.
+    pub(crate) fn entitlement_at(
+        row: &Row<'_>,
+        at: usize,
+    ) -> rusqlite::Result<CredentialEntitlementFence> {
+        Ok(CredentialEntitlementFence {
+            provider_id: row.get(at)?,
+            credential_id: row.get(at + 1)?,
+            code: row.get(at + 2)?,
+            listing_fingerprint: row.get(at + 3)?,
+            observed_at_ms: row.get(at + 4)?,
+        })
+    }
 }
 
 const OBSERVATION_COLUMNS: &str =
@@ -1954,17 +2030,7 @@ impl AccountTx<'_> {
             )
             .map_err(err)?;
         let rows = statement
-            .query_map(params![principal, admission_id], |row| {
-                Ok(AccountExclusionRow {
-                    principal: row.get(0)?,
-                    admission_id: row.get(1)?,
-                    credential_id: row.get(2)?,
-                    runner_view_digest: row.get(3)?,
-                    roster_view_digest: row.get(4)?,
-                    observation_id: row.get(5)?,
-                    recorded_at: row.get(6)?,
-                })
-            })
+            .query_map(params![principal, admission_id], |row| rows::exclusion_at(row, 0))
             .map_err(err)?;
         rows.collect::<rusqlite::Result<_>>().map_err(err)
     }

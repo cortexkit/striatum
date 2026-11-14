@@ -339,7 +339,7 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
     read_effective_at(conn, crate::now_ms())
 }
 
-fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
+pub(crate) fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
     if !enabled(conn)? {
         return Ok(Vec::new());
     }

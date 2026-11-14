@@ -1,6 +1,6 @@
 //! In-memory copy of the block tables: the eleven `fence_origin` source
-//! tables, the probe clocks, route clears, probe authorizations and success
-//! pools.
+//! tables, the probe clocks, route clears, probe authorizations, success
+//! pools and account eligibility.
 //!
 //! The SQL statements stay the only definition of every write. The writer
 //! connection's update hook records each row a command changes in these
@@ -12,7 +12,8 @@
 //! a fresh load.
 //!
 //! Each source row is held as the `fence_origin` rows SQLite computes for it
-//! (evidence signatures and keys come from SQLite's own JSON functions). Two
+//! (evidence signatures and keys come from SQLite's own JSON functions),
+//! together with the raw columns the request readers return. Two
 //! view predicates span rows and are applied when blocks are derived: a
 //! `credential` origin's class depends on active `credential-quota:` account
 //! fences, and a `route` origin is hidden by a provider row that records the
@@ -31,11 +32,11 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Row};
 use striatum_core::blocks::Block;
 
-use crate::fence_rechecks::{self, Clocks, LoadedBlocks, RouteClear, ViewOrigin};
+use crate::fence_rechecks::{self, Clocks, FenceRecheck, LoadedBlocks, RouteClear, ViewOrigin};
 
 /// Every table whose rows the block state holds. The writer connection's
 /// update hook and delete authorizer watch exactly these.
-pub const BLOCK_TABLES: [&str; 15] = [
+pub const BLOCK_TABLES: [&str; 16] = [
     "account_fence",
     "credential_entitlement_fences",
     "account_route_fence",
@@ -51,12 +52,23 @@ pub const BLOCK_TABLES: [&str; 15] = [
     "fence_recheck_route_clear",
     "fence_probe_authorization",
     "fence_success_pool",
+    "account_eligibility",
 ];
 
+const ACCOUNT_FENCE_TABLE: usize = 0;
+const CREDENTIAL_TABLE: usize = 1;
+const ROUTE_FENCE_TABLE: usize = 2;
+const NON_QUOTA_ROUTE_FENCE_TABLE: usize = 3;
 const PROVIDER_TABLE: usize = 5;
 const ROUTE_TABLE: usize = 6;
+const SIZE_TABLE: usize = 7;
+const NON_QUOTA_SIZE_TABLE: usize = 8;
+const EXCLUSION_TABLE: usize = 9;
 const CLOCK_TABLE: usize = 11;
 const ROUTE_CLEAR_TABLE: usize = 12;
+const AUTHORIZATION_TABLE: usize = 13;
+const SUCCESS_POOL_TABLE: usize = 14;
+const ELIGIBILITY_TABLE: usize = 15;
 
 pub(crate) fn table_index(name: &str) -> Option<u8> {
     BLOCK_TABLES
@@ -143,33 +155,40 @@ pub fn block_read_backs() -> u64 {
 /// The projection of each table's rows. Source tables select, per view
 /// branch the table feeds, whether the row is in the view and then the
 /// view's 14 columns, computed with the view's own expressions; then the
-/// columns the cross-row predicates need. Each select starts with the rowid
-/// and the table's primary key, as JSON, which lets a row replaced by
-/// `INSERT OR REPLACE` (whose delete the update hook does not report) be
-/// found by key. None has a WHERE clause: the read-back appends one.
-const SELECTS: [&str; 15] = [
+/// columns the cross-row predicates need; then the raw columns the request
+/// readers return, in the order those readers' row decoders expect. Each
+/// select starts with the rowid and the table's primary key, as JSON, which
+/// lets a row replaced by `INSERT OR REPLACE` (whose delete the update hook
+/// does not report) be found by key. None has a WHERE clause: the read-back
+/// appends one.
+const SELECTS: [&str; 16] = [
     // account_fence: only active fences are in the view.
     "SELECT rowid,json_array(fence_id),
         cleared_at IS NULL,'account',json_array(fence_id),provider,account_id,NULL,NULL,NULL,NULL,NULL,
         fence_json,MIN(observed_at,created_at),1,NULL,json_extract(fence_json,'$.reset.at_ms'),
-        fence_id
+        fence_id,
+        fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,admission_id,
+        observation_id,created_at,cleared_at,cleared_reason,pool_key_json,recovery_set_json
      FROM account_fence",
     // credential_entitlement_fences: the class is derived later from the
     // quota-hold prefix in the last column.
     "SELECT rowid,json_array(provider_id,credential_id),
         1,'credential',json_array(provider_id,credential_id),provider_id,NULL,credential_id,NULL,NULL,NULL,NULL,
         json_array(code,observed_at_ms),observed_at_ms,NULL,NULL,NULL,
-        'credential-quota:'||json_array(provider_id,credential_id)||':'
+        'credential-quota:'||json_array(provider_id,credential_id)||':',
+        provider_id,credential_id,code,listing_fingerprint,observed_at_ms
      FROM credential_entitlement_fences",
     "SELECT rowid,json_array(provider,credential_id,model),
         wall_class='quota','account_route',json_array(provider,credential_id,model),provider,NULL,credential_id,model,NULL,NULL,NULL,
         json_array(wall_class,until_ms,COALESCE(last_reported_at,recorded_at)),COALESCE(last_reported_at,recorded_at),
-        wall_class='quota',until_ms,CASE WHEN wall_class='quota' THEN until_ms END
+        wall_class='quota',until_ms,CASE WHEN wall_class='quota' THEN until_ms END,
+        provider,credential_id,model,until_ms,decision_id,recorded_at,wall_class,last_reported_at
      FROM account_route_fence",
     "SELECT rowid,json_array(provider,credential_id,model,wall_kind),
         1,CASE WHEN wall_kind='transient' THEN 'transient_route' ELSE 'non_quota_route' END,
         json_array(provider,credential_id,model),provider,NULL,credential_id,model,NULL,NULL,NULL,
-        json_array(until_ms,last_reported_at),last_reported_at,0,until_ms,NULL
+        json_array(until_ms,last_reported_at),last_reported_at,0,until_ms,NULL,
+        provider,credential_id,model,until_ms,decision_id,recorded_at,wall_kind
      FROM account_non_quota_route_fence",
     "SELECT rowid,json_array(provider,credential_id),
         walled_until IS NOT NULL,'pool_billing',json_array(provider,credential_id),provider,NULL,credential_id,NULL,NULL,NULL,NULL,
@@ -198,15 +217,18 @@ const SELECTS: [&str; 15] = [
      FROM model_route_state",
     "SELECT rowid,json_array(provider,credential_id,model,size_class),
         1,'size',json_array(provider,credential_id,model,size_class),provider,NULL,credential_id,model,size_class,NULL,NULL,
-        json_array(observed_at,expires_at),observed_at,1,expires_at,expires_at
+        json_array(observed_at,expires_at),observed_at,1,expires_at,expires_at,
+        provider,credential_id,model,size_class,expires_at,observed_at
      FROM account_size_refusal",
     "SELECT rowid,json_array(provider,credential_id,model,size_class),
         1,'non_quota_size',json_array(provider,credential_id,model,size_class),provider,NULL,credential_id,model,size_class,NULL,NULL,
-        json_array(observed_at,expires_at),observed_at,0,expires_at,NULL
+        json_array(observed_at,expires_at),observed_at,0,expires_at,NULL,
+        provider,credential_id,model,size_class,expires_at,observed_at
      FROM account_non_quota_size_refusal",
     "SELECT rowid,json_array(principal,admission_id,credential_id),
         1,'principal',json_array(principal,admission_id,credential_id),'',NULL,credential_id,NULL,NULL,principal,admission_id,
-        json_array(recorded_at,runner_view_digest,roster_view_digest),recorded_at,0,recorded_at+86400000,NULL
+        json_array(recorded_at,runner_view_digest,roster_view_digest),recorded_at,0,recorded_at+86400000,NULL,
+        principal,admission_id,credential_id,runner_view_digest,roster_view_digest,observation_id,recorded_at
      FROM account_principal_exclusion",
     "SELECT rowid,json_array(provider,account_id),
         1,'observation',json_array(provider,account_id),provider,account_id,NULL,NULL,NULL,NULL,NULL,
@@ -220,6 +242,9 @@ const SELECTS: [&str; 15] = [
      FROM fence_probe_authorization",
     "SELECT rowid,json_array(fence_id,pool_key_json),fence_id,pool_key_json,evidence_at,healed_at
      FROM fence_success_pool",
+    "SELECT rowid,json_array(provider,credential_id,model),
+        provider,credential_id,model,listing_fingerprint,code,observed_at
+     FROM account_eligibility",
 ];
 
 /// The read-back form of [`SELECTS`]: one row by rowid.
@@ -288,16 +313,44 @@ pub struct SuccessPool {
     pub healed_at: i64,
 }
 
+/// The raw columns of a source row that request readers return, decoded with
+/// those readers' own row decoders.
+#[derive(Clone, Debug, PartialEq)]
+enum Raw {
+    None,
+    /// An active account fence with its pool key and recovery set, as JSON.
+    AccountFence {
+        row: crate::AccountFenceRow,
+        pool_key_json: Option<String>,
+        recovery_set_json: String,
+    },
+    Entitlement(striatum_core::route_state_store::CredentialEntitlementFence),
+    /// An `account_route_fence` row of any wall class.
+    RouteFence {
+        row: crate::AccountRouteFence,
+        wall_class: Option<String>,
+        last_reported_at: Option<i64>,
+    },
+    NonQuotaRouteFence {
+        row: crate::AccountRouteFence,
+        wall_kind: String,
+    },
+    Size(crate::AccountSizeRefusal),
+    Exclusion(crate::AccountExclusionRow),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Held {
     Source {
         origins: Vec<ViewOrigin>,
         link: Link,
+        raw: Raw,
     },
     Clock(Block, Option<i64>),
     RouteClear(RouteClear),
     Authorization(ProbeAuthorization),
     SuccessPool(SuccessPool),
+    Eligibility(crate::AccountEligibilityFact),
 }
 
 /// Decode one row of `SELECTS[table]`: its rowid, its primary key and what
@@ -331,15 +384,63 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             class.as_deref(),
         ))
     };
-    let source = |origins: Vec<Option<ViewOrigin>>, link: Link, always: bool| {
+    let source = |origins: Vec<Option<ViewOrigin>>, link: Link, raw: Raw, always: bool| {
         let origins: Vec<ViewOrigin> = origins.into_iter().flatten().collect();
-        (always || !origins.is_empty()).then_some(Held::Source { origins, link })
+        (always || !origins.is_empty()).then_some(Held::Source { origins, link, raw })
     };
+    use crate::account_selection::rows;
     let held = match table {
-        0 => source(vec![slot(2)?], Link::AccountFence(r.get(17)?), false),
-        1 => source(vec![slot(2)?], Link::Credential(r.get(17)?), false),
-        2 | 3 | 7 | 8 | 9 | 10 => source(vec![slot(2)?], Link::None, false),
-        4 => source(vec![slot(2)?, slot(17)?], Link::None, false),
+        ACCOUNT_FENCE_TABLE => source(
+            vec![slot(2)?],
+            Link::AccountFence(r.get(17)?),
+            Raw::AccountFence {
+                row: rows::fence_at(r, 18)?,
+                pool_key_json: r.get(31)?,
+                recovery_set_json: r.get(32)?,
+            },
+            false,
+        ),
+        CREDENTIAL_TABLE => source(
+            vec![slot(2)?],
+            Link::Credential(r.get(17)?),
+            Raw::Entitlement(rows::entitlement_at(r, 18)?),
+            false,
+        ),
+        // Every row is held, whatever its wall class: the latest-report
+        // reader groups all of them.
+        ROUTE_FENCE_TABLE => source(
+            vec![slot(2)?],
+            Link::None,
+            Raw::RouteFence {
+                row: rows::route_fence_at(r, 17)?,
+                wall_class: r.get(23)?,
+                last_reported_at: r.get(24)?,
+            },
+            true,
+        ),
+        NON_QUOTA_ROUTE_FENCE_TABLE => source(
+            vec![slot(2)?],
+            Link::None,
+            Raw::NonQuotaRouteFence {
+                row: rows::route_fence_at(r, 17)?,
+                wall_kind: r.get(23)?,
+            },
+            false,
+        ),
+        SIZE_TABLE | NON_QUOTA_SIZE_TABLE => source(
+            vec![slot(2)?],
+            Link::None,
+            Raw::Size(rows::size_refusal_at(r, 17)?),
+            false,
+        ),
+        EXCLUSION_TABLE => source(
+            vec![slot(2)?],
+            Link::None,
+            Raw::Exclusion(rows::exclusion_at(r, 17)?),
+            false,
+        ),
+        10 => source(vec![slot(2)?], Link::None, Raw::None, false),
+        4 => source(vec![slot(2)?, slot(17)?], Link::None, Raw::None, false),
         PROVIDER_TABLE => source(
             vec![slot(2)?],
             Link::Provider {
@@ -347,6 +448,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
                 quarantined: quarantined(18)?,
                 wall: wall(18)?,
             },
+            Raw::None,
             true,
         ),
         ROUTE_TABLE => source(
@@ -357,6 +459,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
                 quarantined: quarantined(33)?,
                 wall: wall(33)?,
             },
+            Raw::None,
             false,
         ),
         CLOCK_TABLE => {
@@ -369,7 +472,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             evidence: r.get(4)?,
             model: r.get(5)?,
         })),
-        13 => Some(Held::Authorization(ProbeAuthorization {
+        AUTHORIZATION_TABLE => Some(Held::Authorization(ProbeAuthorization {
             owner: r.get(2)?,
             kind: r.get(3)?,
             origin_key: r.get(4)?,
@@ -378,12 +481,13 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             claimed_at: r.get(7)?,
             claim_generation: r.get(8)?,
         })),
-        14 => Some(Held::SuccessPool(SuccessPool {
+        SUCCESS_POOL_TABLE => Some(Held::SuccessPool(SuccessPool {
             fence_id: r.get(2)?,
             pool_key_json: r.get(3)?,
             evidence_at: r.get(4)?,
             healed_at: r.get(5)?,
         })),
+        ELIGIBILITY_TABLE => Some(Held::Eligibility(rows::eligibility_at(r, 2)?)),
         _ => unreachable!("block table index"),
     };
     Ok((rowid, key, held))
@@ -485,10 +589,6 @@ impl Table {
             self.rows.insert(rowid, (key.to_owned(), Arc::clone(held)));
             self.keys.insert(key.to_owned(), rowid);
         }
-    }
-
-    fn held(&self) -> impl Iterator<Item = &Held> {
-        self.rows.iter().map(|(_, (_, held))| &**held)
     }
 }
 
@@ -671,34 +771,57 @@ impl BlockState {
             })
     }
 
-    fn sources(&self) -> impl Iterator<Item = (&Vec<ViewOrigin>, &Link)> {
-        self.tables[..CLOCK_TABLE]
+    /// Each source row with its table and rowid.
+    fn sources(&self) -> impl Iterator<Item = (usize, i64, &Vec<ViewOrigin>, &Link, &Raw)> {
+        self.tables
             .iter()
-            .flat_map(Table::held)
-            .filter_map(|held| match held {
-                Held::Source { origins, link } => Some((origins, link)),
-                _ => None,
+            .take(CLOCK_TABLE)
+            .enumerate()
+            .flat_map(|(table, rows)| {
+                rows.rows.iter().filter_map(move |(rowid, (_, held))| match &**held {
+                    Held::Source { origins, link, raw } => {
+                        Some((table, *rowid, origins, link, raw))
+                    }
+                    _ => None,
+                })
             })
     }
 
-    /// The rows of the `fence_origin` view, sorted by kind and origin key.
-    pub fn view_origins(&self) -> Vec<ViewOrigin> {
+    /// One table's held rows with their rowids, in no particular order.
+    fn rows_of(&self, table: usize) -> impl Iterator<Item = (i64, &Held)> {
+        self.tables
+            .get(table)
+            .into_iter()
+            .flat_map(|rows| rows.rows.iter().map(|(rowid, (_, held))| (*rowid, &**held)))
+    }
+
+    /// One source table's raw rows with their rowids, in no particular order.
+    fn raws(&self, table: usize) -> impl Iterator<Item = (i64, &Raw)> {
+        self.rows_of(table).filter_map(|(rowid, held)| match held {
+            Held::Source { raw, .. } => Some((rowid, raw)),
+            _ => None,
+        })
+    }
+
+    /// The rows of the `fence_origin` view, each with the position SQLite
+    /// returns it at: its view branch, then its table rowid.
+    fn view_rows(&self) -> Vec<((u8, i64), ViewOrigin)> {
         let fences: std::collections::BTreeSet<&str> = self
             .sources()
-            .filter_map(|(_, link)| match link {
+            .filter_map(|(_, _, _, link, _)| match link {
                 Link::AccountFence(id) => Some(id.as_str()),
                 _ => None,
             })
             .collect();
         let providers: HashMap<&str, &WallFields> = self
             .sources()
-            .filter_map(|(_, link)| match link {
+            .filter_map(|(_, _, _, link, _)| match link {
                 Link::Provider { key, wall, .. } => Some((key.as_str(), wall)),
                 _ => None,
             })
             .collect();
         let mut view = Vec::new();
-        for (origins, link) in self.sources() {
+        for (_, rowid, origins, link, _) in self.sources() {
             for origin in origins {
                 let mut origin = origin.clone();
                 match link {
@@ -720,18 +843,32 @@ impl BlockState {
                     }
                     _ => {}
                 }
-                view.push(origin);
+                view.push(((view_branch(&origin.kind), rowid), origin));
             }
         }
+        view
+    }
+
+    /// The rows of the `fence_origin` view, sorted by kind and origin key.
+    pub fn view_origins(&self) -> Vec<ViewOrigin> {
+        let mut view: Vec<ViewOrigin> = self.view_rows().into_iter().map(|(_, row)| row).collect();
         view.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
         view
+    }
+
+    /// The rows of the `fence_origin` view in the order a full scan of the
+    /// view returns them: branch by branch, each table in rowid order.
+    fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
+        let mut view = self.view_rows();
+        view.sort_by_key(|(position, _)| *position);
+        view.into_iter().map(|(_, row)| row).collect()
     }
 
     /// The route and provider origins whose rows hold one account's error,
     /// keyed as `fence_rechecks::quarantined_origins` keys them.
     fn quarantined(&self) -> Vec<(String, String)> {
         self.sources()
-            .filter_map(|(_, link)| match link {
+            .filter_map(|(_, _, _, link, _)| match link {
                 Link::Provider {
                     key,
                     quarantined: true,
@@ -748,14 +885,12 @@ impl BlockState {
             .collect()
     }
 
-    /// The effective blocks at `now`, as `SqliteRouteStateStore::load_blocks`
-    /// computes them from SQL. Blocks are sorted by kind and origin key.
-    pub fn blocks(&self, now: i64) -> striatum_core::RouteStateResult<LoadedBlocks> {
-        if !self.enabled {
-            return Ok(LoadedBlocks::default());
-        }
+    /// The stored clocks with their route clears attached, the clears in
+    /// model order (as `load_blocks` reads them) or, with `rowid_order`, in
+    /// table order (as the join in `fence_rechecks::read` returns them).
+    fn clocks(&self, rowid_order: bool) -> Clocks {
         let mut clocks = Clocks::new();
-        for held in self.tables[CLOCK_TABLE].held() {
+        for (_, held) in self.rows_of(CLOCK_TABLE) {
             if let Held::Clock(block, cleared) = held {
                 clocks.insert(
                     (block.kind.clone(), block.origin_key.clone()),
@@ -763,18 +898,36 @@ impl BlockState {
                 );
             }
         }
-        let mut clears: Vec<RouteClear> = self.tables[ROUTE_CLEAR_TABLE]
-            .held()
-            .filter_map(|held| match held {
-                Held::RouteClear(clear) => Some(clear.clone()),
+        let mut clears: Vec<(i64, RouteClear)> = self
+            .rows_of(ROUTE_CLEAR_TABLE)
+            .filter_map(|(rowid, held)| match held {
+                Held::RouteClear(clear) => Some((rowid, clear.clone())),
                 _ => None,
             })
             .collect();
-        clears.sort_by(|a, b| a.model.cmp(&b.model));
+        if rowid_order {
+            clears.sort_by_key(|(rowid, _)| *rowid);
+        } else {
+            clears.sort_by(|a, b| a.1.model.cmp(&b.1.model));
+        }
+        let clears: Vec<RouteClear> = clears.into_iter().map(|(_, clear)| clear).collect();
         fence_rechecks::attach_route_clears(&mut clocks, &clears);
-        let mut loaded =
-            fence_rechecks::derive_blocks(clocks, &self.quarantined(), self.view_origins(), now)
-                .map_err(crate::err)?;
+        clocks
+    }
+
+    /// The effective blocks at `now`, as `SqliteRouteStateStore::load_blocks`
+    /// computes them from SQL. Blocks are sorted by kind and origin key.
+    pub fn blocks(&self, now: i64) -> striatum_core::RouteStateResult<LoadedBlocks> {
+        if !self.enabled {
+            return Ok(LoadedBlocks::default());
+        }
+        let mut loaded = fence_rechecks::derive_blocks(
+            self.clocks(false),
+            &self.quarantined(),
+            self.view_origins(),
+            now,
+        )
+        .map_err(crate::err)?;
         loaded
             .cleared_evidence
             .sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
@@ -784,20 +937,325 @@ impl BlockState {
         Ok(loaded)
     }
 
-    /// Probe authorizations, in no particular order.
-    pub fn authorizations(&self) -> impl Iterator<Item = &ProbeAuthorization> {
-        self.tables[13].held().filter_map(|held| match held {
-            Held::Authorization(row) => Some(row),
+    /// The answer of `SqliteRouteStateStore::fence_rechecks` at `now`, in its
+    /// order: view rows in scan order, then the observation clocks whose
+    /// source is gone, by kind and key. `derive_blocks` keeps that order.
+    pub fn fence_rechecks(&self, now: i64) -> striatum_core::RouteStateResult<Vec<FenceRecheck>> {
+        if !self.enabled {
+            return Ok(Vec::new());
+        }
+        let loaded = fence_rechecks::derive_blocks(
+            self.clocks(true),
+            &self.quarantined(),
+            self.view_origins_in_scan_order(),
+            now,
+        )
+        .map_err(crate::err)?;
+        Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
+    }
+
+    /// Whether the store has the block schema. Without it the state holds
+    /// nothing and readers must ask SQL, which knows the older tables.
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// `account_eligibility()`: by provider, credential and model.
+    pub fn eligibility(&self) -> Vec<crate::AccountEligibilityFact> {
+        let mut facts: Vec<_> = self
+            .rows_of(ELIGIBILITY_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::Eligibility(fact) => Some(fact.clone()),
+                _ => None,
+            })
+            .collect();
+        facts.sort_by(|a, b| {
+            (&a.provider, &a.credential_id, &a.model).cmp(&(&b.provider, &b.credential_id, &b.model))
+        });
+        facts
+    }
+
+    /// `account_size_refusals()`: quota size refusals, then non-quota ones,
+    /// each table in rowid order, as SQL's `UNION ALL` scans them.
+    pub fn size_refusals(&self) -> Vec<crate::AccountSizeRefusal> {
+        let mut refusals = Vec::new();
+        for table in [SIZE_TABLE, NON_QUOTA_SIZE_TABLE] {
+            let mut rows: Vec<_> = self
+                .raws(table)
+                .filter_map(|(rowid, raw)| match raw {
+                    Raw::Size(row) => Some((rowid, row)),
+                    _ => None,
+                })
+                .collect();
+            rows.sort_by_key(|(rowid, _)| *rowid);
+            refusals.extend(rows.into_iter().map(|(_, row)| row.clone()));
+        }
+        refusals
+    }
+
+    /// The route fences of one class, by provider, credential and model:
+    /// `quota` reads `account_route_fence`, `transient` and `billing` read
+    /// `account_non_quota_route_fence` rows of that kind.
+    pub fn route_fences(&self, class: &str) -> Vec<crate::AccountRouteFence> {
+        let mut fences: Vec<crate::AccountRouteFence> = if class == "quota" {
+            self.raws(ROUTE_FENCE_TABLE)
+                .filter_map(|(_, raw)| match raw {
+                    Raw::RouteFence {
+                        row, wall_class, ..
+                    } if wall_class.as_deref() == Some("quota") => Some(row.clone()),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            self.raws(NON_QUOTA_ROUTE_FENCE_TABLE)
+                .filter_map(|(_, raw)| match raw {
+                    Raw::NonQuotaRouteFence { row, wall_kind } if wall_kind == class => {
+                        Some(row.clone())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        fences.sort_by(|a, b| {
+            (&a.provider, &a.credential_id, &a.model).cmp(&(&b.provider, &b.credential_id, &b.model))
+        });
+        fences
+    }
+
+    /// `account_route_fence_latest_reports()`: the latest report per
+    /// credential over every `account_route_fence` row, of any class.
+    pub fn route_fence_latest_reports(&self) -> std::collections::BTreeMap<String, i64> {
+        let mut latest = std::collections::BTreeMap::new();
+        for (_, raw) in self.raws(ROUTE_FENCE_TABLE) {
+            if let Raw::RouteFence {
+                row,
+                last_reported_at,
+                ..
+            } = raw
+            {
+                let at = last_reported_at.unwrap_or(row.recorded_at);
+                latest
+                    .entry(row.credential_id.clone())
+                    .and_modify(|latest: &mut i64| *latest = (*latest).max(at))
+                    .or_insert(at);
+            }
+        }
+        latest
+    }
+
+    fn entitlements(
+        &self,
+    ) -> impl Iterator<Item = &striatum_core::route_state_store::CredentialEntitlementFence> {
+        self.raws(CREDENTIAL_TABLE).filter_map(|(_, raw)| match raw {
+            Raw::Entitlement(row) => Some(row),
             _ => None,
         })
     }
 
+    /// `credential_entitlement_fences()`: by provider and credential.
+    pub fn entitlement_fences(
+        &self,
+    ) -> Vec<striatum_core::route_state_store::CredentialEntitlementFence> {
+        let mut fences: Vec<_> = self.entitlements().cloned().collect();
+        fences.sort_by(|a, b| {
+            (&a.provider_id, &a.credential_id).cmp(&(&b.provider_id, &b.credential_id))
+        });
+        fences
+    }
+
+    /// `credential_entitlement_fence(provider, credential)`.
+    pub fn entitlement_fence(
+        &self,
+        provider: &str,
+        credential: &str,
+    ) -> Option<striatum_core::route_state_store::CredentialEntitlementFence> {
+        self.entitlements()
+            .find(|fence| fence.provider_id == provider && fence.credential_id == credential)
+            .cloned()
+    }
+
+    fn active_fence_rows(
+        &self,
+        provider: &str,
+    ) -> Vec<(&crate::AccountFenceRow, &Option<String>, &String)> {
+        let mut rows: Vec<_> = self
+            .raws(ACCOUNT_FENCE_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::AccountFence {
+                    row,
+                    pool_key_json,
+                    recovery_set_json,
+                } if row.provider == provider => Some((row, pool_key_json, recovery_set_json)),
+                _ => None,
+            })
+            .collect();
+        rows.sort_by(|a, b| (a.0.created_at, &a.0.fence_id).cmp(&(b.0.created_at, &b.0.fence_id)));
+        rows
+    }
+
+    /// `active_fences(provider)`: by creation time and id. Only active
+    /// fences are held.
+    pub fn active_fences(&self, provider: &str) -> Vec<crate::AccountFenceRow> {
+        self.active_fence_rows(provider)
+            .into_iter()
+            .map(|(row, _, _)| row.clone())
+            .collect()
+    }
+
+    /// `active_pool_fences(provider)`: each active fence's pool key and the
+    /// part of its recovery set no success has healed for this evidence.
+    pub fn active_pool_fences(
+        &self,
+        provider: &str,
+    ) -> striatum_core::RouteStateResult<Vec<crate::AccountPoolFenceRow>> {
+        use striatum_core::accounts::PoolKey;
+        self.active_fence_rows(provider)
+            .into_iter()
+            .map(|(row, pool_key_json, recovery_set_json)| {
+                let evidence_at = row.observed_at.min(row.created_at);
+                let healed = self
+                    .success_pools()
+                    .filter(|pool| pool.fence_id == row.fence_id && pool.evidence_at == evidence_at)
+                    .map(|pool| serde_json::from_str::<PoolKey>(&pool.pool_key_json))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(crate::err)?;
+                let mut recovery_set: Vec<PoolKey> =
+                    serde_json::from_str(recovery_set_json).map_err(crate::err)?;
+                recovery_set.retain(|pool| !healed.contains(pool));
+                Ok(crate::AccountPoolFenceRow {
+                    evidence: row.clone(),
+                    pool_key: pool_key_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(crate::err)?,
+                    recovery_set,
+                })
+            })
+            .collect()
+    }
+
+    /// `active_fence_providers()`: every provider with an active fence,
+    /// sorted.
+    pub fn active_fence_providers(&self) -> Vec<String> {
+        self.raws(ACCOUNT_FENCE_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::AccountFence { row, .. } => Some(row.provider.clone()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// `credential_quota_classification`: the stored class of a classified
+    /// credential clock whose evidence the source still records, or the
+    /// proposed class and whether it is new.
+    pub fn credential_quota_classification(
+        &self,
+        provider: &str,
+        credential: &str,
+        proposed: bool,
+    ) -> (bool, bool) {
+        if !self.enabled {
+            return (proposed, false);
+        }
+        let sources: std::collections::HashSet<(&str, &str)> = self
+            .sources()
+            .filter(|(table, ..)| *table == CREDENTIAL_TABLE)
+            .flat_map(|(_, _, origins, _, _)| origins)
+            .map(|origin| (origin.origin_key.as_str(), origin.evidence.as_str()))
+            .collect();
+        let prior = self.rows_of(CLOCK_TABLE).find_map(|(_, held)| match held {
+            Held::Clock(block, _)
+                if block.kind == "credential"
+                    && block.classified
+                    && block.scope.provider == provider
+                    && block.scope.credential_id.as_deref() == Some(credential)
+                    && sources.contains(&(block.origin_key.as_str(), block.evidence.as_str())) =>
+            {
+                Some(block.lifetime == striatum_core::blocks::LifetimeClass::Quota)
+            }
+            _ => None,
+        });
+        (prior.unwrap_or(proposed), prior.is_none())
+    }
+
+    /// `admission_exclusions(principal, admission)`: by credential.
+    pub fn admission_exclusions(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> Vec<crate::AccountExclusionRow> {
+        let mut rows: Vec<_> = self
+            .raws(EXCLUSION_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::Exclusion(row)
+                    if row.principal == principal && row.admission_id == admission_id =>
+                {
+                    Some(row.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        rows.sort_by(|a, b| a.credential_id.cmp(&b.credential_id));
+        rows
+    }
+
+    /// `exclusion_count(principal, credential)`.
+    pub fn exclusion_count(&self, principal: &str, credential_id: &str) -> i64 {
+        self.raws(EXCLUSION_TABLE)
+            .filter(|(_, raw)| {
+                matches!(raw, Raw::Exclusion(row)
+                    if row.principal == principal && row.credential_id == credential_id)
+            })
+            .count() as i64
+    }
+
+    /// `probe_authorization_owners()`: distinct, sorted.
+    pub fn authorization_owners(&self) -> Vec<String> {
+        self.authorizations()
+            .map(|row| row.owner.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Probe authorizations, in no particular order.
+    pub fn authorizations(&self) -> impl Iterator<Item = &ProbeAuthorization> {
+        self.rows_of(AUTHORIZATION_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::Authorization(row) => Some(row),
+                _ => None,
+            })
+    }
+
     /// Success pools, in no particular order.
     pub fn success_pools(&self) -> impl Iterator<Item = &SuccessPool> {
-        self.tables[14].held().filter_map(|held| match held {
-            Held::SuccessPool(row) => Some(row),
-            _ => None,
-        })
+        self.rows_of(SUCCESS_POOL_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::SuccessPool(row) => Some(row),
+                _ => None,
+            })
+    }
+}
+
+/// The position of a kind's branch in the `fence_origin` view's `UNION ALL`.
+fn view_branch(kind: &str) -> u8 {
+    match kind {
+        "account" => 0,
+        "credential" => 1,
+        "account_route" => 2,
+        "transient_route" | "non_quota_route" => 3,
+        "pool_billing" => 4,
+        "pool_rate" => 5,
+        "provider" => 6,
+        "route" => 7,
+        "failure" => 8,
+        "size" => 9,
+        "non_quota_size" => 10,
+        "principal" => 11,
+        _ => 12,
     }
 }
 
@@ -805,6 +1263,21 @@ impl crate::AccountTx<'_> {
     /// The block tables, read in the state loader's transaction.
     pub fn load_block_state(&self) -> striatum_core::RouteStateResult<BlockState> {
         BlockState::load(self.conn).map_err(crate::err)
+    }
+
+    /// The block rows the running command has changed so far, read back so
+    /// the command can apply them to its working state and read its own
+    /// writes. A row changed again later is captured again, and the writer
+    /// reads back the rest when the command ends.
+    pub fn read_back_blocks(&self) -> striatum_core::RouteStateResult<BlockRows> {
+        let captured = CAPTURE.with(|capture| {
+            capture
+                .borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        });
+        read_back(self.conn, &captured).map_err(crate::err)
     }
 }
 

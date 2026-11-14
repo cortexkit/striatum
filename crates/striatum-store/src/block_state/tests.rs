@@ -1,5 +1,6 @@
-//! The block state must equal a fresh load after every command, and blocks
-//! derived from it must equal the SQL adapter's at every `now`.
+//! The block state must equal a fresh load after every command, blocks
+//! derived from it must equal the SQL adapter's at every `now`, and every
+//! request reader's answer from memory must equal its SQL answer.
 
 use super::*;
 use crate::{
@@ -144,7 +145,118 @@ impl Rig {
                 derived.cleared_evidence, sql.cleared_evidence,
                 "cleared evidence at {now}: {context}"
             );
+            let effective = self
+                .store
+                .with_reader_for_test(move |conn| fence_rechecks::read_effective_at(conn, now))
+                .unwrap();
+            assert_eq!(
+                memory.fence_rechecks(now).unwrap(),
+                effective,
+                "fence_rechecks at {now}, in order: {context}"
+            );
         }
+        self.check_readers(&memory, times[0], context);
+    }
+
+    /// Every request reader of the block tables answers from memory exactly
+    /// as its SQL does, order included.
+    fn check_readers(&self, memory: &BlockState, now: i64, context: &str) {
+        let store = &self.store;
+        assert_eq!(
+            memory.eligibility(),
+            store.account_eligibility().unwrap(),
+            "eligibility: {context}"
+        );
+        assert_eq!(
+            memory.size_refusals(),
+            store.account_size_refusals(now).unwrap(),
+            "size refusals: {context}"
+        );
+        assert_eq!(
+            memory.route_fences("quota"),
+            store.account_route_fences(now).unwrap(),
+            "quota route fences: {context}"
+        );
+        assert_eq!(
+            memory.route_fences("transient"),
+            store.transient_account_route_fences(now).unwrap(),
+            "transient route fences: {context}"
+        );
+        assert_eq!(
+            memory.route_fences("billing"),
+            store.non_quota_account_route_fences(now).unwrap(),
+            "billing route fences: {context}"
+        );
+        assert_eq!(
+            memory.route_fence_latest_reports(),
+            store.account_route_fence_latest_reports().unwrap(),
+            "latest route fence reports: {context}"
+        );
+        assert_eq!(
+            memory.entitlement_fences(),
+            store.credential_entitlement_fences().unwrap(),
+            "entitlement fences: {context}"
+        );
+        let sql = store
+            .account_read(|tx| {
+                let mut answers = Vec::new();
+                for provider in PROVIDERS {
+                    answers.push(format!(
+                        "{provider} {:?} {:?}",
+                        tx.active_fences(provider)?,
+                        tx.active_pool_fences(provider)?
+                    ));
+                    for credential in CREDENTIALS {
+                        answers.push(format!(
+                            "{provider}/{credential} {:?} {:?} {:?}",
+                            tx.credential_entitlement_fence(provider, credential)?,
+                            tx.credential_quota_classification(provider, credential, false)?,
+                            tx.credential_quota_classification(provider, credential, true)?,
+                        ));
+                    }
+                }
+                answers.push(format!("{:?}", tx.active_fence_providers()?));
+                answers.push(format!("{:?}", tx.probe_authorization_owners()?));
+                for admission in 0..4 {
+                    answers.push(format!(
+                        "{:?}",
+                        tx.admission_exclusions("x", &format!("adm{admission}"))?
+                    ));
+                }
+                for credential in CREDENTIALS {
+                    answers.push(format!("{}", tx.exclusion_count("x", credential)?));
+                }
+                Ok(answers)
+            })
+            .unwrap();
+        let mut answers = Vec::new();
+        for provider in PROVIDERS {
+            answers.push(format!(
+                "{provider} {:?} {:?}",
+                memory.active_fences(provider),
+                memory.active_pool_fences(provider).unwrap()
+            ));
+            for credential in CREDENTIALS {
+                answers.push(format!(
+                    "{provider}/{credential} {:?} {:?} {:?}",
+                    memory.entitlement_fence(provider, credential),
+                    memory.credential_quota_classification(provider, credential, false),
+                    memory.credential_quota_classification(provider, credential, true),
+                ));
+            }
+        }
+        answers.push(format!("{:?}", memory.active_fence_providers()));
+        answers.push(format!("{:?}", memory.authorization_owners()));
+        for admission in 0..4 {
+            answers.push(format!(
+                "{:?}",
+                memory.admission_exclusions("x", &format!("adm{admission}"))
+            ));
+        }
+        for credential in CREDENTIALS {
+            answers.push(format!("{}", memory.exclusion_count("x", credential)));
+        }
+        assert_eq!(answers, sql, "keyed readers: {context}");
     }
 }
 
@@ -234,6 +346,19 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     );
     rig.check(&[NOW], "credential replaced");
     // A replacement the view does not select must still evict the old row.
+    // (Every account route fence is held for its raw reader, so a pool key
+    // row, held only while it walls, stands in.)
+    rig.sql(format!(
+        "INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,updated_at) VALUES ('p','c',{},'billing',{NOW});",
+        NOW + 60_000
+    ));
+    assert_eq!(rig.published().table_sizes()[4], ("pool_key_state", 1));
+    rig.sql(format!(
+        "INSERT OR REPLACE INTO pool_key_state(provider,credential_id,updated_at) VALUES ('p','c',{NOW});"
+    ));
+    assert_eq!(rig.published().table_sizes()[4], ("pool_key_state", 0));
+    rig.check(&[NOW], "pool key replaced by an unselected row");
+    // A route fence outside the quota class is held, though not in the view.
     rig.sql(format!(
         "INSERT INTO account_route_fence VALUES ('p','c','m',{},'d',{NOW},{NOW},'quota');",
         NOW + 60_000
@@ -242,8 +367,8 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
         "INSERT OR REPLACE INTO account_route_fence VALUES ('p','c','m',{},'d',{NOW},{NOW},'transient');",
         NOW + 60_000
     ));
-    assert_eq!(rig.published().table_sizes()[2], ("account_route_fence", 0));
-    rig.check(&[NOW], "route fence replaced by an unselected row");
+    assert_eq!(rig.published().table_sizes()[2], ("account_route_fence", 1));
+    rig.check(&[NOW], "route fence replaced by a transient row");
 }
 
 #[test]
@@ -386,14 +511,23 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
     let offset = rng.below(4);
     let at = rng.time(now);
     let until = rng.time(now) + 3_600_000;
-    match rng.below(30) {
+    match rng.below(32) {
         0 => {
             let id = if rng.below(2) == 0 {
                 format!("f{}", rng.below(4))
             } else {
                 format!("credential-quota:[\"{p}\",\"{c}\"]:{}", rng.below(3))
             };
-            rig.sql(format!("INSERT OR IGNORE INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('{id}','{p}','a0','{{}}','{{\"reset\":{{\"at_ms\":{until}}}}}','broca_account_limit',{at},'x',{at},NULL,'[]');"));
+            let pool = match rng.below(3) {
+                0 => "NULL".to_owned(),
+                key => format!("'{}'", pool_key(key as u32)),
+            };
+            let recovery = if rng.below(2) == 0 {
+                "[]".to_owned()
+            } else {
+                format!("[{},{}]", pool_key(1), pool_key(2))
+            };
+            rig.sql(format!("INSERT OR IGNORE INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('{id}','{p}','a0','{{}}','{{\"reset\":{{\"at_ms\":{until}}}}}','broca_account_limit',{at},'x',{at},{pool},'{recovery}');"));
             "insert account fence"
         }
         1 => {
@@ -496,6 +630,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                 "account_size_refusal",
                 "account_principal_exclusion",
                 "account_transient_backoff",
+                "account_eligibility",
             ]);
             rig.sql(format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} ORDER BY rowid LIMIT 1 OFFSET {offset});"));
             "delete a source row"
@@ -543,7 +678,14 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             "release an authorization"
         }
         24 => {
-            rig.sql(format!("INSERT OR REPLACE INTO fence_success_pool VALUES ('f{offset}','[\"{m}\"]',{at},{now});"));
+            // Either a pool healed for an active fence's current evidence,
+            // which shrinks its recovery set, or one for other evidence.
+            let key = pool_key(1 + rng.below(2) as u32);
+            if rng.below(2) == 0 {
+                rig.sql(format!("INSERT OR REPLACE INTO fence_success_pool SELECT fence_id,'{key}',MIN(observed_at,created_at),{now} FROM account_fence ORDER BY rowid LIMIT 1 OFFSET {offset};"));
+            } else {
+                rig.sql(format!("INSERT OR REPLACE INTO fence_success_pool VALUES ('f{offset}','{key}',{at},{now});"));
+            }
             "success pool"
         }
         25 => {
@@ -585,6 +727,19 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                 .unwrap();
             "operator clear"
         }
+        29 => {
+            // An empty model covers every model on the provider.
+            let model = if rng.below(3) == 0 { "" } else { m };
+            let fingerprint = rng.pick(&["NULL", "'l0'", "'l1'"]);
+            rig.sql(format!("INSERT INTO account_eligibility VALUES ('{p}','{c}','{model}',{fingerprint},'model_unsupported',{at}) ON CONFLICT(provider,credential_id,model) DO UPDATE SET listing_fingerprint=excluded.listing_fingerprint,observed_at=excluded.observed_at;"));
+            "eligibility fact"
+        }
+        30 => {
+            rig.sql(format!(
+                "DELETE FROM account_eligibility WHERE provider='{p}' AND credential_id='{c}';"
+            ));
+            "replace a listing's eligibility"
+        }
         _ => {
             let result = rig.store.account_command(AccountCommandKind::Maintenance, move |tx| {
                 tx.pool_sql(|conn| {
@@ -596,6 +751,15 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             "failed command"
         }
     }
+}
+
+fn pool_key(window: u32) -> String {
+    serde_json::to_string(&striatum_core::accounts::PoolKey {
+        window_minutes: Some(window * 60),
+        scope: striatum_core::accounts::PoolScope::EveryModel,
+        name: None,
+    })
+    .unwrap()
 }
 
 fn fact(provider: &str, model: &str) -> striatum_core::model_facts::ModelFact {
@@ -653,6 +817,11 @@ struct Reached {
     partial_clear: bool,
     tombstone: bool,
     replaced_rowid: bool,
+    eligibility: bool,
+    non_quota_account_route_row: bool,
+    healed_pool: bool,
+    classified_credential: bool,
+    repeated_exclusion: bool,
 }
 
 impl Reached {
@@ -673,6 +842,22 @@ impl Reached {
                 self.partial_clear |= count("SELECT count(*) FROM fence_recheck_route_clear")? > 0;
                 self.tombstone |=
                     count("SELECT count(*) FROM fence_recheck WHERE cleared_at IS NOT NULL")? > 0;
+                self.eligibility |= count("SELECT count(*) FROM account_eligibility")? > 0;
+                self.non_quota_account_route_row |=
+                    count("SELECT count(*) FROM account_route_fence WHERE wall_class!='quota'")? > 0;
+                self.healed_pool |= count(
+                    "SELECT count(*) FROM account_fence f JOIN fence_success_pool s ON s.fence_id=f.fence_id
+                     AND s.evidence_at=MIN(f.observed_at,f.created_at) WHERE f.cleared_at IS NULL",
+                )? > 0;
+                self.classified_credential |= count(
+                    "SELECT count(*) FROM fence_recheck r JOIN fence_origin o ON o.kind=r.kind
+                     AND o.origin_key=r.origin_key AND o.evidence=r.evidence
+                     WHERE r.kind='credential' AND r.classified=1",
+                )? > 0;
+                self.repeated_exclusion |= count(
+                    "SELECT count(*) FROM (SELECT 1 FROM account_principal_exclusion
+                     GROUP BY principal,credential_id HAVING count(*)>1)",
+                )? > 0;
                 Ok(())
             })
             .unwrap();
@@ -710,7 +895,7 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     }
     // Coverage first: a comparison over sequences that never reached these
     // states would prove nothing about them.
-    assert_eq!(operations.len(), 29, "every operation ran: {operations:?}");
+    assert_eq!(operations.len(), 31, "every operation ran: {operations:?}");
     let Reached {
         credential_quota_from_hold,
         route_hidden_by_provider,
@@ -720,7 +905,23 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
         partial_clear,
         tombstone,
         replaced_rowid,
+        eligibility,
+        non_quota_account_route_row,
+        healed_pool,
+        classified_credential,
+        repeated_exclusion,
     } = reached;
+    assert!(eligibility, "an eligibility fact");
+    assert!(
+        non_quota_account_route_row,
+        "an account route fence outside the quota class"
+    );
+    assert!(healed_pool, "a pool healed for an active fence's evidence");
+    assert!(
+        classified_credential,
+        "a classified credential clock matching its source"
+    );
+    assert!(repeated_exclusion, "a credential excluded by two admissions");
     assert!(
         credential_quota_from_hold,
         "a credential classified by an active hold"
