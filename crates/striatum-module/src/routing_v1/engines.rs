@@ -128,9 +128,11 @@ fn select_request(
     let consumers = super::consumers::effective(&config);
     consumers.admit(&request.consumer, caller)?;
     let policy = media.map(|media| {
-        // Resolve only the media demand default. The registry's policy view
-        // carries language-model requirements (such as context and tools),
-        // while the declaration's IQ is kept in its demand defaults.
+        // Resolve only the media demand level. The consumer registry's general
+        // policy view also carries language-model requirements (context, tools)
+        // that don't apply to engines, so build a policy holding just the
+        // declaration's default `iq` (its demand level on the kind's grade
+        // scale) and let the request's own `iq` and operator settings override it.
         let declared = std::collections::BTreeMap::from([(
             request.consumer.clone(),
             crate::config_policy::ConsumerPolicy {
