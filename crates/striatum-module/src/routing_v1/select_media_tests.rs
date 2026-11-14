@@ -15,6 +15,12 @@ mod policy;
 #[path = "media_ordering_tests.rs"]
 mod ordering;
 
+#[path = "media_requirements_tests.rs"]
+mod requirements;
+
+#[path = "media_outcomes_tests.rs"]
+mod outcomes;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");

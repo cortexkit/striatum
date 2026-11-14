@@ -3,13 +3,13 @@
 use super::*;
 use std::sync::Arc;
 
-fn engine(model: &str, local: bool) -> Value {
+pub(super) fn engine(model: &str, local: bool) -> Value {
     let mut engine = super::engine(model, local);
     engine["max_duration_ms"] = json!(60000);
     engine
 }
 
-fn catalog(
+pub(super) fn catalog(
     h: &Harness,
     rows: &[(&str, &str, Option<f64>, Option<i64>)],
 ) -> Arc<crate::fusiform_catalog::CatalogSnapshot> {
@@ -48,13 +48,13 @@ fn catalog(
     snapshot
 }
 
-fn job() -> Value {
+pub(super) fn job() -> Value {
     let mut params = request();
     params["requirements"]["duration_ms"] = json!(1000);
     params
 }
 
-fn measure(h: &Harness, model: &str, score: f64) {
+pub(super) fn measure(h: &Harness, model: &str, score: f64) {
     h.store()
         .record_engine_evaluation(&striatum_store::EngineEvaluation {
             kind: "transcribe".into(),
@@ -68,7 +68,7 @@ fn measure(h: &Harness, model: &str, score: f64) {
         .unwrap();
 }
 
-fn fence(h: &Harness, model: &str) {
+pub(super) fn fence(h: &Harness, model: &str) {
     let key = format!("media-vendor/{model}");
     crate::record_cooldown_update(h.store(), &serde_json::from_value(json!({
         "routeKey":key,"capacityKey":key,"cooldownUntil":crate::now_ms()+60000,"lastError":"HTTP 503"
