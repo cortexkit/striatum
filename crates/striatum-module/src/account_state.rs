@@ -1123,10 +1123,13 @@ impl AccountCommand<'_> {
 
     pub(crate) fn prune_account_affinities(
         &mut self,
+        keys: &[striatum_store::AffinityRetentionKey],
         before: i64,
-        limit: usize,
+        lease_before: i64,
     ) -> RouteStateResult<AffinityRetentionBatch> {
-        let (batch, deleted) = self.sql.prune_account_affinities_returning(before, limit)?;
+        let (batch, deleted) =
+            self.sql
+                .delete_account_affinities_returning(keys, before, lease_before)?;
         if let Some(state) = self.admissions() {
             state.prune_affinities(&deleted);
             state.pending.clear();

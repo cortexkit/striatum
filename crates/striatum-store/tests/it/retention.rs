@@ -544,6 +544,73 @@ fn insert_conversation(
 }
 
 #[test]
+fn orphan_pin_retention_is_oldest_first_bounded_and_preserves_young_rows() {
+    let rig = Rig::new("orphan-pins");
+    let store = rig.open();
+    store
+        .account_transaction(|tx| {
+            for (id, at) in [
+                ("newer", BEFORE - 1),
+                ("oldest", BEFORE - 3),
+                ("middle", BEFORE - 2),
+                ("at-cutoff", BEFORE),
+            ] {
+                let mut pin = pin_row(id, id, 1, id);
+                pin.created_at = at;
+                tx.insert_pin(&pin)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.prune_account_pins(BEFORE, 0).unwrap(), 0);
+    assert_eq!(store.prune_account_pins(BEFORE, 2).unwrap(), 2);
+    assert_eq!(rig.ids("account_pin", "pin_id"), vec!["at-cutoff", "newer"]);
+    assert_eq!(store.prune_account_pins(BEFORE, 2).unwrap(), 1);
+    assert_eq!(rig.ids("account_pin", "pin_id"), vec!["at-cutoff"]);
+}
+
+#[test]
+fn affinity_plan_rechecks_a_hold_added_before_delete() {
+    let rig = Rig::new("affinity-plan-race");
+    let store = rig.open();
+    let pin = insert_conversation(&store, "planned", 1, BEFORE - 1);
+    let plan = store
+        .plan_account_affinities(NOW - HOUR, NOW, None, 256)
+        .unwrap();
+    assert_eq!(plan.keys.len(), 1);
+    store
+        .account_transaction(|tx| {
+            tx.insert_hold(&AccountHoldRow {
+                decision_id: pin.decision_id.clone(),
+                principal: pin.principal.clone(),
+                conversation_hash: pin.conversation_hash.clone(),
+                provider: pin.provider.clone(),
+                pin_id: pin.pin_id.clone(),
+                pin_generation: pin.pin_generation,
+                account_id: pin.account_id.clone(),
+                credential_id: pin.credential_id.clone(),
+                basis: "five_hour".into(),
+                reset_at: NOW + HOUR,
+                retry_after_s: 60,
+                created_at: NOW,
+            })
+        })
+        .unwrap();
+    let (batch, deleted) = store
+        .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
+            tx.delete_account_affinities_returning(&plan.keys, NOW - HOUR, NOW)
+        })
+        .unwrap();
+    assert_eq!(batch, AffinityRetentionBatch::default());
+    assert!(deleted.is_empty());
+    assert_eq!(rig.ids("account_pin", "pin_id"), vec![pin.pin_id]);
+    assert_eq!(
+        rig.ids("account_affinity", "conversation_hash"),
+        vec!["planned"]
+    );
+}
+
+#[test]
 fn affinity_retention_deletes_a_long_expired_conversation_with_all_its_pins() {
     let rig = Rig::new("affinity");
     let store = rig.open();

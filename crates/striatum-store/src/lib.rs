@@ -107,8 +107,13 @@ pub use diagnostics::{
 };
 pub use engine_measurements::{EngineEvaluation, EngineSpeedSample, ENGINE_SPEED_SAMPLE_LIMIT};
 pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
-pub use reasoning_catalog::{read_counts_offline, read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog};
-pub use retention::{AffinityRetentionBatch, V1DecisionRetentionBatch};
+pub use reasoning_catalog::{
+    read_counts_offline, read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog,
+};
+pub use retention::{
+    AffinityRetentionBatch, AffinityRetentionKey, AffinityRetentionPlan, AffinityRetentionPosition,
+    V1DecisionRetentionBatch,
+};
 pub use routing_v1::{V1Decision, V1Recorded};
 pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
@@ -349,7 +354,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 91] {
+fn route_state_migrations() -> [Migration; 92] {
     [
         Migration {
             version: 1,
@@ -714,6 +719,10 @@ fn route_state_migrations() -> [Migration; 91] {
         Migration {
             version: 92,
             statements: include_str!("../migrations/092_triggers_without_replace.sql"),
+        },
+        Migration {
+            version: 93,
+            statements: include_str!("../migrations/093_pin_retention.sql"),
         },
     ]
 }
