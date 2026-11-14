@@ -258,10 +258,11 @@ pub(crate) fn prune_account_admissions(
     store: &SqliteRouteStateStore,
     before: i64,
     limit: usize,
+    now_ms: i64,
 ) -> RouteStateResult<usize> {
     // Pruning is a writer command so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_admissions(before, limit)
+        tx.prune_account_admissions(before, limit, now_ms)
     })
 }
 

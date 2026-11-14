@@ -5,6 +5,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::Connection;
 use striatum_core::{
     DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome, RouteStateStore,
 };
@@ -14,7 +15,6 @@ use striatum_store::{
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, SqliteRouteStateStore,
     DECISION_MODE_SERVE,
 };
-use rusqlite::Connection;
 
 static NEXT_RIG: AtomicU64 = AtomicU64::new(0);
 
@@ -358,7 +358,7 @@ fn a_store_restored_without_its_history_passes_the_foreign_key_check_and_keeps_s
         })
         .unwrap();
     let later = NOW + 400 * 24 * HOUR;
-    store.prune_account_admissions(later, 256).unwrap();
+    store.prune_account_admissions(later, 256, later).unwrap();
     store.prune_account_holds(later, 256).unwrap();
     store.prune_account_affinities(later, 256).unwrap();
     store.prune_serve_decisions(later, 256).unwrap();

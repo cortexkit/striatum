@@ -486,6 +486,7 @@ pub fn run_retention_pass(
                 store,
                 history_before,
                 rows,
+                now_ms,
             ))
         });
     let (holds, holds_drained) = drain("account_hold", budget, per_table, batches, || {

@@ -7,6 +7,9 @@ use striatum_store::{AccountCommandKind, AccountPinRow};
 #[path = "offer_tests.rs"]
 mod offers;
 
+#[path = "retention_tests.rs"]
+mod retention;
+
 const T: i64 = 1_790_683_200_000;
 const MINUTE: i64 = 60_000;
 
