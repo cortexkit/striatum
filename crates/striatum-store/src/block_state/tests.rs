@@ -393,20 +393,28 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
 /// The update hook reports a REPLACE's insert but not the delete of the row
 /// it evicts, which the state finds through the new row's key. If the new row
 /// were deleted or rekeyed later in the same command, nothing would name the
-/// evicted row and memory would keep it. So no production code may resolve a
-/// conflict on a block table by REPLACE: `INSERT OR REPLACE`, `REPLACE
-/// INTO`, `UPDATE OR REPLACE`, or an `ON CONFLICT REPLACE` clause in a
-/// table's DDL. Tests may, to exercise the capture. If this rule is ever
-/// relaxed, the capture must record the evicted row itself instead.
+/// evicted row and memory would keep it. A REPLACE policy also reaches block
+/// tables indirectly: SQLite applies the conflict policy of a statement to
+/// every statement of the triggers it fires. So no production code or schema
+/// resolves a conflict by REPLACE, on any table: no `OR REPLACE`, no
+/// `REPLACE INTO`, no `ON CONFLICT REPLACE`, in any letter case, in any
+/// non-test `.rs` or `.sql` file of any crate. Test files, and modules
+/// declared as `#[cfg(test)] mod name;`, may use them to exercise the
+/// capture. The only files skipped by name are migrations 054 and 056,
+/// whose REPLACE triggers migration 092 drops and recreates; the schema of
+/// a migrated store is checked as well.
 #[test]
-fn no_production_code_resolves_a_block_table_conflict_by_replace() {
+fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
     use std::path::{Path, PathBuf};
+    const SUPERSEDED: [&str; 2] = ["054_parent_failure_index.sql", "056_restorable_history.sql"];
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     fn files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
             if path.is_dir() {
-                files(&path, out);
+                if path.file_name().is_some_and(|name| name != "target") {
+                    files(&path, out);
+                }
             } else if matches!(path.extension().and_then(|e| e.to_str()), Some("rs" | "sql")) {
                 out.push(path);
             }
@@ -415,25 +423,22 @@ fn no_production_code_resolves_a_block_table_conflict_by_replace() {
     let mut all = Vec::new();
     for krate in std::fs::read_dir(&crates).unwrap() {
         let krate = krate.unwrap().path();
-        for part in ["src", "migrations", "examples"] {
-            if krate.join(part).is_dir() {
-                files(&krate.join(part), &mut all);
-            }
+        if krate.is_dir() {
+            files(&krate, &mut all);
         }
     }
-    // Files compiled only into tests: test files by name, and modules
-    // declared under a `cfg` that names `test`.
+    // Modules declared `#[cfg(test)] mod name;`, as files `name.rs` or
+    // `name/` beside the declaring module (or inside its directory).
     let mut test_only: Vec<PathBuf> = Vec::new();
     for path in &all {
         let Ok(text) = std::fs::read_to_string(path) else { continue };
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         for pair in lines.windows(2) {
-            let declared = pair[1]
-                .strip_prefix("pub mod ")
-                .or_else(|| pair[1].strip_prefix("pub(crate) mod "))
-                .or_else(|| pair[1].strip_prefix("mod "))
+            let declared = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
+                .iter()
+                .find_map(|prefix| pair[1].strip_prefix(prefix))
                 .and_then(|rest| rest.strip_suffix(';'));
-            if let (true, Some(name)) = (pair[0].starts_with("#[cfg(") && pair[0].contains("test"), declared) {
+            if let (true, Some(name)) = (pair[0] == "#[cfg(test)]", declared) {
                 let dir = path.parent().unwrap();
                 let base = if path.file_stem().is_some_and(|stem| stem == "lib" || stem == "main" || stem == "mod") {
                     dir.to_path_buf()
@@ -452,107 +457,139 @@ fn no_production_code_resolves_a_block_table_conflict_by_replace() {
             || text.contains("_tests/")
             || test_only.iter().any(|prefix| path.starts_with(prefix))
     };
-    /// The text without `#[cfg(test)] mod name { ... }` blocks.
-    fn without_test_modules(text: &str) -> String {
-        let mut out = String::new();
-        let mut rest = text;
-        while let Some(at) = rest.find("#[cfg(test)]") {
-            let after = &rest[at + "#[cfg(test)]".len()..];
-            let trimmed = after.trim_start();
-            let Some(body) = trimmed.strip_prefix("mod ").and_then(|tail| {
-                let open = tail.find(['{', ';'])?;
-                (tail.as_bytes()[open] == b'{').then(|| &tail[open..])
-            }) else {
-                out.push_str(&rest[..at + "#[cfg(test)]".len()]);
-                rest = after;
-                continue;
-            };
-            out.push_str(&rest[..at]);
-            let mut depth = 0usize;
-            let mut end = body.len();
-            for (index, c) in body.char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = index + 1;
-                            break;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            rest = &body[end..];
-        }
-        out.push_str(rest);
-        out
-    }
-    let boundary = |text: &str, at: usize| {
-        !text[at..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-    };
-    let scan = |text: &str| -> Vec<String> {
-        let mut found = Vec::new();
-        let normal = without_test_modules(text)
+    let scan = |text: &str| -> Vec<&'static str> {
+        let normal = text
             .to_ascii_lowercase()
-            .replace(['"', '`', '\\'], " ")
+            .replace(['"', '`', '\\', '\''], " ")
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
-        for table in BLOCK_TABLES {
-            for form in ["insert or replace into ", "replace into ", "update or replace "] {
-                let needle = format!("{form}{table}");
-                for (at, _) in normal.match_indices(&needle) {
-                    // `insert or replace into` is reported once, as itself.
-                    let inner = form == "replace into " && normal[..at].ends_with("or ");
-                    if boundary(&normal, at + needle.len()) && !inner {
-                        found.push(needle.clone());
-                    }
-                }
-            }
-            // A conflict clause in the table's own definition.
-            for create in ["create table ", "create table if not exists "] {
-                let needle = format!("{create}{table}");
-                for (at, _) in normal.match_indices(&needle) {
-                    if !boundary(&normal, at + needle.len()) {
-                        continue;
-                    }
-                    let definition = &normal[at..];
-                    let definition = &definition[..definition.find(");").unwrap_or(definition.len())];
-                    if definition.contains("on conflict replace") {
-                        found.push(format!("{table} DDL: on conflict replace"));
-                    }
-                }
-            }
-        }
-        found
+        ["or replace", "replace into", "on conflict replace"]
+            .into_iter()
+            .filter(|form| {
+                normal.match_indices(form).any(|(at, _)| {
+                    let before = normal[..at].chars().next_back();
+                    let after = normal[at + form.len()..].chars().next();
+                    !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                        && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
+            .collect()
     };
-    // The scan sees every spelling, and skips test modules and other tables.
-    assert_eq!(scan("x(\"INSERT  OR\n   Replace INTO `fence_recheck`(kind) VALUES (1)\")"), ["insert or replace into fence_recheck"]);
-    assert_eq!(scan("replace into account_eligibility values (1)"), ["replace into account_eligibility"]);
-    assert_eq!(scan("UPDATE OR REPLACE pool_key_state SET a=1"), ["update or replace pool_key_state"]);
-    assert_eq!(
-        scan("CREATE TABLE IF NOT EXISTS fence_success_pool (a TEXT UNIQUE ON CONFLICT REPLACE);"),
-        ["fence_success_pool DDL: on conflict replace"]
-    );
-    assert!(scan("INSERT OR REPLACE INTO fence_retired_origin SELECT 1; INSERT OR REPLACE INTO fence_recheck_x VALUES (1)").is_empty());
-    assert!(scan("#[cfg(test)]\nmod tests { fn f() { x(\"INSERT OR REPLACE INTO fence_recheck\") } }").is_empty());
-    assert_eq!(
-        scan("#[cfg(test)]\nmod tests { }\nfn f() { x(\"replace into fence_recheck\") }"),
-        ["replace into fence_recheck"]
-    );
+    // The scan sees every spelling and every table.
+    assert_eq!(scan("x(\"INSERT  OR\n   Replace INTO `fence_recheck`(kind) VALUES (1)\")"), ["or replace", "replace into"]);
+    assert_eq!(scan("replace into anything values (1)"), ["replace into"]);
+    assert_eq!(scan("UPDATE OR REPLACE pool_key_state SET a=1"), ["or replace"]);
+    assert_eq!(scan("CREATE TABLE t (a TEXT UNIQUE ON CONFLICT REPLACE);"), ["on conflict replace"]);
+    assert!(scan("let s = text.replace('a', \"b\"); color_replace").is_empty());
     let mut violations = Vec::new();
     let mut scanned = 0;
     for path in all.iter().filter(|path| !is_test(path)) {
+        if path.file_name().is_some_and(|name| SUPERSEDED.iter().any(|superseded| name == *superseded)) {
+            continue;
+        }
         let Ok(text) = std::fs::read_to_string(path) else { continue };
         scanned += 1;
         violations.extend(scan(&text).into_iter().map(|found| format!("{}: {found}", path.display())));
     }
     assert!(scanned > 100, "the scan found the sources: {scanned} files");
-    assert!(violations.is_empty(), "REPLACE on a block table: {violations:#?}");
+    assert!(violations.is_empty(), "REPLACE conflict resolution: {violations:#?}");
+
+    // The migrated schema: no trigger or table resolves a conflict by
+    // REPLACE, and the two recreated triggers' target tables have no
+    // triggers of their own.
+    let rig = rig("block-state-schema-without-replace");
+    let (schema, own_triggers) = rig
+        .store
+        .with_reader_for_test(|conn| {
+            let schema = conn
+                .prepare("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL")?
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let own: i64 = conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='trigger'
+                 AND tbl_name IN ('model_route_parent_failures','account_observation_event','fence_retired_origin')
+                 AND name!='fence_retire_enforcement'",
+                [],
+                |r| r.get(0),
+            )?;
+            Ok((schema, own))
+        })
+        .unwrap();
+    assert!(schema.len() > 50, "the schema was read: {} objects", schema.len());
+    let replacing: Vec<_> = schema.iter().filter(|(_, sql)| !scan(sql).is_empty()).map(|(name, _)| name).collect();
+    assert!(replacing.is_empty(), "schema objects resolving a conflict by REPLACE: {replacing:?}");
+    assert_eq!(own_triggers, 0, "no trigger on the copies' target tables or on the archive besides retirement");
+}
+
+/// Migration 092's copy triggers, which update a conflicting row, leave the
+/// same rows as migrations 054 and 056's, which replaced it: each insert
+/// names every column of its target table.
+#[test]
+fn copy_triggers_without_replace_leave_the_rows_the_replace_left() {
+    let old_054 = include_str!("../../migrations/054_parent_failure_index.sql");
+    let old_056 = include_str!("../../migrations/056_restorable_history.sql");
+    let new = include_str!("../../migrations/092_triggers_without_replace.sql");
+    fn statement(sql: &str, start: &str, end: &str) -> String {
+        let at = sql.find(start).unwrap_or_else(|| panic!("{start}"));
+        let length = sql[at..].find(end).unwrap() + end.len();
+        sql[at..at + length].to_owned()
+    }
+    let run = |triggers: [String; 2]| -> Vec<String> {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE model_route_decisions (id TEXT PRIMARY KEY, parent_session_id TEXT,
+               outcome_at INTEGER, selected_route_key TEXT, selected_provider_id TEXT, outcome_error TEXT);
+             CREATE TABLE account_observation (principal TEXT, runner TEXT, event_id TEXT,
+               observation_id TEXT, bound INTEGER, effects_json TEXT, received_at INTEGER);",
+        )
+        .unwrap();
+        conn.execute_batch(&statement(old_054, "CREATE TABLE IF NOT EXISTS model_route_parent_failures", ");")).unwrap();
+        conn.execute_batch(&statement(old_056, "CREATE TABLE IF NOT EXISTS account_observation_event", ");")).unwrap();
+        for trigger in triggers {
+            conn.execute_batch(&trigger).unwrap();
+        }
+        // Each table gets a plain copy and a copy over a leftover row with
+        // the same key; one decision has no parent session and no copy.
+        conn.execute_batch(
+            "INSERT INTO model_route_decisions VALUES ('d1','s1',1,'r1','p1','e1');
+             INSERT INTO model_route_parent_failures VALUES ('d2','stale',0,'old','old','old');
+             INSERT INTO model_route_decisions VALUES ('d2','s2',2,'r2',NULL,'e2');
+             INSERT INTO model_route_decisions VALUES ('d3',NULL,3,'r3','p3','e3');
+             INSERT INTO account_observation VALUES ('p','r','e1','o1',1,'[]',10);
+             INSERT INTO account_observation_event VALUES ('p','r','e2','old',0,'{}',1);
+             INSERT INTO account_observation VALUES ('p','r','e2','o2',1,'[1]',20);",
+        )
+        .unwrap();
+        let mut rows = Vec::new();
+        for sql in [
+            "SELECT * FROM model_route_parent_failures ORDER BY decision_id",
+            "SELECT * FROM account_observation_event ORDER BY principal,runner,event_id",
+        ] {
+            let mut statement = conn.prepare(sql).unwrap();
+            let columns = statement.column_count();
+            let mut query = statement.query([]).unwrap();
+            while let Some(row) = query.next().unwrap() {
+                rows.push(format!(
+                    "{:?}",
+                    (0..columns).map(|at| row.get::<_, Value>(at).unwrap()).collect::<Vec<_>>()
+                ));
+            }
+        }
+        rows
+    };
+    let replaced = run([
+        statement(old_054, "CREATE TRIGGER IF NOT EXISTS model_route_parent_failures_on_insert", "END;"),
+        statement(old_056, "CREATE TRIGGER IF NOT EXISTS account_observation_event_on_insert", "END;"),
+    ]);
+    let updated = run([
+        statement(new, "CREATE TRIGGER model_route_parent_failures_on_insert", "END;"),
+        statement(new, "CREATE TRIGGER account_observation_event_on_insert", "END;"),
+    ]);
+    assert_eq!(updated, replaced);
+    assert_eq!(replaced.len(), 4, "{replaced:#?}");
+    assert!(replaced.iter().any(|row| row.contains("\"s2\"")), "{replaced:#?}");
+    assert!(replaced.iter().any(|row| row.contains("\"o2\"")), "{replaced:#?}");
 }
 
 #[test]
@@ -1040,6 +1077,77 @@ fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
     assert_eq!(block_reconcile_reloads() - reloads, 1, "one mismatch counted");
     assert_eq!(rig.loads_since(loads), 1, "one reload");
     rig.check(&[NOW], "after the tick");
+}
+
+/// Retirement archives expired, unmanaged origins, and the archive's insert
+/// trigger ends their source evidence in the block tables. It used to
+/// insert with a REPLACE policy, which SQLite also applies to every
+/// statement of that trigger; it now deletes a conflicting archive row
+/// first. On the parity fixture, plus an archive row for a generation that
+/// is current again, both leave the same rows.
+#[test]
+fn retirement_without_a_replace_policy_leaves_the_rows_the_replace_left() {
+    let rig = rig("block-state-retirement-pin");
+    rig.store
+        .with_writer_for_test(|conn| {
+            crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW)?;
+            // A wall archived once, then recorded again with the same
+            // evidence: retiring it again conflicts with its archive row.
+            let wall = format!(
+                "UPDATE pool_key_state SET walled_until={},wall_reason='billing' WHERE provider='retire-p';",
+                NOW - 1_000
+            );
+            conn.execute_batch(&format!(
+                "INSERT INTO pool_key_state(provider,credential_id,updated_at,wall_observed_at) VALUES ('retire-p','c',{0},{0});
+                 {wall}
+                 INSERT INTO fence_retired_origin SELECT kind,origin_key,evidence,evidence_at,1
+                   FROM fence_origin WHERE kind='pool_billing' AND provider='retire-p';
+                 {wall}
+                 INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,
+                   last_error,last_error_at,updated_at,failure_backoff_until,failure_backoff_reason,failure_observed_at)
+                   VALUES ('retire-p/m','retire-p/m','retire-p','m',{1},{0},'route capacity',{0},{0},{1},'error',{0});
+                 INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+                   VALUES ('retire-provider',{1},{0},'provider capacity',{0},{0});
+                 INSERT INTO account_non_quota_size_refusal VALUES ('retire-p','c','m',16,{1},{0});
+                 INSERT INTO account_non_quota_route_fence VALUES ('retire-p','c','m',{1},'d',{0},{0},'transient');",
+                NOW - 5_000,
+                NOW - 1_000
+            ))?;
+            let rows = |conn: &Connection| -> rusqlite::Result<(Vec<String>, Vec<String>)> {
+                let archive = conn
+                    .prepare("SELECT kind,origin_key,evidence,evidence_at,retired_at FROM fence_retired_origin ORDER BY kind,origin_key,evidence")?
+                    .query_map([], |r| {
+                        Ok(format!("{:?}", (0..5).map(|at| r.get::<_, Value>(at)).collect::<rusqlite::Result<Vec<_>>>()?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((block_rows(conn).map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.to_string().into()))?, archive))
+            };
+            conn.execute_batch("SAVEPOINT pin")?;
+            fence_rechecks::snapshot_origins(conn)?;
+            let replaced = conn.execute(
+                "INSERT OR REPLACE INTO fence_retired_origin
+                SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
+                WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
+                    WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)",
+                [NOW],
+            )?;
+            let with_replace = rows(conn)?;
+            conn.execute_batch("ROLLBACK TO pin")?;
+            fence_rechecks::snapshot_origins(conn)?;
+            let retired = fence_rechecks::retire_expired(conn, NOW)?;
+            let without = rows(conn)?;
+            conn.execute_batch("RELEASE pin")?;
+            assert!(replaced > 1, "the fixture retires several origins: {replaced}");
+            assert_eq!(retired, replaced);
+            assert_eq!(without, with_replace, "block rows, then archive rows");
+            assert!(
+                without.1.iter().any(|row| row.contains("pool_billing") && row.contains(&NOW.to_string())),
+                "the conflicting archive row was replaced: {:#?}",
+                without.1
+            );
+            Ok(())
+        })
+        .unwrap();
 }
 
 #[test]

@@ -96,7 +96,9 @@ pub(crate) fn seed_block_parity_fixture(
     };
     conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-fence','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,'[]')", params![serde_json::to_string(&fence).unwrap(),at])?;
     conn.execute_batch(&format!(r#"
-                INSERT OR REPLACE INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at});
+                INSERT INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at})
+                  ON CONFLICT(provider_id,credential_id) DO UPDATE SET code=excluded.code,
+                  listing_fingerprint=excluded.listing_fingerprint,observed_at_ms=excluded.observed_at_ms;
                 INSERT INTO account_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'quota');
                 INSERT INTO account_non_quota_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'billing');
                 INSERT INTO account_non_quota_route_fence VALUES ('cpu-provider-0','oauth:cpu-0','model-0',{until},'parity',{at},{at},'transient');

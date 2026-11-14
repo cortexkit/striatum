@@ -339,7 +339,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 90] {
+fn route_state_migrations() -> [Migration; 91] {
     [
         Migration {
             version: 1,
@@ -700,6 +700,10 @@ fn route_state_migrations() -> [Migration; 90] {
         Migration {
             version: 91,
             statements: include_str!("../migrations/091_admission_conversation_lookup.sql"),
+        },
+        Migration {
+            version: 92,
+            statements: include_str!("../migrations/092_triggers_without_replace.sql"),
         },
     ]
 }
@@ -7559,7 +7563,7 @@ impl crate::AccountTx<'_> {
         let update = &bounded;
         // Old callers can still send an account failure as a route cooldown.
         // Keep account evidence in the account allocator, never fan it out to
-        // every model or replace an independent model wall's cause.
+        // every model, nor swap out an independent model wall's cause.
         if !update.unscoped_wall
             && striatum_core::account_wall::account_scoped_wall(
                 update.last_error.as_deref(),

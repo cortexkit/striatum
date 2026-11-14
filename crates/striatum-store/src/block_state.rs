@@ -166,7 +166,7 @@ pub fn block_read_backs() -> u64 {
 /// columns the cross-row predicates need; then the raw columns the request
 /// readers return, in the order those readers' row decoders expect. Each
 /// select starts with the rowid and the table's primary key, as JSON, which
-/// lets a row replaced by `INSERT OR REPLACE` (whose delete the update hook
+/// lets a row replaced by a REPLACE conflict resolution (whose delete the update hook
 /// does not report) be found by key. None has a WHERE clause: the read-back
 /// appends one.
 const SELECTS: [&str; 16] = [
@@ -639,7 +639,7 @@ impl Table {
     }
 
     fn put(&mut self, rowid: i64, key: &str, held: Option<&Arc<Held>>) {
-        // `INSERT OR REPLACE` deletes the row it conflicts with without
+        // A REPLACE conflict resolution deletes the row it conflicts with without
         // telling the update hook. The new row's key finds it.
         if let Some(other) = self.keys.get(&key.to_owned()).copied() {
             if other != rowid {

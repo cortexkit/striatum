@@ -441,7 +441,7 @@ impl crate::AccountTx<'_> {
             };
             // A new refusal supersedes its earlier horizon, including uncapped
             // raw deadlines retained during migration. Delayed older reports
-            // must not extend or replace the newer evidence.
+            // must not extend or supersede the newer evidence.
             self.conn.execute(&format!("INSERT INTO pool_key_state(provider,credential_id,{deadline},{why},updated_at,{observed})
                 VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(provider,credential_id) DO UPDATE SET
                 {deadline}=excluded.{deadline},{why}=excluded.{why},{observed}=excluded.{observed},

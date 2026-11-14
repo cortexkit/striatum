@@ -177,17 +177,40 @@ pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
+    sync_at(conn, crate::now_ms())
+}
+
+/// The expired, unmanaged origins `sync` retires at `now`: their non-quota
+/// deadline passed and no clock holds their evidence.
+const RETIRING: &str = "SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
+    WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
+        WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)";
+
+/// Archive the expired, unmanaged origins of the current snapshot at `now`,
+/// which makes `fence_retire_enforcement` end their source evidence.
+/// Returns how many it archived. An archive row for the same generation is
+/// replaced: deleted first, so the insert that fires the trigger resolves no
+/// conflict. (A conflict policy on that insert would also apply to every
+/// statement of the trigger, which writes the block tables.) The archive
+/// table has no delete trigger.
+pub(crate) fn retire_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        &format!(
+            "DELETE FROM fence_retired_origin WHERE (kind,origin_key,evidence) IN
+            (SELECT kind,origin_key,evidence FROM ({RETIRING}))"
+        ),
+        [now],
+    )?;
+    conn.execute(&format!("INSERT INTO fence_retired_origin {RETIRING}"), [now])
+}
+
+/// [`sync`] at a given time.
+pub(crate) fn sync_at(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
     }
     snapshot_origins(conn)?;
-    let retired = conn.execute(
-        "INSERT OR REPLACE INTO fence_retired_origin
-        SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
-        WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
-            WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)",
-        [crate::now_ms()],
-    )?;
+    let retired = retire_expired(conn, now)?;
     if retired > 0 {
         snapshot_origins(conn)?;
     }
@@ -219,7 +242,7 @@ pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Re
     upsert_clocks(conn, Some(kind), Some(key))
 }
 
-fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
     // Materialize once and index the compound origin key. A correlated lookup
     // against the UNION view otherwise rebuilds its JSON keys for every clock.
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;

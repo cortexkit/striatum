@@ -61,7 +61,7 @@ pub struct RunnerModel {
     pub pool: Option<String>,
     /// The key-pool session the lease behind `auth` belongs to. Every later
     /// acquire for this target uses the same session, so the lease taken at
-    /// selection is the one the sends renew or replace, and one launch is never
+    /// selection is the one the sends renew or swap, and one launch is never
     /// counted as two runs in flight. Never sent to Broca.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pool_session: Option<String>,
