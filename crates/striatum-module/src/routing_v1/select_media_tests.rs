@@ -101,6 +101,7 @@ async fn synthesize_accepts_input_characters_and_describes_it_without_pricing() 
     super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         let mut speech = engine("speech", false);
         speech["kind"] = json!("synthesize");
+        speech["max_input_bytes"] = json!(100);
         let h = setup(vec![speech.clone()]);
         declare("synthesize", &[speech]);
         let route = h.bind(reserved("colliculus"), None).await;
@@ -111,7 +112,7 @@ async fn synthesize_accepts_input_characters_and_describes_it_without_pricing() 
             .contains(&json!("input_characters")));
         let mut params = request();
         params["kind"] = json!("synthesize");
-        params["requirements"] = json!({"input_characters":4,"input_bytes":9});
+        params["requirements"] = json!({"iq":40,"input_characters":4,"input_bytes":9});
         assert_eq!(select(&route, &params).await["engine"]["model"], "speech");
         for value in [json!(-1), json!(1.5), json!("4")] {
             params["requirements"]["input_characters"] = value;
