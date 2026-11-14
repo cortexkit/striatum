@@ -4702,8 +4702,8 @@ async fn a_losing_racer_on_a_mixed_roster_gets_a_timed_wait() {
     let observed = runner.call("route.account_observe", &refusal).await;
     assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
 
-    // An hour later the xai account's fence is due for one probe, which a
-    // selection decision claims.
+    // An hour later one probe of the xai account's credit refusal is due, and
+    // a selection decision claims it.
     let deadline = receipt + 3_600_000;
     let _due = crate::InjectedClock::set(deadline);
     mixed_reach_xai_reading(deadline as i64);

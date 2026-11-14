@@ -247,8 +247,9 @@ pub(crate) enum LaunchRefusal {
 }
 
 impl LaunchRefusal {
-    /// A store failure, a batch that diverged twice included: the caller
-    /// cannot tell whether any account is eligible.
+    /// A store failure, including a writer batch whose state disagreed with
+    /// SQL on both of its runs: the caller cannot tell whether any account
+    /// is eligible.
     pub(crate) fn store(error: impl std::fmt::Display) -> Self {
         Self::Refused {
             code: "store_error".into(),
@@ -6834,13 +6835,9 @@ fn serve(
             }
             striatum_store::CredentialProbeClaim::Blocked => {
                 // Another request can claim the probe after scoring prepared
-                // this roster. Preserve the actual fence and its retry time;
-                // removing only the credential misreports missing candidates.
-                // A slot another request holds stays closed until its claim's
-                // interval ends, even where a provider reset is already due,
-                // so that interval is the retry time. A claim refused while
-                // every clock looks due (its evidence changed under it) is
-                // retried shortly rather than answered without a time.
+                // this roster. Preserve the actual fence and its retry time
+                // (see `lost_probe_retry_at`); removing only the credential
+                // misreports missing candidates.
                 let until = lost_probe_retry_at(
                     &applicable,
                     params.model_decision_id.as_deref(),

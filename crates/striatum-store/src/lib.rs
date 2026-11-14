@@ -64,7 +64,7 @@ mod engine_measurements;
 mod fence_rechecks;
 mod block_state;
 pub use block_state::{
-    block_read_backs, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
+    block_read_backs, block_reconcile_reloads, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub mod group_reads;

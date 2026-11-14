@@ -1214,8 +1214,8 @@ fn a_legacy_launch_that_loses_its_route_probe_is_told_when_to_retry() {
         false,
         Some("loser"),
     );
-    // Matched on the debug form, so the check reads the same on the older
-    // refusal type, which carried only a code and a message.
+    // Compared through Debug, so the check also compiles against a refusal
+    // type that carries only a code and a message, and fails there.
     let shown = format!("{result:?}");
     assert_eq!(
         shown,

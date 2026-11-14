@@ -1375,8 +1375,9 @@ impl AccountTx<'_> {
     /// Fail with [`crate::block_state::diverged`] if SQL holds an uncleared
     /// clock on `row`'s authorized evidence and generation, which the working
     /// state decided it does not. With `model`, only a non-quota clock of
-    /// that model or of every model counts, as for a neutral release. The
-    /// update sets nothing, so it is a keyed check, not a change.
+    /// that model or with no model counts, as `release_inconclusive_probe`
+    /// requires. The update sets nothing, so it is a keyed check, not a
+    /// change.
     fn expect_no_authorized_clock(
         &self,
         row: &crate::block_state::ProbeAuthorization,

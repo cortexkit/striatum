@@ -15,7 +15,8 @@
 //! Reads inside the writer are listed, not forbidden: the store's own sync
 //! and report statements still read the block tables there. The claim and
 //! probe decisions (claims, decision-probe binding, report matching,
-//! authorization transfer and the anonymous-credential check) and the
+//! authorization transfer and the check that a probe authorization names a
+//! reported credential) and the
 //! healers (success healing, failed and neutral probe outcomes, credential
 //! classification) decide on the command's working state, so their SQL must
 //! not run on the writer either. The state's own load and read-backs are
@@ -187,7 +188,8 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
         .unwrap();
     record("heal: credential classification");
     // A success on SQL heals the provider wall the serving login's origins
-    // include; a newer wall then gives the authorized success a block.
+    // include. A newer wall then gives the authorized-probe success a block to
+    // heal.
     store
         .account_transaction(|tx| {
             tx.heal_serving_fences("oracle-provider", "a", "c", "model", None, now, now + 1)
