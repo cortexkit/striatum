@@ -6984,6 +6984,27 @@ fn serve(
                 code,
                 "account_pool_exhausted" | "account_pool_reserve_limited"
             );
+            // A request that lost a probe race to another request is never
+            // refused untimed, whatever refused the accounts it had left: the
+            // probe it lost is retried at a known time, and an untimed code
+            // such as `auth_required` would make the runner stop for a login.
+            if let Some(lost) = lost_probe_fences.values().copied().min() {
+                let until = reset.map_or(lost, |reset| reset.min(lost));
+                let retry_after_s = u64::try_from(until.saturating_sub(now))
+                    .unwrap_or(0)
+                    .div_ceil(1000);
+                return Ok(OpReply::typed(
+                    "account_pool_exhausted",
+                    format!("no account admitted: a probe this request needed is in use until {}", rfc3339(until)),
+                    json!({
+                        "code": "account_pool_exhausted",
+                        "retry_after_s": retry_after_s,
+                        "decision_id": decision_id,
+                        "exclusions": wire_exclusions(&decision),
+                        "reset_at_ms": until,
+                    }),
+                ));
+            }
             Ok(OpReply::typed(
                 code,
                 format!("no account admitted: {code}"),

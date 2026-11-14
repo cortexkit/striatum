@@ -4625,6 +4625,122 @@ async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
     }
 }
 
+/// The roster of [`a_losing_racer_on_a_mixed_roster_gets_a_timed_wait`]:
+/// the credit-metered xai account, and a second account whose pooled reading
+/// shows it cannot reach the routed model.
+fn mixed_reach_xai_fixture() -> (Arc<Harness>, BrocaCredentials, Vec<ListedCredential>) {
+    let (harness, mut credentials) = setup("xai", false);
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.retain(|row| row.id == "oauth:test");
+    let mut unreached = rows[0].clone();
+    rows[0].id = "oauth:xai".into();
+    rows[0].account_id = Some("xai-account".into());
+    unreached.id = "oauth:pooled".into();
+    unreached.account_id = Some("pooled-account".into());
+    rows.push(unreached);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-credit".into(),
+            credentials: rows.clone(),
+            ..Default::default()
+        },
+        NOW,
+    );
+    harness.set_credentials(credentials.clone());
+    mixed_reach_xai_reading(NOW as i64);
+    (harness, credentials, rows)
+}
+
+/// The xai account's credit reading with headroom, and the second account's
+/// reading, whose only window is a pool the routed model does not draw on.
+fn mixed_reach_xai_reading(at: i64) {
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    let fetched = crate::account_selection::rfc3339(at);
+    crate::account_quota::apply_provider_reply(&mut state, "grok", &serde_json::to_vec(&json!({
+        "result":[
+            {"provider":"grok","apiProvider":"xai","account":"xai-account",
+                "credentialRef":"oauth:xai","source":"vault","fetchedAt":fetched,
+                "usage":{"primary":{"usedPercent":0.0,"windowMinutes":10080}}},
+            {"provider":"grok","apiProvider":"xai","account":"pooled-account",
+                "credentialRef":"oauth:pooled","source":"vault","fetchedAt":fetched,
+                "usage":{"extraRateWindows":[{"id":"gemini-5h","window":{"usedPercent":0.0,"windowMinutes":300}}]}}],
+        "completeProviders":["grok"]
+    })).unwrap(), at).unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+}
+
+/// A request that loses the probe of one account, while the only other
+/// account is refused for a reason with no time (it cannot reach the
+/// model), gets a timed wait for the probe it lost: never the other
+/// account's untimed code, which would read as a missing login.
+#[tokio::test]
+async fn a_losing_racer_on_a_mixed_roster_gets_a_timed_wait() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, mut credentials, rows) = mixed_reach_xai_fixture();
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let select = json!({"consumer":"mason","requirements":{"iq":30},"pin":"xai/model"});
+    let selected = owner.call("route.select", &select).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let runner = harness
+        .bind(
+            reserved(selected.1["result"]["runner"]["module"].as_str().unwrap()),
+            None,
+        )
+        .await;
+    let mut request = account_request("xai", "mixed-send");
+    request["decision_id"] = selected.1["result"]["decision_id"].clone();
+    assert_credential(
+        &runner.call("route.account_for", &request).await,
+        "oauth:xai",
+    );
+    let receipt = NOW + 600_000;
+    let _refusal = crate::InjectedClock::set(receipt);
+    mixed_reach_xai_reading(receipt as i64);
+    let refusal = json!({"event_id":"mixed-refusal","kind":"account_limit_exhausted",
+        "admission_id":"mixed-send","served_account_id":"xai-account","credential_id":"oauth:xai",
+        "limit_window":"credit","observed_at_ms":receipt});
+    let observed = runner.call("route.account_observe", &refusal).await;
+    assert_eq!(observed.0, FrameType::Response, "{}", observed.1);
+
+    // An hour later the xai account's fence is due for one probe, which a
+    // selection decision claims.
+    let deadline = receipt + 3_600_000;
+    let _due = crate::InjectedClock::set(deadline);
+    mixed_reach_xai_reading(deadline as i64);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "xai-credit".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        deadline,
+    );
+    harness.set_credentials(credentials.clone());
+    let probe = owner.call("route.select", &select).await;
+    assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
+
+    let mut loser = account_request("xai", "mixed-loser");
+    loser["caller"] = json!({"runner":RUNNER});
+    match admit_directly(&harness, &format!("reserved:{RUNNER}"), loser, deadline) {
+        crate::account_selection::OpReply::Error { code, detail, .. } => {
+            let detail = detail.unwrap_or_default();
+            assert_eq!(
+                code, "account_pool_exhausted",
+                "losing the probe is a wait, never the other account's untimed refusal: {detail}"
+            );
+            let retry_at = detail["reset_at_ms"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("the wait names when to retry: {detail}"));
+            assert!(
+                (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
+                "{detail}"
+            );
+            assert!(detail["retry_after_s"].as_u64().is_some_and(|s| s > 0), "{detail}");
+        }
+        other => panic!("a second probe was admitted: {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn credit_window_is_not_an_undeclared_v1_report_extension() {
     let _clock = crate::InjectedClock::set(NOW);
