@@ -54,13 +54,25 @@ impl<'a> SelectionPass<'a> {
         available: &std::collections::HashSet<String>,
         snapshot: striatum_core::ModelRouteStateSnapshot,
     ) -> SelectModelRouteInput<'a> {
+        self.input_with_policy(available, snapshot, false)
+    }
+
+    pub fn input_with_policy(
+        &self,
+        available: &std::collections::HashSet<String>,
+        snapshot: striatum_core::ModelRouteStateSnapshot,
+        pinned: bool,
+    ) -> SelectModelRouteInput<'a> {
         let subscription_keys = self.subscription_keys.clone();
         let priced_per_token = self.priced_per_token;
-        let mut operator_exclude_keys = self.operator_exclude.to_vec();
+        // The grouped global view is materialized from pin_only rules. For an
+        // operator ladder, read provider/model rules directly with pin admission
+        // so exclusions other than pin_only and pin_only_for still apply.
+        let mut operator_exclude_keys = if pinned { Vec::new() } else { self.operator_exclude.to_vec() };
         if !self.classifier {
             operator_exclude_keys.extend(
                 self.operator_config
-                    .automatic_exclusions(self.consumer, self.facts),
+                    .selection_exclusions(self.consumer, self.facts, pinned),
             );
         }
         SelectModelRouteInput {
@@ -91,16 +103,35 @@ impl<'a> SelectionPass<'a> {
         &self,
         available: &std::collections::HashSet<String>,
     ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
+        self.score_with_policy(available, false)
+    }
+
+    pub fn score_with_policy(
+        &self,
+        available: &std::collections::HashSet<String>,
+        pinned: bool,
+    ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
+        self.score_with_variant(available, pinned, None)
+    }
+
+    fn score_with_variant(
+        &self,
+        available: &std::collections::HashSet<String>,
+        pinned: bool,
+        variant: Option<&str>,
+    ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
         let allowed = available
             .iter()
             .filter(|route| {
                 self.operator_config
-                    .route_allowed(self.consumer, route, false)
+                    .route_allowed(self.consumer, route, pinned)
             })
             .cloned()
             .collect();
+        let mut input = self.input_with_policy(&allowed, self.snapshot.clone(), pinned);
+        apply_explicit_variant(&mut input, variant);
         let result = select_candidates(
-            self.input(&allowed, self.snapshot.clone()),
+            input,
             &self.routing_config(),
             self.slots,
             self.consumer_exclude,
@@ -117,7 +148,7 @@ impl<'a> SelectionPass<'a> {
         continuing: Option<&str>,
         admit_pin: impl FnMut(&str) -> Result<SelectedModelRoute, E>,
     ) -> Result<
-        (SelectedModelRoute, OrderBasis),
+        (SelectedModelRoute, OrderBasis, Option<String>),
         OrderFailure<E, striatum_core::model_router::NoRouteError>,
     > {
         let policy = self.operator_config.consumer_policy(
@@ -125,6 +156,7 @@ impl<'a> SelectionPass<'a> {
             &crate::config_policy::ConsumerPolicy::default(),
             &std::collections::BTreeMap::new(),
         );
+        let mut explicit_variant = None;
         select_ordered(
             available,
             request_pin,
@@ -132,8 +164,29 @@ impl<'a> SelectionPass<'a> {
             continuing,
             admit_pin,
             |only| self.score(only),
-            || select_in_order(available, &policy, |only| self.score(only)),
+            || select_in_order(available, &policy, |only, variant, _| {
+                let result = self.score_with_variant(only, policy.operator_ladder(), variant);
+                if result.is_ok() {
+                    explicit_variant = variant.map(str::to_owned);
+                }
+                result
+            }),
         )
+        .map(|(selected, basis)| (selected, basis, explicit_variant))
+    }
+}
+
+/// Score the explicitly requested effort while retaining model-level availability.
+pub(crate) fn apply_explicit_variant(input: &mut SelectModelRouteInput<'_>, variant: Option<&str>) {
+    let Some(variant) = variant else { return };
+    for fact in &mut input.facts {
+        let route = fact_to_route(fact);
+        if input.available_models.contains(&route.route_key) || input.available_models.contains(&route.capacity_key) {
+            fact.variant = Some(variant.into());
+            let defaults = fact.prompt_defaults.get_or_insert_with(Default::default);
+            defaults.variant = Some(variant.into());
+            defaults.reasoning_effort = None;
+        }
     }
 }
 
@@ -186,24 +239,33 @@ pub(crate) fn select_candidates(
 pub(crate) fn select_in_order(
     available: &std::collections::HashSet<String>,
     policy: &crate::config_policy::ConsumerPolicy,
-    attempt: impl Fn(
+    mut attempt: impl FnMut(
         &std::collections::HashSet<String>,
+        Option<&str>,
+        Option<&str>,
     )
         -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError>,
 ) -> Result<SelectedModelRoute, striatum_core::model_router::NoRouteError> {
     use crate::config_policy::ConsumerMode;
     if policy.mode != Some(ConsumerMode::Ladder) {
-        return attempt(available);
+        return attempt(available, None, None);
     }
     let mut rejected = Vec::new();
     let mut last = None;
+    let mut earliest_reset: Option<(f64, Option<String>)> = None;
     for pin in policy.ladder.iter().flatten() {
+        let (key, variant) = if policy.operator_ladder() {
+            let Some(route) = cortexkit_role_routing::select::RouteRef::parse_pin(pin) else { continue };
+            (format!("{}/{}", route.provider, route.model), route.variant)
+        } else {
+            (pin.clone(), None)
+        };
         let only = available
             .iter()
-            .filter(|key| *key == pin || key.starts_with(&format!("{pin}/")))
+            .filter(|route| **route == key || route.starts_with(&format!("{key}/")))
             .cloned()
             .collect();
-        match attempt(&only) {
+        match attempt(&only, variant.as_deref(), Some(&key)) {
             Ok(mut selected) => {
                 selected.rejected.retain(|entry| {
                     !rejected.iter().any(
@@ -216,13 +278,18 @@ pub(crate) fn select_in_order(
                 return Ok(selected);
             }
             Err(error) => {
+                if let Some(reset) = error.earliest_reset {
+                    if earliest_reset.as_ref().is_none_or(|(previous, _)| reset < *previous) {
+                        earliest_reset = Some((reset, error.earliest_reset_route.clone()));
+                    }
+                }
                 rejected.extend(
                     error
                         .rejected
                         .iter()
                         .filter(|entry| {
-                            entry.route_key == *pin
-                                || entry.route_key.starts_with(&format!("{pin}/"))
+                            entry.route_key == key
+                                || entry.route_key.starts_with(&format!("{key}/"))
                         })
                         .cloned(),
                 );
@@ -230,8 +297,12 @@ pub(crate) fn select_in_order(
             }
         }
     }
-    let mut error = last.unwrap_or_else(|| attempt(&std::collections::HashSet::new()).unwrap_err());
+    let mut error = last.unwrap_or_else(|| attempt(&std::collections::HashSet::new(), None, None).unwrap_err());
     error.rejected = rejected;
+    if let Some((reset, route)) = earliest_reset {
+        error.earliest_reset = Some(reset);
+        error.earliest_reset_route = route;
+    }
     Err(error)
 }
 

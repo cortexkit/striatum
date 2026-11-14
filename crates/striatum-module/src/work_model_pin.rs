@@ -158,38 +158,7 @@ pub(crate) fn select_with_availability(
     if facts.is_empty() {
         return Err(refuse("unknown_model", format!("unknown model {model:?} for provider {provider:?}; valid variants: none (unknown model)")));
     }
-    let mut variant_warning = None;
-    if let Some(variant) = variant {
-        match catalog.and_then(|catalog| {
-            variant_policy::published(catalog, catalog_targets, provider, model)
-        }) {
-            Some(PublishedEfforts::Published(values)) => {
-                if !values.iter().any(|value| value == variant) {
-                    return Err(refuse(
-                        "invalid_model_variant",
-                        format!(
-                            "unknown variant {variant:?} for {identity}; valid variants: {}",
-                            variant_policy::render(values)
-                        ),
-                    ));
-                }
-            }
-            unknown => {
-                let why = match (catalog, unknown) {
-                    (None, _) => "no reasoning catalog is attached yet",
-                    (Some(_), Some(PublishedEfforts::Unread)) => {
-                        "the catalog has not been read for this model yet"
-                    }
-                    (Some(_), _) => "the catalog has no row for this model",
-                };
-                let warning = format!(
-                    "variant {variant} for {identity} not checked: {why}; the runner decides whether it is admitted"
-                );
-                eprintln!("[striatum] WARN: {pin}: {warning}");
-                variant_warning = Some(warning);
-            }
-        }
-    }
+    let variant_warning = validate_variant(pin, provider, model, variant, catalog, catalog_targets)?;
     let mut fact = facts
         .iter()
         .find(|fact| fact.variant.as_deref() == variant)
@@ -326,6 +295,42 @@ pub(crate) fn select_with_availability(
     selected.explanation = vec![format!("model pinned by head: {pin}; hard admission only")];
     selected.explanation.extend(variant_warning);
     Ok(selected)
+}
+
+/// Validate an explicit effort without silently substituting a policy default.
+pub(crate) fn validate_variant(
+    pin: &str,
+    provider: &str,
+    model: &str,
+    variant: Option<&str>,
+    catalog: Option<&ReasoningCatalog>,
+    catalog_targets: &BTreeMap<String, String>,
+) -> Result<Option<String>, Refusal> {
+    let Some(variant) = variant else { return Ok(None) };
+    let identity = format!("{provider}/{model}");
+    match catalog.and_then(|catalog| {
+        variant_policy::published(catalog, catalog_targets, provider, model)
+    }) {
+        Some(PublishedEfforts::Published(values)) => {
+            if !values.iter().any(|value| value == variant) {
+                return Err(refuse("invalid_model_variant", format!(
+                    "unknown variant {variant:?} for {identity}; valid variants: {}",
+                    variant_policy::render(values)
+                )));
+            }
+            Ok(None)
+        }
+        unknown => {
+            let why = match (catalog, unknown) {
+                (None, _) => "no reasoning catalog is attached yet",
+                (Some(_), Some(PublishedEfforts::Unread)) => "the catalog has not been read for this model yet",
+                (Some(_), _) => "the catalog has no row for this model",
+            };
+            let warning = format!("variant {variant} for {identity} not checked: {why}; the runner decides whether it is admitted");
+            eprintln!("[striatum] WARN: {pin}: {warning}");
+            Ok(Some(warning))
+        }
+    }
 }
 
 #[cfg(test)]
