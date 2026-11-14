@@ -1254,7 +1254,12 @@ async fn handle_select_request_attempt(
         let principal = route_principal(channel, epoch);
         let request: serde_json::Value = serde_json::from_slice(&frame.body).unwrap_or_default();
         let call = (envelope.method == account_selection::ACCOUNT_FOR_OP).then(|| {
-            account_selection::call_log::AccountCall::legacy(&request["params"], &principal, store)
+            account_selection::call_log::AccountCall::legacy(
+                &request["params"],
+                &principal,
+                Some(&live_config),
+                store,
+            )
         });
         let reply = crate::account_refusal_log::record(
             &envelope.method,

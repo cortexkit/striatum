@@ -107,11 +107,26 @@ Routing decision: the durable selected route, request, candidate explanations, p
   while concurrency enforcement is off. `routing account call` has fixed members
   `surface` (`route.account_for` for legacy or `routing/v1`), `principal` (the
   authenticated route principal), `runner_module`, `scope_kind`, `scope_owner`,
-  `consumer` (the bound decision's consumer), `harness`, and `head_call`.
+  `consumer` (the bound decision's consumer), `harness`, `head_call`, and
+  `head_call_source` (`scope`, `head_turn`, or null).
   Missing facts are JSON null. Scope facts come from the daemon-provided route
   `scope_authority` (not request metadata), including
-  when a runner module authorises the call; only scope kind `head` marks a head
-  call. Legacy calls are never head calls. The harness is only the legacy
+  when a runner module authorises the call. Scope kind `head` marks a head
+  call on routing/v1, independently of the optional boolean `head_turn` member
+  from routing contract 0.7.29 (`account_head_turn`, conformance kit 0.10.33).
+  The member is valid in every mode, including `continue`, and defaults to false.
+  It marks a head call only when the daemon-stamped route principal is
+  `reserved:<module>` (a reserved module id the daemon attests, which no
+  request body can claim) and that module is enrolled in routing's `runners`
+  settings. Other callers' flags are
+  ignored, not refused; other authorization rules still apply. Scope wins when
+  both sources mark the call. A head call still occupies a concurrency slot;
+  it is exempt only from the concurrency refusal, without changing priority,
+  eligibility or account choice.
+  The caller-bearing account shape also reads this boolean under the same
+  trust rule as a **legacy-only extension**, removed with the legacy path;
+  it is not a contract-defined wire shape. Legacy route scopes do not mark
+  head calls. The harness is only the legacy
   request's `caller.harness`; routing/v1 has no harness member, so logs null,
   never the runner module or the decision's selected harness. Harness does not
   affect admission identity, allocation or cap counts.

@@ -394,6 +394,13 @@ pub(crate) fn continue_account_with_call(
                     // Excluding this run's signed-out credentials is not missing
                     // authorization: it is waiting for a different usable account.
                     let code = if !signed_out.is_empty() && code == "auth_required" { "account_pool_exhausted".into() } else { code };
+                    // The run's conversation waits until the hold's `until_ms`,
+                    // which may come before the refusal's own reset.
+                    if code == "concurrency_full" {
+                        if let Some(at) = until {
+                            tx.retime_waiter(&(principal.to_owned(), admitted.conversation_hash.clone()), at, ctx.now_ms);
+                        }
+                    }
                     let mut hold=ContinueHold::new(code,json!("no compatible account is available"));
                     hold.until_ms=until.map(|at|at as u64);
                     Ok(ContinueAnswer::Hold(hold))

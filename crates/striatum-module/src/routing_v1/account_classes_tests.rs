@@ -599,7 +599,7 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
     );
 }
 
-fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
+pub(super) fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
     use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
     use std::sync::atomic::{AtomicU64, Ordering};
     static VERSION: AtomicU64 = AtomicU64::new(1);

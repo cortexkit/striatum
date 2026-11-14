@@ -6,6 +6,8 @@
 use super::*;
 use crate::account_state::InflightScope;
 
+mod waiter_tests;
+
 const T: u64 = 1_790_683_200_000;
 const A: &str = "account-1";
 const B: &str = "account-2";
@@ -382,6 +384,13 @@ async fn enforced_head_call_continue_is_offered_a_full_replacement_over_its_cap(
             "the offer's reservation is the overshoot"
         );
         assert!(pressure().is_empty());
+        // A head call is never refused, so it records no waiter.
+        assert!(crate::account_state::snapshot(harness.store())
+            .unwrap()
+            .waiters
+            .live(T as i64)
+            .next()
+            .is_none());
         // Using the offer moves the run's hold to B: B's count stays, A's falls.
         result(
             consumer
