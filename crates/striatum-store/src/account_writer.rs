@@ -312,6 +312,23 @@ pub struct AccountReply<T>(
 );
 
 impl<T> AccountReply<T> {
+    /// [`Self::wait`], giving up after `bound` with
+    /// [`crate::ACCOUNT_STATE_LOAD_PENDING`]; the queued command still runs.
+    pub(crate) fn wait_load(self, bound: std::time::Duration) -> RouteStateResult<T> {
+        match self.0.recv_timeout(bound) {
+            Ok(result) => {
+                evaluation_snapshot::record_stage_timing(*self.1.lock().unwrap());
+                result
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(err(format!(
+                "{} {}ms; retry the operation",
+                crate::ACCOUNT_STATE_LOAD_PENDING,
+                bound.as_millis()
+            ))),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
+        }
+    }
+
     pub fn wait(self) -> RouteStateResult<T> {
         let result = self.0.recv().unwrap_or_else(|_| Err(stopped()));
         // The connection work ran on the writer, but belongs in this caller's
@@ -505,16 +522,23 @@ impl Drop for AccountWriter {
 
 impl SqliteRouteStateStore {
     pub(crate) fn initialize_account_writer_state(&self) -> RouteStateResult<()> {
+        let bound = self
+            .account_state
+            .get()
+            .map_or(std::time::Duration::from_secs(60), |bridge| bridge.load_wait());
         let result = self
             .account_writer_engine()
             .enqueue_inner(|_, _| Ok(()), true)
-            .and_then(AccountReply::wait);
+            .and_then(|reply| reply.wait_load(bound));
         // A load that failed reports itself, but a writer that could not run
         // the barrier (no connection, a stopped or never-started thread) does
         // not: tell the publisher, so readers waiting for the first
-        // publication get the error instead of waiting forever.
+        // publication get the error instead of waiting forever. A load still
+        // running is not a failure: it publishes when it ends.
         if let (Err(error), Some(bridge)) = (&result, self.account_state.get()) {
-            bridge.failed(&error.to_string());
+            if !error.to_string().contains(crate::ACCOUNT_STATE_LOAD_PENDING) {
+                bridge.failed(&error.to_string());
+            }
         }
         result
     }

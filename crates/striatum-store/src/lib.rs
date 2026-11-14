@@ -1212,7 +1212,7 @@ mod evaluation_snapshot;
 mod account_writer;
 pub use account_writer::{AccountCommandKind, AccountReply, STATE_DIVERGED};
 mod account_state;
-pub use account_state::{AccountStateBridge, AccountWorkingState};
+pub use account_state::{AccountStateBridge, AccountWorkingState, ACCOUNT_STATE_LOAD_PENDING};
 #[cfg(any(test, feature = "test-support"))]
 pub use evaluation_snapshot::record_stage_timing_for_test;
 pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};

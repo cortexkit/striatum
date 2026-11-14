@@ -222,14 +222,69 @@ fn a_stalled_first_load_answers_a_request_within_the_bound() {
     let error = answer.unwrap_err().to_string();
     assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
     resume.send(()).unwrap();
-    loader.join().unwrap().unwrap();
+    // The installer waits within the same bound: it may have answered that
+    // the load is still running before the load was resumed.
+    if let Err(error) = loader.join().unwrap() {
+        assert!(error.to_string().contains(super::FIRST_LOAD_PENDING), "{error}");
+    }
     request.join().unwrap();
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
     super::initialize(&store).unwrap();
     assert_eq!(
         owner.loads.load(Ordering::Relaxed),
         1,
         "the request queued no second load"
     );
+}
+
+/// The installing caller and a retry after a failed first load wait on the
+/// load within the same bound as a reader; the load keeps running and
+/// publishes when it ends, without a second load.
+#[test]
+fn a_stalled_load_answers_its_installer_and_its_retry_within_the_bound() {
+    let (_scratch, store) = fixture("state-startup-stalled-installer");
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(200, Ordering::Relaxed);
+    let owner = Arc::new(StateOwner::default());
+    let (resume, paused) = mpsc::channel::<()>();
+    let paused = std::sync::Mutex::new(paused);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        if first.swap(false, Ordering::Relaxed) {
+            return Err(RouteStateStoreError("first load failed".into()));
+        }
+        let _ = paused.lock().unwrap().recv();
+        Ok(())
+    }));
+    let bounded = |what: &str, call: Box<dyn FnOnce() -> RouteStateResult<()> + Send>| {
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || answered.send(call()).unwrap());
+        answer
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{what} waited past the bound"))
+    };
+    let installing = store.clone();
+    let driver = owner.clone();
+    let installed = bounded(
+        "the installer",
+        Box::new(move || installing.install_account_state_bridge(driver)),
+    );
+    assert!(installed.unwrap_err().to_string().contains("first load failed"));
+    let retrying = store.clone();
+    let retried = bounded("the retry", Box::new(move || super::initialize(&retrying)));
+    let error = retried.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    let asking = store.clone();
+    let asked = bounded("a reader during the retry", Box::new(move || super::initialize(&asking)));
+    let error = asked.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    resume.send(()).unwrap();
+    let ready = store.clone();
+    bounded("the reader after the load", Box::new(move || {
+        super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
+        super::initialize(&ready)
+    }))
+    .unwrap();
+    assert_eq!(owner.loads.load(Ordering::Relaxed), 2, "one failed load, one retry");
 }
 
 #[test]

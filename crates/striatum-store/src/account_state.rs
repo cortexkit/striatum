@@ -34,7 +34,18 @@ pub trait AccountStateBridge: Send + Sync {
     }
     /// Ask the writer to reload before its next batch.
     fn request_reload(&self) {}
+    /// The longest a caller waits on a load of the state: the installing
+    /// caller and a retry after a failed load. A load still running after it
+    /// keeps running and publishes; the caller gets
+    /// [`ACCOUNT_STATE_LOAD_PENDING`].
+    fn load_wait(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(60)
+    }
 }
+
+/// The start of the error a caller gets when a load of the account state is
+/// still running at the end of its wait.
+pub const ACCOUNT_STATE_LOAD_PENDING: &str = "account state not loaded within";
 
 pub(crate) struct WriterAccountState {
     bridge: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,

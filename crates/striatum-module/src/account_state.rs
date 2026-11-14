@@ -196,7 +196,7 @@ fn first_load_wait() -> std::time::Duration {
 
 /// The start of the error a reader gets when the first load is still
 /// running at the end of the wait.
-const FIRST_LOAD_PENDING: &str = "account state not loaded within";
+const FIRST_LOAD_PENDING: &str = striatum_store::ACCOUNT_STATE_LOAD_PENDING;
 
 /// Publication swaps one Arc under a short write lock;
 /// readers only hold the read lock long enough to clone it. This provides
@@ -257,6 +257,16 @@ impl AccountStateBridge for StateOwner {
 
     fn request_reload(&self) {
         self.reload.store(true, Ordering::Release);
+        // Before anything is published, a reload is a new first load:
+        // readers wait for it (within the bound) rather than answering the
+        // failure of the load before it and queueing yet another.
+        if self.published.read().unwrap().is_none() {
+            *self.ready.0.lock().unwrap() = None;
+        }
+    }
+
+    fn load_wait(&self) -> std::time::Duration {
+        first_load_wait()
     }
 }
 
