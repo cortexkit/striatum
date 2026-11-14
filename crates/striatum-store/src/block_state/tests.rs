@@ -937,3 +937,113 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     assert!(tombstone, "a cleared clock");
     assert!(replaced_rowid, "a key moved to a new rowid");
 }
+
+/// Resident memory in bytes, from `/proc/self/statm`; 0 where unavailable.
+fn resident_bytes() -> i64 {
+    std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|statm| statm.split_whitespace().nth(1)?.parse::<i64>().ok())
+        .map_or(0, |pages| pages * 4096)
+}
+
+/// Seed the block tables at `scale` times the live store's row counts (read
+/// from production when this was written), plus `eligibility` rows.
+fn seed_live_sized(rig: &Rig, scale: usize, eligibility: usize) {
+    let n = |live: usize| live * scale;
+    let mut sql = String::new();
+    for i in 0..n(71) {
+        let id = if i % 5 == 0 {
+            format!("credential-quota:[\"p{}\",\"c{i}\"]:hold", i % 8)
+        } else {
+            format!("fence-{i}")
+        };
+        let cleared = if i % 3 == 0 { "NULL".to_owned() } else { NOW.to_string() };
+        sql += &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('{id}','p{}','a{i}','{{}}','{{\"reset\":{{\"at_ms\":{}}}}}','broca_account_limit',{},'x',{},NULL,'[]',{cleared});\n", i % 8, NOW + 3_600_000, NOW - i as i64, NOW - i as i64);
+    }
+    for i in 0..n(4) {
+        sql += &format!("INSERT INTO credential_entitlement_fences VALUES ('p{}','c{i}','billing_exhausted','l{i}',{});\n", i % 8, NOW - i as i64);
+    }
+    for i in 0..n(2) {
+        sql += &format!("INSERT INTO account_route_fence VALUES ('p{}','c{i}','m{i}',{},'d',{NOW},{NOW},'quota');\n", i % 8, NOW + 3_600_000);
+    }
+    for i in 0..n(4) {
+        sql += &format!("INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,updated_at) VALUES ('p{}','k{i}',{},'billing',{NOW});\n", i % 8, NOW + 3_600_000);
+    }
+    for i in 0..n(8) {
+        sql += &format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_unscoped,last_error,last_error_at,updated_at) VALUES ('p{i}',{},{NOW},1,'provider capacity',{NOW},{NOW});\n", NOW + 600_000);
+    }
+    for i in 0..n(850) {
+        let wall = if i % 50 == 0 { (NOW + 600_000).to_string() } else { "NULL".into() };
+        sql += &format!("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,wall_unscoped,last_error_at,updated_at) VALUES ('p{}/m{i}','p{}/m{i}','p{}','m{i}',{wall},{NOW},1,{NOW},{NOW});\n", i % 8, i % 8, i % 8);
+    }
+    for i in 0..n(2) {
+        sql += &format!("INSERT INTO account_transient_backoff VALUES ('p{}','a{i}',{},{NOW},'k{i}','[]');\n", i % 8, NOW + 600_000);
+    }
+    for i in 0..eligibility {
+        sql += &format!("INSERT INTO account_eligibility VALUES ('p{}','c{}','m{i}','l0','model_unsupported',{NOW});\n", i % 8, i % 40);
+    }
+    rig.sql(sql);
+    rig.run(fence_rechecks::sync);
+    let authorizations = n(6);
+    rig.run(move |conn| {
+        conn.execute(
+            &format!("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation) SELECT 'owner'||rowid,kind,origin_key,evidence,evidence_at,{NOW},1 FROM fence_recheck LIMIT {authorizations}"),
+            [],
+        )?;
+        Ok(())
+    });
+}
+
+/// Footprint, load and read cost of the block state at the live store's row
+/// counts and at ten times them with 5,000 eligibility rows. Release:
+/// `cargo test --release -p striatum-store --lib live_sized_block_state_costs -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn live_sized_block_state_costs() {
+    for (name, scale, eligibility) in [("live", 1, 0), ("stress x10", 10, 5_000)] {
+        let rig = rig(&format!("block-state-live-{scale}"));
+        seed_live_sized(&rig, scale, eligibility);
+        let memory = rig.published();
+        assert_eq!(memory, rig.fresh());
+        let rounds = 20;
+        let start = std::time::Instant::now();
+        let before = resident_bytes();
+        let copies: Vec<BlockState> = (0..rounds).map(|_| rig.fresh()).collect();
+        let load_us = start.elapsed().as_micros() as f64 / rounds as f64;
+        let bytes = (resident_bytes() - before) / rounds as i64;
+        drop(copies);
+        let start = std::time::Instant::now();
+        for _ in 0..1_000 {
+            let fork = memory.clone();
+            assert!(fork.shares_storage_with(&memory));
+        }
+        let fork_ns = start.elapsed().as_nanos() as f64 / 1_000.0;
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(memory.fence_rechecks(NOW).unwrap());
+        }
+        let rechecks_us = start.elapsed().as_micros() as f64 / 100.0;
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(memory.active_pool_fences("p0").unwrap());
+            std::hint::black_box(memory.eligibility());
+        }
+        let keyed_us = start.elapsed().as_micros() as f64 / 100.0;
+        let sql_us = {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                std::hint::black_box(rig.store.fence_rechecks().unwrap());
+            }
+            start.elapsed().as_micros() as f64 / 100.0
+        };
+        let rows: usize = memory.table_sizes().iter().map(|(_, rows)| rows).sum();
+        eprintln!(
+            "block state {name}: held rows={rows} sizes={:?} resident_bytes/state={bytes} load_us={load_us:.0} fork_ns={fork_ns:.0} fence_rechecks_us={rechecks_us:.0} (sql {sql_us:.0}) pool_fences+eligibility_us={keyed_us:.0}",
+            memory
+                .table_sizes()
+                .into_iter()
+                .filter(|(_, rows)| *rows > 0)
+                .collect::<Vec<_>>()
+        );
+    }
+}
