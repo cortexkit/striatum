@@ -704,6 +704,7 @@ pub(crate) fn claim(
     claim_decided(conn, None, origins, now, None, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn claim_with_authorization(
     conn: &Connection,
     origins: &[FenceRecheck],
@@ -1244,8 +1245,10 @@ impl AccountTx<'_> {
             if !current { return Ok(false); }
             return self.decision_names_credential(owner, credential);
         }
+        // Named apart from the healing path's identical existence check, so
+        // a read trace can tell which decision ran it.
         let authorized: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)", [owner], |row| row.get(0)).map_err(err)?;
+            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1) AS report_authorized", [owner], |row| row.get(0)).map_err(err)?;
         if !authorized { return Ok(true); }
         if preserve { return Ok(false); }
         let current: bool = self.conn.query_row(
@@ -1280,6 +1283,11 @@ impl AccountTx<'_> {
         let blocks = self.working_blocks()?;
         claim_decided(self.conn, blocks.as_deref(), origins, now, consume_owner, grant_owner, authorization)
             .map_err(err)
+    }
+
+    /// Claim `origins` for a pool key lease, which holds their authorization.
+    pub(crate) fn claim_for_lease(&self, origins: &[FenceRecheck], now: i64, lease: &str) -> RouteStateResult<bool> {
+        self.claim_owned(origins, now, None, None, Some(lease))
     }
 
     /// Hand every clock claimed by `from` to `to`. With a working state each

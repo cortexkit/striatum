@@ -12,9 +12,12 @@
 //! - "route-state snapshot": the clocks `route.select`'s route-state
 //!   snapshot overlays.
 //!
-//! Reads inside the writer are listed, not forbidden: the store's own claim,
-//! heal and sync statements still read the block tables there. The state's
-//! own load and read-backs are counted apart.
+//! Reads inside the writer are listed, not forbidden: the store's own heal,
+//! sync and report statements still read the block tables there. The claim
+//! and probe decisions (claims, decision-probe binding, report matching,
+//! authorization transfer and the anonymous-credential check) decide on the
+//! command's working state, so their SQL must not run on the writer either.
+//! The state's own load and read-backs are counted apart.
 
 use std::collections::BTreeSet;
 
@@ -85,6 +88,64 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
     seen
 }
 
+/// The statements each claim and probe decision ran on the writer when it
+/// decided on SQL. Each runs once through a test seam, whose transaction has
+/// no account state, on a fresh store holding one due provider wall. The
+/// clock synchronization's own statements are left out: it still reads SQL
+/// before every decision.
+fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let store = harness.store();
+    striatum_core::RouteStateStore::record_provider_cooldown(
+        store.as_ref(),
+        "oracle-provider",
+        "oracle-provider/model",
+        "oracle-provider/model",
+        &striatum_core::route_state_store::RouteStateUpdate {
+            observed_at_ms: Some(now - 2 * 3_600_000),
+            cooldown_until: Some((now + 3_600_000) as f64),
+            last_error: Some("provider capacity".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let trace = store.trace_block_reads_for_test().unwrap();
+    store
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+    let sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
+    let origins = store.fence_rechecks().unwrap();
+    assert_eq!(origins.len(), 1, "{origins:?}");
+    trace.take();
+    let mut seen = Vec::new();
+    let mut record = |name: &'static str| {
+        let statements = trace
+            .take()
+            .writer
+            .into_iter()
+            .filter(|sql| !sync.contains(sql))
+            .collect();
+        seen.push((name, statements));
+    };
+    store
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, now, Some("first")))
+        .unwrap();
+    record("claim");
+    store
+        .account_transaction(|tx| tx.probe_report_matches("first", None, false))
+        .unwrap();
+    record("report matches probe");
+    store
+        .account_transaction(|tx| tx.probe_authorization_names_credential("first", "c", "model"))
+        .unwrap();
+    record("authorization names credential");
+    store
+        .account_transaction(|tx| tx.transfer_probe_authorization("first", "second"))
+        .unwrap();
+    record("authorization transfer");
+    seen
+}
+
 #[tokio::test]
 async fn request_paths_read_no_block_table_outside_the_writer() {
     let now = 1_800_000_000_000;
@@ -116,6 +177,18 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         let trace = store.trace_block_reads_for_test().unwrap();
         oracle_reads_text(store, trace)
     };
+    // Negatives for the decisions: the trace sees each one's SQL.
+    let decisions = decision_oracle(now as i64);
+    for (name, statements) in &decisions {
+        assert!(
+            !statements.is_empty(),
+            "the trace missed {name}'s SQL: {decisions:?}"
+        );
+    }
+    let decision_text: BTreeSet<String> = decisions
+        .into_iter()
+        .flat_map(|(_, statements)| statements)
+        .collect();
     let trace = store.trace_block_reads_for_test().unwrap();
     let switched = switched();
     let mut writer_reads = Vec::new();
@@ -138,6 +211,15 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         assert!(
             switched_on_writer.is_empty(),
             "{op} ran a switched reader's SQL on the writer: {switched_on_writer:#?}"
+        );
+        let decided_on_sql: Vec<_> = seen
+            .writer
+            .iter()
+            .filter(|sql| decision_text.contains(sql.as_str()))
+            .collect();
+        assert!(
+            decided_on_sql.is_empty(),
+            "{op} decided a claim or probe on SQL: {decided_on_sql:#?}"
         );
         writer_reads.push((op.to_owned(), seen.writer, seen.exempt, seen.maintenance));
     };

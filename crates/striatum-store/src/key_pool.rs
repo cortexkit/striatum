@@ -651,7 +651,7 @@ impl crate::AccountTx<'_> {
                 }
                 if still_admissible {
                     let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,workspace,credential)).cloned().collect();
-                    if !crate::fence_rechecks::claim_with_authorization(conn,&origins,now,lease)? {return Err(rusqlite::Error::InvalidQuery);}
+                    if !self.claim_for_lease(&origins,now,lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
                     if !origins.is_empty() {conn.execute("UPDATE pool_key_lease SET fence_probe=1 WHERE lease_id=?1",[lease])?;}
                     let valid_until = now.saturating_add(request.lease_ms);
                     conn.execute(
@@ -689,7 +689,7 @@ impl crate::AccountTx<'_> {
             };
             let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,&pick.workspace,&pick.credential_id)).cloned().collect();
             let lease = lease_id(now);
-            if !crate::fence_rechecks::claim_with_authorization(conn,&origins,now,&lease)? {return Err(rusqlite::Error::InvalidQuery);}
+            if !self.claim_for_lease(&origins,now,&lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
             let valid_until = now.saturating_add(request.lease_ms);
             conn.execute(
                 "INSERT INTO pool_key_lease
