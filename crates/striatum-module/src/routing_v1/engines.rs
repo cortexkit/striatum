@@ -258,7 +258,8 @@ fn select_request(
     for candidate in &mut candidates {
         candidate.cost = if media.is_some() {
             // Offers are caller-owned, even when their names collide with a
-            // catalog route. The pinned Engine declaration has no cost member.
+            // catalog route. The media contract's `Engine` declaration carries
+            // no cost, so a caller-local offer stays unpriced.
             if candidate.selected.caller_local {
                 None
             } else {

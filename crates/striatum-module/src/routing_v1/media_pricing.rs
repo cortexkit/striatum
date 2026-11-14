@@ -74,9 +74,10 @@ pub(super) fn estimate(
         if matches!(rate.state.as_deref(), Some("stated_zero" | "not_billed")) {
             continue;
         }
-        // This closed pair is the only non-transcription unit served by the
-        // pinned catalog with a request quantity. Bytes are a ceiling on UTF-8
-        // characters, not an exact character count; tokens have no conversion.
+        // Outside transcription, the only catalog rate a media request can
+        // measure is speech's per-character input rate. The request carries
+        // UTF-8 bytes, a ceiling on the character count, not an exact count;
+        // per-token rates have no request quantity to convert from.
         let quantity = match (request.kind.as_str(), key.as_str()) {
             ("synthesize", "rate.input.per_character") => request.requirements.input_bytes? as f64,
             _ => return None,
