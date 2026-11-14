@@ -47,6 +47,7 @@ impl AccountTx<'_> {
     }
 
     pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
+        self.reconcile_block_state()?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
         self.sync_fence_rechecks()

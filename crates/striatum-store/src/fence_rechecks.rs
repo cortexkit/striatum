@@ -1269,6 +1269,8 @@ impl AccountTx<'_> {
         if !enabled(self.conn).map_err(err)? { return Ok(true); }
         sync(self.conn).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
+            // The answer gates the report's effects and healing.
+            self.check_probe_inputs(&blocks, owner, !preserve)?;
             let authorizations = blocks.authorizations_of(owner);
             if authorizations.is_empty() { return Ok(true); }
             if preserve { return Ok(false); }
@@ -1340,6 +1342,95 @@ impl AccountTx<'_> {
             crate::block_state::expect_changes(changed, 1,
                 format_args!("rebind of {} {} from {from}", clock.kind, clock.origin_key)).map_err(err)?;
         }
+        // No clock the state does not show may still be claimed by `from`.
+        let left = self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+            params![from,to]).map_err(err)?;
+        crate::block_state::expect_changes(left, 0, format_args!("clocks claimed by {from} the state does not hold"))
+            .map_err(err)
+    }
+
+    /// Fail with [`crate::block_state::diverged`] if SQL holds an uncleared
+    /// clock on `row`'s authorized evidence and generation, which the working
+    /// state decided it does not. With `model`, only a non-quota clock of
+    /// that model or of every model counts, as for a neutral release. The
+    /// update sets nothing, so it is a keyed check, not a change.
+    fn expect_no_authorized_clock(
+        &self,
+        row: &crate::block_state::ProbeAuthorization,
+        model: Option<&str>,
+    ) -> RouteStateResult<()> {
+        let keyed = "UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
+            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5";
+        let changed = match model {
+            None => self.conn.execute(keyed, params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
+            Some(model) => self.conn.execute(&format!("{keyed} AND quota=0 AND (model IS NULL OR model=?6)"),
+                params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation,model]),
+        }
+        .map_err(err)?;
+        crate::block_state::expect_changes(changed, 0,
+            format_args!("authorized clock of {} {} for {}", row.kind, row.origin_key, row.owner)).map_err(err)
+    }
+
+    /// Compare what a decision read about `owner`'s probe from the working
+    /// state with SQL, keyed by the owner and the origins it holds: its
+    /// authorization rows and, with `clocks`, the clock of each. A decision
+    /// that only reads (whether a report settles a probe, whether a probe
+    /// names a credential) writes nothing a keyed update could check, so it
+    /// checks its inputs instead.
+    fn check_probe_inputs(
+        &self,
+        blocks: &crate::BlockState,
+        owner: &str,
+        clocks: bool,
+    ) -> RouteStateResult<()> {
+        use crate::block_state::{diverged, ProbeAuthorization, STATE_CHECK};
+        let held = blocks.authorizations_of(owner);
+        let stored = self
+            .conn
+            .prepare_cached(&format!("{STATE_CHECK} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key"))
+            .map_err(err)?
+            .query_map([owner], |r| {
+                Ok(ProbeAuthorization {
+                    owner: r.get(0)?,
+                    kind: r.get(1)?,
+                    origin_key: r.get(2)?,
+                    evidence: r.get(3)?,
+                    evidence_at: r.get(4)?,
+                    claimed_at: r.get(5)?,
+                    claim_generation: r.get(6)?,
+                })
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        if stored != held {
+            return Err(err(diverged(format_args!("authorizations of {owner}: state {held:?}, SQL {stored:?}"))));
+        }
+        if !clocks {
+            return Ok(());
+        }
+        for row in &held {
+            let shown = blocks.clock(&row.kind, &row.origin_key).map(|(clock, cleared)| {
+                (clock.evidence.clone(), clock.evidence_at, clock.claim_generation, clock.scope.credential_id.clone(),
+                    clock.scope.model.clone(), cleared)
+            });
+            let stored = self
+                .conn
+                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at
+                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2"))
+                .map_err(err)?
+                .query_row([&row.kind, &row.origin_key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                })
+                .optional()
+                .map_err(err)?;
+            if stored != shown {
+                return Err(err(diverged(format_args!(
+                    "clock of {} {}: state {shown:?}, SQL {stored:?}", row.kind, row.origin_key
+                ))));
+            }
+        }
         Ok(())
     }
 
@@ -1387,11 +1478,14 @@ impl AccountTx<'_> {
             // Consume each clock still on the authorized evidence and
             // generation, keyed and naming the state it was decided on.
             for row in &held {
-                let Some((clock, None)) = blocks.clock(&row.kind, &row.origin_key) else { continue };
-                if clock.evidence != row.evidence || clock.evidence_at != row.evidence_at
-                    || clock.claim_generation != row.claim_generation {
+                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
+                    cleared.is_none() && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.claim_generation == row.claim_generation
+                });
+                let Some((clock, _)) = held_clock else {
+                    self.expect_no_authorized_clock(row, None)?;
                     continue;
-                }
+                };
                 let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3+CASE WHEN quota=1 THEN ?4 WHEN ?6 THEN 0 ELSE ?5 END,
                     claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
                     WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(7)),
@@ -1526,14 +1620,13 @@ impl AccountTx<'_> {
                             clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
                                 && clock.claim_generation == row.claim_generation
                         });
-                        if !current {
-                            continue;
-                        }
+                        // Run for a clock the state calls superseded too: SQL
+                        // must then change nothing, or it disagrees.
                         let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
                             claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND cleared_at IS NULL
                             AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6",
                             params![row.kind,row.origin_key,now,row.evidence,row.evidence_at,row.claim_generation]).map_err(err)?;
-                        crate::block_state::expect_changes(changed, 1,
+                        crate::block_state::expect_changes(changed, usize::from(current),
                             format_args!("release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
                     }
                     self.delete_authorizations(&owner, Some(&held))?;
@@ -1567,6 +1660,8 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<bool> {
         sync(self.conn).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
+            // The answer decides whether the report may heal the probe.
+            self.check_probe_inputs(&blocks, owner, true)?;
             let clocks = blocks.live_clocks();
             return Ok(blocks.authorizations_of(owner).iter().any(|row| {
                 clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
@@ -1640,13 +1735,16 @@ impl AccountTx<'_> {
         if let Some(blocks) = self.working_blocks()? {
             let held = blocks.authorizations_of(owner);
             for row in &held {
-                let Some((clock, None)) = blocks.clock(&row.kind, &row.origin_key) else { continue };
-                if clock.lifetime == LifetimeClass::Quota
-                    || clock.scope.model.as_deref().is_some_and(|named| named != model)
-                    || clock.evidence != row.evidence || clock.evidence_at != row.evidence_at
-                    || clock.claim_generation != row.claim_generation {
+                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
+                    cleared.is_none() && clock.lifetime != LifetimeClass::Quota
+                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
+                        && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.claim_generation == row.claim_generation
+                });
+                let Some((clock, _)) = held_clock else {
+                    self.expect_no_authorized_clock(row, Some(model))?;
                     continue;
-                }
+                };
                 let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3,claim_owner=NULL
                     WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(4)),
                     params![row.kind,row.origin_key,now,clock.evidence,clock.evidence_at,false,clock.next_recheck_at,

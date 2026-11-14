@@ -143,6 +143,12 @@ impl Rig {
             })
             .unwrap();
         assert_eq!(memory.view_origins(), view, "view rows: {context}");
+        let stored = self.store.with_reader_for_test(sql_fingerprints).unwrap();
+        assert_eq!(
+            memory.fingerprints(),
+            stored,
+            "the periodic reconcile's counts and rowids: {context}"
+        );
         for &now in times {
             let derived = memory.blocks(now).unwrap();
             let mut sql = self.store.load_blocks(now).unwrap();
@@ -829,6 +835,211 @@ fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission(
         "only the serving login's route, and its account's block on the covered pool, heal"
     );
     rig.check(&[NOW], "after the heal");
+}
+
+/// A refusal of credential `c` on provider `p0`, two hours old, whose
+/// one-hour probe is due at `NOW`, with its clock stored.
+fn due_credential_refusal(rig: &Rig, credential: &str) {
+    rig.sql(format!(
+        "INSERT INTO credential_entitlement_fences VALUES ('p0','{credential}','billing_exhausted',NULL,{});",
+        NOW - 2 * 3_600_000
+    ));
+    rig.run(fence_rechecks::sync);
+}
+
+impl Rig {
+    /// Make the next batch decide on `stale` instead of a fresh load, and
+    /// return the load count before it.
+    fn decide_next_on(&self, stale: BlockState) -> u64 {
+        let loads = self.owner.loads.load(Ordering::Relaxed);
+        self.owner.stale.lock().unwrap().push(stale);
+        self.owner.request_reload();
+        loads
+    }
+
+    fn loads_since(&self, loads: u64) -> u64 {
+        self.owner.loads.load(Ordering::Relaxed) - loads
+    }
+}
+
+/// Whether a report settles a decision's probe, and whether a probe names a
+/// credential, are answered from the working state and write nothing a
+/// keyed update could check. Each checks the authorization and clock rows
+/// it read against SQL, so a state from before the decision's grant runs
+/// again on a fresh load instead of answering as if there were no probe.
+#[test]
+fn probe_answers_read_from_a_stale_state_run_again_on_a_fresh_load() {
+    let rig = rig("block-state-checked-probe-reads");
+    due_credential_refusal(&rig, "c0");
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    let before_the_grant = rig.published();
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.grant_fence_rechecks(&origins, NOW, Some("decision"))
+        })
+        .unwrap());
+
+    let loads = rig.decide_next_on(before_the_grant.clone());
+    let settles = rig
+        .store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.probe_report_matches("decision", None, true)
+        })
+        .unwrap();
+    assert!(!settles, "a preserved report never settles the decision's probe");
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+
+    let loads = rig.decide_next_on(before_the_grant);
+    let names = rig
+        .store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.probe_authorization_names_credential("decision", "c0", "m0")
+        })
+        .unwrap();
+    assert!(names, "the decision's probe names the refused credential");
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+}
+
+/// An unstarted admission's probe is released only on the generation it
+/// holds. A state that shows the clock on a later generation, while SQL
+/// still holds the admission's, must not skip the release: the keyed update
+/// it runs anyway finds the row, and the batch runs again on a fresh load.
+#[test]
+fn an_admission_release_the_state_calls_superseded_runs_again_on_a_fresh_load() {
+    let rig = rig("block-state-checked-release");
+    due_credential_refusal(&rig, "c0");
+    rig.store
+        .with_writer_for_test(|conn| {
+            conn.execute_batch("PRAGMA foreign_keys=OFF")?;
+            conn.execute(
+                "INSERT INTO account_admission (principal, admission_id, request_fingerprint,
+                   request_mode, decision_id, conversation_hash, provider, model, account_id,
+                   credential_id, pin_id, pin_generation, state, charged, request_bytes,
+                   request_bytes_estimated, committed_at, admission_valid_until,
+                   lease_valid_until, reply_json)
+                 VALUES ('x','adm','fp','admit','d','conv','p0','m0','a0','c0','pin',1,'reserved',
+                   0,0,0,?1,?1,?1,'{}')",
+                [NOW - 60_000],
+            )?;
+            conn.execute_batch("PRAGMA foreign_keys=ON")
+        })
+        .unwrap();
+    rig.sql("SELECT 1;".into());
+    let owner = serde_json::json!(["account_admission", "x", "adm"]).to_string();
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    let granted = owner.clone();
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.grant_fence_rechecks(&origins, NOW, Some(&granted))
+        })
+        .unwrap());
+    // A state whose clock is one generation past the admission's, while
+    // SQL keeps the admission's generation.
+    rig.sql("UPDATE fence_recheck SET claim_generation=claim_generation+1 WHERE kind='credential';".into());
+    let superseded = rig.published();
+    rig.sql("UPDATE fence_recheck SET claim_generation=claim_generation-1 WHERE kind='credential';".into());
+    let generation = |rig: &Rig| {
+        rig.store
+            .with_reader_for_test(|conn| {
+                conn.query_row(
+                    "SELECT claim_generation,claim_owner FROM fence_recheck WHERE kind='credential'",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+            })
+            .unwrap()
+    };
+    let (held, _) = generation(&rig);
+    let loads = rig.decide_next_on(superseded);
+    let released = rig
+        .store
+        .account_command(AccountCommandKind::Tick, move |tx| {
+            tx.release_admission_probes(vec![("x".into(), "adm".into(), owner.clone())], NOW + 1)
+        })
+        .unwrap();
+    assert_eq!(released.released, 1);
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+    assert_eq!(
+        generation(&rig),
+        (held + 1, None),
+        "the admission's generation was released"
+    );
+    rig.check(&[NOW], "after the release");
+}
+
+/// Binding a selection's probes to its decision moves every clock the
+/// selection claimed. A state that misses one of them must not leave it
+/// claimed by the selection: the leftover check finds it, and the batch runs
+/// again on a fresh load.
+#[test]
+fn a_rebind_leaves_no_clock_claimed_by_the_old_owner() {
+    let rig = rig("block-state-checked-rebind");
+    due_credential_refusal(&rig, "c0");
+    due_credential_refusal(&rig, "c1");
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    assert_eq!(origins.len(), 2, "{origins:?}");
+    let first = vec![origins[0].clone()];
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.grant_fence_rechecks(&first, NOW, Some("selection"))
+        })
+        .unwrap());
+    let before_the_second = rig.published();
+    rig.sql(format!(
+        "UPDATE fence_recheck SET claim_owner='selection' WHERE kind='credential' AND origin_key='{}';",
+        origins[1].origin_key
+    ));
+    let claimed = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    let loads = rig.decide_next_on(before_the_second);
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.bind_decision_probe(&claimed, "selection", "decision", "a0", "c0", NOW)
+        })
+        .unwrap());
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+    let owners = rig
+        .store
+        .with_reader_for_test(|conn| {
+            conn.prepare("SELECT claim_owner FROM fence_recheck ORDER BY origin_key")?
+                .query_map([], |r| r.get::<_, Option<String>>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap();
+    assert_eq!(owners, [Some("decision".to_owned()), Some("decision".to_owned())]);
+    rig.check(&[NOW], "after the rebind");
+}
+
+/// A block write the capture misses (nothing reports it) leaves the state
+/// behind SQL. The periodic tick compares each table's held-row count and
+/// highest rowid with SQL, counts the difference and has the state reloaded.
+#[test]
+fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
+    let rig = rig("block-state-reconcile");
+    let row = |account: &str| {
+        format!(
+            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
+            NOW + 60_000
+        )
+    };
+    rig.sql(row("seen"));
+    UNSEEN.with(|unseen| unseen.set(true));
+    rig.store.bypass_account_writer_for_test(&row("unseen")).unwrap();
+    UNSEEN.with(|unseen| unseen.set(false));
+    assert_eq!(rig.store.block_writes_outside_command(), 0, "nothing reported the write");
+    rig.sql("SELECT 1;".into());
+    assert_ne!(rig.published(), rig.fresh(), "the state missed the write");
+    let reloads = block_reconcile_reloads();
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.store
+        .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW))
+        .unwrap();
+    assert_eq!(block_reconcile_reloads() - reloads, 1, "one mismatch counted");
+    assert_eq!(rig.loads_since(loads), 1, "one reload");
+    rig.check(&[NOW], "after the tick");
 }
 
 #[test]

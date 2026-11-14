@@ -230,6 +230,7 @@ pub struct BlockReadTrace {
     writer: Mutex<Vec<String>>,
     exempt: Mutex<Vec<(&'static str, String)>>,
     maintenance: Mutex<usize>,
+    checks: Mutex<usize>,
 }
 
 thread_local! {
@@ -262,6 +263,9 @@ pub struct BlockReads {
     /// Reads made inside a [`declared_exception`], with its reason.
     pub exempt: Vec<(&'static str, String)>,
     pub maintenance: usize,
+    /// Keyed reads a decision made on the writer to check the rows it read
+    /// from the working state against SQL.
+    pub checks: usize,
 }
 
 impl BlockReadTrace {
@@ -271,6 +275,7 @@ impl BlockReadTrace {
             writer: std::mem::take(&mut self.writer.lock().unwrap()),
             exempt: std::mem::take(&mut self.exempt.lock().unwrap()),
             maintenance: std::mem::take(&mut self.maintenance.lock().unwrap()),
+            checks: std::mem::take(&mut self.checks.lock().unwrap()),
         }
     }
 }
@@ -297,6 +302,8 @@ unsafe extern "C" fn on_block_statement(
     }
     if text.contains(crate::block_state::MAINTENANCE_READ) {
         *tap.trace.maintenance.lock().unwrap() += 1;
+    } else if text.contains(crate::block_state::STATE_CHECK) {
+        *tap.trace.checks.lock().unwrap() += 1;
     } else if let Some(reason) = EXCEPTION.with(std::cell::Cell::get) {
         tap.trace
             .exempt

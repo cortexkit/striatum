@@ -1010,6 +1010,9 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn tick(&mut self, now_ms: i64) -> RouteStateResult<()> {
+        // A cheap check that the block state still matches SQL; a mismatch
+        // reloads the state and runs the tick again.
+        self.sql.reconcile_block_state()?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
         self.sql.sync_fence_rechecks()

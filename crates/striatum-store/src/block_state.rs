@@ -83,12 +83,20 @@ thread_local! {
     static CAPTURE: RefCell<Option<Vec<(u8, i64)>>> = const { RefCell::new(None) };
     /// Whether a test seeding seam is writing on this thread.
     static SEEDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether a test makes writes on this thread that the capture misses.
+    #[cfg(test)]
+    pub(crate) static UNSEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Called by the writer connection's update hook. Returns false when no
 /// account command is running on this thread, which means the write bypassed
 /// the account writer.
 pub(crate) fn capture(table: u8, rowid: i64) -> bool {
+    #[cfg(test)]
+    if UNSEEN.with(std::cell::Cell::get) {
+        // A write the capture misses, and nothing reports.
+        return true;
+    }
     CAPTURE.with(|capture| match capture.borrow_mut().as_mut() {
         Some(rows) => {
             rows.push((table, rowid));
@@ -250,6 +258,57 @@ const SELECTS: [&str; 16] = [
 /// Marks the block state's own statements, its load and its read-backs, so
 /// a read trace can tell them from request reads.
 pub(crate) const MAINTENANCE_READ: &str = "/* block state maintenance */";
+
+/// Marks a keyed read a decision makes to check that SQL holds the rows it
+/// read from the working state, where the decision writes nothing a keyed
+/// update could check.
+pub(crate) const STATE_CHECK: &str = "/* block state check */";
+
+/// For each table, the rows the state holds, as a predicate on the table:
+/// the rows some view branch selects (every row for a table whose reader
+/// returns all of them). [`crate::AccountTx::reconcile_block_state`]
+/// compares their count and highest rowid with memory.
+const HELD_ROWS: [&str; 16] = [
+    "cleared_at IS NULL",
+    "1",
+    "1",
+    "1",
+    "walled_until IS NOT NULL OR cooldown_until IS NOT NULL",
+    "1",
+    "cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL OR failure_backoff_until IS NOT NULL",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+    "1",
+];
+
+static RECONCILE_RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the periodic reconcile found the state's rows differing
+/// from SQL and had it reloaded. Any count means a write reached a block
+/// table without the capture seeing it.
+pub fn block_reconcile_reloads() -> u64 {
+    RECONCILE_RELOADS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Each table's held-row count and highest held rowid, read from SQL.
+pub(crate) fn sql_fingerprints(conn: &Connection) -> rusqlite::Result<Vec<(usize, Option<i64>)>> {
+    BLOCK_TABLES
+        .iter()
+        .zip(HELD_ROWS)
+        .map(|(table, held)| {
+            conn.prepare_cached(&format!(
+                "{MAINTENANCE_READ} SELECT count(*),max(rowid) FROM {table} WHERE {held}"
+            ))?
+            .query_row([], |r| Ok((r.get::<_, i64>(0)? as usize, r.get(1)?)))
+        })
+        .collect()
+}
 
 /// The read-back form of [`SELECTS`]: one row by rowid.
 fn select_one(table: usize) -> &'static str {
@@ -766,6 +825,15 @@ impl BlockState {
             .iter()
             .zip(&self.tables)
             .map(|(name, table)| (*name, table.rows.len))
+            .collect()
+    }
+
+    /// Each table's held-row count and highest held rowid, as
+    /// [`sql_fingerprints`] reads them from SQL.
+    pub(crate) fn fingerprints(&self) -> Vec<(usize, Option<i64>)> {
+        self.tables
+            .iter()
+            .map(|table| (table.rows.len, table.rows.iter().map(|(rowid, _)| *rowid).max()))
             .collect()
     }
 
@@ -1476,6 +1544,34 @@ fn view_branch(kind: &str) -> u8 {
 }
 
 impl crate::AccountTx<'_> {
+    /// Compare the working state with SQL cheaply, table by table: the count
+    /// of rows the state holds and the highest of their rowids. A difference
+    /// means some write reached SQL without the capture seeing it; it is
+    /// counted, and the command fails with [`diverged`], so the writer
+    /// reloads the state and runs the batch again. A command without a
+    /// state has nothing to compare.
+    pub fn reconcile_block_state(&self) -> striatum_core::RouteStateResult<()> {
+        let Some(blocks) = self.working_blocks()? else {
+            return Ok(());
+        };
+        let sql = sql_fingerprints(self.conn).map_err(crate::err)?;
+        for ((table, memory), stored) in BLOCK_TABLES.iter().zip(blocks.fingerprints()).zip(sql) {
+            if memory != stored {
+                RECONCILE_RELOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    table,
+                    ?memory,
+                    sql = ?stored,
+                    "block state differs from SQL; reloading it"
+                );
+                return Err(crate::err(diverged(format_args!(
+                    "{table}: state holds {memory:?} (rows, highest rowid), SQL {stored:?}"
+                ))));
+            }
+        }
+        Ok(())
+    }
+
     /// The block tables, read in the state loader's transaction.
     pub fn load_block_state(&self) -> striatum_core::RouteStateResult<BlockState> {
         BlockState::load(self.conn).map_err(crate::err)
