@@ -297,6 +297,11 @@ pub(crate) fn published(store: &SqliteRouteStateStore) -> RouteStateResult<Publi
 }
 
 impl Published<'_> {
+    /// The published block state, or `None` where SQL answers.
+    pub(crate) fn block_state(&self) -> Option<&BlockState> {
+        self.blocks()
+    }
+
     fn blocks(&self) -> Option<&BlockState> {
         match self {
             Self::State(state) => Some(&state.blocks),

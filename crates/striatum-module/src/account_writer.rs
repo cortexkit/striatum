@@ -34,7 +34,8 @@ pub(crate) fn pool_key_states(
     provider: &str,
     now_ms: i64,
 ) -> RouteStateResult<BTreeMap<String, striatum_core::key_pool::PoolKeyState>> {
-    store.pool_key_states(provider, now_ms)
+    let published = crate::account_state::published(store)?;
+    store.pool_key_states_from(provider, now_ms, published.block_state())
 }
 
 pub(crate) fn prune_unserved_unpicked_facts(

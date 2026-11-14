@@ -4,17 +4,14 @@
 //! readers while real handlers run, and check that none of the request
 //! readers that now answer from the state reads SQL.
 //!
-//! One read is a declared exception (`group_reads::declared_exception`)
-//! and still reads SQL, because its caller does not yet take the account
-//! state: "pool key states", key-pool lease state joined with the probe
-//! clocks, which the pool group owns. The route-state snapshot that
-//! `route.select` scores against and `route.cooldown_status` answers from,
-//! with the provider cooldown row, is built from the state's route and
-//! provider rows.
+//! The route-state snapshot that `route.select` scores against and
+//! `route.cooldown_status` answers from, with the provider cooldown row, is
+//! built from the state's route and provider rows; pool key states from the
+//! state's key rows and clocks, with only the live lease counts read from the
+//! lease table, which is no block table.
 //!
-//! Reads inside the writer are forbidden too, except on the two pool paths
-//! (pool acquisition, and a finished run that ends its lease), where the
-//! pool group still syncs clocks and reads key states on SQL. The claim and
+//! Reads inside the writer are forbidden too: the clock synchronization
+//! (`sync`/`register`) decides on the command's working state. The claim and
 //! probe decisions (claims, decision-probe binding, report matching,
 //! authorization transfer and the check that a probe authorization names a
 //! reported credential) and the
@@ -97,6 +94,9 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
         .account_read(|tx| tx.report_route_fences(0))
         .unwrap();
     record("report_route_fences");
+    // The SQL key-state reader, for a store without account state.
+    store.pool_key_states(POOL, 0).unwrap();
+    record("pool_key_states");
     seen
 }
 
@@ -117,10 +117,6 @@ fn route_state_oracle() -> BTreeSet<String> {
     let shared: BTreeSet<String> = trace.take().writer.into_iter().collect();
     store.build_snapshot(1_000.0).unwrap();
     let snapshot = trace.take();
-    assert!(
-        snapshot.exempt.is_empty(),
-        "the SQL snapshot is no declared exception: {snapshot:#?}"
-    );
     store.get_provider_cooldown(POOL).unwrap();
     let provider = trace.take();
     let rows: BTreeSet<String> = snapshot
@@ -320,17 +316,6 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             store.block_tables_written_outside_command()
         );
         let seen = trace.take();
-        // The clock synchronization (`sync`/`register`) decides on the
-        // command's working state, so no command reads the block tables on
-        // the writer, except where pool lease state still syncs and reads
-        // them on SQL ("pool key states").
-        if !matches!(op, "pool_acquire" | "observe finish") {
-            assert!(
-                seen.writer.is_empty(),
-                "{op} read block tables on the writer: {:#?}",
-                seen.writer
-            );
-        }
         let ordinary: Vec<_> = seen
             .reader
             .iter()
@@ -362,23 +347,21 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             .writer
             .iter()
             .chain(&seen.reader)
-            .chain(seen.exempt.iter().map(|(_, sql)| sql))
             .filter(|sql| route_state_text.contains(sql.as_str()))
             .collect();
         assert!(
             route_state_on_sql.is_empty(),
             "{op} read the route-state snapshot or a provider row from SQL: {route_state_on_sql:#?}"
         );
-        let snapshot_exceptions: Vec<_> = seen
-            .exempt
-            .iter()
-            .filter(|(reason, _)| *reason != "pool key states")
-            .collect();
+        // The clock synchronization (`sync`/`register`) and pool key states
+        // decide on the command's working state: no command reads the
+        // block tables on the writer at all.
         assert!(
-            snapshot_exceptions.is_empty(),
-            "{op} made a declared exception other than the pool's: {snapshot_exceptions:#?}"
+            seen.writer.is_empty(),
+            "{op} read block tables on the writer: {:#?}",
+            seen.writer
         );
-        writer_reads.push((op.to_owned(), seen.writer, seen.exempt, seen.maintenance));
+        writer_reads.push((op.to_owned(), seen.maintenance, seen.checks));
     };
 
     let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}"),"affinity":"block-reads"})).await;
@@ -490,24 +473,10 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         "the tick's reconcile reloaded a state the request mix left unequal to SQL"
     );
     assert_eq!(store.block_writes_outside_command(), 0);
-    for (op, reads, exempt, maintenance) in &writer_reads {
+    for (op, maintenance, checks) in &writer_reads {
         eprintln!(
-            "block reads: {op}: {} ordinary on the writer, {} declared exceptions, {maintenance} state maintenance",
-            reads.len(),
-            exempt.len(),
+            "block reads: {op}: 0 ordinary, {maintenance} state maintenance, {checks} keyed state checks"
         );
-        for sql in reads.iter().collect::<BTreeSet<_>>() {
-            eprintln!(
-                "    writer: {}",
-                sql.split_whitespace().collect::<Vec<_>>().join(" ")
-            );
-        }
-        for (reason, sql) in exempt.iter().collect::<BTreeSet<_>>() {
-            eprintln!(
-                "    {reason}: {}",
-                sql.split_whitespace().collect::<Vec<_>>().join(" ")
-            );
-        }
     }
 }
 

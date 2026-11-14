@@ -344,6 +344,34 @@ impl Rig {
             answers.push(format!("{}", memory.exclusion_count("x", credential)));
         }
         assert_eq!(answers, sql, "keyed readers: {context}");
+        // Pool key states, the stored clocks they read, and whether a sync
+        // would change a clock.
+        assert_eq!(
+            memory.clock_rechecks(),
+            store.with_reader_for_test(fence_rechecks::read).unwrap(),
+            "stored clocks: {context}"
+        );
+        assert_eq!(
+            memory.needs_sync(),
+            store.with_reader_for_test(fence_rechecks::needs_sync).unwrap(),
+            "needs_sync: {context}"
+        );
+        for provider in PROVIDERS {
+            let sql = store
+                .with_reader_for_test(|conn| crate::key_pool::read_key_states(conn, provider, now, None))
+                .unwrap();
+            let leases = store
+                .with_reader_for_test(|conn| crate::key_pool::lease_counts(conn, provider, now, None))
+                .unwrap();
+            let from_memory = crate::key_pool::key_states_from(
+                provider,
+                memory.pool_key_rows(provider).unwrap(),
+                &memory.clock_rechecks(),
+                true,
+                leases,
+            );
+            assert_eq!(from_memory, sql, "{provider} key states: {context}");
+        }
     }
 }
 
@@ -433,18 +461,20 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     );
     rig.check(&[NOW], "credential replaced");
     // A replacement the view does not select must still evict the old row.
-    // (Every account route fence is held for its raw reader, so a pool key
-    // row, held only while it walls, stands in.)
-    rig.sql(format!(
-        "INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,updated_at) VALUES ('p','c',{},'billing',{NOW});",
-        NOW + 60_000
-    ));
-    assert_eq!(rig.published().table_sizes()[4], ("pool_key_state", 1));
-    rig.sql(format!(
-        "INSERT OR REPLACE INTO pool_key_state(provider,credential_id,updated_at) VALUES ('p','c',{NOW});"
-    ));
-    assert_eq!(rig.published().table_sizes()[4], ("pool_key_state", 0));
-    rig.check(&[NOW], "pool key replaced by an unselected row");
+    // (Every account route fence, pool key row and route row is held for its
+    // raw reader, so an account fence, held only while it is active, stands
+    // in: a cleared fence replaces it.)
+    let fence = |cleared: &str| {
+        format!(
+            "INSERT OR REPLACE INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at)
+             VALUES ('f','p','a','{{}}','{{}}','broca_account_limit',{NOW},'x',{NOW},NULL,'[]',{cleared});"
+        )
+    };
+    rig.sql(fence("NULL"));
+    assert_eq!(rig.published().table_sizes()[0], ("account_fence", 1));
+    rig.sql(fence(&NOW.to_string()));
+    assert_eq!(rig.published().table_sizes()[0], ("account_fence", 0));
+    rig.check(&[NOW], "active fence replaced by a cleared one");
     // A route fence outside the quota class is held, though not in the view.
     rig.sql(format!(
         "INSERT INTO account_route_fence VALUES ('p','c','m',{},'d',{NOW},{NOW},'quota');",
@@ -456,6 +486,38 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     ));
     assert_eq!(rig.published().table_sizes()[2], ("account_route_fence", 1));
     rig.check(&[NOW], "route fence replaced by a transient row");
+}
+
+/// Every pool key row is held, walled or not. A key row replaced under the
+/// same key (a REPLACE gives it a new rowid without reporting the delete of
+/// the old one) is held as exactly one row: the new one, at its new rowid.
+#[test]
+fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
+    let rig = rig("block-state-pool-replace");
+    rig.sql(format!(
+        "INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,updated_at) VALUES ('p','c',{},'billing',{NOW});",
+        NOW + 60_000
+    ));
+    let rowid = |rig: &Rig| -> i64 {
+        rig.store
+            .with_reader_for_test(|conn| conn.query_row("SELECT rowid FROM pool_key_state", [], |r| r.get(0)))
+            .unwrap()
+    };
+    let before = rowid(&rig);
+    rig.sql(format!(
+        "INSERT OR REPLACE INTO pool_key_state(provider,credential_id,last_used_at,updated_at) VALUES ('p','c',{NOW},{NOW});"
+    ));
+    let after = rowid(&rig);
+    assert_ne!(before, after, "REPLACE gave the key a new rowid");
+    let state = rig.published();
+    assert_eq!(state.table_sizes()[4], ("pool_key_state", 1));
+    assert_eq!(
+        state.pool_key_rows("p").unwrap(),
+        vec![("c".to_owned(), Some(NOW), None, None)],
+        "the held row is the replacement"
+    );
+    assert!(state.fingerprints()[4] == (1, Some(after)), "held at its new rowid");
+    rig.check(&[NOW], "pool key replaced");
 }
 
 /// The update hook reports a REPLACE's insert but not the delete of the row
@@ -2978,4 +3040,42 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
         }
     }
     assert!(compared > 100, "registers compared: {compared}");
+}
+
+/// Pool acquisition reads key states and clocks from the working state, and
+/// its lease insert names neither. So before a lease is granted, the pool's
+/// key rows and every applying provider's clocks are checked against SQL:
+/// a state from before a key was walled runs again on a fresh load, which
+/// refuses the walled key instead of leasing it.
+#[test]
+fn a_lease_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
+    use striatum_core::key_pool::PoolKey;
+    let rig = rig("block-state-stale-lease");
+    let keys = [PoolKey::new("k0", None, "active")];
+    let acquire = |session: &str| {
+        rig.store
+            .pool_acquire(&crate::PoolAcquire {
+                provider: "p1",
+                session_id: session,
+                keys: &keys,
+                now_ms: NOW,
+                lease_ms: 60_000,
+                affinity_idle_ms: 60_000,
+            })
+            .unwrap()
+    };
+    let first = acquire("s0");
+    assert!(matches!(first, crate::PoolAcquireOutcome::Leased(_)), "{first:?}");
+    let before_the_wall = rig.published();
+    rig.store
+        .pool_wall("p1", "k0", crate::PoolWallKind::Billing, NOW + 600_000, "402", NOW)
+        .unwrap();
+    let loads = rig.decide_next_on(before_the_wall);
+    let second = acquire("s1");
+    assert_eq!(rig.loads_since(loads), 2, "the stale grant is caught");
+    assert!(
+        matches!(second, crate::PoolAcquireOutcome::Exhausted(_)),
+        "the walled key is refused on the fresh load: {second:?}"
+    );
+    rig.check(&[NOW], "after the stale lease");
 }

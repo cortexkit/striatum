@@ -228,29 +228,8 @@ impl SqliteRouteStateStore {
 pub struct BlockReadTrace {
     reader: Mutex<Vec<String>>,
     writer: Mutex<Vec<String>>,
-    exempt: Mutex<Vec<(&'static str, String)>>,
     maintenance: Mutex<usize>,
     checks: Mutex<usize>,
-}
-
-thread_local! {
-    /// The reason of the declared exception running on this thread, if any.
-    static EXCEPTION: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
-}
-
-/// Run `read` as a declared exception to the rule that request paths read
-/// the block tables from the account state: the block-table reads it makes
-/// are traced under `reason`, apart from ordinary reads. Outside a trace this
-/// only sets a thread-local flag.
-pub fn declared_exception<T>(reason: &'static str, read: impl FnOnce() -> T) -> T {
-    struct Restore(Option<&'static str>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            EXCEPTION.with(|exception| exception.set(self.0));
-        }
-    }
-    let _restore = Restore(EXCEPTION.with(|exception| exception.replace(Some(reason))));
-    read()
 }
 
 /// What a [`BlockReadTrace`] saw: ordinary reads on pooled readers, ordinary
@@ -260,8 +239,6 @@ pub fn declared_exception<T>(reason: &'static str, read: impl FnOnce() -> T) -> 
 pub struct BlockReads {
     pub reader: Vec<String>,
     pub writer: Vec<String>,
-    /// Reads made inside a [`declared_exception`], with its reason.
-    pub exempt: Vec<(&'static str, String)>,
     pub maintenance: usize,
     /// Keyed reads a decision made on the writer to check the rows it read
     /// from the working state against SQL.
@@ -273,7 +250,6 @@ impl BlockReadTrace {
         BlockReads {
             reader: std::mem::take(&mut self.reader.lock().unwrap()),
             writer: std::mem::take(&mut self.writer.lock().unwrap()),
-            exempt: std::mem::take(&mut self.exempt.lock().unwrap()),
             maintenance: std::mem::take(&mut self.maintenance.lock().unwrap()),
             checks: std::mem::take(&mut self.checks.lock().unwrap()),
         }
@@ -304,12 +280,6 @@ unsafe extern "C" fn on_block_statement(
         *tap.trace.maintenance.lock().unwrap() += 1;
     } else if text.contains(crate::block_state::STATE_CHECK) {
         *tap.trace.checks.lock().unwrap() += 1;
-    } else if let Some(reason) = EXCEPTION.with(std::cell::Cell::get) {
-        tap.trace
-            .exempt
-            .lock()
-            .unwrap()
-            .push((reason, text.into_owned()));
     } else if tap.writer {
         tap.trace.writer.lock().unwrap().push(text.into_owned());
     } else {

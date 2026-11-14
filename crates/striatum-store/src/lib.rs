@@ -69,16 +69,6 @@ pub use block_state::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub mod group_reads;
-/// A declared exception marks a request-path read of the block tables from
-/// SQL instead of the in-memory account state. Production builds carry no
-/// block-read trace, so it only runs its read. The traced version lives in
-/// `group_reads.rs`.
-#[cfg(not(any(test, feature = "test-support")))]
-mod group_reads {
-    pub fn declared_exception<T>(_reason: &'static str, read: impl FnOnce() -> T) -> T {
-        read()
-    }
-}
 #[cfg(any(test, feature = "test-support"))]
 mod block_parity_fixture;
 mod key_pool;
