@@ -502,6 +502,17 @@ impl AccountCommand<'_> {
         let decided = change(state);
         for effect in std::mem::take(&mut state.pending) {
             match effect {
+                admissions::Effect::Observed {
+                    admission,
+                    previous,
+                    at,
+                } => {
+                    if !sql.set_admission_last_observed(&admission.0, &admission.1, previous, at)? {
+                        return Err(diverged(format!(
+                            "admission {admission:?} observation time differs from state"
+                        )));
+                    }
+                }
                 admissions::Effect::Admission { row, from } => {
                     if !sql.set_admission_lifecycle(&row, &from)? {
                         return Err(diverged(format!(
@@ -601,6 +612,17 @@ impl AccountCommand<'_> {
             state.start(principal, admission_id, run_id, at, late)
         })?;
         Ok(changed)
+    }
+
+    pub(crate) fn observe_admission(
+        &mut self,
+        row: &AccountAdmissionRow,
+        at: i64,
+    ) -> RouteStateResult<()> {
+        if self.state.is_none() {
+            return self.sql.observe_admission(row, at);
+        }
+        self.decide(|state| state.observe_admission(row, at))
     }
 
     pub(crate) fn mark_admission_released(

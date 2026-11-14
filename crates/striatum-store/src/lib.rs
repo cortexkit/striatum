@@ -72,6 +72,8 @@ pub use fence_rechecks::{
 };
 #[cfg(test)]
 mod continuation_migration_tests;
+#[cfg(test)]
+mod last_observation_tests;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
@@ -331,7 +333,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 87] {
+fn route_state_migrations() -> [Migration; 88] {
     [
         Migration {
             version: 1,
@@ -680,6 +682,10 @@ fn route_state_migrations() -> [Migration; 87] {
         Migration {
             version: 88,
             statements: include_str!("../migrations/088_continuation_whole_offers.sql"),
+        },
+        Migration {
+            version: 89,
+            statements: include_str!("../migrations/089_admission_last_observed.sql"),
         },
     ]
 }

@@ -501,7 +501,7 @@ fn project_additive_shape_members(value: &mut Value) {
                 ("pool_key_lease", &["fence_probe"][..]),
                 (
                     "account_admission",
-                    &["input_size_class", "model_decision_id"][..],
+                    &["input_size_class", "model_decision_id", "last_observed_at"][..],
                 ),
                 // When retention compacted the row; recordings predate it.
                 ("model_route_decisions", &["detail_stripped_at"][..]),

@@ -130,6 +130,7 @@ fn admission(id: &str, pin_id: &str, decision_id: &str) -> AccountAdmissionRow {
         started_late: false,
         released_at: None,
         finished_at: None,
+        last_observed_at: None,
     }
 }
 

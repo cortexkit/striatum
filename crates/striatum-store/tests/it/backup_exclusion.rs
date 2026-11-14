@@ -248,6 +248,7 @@ fn admission(admission_id: &str, decision_id: &str, pin: &AccountPinRow) -> Acco
         started_late: false,
         released_at: None,
         finished_at: None,
+        last_observed_at: None,
     }
 }
 

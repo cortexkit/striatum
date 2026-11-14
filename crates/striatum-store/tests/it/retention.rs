@@ -241,6 +241,7 @@ fn admission_row(
         started_late: false,
         released_at: None,
         finished_at: Some(at),
+        last_observed_at: None,
     }
 }
 

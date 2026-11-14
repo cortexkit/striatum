@@ -1125,6 +1125,8 @@ pub struct AccountAdmissionRow {
     pub started_late: bool,
     pub released_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Routing's latest attempt time, or the start time if later.
+    pub last_observed_at: Option<i64>,
 }
 
 /// The demand one charged admission contributes to its account.
@@ -1297,7 +1299,7 @@ const ADMISSION_COLUMNS: &str = "principal, admission_id, request_fingerprint, r
      decision_id, conversation_hash, provider, model, account_id, credential_id, pin_id, \
      pin_generation, state, charged, request_bytes, request_bytes_estimated, committed_at, \
      admission_valid_until, lease_valid_until, reply_json, run_id, started_at, started_late, \
-     released_at, finished_at";
+     released_at, finished_at, last_observed_at";
 
 fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
     Ok(AccountAdmissionRow {
@@ -1326,6 +1328,7 @@ fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
         started_late: row.get::<_, i64>(22)? != 0,
         released_at: row.get(23)?,
         finished_at: row.get(24)?,
+        last_observed_at: row.get(25)?,
     })
 }
 
@@ -1470,7 +1473,7 @@ impl AccountTx<'_> {
                 &format!(
                     "INSERT INTO account_admission ({ADMISSION_COLUMNS}) VALUES \
                      (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                      ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                      ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
                 ),
                 params![
                     row.principal,
@@ -1498,6 +1501,7 @@ impl AccountTx<'_> {
                     i64::from(row.started_late),
                     row.released_at,
                     row.finished_at,
+                    row.last_observed_at,
                 ],
             )
             .map(|_| ())
@@ -1535,7 +1539,7 @@ impl AccountTx<'_> {
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'started', run_id = ?3, started_at = ?4, \
-                 started_late = ?5 \
+                 started_late = ?5, last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
                  WHERE principal = ?1 AND admission_id = ?2 AND state IN ('reserved', 'expired')",
                 params![principal, admission_id, run_id, at, i64::from(late)],
             )
