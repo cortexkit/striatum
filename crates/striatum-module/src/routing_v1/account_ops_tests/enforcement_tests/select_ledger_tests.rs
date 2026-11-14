@@ -1,6 +1,65 @@
 use super::*;
 use striatum_core::RouteStateStore;
 
+#[tokio::test]
+async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibility() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    caps(&harness, 1, true);
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    let consumer = harness.bind(reserved("class-owner"), None).await;
+    fill(&runner, A, "a", 1).await;
+    fill(&runner, B, "b", 1).await;
+    for legacy in [false, true] {
+        refused(
+            &consumer.call("route.select", &select_body(legacy)).await,
+            legacy,
+            NOW + 30_000,
+        );
+        if !legacy {
+            let mut fallback = select_body(false);
+            fallback["pin"] = json!("synthetic/missing");
+            fallback["pin_fallback"] = json!("route");
+            refused(
+                &consumer.call("route.select", &fallback).await,
+                false,
+                NOW + 30_000,
+            );
+        }
+        harness.edit_config(|config| {
+            config["concurrency"]["providers"]["synthetic"]["limit"] = json!(2);
+        });
+        assert_eq!(
+            consumer.call("route.select", &select_body(legacy)).await.0,
+            FrameType::Response
+        );
+        harness.edit_config(|config| {
+            config["concurrency"]["providers"]["synthetic"]["limit"] = json!(1);
+        });
+        refused(
+            &consumer.call("route.select", &select_body(legacy)).await,
+            legacy,
+            NOW + 30_000,
+        );
+    }
+    for providers in [json!({"unrelated":{"limit":1}}), json!({})] {
+        harness.edit_config(|config| {
+            config["concurrency"]["providers"] = providers;
+        });
+        crate::account_selection::SELECT_ELIGIBILITY_PROBES.store(0, Ordering::Relaxed);
+        for legacy in [false, true] {
+            assert_eq!(
+                consumer.call("route.select", &select_body(legacy)).await.0,
+                FrameType::Response
+            );
+        }
+        assert_eq!(
+            crate::account_selection::SELECT_ELIGIBILITY_PROBES.load(Ordering::Relaxed),
+            0
+        );
+    }
+}
+
 fn select_body(legacy: bool) -> Value {
     if legacy {
         json!({"targetAgent":"mason","requirements":{"iq":30,"eq":0},"substrate":"broca","executor":"broca","detail":true})

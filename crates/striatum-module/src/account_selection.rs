@@ -213,6 +213,11 @@ impl CommandContext {
     }
 }
 
+// Tests count eligibility calls rather than inferring avoided work from timing.
+#[cfg(test)]
+pub(crate) static SELECT_ELIGIBILITY_PROBES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// One immutable vault/config/catalog view shared by selection and allocation.
 #[derive(Clone)]
 pub(crate) struct ClassContext {
@@ -2393,6 +2398,8 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Vec<String> {
+        #[cfg(test)]
+        SELECT_ELIGIBILITY_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let Some(roster) = self.roster_for(provider, model, priced).roster else {
             return Vec::new();
         };

@@ -2155,12 +2155,23 @@ async fn handle_select_request_attempt(
             None
         };
 
+    let admission_pin = params
+        .pin
+        .as_ref()
+        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
+    let ledger_pin = params
+        .model_pin
+        .as_deref()
+        .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
+        .filter(|_| params.pin_fallback == select_policy::PinFallback::None)
+        .map(|pin| crate::select_concurrency::pin_capacity(pin, &facts));
     let ledger = crate::select_concurrency::capture(
         store.as_ref(),
         classes.as_ref(),
         &facts,
         priced_per_token,
         now as i64,
+        |fact| crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref()),
     )
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     let head_request = crate::select_concurrency::head(&operator_config, &target_agent);
@@ -2188,10 +2199,6 @@ async fn handle_select_request_attempt(
         operator_config: &operator_config,
     };
 
-    let admission_pin = params
-        .pin
-        .as_ref()
-        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
     let mut pin_rejected = None;
     if let Some(pin) = params
         .model_pin

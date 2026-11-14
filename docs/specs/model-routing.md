@@ -290,6 +290,13 @@ account-preflight probe, without looking up conversation affinity. Variants shar
 their model's cap count; paid pools use the pool provider stored by admission.
 The ledger filter runs after the quality gate and before caller-supplied
 `concurrency_slots`, never widens the shortlist, and records no waiter.
+Selection first checks a provider/model cap-presence index and skips account
+eligibility entirely when no cap can apply. Presence only filters work; actual
+limits still come from the effective account cap. Resolved caps are shared by
+credential snapshots until catalog, roster or settings publication changes the
+inputs. A settings reload is resolved on the next select, without waiting for a
+credential poll. Eligibility is restricted to available routes and explicit
+pin/eligible-route constraints, with variants probed once per provider/model.
 
 When all candidates are removed, selection answers `no_route` with
 `concurrency_full` and the earliest predicted free slot, capped at 30 seconds

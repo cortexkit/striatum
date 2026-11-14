@@ -3,28 +3,78 @@
 use striatum_core::concurrency_availability::{AccountConcurrency, ConcurrencyAvailability};
 use striatum_core::model_router::{NoRouteError, RouteFailureReason};
 
+pub(crate) fn pin_capacity(pin: &str, facts: &[striatum_core::ModelFact]) -> String {
+    let variant = crate::work_model_pin::named_variant(pin, facts);
+    crate::work_model_pin::route_keys(pin, variant.as_deref(), facts).1
+}
+
+pub(crate) fn considered(
+    fact: &striatum_core::ModelFact,
+    available: &std::collections::HashSet<String>,
+    pin: Option<&str>,
+) -> bool {
+    let capacity = striatum_core::model_facts::make_capacity_key(&fact.provider_id, &fact.model_id);
+    if let Some(pin) = pin {
+        return capacity == pin;
+    }
+    available.contains(&capacity)
+        || available.contains(&striatum_core::model_facts::make_route_key(
+            &fact.provider_id,
+            &fact.model_id,
+            fact.variant.as_deref(),
+        ))
+}
+
 pub(crate) fn capture(
     store: &striatum_store::SqliteRouteStateStore,
     classes: Option<&crate::account_selection::ClassContext>,
     facts: &[striatum_core::ModelFact],
     priced: bool,
     now: i64,
+    consider: impl Fn(&striatum_core::ModelFact) -> bool,
 ) -> striatum_core::RouteStateResult<ConcurrencyAvailability> {
     let mut availability = ConcurrencyAvailability::default();
     let Some(classes) = classes else {
         return Ok(availability);
     };
-    let state = crate::account_state::snapshot(store)?;
-    let mut caps = classes.credentials.concurrency_caps.clone();
-    caps.publish_settings(classes.config.concurrency_caps());
-    let caps = &caps.resolved;
+    let caps = classes
+        .credentials
+        .concurrency_caps
+        .resolved_for_settings(classes.config.concurrency_caps());
+    if !caps.any_caps() {
+        return Ok(availability);
+    }
+    let mut state = None;
+    let mut checked = std::collections::HashSet::new();
     for fact in facts {
         let provider = &fact.provider_id;
+        if !caps.provider_can_cap(provider) || !consider(fact) {
+            continue;
+        }
         let model = crate::account_selection::normalize(&fact.model_id);
+        if !caps.model_can_cap(provider, &model) {
+            continue;
+        }
+        let capacity = striatum_core::model_facts::make_capacity_key(provider, &fact.model_id);
+        let route = striatum_core::model_facts::make_route_key(
+            provider,
+            &fact.model_id,
+            fact.variant.as_deref(),
+        );
+        if !checked.insert(capacity.clone()) {
+            if let Some(full) = availability.full_routes.get(&capacity).cloned() {
+                availability.full_routes.insert(route, full);
+            }
+            continue;
+        }
         let accounts = classes.select_eligible_accounts(provider, &model, priced);
         if accounts.is_empty() {
             continue;
         }
+        if state.is_none() {
+            state = Some(crate::account_state::snapshot(store)?);
+        }
+        let state = state.as_ref().unwrap();
         let mut full = Vec::new();
         for account in &accounts {
             let Some(cap) = caps.cap(provider, account, &model).limit else {
@@ -32,13 +82,13 @@ pub(crate) fn capture(
             };
             let count = state
                 .inflight
-                .count_for_model(caps, provider, account, &model, now);
+                .count_for_model(&caps, provider, account, &model, now);
             if (count as u64) < cap {
                 break;
             }
             let reset = state
                 .inflight
-                .next_free_at(caps, provider, account, &model, cap, now)
+                .next_free_at(&caps, provider, account, &model, cap, now)
                 .unwrap_or(now.saturating_add(30_000))
                 .min(now.saturating_add(30_000));
             full.push(AccountConcurrency {
@@ -49,13 +99,8 @@ pub(crate) fn capture(
             });
         }
         if full.len() == accounts.len() {
-            availability.full_routes.insert(
-                striatum_core::fact_to_route(fact).capacity_key,
-                full.clone(),
-            );
-            availability
-                .full_routes
-                .insert(striatum_core::fact_to_route(fact).route_key, full);
+            availability.full_routes.insert(capacity, full.clone());
+            availability.full_routes.insert(route, full);
         }
     }
     Ok(availability)

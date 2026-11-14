@@ -1621,12 +1621,31 @@ async fn select_at_tier_attempt(
         })
         .cloned()
         .collect();
+    let ledger_pin = request
+        .pin
+        .clone()
+        .or_else(|| {
+            request
+                .pin_slot
+                .as_deref()
+                .and_then(|slot| operator_config.select_slot_pin(slot))
+        })
+        .filter(|_| request.pin_fallback != Some(PinFallback::Route))
+        .map(|pin| crate::select_concurrency::pin_capacity(&pin, &facts));
     let concurrency = crate::select_concurrency::capture(
         deps.store,
         priced.classes.as_ref(),
         &facts,
         priced_per_token,
         now as i64,
+        |fact| {
+            crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref())
+                && request.eligible_routes.as_ref().is_none_or(|routes| {
+                    routes.iter().any(|route| {
+                        route.provider == fact.provider_id && route.model == fact.model_id
+                    })
+                })
+        },
     )
     .map_err(store_refusal)?;
     let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
