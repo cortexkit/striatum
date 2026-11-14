@@ -2254,6 +2254,7 @@ async fn handle_select_request_attempt(
                     .map_err(|code| work_model_pin::Refusal {
                         message: code.clone(),
                         code,
+                        retry_at: None,
                     })
                 } else {
                     work_model_pin::select_with_availability(
@@ -2310,7 +2311,7 @@ async fn handle_select_request_attempt(
                     &selected.model.model_id,
                     priced_per_token,
                 )
-                .map_err(|(code, message)| work_model_pin::Refusal { code, message })?;
+                .map_err(|(code, message)| work_model_pin::Refusal { code, message, retry_at: None })?;
             }
             // Resolve the Broca launch target and its credential mapping
             // before recording a decision; an unusable mapping rejects the pin.
@@ -2335,7 +2336,16 @@ async fn handle_select_request_attempt(
                             priced_per_token,
                             None,
                         )
-                        .map_err(|(code, message)| work_model_pin::Refusal { code, message })?,
+                        .map_err(|refusal| match refusal {
+                            account_selection::LaunchRefusal::Lost { retry_at } => work_model_pin::Refusal {
+                                code: "no_route".into(),
+                                message: "the selected recovery probe is held by another request".into(),
+                                retry_at: Some(retry_at),
+                            },
+                            account_selection::LaunchRefusal::Refused { code, message } => {
+                                work_model_pin::Refusal { code, message, retry_at: None }
+                            }
+                        })?,
                     )
                 } else {
                     None
@@ -2455,7 +2465,7 @@ async fn handle_select_request_attempt(
                 if !deferred_runner_pin {
                     if pin_harness != Some(substrate_policy::Harness::Broca) {
                         if let Some(classes) = classes.as_ref() {
-                            if let Err((code, message)) = classes.claim_launch_credential(
+                            match classes.claim_launch_credential(
                                 store,
                                 &selected.model.provider_id,
                                 &selected.model.model_id,
@@ -2463,10 +2473,21 @@ async fn handle_select_request_attempt(
                                 false,
                                 Some(&decision_id),
                             ) {
-                                return send_route_error(
-                                    writer, ver, channel, epoch, corr, &code, &message,
-                                )
-                                .await;
+                                Ok(_) => {}
+                                // As a lost decision-probe binding: try
+                                // another route, else answer the wait.
+                                Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
+                                    *probe_lost = true;
+                                    lost_probe_routes.insert(selected.route_key.clone());
+                                    *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                    return Ok(());
+                                }
+                                Err(account_selection::LaunchRefusal::Refused { code, message }) => {
+                                    return send_route_error(
+                                        writer, ver, channel, epoch, corr, &code, &message,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -2509,7 +2530,7 @@ async fn handle_select_request_attempt(
                         detail: Some(serde_json::Value::Object(refusal.detail)),
                     }).await;
                 }
-                if let Some(until) = *lost_probe_until {
+                if let Some(until) = [*lost_probe_until, refusal.retry_at].into_iter().flatten().min() {
                     return send_route_error_body(
                         writer, ver, channel, epoch, corr, lost_probe_wait(until),
                     ).await;
@@ -2874,7 +2895,13 @@ async fn handle_select_request_attempt(
                             Some(&decision_id),
                         ) {
                             Ok((runner, _)) => result["runner"] = json!(runner),
-                            Err((code, message)) => {
+                            Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
+                                *probe_lost = true;
+                                lost_probe_routes.insert(selected.route_key.clone());
+                                *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                return Ok(());
+                            }
+                            Err(account_selection::LaunchRefusal::Refused { code, message }) => {
                                 return send_route_error(
                                     writer, ver, channel, epoch, corr, &code, &message,
                                 )
@@ -2885,7 +2912,7 @@ async fn handle_select_request_attempt(
                     add_stage_ms(&timing.runner_ms, runner_started.elapsed());
                     if selected_harness != Some(substrate_policy::Harness::Broca) {
                         if let Some(classes) = classes.as_ref() {
-                            if let Err((code, message)) = classes.claim_launch_credential(
+                            match classes.claim_launch_credential(
                                 store,
                                 &selected.model.provider_id,
                                 &selected.model.model_id,
@@ -2893,10 +2920,21 @@ async fn handle_select_request_attempt(
                                 false,
                                 Some(&decision_id),
                             ) {
-                                return send_route_error(
-                                    writer, ver, channel, epoch, corr, &code, &message,
-                                )
-                                .await;
+                                Ok(_) => {}
+                                // As a lost decision-probe binding: try
+                                // another route, else answer the wait.
+                                Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
+                                    *probe_lost = true;
+                                    lost_probe_routes.insert(selected.route_key.clone());
+                                    *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                    return Ok(());
+                                }
+                                Err(account_selection::LaunchRefusal::Refused { code, message }) => {
+                                    return send_route_error(
+                                        writer, ver, channel, epoch, corr, &code, &message,
+                                    )
+                                    .await;
+                                }
                             }
                         }
                     }
@@ -3150,7 +3188,7 @@ fn runner_for_route(
         striatum_core::runner::RunnerModel,
         Option<key_pool::PoolGrant>,
     ),
-    (String, String),
+    account_selection::LaunchRefusal,
 > {
     if !needs_runner_pin(catalog_targets, provider) {
         if let Some(classes) = classes {
@@ -3188,10 +3226,13 @@ fn runner_for_route(
         variant,
         session,
     )
-    .map_err(|refusal| (refusal.code, refusal.message))?;
+    .map_err(|refusal| account_selection::LaunchRefusal::Refused {
+        code: refusal.code,
+        message: refusal.message,
+    })?;
     if let Some(owner) = owner {
         crate::account_writer::bind_fence_probe_owner(store, &grant.lease_id, owner)
-            .map_err(|error| ("store_error".into(), error.to_string()))?;
+            .map_err(account_selection::LaunchRefusal::store)?;
     }
     Ok((grant.runner.clone(), Some(grant)))
 }

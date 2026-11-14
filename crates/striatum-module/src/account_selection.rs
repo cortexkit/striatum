@@ -236,6 +236,27 @@ pub(crate) enum ProbeBinding {
     Lost { retry_at: i64 },
 }
 
+/// Why a legacy launch could not claim the probes its route needs.
+#[derive(Debug)]
+pub(crate) enum LaunchRefusal {
+    /// Another request holds the probe, or it is not due yet: the caller
+    /// may try another route, or retry at `retry_at`.
+    Lost { retry_at: i64 },
+    /// A refusal with no retry time, with its contract code.
+    Refused { code: String, message: String },
+}
+
+impl LaunchRefusal {
+    /// A store failure, a batch that diverged twice included: the caller
+    /// cannot tell whether any account is eligible.
+    pub(crate) fn store(error: impl std::fmt::Display) -> Self {
+        Self::Refused {
+            code: "store_error".into(),
+            message: error.to_string(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "account_selection/block_parity_tests.rs"]
 mod block_parity_tests;
@@ -2584,6 +2605,8 @@ impl ClassContext {
     /// A legacy send has no later account admission. Claim its selected
     /// origins here, or fail closed when the runner cannot pin the credential
     /// needed for an account-local probe. Route/provider probes need no pin.
+    /// A probe that another request holds, or that is not due yet, is a
+    /// timed refusal, so the caller can try another route or wait.
     pub(crate) fn claim_launch_credential(
         &self,
         store: &SqliteRouteStateStore,
@@ -2592,7 +2615,7 @@ impl ClassContext {
         priced: bool,
         pinnable: bool,
         owner: Option<&str>,
-    ) -> Result<String, (String, String)> {
+    ) -> Result<String, LaunchRefusal> {
         if !self.needs_credential_pin(provider, model)
             && !self.rechecks.iter().any(|origin| {
                 origin.provider == provider
@@ -2630,23 +2653,24 @@ impl ClassContext {
                             && origin.applies(provider, "", "", model)
                     })
                     .collect();
-                tx.grant_fence_rechecks(
+                let granted = tx.grant_fence_rechecks(
                     &origins,
                     context.now_ms,
                     owner.or(context.probe_owner.as_deref()),
-                )
+                )?;
+                Ok((!granted).then(|| {
+                    lost_probe_retry_at(&origins, owner.or(context.probe_owner.as_deref()), context.now_ms)
+                }))
             })
-            .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
-            return if granted {
-                Ok(String::new())
-            } else {
-                Err((
-                    "no_eligible_account".into(),
-                    "the route/provider probe was already claimed or is not due".into(),
-                ))
+            .map_err(LaunchRefusal::store)?;
+            return match granted {
+                None => Ok(String::new()),
+                Some(retry_at) => Err(LaunchRefusal::Lost { retry_at }),
             };
         }
-        let credential = self.launch_credential(provider, model, priced)?;
+        let credential = self
+            .launch_credential(provider, model, priced)
+            .map_err(|(code, message)| LaunchRefusal::Refused { code, message })?;
         let account =
             crate::credential_fences::credential_account_id(&self.account_ids, &credential)
                 .unwrap_or_else(|| credential.clone());
@@ -2674,26 +2698,34 @@ impl ClassContext {
                     .iter()
                     .any(|origin| origin.account_id.is_some() || origin.credential_id.is_some())
             {
-                return Ok(false);
+                return Ok(Err(LaunchRefusal::Refused {
+                    code: "no_eligible_account".into(),
+                    message: format!("{provider}/{model}: a probe requires a credential-pinning runner"),
+                }));
             }
+            let lost = || LaunchRefusal::Lost {
+                retry_at: lost_probe_retry_at(&origins, owner, context.now_ms),
+            };
             if !origins.iter().all(|origin| {
                 context.origin_due(origin, &account, model)
                     || owner.is_some() && origin.claim_owner.as_deref() == owner
             }) {
-                return Ok(false);
+                return Ok(Err(lost()));
             }
-            tx.grant_fence_rechecks(
-                &origins,
-                context.now_ms,
-                owner.or(context.probe_owner.as_deref()),
+            Ok(
+                if tx.grant_fence_rechecks(
+                    &origins,
+                    context.now_ms,
+                    owner.or(context.probe_owner.as_deref()),
+                )? {
+                    Ok(())
+                } else {
+                    Err(lost())
+                },
             )
         })
-        .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
-        if claimed {
-            Ok(credential)
-        } else {
-            Err(("no_eligible_account".into(),format!("{provider}/{model}: a probe is unavailable or requires a credential-pinning runner")))
-        }
+        .map_err(LaunchRefusal::store)?;
+        claimed.map(|()| credential)
     }
 
     pub(crate) fn needs_credential_pin(&self, provider: &str, model: &str) -> bool {
@@ -6384,6 +6416,36 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// looked due waits before asking again.
 const LOST_PROBE_RETRY_MS: i64 = 1_000;
 
+/// When a request whose claim on `origins` was refused may try again: the
+/// latest time any of them opens. A slot another request holds stays closed
+/// until its claim's interval ends, even where a provider reset is already
+/// due, so that interval is the retry time; quota origins share one periodic
+/// check. A claim refused while every clock looks due (its evidence changed
+/// under it) is retried shortly rather than answered without a time.
+/// `owner` is the decision that may already own the probe.
+pub(crate) fn lost_probe_retry_at(
+    origins: &[striatum_store::FenceRecheck],
+    owner: Option<&str>,
+    now: i64,
+) -> i64 {
+    let quota_until = striatum_store::FenceRecheck::quota_group_at(origins, owner);
+    origins
+        .iter()
+        .map(|origin| {
+            let owned = owner.is_some() && origin.claim_owner.as_deref() == owner;
+            if origin.quota {
+                quota_until
+            } else if origin.claim_owner.is_some() && !owned {
+                origin.due_at().max(origin.next_recheck_at)
+            } else {
+                origin.due_at()
+            }
+        })
+        .filter(|until| *until > now)
+        .max()
+        .unwrap_or(now.saturating_add(LOST_PROBE_RETRY_MS))
+}
+
 fn serve(
     tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
@@ -6779,24 +6841,11 @@ fn serve(
                 // so that interval is the retry time. A claim refused while
                 // every clock looks due (its evidence changed under it) is
                 // retried shortly rather than answered without a time.
-                let quota_until = striatum_store::FenceRecheck::quota_group_at(
+                let until = lost_probe_retry_at(
                     &applicable,
                     params.model_decision_id.as_deref(),
+                    now,
                 );
-                let until = applicable
-                    .iter()
-                    .map(|origin| {
-                        if origin.quota {
-                            quota_until
-                        } else if origin.claim_owner.is_some() && !owns_probe(origin) {
-                            origin.due_at().max(origin.next_recheck_at)
-                        } else {
-                            origin.due_at()
-                        }
-                    })
-                    .filter(|until| *until > now)
-                    .max()
-                    .unwrap_or(now.saturating_add(LOST_PROBE_RETRY_MS));
                 lost_probe_fences.insert(admission.account_id.clone(), until);
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
