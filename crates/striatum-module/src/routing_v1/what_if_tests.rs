@@ -83,7 +83,7 @@ async fn s8a3_what_if_matches_recorded_base_response_without_live_commands() {
     }
 }
 
-fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
+pub(super) fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
     let connection = Connection::open(harness.store_path()).unwrap();
     let tables: Vec<String> = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")

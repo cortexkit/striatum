@@ -6,7 +6,7 @@ use cortexkit_role_routing::{
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
     select_media::{self as media, SelectMediaAnswer, SelectMediaRequest},
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use striatum_core::{accounts::AllowedAccountClass, route_state_store::DecisionInput};
 use striatum_store::{EngineEvaluation, EngineSpeedSample, V1Decision};
 
@@ -92,6 +92,37 @@ pub(super) fn select_media(
         deps,
         request.engine_request(),
         Some(&request),
+        None,
+    )
+}
+
+/// Media evidence is copied before the first preview row. Account loading can
+/// clear obsolete credential refusals, so it must use the disposable store in `Deps`.
+pub(super) struct MediaEvaluation {
+    pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+    pub consumers: std::sync::Arc<super::consumers::Registry>,
+    pub joined: std::sync::Arc<super::consumers::MediaRoutes>,
+    pub inputs: std::sync::Arc<crate::PreparedSelectionInputs>,
+    pub account_quota: Option<crate::account_quota::SharedAccountQuota>,
+    pub iq: Option<f64>,
+    pub evaluations: Vec<EngineEvaluation>,
+    pub samples: Vec<EngineSpeedSample>,
+    pub evidence: Value,
+}
+
+pub(super) fn preview_media(
+    request: &SelectMediaRequest,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    view: &mut MediaEvaluation,
+) -> Result<Value, Refusal> {
+    select_request(
+        &Value::Null,
+        caller,
+        deps,
+        request.engine_request(),
+        Some(request),
+        Some(view),
     )
 }
 
@@ -120,7 +151,7 @@ fn missing_media_catalog_requirement(request: &SelectMediaRequest) -> Option<&'s
 
 fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let request = wire::parse_select_engine_request(params)?;
-    select_request(params, caller, deps, request, None)
+    select_request(params, caller, deps, request, None, None)
 }
 
 fn select_request(
@@ -129,10 +160,20 @@ fn select_request(
     deps: &Deps<'_>,
     request: wire::SelectEngineRequest,
     media: Option<&SelectMediaRequest>,
+    mut evaluation: Option<&mut MediaEvaluation>,
 ) -> Result<Value, Refusal> {
-    let config = super::operator_config(deps);
-    let consumers = super::consumers::effective(&config);
-    consumers.admit(&request.consumer, caller)?;
+    let config = evaluation
+        .as_ref()
+        .map_or_else(|| super::operator_config(deps), |view| view.config.clone());
+    let consumers = evaluation.as_ref().map_or_else(
+        || std::sync::Arc::new(super::consumers::effective(&config)),
+        |view| view.consumers.clone(),
+    );
+    // Previews require registration in their own handler, but deliberately do
+    // not require the operator to own the consumer being inspected.
+    if evaluation.is_none() {
+        consumers.admit(&request.consumer, caller)?;
+    }
     let policy = media.map(|media| {
         // Resolve only media defaults. The consumer registry's general
         // policy view also carries language-model requirements (context, tools)
@@ -154,12 +195,18 @@ fn select_request(
         config.consumer_policy(
             &request.consumer,
             &crate::config_policy::ConsumerPolicy {
-                iq: media.requirements.iq.map(f64::from),
+                iq: evaluation
+                    .as_ref()
+                    .and_then(|view| view.iq)
+                    .or(media.requirements.iq.map(f64::from)),
                 ..Default::default()
             },
             &declared,
         )
     });
+    if let Some(view) = evaluation.as_mut() {
+        view.evidence["iq"] = json!(policy.as_ref().and_then(|policy| policy.iq));
+    }
     // The settings resolver folds pins into ladders. Read the pin first so an
     // unavailable explicit choice cannot fall through to another engine.
     let pin = media.and_then(|media| media.pin.clone()).or_else(|| {
@@ -170,6 +217,7 @@ fn select_request(
             )
         })
     });
+    let mut pin_refusal = None;
     if let Some(pin) = &pin {
         if !config.media_route_allowed(&request.consumer, pin, true) {
             // The policy diagnostic names the effective rule, including model
@@ -182,7 +230,7 @@ fn select_request(
                         source.ends_with(".only_for") || source.ends_with(".not_for")
                     })
                 });
-            return Err(Refusal::pin_unavailable(
+            let refusal = Refusal::pin_unavailable(
                 pin,
                 if excluded {
                     PinUnavailableReason::Excluded
@@ -190,7 +238,11 @@ fn select_request(
                     PinUnavailableReason::NotAvailable
                 },
                 None,
-            ));
+            );
+            if evaluation.is_none() {
+                return Err(refusal);
+            }
+            pin_refusal = Some(refusal);
         }
     }
     if super::describe::capabilities().contains(&"consumer_declarations") {
@@ -201,13 +253,19 @@ fn select_request(
         )?;
     }
     let now = now(deps);
-    let inputs = crate::prepare_selection_inputs(
-        deps.quota_cache,
-        deps.store,
-        config.pricing(),
-        &config.quota_model_pools(),
-    )
-    .map_err(store_refusal)?;
+    let inputs = if let Some(view) = evaluation.as_ref() {
+        view.inputs.clone()
+    } else {
+        std::sync::Arc::new(
+            crate::prepare_selection_inputs(
+                deps.quota_cache,
+                deps.store,
+                config.pricing(),
+                &config.quota_model_pools(),
+            )
+            .map_err(store_refusal)?,
+        )
+    };
     let mut candidates: Vec<EngineCandidate<EvalScore, FactNumber>> = Vec::new();
     let catalog = deps
         .broca_credentials
@@ -222,7 +280,12 @@ fn select_request(
         .map_err(store_refusal)?
         .engine_test_facts
         .clone();
-    let joined = media.map(|_| super::consumers::media_routes(catalog.as_ref()));
+    let joined = media.map(|_| {
+        evaluation.as_ref().map_or_else(
+            || super::consumers::media_routes(catalog.as_ref()),
+            |view| view.joined.clone(),
+        )
+    });
     if let Some(joined) = &joined {
         for route in joined
             .by_kind
@@ -262,26 +325,34 @@ fn select_request(
         })
         .map(|candidate| format!("{}/{}", candidate.engine.provider, candidate.engine.model))
         .collect();
+    let mut excluded = std::collections::BTreeMap::new();
     // Withdrawal applies to media and caller-local engines before ranking.
     // Resolved facts also carry it when a credential uses a different provider
     // name from the catalog's provider name.
     candidates.retain(|candidate| {
         let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
-        !catalog
+        let allowed = !catalog
             .as_ref()
             .is_some_and(|catalog| catalog.is_decommissioned(&key))
             && !inputs.facts.iter().any(|fact| {
                 fact.decommissioned
                     && fact.provider_id == candidate.engine.provider
                     && fact.model_id == candidate.engine.model
-            })
+            });
+        if !allowed && evaluation.is_some() && candidate.engine.kind == request.kind {
+            excluded.insert(key, "decommissioned".to_owned());
+        }
+        allowed
     });
     let mut accounts = crate::account_selection::ClassContext::read_with_catalog(
         deps.store,
         deps.broca_credentials,
         config.clone(),
-        crate::ACCOUNT_QUOTA.get(),
-        inputs.facts,
+        evaluation.as_ref().map_or_else(
+            || crate::ACCOUNT_QUOTA.get(),
+            |view| view.account_quota.as_ref(),
+        ),
+        inputs.facts.clone(),
         &inputs.catalog_snapshot,
         now as i64,
     )
@@ -372,14 +443,23 @@ fn select_request(
             .any(|until| until > now as f64)
                 || state.credential_refusal.is_some();
         }
+        if candidate.fenced && evaluation.is_some() {
+            excluded.insert(key.clone(), "route is fenced".to_owned());
+        }
         if !candidate.engine.local && candidate.engine.kind == request.kind {
             // route.select_engine ignores every pin-only rule; media route.select
             // enforces model pin-only rules but not chat provider spending rules.
             // Both operations still refuse only_for and not_for exclusions.
             candidate.fenced |= !policy_allowed;
-            candidate.fenced |= !accounts
+            let reachable = accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
                 .map_err(store_refusal)?;
+            candidate.fenced |= !reachable;
+            if !reachable && evaluation.is_some() {
+                excluded
+                    .entry(key.clone())
+                    .or_insert_with(|| "no eligible media credential".into());
+            }
         }
         #[cfg(test)]
         let facts = media_facts.get(&(key, candidate.engine.kind.as_str().to_owned()));
@@ -408,15 +488,21 @@ fn select_request(
             wire::Kind::Transcribe => Some("wer"),
             _ => None,
         });
-    let (mut evaluations, samples) = deps
-        .store
-        .engine_measurements(
-            request.kind.as_str(),
-            metric,
-            &identities.into_iter().collect::<Vec<_>>(),
-        )
-        .map_err(store_refusal)?;
-    if let Some(limit) = media.and_then(|media| media.requirements.metric_limit.as_ref()) {
+    let (mut evaluations, samples) = if let Some(view) = evaluation.as_ref() {
+        (view.evaluations.clone(), view.samples.clone())
+    } else {
+        deps.store
+            .engine_measurements(
+                request.kind.as_str(),
+                metric,
+                &identities.into_iter().collect::<Vec<_>>(),
+            )
+            .map_err(store_refusal)?
+    };
+    if let Some(limit) = media
+        .and_then(|media| media.requirements.metric_limit.as_ref())
+        .filter(|_| evaluation.is_none())
+    {
         if Some(limit.metric.as_str()) != metric {
             let identities: Vec<_> = candidates
                 .iter()
@@ -483,6 +569,18 @@ fn select_request(
         .collect();
     if let Some(media) = media {
         if let Some(fact) = missing_media_catalog_requirement(media) {
+            if let Some(view) = evaluation.as_mut() {
+                for candidate in &candidates {
+                    excluded.insert(
+                        format!("{}/{}", candidate.engine.provider, candidate.engine.model),
+                        format!("catalog rows have no {fact} fact"),
+                    );
+                }
+                view.evidence["excluded"] = json!(excluded
+                    .into_iter()
+                    .map(|(route, reason)| json!({"route":route,"reason":reason}))
+                    .collect::<Vec<_>>());
+            }
             if let Some(pin) = &pin {
                 return Err(Refusal::pin_unavailable(
                     pin,
@@ -498,25 +596,46 @@ fn select_request(
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             // Local engines bypass the compatibility selector's reachability
             // fence, so apply policy as admission instead of a transient fence.
-            config.media_route_allowed(&request.consumer, &key, pin.as_deref() == Some(&key))
-                && media
-                    .exclude
-                    .as_ref()
-                    .is_none_or(|routes| !routes.contains(&key))
-                && media
-                    .exclude_providers
-                    .as_ref()
-                    .is_none_or(|providers| !providers.contains(&candidate.engine.provider))
-                && media
-                    .eligible_routes
-                    .as_ref()
-                    .is_none_or(|routes| routes.iter().any(|route| route.route_key() == key))
+            let allowed =
+                config.media_route_allowed(&request.consumer, &key, pin.as_deref() == Some(&key))
+                    && media
+                        .exclude
+                        .as_ref()
+                        .is_none_or(|routes| !routes.contains(&key))
+                    && media
+                        .exclude_providers
+                        .as_ref()
+                        .is_none_or(|providers| !providers.contains(&candidate.engine.provider))
+                    && media
+                        .eligible_routes
+                        .as_ref()
+                        .is_none_or(|routes| routes.iter().any(|route| route.route_key() == key));
+            if !allowed && evaluation.is_some() {
+                excluded.insert(
+                    key.clone(),
+                    config
+                        .route_policy_refusal(&request.consumer, &key)
+                        .unwrap_or_else(|| {
+                            "excluded by media policy or request eligibility".into()
+                        }),
+                );
+            }
+            allowed
         });
         if let Some(limit) = &media.requirements.metric_limit {
             let mut floor_request = request.clone();
             floor_request.requirements.metric = Some(limit.metric.clone());
             measurements::apply_evaluations(&floor_request, &mut candidates, &evaluations);
-            candidates.retain(|candidate| limit.admits(candidate.accuracy.map(EvalScore::get)));
+            candidates.retain(|candidate| {
+                let allowed = limit.admits(candidate.accuracy.map(EvalScore::get));
+                if !allowed && evaluation.is_some() {
+                    excluded.insert(
+                        format!("{}/{}", candidate.engine.provider, candidate.engine.model),
+                        "metric_limit".into(),
+                    );
+                }
+                allowed
+            });
         }
     }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
@@ -527,6 +646,50 @@ fn select_request(
             .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
             .map(|kind| &kind.grades)
             .unwrap_or(&empty);
+        let ranked = ranking::rank(&request, &candidates, grades, &top_routes, policy);
+        if let Some(view) = evaluation.as_mut() {
+            for candidate in &candidates {
+                if let Err(refusal) = wire::select_engine(&request, std::slice::from_ref(candidate))
+                {
+                    excluded
+                        .entry(format!(
+                            "{}/{}",
+                            candidate.engine.provider, candidate.engine.model
+                        ))
+                        .or_insert_with(|| {
+                            format!("{}: {}", refusal.code.as_str(), refusal.message)
+                        });
+                }
+            }
+            // A route can have several declarations. A rejected declaration
+            // does not exclude an identity that another declaration can serve.
+            for candidate in candidates.iter().filter(|candidate| {
+                wire::select_engine(&request, std::slice::from_ref(*candidate)).is_ok()
+            }) {
+                excluded.remove(&format!(
+                    "{}/{}",
+                    candidate.engine.provider, candidate.engine.model
+                ));
+            }
+            view.evidence["bar"] = ranked
+                .bar
+                .map_or_else(|| json!({}), |grade| json!({"grade":grade}));
+            view.evidence["top_routable"] = ranked
+                .top
+                .map_or_else(|| json!({}), |grade| json!({"grade":grade}));
+            view.evidence["adequate"] = json!(ranked
+                .adequate
+                .iter()
+                .map(|candidate| media_candidate(candidate, grades))
+                .collect::<Vec<_>>());
+            view.evidence["excluded"] = json!(excluded
+                .into_iter()
+                .map(|(route, reason)| json!({"route":route,"reason":reason}))
+                .collect::<Vec<_>>());
+        }
+        if let Some(refusal) = pin_refusal {
+            return Err(refusal);
+        }
         if let Some(pin) = &pin {
             ordering::entry(&request, &candidates, &declared_routes, pin).ok_or_else(|| {
                 Refusal::pin_unavailable(pin, PinUnavailableReason::NotAvailable, None)
@@ -539,11 +702,20 @@ fn select_request(
                 .find_map(|entry| ordering::entry(&request, &candidates, &declared_routes, entry))
                 .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?
         } else {
-            ranking::pick(&request, &candidates, grades, &top_routes, policy)?
+            ranked.pick(policy)?
         }
     } else {
         wire::select_engine(&request, &candidates)?
     };
+    if evaluation.is_some() {
+        let empty = Default::default();
+        let grades = joined
+            .as_ref()
+            .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
+            .map(|kind| &kind.grades)
+            .unwrap_or(&empty);
+        return Ok(media_candidate(winner, grades));
+    }
     let pricing = (!winner.selected.caller_local)
         .then(|| {
             media_prices.get(&format!(
@@ -575,7 +747,7 @@ fn select_request(
         score_json: score.to_string(),
         rejected_json: "[]".into(),
         allowed_account_class: AllowedAccountClass::PricedPerTokenOnly,
-        quota_signal_json: Some(inputs.quota_signal_json),
+        quota_signal_json: Some(inputs.quota_signal_json.clone()),
         ..Default::default()
     };
     let id = deps
@@ -614,6 +786,14 @@ fn select_request(
     )
     .map_err(store_refusal)?;
     Ok(value)
+}
+
+fn media_candidate(
+    candidate: &EngineCandidate<EvalScore, FactNumber>,
+    grades: &std::collections::BTreeMap<String, f64>,
+) -> Value {
+    let route = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+    json!({"grade": grades.get(&route), "route":route, "cost_usd":candidate.cost.map(|cost| cost.0)})
 }
 
 fn measurement_refusal(mut refusal: Refusal) -> Refusal {

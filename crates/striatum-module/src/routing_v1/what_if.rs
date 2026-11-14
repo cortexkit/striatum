@@ -13,6 +13,9 @@ use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder};
 
 use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
 
+#[path = "media_preview.rs"]
+mod media;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Params {
@@ -73,6 +76,12 @@ pub(super) async fn what_if_with_profile_lookup(
             "not_permitted",
             "route.what_if is operator-only (direct or reserved:callosum)",
         ));
+    }
+    // The absent-kind request keeps its original parser and evaluation path.
+    // Media previews accept no policy, price or runner overrides, so they rank
+    // only the engines that modules actually declare under the person's rules.
+    if params.get("kind").is_some() {
+        return media::what_if(params, caller, deps);
     }
     let mut params: Params = serde_json::from_value(params.clone())
         .map_err(|error| Refusal::invalid_request("params", error.to_string()))?;
