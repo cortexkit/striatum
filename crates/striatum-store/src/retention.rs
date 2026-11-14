@@ -32,8 +32,8 @@
 //!   conversation starts again at generation 1, which must not collide with a
 //!   stored older generation.
 
-use striatum_core::RouteStateResult;
 use rusqlite::{params, Connection, Transaction};
+use striatum_core::RouteStateResult;
 
 use super::{err, SqliteRouteStateStore, DECISION_MODE_SERVE};
 
@@ -134,11 +134,19 @@ impl SqliteRouteStateStore {
     /// lease, start, release and finish) is before `before` (Unix
     /// milliseconds), oldest first. Demand only counts an admission committed
     /// after its account's latest reading, so an admission this old charges
-    /// nothing a fresh reading could still need.
-    pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+    /// nothing a fresh reading could still need. Its window must also be
+    /// closed at `now_ms`, and its observations and moved-run reservations
+    /// must be old. Used-offer sources outlive the started rows they succeed
+    /// so deleting history cannot revive a departed account's count.
+    pub fn prune_account_admissions(
+        &self,
+        before: i64,
+        limit: usize,
+        now_ms: i64,
+    ) -> RouteStateResult<usize> {
         self.refuse_state_blind_admission_write("prune_account_admissions")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
-            tx.prune_account_admissions(before, limit)
+            tx.prune_account_admissions(before, limit, now_ms)
         })
     }
 
@@ -336,7 +344,9 @@ impl SqliteRouteStateStore {
     /// before `before`. The run is over when neither the run's original
     /// admission nor the offer's reservation is still reserved or started, and
     /// neither finished or was released at or after `before`. An admission
-    /// already deleted by account retention counts as over.
+    /// already deleted by account retention counts as over. A used offer also
+    /// outlives every started row it succeeds, and a predecessor outlives any
+    /// continuation naming its decision, so restart resolves the same source.
     pub fn prune_account_continuations(
         &self,
         before: i64,
@@ -463,9 +473,46 @@ impl SqliteRouteStateStore {
     }
 }
 
+// Match the loader's succession rule, including a predecessor reservation
+// rather than the original admission when a run has moved more than once.
+const USED_OFFER_SOURCES: &str = "
+    SELECT c.principal, c.selection_id, c.run_id, l.admission_id AS left_id,
+           l.provider, l.account_id, c.used_at_ms
+    FROM account_continue c
+    LEFT JOIN account_continue p
+      ON p.principal=c.principal AND p.admission_id=c.admission_id
+     AND p.run_id=c.run_id AND p.decision_id=c.previous_decision_id
+    JOIN account_admission l ON l.principal=c.principal
+     AND l.admission_id=COALESCE(p.reservation_id,c.admission_id)
+    WHERE c.decision_id IS NOT NULL AND c.used_at_ms IS NOT NULL";
+
+// The cutoff and the pass clock are separate: a short retention window must
+// not remove a still-open reservation or a recently observed started run.
+fn admission_due_by_values(a: &str) -> String {
+    format!(
+        "{a}.committed_at < ?1
+         AND {a}.admission_valid_until < ?1 AND {a}.lease_valid_until < ?1
+         AND COALESCE({a}.started_at,0) < ?1
+         AND COALESCE({a}.released_at,0) < ?1
+         AND COALESCE({a}.finished_at,0) < ?1
+         AND ({a}.last_observed_at IS NULL OR {a}.last_observed_at < ?1)
+         AND ({a}.state NOT IN ('reserved','started')
+           OR ({a}.state='reserved' AND {a}.admission_valid_until <= ?3)
+           OR ({a}.state='started' AND (
+             ({a}.started_at IS NULL AND {a}.last_observed_at IS NULL)
+             OR MAX(COALESCE({a}.last_observed_at,{a}.started_at),
+                    COALESCE({a}.started_at,{a}.last_observed_at)) <= ?4)))"
+    )
+}
+
 impl crate::AccountTx<'_> {
-    pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
-        self.prune_account_admissions_returning(before, limit)
+    pub fn prune_account_admissions(
+        &self,
+        before: i64,
+        limit: usize,
+        now_ms: i64,
+    ) -> RouteStateResult<usize> {
+        self.prune_account_admissions_returning(before, limit, now_ms)
             .map(|deleted| deleted.len())
     }
 
@@ -475,38 +522,66 @@ impl crate::AccountTx<'_> {
         &self,
         before: i64,
         limit: usize,
+        now_ms: i64,
     ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
         self.command_sql(|conn: &Connection| {
-            let mut statement = conn.prepare(
-                "DELETE FROM account_admission WHERE rowid IN ( \
-                       SELECT rowid FROM account_admission \
+            // Read reservation values, not the delete candidate set: two idle
+            // reservations must not keep each other forever. Source evidence
+            // goes only after the other started rows it succeeds have gone,
+            // even when a batch limit leaves those rows for the next pass.
+            let due = admission_due_by_values("a");
+            let reservation_due = admission_due_by_values("r");
+            let mut statement = conn.prepare(&format!(
+                "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
+                 DELETE FROM account_admission WHERE rowid IN ( \
+                       SELECT a.rowid FROM account_admission a \
                          INDEXED BY account_admission_by_committed \
-                       WHERE committed_at < ?1 \
-                         AND admission_valid_until < ?1 AND lease_valid_until < ?1 \
-                         AND COALESCE(started_at, 0) < ?1 \
-                         AND COALESCE(released_at, 0) < ?1 \
-                         AND COALESCE(finished_at, 0) < ?1 \
-                       ORDER BY committed_at LIMIT ?2) \
-                 RETURNING rowid, principal, admission_id, conversation_hash, provider, \
-                   account_id, pin_id, pin_generation, state, charged, committed_at, \
-                   started_at IS NOT NULL",
+                       WHERE {due} \
+                         AND NOT EXISTS (SELECT 1 FROM account_continue c \
+                           JOIN account_admission r \
+                             ON r.principal=c.principal AND r.admission_id=c.reservation_id \
+                           WHERE c.principal=a.principal AND c.admission_id=a.admission_id \
+                             AND c.run_id=a.run_id AND r.state IN ('reserved','started') \
+                             AND NOT ({reservation_due})) \
+                         AND NOT EXISTS (SELECT 1 FROM sources u \
+                           JOIN account_admission s \
+                             ON s.principal=u.principal AND s.run_id=u.run_id \
+                            AND s.provider=u.provider AND s.account_id=u.account_id \
+                           WHERE u.principal=a.principal AND u.left_id=a.admission_id \
+                             AND s.state='started' \
+                             AND (s.admission_id=u.left_id \
+                               OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms)) \
+                             AND NOT EXISTS (SELECT 1 FROM sources x \
+                               WHERE x.principal=s.principal AND x.left_id=s.admission_id)) \
+                       ORDER BY a.committed_at LIMIT ?2) \
+                  RETURNING rowid, principal, admission_id, conversation_hash, provider, \
+                    account_id, pin_id, pin_generation, state, charged, committed_at, \
+                    started_at IS NOT NULL"
+            ))?;
+            let rows = statement.query_map(
+                params![
+                    before,
+                    limit_param(limit),
+                    now_ms,
+                    now_ms.saturating_sub(30 * 60 * 1_000)
+                ],
+                |row| {
+                    Ok(crate::PrunedAdmission {
+                        rowid: row.get(0)?,
+                        principal: row.get(1)?,
+                        admission_id: row.get(2)?,
+                        conversation_hash: row.get(3)?,
+                        provider: row.get(4)?,
+                        account_id: row.get(5)?,
+                        pin_id: row.get(6)?,
+                        pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                        state: row.get(8)?,
+                        charged: row.get::<_, i64>(9)? == 1,
+                        committed_at: row.get(10)?,
+                        started: row.get(11)?,
+                    })
+                },
             )?;
-            let rows = statement.query_map(params![before, limit_param(limit)], |row| {
-                Ok(crate::PrunedAdmission {
-                    rowid: row.get(0)?,
-                    principal: row.get(1)?,
-                    admission_id: row.get(2)?,
-                    conversation_hash: row.get(3)?,
-                    provider: row.get(4)?,
-                    account_id: row.get(5)?,
-                    pin_id: row.get(6)?,
-                    pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
-                    state: row.get(8)?,
-                    charged: row.get::<_, i64>(9)? == 1,
-                    committed_at: row.get(10)?,
-                    started: row.get(11)?,
-                })
-            })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(err)
@@ -738,7 +813,8 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
         self.retention_write(|tx| {
             let mut statement = tx.prepare(&format!(
-                    "DELETE FROM account_continue WHERE rowid IN ( \
+                "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
+                     DELETE FROM account_continue WHERE rowid IN ( \
                        SELECT c.rowid FROM account_continue c \
                        WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
                          AND COALESCE(c.used_at_ms, 0) < ?1 \
@@ -747,8 +823,19 @@ impl crate::AccountTx<'_> {
                            WHERE a.principal = c.principal \
                              AND a.admission_id IN (c.admission_id, c.reservation_id) \
                              AND (a.state IN {LIVE_ADMISSION_STATES} \
-                               OR COALESCE(a.finished_at, 0) >= ?1 \
-                               OR COALESCE(a.released_at, 0) >= ?1)) \
+                                OR COALESCE(a.finished_at, 0) >= ?1 \
+                                OR COALESCE(a.released_at, 0) >= ?1)) \
+                          AND NOT EXISTS (SELECT 1 FROM sources u \
+                            JOIN account_admission s \
+                              ON s.principal=u.principal AND s.run_id=u.run_id \
+                             AND s.provider=u.provider AND s.account_id=u.account_id \
+                            WHERE u.principal=c.principal AND u.selection_id=c.selection_id \
+                              AND s.state='started' \
+                              AND (s.admission_id=u.left_id \
+                                OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms))) \
+                          AND NOT EXISTS (SELECT 1 FROM account_continue n \
+                            WHERE n.principal=c.principal AND n.admission_id=c.admission_id \
+                              AND n.run_id=c.run_id AND n.previous_decision_id=c.decision_id) \
                        ORDER BY c.rowid LIMIT ?2) \
                      RETURNING rowid, principal, selection_id, admission_id, run_id, \
                        previous_decision_id, decision_id, used_at_ms IS NOT NULL"

@@ -565,8 +565,8 @@ fn apply(
         }
         13 => {
             let (before, limit) = (now - rng.below(60) as i64, 1 + rng.below(6) as usize);
-            let expected = run_oracle(oracle, |tx| tx.prune_account_admissions(before, limit));
-            crate::account_writer::prune_account_admissions(store, before, limit)
+            let expected = run_oracle(oracle, |tx| tx.prune_account_admissions(before, limit, now + 30 * 60_000));
+            crate::account_writer::prune_account_admissions(store, before, limit, now + 30 * 60_000)
                 .map(|pruned| assert_eq!(pruned, expected.unwrap()))
         }
         14 => {
@@ -676,7 +676,7 @@ fn admission(principal: &str, id: &str, pin: &str, generation: u64, at: i64, las
 }
 
 fn prune_everything_before(store: &SqliteRouteStateStore, before: i64) {
-    crate::account_writer::prune_account_admissions(store, before, 100).unwrap();
+    crate::account_writer::prune_account_admissions(store, before, 100, before + 30 * 60_000).unwrap();
 }
 
 #[test]
@@ -749,8 +749,9 @@ fn pruning_the_newest_used_offer_reveals_the_older_used_one() {
         admit(tx, &second, false)?;
         tx.record_continuation("p", "s2", &record, "run", "original", "d1", Some(("d2", "second", 14)))?;
         tx.use_continuation("d2", 13)?;
-        // The first reservation stays started, so its row is retained; the
-        // second finishes and becomes prunable.
+        // Both reservations finish. The successor keeps its predecessor
+        // offer until the successor is pruned, preserving chain resolution.
+        tx.mark_admission_finished("p", "first", 14)?;
         tx.mark_admission_finished("p", "second", 14)?;
         Ok(())
     })
@@ -914,7 +915,7 @@ fn live_sized_admission_state_costs() {
         let before = BASE + 2_000 * STEP;
         let start = std::time::Instant::now();
         let pruned = match prune {
-            0 => crate::account_writer::prune_account_admissions(&store, before, 256).unwrap(),
+            0 => crate::account_writer::prune_account_admissions(&store, before, 256, now + 30 * 60_000).unwrap(),
             1 => crate::account_writer::prune_account_affinities(&store, before, 256)
                 .unwrap()
                 .affinities,

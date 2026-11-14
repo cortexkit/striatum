@@ -5,13 +5,13 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::{params, Connection};
 use striatum_core::{DecisionInput, RouteStateStore};
 use striatum_store::{
     dev_descriptor, AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord,
     AccountExclusionRow, AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow,
     AffinityRetentionBatch, SqliteRouteStateStore, DECISION_MODE_SERVE,
 };
-use rusqlite::{params, Connection};
 
 static NEXT_RIG: AtomicU64 = AtomicU64::new(0);
 
@@ -437,7 +437,7 @@ fn admission_retention_waits_for_every_time_the_admission_carries() {
 
     let mut batches = Vec::new();
     let deleted = drain(2, |limit| {
-        let removed = store.prune_account_admissions(BEFORE, limit).unwrap();
+        let removed = store.prune_account_admissions(BEFORE, limit, NOW).unwrap();
         batches.push(removed);
         removed
     });

@@ -1,6 +1,6 @@
 use super::*;
 
-fn offer(
+pub(super) fn offer(
     tx: &mut AccountCommand<'_>,
     id: &str,
     original: &str,
@@ -26,7 +26,12 @@ fn offer(
     )
 }
 
-fn counts(store: &SqliteRouteStateStore, owner: &StateOwner, now: i64, expected: [usize; 3]) {
+pub(super) fn counts(
+    store: &SqliteRouteStateStore,
+    owner: &StateOwner,
+    now: i64,
+    expected: [usize; 3],
+) {
     let restarted = loaded(store, now);
     for (account, expected) in ["a", "b", "c"].into_iter().zip(expected) {
         assert_eq!(
@@ -44,7 +49,7 @@ fn counts(store: &SqliteRouteStateStore, owner: &StateOwner, now: i64, expected:
     }
 }
 
-fn original(store: &SqliteRouteStateStore) {
+pub(super) fn original(store: &SqliteRouteStateStore) {
     reserve(store, row("original", T), T);
     start(store, "p", "original", "run", T);
 }

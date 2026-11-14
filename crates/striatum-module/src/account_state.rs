@@ -974,8 +974,9 @@ impl AccountCommand<'_> {
         &mut self,
         before: i64,
         limit: usize,
+        now_ms: i64,
     ) -> RouteStateResult<usize> {
-        let deleted = self.sql.prune_account_admissions_returning(before, limit)?;
+        let deleted = self.sql.prune_account_admissions_returning(before, limit, now_ms)?;
         if let Some(state) = self.state.as_deref_mut() {
             for row in &deleted {
                 state.inflight.remove(
@@ -1069,6 +1070,16 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
     }
     store.retry_account_state_load()?;
     bridge.snapshot().map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_at(store: &SqliteRouteStateStore, now_ms: i64) -> RouteStateResult<()> {
+    // The loader runs on the writer thread, where a test's thread-local clock
+    // is not installed. Pin its clock before starting that thread's load.
+    store.install_account_state_bridge(Arc::new(StateOwner {
+        load_now_ms: Some(now_ms),
+        ..StateOwner::default()
+    }))
 }
 
 /// After a request mix: the published admission state must equal a fresh
