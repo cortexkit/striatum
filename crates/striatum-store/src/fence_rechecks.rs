@@ -2144,6 +2144,7 @@ impl AccountTx<'_> {
                     return Ok(());
                 }
                 let row = row.clone();
+                let (pool_json, recovery_json) = (pool.map(str::to_owned), recovery.to_owned());
                 drop(blocks);
                 for pool in needed.iter().filter(|pool| scope.used(pool, model)) {
                     self.put_success_pool(&row.fence_id, &serde_json::to_string(pool).map_err(err)?, origin.evidence_at, now)?;
@@ -2158,7 +2159,16 @@ impl AccountTx<'_> {
                     return Ok(());
                 }
                 if older(&row) {
-                    self.clear_held_fence(&row, now, "run_succeeded")?;
+                    // Decided on the fence's pools and on the successes
+                    // recorded for them: the clear names both.
+                    self.clear_held_pool_fence(
+                        &row,
+                        pool_json.as_deref(),
+                        &recovery_json,
+                        (origin.evidence_at, healed.len()),
+                        now,
+                        "run_succeeded",
+                    )?;
                 }
             }
             "credential" => {

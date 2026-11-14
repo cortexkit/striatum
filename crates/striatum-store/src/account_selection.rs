@@ -2066,6 +2066,45 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// [`Self::clear_held_fence`] for a block whose clear was decided on its
+    /// pools: the update also names the pool key and recovery set as JSON
+    /// and the number of successes recorded for `successes.0` (the evidence
+    /// time), which must be `successes.1`.
+    pub(crate) fn clear_held_pool_fence(
+        &self,
+        row: &AccountFenceRow,
+        pool_key_json: Option<&str>,
+        recovery_set_json: &str,
+        successes: (i64, usize),
+        at: i64,
+        reason: &str,
+    ) -> RouteStateResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL AND observed_at = ?4 \
+                   AND created_at = ?5 AND fence_json = ?6 AND pool_key_json IS ?7 \
+                   AND recovery_set_json = ?8 AND (SELECT count(*) FROM fence_success_pool \
+                   WHERE fence_id = ?1 AND evidence_at = ?9) = ?10",
+                params![
+                    row.fence_id,
+                    at,
+                    reason,
+                    row.observed_at,
+                    row.created_at,
+                    row.fence_json,
+                    pool_key_json,
+                    recovery_set_json,
+                    successes.0,
+                    successes.1 as i64
+                ],
+            )
+            .map_err(err)?;
+        crate::block_state::expect_changes(changed, 1, format_args!("clear of fence {} on its pools", row.fence_id))
+            .map_err(err)
+    }
+
     /// Replace a standing whole-account block's recovery set, which only
     /// grows as later readings report more pools.
     pub fn set_fence_recovery_set(
