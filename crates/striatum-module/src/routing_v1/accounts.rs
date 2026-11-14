@@ -343,8 +343,9 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
         let policy =
             config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
-        // The shared context reports a store failure; for `account_for` that is
-        // transient unavailability, not the open `store_error` code.
+        // A store failure while building the shared context is reported by
+        // `account_for` as transient unavailability, which callers retry,
+        // rather than as a `store_error` refusal.
         checking("account_context");
         let mut ctx = account_ctx(deps, flags, &policy)
             .map_err(|refusal| account_unavailable(refusal.message))?;

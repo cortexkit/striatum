@@ -1318,9 +1318,13 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    /// A report settles only its launch's exact evidence. Admission owners can
-    /// retire their matching decision copy, but never another run's generation.
-    /// Without an admission, the decision must still own the current claim.
+    /// Settles one run's test request after a successful report. The owner's
+    /// authorization must name the block's exact evidence (the refusal that
+    /// started it) and its current claim generation (which numbered test this
+    /// was). An admission owner may also retire the same test's duplicate
+    /// authorization held under the decision id (`decision_copy`), but never a
+    /// later run's re-claim. With no admission, the decision itself must still
+    /// own the current claim.
     pub(crate) fn heal_report_probe(
         &self,
         owner: &str,

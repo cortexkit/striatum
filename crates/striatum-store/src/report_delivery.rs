@@ -161,8 +161,11 @@ impl SqliteRouteStateStore {
                 }
                 report_outcome(&tx, decision_id, outcome, error, now)?;
             }
-            // Decisions can seat several runs. Delivery deduplication, not the
-            // first decision outcome, owns each run's successful probe settlement.
+            // Core reuses one decision for several runs (Athena seats, mason
+            // retries), and each run reports separately under a `run:` delivery
+            // key. Each new delivery settles that run's own test request, so
+            // healing keys on the delivery rather than on the decision's first
+            // recorded outcome.
             if outcome == RouteOutcome::Completed && !effects.preserve_probe {
                 account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
                     .map_err(sql_error)?;
@@ -281,10 +284,12 @@ impl AccountTx<'_> {
                 // Only the first report may heal older matching serving evidence
                 // without a probe authorization. If this decision held one (a
                 // `fence_probe_authorization` row it owns), only
-                // `heal_report_probe` above may settle it: that requires the
-                // authorization's exact evidence and claim generation, claimed
-                // no later than the decision's creation. Ordinary serving
-                // recovery must not bypass those checks.
+                // `heal_report_probe` above may settle it. That requires the row's
+                // evidence (the refusal that started the block) and its claim
+                // generation (which numbered test request this was) to still match
+                // the block's recheck row, with the claim made no later than the
+                // decision's creation. Ordinary serving recovery must not bypass
+                // those checks.
                 if authorized || !first {
                     return Ok(());
                 }
