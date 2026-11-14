@@ -3,6 +3,9 @@
 use super::*;
 use cortexkit_role_routing::select_media::{check_answer, SelectMediaAnswer};
 
+#[path = "media_ranking_tests.rs"]
+mod ranking;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");
