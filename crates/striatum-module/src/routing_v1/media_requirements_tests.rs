@@ -133,7 +133,7 @@ async fn media_requirements_privacy_and_caller_local_offers_narrow_candidates() 
             let route = h.bind(reserved("colliculus"), None).await;
             let mut params = request();
             params["caller_local"] = json!([engine("z-phone", true)]);
-            assert_eq!(select(&route, &params).await["engine"]["model"], "a-remote");
+            assert_eq!(select(&route, &params).await["engine"]["model"], "z-phone");
             params["privacy"] = json!("local_only");
             let answer = select(&route, &params).await;
             assert_eq!(answer["engine"], json!({"provider":"media-vendor","model":"z-phone", "local":true,"caller_local":true,"index":0}));
