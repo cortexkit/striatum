@@ -6179,6 +6179,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn retention_migration_093_has_exact_nonpartial_lookup_indexes() {
+        let scratch = cortexkit_test_support::ScratchDir::new("pin-retention-indexes");
+        let store = SqliteRouteStateStore::open(&dev_descriptor(
+            "striatum",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .store
+            .with_read(|conn| {
+                for (name, table, column, definition) in [
+                    (
+                        "account_pin_by_created",
+                        "account_pin",
+                        "created_at",
+                        "CREATE INDEX account_pin_by_created ON account_pin(created_at)",
+                    ),
+                    (
+                        "account_hold_by_pin",
+                        "account_hold",
+                        "pin_id",
+                        "CREATE INDEX account_hold_by_pin ON account_hold(pin_id)",
+                    ),
+                ] {
+                    let actual: (String, String) = conn.query_row(
+                        "SELECT tbl_name,sql FROM sqlite_schema WHERE type='index' AND name=?1",
+                        [name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    assert_eq!(actual, (table.to_string(), definition.to_string()));
+                    let (unique, partial): (bool, bool) = conn.query_row(
+                        "SELECT \"unique\",partial FROM pragma_index_list(?1) WHERE name=?2",
+                        rusqlite::params![table, name],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
+                    assert!(
+                        !unique && !partial,
+                        "{name} must be nonunique and nonpartial"
+                    );
+                    let mut statement = conn.prepare(
+                        "SELECT name,desc,coll FROM pragma_index_xinfo(?1) WHERE key=1 ORDER BY seqno"
+                    )?;
+                    let terms = statement
+                        .query_map([name], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, bool>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert_eq!(
+                        terms,
+                        vec![(column.to_string(), false, "BINARY".to_string())]
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
     /// A store at migration 55, with every account table populated while
     /// foreign keys are enforced, opens through migrations 56 and 58: the
     /// foreign keys into the two history logs are gone, the admission-to-pin
@@ -6256,8 +6318,11 @@ mod tests {
                             && !line.starts_with(
                                 "account_admission index account_admission_by_conversation ",
                             )
-                            && !line
-                                .starts_with("account_continue index account_continue_by_admission ")
+                            && !line.starts_with(
+                                "account_continue index account_continue_by_admission ",
+                            )
+                            && !line.starts_with("account_pin index account_pin_by_created ")
+                            && !line.starts_with("account_hold index account_hold_by_pin ")
                             && !line.starts_with(demand_index)
                     })
                     .collect();
