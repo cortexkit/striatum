@@ -465,7 +465,7 @@ pub(super) fn seed_open_offer(
 #[tokio::test]
 async fn s8c_capped_sweep_reuses_the_account_snapshot() {
     let _clock = crate::InjectedClock::set(NOW as u64);
-    let (harness, _, routes) = panel_harness().await;
+    let (harness, owner, routes) = panel_harness().await;
     let provider = routes[0].split_once('/').unwrap().0;
     harness.edit_config(|config| {
         config["concurrency"]["enforcement_enabled"] = json!(true);
@@ -498,6 +498,32 @@ async fn s8c_capped_sweep_reuses_the_account_snapshot() {
                     .any(|count| count["effective_cap"] == 1)),
         "{answer}"
     );
+    assert_eq!(
+        crate::account_state::SNAPSHOT_COUNT.load(Ordering::Relaxed) - snapshots,
+        1
+    );
+    assert!(reads.reader.is_empty(), "{:?}", reads.reader);
+    assert!(reads.writer.is_empty(), "{:?}", reads.writer);
+    assert_eq!(
+        commands,
+        harness.store().account_writer_batch_sizes_for_test()
+    );
+    assert_eq!(before, rows(&harness));
+
+    trace.take();
+    let snapshots = crate::account_state::SNAPSHOT_COUNT.load(Ordering::Relaxed);
+    let (ty, estimate) = owner
+        .call(
+            "route.select_panel",
+            &json!({"consumer":fixture::SUMMARY,"class":"audit","seed":"capped","estimate":true}),
+        )
+        .await;
+    assert_eq!(ty, FrameType::Response, "{estimate}");
+    assert!(
+        estimate["result"]["seats"].as_array().unwrap().len() >= 2,
+        "{estimate}"
+    );
+    let reads = trace.take();
     assert_eq!(
         crate::account_state::SNAPSHOT_COUNT.load(Ordering::Relaxed) - snapshots,
         1

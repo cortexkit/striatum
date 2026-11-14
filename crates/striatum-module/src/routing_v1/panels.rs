@@ -62,7 +62,7 @@ pub(super) async fn select_panel(
             config.clone(),
         )?;
         let dry = DryRun {
-            live_config: crate::config_overrides::live_config(deps.routing_config_path),
+            live_config: inputs.live_config.clone(),
             operator_config: config,
             accounts: &accounts,
             inputs: &inputs,

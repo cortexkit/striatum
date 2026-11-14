@@ -266,6 +266,9 @@ impl crate::SqliteRouteStateStore {
                 _ => None,
             })
             .collect();
+        for row in &mut rows {
+            row.scope_error = Some(row.last_error.clone());
+        }
         crate::group_reads::declared_exception("route_data", || self.store.with_read(|conn| {
             let mut query = conn.prepare_cached("SELECT route_key,quota_pressure,latency_ema_ms,success_ema,last_error FROM model_route_state")?;
             for row in query.query_map([], |r| Ok((r.get::<_, String>(0)?,r.get::<_, Option<f64>>(1)?,r.get::<_, Option<f64>>(2)?,r.get::<_, Option<f64>>(3)?,r.get::<_, Option<String>>(4)?)))? {
@@ -282,5 +285,64 @@ impl crate::SqliteRouteStateStore {
             blocks.enabled(),
             now,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_data_refresh_preserves_captured_block_scope() {
+        let scratch = cortexkit_test_support::ScratchDir::new("dry-route-scope");
+        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "dry-route-scope",
+            scratch.path().join("state.db").to_string_lossy(),
+        ))
+        .unwrap();
+        let now = crate::now_ms();
+        let until = now + 600_000;
+        let _seed = Seeding::begin();
+        store.store.with_conn(|conn| conn.execute(
+            "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,updated_at,wall_observed_at,wall_unscoped) VALUES ('synthetic/model','synthetic/model','synthetic','model',?1,?2,?2,0)",
+            rusqlite::params![until,now],
+        )).unwrap();
+        store.account_transaction(|tx| tx.tick(now)).unwrap();
+        let captured = store.account_read(|tx| tx.load_block_state()).unwrap();
+        let original = captured.clone();
+        let before = store
+            .dry_run_route_snapshot(&captured, now as f64, now)
+            .unwrap();
+        assert_eq!(
+            before.by_route["synthetic/model"].cooldown_until,
+            Some(until as f64)
+        );
+        let error = r#"{"class":"transient","provider_code":"socket_timeout"}"#;
+        assert!(striatum_core::account_wall::transient_error(error));
+        store
+            .store
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE model_route_state SET last_error=?1 WHERE route_key='synthetic/model'",
+                    [error],
+                )
+            })
+            .unwrap();
+        let after = store
+            .dry_run_route_snapshot(&captured, now as f64, now)
+            .unwrap();
+        assert_eq!(
+            after.by_route["synthetic/model"].cooldown_until,
+            Some(until as f64)
+        );
+        assert_eq!(
+            after.by_capacity["synthetic/model"].cooldown_until,
+            Some(until as f64)
+        );
+        assert_eq!(
+            after.by_route["synthetic/model"].last_error.as_deref(),
+            Some(error)
+        );
+        assert_eq!(captured, original);
     }
 }

@@ -120,7 +120,7 @@ tests. Update filters and test paths when an approved replacement moves a pin.
 | S8a-3 | `FILTER="$PINS | test(account_writer::) | test(transaction_contention_tests::)"` | Full writer-handler coverage, source negative and per-table bypass counter. |
 | S8b-1 | `FILTER="$PINS | test(account_writer::) | test(account_state::)"` | Startup/load/reload, round trip and command-answer properties; replacement sign-offs already obtained. |
 | S8b-2 | `FILTER="$PINS | test(account_state::) | test(reads_off_writer::)"` | Reader-answer property, counted reader negatives, panel/key-pool mix, route-state differential. |
-| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
+| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::) | test(block_state::dry_run::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
 | S7b | `FILTER="$PINS | test(account_state::) | test(backup_exclusion::)"` | Block migration, frozen data, tombstones, stored-deadline provider status cases. |
 | S9a | `FILTER="$PINS | test(backup_exclusion::) | test(task_usage::) | test(observed_speed)"` | Split script Python check, open/refusal/history-chain, outbox freshness and idempotent mover. |
 | S9b-1 | `FILTER="$PINS"` | Derive windows/predicates/triggers/decision columns, no executable change. |
@@ -584,7 +584,7 @@ its connection wrapper, row-capture hook and DELETE authorizer now live in
 | `account_non_quota_size_refusal` | `AccountState.blocks` size origins; no size-admission command is run. |
 | `account_transient_backoff` | `AccountState.blocks` transient-backoff origins. |
 | `account_principal_exclusion` | `AccountState.blocks` exclusion origins/rows; no admission principal is allocated by an evaluation. |
-| `model_route_state` | Captured `AccountState.blocks` route block columns and clocks. `dry_run_route_snapshot` reads only route measurements from live SQL per evaluation, under the separately counted `route_data` exemption. |
+| `model_route_state` | Captured `AccountState.blocks` route block columns and clocks. `dry_run_route_snapshot` reads only route measurements from live SQL per evaluation, under the separately counted `route_data` category, excluded from the request-path account-state SQL-read counter. Refreshed diagnostic `last_error` cannot reclassify the captured block's scope. |
 | `provider_cooldown_state` | Captured `AccountState.blocks` provider origin, quarantine and inherited-route overlay. |
 | `credential_entitlement_fences` | `AccountState.blocks` credential sources; private listing reconciliation, classification and quota-heal operations retain their effects. |
 | `account_eligibility` | `AccountState.blocks` eligibility facts; private listing reconciliation removes obsolete facts. |
@@ -604,7 +604,11 @@ S8c filter: keep the invariant test filters above, use
 `connection_store::tests::` for the moved SQL-reference tests, and add
 `test(what_if_tests::sweep::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference)`.
 `account_writer::tests::` and `block_state::tests::` also protect the moved
-capture/authorizer hooks and the private account-repair support.
+capture/authorizer hooks and the private account-repair support. The additional
+`block_state::dry_run::tests::` filter covers fresh diagnostic errors without
+reclassifying captured walls. Capped sweeps and standalone panel estimates also
+assert one account snapshot, no SQL reads counted as account-state reads and
+no writer commands.
 The new sweep tests compare whole responses (timings removed), including every
 pick/refusal/exclusion, bar, top-routable and adequate list, panels and head
 choices. The quota-replacement fixtures are recorded through the test-only SQL

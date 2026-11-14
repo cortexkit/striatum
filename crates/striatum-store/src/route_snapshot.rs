@@ -57,6 +57,10 @@ pub(crate) struct RouteStateRow {
     failure_backoff_until: Option<f64>,
     failure_backoff_reason: Option<String>,
     pub(crate) last_error: Option<String>,
+    /// A dry run keeps the error used to determine its captured block's scope
+    /// separately from refreshed diagnostic text. None means no override;
+    /// Some(None) preserves a captured row with no error.
+    pub(crate) scope_error: Option<Option<String>>,
     wall_class: Option<String>,
     wall_unscoped: bool,
 }
@@ -74,6 +78,7 @@ pub(crate) fn route_row_at(r: &Row<'_>, at: usize) -> rusqlite::Result<RouteStat
         failure_backoff_until: r.get(at + 7)?,
         failure_backoff_reason: r.get(at + 8)?,
         last_error: r.get(at + 9)?,
+        scope_error: None,
         wall_class: r.get(at + 10)?,
         wall_unscoped: r.get(at + 11)?,
     })
@@ -209,6 +214,11 @@ pub(crate) fn overlay(
     let mut by_capacity: HashMap<String, RouteRuntimeState> = HashMap::new();
     for row in rows {
         let row = row.borrow();
+        let scope_error = row
+            .scope_error
+            .as_ref()
+            .unwrap_or(&row.last_error)
+            .as_deref();
         let mut state = RouteRuntimeState {
             cooldown_until: row.cooldown_until,
             quota_exhausted_until: row.quota_exhausted_until,
@@ -280,17 +290,12 @@ pub(crate) fn overlay(
         // diagnosis. Its single-account horizon cannot reject another
         // credential, including through a sibling capacity key.
         if !row.wall_unscoped
-            && striatum_core::account_wall::account_scoped_wall(
-                state.last_error.as_deref(),
-                state.wall_class,
-            )
+            && striatum_core::account_wall::account_scoped_wall(scope_error, state.wall_class)
         {
             state.cooldown_until = None;
             state.quota_exhausted_until = None;
             state.wall_class = None;
-            if striatum_core::account_wall::transient_error(
-                state.last_error.as_deref().unwrap_or_default(),
-            ) {
+            if striatum_core::account_wall::transient_error(scope_error.unwrap_or_default()) {
                 state.failure_backoff_until = None;
                 state.failure_backoff_reason = None;
             }
