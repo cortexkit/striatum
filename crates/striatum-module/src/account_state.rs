@@ -180,6 +180,24 @@ impl AccountWorkingState for AccountState {
 /// The longest a reader waits for the first publication of the state.
 const FIRST_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// A shorter first-load bound a test sets, in milliseconds; 0 keeps
+/// [`FIRST_LOAD_WAIT`].
+#[cfg(test)]
+static FIRST_LOAD_WAIT_FOR_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn first_load_wait() -> std::time::Duration {
+    #[cfg(test)]
+    match FIRST_LOAD_WAIT_FOR_TEST.load(Ordering::Relaxed) {
+        0 => {}
+        ms => return std::time::Duration::from_millis(ms),
+    }
+    FIRST_LOAD_WAIT
+}
+
+/// The start of the error a reader gets when the first load is still
+/// running at the end of the wait.
+const FIRST_LOAD_PENDING: &str = "account state not loaded within";
+
 /// Publication swaps one Arc under a short write lock;
 /// readers only hold the read lock long enough to clone it. This provides
 /// atomic snapshot publication without another synchronization dependency.
@@ -252,14 +270,14 @@ impl StateOwner {
         let (ready, waited) = self
             .ready
             .1
-            .wait_timeout_while(self.ready.0.lock().unwrap(), FIRST_LOAD_WAIT, |ready| {
+            .wait_timeout_while(self.ready.0.lock().unwrap(), first_load_wait(), |ready| {
                 ready.is_none()
             })
             .unwrap();
         if waited.timed_out() {
             return Err(RouteStateStoreError(format!(
-                "account state not loaded within {}s; retry the operation",
-                FIRST_LOAD_WAIT.as_secs()
+                "{FIRST_LOAD_PENDING} {}ms; retry the operation",
+                first_load_wait().as_millis()
             )));
         }
         if let Some(Err(error)) = ready.as_ref() {
@@ -1112,11 +1130,16 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
     let Some(bridge) = store.account_state_bridge() else {
         return store.install_account_state_bridge(Arc::new(StateOwner::default()));
     };
-    if bridge.snapshot().is_ok() {
-        return Ok(());
+    match bridge.snapshot() {
+        Ok(_) => Ok(()),
+        // The first load is still running: answer that. A retry would
+        // queue a second load behind it and wait for both without a bound.
+        Err(error) if error.to_string().contains(FIRST_LOAD_PENDING) => Err(error),
+        Err(_) => {
+            store.retry_account_state_load()?;
+            bridge.snapshot().map(|_| ())
+        }
     }
-    store.retry_account_state_load()?;
-    bridge.snapshot().map(|_| ())
 }
 
 /// After a request mix: the published admission state must equal a fresh

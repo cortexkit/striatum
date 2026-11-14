@@ -191,6 +191,47 @@ fn a_writer_that_stops_during_the_first_load_wakes_waiting_readers() {
     reader.join().unwrap();
 }
 
+/// A first load that takes longer than the readers' bound answers the
+/// timeout to a request that arrives meanwhile, within the bound. The
+/// request does not queue a second load behind the first, which it would
+/// then wait for without a bound.
+#[test]
+fn a_stalled_first_load_answers_a_request_within_the_bound() {
+    let (_scratch, store) = fixture("state-startup-stalled-load");
+    super::FIRST_LOAD_WAIT_FOR_TEST.store(200, Ordering::Relaxed);
+    let owner = Arc::new(StateOwner::default());
+    let (entered, loading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel::<()>();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        let _ = paused.recv();
+        Ok(())
+    }));
+    let installing = store.clone();
+    let driver = owner.clone();
+    let loader = std::thread::spawn(move || installing.install_account_state_bridge(driver));
+    loading.recv_timeout(Duration::from_secs(2)).unwrap();
+    let requesting = store.clone();
+    let (answered, answer) = mpsc::channel();
+    let request = std::thread::spawn(move || {
+        answered.send(super::initialize(&requesting)).unwrap();
+    });
+    let answer = answer
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the request is answered while the first load still runs");
+    let error = answer.unwrap_err().to_string();
+    assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
+    resume.send(()).unwrap();
+    loader.join().unwrap().unwrap();
+    request.join().unwrap();
+    super::initialize(&store).unwrap();
+    assert_eq!(
+        owner.loads.load(Ordering::Relaxed),
+        1,
+        "the request queued no second load"
+    );
+}
+
 #[test]
 fn account_for_frame_sent_during_load_is_answered_after_publication() {
     let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
