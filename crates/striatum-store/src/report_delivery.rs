@@ -170,9 +170,12 @@ impl AccountTx<'_> {
             return Ok(());
         }
         if let Some((principal, id)) = admissions.first() {
-            let admission = self
-                .admission(principal, id)?
-                .expect("selected admission exists");
+            // Read in the same transaction as the lookup above, so the row is
+            // there; still, a missing row heals nothing rather than panicking
+            // the writer.
+            let Some(admission) = self.admission(principal, id)? else {
+                return Ok(());
+            };
             if effects
                 .reported_credential
                 .as_deref()
