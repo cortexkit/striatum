@@ -2530,7 +2530,10 @@ async fn handle_select_request_attempt(
                         detail: Some(serde_json::Value::Object(refusal.detail)),
                     }).await;
                 }
-                if let Some(until) = [*lost_probe_until, refusal.retry_at].into_iter().flatten().min() {
+                // A store failure is answered as such, even after an earlier
+                // route lost its probe: the wait would hide it.
+                let lost = [*lost_probe_until, refusal.retry_at].into_iter().flatten().min();
+                if let Some(until) = lost.filter(|_| refusal.code != "store_error") {
                     return send_route_error_body(
                         writer, ver, channel, epoch, corr, lost_probe_wait(until),
                     ).await;

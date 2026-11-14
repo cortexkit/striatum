@@ -401,6 +401,69 @@ fn broca_scoring_remembers_a_competing_probe_before_its_first_eligibility_check(
     }
 }
 
+/// A legacy launch whose route's probe another selection bound after this
+/// one scored is told when to retry, as a lost probe binding is, never an
+/// untimed `no_eligible_account`.
+#[test]
+fn a_legacy_launch_whose_probe_another_selection_bound_is_told_when_to_retry() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let load = || {
+        crate::account_selection::ClassContext::load(
+            harness.store(),
+            &harness.credentials(),
+            harness.operator_config(),
+            crate::ACCOUNT_QUOTA.get(),
+            FENCE_NOW as i64,
+        )
+        .unwrap()
+    };
+    let mut first = load();
+    first
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    let mut second = load();
+    second
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    let _binding = first
+        .bind_selected_probe(harness.store(), "inception", "mercury-3", true, "winner")
+        .unwrap();
+    let launched =
+        second.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, Some("loser"));
+    // Compared through Debug, so the check also compiles against a refusal
+    // type that carries only a code and a message, and fails there.
+    let shown = format!("{launched:?}");
+    assert!(shown.starts_with("Err(Lost { retry_at: "), "{shown}");
+}
+
+/// A selection that names no owner claims a launch's probe for its own
+/// reservation owner; claiming the same launch again (route.select checks a
+/// runner, then launches it) finds that claim its own, not a lost race.
+#[test]
+fn a_selection_claiming_its_launch_probe_twice_keeps_it() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let mut context = crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        FENCE_NOW as i64,
+    )
+    .unwrap();
+    context
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    for attempt in ["first", "second"] {
+        let launched =
+            context.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, None);
+        assert!(launched.is_ok(), "{attempt}: {launched:?}");
+    }
+}
+
 fn steal_selected_probe(harness: &Harness) {
     crate::account_selection::before_probe_bind(&harness.credentials(), |store| {
         store
