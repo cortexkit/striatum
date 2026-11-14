@@ -1245,6 +1245,12 @@ async fn handle_select_request_attempt(
             &principal,
             &request["params"],
             || {
+                if envelope.method == account_selection::ACCOUNT_FOR_OP
+                    && live_config.account_flags().enabled
+                    && !crate::broca_credentials::wait_for_first_listing(broca_credentials)
+                {
+                    return crate::broca_credentials::listing_not_ready(&request["params"]);
+                }
                 let policy = striatum_core::accounts::AllocatorPolicy {
                     model_pools: live_config.quota_model_pools_ref().to_vec(),
                     ..Default::default()

@@ -347,6 +347,9 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         // `account_for` as transient unavailability, which callers retry,
         // rather than as a `store_error` refusal.
         checking("account_context");
+        if flags.enabled && !crate::broca_credentials::wait_for_first_listing(deps.broca_credentials) {
+            return Err(op_refusal(crate::broca_credentials::listing_not_ready(params)));
+        }
         let mut ctx = account_ctx(deps, flags, &policy)
             .map_err(|refusal| account_unavailable(refusal.message))?;
         if engine_decision || media_caller {
@@ -766,6 +769,7 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                     "decision_id",
                     "exclusions",
                     "retry_after_ms",
+                    "cause",
                 ] {
                     if let Some(value) = detail.get(key) {
                         refusal.detail.insert(key.into(), value.clone());
