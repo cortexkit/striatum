@@ -7,7 +7,7 @@ use std::sync::Arc;
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::{json, Value};
 
-use crate::account_state::{AccountState, InflightScope};
+use crate::account_state::{AccountState, CapCount, InflightScope};
 use crate::concurrency_caps::{CapScope, ResolvedCaps};
 
 use super::{store_refusal, Deps};
@@ -40,6 +40,15 @@ impl Snapshot {
             .publish_settings(config.concurrency_caps());
         let caps = credentials.concurrency_caps.resolved.clone();
         let mut models = state.inflight.active_models(now);
+        // A waiter's per-model count is listed even when nothing holds it.
+        for (_, waiter) in state.waiters.live(now) {
+            for count in &waiter.counts {
+                let models = models
+                    .entry((count.provider.clone(), count.account.clone()))
+                    .or_default();
+                models.extend(count.model.clone());
+            }
+        }
         for (provider, account) in caps.accounts() {
             models
                 .entry((provider.to_owned(), account.to_owned()))
@@ -79,6 +88,32 @@ impl Snapshot {
     }
 
     pub(super) fn report(&self) -> Value {
+        // Each live waiter is listed on every count it waits on. Waiters
+        // exist only with enforcement on, and a count no one waits on carries
+        // no `waiters` member.
+        let mut waiting: BTreeMap<CapCount, Vec<(u64, Value)>> = BTreeMap::new();
+        if self.enforcement_enabled {
+            for (_, waiter) in self.state.waiters.live(self.now) {
+                for count in &waiter.counts {
+                    waiting.entry(count.clone()).or_default().push((
+                        waiter.order,
+                        json!({"class":waiter.class, "order":waiter.order}),
+                    ));
+                }
+            }
+        }
+        let waiters = |provider: &str, account: &str, model: Option<&str>| {
+            let count = CapCount {
+                provider: provider.to_owned(),
+                account: account.to_owned(),
+                model: model.map(str::to_owned),
+            };
+            waiting.get(&count).map(|waiters| {
+                let mut waiters = waiters.clone();
+                waiters.sort_by_key(|(order, _)| *order);
+                Value::Array(waiters.into_iter().map(|(_, waiter)| waiter).collect())
+            })
+        };
         let accounts: Vec<_> = self
             .models
             .iter()
@@ -92,17 +127,25 @@ impl Snapshot {
                         .inflight
                         .count_for_scope(&self.caps, provider, account, scope, self.now)
                 };
-                let mut counts = vec![json!({
+                let mut shared = json!({
                     "scope":"account", "model":null, "effective_cap":shared_limit,
                     "holds_in_flight":count(InflightScope::Account)
-                })];
+                });
+                if let Some(waiters) = waiters(provider, account, None) {
+                    shared["waiters"] = waiters;
+                }
+                let mut counts = vec![shared];
                 for model in models {
                     let cap = self.caps.cap(provider, account, model);
                     if cap.scope == CapScope::AccountModel {
-                        counts.push(json!({
+                        let mut modeled = json!({
                             "scope":"account_model", "model":model, "effective_cap":cap.limit,
                             "holds_in_flight":count(InflightScope::AccountModel(model))
-                        }));
+                        });
+                        if let Some(waiters) = waiters(provider, account, Some(model)) {
+                            modeled["waiters"] = waiters;
+                        }
+                        counts.push(modeled);
                     }
                 }
                 json!({"provider":provider, "account_id":account, "cap_counts":counts})

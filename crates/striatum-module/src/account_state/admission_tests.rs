@@ -330,7 +330,7 @@ impl Rng {
     }
 }
 
-const OPERATIONS: usize = 19;
+const OPERATIONS: usize = 20;
 const OPERATION_NAMES: [&str; OPERATIONS] = [
     "admit",
     "reassign_or_stale_affinity",
@@ -351,6 +351,7 @@ const OPERATION_NAMES: [&str; OPERATIONS] = [
     "rolled_back_command",
     "reload",
     "admit_without_affinity",
+    "prune_pins",
 ];
 
 /// What the generator has created so far, for choosing targets.
@@ -360,6 +361,7 @@ struct World {
     runs: Vec<(String, String, String)>,
     decisions: Vec<String>,
     serial: u64,
+    pruned_affinities: usize,
 }
 
 impl World {
@@ -571,9 +573,17 @@ fn apply(
         }
         14 => {
             let (before, limit) = (now - rng.below(60) as i64, 1 + rng.below(6) as usize);
-            let expected = run_oracle(oracle, |tx| tx.prune_account_affinities(before, limit));
-            crate::account_writer::prune_account_affinities(store, before, limit)
-                .map(|pruned| assert_eq!(pruned, expected.unwrap()))
+            let keys = store
+                .plan_account_affinities(before, now, None, limit)
+                .unwrap()
+                .keys;
+            let expected = run_oracle(oracle, |tx| tx.prune_account_affinities(&keys, before, now));
+            crate::account_writer::prune_account_affinities(store, keys, before, now).map(
+                |pruned| {
+                    world.pruned_affinities += pruned.affinities;
+                    assert_eq!(pruned, expected.unwrap())
+                },
+            )
         }
         15 => {
             let (before, limit) = (now - rng.below(60) as i64, 1 + rng.below(6) as usize);
@@ -596,6 +606,12 @@ fn apply(
             owner.reload.store(true, Ordering::Release);
             crate::account_writer::tick(store, now)
         }
+        19 => {
+            let (before, limit) = (now - rng.below(60) as i64, 1 + rng.below(6) as usize);
+            let expected = run_oracle(oracle, |tx| tx.prune_account_pins(before, limit));
+            crate::account_writer::prune_account_pins(store, before, limit)
+                .map(|pruned| assert_eq!(pruned, expected.unwrap()))
+        }
         _ => unreachable!(),
     };
     result.unwrap_or_else(|error| panic!("{}: {error}", OPERATION_NAMES[op]));
@@ -613,6 +629,217 @@ fn generated(seed: u64, steps: usize) -> Vec<(usize, i64)> {
 }
 
 #[test]
+fn pin_retention_agrees_with_a_fresh_state_load() {
+    let (_scratch, store) = fixture("pin-retention-load");
+    let owner = install(&store);
+    let mut world = World::default();
+    let mut rng = Rng(13);
+    let current = world.new_admission(&mut rng, 10);
+    run(&store, move |tx| admit(tx, &current, true)).unwrap();
+    for at in [1, 2] {
+        let mut orphan = world.new_admission(&mut rng, at);
+        orphan.hash = "orphan".into();
+        run(&store, move |tx| tx.insert_pin(&orphan.pin_row())).unwrap();
+    }
+    assert_eq!(
+        crate::account_writer::prune_account_pins(&store, 100, 256).unwrap(),
+        2
+    );
+    assert_equivalent(&store, &owner, "after deleting unneeded pins");
+    owner.reload.store(true, Ordering::Release);
+    crate::account_writer::tick(&store, 10).unwrap();
+    assert_equivalent(&store, &owner, "after restart load");
+}
+
+#[test]
+fn expired_affinity_retention_agrees_with_a_fresh_state_load() {
+    let (_scratch, store) = fixture("expired-affinity-retention-load");
+    let owner = install(&store);
+    let mut world = World::default();
+    let mut rng = Rng(17);
+    let expired = world.new_admission(&mut rng, 10);
+    run(&store, move |tx| {
+        tx.insert_pin(&expired.pin_row())?;
+        tx.put_affinity(&expired.affinity(10), None)?;
+        Ok(())
+    })
+    .unwrap();
+    let report = crate::retention::run_retention_pass(
+        &store,
+        &crate::retention::RetentionWindows::default(),
+        4_000_000,
+        &crate::retention::PassBudget {
+            pause: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+    );
+    assert_eq!(report.account_affinities, 1);
+    assert_eq!(report.account_pins, 1);
+    assert_equivalent(&store, &owner, "after deleting an expired affinity");
+    owner.reload.store(true, Ordering::Release);
+    crate::account_writer::tick(&store, 4_000_000).unwrap();
+    assert_equivalent(&store, &owner, "after restart load");
+}
+
+/// Live-shaped retention measurement, in separate processes for independent
+/// resident-memory deltas. Of 165,000 expired affinities, retained admissions
+/// protect 109,931, matching the live store's roughly 55,000 prunable rows.
+fn measure_affinity_retention_load(prune: bool) {
+    const NOW: i64 = 1_800_000_000_000;
+    const DAY: i64 = 86_400_000;
+    let (scratch, store) = fixture(if prune {
+        "retention-load-after"
+    } else {
+        "retention-load-before"
+    });
+    store.with_writer_for_test(|conn| conn.execute_batch(&format!(
+        "BEGIN;
+         WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<279999)
+         INSERT INTO account_decision (decision_id,mode,trigger,principal,provider,model,family,outcome,code,policy_version,decision_json,created_at)
+         SELECT 'd'||i,'serve','request','p','prov','model','model','admit','cold_scored',1,'{{}}',
+           CASE WHEN i<55000 THEN {NOW}-31*{DAY}+i ELSE {NOW}-{DAY}+i END FROM n;
+         WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<191709)
+         INSERT INTO account_pin (pin_id,principal,conversation_hash,provider,pin_generation,affinity_model,account_id,credential_id,pin_mode,decision_id,created_at)
+         SELECT 'pin'||i,'p','h'||i,'prov',1,'model','a'||(i%40),'cred'||(i%40),'conversation_lease','d'||i,
+           CASE WHEN i<55000 THEN {NOW}-31*{DAY}+i ELSE {NOW}-8*{DAY}+i END FROM n;
+         INSERT INTO account_affinity (principal,conversation_hash,provider,affinity_model,pin_id,pin_generation,account_id,credential_id,credential_binding_revision,policy_version,initial_demand_bytes,created_at,last_used_at,expires_at,lease_valid_until)
+         SELECT principal,conversation_hash,provider,affinity_model,pin_id,pin_generation,account_id,credential_id,1,1,10,created_at,created_at,
+           CASE WHEN rowid<=165000 THEN {NOW}-7200000-165000+rowid ELSE {NOW}+{DAY} END,{NOW}-1 FROM account_pin;
+         INSERT INTO account_admission (principal,admission_id,request_fingerprint,request_mode,
+           decision_id,conversation_hash,provider,model,account_id,credential_id,pin_id,pin_generation,
+           state,charged,request_bytes,request_bytes_estimated,committed_at,admission_valid_until,
+           lease_valid_until,reply_json,started_at,finished_at)
+         SELECT principal,'adm'||rowid,'fp','admit',decision_id,conversation_hash,provider,'model',
+           account_id,credential_id,pin_id,pin_generation,'finished',1,100,0,{NOW}-8*{DAY},
+           {NOW}-8*{DAY}+60000,{NOW}-8*{DAY}+120000,'{{}}',{NOW}-8*{DAY},{NOW}-8*{DAY}+1000
+         FROM account_pin WHERE rowid>55069 AND rowid<=165000;
+         COMMIT;"
+    ))).unwrap();
+    if prune {
+        let (mut total, mut after, mut passes) = (0, None, 0);
+        let (mut max_batch, mut max_plan) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let start = std::time::Instant::now();
+        loop {
+            let plan_start = std::time::Instant::now();
+            let plan = store
+                .plan_account_affinities(NOW - 3_600_000, NOW, after, 4096)
+                .unwrap();
+            let plan_time = plan_start.elapsed();
+            max_plan = max_plan.max(plan_time);
+            passes += 1;
+            println!(
+                "affinity plan pass={passes}: examined={} candidates={} wall_ms={}",
+                plan.examined,
+                plan.keys.len(),
+                plan_time.as_secs_f64() * 1000.0
+            );
+            for keys in plan
+                .keys
+                .chunks(crate::retention::AFFINITY_DELETE_BATCH_ROWS)
+            {
+                let keys = keys.to_vec();
+                let batch_start = std::time::Instant::now();
+                let batch = store
+                    .account_command(AccountCommandKind::Maintenance, move |tx| {
+                        tx.delete_account_affinities_returning(&keys, NOW - 3_600_000, NOW)
+                            .map(|(batch, _)| batch)
+                    })
+                    .unwrap();
+                max_batch = max_batch.max(batch_start.elapsed());
+                total += batch.affinities;
+            }
+            after = plan.last.or(after);
+            if plan.examined < 4096 {
+                break;
+            }
+        }
+        assert_eq!(total, 55_069);
+        println!("affinity backlog: deleted={total} passes={passes} wall_ms={} max_batch_ms={} max_plan_ms={}", start.elapsed().as_secs_f64()*1000.0, max_batch.as_secs_f64()*1000.0, max_plan.as_secs_f64()*1000.0);
+    }
+    let start = std::time::Instant::now();
+    let mut deleted = 0;
+    let mut batches = 0;
+    let mut max_batch = std::time::Duration::ZERO;
+    for _ in 0..16 {
+        let batch_start = std::time::Instant::now();
+        let n = store.prune_serve_decisions(NOW - 30 * DAY, 256).unwrap();
+        max_batch = max_batch.max(batch_start.elapsed());
+        deleted += n;
+        batches += 1;
+        if n < 256 {
+            break;
+        }
+    }
+    println!("decision pass prune={prune}: deleted={deleted} batches={batches} wall_ms={} max_batch_ms={}", start.elapsed().as_secs_f64()*1000.0, max_batch.as_secs_f64()*1000.0);
+    drop(store);
+    let store = SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+        "retention-load",
+        scratch.path().join("state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    let resident = || -> u64 {
+        std::fs::read_to_string("/proc/self/statm")
+            .ok()
+            .and_then(|s| s.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 4096
+    };
+    let before = resident();
+    let start = std::time::Instant::now();
+    let state = store.account_transaction(AccountState::load).unwrap();
+    let elapsed = start.elapsed();
+    let after = resident();
+    assert_eq!(
+        state.admissions.affinity.len(),
+        if prune { 136_641 } else { 191_710 }
+    );
+    println!("account-state load prune={prune}: affinities={} wall_ms={} rss_before_bytes={before} rss_after_bytes={after} rss_delta_bytes={}",
+        state.admissions.affinity.len(), elapsed.as_secs_f64()*1000.0, after.saturating_sub(before));
+    drop(std::hint::black_box(state));
+    if !prune {
+        let owner = install(&store);
+        let plan_start = std::time::Instant::now();
+        let plan = store
+            .plan_account_affinities(NOW - 3_600_000, NOW, None, 4096)
+            .unwrap();
+        let plan_time = plan_start.elapsed();
+        let mut max_command = std::time::Duration::ZERO;
+        for keys in plan
+            .keys
+            .chunks(crate::retention::AFFINITY_DELETE_BATCH_ROWS)
+        {
+            let start = std::time::Instant::now();
+            crate::account_writer::prune_account_affinities(
+                &store,
+                keys.to_vec(),
+                NOW - 3_600_000,
+                NOW,
+            )
+            .unwrap();
+            max_command = max_command.max(start.elapsed());
+        }
+        println!(
+            "stateful first pass: plan_ms={} max_command_ms={}",
+            plan_time.as_secs_f64() * 1000.0,
+            max_command.as_secs_f64() * 1000.0
+        );
+        assert_equivalent(&store, &owner, "measured planned affinity delete");
+    }
+}
+
+#[test]
+#[ignore]
+fn measure_affinity_retention_load_before() {
+    measure_affinity_retention_load(false);
+}
+
+#[test]
+#[ignore]
+fn measure_affinity_retention_load_after() {
+    measure_affinity_retention_load(true);
+}
+
+#[test]
 fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
     let seeds = 1..=16u64;
     let mut coverage = [false; OPERATIONS];
@@ -625,6 +852,7 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
         assert!(reached, "generator never reaches {}", OPERATION_NAMES[op]);
     }
     let mut reached = BTreeMap::<&str, usize>::new();
+    let mut pruned_affinities = 0;
     for seed in seeds {
         let (_scratch, store) = fixture(&format!("admission-state-property-{seed}"));
         let (_oracle_scratch, oracle) = fixture(&format!("admission-state-oracle-{seed}"));
@@ -639,6 +867,7 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
             assert_same_answers(&published(&owner), &oracle, &world, now, &context);
         }
         let state = published(&owner);
+        pruned_affinities += world.pruned_affinities;
         for (name, size) in [
             ("open", state.open.len()),
             ("latest", state.latest.len()),
@@ -656,6 +885,10 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
     for (name, total) in &reached {
         assert!(*total > 0, "no sequence ended with a non-empty {name} index");
     }
+    assert!(
+        pruned_affinities > 0,
+        "the generated sequence must delete affinity rows"
+    );
 }
 
 fn admission(principal: &str, id: &str, pin: &str, generation: u64, at: i64, lasts: i64) -> Admission {
@@ -915,10 +1148,26 @@ fn live_sized_admission_state_costs() {
         let before = BASE + 2_000 * STEP;
         let start = std::time::Instant::now();
         let pruned = match prune {
-            0 => crate::account_writer::prune_account_admissions(&store, before, 256, now + 30 * 60_000).unwrap(),
-            1 => crate::account_writer::prune_account_affinities(&store, before, 256)
+            0 => crate::account_writer::prune_account_admissions(
+                &store,
+                before,
+                256,
+                now + 30 * 60_000,
+            )
+            .unwrap(),
+            1 => {
+                crate::account_writer::prune_account_affinities(
+                    &store,
+                    store
+                        .plan_account_affinities(before, now, None, 256)
+                        .unwrap()
+                        .keys,
+                    before,
+                    now,
+                )
                 .unwrap()
-                .affinities,
+                .affinities
+            }
             _ => crate::account_writer::prune_account_continuations(&store, before, 256).unwrap(),
         };
         println!(

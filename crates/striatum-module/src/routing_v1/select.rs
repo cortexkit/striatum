@@ -889,6 +889,7 @@ async fn prepare_selection(
                 .as_ref()
                 .map(|_| crate::config_policy::ConsumerMode::Ladder),
             ladder,
+            ladder_source: Some(crate::config_policy::ConsumerLadderSource::Declaration),
             ..Default::default()
         },
         &consumers.policies,
@@ -1670,7 +1671,7 @@ async fn select_at_tier_attempt(
 
     if let Some(view) = evaluation {
         let mut evidence = view.evidence.lock().unwrap();
-        let _ = selection.score_candidates_evaluated(&usable, Some(&mut evidence));
+        let _ = selection.score_candidates_evaluated(&usable, consumer_policy.operator_ladder(), None, None, Some(&mut evidence));
     }
 
     let project_pin = request
@@ -1739,6 +1740,7 @@ async fn select_at_tier_attempt(
             request_pin = None;
         }
     }
+    let mut ladder_variant = None;
     let ladder_choice = if request_pin.is_none()
         && !classifier
         && project_pin.is_none()
@@ -1751,32 +1753,40 @@ async fn select_at_tier_attempt(
             let Some(route) = RouteRef::parse_pin(entry) else {
                 continue;
             };
+            let route_key = if consumer_policy.operator_ladder() {
+                format!("{}/{}", route.provider, route.model)
+            } else {
+                route.route_key()
+            };
             let subset = available
                 .iter()
                 .filter(|key| {
-                    *key == &route.route_key()
-                        || key.starts_with(&format!("{}/", route.route_key()))
+                    *key == &route_key || key.starts_with(&format!("{route_key}/"))
                 })
                 .cloned()
                 .collect();
-            if let Ok(selected) = selection.score(&subset) {
+            let variant = consumer_policy.operator_ladder().then_some(route.variant).flatten();
+            if let Ok(selected) = selection.score_ladder(&subset, &consumer_policy, variant.as_deref(), Some(&route_key)) {
+                selection.check_ladder_variant(&selected, variant.as_deref())?;
                 match selection.account_check(&selected) {
                     Ok(()) => {
+                        ladder_variant = variant;
                         result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
                         break;
                     }
                     Err(refusal) if refusal.code.as_str() == "account_hold" => {
                         if selection.hold_ok {
+                            ladder_variant = variant;
                             result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
                             break;
                         }
                         if fallback_hold.as_ref().is_none_or(
-                            |(_, previous): &(SelectedModelRoute, Refusal)| {
+                            |(_, previous, _): &(SelectedModelRoute, Refusal, Option<String>)| {
                                 previous.detail.get("reset_at_ms").and_then(Value::as_i64)
                                     > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
                             },
                         ) {
-                            fallback_hold = Some((selected, refusal));
+                            fallback_hold = Some((selected, refusal, variant));
                         }
                     }
                     Err(_) => {}
@@ -1784,7 +1794,10 @@ async fn select_at_tier_attempt(
             }
         }
         result.or_else(|| {
-            fallback_hold.map(|(selected, _)| Ok((selected, select_policy::OrderBasis::Mode)))
+            fallback_hold.map(|(selected, _, variant)| {
+                ladder_variant = variant;
+                Ok((selected, select_policy::OrderBasis::Mode))
+            })
         })
     } else {
         None
@@ -1801,8 +1814,12 @@ async fn select_at_tier_attempt(
                 if classifier {
                     return selection.score(&usable);
                 }
-                select_policy::select_in_order(&usable, &consumer_policy, |only| {
-                    selection.score(only)
+                select_policy::select_in_order(&usable, &consumer_policy, |only, variant, key| {
+                    let result = selection.score_ladder(only, &consumer_policy, variant, key);
+                    if result.is_ok() {
+                        ladder_variant = variant.map(str::to_owned);
+                    }
+                    result
                 })
             },
         )
@@ -1846,7 +1863,8 @@ async fn select_at_tier_attempt(
                     .as_deref()
                     .and_then(RouteRef::parse_pin)
                     .and_then(|pin| pin.variant),
-                select_policy::OrderBasis::Continuing | select_policy::OrderBasis::Mode => None,
+                select_policy::OrderBasis::Mode => ladder_variant,
+                select_policy::OrderBasis::Continuing => None,
             };
             let basis = match order {
                 select_policy::OrderBasis::RequestPin if inputs.consumer_pinned => Basis::ConsumerPin,
@@ -1881,8 +1899,14 @@ async fn select_at_tier_attempt(
                     {
                         return None;
                     }
+                    let variant = consumer_policy.operator_ladder().then(|| {
+                        consumer_policy.ladder.iter().flatten().find_map(|entry| {
+                            let route = RouteRef::parse_pin(entry)?;
+                            (format!("{}/{}", route.provider, route.model) == *key).then_some(route.variant).flatten()
+                        })
+                    }).flatten();
                     if !available.contains(key)
-                        || selection.score(&HashSet::from([key.clone()])).is_err()
+                        || selection.score_ladder(&HashSet::from([key.clone()]), &consumer_policy, variant.as_deref(), Some(key)).is_err()
                     {
                         return None;
                     }
@@ -1903,6 +1927,9 @@ async fn select_at_tier_attempt(
             return Err(no_route_refusal(&no_route, now));
         }
     };
+    if consumer_policy.operator_ladder() {
+        selection.check_ladder_variant(&selected, explicit_variant.as_deref())?;
+    }
     let variant_choice = crate::apply_variant_policy(
         &mut selected,
         &operator_config,
@@ -2400,10 +2427,31 @@ impl<'a> Selection<'a> {
         &self,
         available: &HashSet<String>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
-        self.score_candidates_evaluated(available, None)
+        self.score_candidates_evaluated(available, false, None, None, None)
     }
 
-    fn scoring_snapshot(&self) -> ModelRouteStateSnapshot {
+    fn score_ladder(&self, available: &HashSet<String>, policy: &crate::config_policy::ConsumerPolicy, variant: Option<&str>, key: Option<&str>) -> Result<SelectedModelRoute, NoRouteError> {
+        if policy.operator_ladder() {
+            self.score_candidates_evaluated(available, true, variant, key, None)
+        } else {
+            self.score(available)
+        }
+    }
+
+    fn check_ladder_variant(&self, selected: &SelectedModelRoute, variant: Option<&str>) -> Result<(), Refusal> {
+        let Some(variant) = variant else { return Ok(()) };
+        let pin = format!("{}/{}:{variant}", selected.model.provider_id, selected.model.model_id);
+        work_model_pin::validate_variant(
+            &pin,
+            &selected.model.provider_id,
+            &selected.model.model_id,
+            Some(variant),
+            config_overrides::reasoning_catalog_for(self.sources.operator_config_path).as_ref(),
+            self.sources.catalog_targets,
+        ).map(|_| ()).map_err(|_| Refusal::pin_unavailable(&pin, PinUnavailableReason::InvalidVariant, None))
+    }
+
+    fn scoring_snapshot(&self, pinned: bool) -> ModelRouteStateSnapshot {
         let mut snapshot = clone_scoring_snapshot(self.snapshot);
         for key in self.runtime_unavailable {
             // Account availability cannot lower the maximum model scores used to
@@ -2411,7 +2459,7 @@ impl<'a> Selection<'a> {
             if self
                 .sources
                 .operator_config
-                .route_allowed(self.consumer, key, false)
+                .route_allowed(self.consumer, key, pinned)
             {
                 snapshot
                     .by_route
@@ -2427,6 +2475,9 @@ impl<'a> Selection<'a> {
     fn score_candidates_evaluated(
         &self,
         available: &HashSet<String>,
+        pinned: bool,
+        explicit_variant: Option<&str>,
+        recovery_key: Option<&str>,
         evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
         let allowed = available
@@ -2434,14 +2485,15 @@ impl<'a> Selection<'a> {
             .filter(|route| {
                 self.sources
                     .operator_config
-                    .route_allowed(self.consumer, route, false)
+                    .route_allowed(self.consumer, route, pinned)
             })
             .cloned()
             .collect();
-        let snapshot = self.scoring_snapshot();
-        let input = self.pass().input(&allowed, snapshot);
+        let snapshot = self.scoring_snapshot(pinned);
+        let mut input = self.pass().input_with_policy(&allowed, snapshot, pinned);
+        select_policy::apply_explicit_variant(&mut input, explicit_variant);
         let result = self
-            .score_input_evaluated(input, self.consumer_exclude, None, evaluation)
+            .score_input_evaluated(input, self.consumer_exclude, explicit_variant, evaluation)
             .map_err(select_policy::describe_filter_refusal)
             .map_err(|mut error| {
                 if error.reason == RouteFailureReason::InvalidRequirements {
@@ -2453,10 +2505,11 @@ impl<'a> Selection<'a> {
                     .filter_map(|fact| {
                         let key = fact_to_route(fact).route_key;
                         if !self.recovery_available.contains(&key)
+                            || recovery_key.is_some_and(|only| key != only && !key.starts_with(&format!("{only}/")))
                             || !self.sources.operator_config.route_allowed(
                                 self.consumer,
                                 &key,
-                                false,
+                                pinned,
                             )
                         {
                             return None;
@@ -2478,19 +2531,23 @@ impl<'a> Selection<'a> {
                     .recovery_available
                     .iter()
                     .filter(|key| {
+                        if recovery_key.is_some_and(|only| *key != only && !key.starts_with(&format!("{only}/"))) {
+                            return false;
+                        }
                         self.sources
                             .operator_config
-                            .route_allowed(self.consumer, key, false)
+                            .route_allowed(self.consumer, key, pinned)
                             && (!self.account_blocks.contains_key(*key)
                                 || account_resets.contains_key(*key))
                     })
                     .cloned()
                     .collect();
                 recovery_available.extend(account_resets.keys().cloned());
-                let recovery_input = self
+                let mut recovery_input = self
                     .pass()
-                    .input(&recovery_available, self.scoring_snapshot());
-                let recovery_rejections = self.eligible_rejections(&recovery_input.facts, None);
+                    .input_with_policy(&recovery_available, self.scoring_snapshot(pinned), pinned);
+                select_policy::apply_explicit_variant(&mut recovery_input, explicit_variant);
+                let recovery_rejections = self.eligible_rejections(&recovery_input.facts, explicit_variant);
                 (error.earliest_reset, error.earliest_reset_route) =
                     striatum_core::model_router::earliest_admissible_recovery(
                         &recovery_input,

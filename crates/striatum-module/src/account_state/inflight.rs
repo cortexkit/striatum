@@ -347,6 +347,30 @@ impl InflightLedger {
             .find(|at| (self.count_for_scope(caps, provider, account, scope, *at) as u64) < cap)
     }
 
+    /// The instants after `now` at which an entry of this cap count closes,
+    /// the only instants at which its count can fall with no further command.
+    pub(crate) fn deadlines(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        scope: InflightScope<'_>,
+        now: i64,
+    ) -> Vec<i64> {
+        self.accounts
+            .get(&(provider.to_owned(), account.to_owned()))
+            .map_or_else(Vec::new, |entries| {
+                entries
+                    .values()
+                    .filter(|entry| {
+                        now < entry.until_ms
+                            && caps.cap_count(provider, account, &entry.model) == scope
+                    })
+                    .map(|entry| entry.until_ms)
+                    .collect()
+            })
+    }
+
     /// Include live models absent from today's catalog, so a catalog withdrawal
     /// cannot hide a run that still consumes capacity.
     pub(crate) fn active_models(&self, now: i64) -> BTreeMap<AccountKey, BTreeSet<String>> {

@@ -3,8 +3,26 @@ use super::*;
 use cortexkit_role_routing::account_continue::{
     ContinueAnswer, ContinueHold, ContinueOffer, ContinueRefusal, ContinueRequest,
 };
-use cortexkit_role_routing::errors::Refusal;
+use cortexkit_role_routing::errors::{Refusal, RefusalCode as RoutingRefusalCode};
+use cortexkit_role_routing::refusals::{retry_class, RetryClass};
 use striatum_store::{V1Decision, V1Recorded};
+
+#[cfg(test)]
+static PREPARATION_FAILURES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, OpReply>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn inject_continuation_preparation_failure(selection_id: &str, reply: OpReply) {
+    assert!(matches!(
+        reply.code(),
+        Some("unknown_decision" | "account_selection_unavailable")
+    ));
+    assert!(PREPARATION_FAILURES
+        .lock()
+        .unwrap()
+        .insert(selection_id.into(), reply)
+        .is_none());
+}
 
 struct PreviousDecision {
     provider: String,
@@ -178,6 +196,13 @@ pub(crate) fn continue_account_with_call(
         .transpose()
         .map_err(unavailable)?;
     let prepared = parsed.as_ref().map(|params| prepare_roster(params, ctx));
+    #[cfg(test)]
+    let prepared = PREPARATION_FAILURES
+        .lock()
+        .unwrap()
+        .remove(&request.selection_id)
+        .map(|failure| Some(Err(failure)))
+        .unwrap_or(prepared);
     // Quota holds and sign-in fences remove credentials before allocation. Keep
     // their compatible roster for wake times, never for allocating an offer.
     let reset_roster = match (&ctx.classes, &parsed) {
@@ -320,8 +345,24 @@ pub(crate) fn continue_account_with_call(
             let Some(method) = committed["account"]["method"].as_str().filter(|method|*method!="unknown") else {
                 return Ok(refuse("unknown_decision", "previous authentication method is unknown"));
             };
-            let Some(Ok((mut roster, route_fenced, _))) = prepared.clone() else {
-                return Ok(ContinueAnswer::Hold(ContinueHold::new("account_selection_unavailable",json!("no compatible account is available"))));
+            let (mut roster, route_fenced, _) = match prepared.clone() {
+                Some(Ok(prepared)) => prepared,
+                Some(Err(OpReply::Error { code, detail, .. })) if RoutingRefusalCode::parse(&code).is_known() => {
+                    let detail = detail.unwrap_or_else(|| json!({}));
+                    // A permanent preparation refusal cannot offer a switch for
+                    // this pause. Only a pending cause asks the runner to wake again.
+                    match retry_class(&code, &detail) {
+                        RetryClass::Permanent => return Ok(ContinueAnswer::Refuse(ContinueRefusal::new(code, detail))),
+                        retry => {
+                            let mut hold = ContinueHold::new(code, detail);
+                            if let RetryClass::RetryAt(at) = retry {
+                                hold.until_ms = Some(at);
+                            }
+                            return Ok(ContinueAnswer::Hold(hold));
+                        }
+                    }
+                }
+                _ => return Ok(ContinueAnswer::Hold(ContinueHold::new("account_selection_unavailable",json!("no compatible account is available")))),
             };
             // A copy: the writer may run this command again, and each run
             // must start from the request as parsed.
@@ -394,6 +435,13 @@ pub(crate) fn continue_account_with_call(
                     // Excluding this run's signed-out credentials is not missing
                     // authorization: it is waiting for a different usable account.
                     let code = if !signed_out.is_empty() && code == "auth_required" { "account_pool_exhausted".into() } else { code };
+                    // The run's conversation waits until the hold's `until_ms`,
+                    // which may come before the refusal's own reset.
+                    if code == "concurrency_full" {
+                        if let Some(at) = until {
+                            tx.retime_waiter(&(principal.to_owned(), admitted.conversation_hash.clone()), at, ctx.now_ms);
+                        }
+                    }
                     let mut hold=ContinueHold::new(code,json!("no compatible account is available"));
                     hold.until_ms=until.map(|at|at as u64);
                     Ok(ContinueAnswer::Hold(hold))

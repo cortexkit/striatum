@@ -104,11 +104,7 @@ async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
         .map_err(|_| "ckbus route unavailable")?;
     let route = Arc::new(CredentialRoute {
         consumer,
-        identity: BindIdentity::new(
-            path.parent().unwrap_or(std::path::Path::new(".")),
-            super::DEFAULT_MODULE_ID,
-            "bus",
-        ),
+        identity: BindIdentity::new(super::DEFAULT_MODULE_ID, "bus"),
         principal: ConsumerIdentity {
             module_id: super::DEFAULT_MODULE_ID.into(),
             launch_nonce: nonce.value().to_owned(),
@@ -153,14 +149,18 @@ async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
         let key = key.clone();
         let jwt = jwt.clone();
         async move {
-            let reply = route
+            // NATS requires a Sync callback future; the SDK reconnect future is
+            // only Send. A task handle preserves that bound without sharing it.
+            let reply = tokio::spawn(async move { route
                 .call(
                     "ckbus.nonce_sign",
                     json!({
                         "credential_public": key, "nonce_b64": STANDARD.encode(nonce),
                     }),
                 )
+                .await })
                 .await
+                .map_err(|_| async_nats::AuthError::new("ckbus signing task failed"))?
                 .map_err(async_nats::AuthError::new)?;
             let signature = reply["signature_b64"]
                 .as_str()

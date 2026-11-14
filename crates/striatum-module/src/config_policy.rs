@@ -665,6 +665,10 @@ pub struct ConsumerPolicy {
     /// explicit model pins are admitted without quality ranking.
     pub below_bar: Option<BelowBarPolicy>,
     pub ladder: Option<Vec<String>>,
+    /// Internal provenance: only an operator-written ladder admits pin-only routes.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) ladder_source: Option<ConsumerLadderSource>,
     pub variants: Option<BTreeMap<String, String>>,
     pub runner: Option<String>,
     /// Replaces the global runner list for this consumer and its dotted children, including when empty.
@@ -702,6 +706,20 @@ pub fn slot_consumer(slot: &str) -> Option<&'static str> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConsumerLadderSource {
+    OperatorSettings,
+    Declaration,
+    Request,
+}
+
+impl ConsumerPolicy {
+    pub(crate) fn operator_ladder(&self) -> bool {
+        self.mode == Some(ConsumerMode::Ladder)
+            && self.ladder_source == Some(ConsumerLadderSource::OperatorSettings)
+    }
+}
+
 /// Resolve each key independently, exhausting operator ancestors before looking
 /// at the request or declaration. A more specific lower-priority source cannot
 /// override an operator's parent entry.
@@ -715,7 +733,11 @@ pub fn resolve_consumer_policy(
     if consumer_matches("mason", consumer) {
         result.insert("below_bar".into(), serde_json::json!("refuse"));
     }
-    let mut overlay = |entry: &ConsumerPolicy| {
+    let mut ladder_source = None;
+    let mut overlay = |entry: &ConsumerPolicy, source: ConsumerLadderSource| {
+        if entry.ladder.is_some() {
+            ladder_source = Some(source);
+        }
         // Loaded legacy entries carry their expanded list and original module.
         // A child's own list must clear that module as well as replace the list.
         if entry.runners.is_some() {
@@ -729,7 +751,7 @@ pub fn resolve_consumer_policy(
     };
     for (source, is_operator) in [(declared, false), (operator, true)] {
         if is_operator {
-            overlay(request);
+            overlay(request, request.ladder_source.unwrap_or(ConsumerLadderSource::Request));
         }
         let mut chain: Vec<_> = source
             .iter()
@@ -740,11 +762,16 @@ pub fn resolve_consumer_policy(
             .collect();
         chain.sort_by_key(|(name, _)| consumer_specificity(name));
         for (_, entry) in chain {
-            overlay(entry);
+            overlay(entry, if is_operator {
+                ConsumerLadderSource::OperatorSettings
+            } else {
+                ConsumerLadderSource::Declaration
+            });
         }
     }
     let mut result: ConsumerPolicy =
         serde_json::from_value(serde_json::Value::Object(result)).unwrap();
+    result.ladder_source = ladder_source;
     if let Some(pin) = &result.pin {
         result.mode = Some(ConsumerMode::Ladder);
         result.ladder = Some(vec![pin.variant.as_ref().map_or_else(

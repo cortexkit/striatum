@@ -1,0 +1,1 @@
+{"request":{"method":"route.select","params":{"consumer":"colliculus.voice_message","effect_id":"not-supported","kind":"transcribe","privacy":"remote_allowed","requirements":{"duration_ms":30000,"format":"audio/wav"}}},"reply":{"code":"invalid_request","message":"unknown member","detail":{"field":"effect_id"}}}

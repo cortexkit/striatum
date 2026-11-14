@@ -24,13 +24,13 @@
 //! - Every other account row is served history, kept for the configured
 //!   window after its last activity and then deleted leaf first: an
 //!   admission once every time it carries is past the window; an affinity row
-//!   (with every pin generation of its conversation) once its idle expiry and
-//!   lease are past the window and no remaining admission names one of those
-//!   pins; a hold once it is past the window; a serve decision once it is past
-//!   the window and no pin, admission or hold references it. A conversation's
-//!   pins go together with its affinity row because the next pin for that
-//!   conversation starts again at generation 1, which must not collide with a
-//!   stored older generation.
+//!   (with every pin generation of its conversation) once its idle expiry is
+//!   past the module's grace period, its lease has ended, and no remaining
+//!   admission or hold names one of those pins; a hold once it is past the
+//!   window; an old orphan pin once no conversation affinity, admission or
+//!   hold names it; a serve decision once it is past the window and no pin,
+//!   admission or hold references it. Previous-pin links are explanatory
+//!   metadata, not a chain the allocator follows.
 
 use rusqlite::{params, Connection, Transaction};
 use striatum_core::RouteStateResult;
@@ -47,6 +47,34 @@ pub struct AffinityRetentionBatch {
     pub affinities: usize,
     pub pins: usize,
 }
+
+pub type AffinityRetentionKey = (String, String, String);
+
+/// Position in the expiry index. Rowid breaks ties without sorting a large
+/// group of conversations that happen to expire at the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AffinityRetentionPosition {
+    pub expires_at: i64,
+    pub rowid: i64,
+}
+
+/// A bounded reader scan, including progress past rows references still keep.
+#[derive(Debug, Clone, Default)]
+pub struct AffinityRetentionPlan {
+    pub keys: Vec<AffinityRetentionKey>,
+    pub examined: usize,
+    pub last: Option<AffinityRetentionPosition>,
+}
+
+// Used both on the pooled reader and for the writer's keyed recheck. Every
+// retained admission protects its pin, including continuation reservations.
+const AFFINITY_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
+    JOIN account_admission a ON a.pin_id=p.pin_id \
+    WHERE p.principal=f.principal AND p.conversation_hash=f.conversation_hash \
+      AND p.provider=f.provider) \
+  AND NOT EXISTS (SELECT 1 FROM account_pin p JOIN account_hold h ON h.pin_id=p.pin_id \
+    WHERE p.principal=f.principal AND p.conversation_hash=f.conversation_hash \
+      AND p.provider=f.provider)";
 
 /// A decision a pin, admission or hold still names is kept, so the history
 /// stays explainable while anything in the store points at it. (These names
@@ -77,15 +105,64 @@ pub struct V1DecisionRetentionBatch {
 }
 
 impl SqliteRouteStateStore {
+    /// Plan at most `scan_limit` expiry-index entries on a pooled reader, not
+    /// the writer. The caller keeps `last` across passes so protected entries
+    /// are examined only once per sweep. A plan never authorizes a delete:
+    /// the account command rechecks every candidate against current state.
+    pub fn plan_account_affinities(
+        &self,
+        before: i64,
+        lease_before: i64,
+        after: Option<AffinityRetentionPosition>,
+        scan_limit: usize,
+    ) -> RouteStateResult<AffinityRetentionPlan> {
+        self.store
+            .with_read(|conn| {
+                let after = after.unwrap_or(AffinityRetentionPosition {
+                    expires_at: i64::MIN,
+                    rowid: i64::MIN,
+                });
+                let mut statement = conn.prepare(&format!(
+                    "WITH candidates AS MATERIALIZED ( \
+                   SELECT rowid,principal,conversation_hash,provider,expires_at,lease_valid_until \
+                   FROM account_affinity INDEXED BY account_affinity_by_expiry \
+                   WHERE expires_at < ?1 AND (expires_at,rowid) > (?2,?3) \
+                   ORDER BY expires_at,rowid LIMIT ?4) \
+                 SELECT f.rowid,f.principal,f.conversation_hash,f.provider,f.expires_at, \
+                   COALESCE(f.lease_valid_until,0)<=?5 AND {AFFINITY_UNREFERENCED} \
+                 FROM candidates f ORDER BY f.expires_at,f.rowid"
+                ))?;
+                let mut plan = AffinityRetentionPlan::default();
+                let mut rows = statement.query(params![
+                    before,
+                    after.expires_at,
+                    after.rowid,
+                    limit_param(scan_limit),
+                    lease_before
+                ])?;
+                while let Some(row) = rows.next()? {
+                    plan.examined += 1;
+                    plan.last = Some(AffinityRetentionPosition {
+                        expires_at: row.get(4)?,
+                        rowid: row.get(0)?,
+                    });
+                    if row.get::<_, bool>(5)? {
+                        plan.keys.push((row.get(1)?, row.get(2)?, row.get(3)?));
+                    }
+                }
+                Ok(plan)
+            })
+            .map_err(err)
+    }
+
     fn delete_unreferenced_decisions(
         &self,
         mode: &str,
         created_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                conn.execute(
+        self.retention_write(|tx| {
+                tx.execute(
                     &format!(
                         "DELETE FROM account_decision WHERE rowid IN ( \
                            SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time \
@@ -95,7 +172,6 @@ impl SqliteRouteStateStore {
                     params![mode, created_before, limit_param(limit)],
                 )
             })
-            .map_err(err)
     }
 
     fn retention_write<T>(
@@ -166,19 +242,36 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
+    /// Delete at most `limit` old orphan pins, oldest first. A conversation
+    /// with any affinity keeps its generations for whole-conversation cleanup.
+    /// Every retained admission protects its pin (including a continuation's
+    /// reservation), as do holds. Pin bodies are not cached in account state.
+    pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.prune_account_pins(before, limit)
+        })
+    }
+
     /// Delete at most `limit` conversation affinity rows whose idle expiry and
-    /// lease are both before `before` (Unix milliseconds), together with every
+    /// lease are before / at `before` (Unix milliseconds), together with every
     /// pin generation of the same conversation, in one transaction. A
-    /// conversation is kept while any stored admission still names one of its
-    /// pins; [`Self::prune_account_admissions`] removes those first.
+    /// conversation is kept while any stored admission or hold still names
+    /// one of its pins; their retention batches remove those first.
     pub fn prune_account_affinities(
         &self,
         before: i64,
         limit: usize,
     ) -> RouteStateResult<AffinityRetentionBatch> {
         self.refuse_state_blind_admission_write("prune_account_affinities")?;
+        let keys = self
+            .plan_account_affinities(before, before, None, limit)?
+            .keys;
+        if keys.is_empty() {
+            return Ok(AffinityRetentionBatch::default());
+        }
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
-            tx.prune_account_affinities(before, limit)
+            tx.delete_account_affinities_returning(&keys, before, before)
+                .map(|(batch, _)| batch)
         })
     }
 
@@ -506,6 +599,23 @@ fn admission_due_by_values(a: &str) -> String {
 }
 
 impl crate::AccountTx<'_> {
+    pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.retention_write(|tx| {
+            tx.execute(
+                "DELETE FROM account_pin WHERE rowid IN ( \
+                   SELECT p.rowid FROM account_pin p INDEXED BY account_pin_by_created \
+                   WHERE p.created_at < ?1 \
+                     AND NOT EXISTS (SELECT 1 FROM account_affinity f \
+                       WHERE f.principal=p.principal AND f.conversation_hash=p.conversation_hash \
+                         AND f.provider=p.provider) \
+                     AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.pin_id=p.pin_id) \
+                     AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.pin_id=p.pin_id) \
+                   ORDER BY p.created_at LIMIT ?2)",
+                params![before, limit_param(limit)],
+            )
+        })
+    }
+
     pub fn prune_account_admissions(
         &self,
         before: i64,
@@ -587,75 +697,42 @@ impl crate::AccountTx<'_> {
         .map_err(err)
     }
 
-    pub fn prune_account_affinities(
-        &self,
-        before: i64,
-        limit: usize,
-    ) -> RouteStateResult<AffinityRetentionBatch> {
-        self.prune_account_affinities_returning(before, limit)
-            .map(|(batch, _)| batch)
-    }
-
-    /// The same retention delete, also returning the deleted conversation keys
-    /// (principal, conversation hash, provider) for the module's state.
+    /// Recheck planned keys on the writer before deleting their generations.
+    /// A selection may have refreshed the lease or added a reference after the
+    /// reader planned the key. Return only keys actually deleted so the module's
+    /// in-memory `AccountState.admissions` removes exactly the same rows.
     #[allow(clippy::type_complexity)]
-    pub fn prune_account_affinities_returning(
+    pub fn delete_account_affinities_returning(
         &self,
+        keys: &[AffinityRetentionKey],
         before: i64,
-        limit: usize,
-    ) -> RouteStateResult<(AffinityRetentionBatch, Vec<(String, String, String)>)> {
-        if limit == 0 {
-            return Ok((AffinityRetentionBatch::default(), Vec::new()));
-        }
-        self.command_sql(|conn: &Connection| {
-            let tx = conn;
-            let keys: Vec<(String, String, String)> = {
-                let mut statement = tx.prepare(
-                    "SELECT principal, conversation_hash, provider FROM account_affinity \
-                           INDEXED BY account_affinity_by_expiry \
-                         WHERE expires_at < ?1 AND COALESCE(lease_valid_until, 0) < ?1 \
-                           AND NOT EXISTS (SELECT 1 FROM account_pin p \
-                             JOIN account_admission a ON a.pin_id = p.pin_id \
-                             WHERE p.principal = account_affinity.principal \
-                               AND p.conversation_hash = account_affinity.conversation_hash \
-                               AND p.provider = account_affinity.provider) \
-                         ORDER BY expires_at LIMIT ?2",
-                )?;
-                let rows = statement.query_map(params![before, limit_param(limit)], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-                rows.collect::<rusqlite::Result<_>>()?
-            };
+        lease_before: i64,
+    ) -> RouteStateResult<(AffinityRetentionBatch, Vec<AffinityRetentionKey>)> {
+        self.command_sql(|tx: &Connection| {
+            let mut eligible = tx.prepare(&format!(
+                "SELECT EXISTS(SELECT 1 FROM account_affinity f \
+                 WHERE f.principal=?1 AND f.conversation_hash=?2 AND f.provider=?3 \
+                   AND f.expires_at<?4 AND COALESCE(f.lease_valid_until,0)<=?5 \
+                   AND {AFFINITY_UNREFERENCED})"
+            ))?;
+            let mut delete_pins = tx.prepare(
+                "DELETE FROM account_pin WHERE principal=?1 AND conversation_hash=?2 AND provider=?3"
+            )?;
+            let mut delete_affinity = tx.prepare(
+                "DELETE FROM account_affinity WHERE principal=?1 AND conversation_hash=?2 AND provider=?3"
+            )?;
             let mut batch = AffinityRetentionBatch::default();
             let mut deleted = Vec::new();
-            {
-                let mut delete_pins = tx.prepare(
-                    "DELETE FROM account_pin \
-                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
-                )?;
-                let mut delete_affinity = tx.prepare(
-                    "DELETE FROM account_affinity \
-                         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
-                )?;
-                for (principal, conversation_hash, provider) in &keys {
-                    batch.pins +=
-                        delete_pins.execute(params![principal, conversation_hash, provider])?;
-                    let affinities =
-                        delete_affinity.execute(params![principal, conversation_hash, provider])?;
-                    batch.affinities += affinities;
-                    if affinities > 0 {
-                        deleted.push((
-                            principal.clone(),
-                            conversation_hash.clone(),
-                            provider.clone(),
-                        ));
-                    }
+            for (principal, hash, provider) in keys {
+                if !eligible.query_row(params![principal,hash,provider,before,lease_before], |row| row.get::<_,bool>(0))? {
+                    continue;
                 }
+                batch.pins += delete_pins.execute(params![principal,hash,provider])?;
+                batch.affinities += delete_affinity.execute(params![principal,hash,provider])?;
+                deleted.push((principal.clone(),hash.clone(),provider.clone()));
             }
-
             Ok((batch, deleted))
-        })
-        .map_err(err)
+        }).map_err(err)
     }
 
     pub fn prune_account_observations(

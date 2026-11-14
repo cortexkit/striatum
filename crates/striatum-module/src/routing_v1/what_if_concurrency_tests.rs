@@ -186,3 +186,95 @@ async fn what_if_reports_ledger_cap_counts_with_either_switch_without_writes() {
     assert_eq!(cap_counts(&answer, "modeled")[2]["holds_in_flight"], 2);
     assert_eq!(rows(&harness), before);
 }
+
+#[tokio::test]
+async fn what_if_lists_live_waiters_on_each_cap_count_only_with_enforcement_on() {
+    use crate::account_state::CapCount;
+    use cortexkit_role_routing::declarations::ConsumerPriority;
+    let _clock = crate::InjectedClock::set(T as u64);
+    let (harness, _) = configured().await;
+    let mut catalog = fixture::catalog();
+    let template = catalog.accounts[0].clone();
+    catalog.accounts = ["shared", "modeled"]
+        .into_iter()
+        .map(|id| {
+            let mut account = template.clone();
+            account.provider = PROVIDER.into();
+            account.account_id = id.into();
+            account.credential_id = format!("credential-{id}");
+            account.method = "apikey".into();
+            account.serves = vec![PROVIDER.into()];
+            account
+        })
+        .collect();
+    super::super::conformance_tests::install_catalog(&harness, &catalog);
+    harness.edit_config(|config| {
+        config["concurrency"] = json!({"enforcement_enabled":true,"accounts":{
+            "example-provider/shared":{"limit":1,"scope":"account"},
+            "example-provider/modeled":{"limit":1,"scope":"account_model"}
+        }})
+    });
+    let count = |account: &str, model: Option<&str>| CapCount {
+        provider: PROVIDER.into(),
+        account: account.into(),
+        model: model.map(str::to_owned),
+    };
+    // Waiters are recorded only by refusals inside account commands; these
+    // stand in for three refused conversations, one of them already ended.
+    let waiting = [
+        (
+            "blocked",
+            ConsumerPriority::Blocking,
+            T,
+            vec![count("modeled", Some("model-a")), count("shared", None)],
+        ),
+        (
+            "worker",
+            ConsumerPriority::Worker,
+            T,
+            vec![count("shared", None)],
+        ),
+        (
+            "ended",
+            ConsumerPriority::Background,
+            T - 30_000,
+            vec![count("shared", None)],
+        ),
+    ];
+    crate::account_writer::execute(&harness.store(), AccountCommandKind::Repair, move |tx| {
+        for (conversation, class, retry, counts) in waiting.clone() {
+            tx.record_waiter(
+                ("p".to_owned(), conversation.to_owned()),
+                class,
+                retry,
+                counts,
+                T - 30_000,
+            );
+        }
+        Ok(())
+    })
+    .unwrap();
+    let direct = operator(&harness).await;
+    let answer = evaluate(&direct, json!({"iqs":[0]})).await;
+    assert_eq!(
+        cap_counts(&answer, "shared"),
+        json!([{"scope":"account","model":null,"effective_cap":1,"holds_in_flight":0,
+            "waiters":[{"class":"blocking","order":0},{"class":"worker","order":1}]}])
+    );
+    let modeled = cap_counts(&answer, "modeled");
+    let model_a = modeled
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|count| count["model"] == "model-a")
+        .unwrap();
+    assert_eq!(model_a["waiters"], json!([{"class":"blocking","order":0}]));
+    assert!(modeled[0].get("waiters").is_none(), "{modeled}");
+    // With enforcement off no waiter applies, and none is listed.
+    harness.edit_config(|config| config["concurrency"]["enforcement_enabled"] = json!(false));
+    let answer = evaluate(&direct, json!({"iqs":[0]})).await;
+    assert!(
+        !answer["concurrency"].to_string().contains("waiters"),
+        "{answer}"
+    );
+}

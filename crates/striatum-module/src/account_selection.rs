@@ -3265,6 +3265,8 @@ fn fingerprint(params: &AccountForParams) -> String {
         service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
         #[serde(skip_serializing_if = "Option::is_none")]
         warm_credential: Option<&'a str>,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        head_turn: bool,
     }
     let identity = AdmissionIdentity {
         provider: normalize(&params.provider),
@@ -3286,6 +3288,7 @@ fn fingerprint(params: &AccountForParams) -> String {
         parent_conversation_key: params.parent_conversation_key.as_deref(),
         service_tier: params.service_tier,
         warm_credential: params.warm_credential.as_deref(),
+        head_turn: params.head_turn,
     };
     let encoded = serde_json::to_vec(&identity).expect("admission identity is serializable");
     hex(&Sha256::digest(&encoded))
@@ -4781,6 +4784,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(default)]
+    head_turn: bool,
     #[serde(skip)]
     pub(crate) call: Option<call_log::AccountCall>,
     #[serde(default)]
@@ -4854,6 +4859,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
             service_tier_chosen: None,
@@ -5045,8 +5051,15 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 #[cfg(test)]
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
     let params = decode_params(body).unwrap_or(Value::Null);
-    let call = (method == ACCOUNT_FOR_OP)
-        .then(|| call_log::AccountCall::legacy(&params, principal, ctx.store));
+    let call = (method == ACCOUNT_FOR_OP).then(|| {
+        call_log::AccountCall::legacy(
+            &params,
+            principal,
+            ctx.classes.as_ref().map(|classes| classes.config.as_ref()),
+            ctx.classes.as_ref().map(|classes| &classes.credentials),
+            ctx.store,
+        )
+    });
     let reply = handle_with_call(method, body, principal, ctx, call.clone());
     if let Some(call) = call {
         call.finish();
@@ -5312,6 +5325,8 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
 }
 
 mod continuation;
+#[cfg(test)]
+pub(crate) use continuation::inject_continuation_preparation_failure;
 #[cfg(test)]
 pub(crate) use continuation::continue_account;
 pub(crate) use continuation::continue_account_with_call;
@@ -5894,18 +5909,15 @@ fn prepare_service_tier(
             })
             .cloned()
             .collect();
-        let runners: Vec<_> = classes
-            .config
-            .v1_runners()
-            .into_iter()
-            .filter(|runner| runner.module == parsed.caller.runner)
-            .collect();
         let registry = crate::routing_v1::runners::Registry::build(
             classes.config.as_ref(),
             &classes.credentials,
             &classes.facts,
             classes.now_ms.max(0) as u64,
         );
+        let runners: Vec<_> = registry.policies().into_iter()
+            .filter(|runner| runner.module == parsed.caller.runner)
+            .collect();
         classes.apply_service_tier(
             &mut facts,
             tier.as_str(),
@@ -7141,7 +7153,9 @@ fn serve(
         }
     };
     if gate.refused() {
-        return gate.refuse(tx, ctx, params, principal, provider, &decision, roster);
+        return gate.refuse(
+            tx, ctx, params, principal, &hash, provider, &decision, roster,
+        );
     }
     // An account the class context left out because another selection holds
     // its probe reserved is a lost race as well.
@@ -7247,20 +7261,39 @@ fn serve(
         )?;
     }
     match &decision.outcome {
-        Outcome::Admit(admission) => commit_admission(
-            tx,
-            ctx,
-            principal,
-            params,
-            provider,
-            &hash,
-            affinity_row.as_ref(),
-            &decision_id,
-            &decision,
-            admission,
-            request_fingerprint,
-            roster,
-        ),
+        Outcome::Admit(admission) => {
+            // Read before the insert: afterwards every request of the
+            // conversation would look like a renewal of a holder.
+            let taken = gate.slot_taken(
+                tx,
+                ctx,
+                params,
+                principal,
+                &hash,
+                provider,
+                &admission.account_id,
+            );
+            let reply = commit_admission(
+                tx,
+                ctx,
+                principal,
+                params,
+                provider,
+                &hash,
+                affinity_row.as_ref(),
+                &decision_id,
+                &decision,
+                admission,
+                request_fingerprint,
+                roster,
+            )?;
+            // Taking a slot on a count it waits on ends the conversation's
+            // wait; a slot elsewhere leaves it waiting.
+            if let (Some(count), OpReply::Result(_)) = (&taken, &reply) {
+                tx.took_slot(&(principal.to_owned(), hash.clone()), count);
+            }
+            Ok(reply)
+        }
         Outcome::Hold(hold) => {
             tx.insert_hold(&AccountHoldRow {
                 decision_id: decision_id.clone(),
@@ -9851,6 +9884,156 @@ mod tests {
             "requested_account": null,
             "hold_wait_max_s": 900
         })
+    }
+
+    fn affinity_grace_fixture(label: &str) -> Fixture {
+        let rig = fixture(label);
+        crate::account_writer::execute(
+            rig.store(),
+            striatum_store::AccountCommandKind::Repair,
+            |tx| {
+                let salt = tx.salt(NOW, || "grace-test-salt".into())?;
+                let hash = conversation_hash(&salt, BROCA, "grace-conversation");
+                for (hash, pin, generation, expires_at) in [
+                    (hash, "grace-pin", 7, NOW - 30 * 60_000),
+                    (
+                        "dead-conversation".into(),
+                        "dead-pin",
+                        1,
+                        NOW - 2 * 60 * 60_000,
+                    ),
+                ] {
+                    tx.insert_pin(&AccountPinRow {
+                        pin_id: pin.into(),
+                        principal: BROCA.into(),
+                        conversation_hash: hash.clone(),
+                        provider: "anthropic".into(),
+                        pin_generation: generation,
+                        affinity_model: "claude-opus-5-5".into(),
+                        account_id: ACCOUNT_A.into(),
+                        credential_id: "oauth:anthropic".into(),
+                        pin_mode: "conversation_lease".into(),
+                        previous_pin_id: None,
+                        decision_id: "history".into(),
+                        created_at: NOW - AFFINITY_IDLE_MS,
+                    })?;
+                    tx.put_affinity(
+                        &AccountAffinityRow {
+                            principal: BROCA.into(),
+                            conversation_hash: hash,
+                            provider: "anthropic".into(),
+                            affinity_model: "claude-opus-5-5".into(),
+                            pin_id: pin.into(),
+                            pin_generation: generation,
+                            account_id: ACCOUNT_A.into(),
+                            credential_id: "oauth:anthropic".into(),
+                            credential_binding_revision: 1,
+                            policy_version: 2,
+                            initial_demand_bytes: 12_000,
+                            created_at: expires_at - AFFINITY_IDLE_MS,
+                            last_used_at: expires_at - AFFINITY_IDLE_MS,
+                            expires_at,
+                            lease_valid_until: Some(NOW - 1),
+                        },
+                        None,
+                    )?;
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        let report = crate::retention::run_retention_pass(
+            rig.store(),
+            &Default::default(),
+            NOW,
+            &crate::retention::PassBudget {
+                pause: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            report.account_affinities, 1,
+            "only the conversation beyond the grace hour goes"
+        );
+        rig
+    }
+
+    #[test]
+    fn affinity_retention_grace_preserves_expected_pin_compare_and_set() {
+        let rig = affinity_grace_fixture("grace-cas");
+        let mut params = admit_params("renew", "grace-conversation", "anthropic-auth");
+        params["mode"] = json!("renew");
+        params["expected_pin"] = json!({"id":"grace-pin","generation":6});
+        let reply = rig.call(&rig.ctx(true, NOW), ACCOUNT_FOR_OP, BROCA, params);
+        assert_eq!(reply.code(), Some("pin_generation_conflict"));
+        let OpReply::Error { detail, .. } = reply else {
+            unreachable!()
+        };
+        assert_eq!(
+            detail.unwrap()["current_pin"],
+            json!({"id":"grace-pin","generation":7,
+            "account_id":ACCOUNT_A,"credential_id":"oauth:anthropic"})
+        );
+    }
+
+    #[test]
+    fn affinity_retention_grace_preserves_bound_service_tier_refusal() {
+        let rig = affinity_grace_fixture("grace-tier");
+        let ctx = rig.ctx(true, NOW);
+        let mut request = admit_params("tier", "grace-conversation", "anthropic-auth");
+        request["candidates"] = json!({"view_digest":"tier-view","accounts":[{"account_id":ACCOUNT_B,"credential_id":"oauth:anthropic-b"}]});
+        let mut params = parse_account_for(&request).unwrap();
+        params.service_tier_bound = true;
+        let mut roster = roster_for_model(&ctx, "anthropic", Some("claude-opus-5-5"));
+        roster
+            .roster
+            .as_mut()
+            .unwrap()
+            .accounts
+            .retain(|account| account.account_id != ACCOUNT_A);
+        let reply = crate::account_writer::execute(
+            rig.store(),
+            striatum_store::AccountCommandKind::Repair,
+            {
+                let command = ctx.command_context();
+                move |tx| {
+                    serve(
+                        tx,
+                        &command,
+                        BROCA,
+                        &params,
+                        "anthropic",
+                        &roster,
+                        "tier-fingerprint",
+                    )
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.code(), Some("account_selection_unavailable"));
+        let OpReply::Error { detail, .. } = reply else {
+            unreachable!()
+        };
+        assert_eq!(
+            detail.unwrap()["exclusions"][0]["reason"],
+            "bound_service_tier_unavailable"
+        );
+    }
+
+    #[test]
+    fn affinity_retention_grace_still_suppresses_import_preference() {
+        let rig = affinity_grace_fixture("grace-import");
+        let mut params = admit_params("import", "grace-conversation", "anthropic-auth");
+        params["preferred_existing_account"] = json!({"account_id":ACCOUNT_B});
+        let reply = result(rig.call(&rig.ctx(true, NOW), ACCOUNT_FOR_OP, BROCA, params));
+        assert_eq!(
+            reply["pin"]["generation"], 8,
+            "expired affinity still supplies the previous generation"
+        );
+        assert_ne!(reply["reason"]["code"], "imported_affinity");
+        let decision: Value =
+            serde_json::from_str(&rig.serve_rows().last().unwrap().decision_json).unwrap();
+        assert!(decision["explanation"]["import"].is_null());
     }
 
     fn result(reply: OpReply) -> Value {

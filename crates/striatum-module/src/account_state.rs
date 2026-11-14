@@ -14,10 +14,12 @@ use striatum_store::{
 mod admissions;
 mod blocks;
 mod inflight;
+mod waiters;
 
 pub(crate) use admissions::AdmissionState;
 pub(crate) use blocks::{published, writer, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
+pub(crate) use waiters::{matched as matched_waiters, CapCount, Waiter, Waiters};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AccountState {
@@ -31,6 +33,9 @@ pub(crate) struct AccountState {
     /// command changes into this state, so it always equals a fresh load.
     /// Request paths read it through `blocks::BlockReads` and `published`.
     pub(crate) blocks: striatum_store::BlockState,
+    /// Conversations refused for concurrency that a free slot is held for.
+    /// Memory only: a load starts with none.
+    pub(crate) waiters: Waiters,
 }
 
 impl AccountState {
@@ -51,6 +56,7 @@ impl AccountState {
             admissions,
             inflight,
             blocks: tx.load_block_state()?,
+            waiters: Waiters::default(),
         })
     }
 }
@@ -448,6 +454,50 @@ impl AccountCommand<'_> {
                 now,
             )
         })
+    }
+
+    /// The ledger and the waiters of the working state, for the concurrency
+    /// check. `None` for a private projection, which keeps neither.
+    pub(crate) fn concurrency_view(&self) -> Option<(&InflightLedger, &Waiters)> {
+        self.state
+            .as_deref()
+            .map(|state| (&state.inflight, &state.waiters))
+    }
+
+    /// Make the conversation a waiter, or update its wait, after a computed
+    /// `concurrency_full` refusal.
+    pub(crate) fn record_waiter(
+        &mut self,
+        conversation: waiters::Conversation,
+        class: cortexkit_role_routing::declarations::ConsumerPriority,
+        retry_at_ms: i64,
+        counts: Vec<CapCount>,
+        now: i64,
+    ) {
+        if let Some(state) = self.state.as_deref_mut() {
+            state
+                .waiters
+                .record(conversation, class, retry_at_ms, counts, now);
+        }
+    }
+
+    /// Move a waiting conversation's retry time to the one its answer gave.
+    pub(crate) fn retime_waiter(
+        &mut self,
+        conversation: &waiters::Conversation,
+        retry_at_ms: i64,
+        now: i64,
+    ) {
+        if let Some(state) = self.state.as_deref_mut() {
+            state.waiters.retime(conversation, retry_at_ms, now);
+        }
+    }
+
+    /// The conversation took a slot on `count`, which ends a wait on it.
+    pub(crate) fn took_slot(&mut self, conversation: &waiters::Conversation, count: &CapCount) {
+        if let Some(state) = self.state.as_deref_mut() {
+            state.waiters.took(conversation, count);
+        }
     }
 
     // A replay or a read-only writer command can visit an account without a
@@ -1148,10 +1198,13 @@ impl AccountCommand<'_> {
 
     pub(crate) fn prune_account_affinities(
         &mut self,
+        keys: &[striatum_store::AffinityRetentionKey],
         before: i64,
-        limit: usize,
+        lease_before: i64,
     ) -> RouteStateResult<AffinityRetentionBatch> {
-        let (batch, deleted) = self.sql.prune_account_affinities_returning(before, limit)?;
+        let (batch, deleted) =
+            self.sql
+                .delete_account_affinities_returning(keys, before, lease_before)?;
         if let Some(state) = self.admissions() {
             state.prune_affinities(&deleted);
             state.pending.clear();
@@ -1329,3 +1382,5 @@ mod admission_tests;
 mod inflight_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod waiters_tests;
