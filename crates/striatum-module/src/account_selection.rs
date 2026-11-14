@@ -2666,7 +2666,8 @@ impl ClassContext {
             Outcome::Admit(admission) => Ok(admission.credential_id),
             // Selection scored this route as admissible; refusing it now
             // means its evidence changed or another request took its probe
-            // since. Answer when to retry, as a lost probe binding does.
+            // since. Return a retry time, as when another request
+            // takes the probe first.
             _ => Err(LaunchRefusal::Lost {
                 retry_at: self
                     .blocked_reset(provider, model, priced)
@@ -2755,7 +2756,8 @@ impl ClassContext {
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
             // The claim is made for this owner, or for the selection's probe
-            // owner when it names none; a clock that owner holds is its own.
+            // owner when it names none; a probe clock (`fence_recheck` row) that owner
+            // already claimed counts as its own claim.
             let owner = owned_owner.as_deref().or(context.probe_owner.as_deref());
             let credential = owned_credential.clone();
 

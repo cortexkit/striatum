@@ -1217,7 +1217,8 @@ fn retirement_without_a_replace_policy_leaves_the_rows_the_replace_left() {
 
 /// A whole-account block on several pools clears only once a success has
 /// healed every pool in its recovery set. The clear is decided on that set
-/// and on the successes recorded, and names both: a state from before the
+/// and on the successes recorded, and its keyed update requires both to be
+/// unchanged: a state from before the
 /// set grew decides to clear, SQL holds the larger set, and the batch runs
 /// again on a fresh load, which keeps the block.
 #[test]
@@ -1375,7 +1376,8 @@ fn a_report_from_an_owner_whose_claim_was_superseded_does_not_match() {
 }
 
 /// The same superseded test request, settled through an authorized success
-/// (the legacy and media paths) or as an admission's run, heals nothing
+/// (`heal_authorized_probe`, which the legacy decision-outcome and media
+/// run-finished paths call) or as an admission's run, heals nothing
 /// either: only an admission that itself owns the clock's claim is current
 /// on another generation.
 #[test]
