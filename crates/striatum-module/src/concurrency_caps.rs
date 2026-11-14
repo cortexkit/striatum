@@ -223,7 +223,20 @@ pub(crate) struct CapInputs {
     settings: CapSettings,
     accounts: BTreeMap<(String, String), Option<String>>,
     warned: std::collections::BTreeSet<String>,
-    selection_cache: Arc<Mutex<Option<(CapSettings, Arc<ResolvedCaps>)>>>,
+    selection_cache: Arc<SelectionCapCache>,
+}
+
+#[derive(Default)]
+struct SelectionCapCache {
+    entry: Mutex<Option<(CapSettings, Arc<ResolvedCaps>)>>,
+}
+
+impl std::fmt::Debug for SelectionCapCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Warming a memo does not publish new credential state. Keep snapshot
+        // diagnostics independent of which read happened to populate it first.
+        formatter.write_str("SelectionCapCache")
+    }
 }
 
 impl CapInputs {
@@ -231,7 +244,7 @@ impl CapInputs {
     /// changes their cap inputs. Config reloads may precede the credential poll;
     /// resolve that settings value once without copying the catalog or roster.
     pub(crate) fn resolved_for_settings(&self, settings: &CapSettings) -> Arc<ResolvedCaps> {
-        let mut cache = self.selection_cache.lock().unwrap();
+        let mut cache = self.selection_cache.entry.lock().unwrap();
         if let Some((previous, caps)) = &*cache {
             if previous == settings {
                 return caps.clone();
