@@ -191,20 +191,33 @@ impl AccountCall {
             accounts.push(json!({"account_id":account,"count":count,"cap":cap}));
         }
         if !room {
-            let class = self
-                .consumer
-                .as_deref()
-                .zip(ctx.classes.as_ref())
-                .and_then(|(consumer, classes)| {
-                    crate::routing_v1::consumers::effective(&classes.config)
-                        .defaults_for(consumer)
-                        .priority
-                })
-                .unwrap_or_default();
-            *self.would_refuse.lock().unwrap() = Some(json!({
-                "surface":self.surface,"consumer":self.consumer.as_ref().or(self.runner_module.as_ref()),
-                "class":class,"model":params.model,"accounts":accounts
-            }));
+            *self.would_refuse.lock().unwrap() = Some(self.pressure(ctx, &params.model, accounts));
         }
+    }
+
+    /// Record the line of a request that enforcement refused. It is the
+    /// would-refuse line marked as a refusal, so one day's counts compare
+    /// across the enforcement switch.
+    pub(super) fn refused(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) {
+        let mut line = self.pressure(ctx, model, accounts);
+        line["refused"] = json!(true);
+        *self.would_refuse.lock().unwrap() = Some(line);
+    }
+
+    fn pressure(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) -> Value {
+        let class = self
+            .consumer
+            .as_deref()
+            .zip(ctx.classes.as_ref())
+            .and_then(|(consumer, classes)| {
+                crate::routing_v1::consumers::effective(&classes.config)
+                    .defaults_for(consumer)
+                    .priority
+            })
+            .unwrap_or_default();
+        json!({
+            "surface":self.surface,"consumer":self.consumer.as_ref().or(self.runner_module.as_ref()),
+            "class":class,"model":model,"accounts":accounts
+        })
     }
 }

@@ -18,7 +18,7 @@ use striatum_core::model_facts::{
     ModelScores, CLASS_VECTOR_TRAILING_WINDOW_DAYS, CLASS_VECTOR_TRAILING_WINDOW_MS,
     ENUMERATED_WORKLOAD_CLASSES,
 };
-use striatum_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
+use striatum_core::model_router::ModelRouteStateSnapshot;
 use striatum_core::quota::quota_poll::reading_log_retention_cutoff;
 use striatum_core::route_state_store::{
     QuotaReadingLogRow, QuotaStaleDisclosure, UsageRecordResult,
@@ -63,6 +63,7 @@ pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
 mod block_state;
+mod route_snapshot;
 pub use block_state::{
     block_read_backs, block_reconcile_reloads, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
@@ -759,6 +760,13 @@ impl SqliteRouteStateStore {
             tx.clear_route_cooldowns(&requested)
         })
     }
+}
+
+/// The time the store's SQL readers evaluate expiry at: the wall clock, or a
+/// replayed request's recorded time in test builds. Readers of the account
+/// state that stand in for those SQL readers use it too, so both answer alike.
+pub fn store_now_ms() -> i64 {
+    now_ms()
 }
 
 fn now_ms() -> i64 {
@@ -1579,6 +1587,17 @@ impl SqliteRouteStateStore {
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
         self.store.with_read(f).map_err(err)
+    }
+
+    /// The SQL route-state snapshot with its probe clocks evaluated at
+    /// `recheck_now`, to compare with the account state's at the same times.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn build_snapshot_at_for_test(
+        &self,
+        now: f64,
+        recheck_now: i64,
+    ) -> RouteStateResult<ModelRouteStateSnapshot> {
+        self.with_reader_for_test(|conn| Ok(route_snapshot::read_snapshot(conn, now, recheck_now)))?
     }
 
     /// Replace writer and maintenance waits with a test-controlled lock handshake.
@@ -3818,38 +3837,14 @@ impl RouteStateStore for SqliteRouteStateStore {
         &self,
         provider_key: &str,
     ) -> RouteStateResult<Option<ProviderCooldownState>> {
-        let provider_key = derive_provider_key(provider_key)
-            .ok_or_else(|| err("provider cooldown lookup has no canonical provider key"))?
-            .to_owned();
+        // The SQL oracle: request paths read the account state's copy of the
+        // row (`BlockState::provider_cooldown`).
+        let provider_key = route_snapshot::provider_lookup_key(provider_key)?.to_owned();
         self.store
             .with_conn(|c: &Connection| {
-                c.query_row(
-                    "SELECT provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
-                            wall_class, last_error
-                     FROM provider_cooldown_state WHERE provider_key = ?1",
-                    [&provider_key],
-                    |row| {
-                        let state = ProviderCooldownState {
-                            provider_key: row.get(0)?,
-                            cooldown_until: row.get(1)?,
-                            quota_exhausted_until: row.get(2)?,
-                            quota_pressure: row.get(3)?,
-                            wall_class: row_wall_class(row, 4)?,
-                        };
-                        let last_error: Option<String> = row.get(5)?;
-                        Ok((state, last_error))
-                    },
-                )
-                .optional()
+                Ok(route_snapshot::read_provider_cooldown(c, &provider_key))
             })
-            .map_err(err)
-            .map(|row| {
-                // A provider row written from one credential's refusal (before
-                // such refusals were kept off the provider) is read as absent: it
-                // is evidence about that credential, which its fence covers.
-                row.filter(|(_, last_error)| !credential_refusal_wall(last_error.as_deref()))
-                    .map(|(state, _)| state)
-            })
+            .map_err(err)?
     }
 
     fn record_provider_cooldown(
@@ -4096,121 +4091,11 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot> {
+        // The SQL oracle: request paths build the same snapshot from the
+        // account state's block rows (`BlockState::route_state_snapshot`).
         self.store
-            .with_conn(|c: &Connection| {
-                let clock_schema=fence_rechecks::enabled(c)?;
-                // The route-state snapshot still overlays clocks read from
-                // SQL, not the account state's blocks.
-                let rechecks=crate::group_reads::declared_exception("route-state snapshot", || fence_rechecks::read_effective(c))?;
-                let mut by_route: HashMap<String, RouteRuntimeState> = HashMap::new();
-                let mut by_capacity: HashMap<String, RouteRuntimeState> = HashMap::new();
-
-                let mut stmt = c.prepare(&format!(
-                    "SELECT route_key, capacity_key, cooldown_until, quota_exhausted_until,
-                             quota_pressure, latency_ema_ms, success_ema,
-                             failure_backoff_until, failure_backoff_reason, last_error, wall_class,{}
-                      FROM model_route_state",if clock_schema {"wall_unscoped"}else{"0"},
-                ))?;
-                let rows = stmt.query_map([], |r| {
-                    Ok(StateRow {
-                        route_key: r.get(0)?,
-                        capacity_key: r.get(1)?,
-                        cooldown_until: r.get(2)?,
-                        quota_exhausted_until: r.get(3)?,
-                        quota_pressure: r.get(4)?,
-                        latency_ema_ms: r.get(5)?,
-                        success_ema: r.get(6)?,
-                        failure_backoff_until: r.get(7)?,
-                        failure_backoff_reason: r.get(8)?,
-                        last_error: r.get(9)?,
-                        wall_class: row_wall_class(r, 10)?,
-                        wall_unscoped:r.get(11)?,
-                    })
-                })?;
-                for row in rows {
-                    let row = row?;
-                    let mut state = RouteRuntimeState {
-                        cooldown_until: row.cooldown_until,
-                        quota_exhausted_until: row.quota_exhausted_until,
-                        wall_class: row.wall_class,
-                        last_error: row.last_error.clone(),
-                        latency_ema_ms: row.latency_ema_ms,
-                        success_ema: row.success_ema,
-                        failure_backoff_until: row.failure_backoff_until,
-                        failure_backoff_reason: row.failure_backoff_reason,
-                        ..Default::default()
-                    };
-                    let provider=derive_provider_key(&row.route_key).unwrap_or("");
-                    let model=row.capacity_key.strip_prefix(provider).and_then(|key|key.strip_prefix('/')).unwrap_or("");
-                    let schedule=|kinds:&[&str],raw:f64|rechecks.iter().filter(|origin| kinds.contains(&origin.kind.as_str())
-                        && ((origin.kind=="provider" && origin.applies(provider,"","",model))
-                            || origin.origin_key==serde_json::json!([row.route_key]).to_string()))
-                        .map(|origin|if origin.last_claimed_at.is_some_and(|at|at>=origin.evidence_at) {origin.due_at() as f64}else{raw.min(origin.due_at() as f64)}).reduce(f64::max).or_else(||(!clock_schema).then_some(raw));
-                    if let Some(raw)=state.cooldown_until {state.cooldown_until=schedule(&["route","provider"],raw);}
-                    if let Some(raw)=state.quota_exhausted_until {state.quota_exhausted_until=schedule(&["route","provider"],raw);}
-                    if let Some(raw)=state.failure_backoff_until {state.failure_backoff_until=schedule(&["failure"],raw);}
-                    // These legacy origins have no account identity. Preserve
-                    // the reported quota label in storage, but enforce a
-                    // non-quota retry clock rather than infer an account quota.
-                    if row.wall_unscoped && striatum_core::account_wall::account_scoped_wall(state.last_error.as_deref(),state.wall_class) {
-                        // Older downstream readers classify that text as an
-                        // account wall. Keep it only in the original store row,
-                        // not in the effective identity-free cooldown view.
-                        state.last_error=Some("identity-free legacy cooldown".into());
-                    }
-                    if state.wall_class==Some(RouteWallClass::Quota) || (row.wall_unscoped && state.wall_class==Some(RouteWallClass::Transient)) {
-                        state.wall_class=None;
-                    }
-                    // Read-side quarantine leaves the original row available for
-                    // diagnosis. Its single-account horizon cannot reject another
-                    // credential, including through a sibling capacity key.
-                    if !row.wall_unscoped && striatum_core::account_wall::account_scoped_wall(
-                        state.last_error.as_deref(),
-                        state.wall_class,
-                    ) {
-                        state.cooldown_until = None;
-                        state.quota_exhausted_until = None;
-                        state.wall_class = None;
-                        if striatum_core::account_wall::transient_error(
-                            state.last_error.as_deref().unwrap_or_default(),
-                        ) {
-                            state.failure_backoff_until = None;
-                            state.failure_backoff_reason = None;
-                        }
-                    }
-                    // Capacity-shared signals propagate across variants of the same
-                    // provider/model. Soft pressure lives ONLY on the capacity key so a
-                    // fresh quota reading can replace a stale stored value for every
-                    // sibling route at once.
-                    let cap = by_capacity.entry(row.capacity_key.clone()).or_default();
-                    cap.cooldown_until = max_defined(cap.cooldown_until, state.cooldown_until);
-                    cap.quota_exhausted_until =
-                        max_defined(cap.quota_exhausted_until, state.quota_exhausted_until);
-                    let row_wall_is_live = state.cooldown_until.is_some_and(|until| until > now)
-                        || state.quota_exhausted_until.is_some_and(|until| until > now);
-                    if row_wall_is_live
-                        && (cap.wall_class.is_none()
-                            || state.wall_class == Some(RouteWallClass::Billing))
-                    {
-                        cap.wall_class = state.wall_class;
-                        cap.last_error = state.last_error.clone();
-                    }
-                    if let Some(pressure) = row.quota_pressure {
-                        cap.quota_pressure = Some(match cap.quota_pressure {
-                            Some(existing) => existing.max(pressure),
-                            None => pressure,
-                        });
-                    }
-                    by_route.insert(row.route_key, state);
-                }
-
-                Ok(ModelRouteStateSnapshot {
-                    now,
-                    by_route,
-                    by_capacity,
-                })
-            })
-            .map_err(err)
+            .with_conn(|c: &Connection| Ok(route_snapshot::read_snapshot(c, now, now_ms())))
+            .map_err(err)?
     }
 }
 
@@ -4238,25 +4123,10 @@ struct ExistingState {
     last_error_at: Option<i64>,
 }
 
-struct StateRow {
-    wall_unscoped: bool,
-    route_key: String,
-    capacity_key: String,
-    cooldown_until: Option<f64>,
-    quota_exhausted_until: Option<f64>,
-    wall_class: Option<RouteWallClass>,
-    last_error: Option<String>,
-    quota_pressure: Option<f64>,
-    latency_ema_ms: Option<f64>,
-    success_ema: Option<f64>,
-    failure_backoff_until: Option<f64>,
-    failure_backoff_reason: Option<String>,
-}
-
 /// Whether a stored wall was written from a permanent refusal of one named
 /// credential. Such a wall is not provider or route evidence: the credential's
 /// fence covers it, so it neither blocks nor lends its horizon to a later write.
-fn credential_refusal_wall(last_error: Option<&str>) -> bool {
+pub(crate) fn credential_refusal_wall(last_error: Option<&str>) -> bool {
     last_error.is_some_and(|error| {
         striatum_core::account_wall::credential_refusal_in(error).is_some()
     })
@@ -4264,7 +4134,7 @@ fn credential_refusal_wall(last_error: Option<&str>) -> bool {
 
 /// `max` over two optional times, treating `None` as "no value" (the defined one
 /// wins; the larger of two defined values wins). Mirrors the TS `maxDefined`.
-fn max_defined(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+pub(crate) fn max_defined(a: Option<f64>, b: Option<f64>) -> Option<f64> {
     match (a, b) {
         (Some(x), Some(y)) => Some(x.max(y)),
         (Some(x), None) => Some(x),

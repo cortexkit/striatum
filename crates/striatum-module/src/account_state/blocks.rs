@@ -18,9 +18,11 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use striatum_core::model_router::ModelRouteStateSnapshot;
 use striatum_core::route_state_store::{
     CredentialEntitlementFence, RouteStateResult, RouteStateStoreError,
 };
+use striatum_core::ProviderCooldownState;
 use striatum_store::{
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountPoolFenceRow,
     AccountRouteFence, AccountSizeRefusal, AccountTx, BlockState, FenceRecheck,
@@ -30,12 +32,10 @@ use striatum_store::{
 use super::{snapshot, AccountCommand, AccountState};
 
 /// The time `SqliteRouteStateStore::fence_rechecks` evaluates expiry at: the
-/// wall clock when the read runs, not the request's clock.
+/// store's clock when the read runs (the wall clock, or a replayed request's
+/// recorded time in test builds), not the request's clock.
 fn wall_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
+    striatum_store::store_now_ms()
 }
 
 /// The block reads a helper may make, answered by whoever holds the rows.
@@ -325,6 +325,29 @@ impl Published<'_> {
         match self.blocks() {
             Some(blocks) => blocks.fence_rechecks(wall_now()),
             None => self.store().fence_rechecks(),
+        }
+    }
+
+    /// The route-state snapshot at `now`. Its probe clocks are evaluated at
+    /// the wall clock, as the store's SQL `build_snapshot` evaluates them.
+    pub(crate) fn route_state_snapshot(
+        &self,
+        now: f64,
+    ) -> RouteStateResult<ModelRouteStateSnapshot> {
+        match self.blocks() {
+            Some(blocks) => blocks.route_state_snapshot(now, wall_now()),
+            None => striatum_core::RouteStateStore::build_snapshot(self.store(), now),
+        }
+    }
+
+    /// One provider's cooldown row, for `route.cooldown_status`.
+    pub(crate) fn provider_cooldown(
+        &self,
+        provider_key: &str,
+    ) -> RouteStateResult<Option<ProviderCooldownState>> {
+        match self.blocks() {
+            Some(blocks) => blocks.provider_cooldown(provider_key),
+            None => striatum_core::RouteStateStore::get_provider_cooldown(self.store(), provider_key),
         }
     }
 

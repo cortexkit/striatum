@@ -175,6 +175,74 @@ impl Rig {
         for &now in times {
             self.check_readers(&memory, now, &format!("{context} at {now}"));
         }
+        self.check_route_state(&memory, times, context);
+    }
+
+    /// The route-state snapshot and `route.cooldown_status` answer from
+    /// memory exactly as from SQL, for a request at each time against probe
+    /// clocks evaluated at each time (the SQL reader evaluates them at the
+    /// wall clock, which a request's `now` need not equal).
+    fn check_route_state(&self, memory: &BlockState, times: &[i64], context: &str) {
+        for &now in times {
+            for &recheck in times {
+                let at = format!("snapshot at {now}, clocks at {recheck}: {context}");
+                let derived = memory.route_state_snapshot(now as f64, recheck).unwrap();
+                let sql = self
+                    .store
+                    .with_reader_for_test(move |conn| {
+                        Ok(crate::route_snapshot::read_snapshot(conn, now as f64, recheck))
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(derived, sql, "{at}");
+                let mut keys: Vec<(&String, &String)> = sql
+                    .by_route
+                    .keys()
+                    .map(|route| (route, route))
+                    .chain(sql.by_capacity.keys().map(|capacity| (capacity, capacity)))
+                    .collect();
+                // A variant route asked with its capacity's key.
+                for route in sql.by_route.keys() {
+                    if let Some(capacity) = sql.by_capacity.keys().find(|capacity| {
+                        route.len() > capacity.len() && route.starts_with(capacity.as_str())
+                    }) {
+                        keys.push((route, capacity));
+                    }
+                }
+                for (route, capacity) in keys {
+                    let provider = striatum_core::derive_provider_key(route).unwrap_or("");
+                    let from_memory = memory.provider_cooldown(provider).unwrap();
+                    let from_sql = self.store.get_provider_cooldown(provider).unwrap();
+                    assert_eq!(from_memory, from_sql, "provider {provider}: {at}");
+                    let cooled = striatum_core::route_state_store::route_cooled(
+                        from_memory.as_ref(),
+                        &derived,
+                        route,
+                        capacity,
+                        now as f64,
+                    );
+                    assert_eq!(
+                        cooled,
+                        striatum_core::route_state_store::route_cooled(
+                            from_sql.as_ref(),
+                            &sql,
+                            route,
+                            capacity,
+                            now as f64,
+                        ),
+                        "cooldown_status of {route} on {capacity}: {at}"
+                    );
+                    COOLED.with(|seen| seen.borrow_mut().insert(cooled));
+                }
+            }
+        }
+        for provider in PROVIDERS {
+            assert_eq!(
+                memory.provider_cooldown(provider).unwrap(),
+                self.store.get_provider_cooldown(provider).unwrap(),
+                "provider {provider}: {context}"
+            );
+        }
     }
 
     /// Every request reader of the block tables answers from memory exactly
@@ -2005,6 +2073,9 @@ fn block_rows(conn: &Connection) -> RouteStateResult<Vec<String>> {
 }
 
 thread_local! {
+    /// The `route.cooldown_status` answers `check_route_state` compared.
+    static COOLED: std::cell::RefCell<std::collections::BTreeSet<bool>> =
+        const { std::cell::RefCell::new(std::collections::BTreeSet::new()) };
     /// Each decision `decide_both` compared: its name, whether the state
     /// answered `true`, and whether it matched SQL.
     static DECIDED: std::cell::RefCell<Vec<(&'static str, bool, bool)>> =
@@ -2213,6 +2284,157 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     assert!(replaced_rowid, "a key moved to a new rowid");
 }
 
+/// Route and provider rows the main sequence does not write: variants
+/// sharing one capacity, every stored wall class, credential refusals and
+/// transient errors, route data alone, and clocks claimed by a probe. After
+/// every step the route-state snapshot and `route.cooldown_status` must
+/// answer from memory exactly as from SQL (`Rig::check_route_state`).
+#[test]
+fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes() {
+    const ROUTE_ERRORS: [&str; 6] = [
+        ERRORS[0],
+        ERRORS[1],
+        ERRORS[2],
+        ERRORS[3],
+        "'{\"class\":\"transient\",\"provider_code\":\"overloaded\"}'",
+        "'{\"class\":\"permanent\",\"provider_code\":\"billing_exhausted\",\"credential_id\":\"c0\"}'",
+    ];
+    COOLED.with(|seen| seen.borrow_mut().clear());
+    let mut operations = std::collections::BTreeMap::<&str, usize>::new();
+    let (mut shared_capacity, mut clock_scheduled, mut billing_capacity, mut quarantined) =
+        (false, false, false, false);
+    for seed in 1..=6u64 {
+        let rig = rig(&format!("route-state-snapshot-{seed}"));
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut now = NOW;
+        for index in 0..120 {
+            let p = rng.pick(&PROVIDERS);
+            let m = rng.pick(&MODELS);
+            let route = match rng.below(3) {
+                0 => format!("{p}/{m}"),
+                variant => format!("{p}/{m}/v{variant}"),
+            };
+            let at = rng.time(now);
+            let operation = match rng.below(7) {
+                0 => {
+                    let (cooldown, quota, failure) = (
+                        rng.maybe_time(now + 3_600_000),
+                        rng.maybe_time(now + 3_600_000),
+                        rng.maybe_time(now + 3_600_000),
+                    );
+                    let class = rng.pick(&["NULL", "'quota'", "'billing'"]);
+                    let error = rng.pick(&ROUTE_ERRORS);
+                    let unscoped = rng.below(2);
+                    let pressure = rng.pick(&["NULL", "0.25", "0.75"]);
+                    rig.sql(format!("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,quota_pressure,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at,failure_backoff_until,failure_backoff_reason,failure_observed_at)
+                        VALUES ('{route}','{p}/{m}','{p}','{m}',{cooldown},{quota},{pressure},{at},{unscoped},{class},{error},{at},{at},{failure},'error',{at})
+                        ON CONFLICT(route_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,quota_exhausted_until=excluded.quota_exhausted_until,quota_pressure=excluded.quota_pressure,
+                        wall_observed_at=excluded.wall_observed_at,wall_unscoped=excluded.wall_unscoped,wall_class=excluded.wall_class,last_error=excluded.last_error,
+                        failure_backoff_until=excluded.failure_backoff_until,failure_observed_at=excluded.failure_observed_at;"));
+                    "write a route row"
+                }
+                1 => {
+                    let (cooldown, quota) = (
+                        rng.maybe_time(now + 3_600_000),
+                        rng.maybe_time(now + 3_600_000),
+                    );
+                    let class = rng.pick(&["NULL", "'quota'", "'billing'"]);
+                    let error = rng.pick(&ROUTE_ERRORS);
+                    let unscoped = rng.below(2);
+                    rig.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,quota_exhausted_until,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at)
+                        VALUES ('{p}',{cooldown},{quota},{at},{unscoped},{class},{error},{at},{at})
+                        ON CONFLICT(provider_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,quota_exhausted_until=excluded.quota_exhausted_until,
+                        wall_observed_at=excluded.wall_observed_at,wall_unscoped=excluded.wall_unscoped,wall_class=excluded.wall_class,last_error=excluded.last_error;"));
+                    "write a provider row"
+                }
+                2 => {
+                    rig.store
+                        .account_command(AccountCommandKind::Maintenance, |tx| {
+                            tx.sync_fence_rechecks()
+                        })
+                        .unwrap();
+                    "sync clocks"
+                }
+                3 => {
+                    // A probe claims every due clock, which schedules the
+                    // walls it covers at the claim's own due time.
+                    let owner = format!("probe-{index}");
+                    rig.store
+                        .account_command(AccountCommandKind::Maintenance, move |tx| {
+                            tx.sync_fence_rechecks()?;
+                            let origins = tx.fence_rechecks()?;
+                            tx.grant_fence_rechecks(&origins, now, Some(&owner))
+                        })
+                        .unwrap();
+                    "claim clocks"
+                }
+                4 => {
+                    rig.sql(format!("DELETE FROM model_route_state WHERE route_key='{route}';"));
+                    "delete a route row"
+                }
+                5 => {
+                    let latency = rng.below(500);
+                    let success = rng.pick(&["NULL", "0.5", "1.0"]);
+                    rig.sql(format!("UPDATE model_route_state SET latency_ema_ms={latency},success_ema={success},updated_at={at} WHERE route_key='{route}';"));
+                    "route data only"
+                }
+                _ => {
+                    let update = RouteStateUpdate {
+                        observed_at_ms: Some(at),
+                        cooldown_until: Some((now + 3_600_000) as f64),
+                        last_error: Some("provider capacity".into()),
+                        ..Default::default()
+                    };
+                    rig.store
+                        .record_provider_cooldown(p, &route, &format!("{p}/{m}"), &update)
+                        .unwrap();
+                    "record provider cooldown"
+                }
+            };
+            *operations.entry(operation).or_default() += 1;
+            let context = format!("seed={seed} step={index} op={operation}");
+            rig.check(&[now - 3_600_000, now, now + 3_600_000], &context);
+            let snapshot = rig.published().route_state_snapshot(now as f64, now).unwrap();
+            billing_capacity |= snapshot
+                .by_capacity
+                .values()
+                .any(|state| state.wall_class == Some(striatum_core::RouteWallClass::Billing));
+            rig.store
+                .with_reader_for_test(|conn| {
+                    shared_capacity |= conn.query_row(
+                        "SELECT count(*) FROM (SELECT 1 FROM model_route_state GROUP BY capacity_key HAVING count(*)>1)",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )? > 0;
+                    quarantined |= !fence_rechecks::quarantined_origins(conn)?.is_empty();
+                    let stored: Vec<(String, Option<f64>)> = conn
+                        .prepare("SELECT route_key,cooldown_until FROM model_route_state")?
+                        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    clock_scheduled |= stored.iter().any(|(route, raw)| {
+                        let scheduled = snapshot.by_route[route].cooldown_until;
+                        scheduled.is_some() && scheduled != *raw
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            now += rng.below(3) as i64 * 600_000;
+        }
+        assert_eq!(rig.store.block_writes_outside_command(), 0, "seed={seed}");
+    }
+    assert_eq!(operations.len(), 7, "every operation ran: {operations:?}");
+    assert!(shared_capacity, "variants sharing one capacity");
+    assert!(clock_scheduled, "a route deadline a claimed clock rescheduled");
+    assert!(billing_capacity, "a capacity walled by billing");
+    assert!(quarantined, "a quarantined route or provider row");
+    let cooled = COOLED.with(|seen| seen.borrow().clone());
+    assert_eq!(
+        cooled,
+        [false, true].into_iter().collect(),
+        "cooldown_status answered both ways"
+    );
+}
+
 /// Resident memory in bytes, from `/proc/self/statm`; 0 where unavailable.
 fn resident_bytes() -> i64 {
     std::fs::read_to_string("/proc/self/statm")
@@ -2321,4 +2543,256 @@ fn live_sized_block_state_costs() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+/// Every production writer of the block tables, driven through its real
+/// store entry point, writes inside an account command: none changes a block
+/// row the capture misses (`block_writes_outside_command` stays 0), and after
+/// each one the published state equals a fresh load. The tick that ends the
+/// sequence reconciles the state with SQL and must find nothing to reload.
+/// The request handlers' own commands (selection, admission, observation,
+/// report) are driven by the module's read-trace test, which checks the same
+/// counters.
+#[test]
+fn every_production_block_writer_writes_inside_an_account_command() {
+    use striatum_core::key_pool::PoolKey;
+    use striatum_core::route_state_store::CredentialRefusal;
+    use striatum_core::{DecisionInput, DecisionOutcomeUpdate};
+
+    // The counter sees a write outside a command: the negative.
+    let control = rig("block-writers-control");
+    control
+        .store
+        .bypass_account_writer_for_test(
+            "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at) VALUES ('p9',1,1)",
+        )
+        .unwrap();
+    assert_eq!(control.store.block_writes_outside_command(), 1);
+
+    let rig = rig("block-writers");
+    let now = NOW;
+    let reloads = block_reconcile_reloads();
+    let mut ran = Vec::new();
+    let mut read_backs = block_read_backs();
+    let mut step = |name: &'static str, rig: &Rig| {
+        // The writer read back the block rows the step changed: the step
+        // really wrote, inside a command.
+        let now_read_backs = block_read_backs();
+        ran.push((name, now_read_backs - read_backs));
+        read_backs = now_read_backs;
+        assert_eq!(
+            rig.store.block_writes_outside_command(),
+            0,
+            "{name} wrote outside a command: {:?}",
+            rig.store.block_tables_written_outside_command()
+        );
+        rig.check(&[now], name);
+    };
+    let route = "p0/m0";
+    rig.store
+        .upsert_fact(&fact("p0", "m0"), FactSource::Seed)
+        .unwrap();
+    step("upsert_fact (catalogue trigger creates the route row)", &rig);
+    rig.store
+        .apply_fusiform_catalog(
+            &[crate::FusiformFactUpdate {
+                auth_methods: None,
+                login_methods_documented: false,
+                provider_id: "p0".into(),
+                model_id: "m1".into(),
+                present: true,
+                context_window: Some(64_000.0),
+                max_output_tokens: Some(4_096),
+                cost_tier: Some(1.0),
+                cost_per_mtok_out: Some(1.0),
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
+                supports_vision: Some(false),
+                supports_tool_use: Some(true),
+                reasoning_efforts: None,
+                canonical_id: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
+                lineage: None,
+            }],
+            crate::FusiformCatalogCursor {
+                catalog_version: 1,
+                resolved_at_ms: now,
+            },
+        )
+        .unwrap();
+    step("apply_fusiform_catalog", &rig);
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            route,
+            route,
+            &RouteStateUpdate {
+                observed_at_ms: Some(now),
+                cooldown_until: Some((now + 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    step("record_provider_cooldown", &rig);
+    for _ in 0..4 {
+        rig.store
+            .update_route_state(
+                route,
+                route,
+                &RouteStateUpdate {
+                    observed_at_ms: Some(now),
+                    quota_exhausted_until: Some((now + 600_000) as f64),
+                    latency_ema_ms: Some(10.0),
+                    increment_failure: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    step("update_route_state", &rig);
+    let decision = rig
+        .store
+        .record_decision(&DecisionInput {
+            decision_id: Some("writer-decision".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            selected_route_key: Some(route.into()),
+            selected_provider_id: Some("p0".into()),
+            selected_model_id: Some("m0".into()),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    for _ in 0..4 {
+        rig.store
+            .set_decision_outcome(
+                &decision,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: striatum_core::RouteOutcome::Error,
+                    last_error: Some("upstream error".into()),
+                    observed_at_ms: now,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+    }
+    step("set_decision_outcome (terminal failures start a backoff)", &rig);
+    rig.store.clear_failure_backoff(route).unwrap();
+    step("clear_failure_backoff", &rig);
+    rig.store.clear_route_cooldowns(route).unwrap();
+    step("clear_route_cooldowns", &rig);
+    let refusal = CredentialRefusal {
+        provider_id: "p0".into(),
+        credential_id: "c0".into(),
+        code: "ENTITLEMENT_ERROR".into(),
+    };
+    rig.store
+        .record_credential_entitlement_fence(&refusal, None, now)
+        .unwrap();
+    step("record_credential_entitlement_fence", &rig);
+    rig.store
+        .touch_credential_entitlement_fence("p0", "c0", now + 1)
+        .unwrap();
+    step("touch_credential_entitlement_fence", &rig);
+    rig.store
+        .adopt_credential_entitlement_fingerprint("c0", "l1")
+        .unwrap();
+    step("adopt_credential_entitlement_fingerprint", &rig);
+    rig.store
+        .clear_credential_entitlement_fences("c0", Some("l1"))
+        .unwrap();
+    step("clear_credential_entitlement_fences", &rig);
+    rig.store
+        .record_credential_entitlement_fence(&refusal, None, now)
+        .unwrap();
+    rig.store
+        .clear_credential_entitlement_fences_for_credential("c0")
+        .unwrap();
+    step("clear_credential_entitlement_fences_for_credential", &rig);
+    // The cleared fence's clock is stale now; the tick's sync deletes it.
+    rig.store
+        .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + 1))
+        .unwrap();
+    step("tick (expiry releases, sync, retirement)", &rig);
+    let keys = [
+        PoolKey::new("k0", None, "active"),
+        PoolKey::new("k1", None, "active"),
+    ];
+    rig.store
+        .pool_wall("p1", "k0", crate::PoolWallKind::RateLimited, now + 60_000, "429", now)
+        .unwrap();
+    rig.store
+        .pool_wall("p1", "k0", crate::PoolWallKind::Billing, now + 60_000, "402", now)
+        .unwrap();
+    step("pool_wall", &rig);
+    let lease = match rig
+        .store
+        .pool_acquire(&crate::PoolAcquire {
+            provider: "p1",
+            session_id: "s0",
+            keys: &keys,
+            now_ms: now,
+            lease_ms: 60_000,
+            affinity_idle_ms: 60_000,
+        })
+        .unwrap()
+    {
+        crate::PoolAcquireOutcome::Leased(lease) => lease,
+        other => panic!("one key is free: {other:?}"),
+    };
+    step("pool_acquire", &rig);
+    rig.store
+        .pool_renew("p1", "s0", &lease.lease_id, None, now + 1, 60_000)
+        .unwrap();
+    step("pool_renew", &rig);
+    rig.store
+        .pool_release("p1", "s0", Some(&lease.lease_id), true, now + 2)
+        .unwrap();
+    step("pool_release", &rig);
+    rig.store.pool_key_states("p1", now + 3).unwrap();
+    step("pool_key_states (syncs clocks when evidence changed)", &rig);
+    // A seed fact no decision selected is pruned with its route row.
+    rig.store
+        .upsert_fact(&fact("p1", "m9"), FactSource::Seed)
+        .unwrap();
+    step("upsert_fact (an unserved seed route)", &rig);
+    // The catalogue no longer lists it (setup: model_facts is no block table).
+    rig.sql("UPDATE model_facts SET fusiform_present=0 WHERE route_key='p1/m9';".into());
+    assert!(
+        !rig.store.prune_unserved_unpicked_facts().unwrap().is_empty(),
+        "the unserved seed route is pruned"
+    );
+    step("prune_unserved_unpicked_facts", &rig);
+    rig.store
+        .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + 7_200_000))
+        .unwrap();
+    step("final tick (reconciles the state with SQL)", &rig);
+    assert_eq!(
+        block_reconcile_reloads(),
+        reloads,
+        "the tick's reconcile found the state differing from SQL"
+    );
+    assert_eq!(ran.len(), 21, "{ran:?}");
+    // Lease renewal and release write only the lease tables, the key-state
+    // read syncs clocks only when their evidence changed, and the final tick
+    // has nothing left to do: those may change no block row.
+    let may_be_silent = [
+        "pool_renew",
+        "pool_release",
+        "pool_key_states (syncs clocks when evidence changed)",
+        "final tick (reconciles the state with SQL)",
+    ];
+    let silent: Vec<_> = ran
+        .iter()
+        .filter(|(name, rows)| *rows == 0 && !may_be_silent.contains(name))
+        .collect();
+    assert!(silent.is_empty(), "steps that changed no block row: {silent:?}");
 }

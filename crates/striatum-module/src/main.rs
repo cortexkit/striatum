@@ -36,6 +36,7 @@ mod fusiform_catalog;
 mod head_choices;
 mod key_pool;
 mod legacy_wire;
+mod logging;
 #[cfg(test)]
 mod literal_census_tests;
 mod model_resolution;
@@ -57,6 +58,9 @@ mod substrate_policy;
 mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
+#[cfg(test)]
+#[path = "test_exe/tests.rs"]
+mod test_exe;
 mod tier_settings;
 mod variant_policy;
 mod winner_ladder;
@@ -1104,8 +1108,20 @@ fn check_config_at(path: &Path) -> Result<(), ModuleError> {
     config_overrides::initialize_config(path).map_err(ModuleError::Message)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ModuleError> {
+fn main() -> Result<(), ModuleError> {
+    initialize_logging();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ModuleError::Message(error.to_string()))?
+        .block_on(async_main())
+}
+
+fn initialize_logging() {
+    logging::install();
+}
+
+async fn async_main() -> Result<(), ModuleError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "config-convert") {
         if args.len() != 3 {
@@ -3684,10 +3700,27 @@ async fn handle_cooldown_status(
                 .await;
             }
         };
+    // The provider row and the route-state snapshot both come from one
+    // published account state, which holds every route and provider row.
+    let blocks = match account_state::published(store) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("cooldown_status: {error}"),
+            )
+            .await;
+        }
+    };
     let provider_state = if let Some(provider_key) =
         derive_provider_key(&params.route_key).or_else(|| derive_provider_key(&params.capacity_key))
     {
-        match store.get_provider_cooldown(provider_key) {
+        match blocks.provider_cooldown(provider_key) {
             Ok(state) => state,
             Err(error) => {
                 return send_route_error(
@@ -3705,7 +3738,7 @@ async fn handle_cooldown_status(
     } else {
         None
     };
-    let snapshot = match store.build_snapshot(params.now as f64) {
+    let snapshot = match blocks.route_state_snapshot(params.now as f64) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return send_route_error(
@@ -3720,31 +3753,13 @@ async fn handle_cooldown_status(
             .await;
         }
     };
-    let provider_cooled = provider_state.as_ref().is_some_and(|state| {
-        state
-            .cooldown_until
-            .is_some_and(|until| until > params.now as f64)
-            || state
-                .quota_exhausted_until
-                .is_some_and(|until| until > params.now as f64)
-    });
-    let cooled = provider_cooled
-        || snapshot
-            .by_route
-            .get(&params.route_key)
-            .into_iter()
-            .chain(snapshot.by_capacity.get(&params.capacity_key))
-            .any(|state| {
-                state
-                    .cooldown_until
-                    .is_some_and(|until| until > params.now as f64)
-                    || state
-                        .quota_exhausted_until
-                        .is_some_and(|until| until > params.now as f64)
-                    || state
-                        .failure_backoff_until
-                        .is_some_and(|until| until > params.now as f64)
-            });
+    let cooled = striatum_core::route_state_store::route_cooled(
+        provider_state.as_ref(),
+        &snapshot,
+        &params.route_key,
+        &params.capacity_key,
+        params.now as f64,
+    );
     let body =
         serde_json::to_vec(&json!({"result": {"cooled": cooled}})).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
