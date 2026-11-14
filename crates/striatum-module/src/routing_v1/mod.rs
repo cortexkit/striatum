@@ -93,6 +93,14 @@ mod profile_tests;
 pub(crate) mod replay_tests;
 #[cfg(test)]
 mod report_delivery_tests;
+
+/// Reuse real-handler contract tests in a child process with production logging.
+#[cfg(test)]
+pub(crate) fn exercise_normal_traffic_for_logging() {
+    account_ops_tests::session_ids_and_affinity_are_scoped_by_owner_and_ref_and_parent_use_is_shared_only_within_owner();
+    report_delivery_tests::report_run_repeat_returns_first_answer_and_usage_but_new_runs_count();
+}
+
 #[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]

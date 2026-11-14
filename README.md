@@ -6,6 +6,14 @@ It runs as the `striatum` module under subc, with binary `ck-striatum` and store
 
 Settings live at `$XDG_CONFIG_HOME/cortexkit/striatum.jsonc` (default `~/.config/cortexkit/striatum.jsonc`); project and workspace tier settings use `.cortexkit/striatum.jsonc` under each root. Routing reads only `striatum.jsonc`, with no fallback to older filenames. `--check-config` validates and names the same global file. A file absent on its first read means defaults (or no tier settings). Once a settings file has loaded successfully, moving or deleting it keeps the last good configuration and reports the missing file once until it is restored. Malformed global edits also keep the last good configuration; replace a file with an empty JSON object (`{}`) to intentionally clear its settings.
 
+Tracing warnings and errors go to stderr, one event per line, as `LEVEL message key=value`.
+The daemon adds timestamps and the module prefix. The default threshold is `warn`.
+`STRIATUM_LOG` overrides `RUST_LOG`; either accepts comma-separated global levels
+(`off`, `error`, `warn`, `info`, `debug`, `trace`) and `target=level` directives, such
+as `warn,striatum_store=debug,ck_striatum=info`. The longest target prefix wins;
+invalid directives are ignored. Span lifecycle events and span fields are not printed.
+Existing operator messages, including the `--check-config` success report, are unchanged.
+
 ## Build and test
 
 ```sh
