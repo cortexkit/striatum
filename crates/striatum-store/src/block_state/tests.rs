@@ -2544,3 +2544,255 @@ fn live_sized_block_state_costs() {
         );
     }
 }
+
+/// Every production writer of the block tables, driven through its real
+/// store entry point, writes inside an account command: none changes a block
+/// row the capture misses (`block_writes_outside_command` stays 0), and after
+/// each one the published state equals a fresh load. The tick that ends the
+/// sequence reconciles the state with SQL and must find nothing to reload.
+/// The request handlers' own commands (selection, admission, observation,
+/// report) are driven by the module's read-trace test, which checks the same
+/// counters.
+#[test]
+fn every_production_block_writer_writes_inside_an_account_command() {
+    use striatum_core::key_pool::PoolKey;
+    use striatum_core::route_state_store::CredentialRefusal;
+    use striatum_core::{DecisionInput, DecisionOutcomeUpdate};
+
+    // The counter sees a write outside a command: the negative.
+    let control = rig("block-writers-control");
+    control
+        .store
+        .bypass_account_writer_for_test(
+            "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at) VALUES ('p9',1,1)",
+        )
+        .unwrap();
+    assert_eq!(control.store.block_writes_outside_command(), 1);
+
+    let rig = rig("block-writers");
+    let now = NOW;
+    let reloads = block_reconcile_reloads();
+    let mut ran = Vec::new();
+    let mut read_backs = block_read_backs();
+    let mut step = |name: &'static str, rig: &Rig| {
+        // The writer read back the block rows the step changed: the step
+        // really wrote, inside a command.
+        let now_read_backs = block_read_backs();
+        ran.push((name, now_read_backs - read_backs));
+        read_backs = now_read_backs;
+        assert_eq!(
+            rig.store.block_writes_outside_command(),
+            0,
+            "{name} wrote outside a command: {:?}",
+            rig.store.block_tables_written_outside_command()
+        );
+        rig.check(&[now], name);
+    };
+    let route = "p0/m0";
+    rig.store
+        .upsert_fact(&fact("p0", "m0"), FactSource::Seed)
+        .unwrap();
+    step("upsert_fact (catalogue trigger creates the route row)", &rig);
+    rig.store
+        .apply_fusiform_catalog(
+            &[crate::FusiformFactUpdate {
+                auth_methods: None,
+                login_methods_documented: false,
+                provider_id: "p0".into(),
+                model_id: "m1".into(),
+                present: true,
+                context_window: Some(64_000.0),
+                max_output_tokens: Some(4_096),
+                cost_tier: Some(1.0),
+                cost_per_mtok_out: Some(1.0),
+                input_rate: None,
+                cache_read_rate: None,
+                cache_write_rate: None,
+                reasoning_rate: None,
+                supports_vision: Some(false),
+                supports_tool_use: Some(true),
+                reasoning_efforts: None,
+                canonical_id: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
+                lineage: None,
+            }],
+            crate::FusiformCatalogCursor {
+                catalog_version: 1,
+                resolved_at_ms: now,
+            },
+        )
+        .unwrap();
+    step("apply_fusiform_catalog", &rig);
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            route,
+            route,
+            &RouteStateUpdate {
+                observed_at_ms: Some(now),
+                cooldown_until: Some((now + 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    step("record_provider_cooldown", &rig);
+    for _ in 0..4 {
+        rig.store
+            .update_route_state(
+                route,
+                route,
+                &RouteStateUpdate {
+                    observed_at_ms: Some(now),
+                    quota_exhausted_until: Some((now + 600_000) as f64),
+                    latency_ema_ms: Some(10.0),
+                    increment_failure: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    step("update_route_state", &rig);
+    let decision = rig
+        .store
+        .record_decision(&DecisionInput {
+            decision_id: Some("writer-decision".into()),
+            target_agent: "mason".into(),
+            requirements_json: "{}".into(),
+            selected_route_key: Some(route.into()),
+            selected_provider_id: Some("p0".into()),
+            selected_model_id: Some("m0".into()),
+            score_json: "{}".into(),
+            rejected_json: "[]".into(),
+            anchor_version: 2,
+            ..Default::default()
+        })
+        .unwrap();
+    for _ in 0..4 {
+        rig.store
+            .set_decision_outcome(
+                &decision,
+                &DecisionOutcomeUpdate {
+                    provider_outcome: None,
+                    outcome: striatum_core::RouteOutcome::Error,
+                    last_error: Some("upstream error".into()),
+                    observed_at_ms: now,
+                    failure_backoff: Default::default(),
+                },
+            )
+            .unwrap();
+    }
+    step("set_decision_outcome (terminal failures start a backoff)", &rig);
+    rig.store.clear_failure_backoff(route).unwrap();
+    step("clear_failure_backoff", &rig);
+    rig.store.clear_route_cooldowns(route).unwrap();
+    step("clear_route_cooldowns", &rig);
+    let refusal = CredentialRefusal {
+        provider_id: "p0".into(),
+        credential_id: "c0".into(),
+        code: "ENTITLEMENT_ERROR".into(),
+    };
+    rig.store
+        .record_credential_entitlement_fence(&refusal, None, now)
+        .unwrap();
+    step("record_credential_entitlement_fence", &rig);
+    rig.store
+        .touch_credential_entitlement_fence("p0", "c0", now + 1)
+        .unwrap();
+    step("touch_credential_entitlement_fence", &rig);
+    rig.store
+        .adopt_credential_entitlement_fingerprint("c0", "l1")
+        .unwrap();
+    step("adopt_credential_entitlement_fingerprint", &rig);
+    rig.store
+        .clear_credential_entitlement_fences("c0", Some("l1"))
+        .unwrap();
+    step("clear_credential_entitlement_fences", &rig);
+    rig.store
+        .record_credential_entitlement_fence(&refusal, None, now)
+        .unwrap();
+    rig.store
+        .clear_credential_entitlement_fences_for_credential("c0")
+        .unwrap();
+    step("clear_credential_entitlement_fences_for_credential", &rig);
+    // The cleared fence's clock is stale now; the tick's sync deletes it.
+    rig.store
+        .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + 1))
+        .unwrap();
+    step("tick (expiry releases, sync, retirement)", &rig);
+    let keys = [
+        PoolKey::new("k0", None, "active"),
+        PoolKey::new("k1", None, "active"),
+    ];
+    rig.store
+        .pool_wall("p1", "k0", crate::PoolWallKind::RateLimited, now + 60_000, "429", now)
+        .unwrap();
+    rig.store
+        .pool_wall("p1", "k0", crate::PoolWallKind::Billing, now + 60_000, "402", now)
+        .unwrap();
+    step("pool_wall", &rig);
+    let lease = match rig
+        .store
+        .pool_acquire(&crate::PoolAcquire {
+            provider: "p1",
+            session_id: "s0",
+            keys: &keys,
+            now_ms: now,
+            lease_ms: 60_000,
+            affinity_idle_ms: 60_000,
+        })
+        .unwrap()
+    {
+        crate::PoolAcquireOutcome::Leased(lease) => lease,
+        other => panic!("one key is free: {other:?}"),
+    };
+    step("pool_acquire", &rig);
+    rig.store
+        .pool_renew("p1", "s0", &lease.lease_id, None, now + 1, 60_000)
+        .unwrap();
+    step("pool_renew", &rig);
+    rig.store
+        .pool_release("p1", "s0", Some(&lease.lease_id), true, now + 2)
+        .unwrap();
+    step("pool_release", &rig);
+    rig.store.pool_key_states("p1", now + 3).unwrap();
+    step("pool_key_states (syncs clocks when evidence changed)", &rig);
+    // A seed fact no decision selected is pruned with its route row.
+    rig.store
+        .upsert_fact(&fact("p1", "m9"), FactSource::Seed)
+        .unwrap();
+    step("upsert_fact (an unserved seed route)", &rig);
+    // The catalogue no longer lists it (setup: model_facts is no block table).
+    rig.sql("UPDATE model_facts SET fusiform_present=0 WHERE route_key='p1/m9';".into());
+    assert!(
+        !rig.store.prune_unserved_unpicked_facts().unwrap().is_empty(),
+        "the unserved seed route is pruned"
+    );
+    step("prune_unserved_unpicked_facts", &rig);
+    rig.store
+        .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + 7_200_000))
+        .unwrap();
+    step("final tick (reconciles the state with SQL)", &rig);
+    assert_eq!(
+        block_reconcile_reloads(),
+        reloads,
+        "the tick's reconcile found the state differing from SQL"
+    );
+    assert_eq!(ran.len(), 21, "{ran:?}");
+    // Lease renewal and release write only the lease tables, the key-state
+    // read syncs clocks only when their evidence changed, and the final tick
+    // has nothing left to do: those may change no block row.
+    let may_be_silent = [
+        "pool_renew",
+        "pool_release",
+        "pool_key_states (syncs clocks when evidence changed)",
+        "final tick (reconciles the state with SQL)",
+    ];
+    let silent: Vec<_> = ran
+        .iter()
+        .filter(|(name, rows)| *rows == 0 && !may_be_silent.contains(name))
+        .collect();
+    assert!(silent.is_empty(), "steps that changed no block row: {silent:?}");
+}

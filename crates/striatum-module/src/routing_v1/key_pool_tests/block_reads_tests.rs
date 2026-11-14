@@ -308,7 +308,16 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     let trace = store.trace_block_reads_for_test().unwrap();
     let switched = switched();
     let mut writer_reads = Vec::new();
+    let reloads = striatum_store::block_reconcile_reloads();
     let mut check = |op: &str| {
+        // Every block write the op made ran inside an account command: the
+        // capture saw it, so the state never needs a reload to catch up.
+        assert_eq!(
+            store.block_writes_outside_command(),
+            0,
+            "{op} wrote block tables outside an account command: {:?}",
+            store.block_tables_written_outside_command()
+        );
         let seen = trace.take();
         let ordinary: Vec<_> = seen
             .reader
@@ -460,6 +469,15 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         .await;
     check("pool_acquire with fences");
 
+    // A tick reconciles the state with SQL; after the whole mix it finds
+    // nothing the capture missed.
+    crate::account_writer::tick(store, now as i64).unwrap();
+    assert_eq!(
+        striatum_store::block_reconcile_reloads(),
+        reloads,
+        "the tick's reconcile reloaded a state the request mix left unequal to SQL"
+    );
+    assert_eq!(store.block_writes_outside_command(), 0);
     for (op, reads, exempt, maintenance) in &writer_reads {
         eprintln!(
             "block reads: {op}: {} ordinary on the writer, {} declared exceptions, {maintenance} state maintenance",

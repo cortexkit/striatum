@@ -1223,6 +1223,12 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         loaded.blocks, published.blocks,
         "the request mix left the block state unequal to a fresh load"
     );
+    assert_eq!(
+        store.block_writes_outside_command(),
+        0,
+        "the request mix wrote block tables outside an account command: {:?}",
+        store.block_tables_written_outside_command()
+    );
     // The route-state snapshot and the provider rows `route.cooldown_status`
     // reads answer from the state as from SQL, for requests an hour either
     // side of now against clocks evaluated at each of those times.
