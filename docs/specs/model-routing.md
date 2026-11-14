@@ -283,11 +283,40 @@ remain usable without a catalog cap. The reader currently ignores
 model unless a setting wins. Cap policy is rebuilt when plan prices, the roster
 or settings are updated, and requests look it up from an immutable snapshot;
 429 responses never teach it a limit.
-`concurrency.enforcement_enabled` defaults to `false`. The switch is reserved
-for admission enforcement; currently neither value changes picks, refusals or
-stored replies, and neither records waiters. Operators can inspect the ledger's
-cap counts with [`route.what_if`](../route-what-if.md) before enforcement is
-connected. Cap policy and reporting are active with either switch value.
+`concurrency.enforcement_enabled` defaults to `false`. With enforcement on,
+selection removes a route only when it has at least one eligible account and
+every eligible account is at its effective cap. An account counts as eligible
+when the allocator would admit it for that model right now (its blocks, quota
+reserve and sign-in state), judged without any conversation's account affinity,
+because a selection serves no particular conversation yet. Variants share
+their model's cap count; paid pools use the pool provider stored by admission.
+The ledger filter runs after the quality gate and before caller-supplied
+`concurrency_slots`, never widens the shortlist, and records no waiter.
+Selection first checks a provider/model cap-presence index and skips account
+eligibility entirely when no cap can apply. Presence only filters work; actual
+limits still come from the effective account cap. Resolved caps are shared by
+credential snapshots until catalog, roster or settings publication changes the
+inputs. A settings reload is resolved on the next select, without waiting for a
+credential poll. Eligibility is restricted to available routes and explicit
+pin/eligible-route constraints, with variants probed once per provider/model.
+
+When all candidates are removed, selection answers `no_route` with
+`concurrency_full` and the earliest predicted free slot, capped at 30 seconds
+from now. Legacy `route.select` uses error code `concurrency_full` and
+`earliestReset` in epoch milliseconds. Full explicit pins wait for their route
+rather than silently falling through. An interactive consumer (legacy:
+`targetAgent`) retries the same order, pins and preferences without the ledger
+filter only when the filter would otherwise leave no route. The legacy
+`head_agents` settings list alone does not grant that exemption.
+
+Each concurrency no-route emits one `routing select concurrency refused` line
+with `surface`, `consumer`, `class` and `routes` (including each removed route's
+account counts, caps and resets), and writes the usual failed-decision audit
+row. With enforcement off, picks are unchanged and a request that would have
+received that refusal emits one `routing select concurrency would refuse` line
+instead. Requests from interactive consumers emit neither refusal line. Selection previews use the
+same filter as live selection without auditing or logging a refusal. Operators
+can inspect the counts with [`route.what_if`](../route-what-if.md).
 
 ## Open items
 - The historical fixed free-bucket and missing window-slack findings are addressed for live quota-priced subscriptions by the economics above. Legacy pure-core snapshots without account economics retain their old free-bucket behavior. (`crates/striatum-core/src/model_router.rs`, `route_order_keys`)

@@ -498,6 +498,7 @@ pub struct BelowFloorWarning {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteFailureReason {
+    ConcurrencyFull,
     NoAvailableModel,
     MissingRequiredCapability,
     ContextTooSmall,
@@ -512,6 +513,7 @@ pub enum RouteFailureReason {
 impl RouteFailureReason {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::ConcurrencyFull => "concurrency_full",
             RouteFailureReason::NoAvailableModel => "no_available_model",
             RouteFailureReason::MissingRequiredCapability => "missing_required_capability",
             RouteFailureReason::ContextTooSmall => "context_too_small",
@@ -2390,6 +2392,29 @@ pub fn evaluate_model_route_with_profiles(
     profiles: &RouteTaskProfiles,
     evaluation: Option<&mut RouteEvaluation>,
 ) -> Result<SelectedModelRoute, NoRouteError> {
+    evaluate_model_route_with_concurrency(
+        input,
+        config,
+        slots,
+        operator_group,
+        availability_rejections,
+        profiles,
+        evaluation,
+        None,
+    )
+}
+
+/// Ledger exclusions run after quality admission and before caller slot hints.
+pub fn evaluate_model_route_with_concurrency(
+    input: SelectModelRouteInput<'_>,
+    config: &RoutingConfig,
+    slots: Option<&ConcurrencySlots>,
+    operator_group: &[String],
+    availability_rejections: &HashMap<String, String>,
+    profiles: &RouteTaskProfiles,
+    evaluation: Option<&mut RouteEvaluation>,
+    concurrency: Option<&crate::concurrency_availability::ConcurrencyAvailability>,
+) -> Result<SelectedModelRoute, NoRouteError> {
     let PricedAdmission {
         admissible,
         mut rejected,
@@ -2479,10 +2504,34 @@ pub fn evaluate_model_route_with_profiles(
         }
     }
     let mut taken: Vec<Option<Scored>> = scored.into_iter().map(Some).collect();
-    let scored: Vec<Scored> = chosen
+    let mut scored: Vec<Scored> = chosen
         .into_iter()
         .map(|position| taken[position].take().expect("each position is used once"))
         .collect();
+
+    if let Some(concurrency) = concurrency {
+        let removed: Vec<String> = scored
+            .iter()
+            .filter_map(|s| {
+                let key = &admissible[s.idx].route.route_key;
+                concurrency.accounts(key).is_some().then(|| key.clone())
+            })
+            .collect();
+        let mut refusal = concurrency.refusal(&removed);
+        scored.retain(|s| {
+            concurrency
+                .accounts(&admissible[s.idx].route.route_key)
+                .is_none()
+        });
+        if scored.is_empty() {
+            refusal.candidates = candidate_quality_scores(&input.facts, &admissible);
+            refusal.requirements = Some(input.requirements);
+            rejected.extend(refusal.rejected);
+            refusal.rejected = rejected;
+            return Err(refusal);
+        }
+        rejected.extend(refusal.rejected);
+    }
 
     // Saturation only chooses among the ordered shortlist, so it can pass over a
     // full route but never admit one the quality gate left out.

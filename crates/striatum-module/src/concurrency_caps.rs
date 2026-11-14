@@ -2,6 +2,7 @@
 //! are published, rather than resolving override precedence on every admission.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,14 @@ struct AccountCaps {
 struct ProviderCaps {
     default: AccountCaps,
     accounts: HashMap<String, AccountCaps>,
+    presence: CapPresence,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CapPresence {
+    any: bool,
+    default: bool,
+    models: HashMap<String, bool>,
 }
 
 /// Defaults cover models not yet in the catalog and accounts absent from the
@@ -123,9 +132,32 @@ struct ProviderCaps {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ResolvedCaps {
     providers: HashMap<String, ProviderCaps>,
+    any_caps: bool,
 }
 
 impl ResolvedCaps {
+    pub(crate) fn any_caps(&self) -> bool {
+        self.any_caps
+    }
+
+    pub(crate) fn provider_can_cap(&self, provider: &str) -> bool {
+        self.providers
+            .get(provider)
+            .is_some_and(|caps| caps.presence.any)
+    }
+
+    /// Presence is only a cheap prefilter. Admission still reads the account's
+    /// effective cap, including its more-specific unlimited overrides.
+    pub(crate) fn model_can_cap(&self, provider: &str, normalized_model: &str) -> bool {
+        self.providers.get(provider).is_some_and(|caps| {
+            caps.presence
+                .models
+                .get(normalized_model)
+                .copied()
+                .unwrap_or(caps.presence.default)
+        })
+    }
+
     pub(crate) fn accounts(&self) -> impl Iterator<Item = (&str, &str)> {
         self.providers.iter().flat_map(|(provider, caps)| {
             caps.accounts
@@ -191,9 +223,42 @@ pub(crate) struct CapInputs {
     settings: CapSettings,
     accounts: BTreeMap<(String, String), Option<String>>,
     warned: std::collections::BTreeSet<String>,
+    selection_cache: Arc<SelectionCapCache>,
+}
+
+#[derive(Default)]
+struct SelectionCapCache {
+    entry: Mutex<Option<(CapSettings, Arc<ResolvedCaps>)>>,
+}
+
+impl std::fmt::Debug for SelectionCapCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Warming a memo does not publish new credential state. Keep snapshot
+        // diagnostics independent of which read happened to populate it first.
+        formatter.write_str("SelectionCapCache")
+    }
 }
 
 impl CapInputs {
+    /// Cloned `BrocaCredentials` snapshots share this cache until a publication
+    /// changes their cap inputs. Config reloads may precede the credential poll;
+    /// resolve that settings value once without copying the catalog or roster.
+    pub(crate) fn resolved_for_settings(&self, settings: &CapSettings) -> Arc<ResolvedCaps> {
+        let mut cache = self.selection_cache.entry.lock().unwrap();
+        if let Some((previous, caps)) = &*cache {
+            if previous == settings {
+                return caps.clone();
+            }
+        }
+        let caps = Arc::new(if settings == &self.settings {
+            self.resolved.clone()
+        } else {
+            self.resolve(settings)
+        });
+        *cache = Some((settings.clone(), caps.clone()));
+        caps
+    }
+
     pub(crate) fn publish_catalog(&mut self, prices: &serde_json::Value, now: i64) {
         self.catalog = crate::fusiform_catalog::PlanConcurrencyCatalog::load(prices, now);
         for message in &self.catalog.warnings {
@@ -234,17 +299,18 @@ impl CapInputs {
 
     fn account_caps(
         &self,
+        settings: &CapSettings,
         provider: &str,
         tier: Option<&str>,
         account: Option<&str>,
     ) -> AccountCaps {
         let catalog = tier.and_then(|tier| self.catalog.cap(provider, tier));
         let scope = catalog.map_or(CapScope::Account, |cap| cap.scope);
-        let account_override = account
-            .and_then(|account| self.settings.accounts.get(&format!("{provider}/{account}")));
+        let account_override =
+            account.and_then(|account| settings.accounts.get(&format!("{provider}/{account}")));
         let general = tier
-            .and_then(|tier| self.settings.plans.get(&format!("{provider}/{tier}")))
-            .or_else(|| self.settings.providers.get(provider));
+            .and_then(|tier| settings.plans.get(&format!("{provider}/{tier}")))
+            .or_else(|| settings.providers.get(provider));
         let effective = |setting: &CapOverride| EffectiveCap {
             limit: setting.limit.value(),
             scope: setting.scope.unwrap_or(scope),
@@ -258,7 +324,7 @@ impl CapInputs {
             models: HashMap::new(),
         };
         if account_override.is_none() {
-            for (key, value) in &self.settings.models {
+            for (key, value) in &settings.models {
                 if let Some((p, model)) = key.split_once('/') {
                     if p == provider {
                         out.models.insert(
@@ -276,16 +342,16 @@ impl CapInputs {
     }
 
     fn rebuild(&mut self) {
+        self.resolved = self.resolve(&self.settings);
+        self.selection_cache = Arc::default();
+    }
+
+    fn resolve(&self, settings: &CapSettings) -> ResolvedCaps {
         let mut resolved = ResolvedCaps::default();
         let mut providers: std::collections::BTreeSet<_> =
-            self.settings.providers.keys().map(String::as_str).collect();
+            settings.providers.keys().map(String::as_str).collect();
         providers.extend(self.accounts.keys().map(|(p, _)| p.as_str()));
-        for key in self
-            .settings
-            .models
-            .keys()
-            .chain(self.settings.accounts.keys())
-        {
+        for key in settings.models.keys().chain(settings.accounts.keys()) {
             if let Some((provider, _)) = key.split_once('/') {
                 providers.insert(provider);
             }
@@ -294,8 +360,9 @@ impl CapInputs {
             resolved.providers.insert(
                 provider.to_owned(),
                 ProviderCaps {
-                    default: self.account_caps(provider, None, None),
+                    default: self.account_caps(settings, provider, None, None),
                     accounts: HashMap::new(),
+                    presence: CapPresence::default(),
                 },
             );
         }
@@ -307,18 +374,47 @@ impl CapInputs {
                 .accounts
                 .insert(
                     account.clone(),
-                    self.account_caps(provider, tier.as_deref(), Some(account)),
+                    self.account_caps(settings, provider, tier.as_deref(), Some(account)),
                 );
         }
-        for key in self.settings.accounts.keys() {
+        for key in settings.accounts.keys() {
             if let Some((provider, account)) = key.split_once('/') {
                 let row = resolved.providers.get_mut(provider).unwrap();
                 row.accounts
                     .entry(account.to_owned())
-                    .or_insert_with(|| self.account_caps(provider, None, Some(account)));
+                    .or_insert_with(|| self.account_caps(settings, provider, None, Some(account)));
             }
         }
-        self.resolved = resolved;
+        for provider in resolved.providers.values_mut() {
+            let accounts: Vec<_> = std::iter::once(&provider.default)
+                .chain(provider.accounts.values())
+                .collect();
+            let default = accounts.iter().any(|caps| caps.default.limit.is_some());
+            let models: std::collections::BTreeSet<_> = accounts
+                .iter()
+                .flat_map(|caps| caps.models.keys())
+                .collect();
+            let models: HashMap<_, _> = models
+                .into_iter()
+                .map(|model| {
+                    let capped = accounts.iter().any(|caps| {
+                        caps.models
+                            .get(model)
+                            .unwrap_or(&caps.default)
+                            .limit
+                            .is_some()
+                    });
+                    (model.clone(), capped)
+                })
+                .collect();
+            provider.presence = CapPresence {
+                any: default || models.values().any(|capped| *capped),
+                default,
+                models,
+            };
+        }
+        resolved.any_caps = resolved.providers.values().any(|caps| caps.presence.any);
+        resolved
     }
 }
 

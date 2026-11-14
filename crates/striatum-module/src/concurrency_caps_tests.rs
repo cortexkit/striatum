@@ -6,6 +6,63 @@ use serde_json::{json, Value};
 const T: i64 = 1_790_683_200_000;
 
 #[test]
+fn selection_cap_presence_is_conservative_without_supplying_limits() {
+    let input = inputs(
+        "account",
+        json!({
+            "models":{"special/m1":{"limit":2},"special/m2":{"limit":"none"},"google/m1":{"limit":"none"}},
+            "accounts":{"account-only/a":{"limit":1},"google/a":{"limit":6}}
+        }),
+    );
+    let caps = &input.resolved;
+    assert!(caps.any_caps());
+    assert!(!caps.provider_can_cap("uncapped"));
+    assert!(caps.provider_can_cap("account-only"));
+    assert!(caps.model_can_cap("account-only", "unknown-model"));
+    assert_eq!(
+        caps.cap("account-only", "not-a", "unknown-model").limit,
+        None
+    );
+    assert!(caps.model_can_cap("special", "m1"));
+    assert!(!caps.model_can_cap("special", "m2"));
+    assert!(!caps.model_can_cap("special", "other"));
+    assert!(caps.model_can_cap("google", "m1"));
+    assert_eq!(caps.cap("google", "a", "m1").limit, Some(6));
+    assert!(!CapInputs::default().resolved.any_caps());
+}
+
+#[test]
+fn selection_cap_cache_shares_snapshots_and_invalidates_publications_and_reload() {
+    let mut input = inputs("account", json!({}));
+    let settings = CapSettings::default();
+    let first = input.resolved_for_settings(&settings);
+    assert!(Arc::ptr_eq(&first, &input.resolved_for_settings(&settings)));
+    assert!(Arc::ptr_eq(
+        &first,
+        &input.clone().resolved_for_settings(&settings)
+    ));
+    let changed: CapSettings =
+        serde_json::from_value(json!({"models":{"google/m1":{"limit":4}}})).unwrap();
+    let reload = input.resolved_for_settings(&changed);
+    assert!(!Arc::ptr_eq(&first, &reload));
+    assert_eq!(reload.cap("google", "a", "m1").limit, Some(4));
+    assert!(Arc::ptr_eq(&reload, &input.resolved_for_settings(&changed)));
+    input.publish_catalog(&prices("account", json!(5)), T);
+    let catalog = input.resolved_for_settings(&changed);
+    assert!(!Arc::ptr_eq(&reload, &catalog));
+    assert_eq!(catalog.cap("google", "a", "m2").limit, Some(5));
+    input.publish_roster(&roster(None));
+    let roster = input.resolved_for_settings(&changed);
+    assert!(!Arc::ptr_eq(&catalog, &roster));
+    assert_eq!(roster.cap("google", "a", "m2").limit, None);
+    input.publish_settings(&changed);
+    assert!(!Arc::ptr_eq(
+        &roster,
+        &input.resolved_for_settings(&changed)
+    ));
+}
+
+#[test]
 fn concurrency_enforcement_switch_defaults_off_and_preserves_resolved_caps() {
     let defaults = serde_json::to_value(CapSettings::default()).unwrap();
     assert_eq!(defaults["enforcement_enabled"], json!(false));

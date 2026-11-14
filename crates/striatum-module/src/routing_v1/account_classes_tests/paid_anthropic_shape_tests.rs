@@ -4,6 +4,43 @@ const MODEL: &str = "claude-haiku-5-5";
 const POOL: &str = "anthropic-platform";
 const KEYS: [&str; 2] = ["apikey:anthropic:dave", "apikey:anthropic:erin"];
 
+#[tokio::test]
+async fn select_ledger_paid_pool_uses_the_admissions_pool_provider_count() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let harness = paid_anthropic_harness();
+    harness.edit_config(|config| {
+        config["concurrency"] = json!({"enforcement_enabled":true,"models":{
+            format!("{POOL}/{MODEL}"):{"limit":1}
+        }});
+    });
+    let owner = harness.bind(reserved(OWNER), None).await;
+    let broca = harness.bind(reserved("broca"), None).await;
+    let body =
+        json!({"consumer":"codemode","pin":format!("{POOL}/{MODEL}"),"requirements":{"iq":0}});
+    for id in ["first", "second"] {
+        let selected = owner.call("route.select", &body).await;
+        assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+        let mut request = credential_only_request(id);
+        offer_key_account_ids(&mut request);
+        request["decision_id"] = selected.1["result"]["decision_id"].clone();
+        let admitted = broca.call("route.account_for", &request).await;
+        assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
+    }
+    let full = owner.call("route.select", &body).await;
+    assert_eq!(full.0, FrameType::Error, "{}", full.1);
+    assert_eq!(full.1["code"], "no_route");
+    assert_eq!(full.1["detail"]["reason"], "concurrency_full");
+    assert_eq!(full.1["detail"]["reset_at_ms"], NOW + 30_000);
+    // The catalog provider's model cap must not cover a pool admission.
+    harness.edit_config(|config| {
+        config["concurrency"]["models"] = json!({format!("anthropic/{MODEL}"):{"limit":1}});
+    });
+    assert_eq!(
+        owner.call("route.select", &body).await.0,
+        FrameType::Response
+    );
+}
+
 fn paid_anthropic_harness() -> Arc<Harness> {
     let harness = Harness::new("paid-anthropic-shape");
     let mut fact = account_fact("anthropic");

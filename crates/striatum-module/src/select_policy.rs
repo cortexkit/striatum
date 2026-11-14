@@ -29,6 +29,7 @@ pub(crate) struct SelectionPass<'a> {
     pub rejections: &'a HashMap<String, String>,
     pub config: &'a RoutingConfig,
     pub slots: Option<&'a ConcurrencySlots>,
+    pub concurrency: Option<&'a striatum_core::concurrency_availability::ConcurrencyAvailability>,
     pub min_band: Option<f64>,
     pub prefer_prompt_cache: bool,
     pub providers_without_prompt_cache: &'a [String],
@@ -130,13 +131,27 @@ impl<'a> SelectionPass<'a> {
             .collect();
         let mut input = self.input_with_policy(&allowed, self.snapshot.clone(), pinned);
         apply_explicit_variant(&mut input, variant);
-        let result = select_candidates(
-            input,
-            &self.routing_config(),
-            self.slots,
-            self.consumer_exclude,
-            self.rejections,
-        );
+        let result = if self.concurrency.is_none() {
+            select_candidates(
+                input,
+                &self.routing_config(),
+                self.slots,
+                self.consumer_exclude,
+                self.rejections,
+            )
+        } else {
+            striatum_core::model_router::evaluate_model_route_with_concurrency(
+                input,
+                &self.routing_config(),
+                self.slots,
+                self.consumer_exclude,
+                self.rejections,
+                &Default::default(),
+                None,
+                self.concurrency,
+            )
+            .map_err(describe_filter_refusal)
+        };
         explain_dotted_exclusions(result, self.operator_config, self.consumer)
     }
 
@@ -252,10 +267,14 @@ pub(crate) fn select_in_order(
     }
     let mut rejected = Vec::new();
     let mut last = None;
+    let mut concurrency_error = None;
+    let mut concurrency_reset: Option<(f64, Option<String>)> = None;
     let mut earliest_reset: Option<(f64, Option<String>)> = None;
     for pin in policy.ladder.iter().flatten() {
         let (key, variant) = if policy.operator_ladder() {
-            let Some(route) = cortexkit_role_routing::select::RouteRef::parse_pin(pin) else { continue };
+            let Some(route) = cortexkit_role_routing::select::RouteRef::parse_pin(pin) else {
+                continue;
+            };
             (format!("{}/{}", route.provider, route.model), route.variant)
         } else {
             (pin.clone(), None)
@@ -268,18 +287,29 @@ pub(crate) fn select_in_order(
         match attempt(&only, variant.as_deref(), Some(&key)) {
             Ok(mut selected) => {
                 selected.rejected.retain(|entry| {
-                    !rejected.iter().any(
-                        |prior: &striatum_core::model_router::RejectedRoute| {
+                    !rejected
+                        .iter()
+                        .any(|prior: &striatum_core::model_router::RejectedRoute| {
                             prior.route_key == entry.route_key
-                        },
-                    )
+                        })
                 });
                 selected.rejected.extend(rejected);
                 return Ok(selected);
             }
             Err(error) => {
+                if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull {
+                    if let Some(reset) = error.earliest_reset {
+                        if concurrency_reset.as_ref().is_none_or(|(previous, _)| reset < *previous) {
+                            concurrency_reset = Some((reset, error.earliest_reset_route.clone()));
+                        }
+                    }
+                    concurrency_error = Some(error.clone());
+                }
                 if let Some(reset) = error.earliest_reset {
-                    if earliest_reset.as_ref().is_none_or(|(previous, _)| reset < *previous) {
+                    if earliest_reset
+                        .as_ref()
+                        .is_none_or(|(previous, _)| reset < *previous)
+                    {
                         earliest_reset = Some((reset, error.earliest_reset_route.clone()));
                     }
                 }
@@ -297,8 +327,13 @@ pub(crate) fn select_in_order(
             }
         }
     }
-    let mut error = last.unwrap_or_else(|| attempt(&std::collections::HashSet::new(), None, None).unwrap_err());
+    let mut error = concurrency_error
+        .or(last)
+        .unwrap_or_else(|| attempt(&std::collections::HashSet::new(), None, None).unwrap_err());
     error.rejected = rejected;
+    if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull {
+        earliest_reset = concurrency_reset;
+    }
     if let Some((reset, route)) = earliest_reset {
         error.earliest_reset = Some(reset);
         error.earliest_reset_route = route;

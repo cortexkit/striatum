@@ -1,6 +1,6 @@
-# Media `route.select` samples v1.2
+# Media `route.select` samples v1.3
 
-This expansion is prepared for the Git release tag `route-select-media-v1.2`; all 21 previous pairs
+This expansion is prepared for the Git release tag `route-select-media-v1.3`; all 23 previous pairs
 are byte-identical. Production advertises `select_kind`
 and `select_media`, using routing contract 0.7.28 and conformance-test crate
 0.10.32. The regeneration test calls the real module frame dispatcher with
@@ -10,6 +10,27 @@ Each JSON file contains the request body and the reply body exactly as captured,
 without reserializing either body. The fixed clock is `1750000000000` ms; replay
 inputs fix decision IDs. `SHA256SUMS` covers every JSON file, sorted by filename.
 These are synthetic fixtures, not captures of private user requests or live keys.
+
+## Realtime dictation token pairs
+
+Both new pairs come from a Callosum-attested caller through the real `route.select`
+handler. Their identical request is
+`{"consumer":"colliculus.dictation_token","kind":"realtime","requirements":{},"privacy":"remote_allowed"}`.
+
+The isolated fixture loads Colliculus's real declaration bytes from
+`crates/striatum-module/fixtures/colliculus-media-v1/`, generated at Colliculus commit
+`04a55268b791547f9c1def9875f644e7fd6369ef` by
+`service::sets::tests::write_declaration_goldens`. The committed inputs retain all
+nine engines and five consumers, including the `callosum` selector for
+`colliculus.dictation_token`. Their source checksums were verified before import;
+the fixture directory records provenance and checksums independently of the pair
+manifest. An active synthetic OpenAI media credential reaches the live engine;
+its catalog row uses the pinned Fusiform duration rate and a synthetic grade 80.
+
+| File | Selection context and expected reply |
+| --- | --- |
+| `dictation-token-realtime.json` | The unmodified declarations select `colliculus/openai/gpt-live-transcribe` with kind `realtime`. |
+| `dictation-token-no-engine.json` | Only the `realtime` engine is removed in this isolated fixture; the `stream_transcribe` declaration for the same model remains. With the request unchanged, the handler refuses with `no_route`, message `no route meets the request: no_available_model`, and exact detail `{"reason":"no_available_model"}`. |
 
 ## Fixture and cases
 
@@ -101,7 +122,7 @@ cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routin
 (cd test-vectors/route-select-media-v1 && shasum -a 256 -c SHA256SUMS)
 ```
 
-The ordinary test regenerates all 23 pairs in memory and compares every byte,
+The ordinary test regenerates all 25 pairs in memory and compares every byte,
 the checksum manifest and exact directory membership. The reachability pair is
 additionally regenerated under all 14 causes listed above. Only the explicit
 update command writes samples. Existing engine vectors and replay goldens are

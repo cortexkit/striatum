@@ -1621,7 +1621,37 @@ async fn select_at_tier_attempt(
         })
         .cloned()
         .collect();
+    let ledger_pin = request
+        .pin
+        .clone()
+        .or_else(|| {
+            request
+                .pin_slot
+                .as_deref()
+                .and_then(|slot| operator_config.select_slot_pin(slot))
+        })
+        .filter(|_| request.pin_fallback != Some(PinFallback::Route))
+        .map(|pin| crate::select_concurrency::pin_capacity(&pin, &facts));
+    let concurrency = crate::select_concurrency::capture(
+        deps.store,
+        priced.classes.as_ref(),
+        &facts,
+        priced_per_token,
+        now as i64,
+        |fact| {
+            crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref())
+                && request.eligible_routes.as_ref().is_none_or(|routes| {
+                    routes.iter().any(|route| {
+                        route.provider == fact.provider_id && route.model == fact.model_id
+                    })
+                })
+        },
+    )
+    .map_err(store_refusal)?;
+    let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
     let selection = Selection {
+        concurrency: &concurrency,
+        use_concurrency: &use_concurrency,
         eligible_routes: request.eligible_routes.as_deref(),
         classifier_order,
         prefer_prompt_cache: request.prefer_prompt_cache.unwrap_or(false),
@@ -1703,145 +1733,222 @@ async fn select_at_tier_attempt(
     // before the order runs, and the order runs as for an unpinned request.
     // The continuing model falls through once it is no longer allowed. Legacy
     // targetAgent bodies never reach this surface.
-    let mut request_pin = request.pin.clone().or_else(|| {
-        request
-            .pin_slot
-            .as_deref()
-            .and_then(|slot| operator_config.select_slot_pin(slot))
-    });
-    let mut pin_reason = None;
-    if request.pin_slot.is_some() && request_pin.is_none() {
-        if request.pin_fallback == Some(PinFallback::Route) {
-            pin_reason = Some("unknown_slot".into());
-        } else {
-            return Err(Refusal::pin_unavailable(
-                request.pin_slot.as_deref().unwrap(),
-                PinUnavailableReason::parse("unknown_slot"),
-                None,
-            ));
-        }
-    }
-    if request.pin_fallback == Some(PinFallback::Route) {
-        if let Some(Err(refusal)) = request_pin
-            .as_deref()
-            .map(|pin| selection.pin(pin, &available))
-        {
-            pin_reason = Some(refused_pin_reason(&refusal));
-            request_pin = None;
-        }
-    }
-    let mut ladder_variant = None;
-    let ladder_choice = if request_pin.is_none()
-        && !classifier
-        && project_pin.is_none()
-        && continuing.is_none()
-        && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
-    {
-        let mut result = None;
-        let mut fallback_hold = None;
-        for entry in consumer_policy.ladder.iter().flatten() {
-            let Some(route) = RouteRef::parse_pin(entry) else {
-                continue;
-            };
-            let route_key = if consumer_policy.operator_ladder() {
-                format!("{}/{}", route.provider, route.model)
+    let choose = || {
+        let mut request_pin = request.pin.clone().or_else(|| {
+            request
+                .pin_slot
+                .as_deref()
+                .and_then(|slot| operator_config.select_slot_pin(slot))
+        });
+        let mut pin_reason = None;
+        if request.pin_slot.is_some() && request_pin.is_none() {
+            if request.pin_fallback == Some(PinFallback::Route) {
+                pin_reason = Some("unknown_slot".into());
             } else {
-                route.route_key()
-            };
-            let subset = available
-                .iter()
-                .filter(|key| {
-                    *key == &route_key || key.starts_with(&format!("{route_key}/"))
-                })
-                .cloned()
-                .collect();
-            let variant = consumer_policy.operator_ladder().then_some(route.variant).flatten();
-            if let Ok(selected) = selection.score_ladder(&subset, &consumer_policy, variant.as_deref(), Some(&route_key)) {
-                selection.check_ladder_variant(&selected, variant.as_deref())?;
-                match selection.account_check(&selected) {
-                    Ok(()) => {
-                        ladder_variant = variant;
-                        result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
-                        break;
-                    }
-                    Err(refusal) if refusal.code.as_str() == "account_hold" => {
-                        if selection.hold_ok {
+                return Err(Refusal::pin_unavailable(
+                    request.pin_slot.as_deref().unwrap(),
+                    PinUnavailableReason::parse("unknown_slot"),
+                    None,
+                ));
+            }
+        }
+        if request.pin_fallback == Some(PinFallback::Route) {
+            if let Some(Err(refusal)) = request_pin
+                .as_deref()
+                .map(|pin| selection.pin(pin, &available))
+            {
+                // Explicit fallback authorizes another route, including when
+                // the pin's eligible accounts have no concurrency capacity.
+                pin_reason = Some(refused_pin_reason(&refusal));
+                request_pin = None;
+            }
+        }
+        let mut ladder_variant = None;
+        let ladder_choice = if request_pin.is_none()
+            && !classifier
+            && project_pin.is_none()
+            && continuing.is_none()
+            && consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder)
+        {
+            let mut result = None;
+            let mut fallback_hold = None;
+            let mut ledger_rejected = Vec::new();
+            for entry in consumer_policy.ladder.iter().flatten() {
+                let Some(route) = RouteRef::parse_pin(entry) else {
+                    continue;
+                };
+                let route_key = if consumer_policy.operator_ladder() {
+                    format!("{}/{}", route.provider, route.model)
+                } else {
+                    route.route_key()
+                };
+                let subset = available
+                    .iter()
+                    .filter(|key| *key == &route_key || key.starts_with(&format!("{route_key}/")))
+                    .cloned()
+                    .collect();
+                let variant = consumer_policy
+                    .operator_ladder()
+                    .then_some(route.variant)
+                    .flatten();
+                let scored = selection.score_ladder(
+                    &subset,
+                    &consumer_policy,
+                    variant.as_deref(),
+                    Some(&route_key),
+                );
+                if let Err(error) = &scored {
+                    ledger_rejected.extend(
+                        error
+                            .rejected
+                            .iter()
+                            .filter(|r| r.reason == "concurrency_full")
+                            .cloned(),
+                    );
+                }
+                if let Ok(mut selected) = scored {
+                    selected.rejected.extend(ledger_rejected.clone());
+                    selection.check_ladder_variant(&selected, variant.as_deref())?;
+                    match selection.account_check(&selected) {
+                        Ok(()) => {
                             ladder_variant = variant;
                             result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
                             break;
                         }
-                        if fallback_hold.as_ref().is_none_or(
-                            |(_, previous, _): &(SelectedModelRoute, Refusal, Option<String>)| {
-                                previous.detail.get("reset_at_ms").and_then(Value::as_i64)
-                                    > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
-                            },
-                        ) {
-                            fallback_hold = Some((selected, refusal, variant));
+                        Err(refusal) if refusal.code.as_str() == "account_hold" => {
+                            if selection.hold_ok {
+                                ladder_variant = variant;
+                                result = Some(Ok((selected, select_policy::OrderBasis::Mode)));
+                                break;
+                            }
+                            if fallback_hold.as_ref().is_none_or(
+                                |(_, previous, _): &(
+                                    SelectedModelRoute,
+                                    Refusal,
+                                    Option<String>,
+                                )| {
+                                    previous.detail.get("reset_at_ms").and_then(Value::as_i64)
+                                        > refusal.detail.get("reset_at_ms").and_then(Value::as_i64)
+                                },
+                            ) {
+                                fallback_hold = Some((selected, refusal, variant));
+                            }
                         }
+                        Err(_) => {}
                     }
-                    Err(_) => {}
                 }
             }
-        }
-        result.or_else(|| {
-            fallback_hold.map(|(selected, _, variant)| {
-                ladder_variant = variant;
-                Ok((selected, select_policy::OrderBasis::Mode))
-            })
-        })
-    } else {
-        None
-    };
-    let mut ordered = ladder_choice.unwrap_or_else(|| {
-        select_policy::select_ordered(
-            &usable,
-            request_pin.as_deref(),
-            project_pin.as_deref(),
-            continuing.as_deref(),
-            |pin| selection.pin(pin, &available),
-            |only| selection.score(only),
-            || {
-                if classifier {
-                    return selection.score(&usable);
-                }
-                select_policy::select_in_order(&usable, &consumer_policy, |only, variant, key| {
-                    let result = selection.score_ladder(only, &consumer_policy, variant, key);
-                    if result.is_ok() {
-                        ladder_variant = variant.map(str::to_owned);
-                    }
-                    result
+            result.or_else(|| {
+                fallback_hold.map(|(selected, _, variant)| {
+                    ladder_variant = variant;
+                    Ok((selected, select_policy::OrderBasis::Mode))
                 })
-            },
-        )
-    });
-    // The contract reserves pin_outcome for a pin carried by the request,
-    // not a settings pin promoted internally for admission.
-    let pin_outcome = (!inputs.consumer_pinned)
-        .then(|| request.pin.as_ref().or(request.pin_slot.as_ref()))
-        .flatten()
-        .map(|_| {
-            if pin_reason.is_some() {
-                PinOutcome::FellBack
-            } else {
-                PinOutcome::Pinned
-            }
+            })
+        } else {
+            None
+        };
+        let mut ordered = ladder_choice.unwrap_or_else(|| {
+            select_policy::select_ordered(
+                &usable,
+                request_pin.as_deref(),
+                project_pin.as_deref(),
+                continuing.as_deref(),
+                |pin| selection.pin(pin, &available),
+                |only| selection.score(only),
+                || {
+                    if classifier {
+                        return selection.score(&usable);
+                    }
+                    select_policy::select_in_order(
+                        &usable,
+                        &consumer_policy,
+                        |only, variant, key| {
+                            let result =
+                                selection.score_ladder(only, &consumer_policy, variant, key);
+                            if result.is_ok() {
+                                ladder_variant = variant.map(str::to_owned);
+                            }
+                            result
+                        },
+                    )
+                },
+            )
         });
-    // `prefer` ranks within the automatic order only: a pin, the continuing
-    // model and an operator ladder each decide before it. A listed route is
-    // answered only when it alone would be an adequate answer to this same
-    // request, so the preference never admits a route the request would not
-    // otherwise get.
-    let mut preferred = false;
-    let laddered =
-        classifier || consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder);
-    if let (Ok((normal, select_policy::OrderBasis::Mode)), Some(prefer), false) =
-        (&ordered, &request.prefer, laddered)
-    {
-        if let Some(listed) = selection.preferred(&usable, prefer, normal) {
-            ordered = Ok((listed, select_policy::OrderBasis::Mode));
-            preferred = true;
+        // The contract reserves pin_outcome for a pin carried by the request,
+        // not a settings pin promoted internally for admission.
+        let pin_outcome = (!inputs.consumer_pinned)
+            .then(|| request.pin.as_ref().or(request.pin_slot.as_ref()))
+            .flatten()
+            .map(|_| {
+                if pin_reason.is_some() {
+                    PinOutcome::FellBack
+                } else {
+                    PinOutcome::Pinned
+                }
+            });
+        // `prefer` ranks within the automatic order only: a pin, the continuing
+        // model and an operator ladder each decide before it. A listed route is
+        // answered only when it alone would be an adequate answer to this same
+        // request, so the preference never admits a route the request would not
+        // otherwise get.
+        let mut preferred = false;
+        let laddered =
+            classifier || consumer_policy.mode == Some(crate::config_policy::ConsumerMode::Ladder);
+        if let (Ok((normal, select_policy::OrderBasis::Mode)), Some(prefer), false) =
+            (&ordered, &request.prefer, laddered)
+        {
+            if let Some(listed) = selection.preferred(&usable, prefer, normal) {
+                ordered = Ok((listed, select_policy::OrderBasis::Mode));
+                preferred = true;
+            }
         }
+        Ok((
+            ordered,
+            request_pin,
+            pin_reason,
+            pin_outcome,
+            ladder_variant,
+            preferred,
+        ))
+    };
+    let mut choice = choose()?;
+    let concurrency_failure = match &choice.0 {
+        Err(select_policy::OrderFailure::Score(error)) => {
+            error.reason == RouteFailureReason::ConcurrencyFull
+        }
+        Err(select_policy::OrderFailure::Pin(error)) => {
+            error.detail.get("reason").and_then(Value::as_str) == Some("concurrency_full")
+        }
+        _ => false,
+    };
+    if (concurrency_failure && crate::select_concurrency::head(&operator_config, &consumer))
+        || (!live_config.concurrency_caps().enforcement_enabled && use_concurrency.get())
+    {
+        if concurrency_failure
+            && evaluation.is_none()
+            && !crate::select_concurrency::head(&operator_config, &consumer)
+        {
+            if let Err(select_policy::OrderFailure::Score(error)) = &choice.0 {
+                crate::select_concurrency::record("routing/v1", &consumer, &operator_config, error);
+            } else {
+                let routes = match &choice.0 {
+                    Err(select_policy::OrderFailure::Pin(refusal)) => {
+                        concurrency_rejected_routes(refusal)
+                    }
+                    _ => Vec::new(),
+                };
+                crate::select_concurrency::record(
+                    "routing/v1",
+                    &consumer,
+                    &operator_config,
+                    &concurrency.refusal(&routes),
+                );
+            }
+        }
+        use_concurrency.set(false);
+        choice = choose()?;
     }
+    let (ordered, request_pin, pin_reason, pin_outcome, ladder_variant, preferred) = choice;
     let (mut selected, basis, explicit_variant) = match ordered {
         Ok((selected, order)) => {
             let explicit = match order {
@@ -1857,7 +1964,9 @@ async fn select_at_tier_attempt(
                 select_policy::OrderBasis::Continuing => None,
             };
             let basis = match order {
-                select_policy::OrderBasis::RequestPin if inputs.consumer_pinned => Basis::ConsumerPin,
+                select_policy::OrderBasis::RequestPin if inputs.consumer_pinned => {
+                    Basis::ConsumerPin
+                }
                 select_policy::OrderBasis::RequestPin => Basis::RequestPin,
                 select_policy::OrderBasis::ProjectPin => Basis::ProjectPin,
                 select_policy::OrderBasis::Continuing => Basis::Affinity,
@@ -1866,7 +1975,26 @@ async fn select_at_tier_attempt(
             };
             (selected, basis, explicit)
         }
-        Err(select_policy::OrderFailure::Pin(refusal)) => return Err(refusal),
+        Err(select_policy::OrderFailure::Pin(refusal)) => {
+            if refusal.detail.get("reason").and_then(Value::as_str) == Some("concurrency_full")
+                && evaluation.is_none()
+            {
+                let routes = concurrency_rejected_routes(&refusal);
+                let error = concurrency.refusal(&routes);
+                if (request.pin.is_none() && request.pin_slot.is_none())
+                    || request.pin_fallback == Some(PinFallback::Route)
+                {
+                    selection.record_refusal(&error, &priced.provenance);
+                }
+                crate::select_concurrency::record(
+                    "routing/v1",
+                    &consumer,
+                    &operator_config,
+                    &error,
+                );
+            }
+            return Err(refusal);
+        }
         Err(select_policy::OrderFailure::Score(no_route)) => {
             if selection.harness_exclusions_emptied_routes(&harness_excluded, &statically_available)
             {
@@ -1874,6 +2002,12 @@ async fn select_at_tier_attempt(
             }
             if evaluation.is_none() {
                 selection.record_refusal(&no_route, &priced.provenance);
+                crate::select_concurrency::record(
+                    "routing/v1",
+                    &consumer,
+                    &operator_config,
+                    &no_route,
+                );
             }
             // Account preflight is separate from model scoring. Only name an
             // account block when an otherwise adequate, policy-allowed model
@@ -2304,8 +2438,22 @@ async fn select_at_tier_attempt(
     Ok(SelectionAttempt::Selected(value))
 }
 
+fn concurrency_rejected_routes(refusal: &Refusal) -> Vec<String> {
+    refusal
+        .detail
+        .get("rejected")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|route| route["reason"] == "concurrency_full")
+        .filter_map(|route| route["routeKey"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    concurrency: &'a striatum_core::concurrency_availability::ConcurrencyAvailability,
+    use_concurrency: &'a std::cell::Cell<bool>,
     eligible_routes: Option<&'a [RouteRef]>,
     classifier_order: Option<Vec<String>>,
     prefer_prompt_cache: bool,
@@ -2393,6 +2541,7 @@ impl<'a> Selection<'a> {
 
     fn score(&self, available: &HashSet<String>) -> Result<SelectedModelRoute, NoRouteError> {
         if let Some(order) = &self.classifier_order {
+            let mut full_error: Option<NoRouteError> = None;
             // Classifier order uses input price, not chat workload profiles or
             // output price. The ordinary scorer still admits each candidate,
             // preserving exclusions, quotas and account fences.
@@ -2402,13 +2551,28 @@ impl<'a> Selection<'a> {
                     .filter(|key| *key == route || key.starts_with(&format!("{route}/")))
                     .cloned()
                     .collect();
-                if let Ok(selected) = self.score_candidates(&only) {
-                    if self.account_check(&selected).is_ok() {
+                match self.score_candidates(&only) {
+                    Ok(mut selected) if self.account_check(&selected).is_ok() => {
+                        if let Some(error) = full_error {
+                            selected.rejected.extend(error.rejected);
+                        }
                         return Ok(selected);
                     }
+                    Err(mut error) if error.reason == RouteFailureReason::ConcurrencyFull => {
+                        if let Some(previous) = full_error.take() {
+                            error.earliest_reset =
+                                match (error.earliest_reset, previous.earliest_reset) {
+                                    (Some(a), Some(b)) => Some(a.min(b)),
+                                    (a, b) => a.or(b),
+                                };
+                            error.rejected.extend(previous.rejected);
+                        }
+                        full_error = Some(error);
+                    }
+                    _ => {}
                 }
             }
-            return self.score_candidates(&HashSet::new());
+            return full_error.map_or_else(|| self.score_candidates(&HashSet::new()), Err);
         }
         self.score_candidates(available)
     }
@@ -2486,7 +2650,10 @@ impl<'a> Selection<'a> {
             .score_input_evaluated(input, self.consumer_exclude, explicit_variant, evaluation)
             .map_err(select_policy::describe_filter_refusal)
             .map_err(|mut error| {
-                if error.reason == RouteFailureReason::InvalidRequirements {
+                if matches!(
+                    error.reason,
+                    RouteFailureReason::InvalidRequirements | RouteFailureReason::ConcurrencyFull
+                ) {
                     return error;
                 }
                 let account_resets: HashMap<_, _> = self
@@ -2619,7 +2786,7 @@ impl<'a> Selection<'a> {
             })
             .collect();
         input.providers_without_cache_write_reports = lookup.providers_without_cache_write_reports;
-        striatum_core::model_router::evaluate_model_route_with_profiles(
+        striatum_core::model_router::evaluate_model_route_with_concurrency(
             input,
             &self.pass().routing_config(),
             self.slots,
@@ -2627,6 +2794,7 @@ impl<'a> Selection<'a> {
             &rejections,
             &profiles,
             evaluation,
+            self.use_concurrency.get().then_some(self.concurrency),
         )
     }
 
@@ -2650,6 +2818,7 @@ impl<'a> Selection<'a> {
             rejections: self.rejections,
             config: self.routing_config,
             slots: self.slots,
+            concurrency: self.use_concurrency.get().then_some(self.concurrency),
             operator_config: self.sources.operator_config,
         }
     }
@@ -2775,7 +2944,13 @@ impl<'a> Selection<'a> {
             .min_context = Some(0.0);
         let mut priced = self
             .score_input(input, &[], variant.as_deref())
-            .map_err(|error| refused(error.reason.as_str(), error.refusal_message()))?;
+            .map_err(|error| {
+                if error.reason == RouteFailureReason::ConcurrencyFull {
+                    no_route_refusal(&error, self.now)
+                } else {
+                    refused(error.reason.as_str(), error.refusal_message())
+                }
+            })?;
         priced.score.adequacy = selected.score.adequacy;
         priced.score.raw_adequacy = selected.score.raw_adequacy;
         priced.score.metrics = selected.score.metrics;
@@ -3120,6 +3295,7 @@ fn refused_pin_reason(refusal: &Refusal) -> String {
 /// reason: even a quality refusal can have an adequate route behind a timed block.
 fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
     let reason = match no_route.reason {
+        RouteFailureReason::ConcurrencyFull => NoRouteReason::ConcurrencyFull,
         RouteFailureReason::NoAvailableModel => NoRouteReason::NoAvailableModel,
         RouteFailureReason::MissingRequiredCapability => NoRouteReason::MissingCapability,
         RouteFailureReason::ContextTooSmall => NoRouteReason::ContextTooSmall,

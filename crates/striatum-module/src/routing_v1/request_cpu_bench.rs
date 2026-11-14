@@ -148,6 +148,69 @@ pub(crate) fn production_fixture() -> RequestFixture {
     build_fixture(800, 40)
 }
 
+#[tokio::test]
+#[ignore = "paired release select CPU/p99 measurement on the live-count fixture"]
+async fn select_concurrency_request_cpu() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = representative_fixture(FixtureCounts {
+        subscription_rules: 10,
+        exclusion_rules: 103,
+        runner_route_rules: 0,
+        catalog_facts: 836,
+        listed_credentials: 39,
+    });
+    fixture.edit_config(|config| {
+        config["concurrency"] =
+            json!({"enforcement_enabled":true,"providers":{"cpu-provider-1":{"limit":1000}}});
+        config["models"]["cpu-provider-0/model-9"]
+            .as_object_mut()
+            .unwrap()
+            .remove("subscription");
+        config["models"]["cpu-provider-1/model-0"]["subscription"] = json!(true);
+        for name in ["cpu_uncapped", "cpu_capped"] {
+            config["consumers"][name] =
+                json!({"owner":fixture::CONSUMER.trim_start_matches("reserved:")});
+        }
+    });
+    let route = fixture
+        .harness
+        .bind(reserved(fixture::CONSUMER), None)
+        .await;
+    let n = std::env::var("STRIATUM_SELECT_SAMPLES")
+        .map(|n| n.parse::<usize>().unwrap())
+        .unwrap_or(1000);
+    assert!(n >= 100);
+    for (consumer, pin) in [
+        ("cpu_uncapped", "cpu-provider-0/model-0"),
+        ("cpu_capped", "cpu-provider-1/model-0"),
+    ] {
+        let request = json!({"consumer":consumer,"requirements":{"iq":50},"pin":pin});
+        // Warm the route and settings caches before timing either consumer.
+        for _ in 0..50 {
+            call(
+                &fixture,
+                &route,
+                "route.select",
+                request.clone(),
+                &mut Samples::default(),
+            )
+            .await;
+        }
+        let mut samples = Samples::default();
+        for _ in 0..n {
+            call(
+                &fixture,
+                &route,
+                "route.select",
+                request.clone(),
+                &mut samples,
+            )
+            .await;
+        }
+        samples.print(consumer);
+    }
+}
+
 fn build_fixture(catalog_facts: usize, listed_credentials: usize) -> RequestFixture {
     let now = FIXTURE_NOW;
     let harness = Harness::new("request-cpu");
