@@ -1,6 +1,7 @@
-# Media `route.select` samples
+# Media `route.select` samples v1.1
 
-These samples have no Git release tag yet. Production advertises `select_kind`
+This expansion is prepared for the Git release tag `route-select-media-v1.1`; all six original pairs
+are byte-identical. Production advertises `select_kind`
 and `select_media`, using routing contract 0.7.28 and conformance-test crate
 0.10.32. The regeneration test calls the real module frame dispatcher with
 production's capabilities, without a test override.
@@ -34,6 +35,55 @@ inherits that catalog grade and has known-zero ranking cost, with no price.
 | `no-route.json` | The same ladder with `privacy: "local_only"` cannot use any engine. The reply is `no_route` with only the contract's reason in its detail. |
 | `voice-message-caller-local.json` | Back in demand mode, Callosum offers its phone engine for the same 30-second voice message. Its catalog grade equals the remote engine's; known-zero cost wins, and the reply has `caller_local: true`, `index: 0`, and no module or price. |
 
+## Added refusal and redemption pairs
+
+Each selection request below uses `route.select` with `kind`, not the older
+`route.select_engine` operation. Caller identity and flow metadata come from the
+bound route; they are not extra request members.
+
+| File | Cause and expected reply |
+| --- | --- |
+| `unknown-consumer.json` | Callosum names an undeclared consumer: `unknown_consumer`. |
+| `caller-not-owner.json` | `reserved:stranger` is neither the owner nor an authorized selector: `consumer_not_owned`. |
+| `caller-direct.json` | A direct caller is neither the owner nor an authorized selector: `consumer_not_owned`. |
+| `invalid-request.json` | An unsupported top-level `effect_id`: `invalid_request`, naming that field. |
+| `kind-mismatch.json` | `synthesize` conflicts with the voice consumer's declared `transcribe` kind: `invalid_request`, naming `kind`. |
+| `invalid-requirements.json` | Negative `duration_ms`: `invalid_requirements`, naming that field. |
+| `flow-scope-not-supported.json` | Even the authorized selector Callosum cannot select on a flow-stamped route: `flow_scope_not_supported`. |
+| `store-error.json` | Removing the actual `routing_engine_eval` table induces `store_error` through the real selection handler. |
+| `reachability-unavailable.json` | All otherwise suitable remote routes are unavailable: `no_route`, with only `reason: no_available_model` in `detail`. The grouped causes below produce identical complete pairs. |
+| `requirements-unmet.json` | No declared engine advertises the requested French language (`fr`): `no_route` / `no_available_model`. |
+| `no-engines.json` | The consumer remains declared but no module engines are declared: `no_route` / `no_available_model`. |
+| `missing-capability.json` | A video request requires a 1000-ms output duration, but the catalog has no `limit.output_duration_ms` fact: `no_route` / `missing_capability`, with the failed fact named in the message. |
+| `decision-admitted.json` | Colliculus, the selected provider executor, redeems the decision from `voice-message-transcribe.json` before expiry. Admission is `reserved` and keeps the same `media-vendor` / `fixture-transcribe` binding. |
+| `decision-caller-mismatch.json` | A new admission of that same decision from `reserved:stranger` fails the account caller check: `account_not_authorized`. The stranger has no runner declaration or authorized session scope; this is distinct from an authorized executor naming an unknown decision. |
+| `decision-expired.json` | Colliculus requests a new admission 600001 ms after selection, past the ten-minute decision life: `unknown_decision`. It is an account redemption refusal, not a select-time expiry code. |
+
+### Shared reachability shape
+
+The regeneration test independently seeds each of these causes, invokes the real
+handler, and asserts that the entire request/reply pair equals
+`reachability-unavailable.json`, byte for byte:
+
+- route cooldown;
+- route quota exhaustion;
+- route failure backoff;
+- credential entitlement fence (`ENTITLEMENT_ERROR`);
+- credential billing fence (`billing_exhausted`);
+- credential refusal (`credential_refused`);
+- pooled-key billing wall;
+- pooled-key rate-limit wall;
+- account route fence / provider-reset wall;
+- vault listing missing, stale, failed, or without the `media-provider` list grant;
+- a loaded listing containing only a non-media (LLM-only) credential.
+
+Both transcription routes are fenced when a cause is route-specific, so another
+declared engine cannot mask the refusal. These causes do **not** expose the older
+engine selector's `detail.filter` or a retry timestamp. The existing `no-route.json`
+also covers local-only privacy with no eligible local engine. Media selection's
+`no_route` reasons are `no_available_model` and `missing_capability`; both are
+represented.
+
 Samples are read alongside the fixture and policy setup in
 `crates/striatum-module/src/routing_v1/media_samples_tests.rs`; policy is not an
 extra request member. Replies are validated with the pinned media contract and
@@ -49,6 +99,8 @@ cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routin
 (cd test-vectors/route-select-media-v1 && shasum -a 256 -c SHA256SUMS)
 ```
 
-The ordinary test regenerates all six pairs in memory and compares every byte,
-the checksum manifest and exact directory membership. Only the explicit update
-command writes samples. Existing engine vectors and replay goldens are untouched.
+The ordinary test regenerates all 21 pairs in memory and compares every byte,
+the checksum manifest and exact directory membership. The reachability pair is
+additionally regenerated under all 14 causes listed above. Only the explicit
+update command writes samples. Existing engine vectors and replay goldens are
+untouched.
