@@ -502,7 +502,7 @@ pub(crate) fn live_with_eligibility(
     credentials: &SharedBrocaCredentials,
     reconcile_eligibility: bool,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
-    let blocks = crate::account_state::published(store).map_err(|e| e.to_string())?;
+    let blocks = crate::account_state::published(store, crate::account_selection::now_ms()).map_err(|e| e.to_string())?;
     let fences = blocks
         .report_credential_refusals()
         .map_err(|e| e.to_string())?;

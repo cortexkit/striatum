@@ -688,7 +688,7 @@ impl RequestInputs {
         let now = now_ms() as f64;
         // Read after the previous seat's admission, before this seat reserves
         // its own probes. Only the immutable catalog is shared between seats.
-        let mut snapshot = crate::account_state::published(deps.store)
+        let mut snapshot = crate::account_state::published(deps.store, now as i64)
             .and_then(|blocks| blocks.route_state_snapshot(now))
             .map_err(store_refusal)?;
         let (

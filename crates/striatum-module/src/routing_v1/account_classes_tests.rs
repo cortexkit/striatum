@@ -5894,3 +5894,115 @@ fn s4b_all_rows(
         })
         .collect()
 }
+
+/// What one selection step answers, for the tests below: a probe binding,
+/// or a launch by a runner that can or cannot pin its credential.
+fn selection_step(
+    context: &crate::account_selection::ClassContext,
+    harness: &Harness,
+    step: &str,
+) -> String {
+    match step {
+        "bind" => match context.bind_selected_probe(harness.store(), "synthetic", "model", false, "decision") {
+            Ok(crate::account_selection::ProbeBinding::Bound) => "Ok(Bound)".into(),
+            Ok(crate::account_selection::ProbeBinding::Lost { retry_at }) => format!("Ok(Lost {{ retry_at: {retry_at} }})"),
+            Err(error) => format!("Err({error})"),
+        },
+        "launch with a pinning runner" => format!(
+            "{:?}",
+            context.claim_launch_credential(harness.store(), "synthetic", "model", false, true, None)
+        ),
+        _ => format!(
+            "{:?}",
+            context.claim_launch_credential(harness.store(), "synthetic", "model", false, false, None)
+        ),
+    }
+}
+
+const SELECTION_STEPS: [&str; 3] = ["bind", "launch with a pinning runner", "launch without one"];
+
+/// A selection reads its account blocks once, before it binds its probe or
+/// launches. A block recorded after that read, through the account writer,
+/// must still stop the bind and both launch branches: they decide which
+/// clocks apply, and whether anything needs claiming, from the current
+/// state and the command's own fences, not from the selection's read.
+#[test]
+fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for step in SELECTION_STEPS {
+        let (harness, _) = setup("synthetic", false);
+        let mut context = s4b_load(&harness, NOW as i64);
+        context
+            .reserve_selection_probes(harness.store(), &harness.credentials())
+            .unwrap();
+        let chosen = context
+            .probe("synthetic", "model", false, false, None, "chosen")
+            .admission()
+            .map(|admission| admission.credential_id.clone());
+        assert_eq!(chosen.as_deref(), Some("oauth:test"), "{step}: the selection picks the login the block names");
+        exhaust_oauth(&harness, "synthetic");
+        let answer = selection_step(&context, &harness, step);
+        let claimed: Vec<_> = harness
+            .store()
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .filter(|clock| clock.claim_owner.is_some())
+            .collect();
+        assert!(claimed.is_empty(), "{step} claimed past the new block: {claimed:?} ({answer})");
+        assert!(
+            !answer.starts_with("Ok(Bound") && !answer.starts_with("Ok(\""),
+            "{step} went ahead past the new block: {answer}"
+        );
+    }
+}
+
+/// The bind and both launch claims decide which clocks apply from the
+/// command's working state, and the claim names only those. Each checks the
+/// rows that chose them first: when SQL holds a route clear the state lacks
+/// (written where neither the capture nor a reload sees it), the command
+/// runs again on a fresh load and claims nothing the clear lifted.
+#[test]
+fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for step in SELECTION_STEPS {
+        let (harness, _) = setup("synthetic", false);
+        striatum_core::RouteStateStore::record_provider_cooldown(
+            harness.store().as_ref(),
+            "synthetic",
+            "synthetic/model",
+            "synthetic/model",
+            &striatum_core::route_state_store::RouteStateUpdate {
+                observed_at_ms: Some(NOW as i64 - 2 * 3_600_000),
+                cooldown_until: Some((NOW + 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        harness
+            .store()
+            .account_transaction(|tx| tx.sync_fence_rechecks())
+            .unwrap();
+        let mut context = s4b_load(&harness, NOW as i64);
+        context
+            .reserve_selection_probes(harness.store(), &harness.credentials())
+            .unwrap();
+        harness
+            .store()
+            .write_unseen_for_test(
+                "INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'model',evidence
+                 FROM fence_recheck WHERE kind='provider';",
+            )
+            .unwrap();
+        let answer = selection_step(&context, &harness, step);
+        let claimed: Vec<_> = harness
+            .store()
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .filter(|clock| clock.claim_owner.is_some())
+            .collect();
+        assert!(claimed.is_empty(), "{step} claimed a clock the clear lifted: {claimed:?} ({answer})");
+    }
+}

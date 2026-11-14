@@ -3705,7 +3705,7 @@ async fn handle_cooldown_status(
         };
     // The provider row and the route-state snapshot both come from one
     // published account state, which holds every route and provider row.
-    let blocks = match account_state::published(store) {
+    let blocks = match account_state::published(store, crate::account_selection::now_ms()) {
         Ok(blocks) => blocks,
         Err(error) => {
             return send_route_error(

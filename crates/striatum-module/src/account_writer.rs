@@ -34,7 +34,7 @@ pub(crate) fn pool_key_states(
     provider: &str,
     now_ms: i64,
 ) -> RouteStateResult<BTreeMap<String, striatum_core::key_pool::PoolKeyState>> {
-    let published = crate::account_state::published(store)?;
+    let published = crate::account_state::published(store, now_ms)?;
     store.pool_key_states_from(provider, now_ms, published.block_state())
 }
 
@@ -203,7 +203,7 @@ pub(crate) fn pool_acquire_for_route(
     request: &PoolAcquire<'_>,
     providers: &[&str],
     model: &str,
-    recovered: &[(String, String)],
+    recovered: &[striatum_store::RecoveredOrigin],
     accounts: &BTreeMap<String, String>,
 ) -> RouteStateResult<PoolAcquireOutcome> {
     // A module command, so expired probes are released before the lease is

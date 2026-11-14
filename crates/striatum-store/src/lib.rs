@@ -99,7 +99,7 @@ pub use diagnostics::{
     DiagnosticRouteWall,
 };
 pub use engine_measurements::{EngineEvaluation, EngineSpeedSample, ENGINE_SPEED_SAMPLE_LIMIT};
-pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind};
+pub use key_pool::{PoolAcquire, PoolAcquireOutcome, PoolLease, PoolWallKind, RecoveredOrigin};
 pub use reasoning_catalog::{
     read_counts_offline, read_reasoning_catalog_offline, PublishedEfforts, ReasoningCatalog,
 };
@@ -762,7 +762,7 @@ pub(crate) const ROUTE_READ_ROUTE_EXISTING: &str = concat!(route_write_read!(), 
                                 latency_ema_ms, success_ema, failure_count, quota_error_count,
                                 last_error, last_error_at, wall_class
                          FROM model_route_state WHERE route_key = ?1");
-pub(crate) const ROUTE_READ_ROUTE_EXISTING_AFTER: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+pub(crate) const ROUTE_READ_ROUTE_PROVIDER_ROW: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
                                 last_error, last_error_at, wall_class
                          FROM provider_cooldown_state WHERE provider_key = ?1");
 pub(crate) const ROUTE_READ_OUTCOME_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
@@ -7796,7 +7796,7 @@ impl crate::AccountTx<'_> {
                 let provider = tx
                     .query_row(
                         // Read only to decide this writer's own write of the row (see `route_write_read`).
-                        ROUTE_READ_ROUTE_EXISTING_AFTER,
+                        ROUTE_READ_ROUTE_PROVIDER_ROW,
                         [&provider_key],
                         |r| {
                             Ok(ExistingProviderState {

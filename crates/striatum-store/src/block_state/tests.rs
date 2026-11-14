@@ -3362,13 +3362,39 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "Some(1800000060000)",
         ),
     ];
+    // One more case per table the pool check compares, each a row of the
+    // provider SQL holds and the stale state lacks; the answer is the twin's.
+    fn drift_row(rig: &Rig, sql: &str) {
+        rig.sql(sql.replace("{NOW}", &NOW.to_string()).replace("{LATER}", &(NOW + 600_000).to_string()).replace("{BEFORE}", &(NOW - 1_000).to_string()));
+    }
+    let any = |rig: &Rig| acquire(rig, "s1", &["p1"], "m", &keys());
+    let table_cases: Vec<(&str, Step, Step)> = vec![
+        ("account_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{}','{\"reset\":{\"at_ms\":{LATER}}}','broca_account_limit',{BEFORE},'x',{BEFORE},NULL,'[]',NULL);")),
+        ("credential_entitlement_fences", |_| {}, |rig| drift_row(rig, "INSERT INTO credential_entitlement_fences VALUES ('p1','k0','billing_exhausted','l0',{BEFORE});")),
+        ("account_route_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_route_fence(provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'quota');")),
+        ("account_non_quota_route_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_non_quota_route_fence VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'transient');")),
+        ("model_route_state", |_| {}, |rig| drift_row(rig, "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1/m','p1/m','p1','m',{LATER},{BEFORE},'route capacity',{BEFORE},{BEFORE});")),
+        ("account_size_refusal", |_| {}, |rig| drift_row(rig, "INSERT INTO account_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")),
+        ("account_non_quota_size_refusal", |_| {}, |rig| drift_row(rig, "INSERT INTO account_non_quota_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")),
+        ("account_transient_backoff", |_| {}, |rig| drift_row(rig, "INSERT INTO account_transient_backoff VALUES ('p1','a0',{LATER},{BEFORE},'k','[]');")),
+        ("fence_success_pool",
+            |rig| drift_row(rig, &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{{}}','{{\"reset\":{{\"at_ms\":{{LATER}}}}}}','broca_account_limit',{{BEFORE}},'x',{{BEFORE}},'{}','[{},{}]',NULL);", pool_key(1), pool_key(1), pool_key(2))),
+            |rig| drift_row(rig, &format!("INSERT INTO fence_success_pool VALUES ('drift-fence','{}',{{BEFORE}},{{NOW}});", pool_key(2)))),
+    ];
+    let cases: Vec<(&str, Step, Step, Act, &str)> = cases
+        .into_iter()
+        .chain(table_cases.into_iter().map(|(name, setup, drift)| (name, setup, drift, any as Act, "")))
+        .collect();
+    let _ = any;
     for (name, setup, drift, act, expected) in cases {
         // The same steps on a state that is never stale give the answer.
         let twin = rig("block-state-fresh-pool-input");
         setup(&twin);
         drift(&twin);
         let fresh = act(&twin);
-        assert_eq!(fresh, expected, "{name}: the fresh answer");
+        if !expected.is_empty() {
+            assert_eq!(fresh, expected, "{name}: the fresh answer");
+        }
         let rig = rig("block-state-stale-pool-input");
         setup(&rig);
         let stale = rig.published();
@@ -3545,12 +3571,21 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
     let reviewed: Vec<String> = reviewed_exempt_reads().iter().map(|sql| normalize(sql)).collect();
     let trace = rig.store.trace_block_reads_for_test().unwrap();
     let mut seen_writers = Vec::new();
-    let mut expect = |writer: &'static str| {
+    let mut ran: std::collections::BTreeSet<String> = Default::default();
+    // Each writer's marked reads, and the key each bound: the rows it read.
+    let mut expect = |writer: &'static str, statements: usize, keys: &[&str]| {
         let seen = trace.take();
         assert!(seen.reader.is_empty() && seen.writer.is_empty(), "{writer}: {seen:#?}");
-        assert!(!seen.route_writes.is_empty(), "{writer} read its row through a marked statement");
+        assert_eq!(seen.route_writes.len(), statements, "{writer}: {:#?}", seen.route_writes);
         for sql in &seen.route_writes {
             assert!(reviewed.contains(&normalize(sql)), "{writer}: unreviewed {sql}");
+            ran.insert(normalize(sql));
+        }
+        for row in &seen.route_write_rows {
+            assert!(
+                keys.iter().any(|key| row.contains(&format!("'{key}'"))),
+                "{writer} read a row other than {keys:?}: {row}"
+            );
         }
         seen_writers.push(writer);
     };
@@ -3567,7 +3602,7 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
             },
         )
         .unwrap();
-    expect("record_provider_cooldown");
+    expect("record_provider_cooldown", 3, &["p0"]);
     rig.store
         .update_route_state(
             "p1/m1",
@@ -3580,7 +3615,7 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
             },
         )
         .unwrap();
-    expect("update_route_state");
+    expect("update_route_state", 3, &["p1/m1", "p1"]);
     rig.store
         .record_decision(&DecisionInput {
             decision_id: Some("route-writer-decision".into()),
@@ -3608,8 +3643,151 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
             },
         )
         .unwrap();
-    expect("set_decision_outcome");
+    expect("set_decision_outcome", 1, &["p1/m1"]);
     rig.store.clear_failure_backoff("p1/m1").unwrap();
-    expect("clear_failure_backoff");
+    expect("clear_failure_backoff", 1, &["p1/m1"]);
     assert_eq!(seen_writers.len(), 4);
+    // Every one of the eight marked statements ran.
+    let marked: std::collections::BTreeSet<String> = reviewed_exempt_reads()
+        .iter()
+        .filter(|sql| sql.contains(crate::ROUTE_WRITE_READ))
+        .map(|sql| normalize(sql))
+        .collect();
+    assert_eq!(
+        reviewed_exempt_reads().iter().filter(|sql| sql.contains(crate::ROUTE_WRITE_READ)).count(),
+        8
+    );
+    assert_eq!(ran, marked);
+}
+
+/// An admission rules credentials out by its principal's exclusions, read
+/// from the state. A state missing an exclusion SQL holds runs the check
+/// again on a fresh load.
+#[test]
+fn an_exclusion_check_on_a_stale_state_runs_again_on_a_fresh_load() {
+    let rig = rig("block-state-stale-exclusion");
+    let stale = rig.published();
+    rig.sql(
+        "INSERT INTO account_principal_exclusion(principal,admission_id,credential_id,runner_view_digest,roster_view_digest,observation_id,recorded_at)
+         VALUES ('principal','admission','credential','runner','roster',NULL,1);"
+            .into(),
+    );
+    let loads = rig.decide_next_on(stale);
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, |tx| {
+            tx.check_admission_exclusions("principal", "admission")
+        })
+        .unwrap();
+    assert_eq!(rig.loads_since(loads), 2, "the stale exclusions are caught");
+    rig.check(&[NOW], "after the stale exclusion check");
+}
+
+/// A success heals the block its test request authorized, once: the report
+/// is recorded as delivered and the authorization deleted whatever the heal
+/// finds. A state from before the grant would find no test and heal
+/// nothing, so each heal checks the owner's authorizations and their clocks
+/// against SQL first and runs again on a fresh load, which heals.
+#[test]
+fn a_heal_that_finds_no_test_on_a_stale_state_runs_again_and_heals() {
+    for path in ["authorized probe", "report probe"] {
+        let rig = rig("block-state-stale-heal");
+        due_credential_refusal(&rig, "c0");
+        let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+        let before_the_grant = rig.published();
+        let granted = origins.clone();
+        assert!(rig
+            .store
+            .account_command(AccountCommandKind::Maintenance, move |tx| {
+                tx.grant_fence_rechecks(&granted, NOW, Some("decision"))
+            })
+            .unwrap());
+        let loads = rig.decide_next_on(before_the_grant);
+        let path_name = path;
+        rig.store
+            .account_command(AccountCommandKind::Report, move |tx| match path_name {
+                "authorized probe" => tx.heal_authorized_probe("decision", "p0", "m0", NOW + 10),
+                _ => {
+                    let origins = tx.fence_rechecks()?;
+                    tx.heal_report_probe("decision", None, false, "m0", NOW + 5, &origins, NOW + 10)
+                }
+            })
+            .unwrap();
+        assert_eq!(rig.loads_since(loads), 2, "{path}: the stale run, then a fresh one");
+        let left = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+        assert!(
+            left.iter().all(|clock| clock.credential_id.as_deref() != Some("c0")),
+            "{path}: the test request's success healed its block: {left:?}"
+        );
+        rig.check(&[NOW], path);
+    }
+}
+
+/// A pool key's recovered probes are named with the evidence they recovered
+/// from. A recovery read before the block was renewed does not lift the
+/// renewed block.
+#[test]
+fn a_recovery_from_older_evidence_does_not_lift_a_renewed_pool_block() {
+    use striatum_core::key_pool::PoolKey;
+    let rig = rig("block-state-recovered-evidence");
+    let provider_wall = |observed: i64| {
+        rig.store
+            .record_provider_cooldown(
+                "p1",
+                "p1/m",
+                "p1/m",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(observed),
+                    cooldown_until: Some((NOW + 3_600_000) as f64),
+                    last_error: Some("provider capacity".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        rig.run(fence_rechecks::sync);
+    };
+    provider_wall(NOW - 2_000);
+    let old: Vec<crate::RecoveredOrigin> = rig
+        .store
+        .account_read(|tx| tx.fence_rechecks())
+        .unwrap()
+        .into_iter()
+        .map(|origin| (origin.kind, origin.origin_key, origin.evidence))
+        .collect();
+    assert!(!old.is_empty());
+    // The block is renewed with new evidence after the recovery was read.
+    provider_wall(NOW - 1_000);
+    let keys = [PoolKey::new("k0", None, "active")];
+    let acquire = |recovered: &[crate::RecoveredOrigin]| {
+        rig.store
+            .pool_acquire_for_route(
+                &crate::PoolAcquire {
+                    provider: "p1",
+                    session_id: "s",
+                    keys: &keys,
+                    now_ms: NOW,
+                    lease_ms: 60_000,
+                    affinity_idle_ms: 60_000,
+                },
+                &["p1"],
+                "m",
+                recovered,
+                &std::collections::BTreeMap::new(),
+            )
+            .unwrap()
+    };
+    assert!(
+        matches!(acquire(&old), crate::PoolAcquireOutcome::Exhausted(_)),
+        "a recovery from the older evidence leaves the renewed block"
+    );
+    let current: Vec<crate::RecoveredOrigin> = rig
+        .store
+        .account_read(|tx| tx.fence_rechecks())
+        .unwrap()
+        .into_iter()
+        .map(|origin| (origin.kind, origin.origin_key, origin.evidence))
+        .collect();
+    assert!(
+        matches!(acquire(&current), crate::PoolAcquireOutcome::Leased(_)),
+        "a recovery from the current evidence lifts it"
+    );
 }

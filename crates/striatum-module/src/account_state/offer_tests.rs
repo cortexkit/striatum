@@ -607,17 +607,20 @@ fn a_lapsed_offer_stops_counting_at_its_deadline_before_and_after_any_command() 
         None,
         "the view releases the reservation"
     );
+    let later = published_at(&store, deadline + 1).unwrap();
+    assert_eq!(count_b(&later, deadline + 1), 0, "lapsed offer, read after its deadline");
     assert_eq!(store.writer_commit_count_for_test(), commits, "reading sends no command");
-    crate::account_writer::tick(&store, deadline + 30_000).unwrap();
+    // The Tick a millisecond later stamps the deadline, not its own time.
+    crate::account_writer::tick(&store, deadline + 1).unwrap();
     let stored = snapshot(&store).unwrap();
-    assert_eq!(count_b(&stored, deadline + 30_000), 0, "after the Tick releases it");
+    assert_eq!(count_b(&stored, deadline + 1), 0, "after the Tick releases it");
     let row = store
         .account_read(|tx| tx.admission("p", "lapsing"))
         .unwrap()
         .unwrap();
     assert_eq!((row.state.as_str(), row.released_at), ("released", Some(deadline)));
     assert_eq!(
-        count_b(&loaded(&store, deadline + 30_000), deadline + 30_000),
+        count_b(&loaded(&store, deadline + 1), deadline + 1),
         0,
         "after a restart"
     );

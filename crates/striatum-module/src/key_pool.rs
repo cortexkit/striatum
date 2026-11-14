@@ -188,7 +188,7 @@ pub fn acquire(
     // fenced until its vault listing changes: only the pool's other keys are leased.
     let fences = crate::credential_fences::live(ctx.store, ctx.credentials)
         .map_err(|error| refusal("store_error", format!("key pool: {error}")))?;
-    let clocks = crate::account_state::published(ctx.store)
+    let clocks = crate::account_state::published(ctx.store, ctx.now_ms)
         .and_then(|blocks| blocks.fence_rechecks())
         .map_err(|error| refusal("store_error", error.to_string()))?;
     let classes = ctx

@@ -33,6 +33,13 @@ pub struct PoolAcquire<'a> {
     pub affinity_idle_ms: i64,
 }
 
+/// A probe origin the caller found recovered for a pool key (its quota
+/// reading shows room again): kind, origin key and the evidence it was
+/// recovered from. Acquisition skips only a clock that still holds that
+/// evidence, so a recovery read from an older state cannot lift a block
+/// renewed since, including on a run again after `STATE_DIVERGED`.
+pub type RecoveredOrigin = (String, String, String);
+
 /// A granted lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolLease {
@@ -278,7 +285,7 @@ impl SqliteRouteStateStore {
         request: &PoolAcquire<'_>,
         providers: &[&str],
         model: &str,
-        recovered: &[(String, String)],
+        recovered: &[RecoveredOrigin],
         accounts: &BTreeMap<String, String>,
     ) -> RouteStateResult<PoolAcquireOutcome> {
         let provider = request.provider.to_owned();
@@ -704,7 +711,7 @@ impl crate::AccountTx<'_> {
         request: &PoolAcquire<'_>,
         providers: &[&str],
         model: &str,
-        recovered: &[(String, String)],
+        recovered: &[RecoveredOrigin],
         accounts: &BTreeMap<String, String>,
     ) -> RouteStateResult<PoolAcquireOutcome> {
         self.pool_sql(|conn| {
@@ -730,7 +737,7 @@ impl crate::AccountTx<'_> {
                     && accounts.get(*id).is_some_and(|id|id==account)).unwrap_or(credential);
                 providers.contains(&origin.provider.as_str())
                 && origin.applies(&origin.provider,account,named,model) && origin.principal.is_none() && origin.size_class.is_none()
-                && !recovered.contains(&(origin.kind.clone(),origin.origin_key.clone()))
+                && !recovered.iter().any(|(kind,key,evidence)|*kind==origin.kind && *key==origin.origin_key && *evidence==origin.evidence)
             };
             let origins=self.clock_rechecks_on()?;
             // The pool's own provider (its key rows and pool clocks) and

@@ -413,14 +413,17 @@ its query plan):
   these writes, and a read's result decides only that statement's own write:
   * `record_provider_cooldown`: prior provider observation time, inherited
     route rows, the existing provider row;
-  * `update_route_state`: prior route observation time, the existing route row
-    (two reads);
+  * `update_route_state`: prior route observation time, the existing route row,
+    and its provider's `provider_cooldown_state` row;
   * the route-outcome recorder in `set_decision_outcome`: the route's failure
     streak and backoff;
   * `clear_failure_backoff`: the route's failure streak and backoff, for its
     prior-state reply.
-  Each statement is a `ROUTE_READ_*` constant in `S/lib.rs`. Pinned by
-  `the_route_state_writers_read_only_their_own_rows_through_reviewed_statements`.
+  Eight statements in all (three, three, one and one), each a `ROUTE_READ_*`
+  constant in `S/lib.rs`. Pinned by
+  `the_route_state_writers_read_only_their_own_rows_through_reviewed_statements`,
+  which drives each writer, requires all eight to run and checks the key each
+  bound.
 * **Reviewed reading triggers.** Schema triggers that read block tables when a
   write fires them, each keyed (`S/group_reads.rs::REVIEWED_TRIGGERS`):
   * `model_route_state_inherit_fence_scope`: `provider_cooldown_state` by

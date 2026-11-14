@@ -1145,6 +1145,30 @@ fn claim_states(
         .collect()
 }
 
+/// A keyed check written as a no-op update: it changes no row, and its
+/// count of matched rows is the answer. Whether SQL still holds the clock an
+/// authorization names, with that evidence and claim generation (and, with
+/// `model`, as a non-quota clock of that model or of none).
+pub(crate) fn no_authorized_clock_check_sql(model: bool) -> String {
+    format!(
+        "{} UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
+            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5{}",
+        crate::block_state::STATE_CHECK,
+        if model { " AND quota=0 AND (model IS NULL OR model=?6)" } else { "" }
+    )
+}
+
+/// A keyed no-op update that answers whether an admission is still
+/// unstarted (`reserved` or `expired`) and, if so, its deadline.
+pub(crate) fn unstarted_admission_check_sql() -> String {
+    format!(
+        "{} UPDATE account_admission SET state = state WHERE principal=?1 \
+           AND admission_id=?2 AND state IN ('reserved','expired') \
+           AND started_at IS NULL RETURNING admission_valid_until",
+        crate::block_state::STATE_CHECK
+    )
+}
+
 /// The keyed check of one owner's probe authorizations against the state.
 pub(crate) fn authorization_check_sql() -> String {
     format!(
@@ -1740,11 +1764,9 @@ impl AccountTx<'_> {
         row: &crate::block_state::ProbeAuthorization,
         model: Option<&str>,
     ) -> RouteStateResult<()> {
-        let keyed = "UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
-            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5";
         let changed = match model {
-            None => self.conn.execute(keyed, params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
-            Some(model) => self.conn.execute(&format!("{keyed} AND quota=0 AND (model IS NULL OR model=?6)"),
+            None => self.conn.execute(&no_authorized_clock_check_sql(false), params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
+            Some(model) => self.conn.execute(&no_authorized_clock_check_sql(true),
                 params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation,model]),
         }
         .map_err(err)?;
@@ -1990,9 +2012,7 @@ impl AccountTx<'_> {
             let deadline: Option<i64> = self
                 .conn
                 .query_row(
-                    "UPDATE account_admission SET state = state WHERE principal=?1 \
-                       AND admission_id=?2 AND state IN ('reserved','expired') \
-                       AND started_at IS NULL RETURNING admission_valid_until",
+                    &unstarted_admission_check_sql(),
                     params![principal, admission],
                     |row| row.get(0),
                 )
@@ -2178,6 +2198,13 @@ impl AccountTx<'_> {
             return Ok(());
         }
         let origins = self.fence_rechecks()?;
+        // Which test this owner holds (if any) decides both the heal and the
+        // authorization delete below, and a missed heal is never retried:
+        // check the owner's authorizations and their clocks against SQL
+        // first, so a stale state runs again instead of healing nothing.
+        if let Some(blocks) = self.working_blocks()? {
+            self.check_probe_inputs(&blocks, owner, true)?;
+        }
         // A pool lease can probe both an alias key's billing refusal and the
         // target provider's cooldown. Each proof keeps its own provider scope.
         for origin in origins
@@ -2244,6 +2271,15 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<()> {
+        // The report is recorded as delivered whatever this finds, so a heal
+        // skipped on a stale state would be lost: check the owner's (and the
+        // decision copy's) authorizations and their clocks against SQL first.
+        if let Some(blocks) = self.working_blocks()? {
+            self.check_probe_inputs(&blocks, owner, true)?;
+            if let Some(copy) = decision_copy.filter(|copy| *copy != owner) {
+                self.check_probe_inputs(&blocks, copy, true)?;
+            }
+        }
         for origin in origins.iter().filter(|origin| {
             origin.evidence_at < admitted_at
                 && origin.model.as_deref().is_none_or(|value| value == model)

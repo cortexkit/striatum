@@ -378,6 +378,23 @@ fn provider_rows_check_sql(table: usize, column: &str) -> String {
     format!("{STATE_CHECK} {} WHERE {column}=?1", SELECTS[table])
 }
 
+/// The keyed check of one admission's principal exclusions.
+fn exclusions_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} {} WHERE principal=?1 AND admission_id=?2",
+        SELECTS[EXCLUSION_TABLE]
+    )
+}
+
+/// The check of a provider's active account fences' success pools, by the
+/// pool table's primary key under the fences' provider index.
+fn success_pools_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} {} WHERE fence_id IN (SELECT fence_id FROM account_fence WHERE provider=?1 AND cleared_at IS NULL)",
+        SELECTS[SUCCESS_POOL_TABLE]
+    )
+}
+
 /// The keyed check of a clock, or of its route clears, by origin.
 fn by_origin_check_sql(table: usize) -> String {
     format!("{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2", SELECTS[table])
@@ -398,9 +415,14 @@ pub fn reviewed_exempt_reads() -> Vec<String> {
             .map(|(table, column)| provider_rows_check_sql(*table, column)),
     );
     reads.push(by_origin_check_sql(ROUTE_CLEAR_TABLE));
+    reads.push(exclusions_check_sql());
+    reads.push(success_pools_check_sql());
     reads.push(by_origin_check_sql(CLOCK_TABLE));
     reads.push(fence_rechecks::authorization_check_sql());
     reads.push(fence_rechecks::probe_clock_check_sql());
+    reads.push(fence_rechecks::no_authorized_clock_check_sql(false));
+    reads.push(fence_rechecks::no_authorized_clock_check_sql(true));
+    reads.push(fence_rechecks::unstarted_admission_check_sql());
     reads.extend(
         [
             crate::ROUTE_READ_PROVIDER_PRIOR_OBSERVED,
@@ -408,7 +430,7 @@ pub fn reviewed_exempt_reads() -> Vec<String> {
             crate::ROUTE_READ_PROVIDER_EXISTING,
             crate::ROUTE_READ_ROUTE_PRIOR_OBSERVED,
             crate::ROUTE_READ_ROUTE_EXISTING,
-            crate::ROUTE_READ_ROUTE_EXISTING_AFTER,
+            crate::ROUTE_READ_ROUTE_PROVIDER_ROW,
             crate::ROUTE_READ_OUTCOME_FAILURE_STATE,
             crate::ROUTE_READ_CLEAR_FAILURE_STATE,
         ]
@@ -1400,7 +1422,81 @@ impl BlockState {
                 )));
             }
         }
+        // The pools a success healed of the provider's active account
+        // fences, which decide which of a fence's pools still block. The
+        // fences themselves agree by now.
+        let fences: std::collections::HashSet<String> = self
+            .raws(ACCOUNT_FENCE_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::AccountFence { row, .. } if row.provider == provider => Some(row.fence_id.clone()),
+                _ => None,
+            })
+            .collect();
+        self.check_rows(
+            conn,
+            SUCCESS_POOL_TABLE,
+            &success_pools_check_sql(),
+            [provider],
+            |_, held| matches!(held, Held::SuccessPool(pool) if fences.contains(&pool.fence_id)),
+            format_args!("the success pools of provider {provider}"),
+        )
+    }
+
+    /// Compare the rows `statement` (bound to `params`) returns from SQL with
+    /// the rows of `table` this state holds that `keep` selects, by rowid.
+    fn check_rows(
+        &self,
+        conn: &Connection,
+        table: usize,
+        statement: &str,
+        params: impl rusqlite::Params,
+        keep: impl Fn(&str, &Held) -> bool,
+        what: std::fmt::Arguments<'_>,
+    ) -> rusqlite::Result<()> {
+        let mut in_sql: Vec<(i64, Held)> = Vec::new();
+        let mut prepared = conn.prepare_cached(statement)?;
+        let mut rows = prepared.query(params)?;
+        while let Some(row) = rows.next()? {
+            if let (rowid, _, Some(held)) = decode(table, row)? {
+                in_sql.push((rowid, held));
+            }
+        }
+        in_sql.sort_by_key(|(rowid, _)| *rowid);
+        let mut in_state: Vec<(i64, Held)> = self.tables[table]
+            .rows
+            .iter()
+            .filter(|(_, (key, held))| keep(key, held))
+            .map(|(rowid, (_, held))| (*rowid, (**held).clone()))
+            .collect();
+        in_state.sort_by_key(|(rowid, _)| *rowid);
+        if in_sql != in_state {
+            return Err(diverged(format_args!("{what} differ from the state's")));
+        }
         Ok(())
+    }
+
+    /// Check that SQL holds the principal exclusions of one admission as this
+    /// state does (by the table's primary-key prefix). An admission that
+    /// skips excluded credentials decided on these.
+    pub(crate) fn check_exclusions(
+        &self,
+        conn: &Connection,
+        principal: &str,
+        admission_id: &str,
+    ) -> rusqlite::Result<()> {
+        self.check_rows(
+            conn,
+            EXCLUSION_TABLE,
+            &exclusions_check_sql(),
+            [principal, admission_id],
+            |key, _| {
+                serde_json::from_str::<Vec<serde_json::Value>>(key).is_ok_and(|parts| {
+                    parts.first().and_then(|v| v.as_str()) == Some(principal)
+                        && parts.get(1).and_then(|v| v.as_str()) == Some(admission_id)
+                })
+            },
+            format_args!("the exclusions of admission {principal} {admission_id}"),
+        )
     }
 
     /// Check, by primary key, that SQL holds the probe clock of one origin
@@ -2198,6 +2294,22 @@ impl crate::AccountTx<'_> {
                 .map_err(crate::err)?;
         }
         Ok(())
+    }
+
+    /// Check that SQL holds one admission's principal exclusions as the
+    /// working state does, raising `STATE_DIVERGED` on a difference: an
+    /// admission decides which credentials it may use on them.
+    pub fn check_admission_exclusions(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> striatum_core::RouteStateResult<()> {
+        let Some(state) = self.working_blocks()? else {
+            return Ok(());
+        };
+        state
+            .check_exclusions(self.conn, principal, admission_id)
+            .map_err(crate::err)
     }
 
     /// The block tables, read in the state loader's transaction.

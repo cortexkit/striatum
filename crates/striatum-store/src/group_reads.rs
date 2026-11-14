@@ -79,6 +79,57 @@ pub fn reads_tables(sql: &str, tables: &[&str]) -> bool {
     })
 }
 
+/// Whether `sql` selects rows from `table` other than a write's own target
+/// row: a `FROM` or `JOIN` of it, or it as a later item of a comma join,
+/// whatever its quoting or its `main.`/`temp.` schema prefix.
+fn selects_from(sql: &str, table: &str) -> bool {
+    let mut text = sql.to_ascii_lowercase();
+    for quote in ['"', '`', '[', ']'] {
+        text = text.replace(quote, "");
+    }
+    let text = text
+        .replace("main.", "")
+        .replace("temp.", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace(" ,", ",")
+        .replace(", ", ",");
+    if !text.contains("select") {
+        return false;
+    }
+    // A `DELETE FROM` names its own target; that is not a read of it.
+    let own = format!("delete from {table}");
+    let text = text.strip_prefix(own.as_str()).unwrap_or(&text);
+    ["from ", "join ", ","].iter().any(|before| {
+        let needle = format!("{before}{table}");
+        text.match_indices(&needle).any(|(at, _)| {
+            // `pool_key_state_x` is another table, and `, pool_key_state.col`
+            // names a column of the target, not a join.
+            !text[at + needle.len()..]
+                .chars()
+                .next()
+                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_' || next == '.')
+        })
+    })
+}
+
+/// Whether a statement trace event is a trigger's: SQLite then passes a
+/// "-- <trigger>" comment rather than the statement's own text, so the text
+/// differs from the prepared statement's. A statement whose own text starts
+/// with a comment is not one.
+///
+/// # Safety
+/// `statement` is the `sqlite3_stmt` SQLite passed with the event.
+unsafe fn trigger_event(statement: *mut c_void, text: &str) -> bool {
+    if !text.starts_with("--") {
+        return false;
+    }
+    // SAFETY: for SQLITE_TRACE_STMT the P argument is the running statement.
+    let own = unsafe { ffi::sqlite3_sql(statement as *mut ffi::sqlite3_stmt) };
+    own.is_null() || unsafe { CStr::from_ptr(own) }.to_string_lossy() != text
+}
+
 /// Statements seen since the last [`GroupReads::take`].
 #[derive(Default)]
 pub struct GroupReads {
@@ -111,7 +162,7 @@ impl GroupReads {
 unsafe extern "C" fn on_statement(
     _mask: c_uint,
     context: *mut c_void,
-    _statement: *mut c_void,
+    statement: *mut c_void,
     sql: *mut c_void,
 ) -> c_int {
     if sql.is_null() {
@@ -123,7 +174,7 @@ unsafe extern "C" fn on_statement(
     let text = unsafe { CStr::from_ptr(sql as *const std::ffi::c_char) }.to_string_lossy();
     // Statements a trigger runs arrive as "-- <trigger>"; their own reads are
     // part of the write that fired them.
-    if !text.starts_with("--") {
+    if !unsafe { trigger_event(statement, &text) } {
         unsafe { &*(context as *const GroupReads) }.record(&text);
     }
     0
@@ -273,6 +324,7 @@ pub struct BlockReadTrace {
     maintenance: Mutex<usize>,
     checks: Mutex<Vec<String>>,
     route_writes: Mutex<Vec<String>>,
+    route_write_rows: Mutex<Vec<String>>,
     triggers: Mutex<Vec<String>>,
     /// A connection to the traced database, used only to prepare each new
     /// statement text once under an authorizer, and what that found.
@@ -304,6 +356,8 @@ pub struct BlockReads {
     /// A route-state writer's read of the row it is about to write, which
     /// decides only that write (`ROUTE_WRITE_READ`), by text.
     pub route_writes: Vec<String>,
+    /// The same reads with their bound values, naming the rows they read.
+    pub route_write_rows: Vec<String>,
     /// Writes whose only block reads are those of [`REVIEWED_TRIGGERS`] they
     /// fire, by text.
     pub triggers: Vec<String>,
@@ -317,6 +371,7 @@ impl BlockReadTrace {
             maintenance: std::mem::take(&mut self.maintenance.lock().unwrap()),
             checks: std::mem::take(&mut self.checks.lock().unwrap()),
             route_writes: std::mem::take(&mut self.route_writes.lock().unwrap()),
+            route_write_rows: std::mem::take(&mut self.route_write_rows.lock().unwrap()),
             triggers: std::mem::take(&mut self.triggers.lock().unwrap()),
         }
     }
@@ -382,7 +437,7 @@ impl BlockReadTrace {
                 // SELECT` or a sub-query over it) reads other rows, so it
                 // counts.
                 let own_row = |table: &str| {
-                    target.as_deref() == Some(table) && !reads_tables(sql, &[table])
+                    target.as_deref() == Some(table) && !selects_from(sql, table)
                 };
                 let watched = |kind: &u8, table: &String| {
                     *kind == 0 && BLOCK_TRACE_TABLES.contains(&table.as_str())
@@ -424,7 +479,7 @@ struct BlockTap {
 unsafe extern "C" fn on_block_statement(
     _mask: c_uint,
     context: *mut c_void,
-    _statement: *mut c_void,
+    statement: *mut c_void,
     sql: *mut c_void,
 ) -> c_int {
     if sql.is_null() {
@@ -435,7 +490,7 @@ unsafe extern "C" fn on_block_statement(
     let tap = unsafe { &*(context as *const BlockTap) };
     // A trigger's statements arrive as "-- <trigger>"; their reads were
     // found when the statement that fires them was prepared.
-    if text.starts_with("--") {
+    if unsafe { trigger_event(statement, &text) } {
         return 0;
     }
     let found = tap.trace.tables_read(&text);
@@ -457,6 +512,23 @@ unsafe extern "C" fn on_block_statement(
     } else if text.contains(crate::block_state::STATE_CHECK) {
         tap.trace.checks.lock().unwrap().push(text.into_owned());
     } else if text.contains(crate::ROUTE_WRITE_READ) {
+        // SAFETY: `statement` is the running statement; SQLite allocates the
+        // expanded text, which is freed here after it is copied.
+        let expanded = unsafe {
+            let raw = ffi::sqlite3_expanded_sql(statement as *mut ffi::sqlite3_stmt);
+            if raw.is_null() {
+                None
+            } else {
+                let copy = CStr::from_ptr(raw).to_string_lossy().into_owned();
+                ffi::sqlite3_free(raw as *mut c_void);
+                Some(copy)
+            }
+        };
+        tap.trace
+            .route_write_rows
+            .lock()
+            .unwrap()
+            .push(expanded.unwrap_or_else(|| text.to_string()));
         tap.trace.route_writes.lock().unwrap().push(text.into_owned());
     } else if tap.writer {
         tap.trace.writer.lock().unwrap().push(text.into_owned());
@@ -529,6 +601,10 @@ mod tests {
             "UPDATE trace_log SET n=1 WHERE n IN (SELECT walled_until FROM pool_key_state)",
             "INSERT INTO pool_key_state(provider,credential_id,updated_at) SELECT provider,credential_id||'x',updated_at FROM pool_key_state WHERE 0",
             "INSERT INTO trace_scratch VALUES (1)",
+            "-- a statement that starts with a comment\nSELECT count(*) FROM fence_recheck",
+            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM \"pool_key_state\")",
+            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM main.pool_key_state)",
+            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT n FROM trace_log , pool_key_state)",
         ];
         for sql in reads {
             store.with_writer_for_test(|conn| conn.execute_batch(sql)).unwrap();

@@ -140,11 +140,12 @@ pub(crate) fn open_preflight_admission(
     store: &SqliteRouteStateStore,
     principal: &str,
     admission_id: &str,
+    now_ms: i64,
 ) -> RouteStateResult<Option<AccountAdmissionRow>> {
     if store.is_account_evaluation_projection() {
         return store.account_read(|tx| tx.admission(principal, admission_id));
     }
-    Ok(published_at(store, crate::account_selection::now_ms())?
+    Ok(published_at(store, now_ms)?
         .admissions
         .open_admission(principal, admission_id)
         .map(|open| open.row.clone()))

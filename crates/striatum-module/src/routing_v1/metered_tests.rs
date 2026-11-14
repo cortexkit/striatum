@@ -1098,7 +1098,7 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
     let first = broca_account_request(&Value::Null, "abandoned", false);
     let admitted = runner.call("route.account_for", &first).await;
     assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe", "{}", admitted.1);
-    let held = crate::account_state::published(harness.store()).unwrap().block_state().unwrap().clone();
+    let held = crate::account_state::published(harness.store(), crate::account_selection::now_ms()).unwrap().block_state().unwrap().clone();
     assert!(!held.authorization_owners().is_empty(), "the admission holds the probe");
 
     let now = FENCE_NOW as i64 + 61_000;
@@ -1117,7 +1117,7 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
         commits,
         "reading an expired probe sends no command"
     );
-    let read = crate::account_state::published(harness.store()).unwrap().block_state().unwrap().clone();
+    let read = crate::account_state::published(harness.store(), now).unwrap().block_state().unwrap().clone();
     assert!(read.authorization_owners().is_empty(), "the reader sees the probe released");
 
     let _tick = crate::InjectedClock::set(now as u64 + 30_000);
