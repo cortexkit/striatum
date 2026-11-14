@@ -26,6 +26,15 @@
         "poll_ms": null
       }
     },
+    "concurrency": {
+      "$ref": "#/$defs/CapSettings",
+      "default": {
+        "accounts": {},
+        "models": {},
+        "plans": {},
+        "providers": {}
+      }
+    },
     "consecutive_terminal_failure_threshold": {
       "description": "Terminal send failures required before the route-local safety backoff starts.",
       "type": [
@@ -230,6 +239,81 @@
         "refuse"
       ]
     },
+    "CapLimit": {
+      "anyOf": [
+        {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        {
+          "$ref": "#/$defs/NoCap"
+        }
+      ]
+    },
+    "CapOverride": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/CapLimit"
+        },
+        "scope": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CapScope"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limit"
+      ]
+    },
+    "CapScope": {
+      "type": "string",
+      "enum": [
+        "account",
+        "account_model"
+      ]
+    },
+    "CapSettings": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/CapOverride"
+          },
+          "default": {}
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ModelCapOverride"
+          },
+          "default": {}
+        },
+        "plans": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/CapOverride"
+          },
+          "default": {}
+        },
+        "providers": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/CapOverride"
+          },
+          "default": {}
+        }
+      },
+      "additionalProperties": false
+    },
     "CatalogSection": {
       "type": "object",
       "properties": {
@@ -432,6 +516,18 @@
         "pi"
       ]
     },
+    "ModelCapOverride": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "$ref": "#/$defs/CapLimit"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "limit"
+      ]
+    },
     "ModelFactOverride": {
       "description": "One per-model override. Every field is optional: a present field is operator-owned,\nwhile a withdrawn field returns to its non-override authority.",
       "type": "object",
@@ -616,6 +712,12 @@
             "preview_alias"
           ]
         }
+      ]
+    },
+    "NoCap": {
+      "type": "string",
+      "enum": [
+        "none"
       ]
     },
     "OverqualificationMode": {

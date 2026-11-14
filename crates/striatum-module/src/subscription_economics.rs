@@ -108,7 +108,20 @@ fn decimal(value: &Value, units_key: &str) -> Option<f64> {
     (result.is_finite() && result > 0.0).then_some(result)
 }
 
+/// Login adapters and catalog plan providers can differ. Pricing and caps must
+/// use the same join, while admissions keep their actual serving provider.
+pub(crate) fn plan_price_key<'a>(provider: &'a str, tier: &'a str) -> (&'a str, &'a str) {
+    (
+        match provider {
+            "antigravity" => "google",
+            other => other,
+        },
+        tier,
+    )
+}
+
 fn price_row<'a>(prices: &'a Value, provider: &str, tier: &str) -> Option<&'a Value> {
+    let (provider, tier) = plan_price_key(provider, tier);
     prices["prices"]
         .as_array()?
         .iter()

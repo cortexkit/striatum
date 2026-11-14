@@ -10,6 +10,9 @@ mod offers;
 #[path = "retention_tests.rs"]
 mod retention;
 
+#[path = "cap_tests.rs"]
+mod caps;
+
 const T: i64 = 1_790_683_200_000;
 const MINUTE: i64 = 60_000;
 

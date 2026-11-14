@@ -44,6 +44,75 @@ const SETUP_TIMEOUT: Duration = Duration::from_secs(5);
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PlanConcurrencyCatalog {
+    caps: BTreeMap<(String, String), crate::concurrency_caps::EffectiveCap>,
+    pub(crate) warnings: Vec<String>,
+}
+
+impl PlanConcurrencyCatalog {
+    pub(crate) fn load(prices: &Value, now: i64) -> Self {
+        use crate::concurrency_caps::{CapScope, EffectiveCap};
+        let mut out = Self::default();
+        let mut plans: BTreeMap<(&str, &str), Vec<&Value>> = BTreeMap::new();
+        for row in prices["prices"].as_array().into_iter().flatten() {
+            if let (Some(provider), Some(tier)) =
+                (row["provider_id"].as_str(), row["tier"].as_str())
+            {
+                plans.entry((provider, tier)).or_default().push(row);
+            }
+        }
+        for ((provider, tier), rows) in plans {
+            let warning = if rows.len() != 1 {
+                Some("multiple plan rows match; concurrency cap ignored")
+            } else if rows[0].get("concurrency").is_none_or(Value::is_null) {
+                None
+            } else {
+                let value = &rows[0]["concurrency"];
+                let limit = value["limit"]
+                    .as_u64()
+                    .filter(|n| *n > 0);
+                let scope = match value["scope"].as_str() {
+                    Some("account") => Some(CapScope::Account),
+                    Some("account_model") => Some(CapScope::AccountModel),
+                    _ => None,
+                };
+                if let (Some(limit), Some(scope)) = (limit, scope) {
+                    out.caps.insert(
+                        (provider.to_owned(), tier.to_owned()),
+                        EffectiveCap {
+                            limit: Some(limit),
+                            scope,
+                        },
+                    );
+                    value["review_by_ms"]
+                        .as_i64()
+                        .filter(|review| *review < now)
+                        .map(|_| "concurrency cap due for review; still applied")
+                } else {
+                    Some("invalid concurrency limit or scope; cap ignored")
+                }
+            };
+            if let Some(reason) = warning {
+                let message = format!("{provider}/{tier}: {reason}");
+                out.warnings.push(message);
+            }
+        }
+        out
+    }
+
+    pub(crate) fn cap(
+        &self,
+        provider: &str,
+        tier: &str,
+    ) -> Option<crate::concurrency_caps::EffectiveCap> {
+        let (provider, tier) = crate::subscription_economics::plan_price_key(provider, tier);
+        self.caps
+            .get(&(provider.to_owned(), tier.to_owned()))
+            .copied()
+    }
+}
+
 #[derive(Debug)]
 pub enum FusiformCatalogError {
     Message(String),

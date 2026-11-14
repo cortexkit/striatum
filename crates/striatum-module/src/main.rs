@@ -27,6 +27,7 @@ mod broca_credentials;
 mod catalog_targets;
 mod config_convert;
 mod config_overrides;
+mod concurrency_caps;
 mod config_policy;
 mod credential_fences;
 mod diagnostics_findings;

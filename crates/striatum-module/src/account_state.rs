@@ -310,6 +310,32 @@ impl<'a> AccountCommand<'a> {
 // working state, which already holds every earlier change of its batch.
 // Without a state (private SQL projections) they are the SQL reads.
 impl AccountCommand<'_> {
+    /// Counts only holds assigned to the requested model's effective count.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "admission enforcement consumes resolved caps in a later change"
+        )
+    )]
+    pub(crate) fn inflight_count_for_model(
+        &mut self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        now: i64,
+    ) -> usize {
+        let state = self
+            .state
+            .as_deref_mut()
+            .expect("ledger needs module state");
+        state.inflight.touch(provider, account, now);
+        state
+            .inflight
+            .count_for_model(caps, provider, account, model, now)
+    }
+
     // A replay or a read-only writer command can visit an account without a
     // lifecycle effect. Remember its key so command cleanup still drops lapsed
     // entries without scanning any other account or changing durable rows.
