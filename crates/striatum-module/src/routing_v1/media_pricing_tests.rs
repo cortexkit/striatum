@@ -131,6 +131,33 @@ async fn media_cost_speech_utf8_ceiling_ranks_before_tokens_and_round_trips_pric
 }
 
 #[tokio::test]
+async fn media_cost_zero_minimum_preserves_measured_character_estimate() {
+    let h = setup(vec![offer("speech", "synthesize", false)]);
+    let route = h.bind(reserved("colliculus"), None).await;
+    let mut params = job("synthesize");
+    params["requirements"] = json!({"input_characters":3,"input_bytes":7});
+    for minimum in [
+        json!({"kind":"none"}),
+        json!({"kind":"minimum","quantity":0}),
+    ] {
+        let mut row = speech();
+        row["rate.input.per_character"]["minimum_quantity"] = minimum;
+        install(&h, &[("speech", row)]);
+        let answer = select(&route, &params).await;
+        near(&answer["price"]["estimated_task_usd"], 0.00012);
+        near(&score(&h, &answer)["cost"], 0.00012);
+        near(
+            &answer["price"]["rates"]["input.per_character"]["rate"],
+            0.00004,
+        );
+        assert_eq!(
+            score(&h, &answer)["objective"]["taskPricing"]["basis"],
+            "input_characters"
+        );
+    }
+}
+
+#[tokio::test]
 async fn media_cost_all_incurred_rates_are_required_and_missing_quantity_quotes_units() {
     super::super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         let h = setup(vec![offer("speech", "synthesize", false)]);

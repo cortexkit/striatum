@@ -94,6 +94,7 @@ pub(super) fn estimate(
     for (key, rate) in rates {
         if rate.increment != RateQuantityKind::Unspecified
             || (rate.minimum_quantity != RateQuantityKind::Unspecified
+                && rate.minimum != Some(0)
                 && (quantity.is_some() || rate.minimum.is_none()))
         {
             report_quantity_once(&route, key);
