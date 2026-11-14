@@ -1,6 +1,7 @@
 use super::*;
 
 mod account_decision_tests;
+mod enforcement_tests;
 mod inflight_tests;
 mod request_reads_tests;
 mod shadow_lines_tests;
