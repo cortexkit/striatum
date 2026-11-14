@@ -1,0 +1,1 @@
+{"request":{"method":"route.select","params":{"consumer":"colliculus.dictation_token","kind":"realtime","privacy":"remote_allowed","requirements":{}}},"reply":{"code":"no_route","message":"no route meets the request: no_available_model","detail":{"reason":"no_available_model"}}}

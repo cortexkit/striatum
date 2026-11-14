@@ -67,6 +67,8 @@ mod credential_startup_tests;
 #[cfg(test)]
 mod add_shapes_tests;
 #[cfg(test)]
+mod concurrency_samples_tests;
+#[cfg(test)]
 mod conformance_tests;
 #[cfg(test)]
 mod consumers_tests;
