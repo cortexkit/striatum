@@ -1794,11 +1794,7 @@ impl ClassContext {
             .credential_id
             .as_deref()
             .filter(|id| {
-                (origin.quota
-                    || matches!(
-                        origin.kind.as_str(),
-                        "account_route" | "non_quota_route" | "transient_route"
-                    ))
+                origin.quota
                     && crate::credential_fences::credential_account_id(&self.account_ids, id)
                         .as_deref()
                         == Some(account)
@@ -2090,18 +2086,24 @@ impl ClassContext {
     }
 
     /// A new conversation has no cache to preserve. Prefer an open account,
-    /// but keep the roster intact when retrying a transient is the only option.
+    /// but a blocked credential must not hide an unblocked sibling credential.
     fn avoid_transient_accounts(&self, roster: &mut RosterBuild, provider: &str, model: &str) {
-        let fenced = self.accounts_fenced_by(&self.transient_route_fences, provider, model);
+        let accounts = self.accounts_fenced_by(&self.transient_route_fences, provider, model);
+        let fenced = |account: &AccountView| {
+            accounts.contains_key(&account.account_id)
+                && account.credentials.iter().all(|credential| {
+                    self.rechecks.iter().any(|origin| {
+                        origin.kind == "transient_route"
+                            && origin.applies(
+                                provider, &account.account_id, &credential.credential_id, model,
+                            )
+                            && !self.origin_due(origin, &account.account_id, model)
+                    })
+                })
+        };
         if let Some(roster) = &mut roster.roster {
-            if roster
-                .accounts
-                .iter()
-                .any(|account| !fenced.contains_key(&account.account_id))
-            {
-                roster
-                    .accounts
-                    .retain(|account| !fenced.contains_key(&account.account_id));
+            if roster.accounts.iter().any(|account| !fenced(account)) {
+                roster.accounts.retain(|account| !fenced(account));
             }
         }
     }
@@ -2150,9 +2152,9 @@ impl ClassContext {
         )
     }
 
-    /// Accounts closed by a report for this route or by an account-wide
-    /// backoff observation, each with its deadline. Report fences name the
-    /// credential that served; observations already name the whole account.
+    /// Accounts closed by a shared quota route fence or an account-wide backoff
+    /// observation, each with its deadline. Credential-scoped route backoffs
+    /// reach admission so its atomic probe check can judge the exact credential.
     fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
         // A refusal probe must reach admission to claim its single-request
         // reservation. A quota route fence must not hide that same probe;
@@ -2161,7 +2163,7 @@ impl ClassContext {
         for origin in self.rechecks.iter().filter(|origin| {
             matches!(
                 origin.kind.as_str(),
-                "account_route" | "non_quota_route" | "observation"
+                "account_route" | "observation"
             )
         }) {
             let account = origin.account_id.clone().or_else(|| {
@@ -5634,7 +5636,16 @@ fn route_fence_refusal(
         .roster
         .iter()
         .flat_map(|roster| &roster.accounts)
-        .any(|view| wanted(&view.account_id))
+        .any(|view| {
+            params.candidates.as_ref().is_none_or(|candidates| {
+                candidates.accounts.iter().any(|candidate| {
+                    candidate.account_id == view.account_id
+                        && view.credentials.iter().any(|credential| {
+                            credential.credential_id == candidate.credential_id
+                        })
+                })
+            })
+        })
     {
         return None;
     }
@@ -6373,7 +6384,9 @@ fn serve(
         None => false,
     };
     let mut roster = roster.clone();
-    if !established {
+    // Explicit candidates already bound the choice. Keep their blocked
+    // credentials until the atomic probe check can preserve the refusal cause.
+    if !established && params.candidates.is_none() {
         if let Some(classes) = &ctx.classes {
             classes.avoid_transient_accounts(&mut roster, provider, &params.model);
         }
@@ -7255,6 +7268,8 @@ struct ObserveParams {
     retry_at_ms: Option<u64>,
     #[serde(default)]
     provider_code: Option<String>,
+    #[serde(default)]
+    attempt_outcome: Option<cortexkit_role_routing::attempt::AttemptOutcome>,
 }
 
 /// What `route.account_observe` reads from each tracked provider's roster
@@ -7299,6 +7314,22 @@ pub(crate) fn observe_authorized(
         );
     }
     checking("account_observe_parse");
+    // Legacy callers keep their open envelope, but the success member has the
+    // same capability gate and validation as the closed routing/v1 shape.
+    if params.get("attempt_outcome").is_some() {
+        if let Err(refusal) = cortexkit_role_routing::observe::parse_account_observe_request_serving(
+            params,
+            &crate::routing_v1::describe::capabilities(),
+        ) {
+            let mut detail = refusal.detail;
+            detail.insert("code".into(), json!(refusal.code.as_str()));
+            return OpReply::typed(
+                refusal.code.as_str(),
+                refusal.message,
+                Value::Object(detail),
+            );
+        }
+    }
     let parsed: ObserveParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return invalid(format!("invalid route.account_observe params: {error}")),
@@ -7375,7 +7406,7 @@ fn record_observation(
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let runner = normalize(&parsed.caller.runner);
-    let existing = if allow_served_account || admission_principal != principal {
+    let existing = if parsed.attempt_outcome.is_some() || allow_served_account || admission_principal != principal {
         tx.observation_by_principal_event(principal, &parsed.event_id)?
     } else {
         tx.observation_by_event(principal, &runner, &parsed.event_id)?
@@ -7386,14 +7417,23 @@ fn record_observation(
                 "id": existing.observation_id,
                 "duplicate": true,
                 "bound": existing.bound,
-                "effects": serde_json::from_str::<Value>(&existing.effects_json).unwrap_or(Value::Null),
+                "effects": if parsed.attempt_outcome.is_some() { json!([]) } else {
+                    serde_json::from_str::<Value>(&existing.effects_json).unwrap_or(Value::Null)
+                },
             }
         })));
     }
     let observation_id = new_id("aco");
     // `routing_v1::accounts` resolves the admission's principal before the
     // transaction; a decision owner's event stays under the owner's principal.
+    let success_admission = match (&parsed.attempt_outcome, &parsed.admission_id) {
+        (Some(_), Some(id)) => tx.admission_for_success(admission_principal, id)?,
+        _ => None,
+    };
     let admission = match &parsed.admission_id {
+        Some(_) if parsed.attempt_outcome.is_some() => {
+            success_admission.as_ref().map(|r| r.row.clone())
+        }
         Some(id) => tx.admission(admission_principal, id)?,
         None => None,
     };
@@ -7523,6 +7563,7 @@ fn record_observation(
             principal,
             parsed,
             row,
+            success_admission.as_ref(),
             &observation_id,
             roster_digests,
             &mut effects,
@@ -7629,6 +7670,7 @@ fn apply_bound_observation(
     principal: &str,
     parsed: &ObserveParams,
     admission: &AccountAdmissionRow,
+    success_admission: Option<&striatum_store::AdmissionStateRow>,
     observation_id: &str,
     roster_digests: &BTreeMap<String, ProviderRosterFacts>,
     effects: &mut Vec<Value>,
@@ -7725,15 +7767,51 @@ fn apply_bound_observation(
                 )?;
             }
         }
-        "attempt" => header_fences(
-            tx,
-            ctx,
-            principal,
-            parsed,
-            admission,
-            observation_id,
-            effects,
-        )?,
+        "attempt" => {
+            if principal == admission.principal
+                && parsed.served_account_id.as_deref() == Some(admission.account_id.as_str())
+                && parsed.credential_id.as_deref() == Some(admission.credential_id.as_str())
+                && parsed.attempt_outcome.as_ref().is_some_and(|outcome| {
+                    matches!(
+                        outcome.status,
+                        cortexkit_role_routing::attempt::AttemptStatus::Served
+                            | cortexkit_role_routing::attempt::AttemptStatus::ServedEmpty
+                    )
+                })
+            {
+                let scope = striatum_store::QuotaSuccessScope {
+                    family: ctx
+                        .provider_policy(&admission.provider)
+                        .family_for_model(&admission.model),
+                    pool: request_pool(
+                        parsed.pool.as_deref(),
+                        &admission.provider,
+                        &admission.model,
+                    ),
+                };
+                if let Some(probe) = success_admission {
+                    for origin in tx.heal_admission_success(
+                        admission,
+                        probe.input_size_class,
+                        probe.model_decision_id.as_deref(),
+                        Some(&scope),
+                        now,
+                    )? {
+                        effects.push(json!({"effect":"block_cleared", "kind":origin.kind,
+                            "origin_key":origin.origin_key}));
+                    }
+                }
+            }
+            header_fences(
+                tx,
+                ctx,
+                principal,
+                parsed,
+                admission,
+                observation_id,
+                effects,
+            )?;
+        }
         "scoped_not_found" => {
             let (Some(credential_id), Some(view_digest)) = (
                 parsed.credential_id.as_deref(),

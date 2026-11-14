@@ -387,6 +387,27 @@ impl AccountCommand<'_> {
         }
     }
 
+    /// Success needs both the admission and its probe metadata. Open runs use
+    /// memory; a closed run reads the row and metadata in one keyed exception.
+    pub(crate) fn admission_for_success(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<striatum_store::AdmissionStateRow>> {
+        if let Some(open) = self
+            .admission_state()
+            .and_then(|state| state.open_admission(principal, id))
+        {
+            return Ok(Some(striatum_store::AdmissionStateRow {
+                row: open.row.clone(),
+                input_size_class: open.input_size_class,
+                model_decision_id: open.model_decision_id.clone(),
+                rowid: open.rowid,
+            }));
+        }
+        self.sql.admission_success_by_key(principal, id)
+    }
+
     /// The size class an open admission's probe was scoped to. A caller
     /// finishing the admission reads it first, while it is still open.
     pub(crate) fn admission_size_class(

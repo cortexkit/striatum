@@ -63,6 +63,7 @@ const FOR_MEMBERS: &[&str] = &[
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
+    "attempt_outcome",
     "decision_id",
     "retry_at_ms",
     "provider_code",
