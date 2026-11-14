@@ -1349,7 +1349,7 @@ async fn the_frozen_empty_mapping_joins_only_its_single_catalog_vendor() {
     assert_eq!(reply.1["detail"], json!({}), "{}", reply.1);
 }
 
-fn oauth_reading(used_percent: f64) {
+pub(super) fn oauth_reading(used_percent: f64) {
     let mut state = crate::account_quota::AccountQuotaState::default();
     crate::account_quota::apply_provider_reply(&mut state, "test-source", &serde_json::to_vec(&json!({
         "result":[{"provider":"test-source","apiProvider":"synthetic","account":"oauth-account","source":"vault",

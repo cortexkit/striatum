@@ -1240,6 +1240,9 @@ async fn handle_select_request_attempt(
     if account_selection::handles(&envelope.method) {
         let principal = route_principal(channel, epoch);
         let request: serde_json::Value = serde_json::from_slice(&frame.body).unwrap_or_default();
+        let call = (envelope.method == account_selection::ACCOUNT_FOR_OP).then(|| {
+            account_selection::call_log::AccountCall::legacy(&request["params"], &principal, store)
+        });
         let reply = crate::account_refusal_log::record(
             &envelope.method,
             &principal,
@@ -1288,9 +1291,18 @@ async fn handle_select_request_attempt(
                     now_ms: account_selection::now_ms(),
                     classes: Some(classes),
                 };
-                account_selection::handle(&envelope.method, &frame.body, &principal, &ctx)
+                account_selection::handle_with_call(
+                    &envelope.method,
+                    &frame.body,
+                    &principal,
+                    &ctx,
+                    call.clone(),
+                )
             },
         );
+        if let Some(call) = call {
+            call.finish();
+        }
         return send_account_reply(writer, ver, channel, epoch, corr, reply).await;
     }
 
