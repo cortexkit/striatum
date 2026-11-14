@@ -1787,34 +1787,7 @@ const NOT_APPLICABLE: &[&str] = &[
 // refusal reason: scheduling priority and account concurrency limits are not
 // implemented here. The conformance kit's run_suite has no priority check yet;
 // concurrency_full is a refusal reason, not a capability. Keep both unserved.
-// Media selection stays isolated until the kit accepts valid floating-point
-// unit rates and the caller-local cost policy is approved for production.
-const PENDING_READERS: &[(&str, &[&str])] = &[
-    ("select_kind", &["placement_select_kind"]),
-    (
-        "select_media",
-        &[
-            "select_media_input_characters",
-            "select_media_privacy",
-            "select_media_requirements",
-            "select_media_video",
-            "select_media_ranking",
-            "select_media_ladder",
-            "select_media_llm_refuses_media",
-            "select_media_refuses_llm",
-            "select_media_metric_limit",
-            "select_media_unlisted_kind",
-            "select_media_answer",
-            "select_media_pin",
-            "select_media_price",
-            "select_media_demand",
-            "select_media_ungraded_level",
-            "select_media_policy",
-            "select_media_report_admission",
-        ],
-    ),
-    ("consumer_priority", &[]),
-];
+const PENDING_READERS: &[(&str, &[&str])] = &[("consumer_priority", &[])];
 const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
 
 fn assert_no_pending_refusal(reply: &Frame) {
@@ -1962,7 +1935,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
                 &select,
                 &super::describe::capabilities()
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             cortexkit_role_routing::report::parse_report_request_serving(
