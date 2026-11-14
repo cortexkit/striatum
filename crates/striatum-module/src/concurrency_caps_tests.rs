@@ -99,9 +99,13 @@ fn cap_review_deadline_warns_once_without_disabling_the_cap() {
 #[test]
 fn cap_roster_plan_join_and_missing_catalog_cases_keep_settings() {
     let mut input = inputs("account_model", json!({}));
+    let state = roster(Some("ultra"));
+    let reading = state.readings.readings.values().next().unwrap();
+    let identity =
+        crate::account_quota::identity_for_reading(state.roster.as_ref().unwrap(), reading);
     assert_eq!(
-        crate::subscription_economics::plan_price_key("antigravity", "ultra"),
-        ("google", "ultra")
+        crate::subscription_economics::plan_price_key(reading, identity),
+        Some(("google", Some("ultra")))
     );
     for model in ["m1", "m2", "not-in-catalog"] {
         assert_eq!(input.resolved.cap("google", "a", model).limit, Some(3));

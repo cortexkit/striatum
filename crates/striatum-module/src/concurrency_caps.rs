@@ -182,19 +182,15 @@ impl CapInputs {
     pub(crate) fn publish_roster(&mut self, state: &crate::account_quota::AccountQuotaState) {
         let mut accounts = BTreeMap::new();
         if let Some(roster) = &state.roster {
-            for identity in &roster.identities {
-                let provider =
-                    crate::subscription_economics::plan_price_key(&identity.refresh_adapter, "").0;
-                accounts.insert(
-                    (provider.to_owned(), identity.account_id.clone()),
-                    identity.plan_tier.clone(),
-                );
-            }
             for reading in state.readings.readings.values() {
-                if let Some(provider) = reading.routing_provider() {
-                    let tier = crate::account_quota::identity_for_reading(roster, reading)
-                        .and_then(|identity| identity.plan_tier.clone());
-                    accounts.insert((provider.to_owned(), reading.account_id.clone()), tier);
+                let identity = crate::account_quota::identity_for_reading(roster, reading);
+                if let Some((provider, tier)) =
+                    crate::subscription_economics::plan_price_key(reading, identity)
+                {
+                    accounts.insert(
+                        (provider.to_owned(), reading.account_id.clone()),
+                        tier.map(str::to_owned),
+                    );
                 }
             }
         }

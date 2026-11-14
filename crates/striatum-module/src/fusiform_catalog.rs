@@ -106,7 +106,6 @@ impl PlanConcurrencyCatalog {
         provider: &str,
         tier: &str,
     ) -> Option<crate::concurrency_caps::EffectiveCap> {
-        let (provider, tier) = crate::subscription_economics::plan_price_key(provider, tier);
         self.caps
             .get(&(provider.to_owned(), tier.to_owned()))
             .copied()
