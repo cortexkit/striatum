@@ -82,6 +82,20 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
     result(reply);
     assert_reads("in-run observation", &ordinary, &keyed, 0);
 
+    let (reply, ordinary, keyed) = traced(
+        reads,
+        runner.call(
+            "route.account_observe",
+            &json!({"event_id":"second-served","kind":"attempt","admission_id":"second",
+            "served_account_id":admitted["account"]["account_id"],
+            "credential_id":admitted["account"]["credential_id"],
+            "attempt_outcome":{"status":"served"}}),
+        ),
+    )
+    .await;
+    result(reply);
+    assert_reads("in-run typed success", &ordinary, &keyed, 0);
+
     let (reply, ordinary, keyed) = traced(reads, runner.call("route.account_for", &request)).await;
     let offer = result(reply);
     assert_eq!(offer["kind"], "offer", "{offer}");
@@ -115,7 +129,10 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
         runner.call(
             "route.account_observe",
             &json!({"event_id":"after-finish","kind":"attempt",
-                "admission_id":"admission","run_id":"run"}),
+                "admission_id":"admission","run_id":"run",
+                "served_account_id":request["exhausted"]["account"],
+                "credential_id":request["exhausted"]["credential_id"],
+                "attempt_outcome":{"status":"served_empty"}}),
         ),
     )
     .await;

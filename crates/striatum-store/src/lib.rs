@@ -104,6 +104,7 @@ pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;
+pub use account_selection::ContinuationSourceRow;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
@@ -338,7 +339,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 89] {
+fn route_state_migrations() -> [Migration; 90] {
     [
         Migration {
             version: 1,
@@ -695,6 +696,10 @@ fn route_state_migrations() -> [Migration; 89] {
         Migration {
             version: 90,
             statements: include_str!("../migrations/090_account_affinity_by_pin.sql"),
+        },
+        Migration {
+            version: 91,
+            statements: include_str!("../migrations/091_admission_conversation_lookup.sql"),
         },
     ]
 }
@@ -6355,6 +6360,11 @@ mod tests {
                             && !line.starts_with(
                                 "account_admission index account_admission_model_decision ",
                             )
+                            && !line.starts_with(
+                                "account_admission index account_admission_by_conversation ",
+                            )
+                            && !line
+                                .starts_with("account_continue index account_continue_by_admission ")
                             && !line.starts_with(demand_index)
                     })
                     .collect();

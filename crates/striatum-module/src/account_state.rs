@@ -41,12 +41,14 @@ impl AccountState {
     }
 
     fn load_at(tx: &AccountTx<'_>, now: i64) -> RouteStateResult<Self> {
-        let rows = tx.load_admission_group()?;
-        let inflight = InflightLedger::from_rows(rows.open.iter().map(|open| &open.row), now);
+        let mut rows = tx.load_admission_group()?;
+        let sources = std::mem::take(&mut rows.continuation_sources);
+        let admissions = AdmissionState::from_rows(rows);
+        let inflight = InflightLedger::from_admissions(&admissions, sources, now);
         Ok(Self {
             generation: 0,
             selection_salt: tx.existing_salt()?.map(Arc::new),
-            admissions: AdmissionState::from_rows(rows),
+            admissions,
             inflight,
             blocks: tx.load_block_state()?,
         })
@@ -57,6 +59,13 @@ impl AccountState {
 /// source row it deleted. Counted apart from request-path reads, which the
 /// admission state must not need.
 static MAINTENANCE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static CONTINUATION_SOURCE_READS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn continuation_source_reads() -> u64 {
+    CONTINUATION_SOURCE_READS.load(Ordering::Relaxed)
+}
 
 #[cfg(test)]
 pub(crate) fn maintenance_reads() -> u64 {
@@ -421,6 +430,27 @@ impl AccountCommand<'_> {
                 .admission(principal, admission_id)?
                 .filter(|row| matches!(row.state.as_str(), "reserved" | "started" | "expired"))),
         }
+    }
+
+    /// Success needs both the admission and its probe metadata. Open runs use
+    /// memory; a closed run reads the row and metadata in one keyed exception.
+    pub(crate) fn admission_for_success(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<striatum_store::AdmissionStateRow>> {
+        if let Some(open) = self
+            .admission_state()
+            .and_then(|state| state.open_admission(principal, id))
+        {
+            return Ok(Some(striatum_store::AdmissionStateRow {
+                row: open.row.clone(),
+                input_size_class: open.input_size_class,
+                model_decision_id: open.model_decision_id.clone(),
+                rowid: open.rowid,
+            }));
+        }
+        self.sql.admission_success_by_key(principal, id)
     }
 
     /// The size class an open admission's probe was scoped to. A caller
@@ -846,12 +876,45 @@ impl AccountCommand<'_> {
         previous: &str,
         offer: Option<(&str, &str, i64)>,
     ) -> RouteStateResult<()> {
-        self.sql
-            .record_continuation(principal, selection, record, run, admission, previous, offer)?;
+        self.sql.record_continuation(
+            principal, selection, record, run, admission, previous, offer,
+        )?;
         let rowid = self.sql.last_insert_rowid();
+        let source = if offer.is_some() && self.state.is_some() {
+            let state = self.admission_state().expect("checked above");
+            let left = state
+                .chains
+                .get(&(principal.to_owned(), admission.to_owned()))
+                .and_then(|chain| chain.runs.get(run))
+                .and_then(|rows| rows.values().find(|row| row.decision_id == previous))
+                .map(|row| row.reservation_id.clone())
+                .unwrap_or_else(|| admission.to_owned());
+            if state.open_admission(principal, &left).is_none() {
+                // Real continuation requests require an open source. Keep the
+                // low-level writer coherent for old or synthetic closed sources,
+                // but make an unexpected production lookup visible.
+                tracing::warn!(%principal, admission_id = %left, "continuation source is not open; using keyed admission lookup");
+                CONTINUATION_SOURCE_READS.fetch_add(1, Ordering::Relaxed);
+            }
+            self.admission(principal, &left)?
+                .map(|row| striatum_store::ContinuationSourceRow {
+                    principal: principal.to_owned(),
+                    selection_id: selection.to_owned(),
+                    run_id: run.to_owned(),
+                    left_admission_id: left,
+                    provider: row.provider,
+                    account_id: row.account_id,
+                    used_at_ms: None,
+                })
+        } else {
+            None
+        };
         self.mirror(|state| {
             state.record_continuation(principal, selection, run, admission, previous, offer, rowid)
         });
+        if let (Some(state), Some(source)) = (self.state.as_deref_mut(), source) {
+            state.inflight.cache_source(source);
+        }
         Ok(())
     }
 
@@ -863,6 +926,10 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn use_continuation(&mut self, decision: &str, now: i64) -> RouteStateResult<()> {
+        // Report delivery runs directly on the store writer. Evaluate windows
+        // at the report's received time, just as the durable start does, rather
+        // than sampling another clock after the report has waited in the queue.
+        self.now_ms = now;
         if self.state.is_none() {
             return self.sql.use_continuation(decision, now);
         }
@@ -1002,6 +1069,9 @@ impl AccountCommand<'_> {
             .sql
             .prune_account_continuations_returning(before, limit)?;
         let sql = self.sql;
+        if let Some(state) = self.state.as_deref_mut() {
+            state.inflight.prune_continuations(&deleted);
+        }
         if let Some(state) = self.admissions() {
             for original in state.prune_continuations(&deleted) {
                 MAINTENANCE_READS.fetch_add(1, Ordering::Relaxed);

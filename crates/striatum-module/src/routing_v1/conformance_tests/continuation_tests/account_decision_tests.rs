@@ -2,6 +2,7 @@ use super::*;
 
 async fn paused_without_selection() -> (KitSubject, Route, Value, Value) {
     let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
         harness: Mutex::new(Harness::new("continue-account-decision")),
     };
     subject

@@ -52,6 +52,11 @@ mod account_fact_tests {
     use super::*;
 
     #[test]
+    fn admission_column_count_matches_the_column_list() {
+        assert_eq!(ADMISSION_COLUMNS.split(',').count(), ADMISSION_COLUMN_COUNT);
+    }
+
+    #[test]
     fn end_lease_query_plan_uses_affinity_pin_index() {
         let scratch = cortexkit_test_support::ScratchDir::new("end-lease-query-plan");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
@@ -1317,6 +1322,11 @@ const ADMISSION_COLUMNS: &str = "principal, admission_id, request_fingerprint, r
      pin_generation, state, charged, request_bytes, request_bytes_estimated, committed_at, \
      admission_valid_until, lease_valid_until, reply_json, run_id, started_at, started_late, \
      released_at, finished_at, last_observed_at";
+
+/// How many columns `ADMISSION_COLUMNS` selects. Queries that select extra
+/// columns after it read them from this index on, so adding an admission
+/// column moves them all at once instead of leaving a stale literal index.
+const ADMISSION_COLUMN_COUNT: usize = 26;
 
 fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
     Ok(AccountAdmissionRow {

@@ -73,6 +73,19 @@ pub struct ContinuationStateRow {
     pub reservation: Option<ReservationRef>,
 }
 
+/// The row an offer leaves, independent of that row's lifecycle state or
+/// the retention of routing/v1 request records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContinuationSourceRow {
+    pub principal: String,
+    pub selection_id: String,
+    pub run_id: String,
+    pub left_admission_id: String,
+    pub provider: String,
+    pub account_id: String,
+    pub used_at_ms: Option<i64>,
+}
+
 /// An admission row a retention pass deleted, with the fields the derived
 /// indexes are keyed by.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +128,7 @@ pub struct AdmissionGroupRows {
     pub offers: Vec<ContinuationStateRow>,
     /// Every offer row whose original admission is still open, in rowid order.
     pub chains: Vec<ContinuationStateRow>,
+    pub continuation_sources: Vec<ContinuationSourceRow>,
 }
 
 const OPEN_STATES: &str = "('reserved', 'started', 'expired')";
@@ -248,10 +262,10 @@ impl AccountTx<'_> {
                     Ok(AdmissionStateRow {
                         row: admission_from_row(row)?,
                         input_size_class: row
-                            .get::<_, Option<i64>>(26)?
+                            .get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
                             .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
-                        model_decision_id: row.get(27)?,
-                        rowid: row.get(28)?,
+                        model_decision_id: row.get(ADMISSION_COLUMN_COUNT + 1)?,
+                        rowid: row.get(ADMISSION_COLUMN_COUNT + 2)?,
                     })
                 },
             )?;
@@ -277,7 +291,7 @@ impl AccountTx<'_> {
                 [],
                 affinity_from_row,
             )?;
-            let (offers, chains) = if continuations_exist(conn)? {
+            let (offers, chains, continuation_sources) = if continuations_exist(conn)? {
                 let offers = collect(
                     conn,
                     &format!(
@@ -304,9 +318,37 @@ impl AccountTx<'_> {
                     [],
                     continuation_from_row,
                 )?;
-                (offers, chains)
+                // A predecessor decision identifies another offer only within
+                // the same admission and run. Otherwise the offer left its
+                // original admission. Closed rows still supply this evidence.
+                let continuation_sources = collect(
+                    conn,
+                    "SELECT c.principal, c.selection_id, c.run_id, l.admission_id,
+                            l.provider, l.account_id, c.used_at_ms
+                     FROM account_continue c
+                     LEFT JOIN account_continue p
+                       ON p.principal=c.principal AND p.admission_id=c.admission_id
+                      AND p.run_id=c.run_id AND p.decision_id=c.previous_decision_id
+                     JOIN account_admission l ON l.principal=c.principal
+                      AND l.admission_id=COALESCE(p.reservation_id, c.admission_id)
+                     WHERE c.decision_id IS NOT NULL
+                       AND (c.used_at_ms IS NOT NULL OR c.released_at_ms IS NULL)",
+                    [],
+                    |row| {
+                        Ok(ContinuationSourceRow {
+                            principal: row.get(0)?,
+                            selection_id: row.get(1)?,
+                            run_id: row.get(2)?,
+                            left_admission_id: row.get(3)?,
+                            provider: row.get(4)?,
+                            account_id: row.get(5)?,
+                            used_at_ms: row.get(6)?,
+                        })
+                    },
+                )?;
+                (offers, chains, continuation_sources)
             } else {
-                (Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new())
             };
             Ok(AdmissionGroupRows {
                 open,
@@ -314,6 +356,7 @@ impl AccountTx<'_> {
                 affinities,
                 offers,
                 chains,
+                continuation_sources,
             })
         })()
         .map_err(err)
@@ -329,11 +372,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<LatestAdmissionRow>> {
         self.conn
             .query_row(
-                &format!(
-                    "SELECT {LATEST_COLUMNS} FROM account_admission \
-                     WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3 \
-                     ORDER BY committed_at DESC, rowid DESC LIMIT 1"
-                ),
+                &latest_admission_for_conversation_sql(),
                 params![principal, conversation_hash, provider],
                 latest_from_row,
             )
@@ -351,14 +390,75 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<Option<(i64, String)>> {
         self.conn
             .query_row(
-                "SELECT rowid, reservation_id FROM account_continue \
-                 WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
-                 ORDER BY rowid DESC LIMIT 1",
+                LATEST_USED_CONTINUATION_SQL,
                 params![principal, admission_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(err)
+    }
+}
+
+// Both run under the account writer for every conversation retention prunes,
+// so each must be an indexed lookup (migration 91), never a principal scan.
+fn latest_admission_for_conversation_sql() -> String {
+    format!(
+        "SELECT {LATEST_COLUMNS} FROM account_admission \
+         WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3 \
+         ORDER BY committed_at DESC, rowid DESC LIMIT 1"
+    )
+}
+
+const LATEST_USED_CONTINUATION_SQL: &str = "SELECT rowid, reservation_id FROM account_continue \
+     WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
+     ORDER BY rowid DESC LIMIT 1";
+
+#[cfg(test)]
+mod lookup_plan_tests {
+    use super::*;
+
+    fn plan(sql: &str) -> Vec<String> {
+        let scratch = cortexkit_test_support::ScratchDir::new("maintenance-lookup-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "maintenance-lookup-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .with_writer_for_test(|conn| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let rows = statement
+                    .query_map(
+                        rusqlite::params_from_iter(
+                            ["p", "c", "x"].into_iter().take(sql.matches('?').count()),
+                        ),
+                        |row| row.get::<_, String>(3),
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn retention_conversation_recheck_uses_an_index_without_sorting() {
+        let plan = plan(&latest_admission_for_conversation_sql());
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("account_admission_by_conversation")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    #[test]
+    fn retention_continuation_recheck_uses_an_index() {
+        let plan = plan(LATEST_USED_CONTINUATION_SQL);
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("account_continue_by_admission")),
+            "{plan:?}"
+        );
     }
 }
 
@@ -523,6 +623,41 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// A closed admission and its success-proof metadata in one primary-key
+    /// lookup. Open admissions supply these fields from the module's cache.
+    pub fn admission_success_by_key(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<AdmissionStateRow>> {
+        let scope = if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            "input_size_class,model_decision_id"
+        } else {
+            "NULL,NULL"
+        };
+        note_keyed_exception();
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {ADMISSION_COLUMNS},{scope},rowid
+            FROM account_admission {KEYED_EXCEPTION} WHERE principal=?1 AND admission_id=?2"
+                ),
+                params![principal, id],
+                |row| {
+                    Ok(AdmissionStateRow {
+                        row: admission_from_row(row)?,
+                        input_size_class: row
+                            .get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
+                            .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
+                        model_decision_id: row.get(ADMISSION_COLUMN_COUNT + 1)?,
+                        rowid: row.get(ADMISSION_COLUMN_COUNT + 2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
     /// The admissions (at most two, enough to tell an ambiguous run) that a
     /// completed report's decision and run name, each with its probe size
     /// class. Keyed exception: the module's state holds only open admissions
@@ -544,7 +679,7 @@ impl AccountTx<'_> {
             |row| {
                 Ok((
                     admission_from_row(row)?,
-                    row.get::<_, Option<i64>>(26)?
+                    row.get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
                         .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
                 ))
             },
@@ -598,4 +733,3 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 }
-

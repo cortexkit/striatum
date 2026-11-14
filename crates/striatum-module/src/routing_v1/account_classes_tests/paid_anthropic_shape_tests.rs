@@ -416,6 +416,19 @@ fn single_key_request(id: &str) -> Value {
     request
 }
 
+#[path = "observe_success_tests.rs"]
+mod observe_success_tests;
+
+fn success_observation(id: &str, legacy: bool) -> Value {
+    let mut params = json!({"event_id":format!("{id}/success"),"kind":"attempt",
+        "admission_id":id,"served_account_id":KEYS[0],"credential_id":KEYS[0],
+        "attempt_outcome":{"status":"served"}});
+    if legacy {
+        params["caller"] = json!({"runner":"broca"});
+    }
+    params
+}
+
 async fn served_attempt_and_completed_run(
     broca: &super::super::conformance_tests::Route,
     id: &str,
@@ -452,7 +465,7 @@ async fn served_attempt_and_completed_run(
 }
 
 #[tokio::test]
-async fn decisionless_paid_key_quota_probe_retests_after_served_attempt_and_completed_run() {
+async fn decisionless_paid_key_quota_probe_heals_only_after_typed_served_attempt() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = paid_anthropic_harness();
     let scope = FenceScope::General(GeneralWindow::FiveHour);
@@ -510,7 +523,8 @@ async fn decisionless_paid_key_quota_probe_retests_after_served_attempt_and_comp
     assert_eq!(blocked.0, FrameType::Error, "{}", blocked.1);
     assert_eq!(blocked.1["code"], "account_pool_exhausted");
 
-    let _later = crate::InjectedClock::set(NOW + 900_001);
+    let success = observe_ok(&broca, &success_observation("quota-probe", false)).await;
+    assert!(!success["effects"].as_array().unwrap().is_empty());
     let retried = broca
         .call("route.account_for", &single_key_request("quota-retest"))
         .await;
@@ -519,19 +533,15 @@ async fn decisionless_paid_key_quota_probe_retests_after_served_attempt_and_comp
         .store()
         .account_read(|tx| {
             let fences = tx.active_fences(POOL)?;
-            assert_eq!(fences.len(), 1);
-            assert_eq!(fences[0].fence_id, "decisionless-quota");
-            assert_eq!(fences[0].observed_at, observed_at);
-            let rechecks = tx.fence_rechecks()?;
-            assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 900_001));
-            assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 1_800_001);
+            assert!(fences.is_empty());
+            assert!(tx.fence_rechecks()?.is_empty());
             Ok(())
         })
         .unwrap();
 }
 
 #[tokio::test]
-async fn decisionless_paid_key_non_quota_probe_retests_after_served_attempt_and_completed_run() {
+async fn decisionless_paid_key_non_quota_probe_heals_only_after_typed_served_attempt() {
     for code in ["credential_refused", "billing_exhausted"] {
         let _clock = crate::InjectedClock::set(NOW);
         let harness = paid_anthropic_harness();
@@ -574,22 +584,18 @@ async fn decisionless_paid_key_non_quota_probe_retests_after_served_attempt_and_
         assert_eq!(blocked.1["code"], "account_pool_exhausted");
         assert_eq!(blocked.1["detail"]["reset_at_ms"], NOW + 3_600_000);
 
-        let _later = crate::InjectedClock::set(NOW + 3_600_001);
+        let success = observe_ok(&broca, &success_observation("non-quota-probe", true)).await;
+        assert!(!success["effects"].as_array().unwrap().is_empty());
         let retried = broca
             .call("route.account_for", &single_key_request("non-quota-retest"))
             .await;
         assert_eq!(retried.0, FrameType::Response, "{}", retried.1);
         let fences = harness.store().credential_entitlement_fences().unwrap();
-        assert_eq!(fences.len(), 1);
-        assert_eq!(fences[0].credential_id, KEYS[0]);
-        assert_eq!(fences[0].code, code);
-        assert_eq!(fences[0].observed_at_ms, observed_at);
+        assert!(fences.is_empty(), "{code}: {fences:?}");
         harness
             .store()
             .account_read(|tx| {
-                let rechecks = tx.fence_rechecks()?;
-                assert_eq!(rechecks[0].last_claimed_at, Some(NOW as i64 + 3_600_001));
-                assert_eq!(rechecks[0].next_recheck_at, NOW as i64 + 7_200_001);
+                assert!(tx.fence_rechecks()?.is_empty());
                 Ok(())
             })
             .unwrap();

@@ -160,11 +160,10 @@ impl SqliteRouteStateStore {
                 }
                 report_outcome(&tx, decision_id, outcome, error, now)?;
             }
-            // Core reuses one decision for several runs (Athena seats, mason
-            // retries), and each run reports separately under a `run:` delivery
-            // key. Each new delivery settles that run's own test request, so
-            // healing keys on the delivery rather than on the decision's first
-            // recorded outcome.
+            // Core can reuse one routing decision for several runs, and each
+            // run reports separately under a `run:` delivery key. Each new
+            // delivery settles that run's own test request, so healing keys on
+            // the delivery rather than on the decision's first recorded outcome.
             if outcome == RouteOutcome::Completed && !effects.preserve_probe {
                 account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
                     .map_err(sql_error)?;
@@ -194,6 +193,115 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Settle success using the admission's identity, `committed_at` cutoff and
+    /// exact probe proof. Return the origins actually cleared for observation effects.
+    pub fn heal_admission_success(
+        &self,
+        admission: &AccountAdmissionRow,
+        size: Option<u32>,
+        decision: Option<&str>,
+        scope: Option<&crate::QuotaSuccessScope>,
+        now: i64,
+    ) -> RouteStateResult<Vec<crate::FenceRecheck>> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(Vec::new());
+        }
+        let owner = serde_json::json!([
+            "account_admission",
+            admission.principal,
+            admission.admission_id
+        ])
+        .to_string();
+        let origins: Vec<_> = self
+            .fence_rechecks()?
+            .into_iter()
+            .filter(|origin| {
+                origin.applies(
+                    &admission.provider,
+                    &admission.account_id,
+                    &admission.credential_id,
+                    &admission.model,
+                ) && origin
+                    .principal
+                    .as_deref()
+                    .is_none_or(|p| p == admission.principal)
+                    && origin
+                        .admission_id
+                        .as_deref()
+                        .is_none_or(|id| id == admission.admission_id)
+                    && origin
+                        .size_class
+                        .is_none_or(|class| Some(class as u32) == size)
+            })
+            .collect();
+        // An admission authorized to test a whole-account fence can clear that
+        // fence without a quota reading. Pool-scoped fences additionally require
+        // the success scope to cover their pool and model.
+        let mut captured = Vec::new();
+        for origin in &origins {
+            if origin.kind == "account" {
+                let key: Vec<serde_json::Value> =
+                    serde_json::from_str(&origin.origin_key).map_err(err)?;
+                let pool: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT pool_key_json FROM account_fence WHERE fence_id=?1",
+                        [key[0].as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(err)?;
+                if let Some(pool) = pool {
+                    let pool = serde_json::from_str(&pool).map_err(err)?;
+                    if !scope.is_some_and(|scope| scope.used(&pool, &admission.model)) {
+                        continue;
+                    }
+                }
+            }
+            captured.push(origin.clone());
+        }
+        self.heal_report_probe(
+            &owner,
+            decision,
+            true,
+            &admission.model,
+            admission.committed_at,
+            &captured,
+            now,
+        )?;
+        let serving: Vec<_> = self
+            .fence_rechecks()?
+            .into_iter()
+            .filter(|origin| {
+                origin.principal.is_none()
+                    && origin.evidence_at < admission.committed_at
+                    && origins.iter().any(|scoped| {
+                        scoped.kind == origin.kind
+                            && scoped.origin_key == origin.origin_key
+                            && scoped.evidence == origin.evidence
+                    })
+            })
+            .collect();
+        self.heal_origins(
+            &serving,
+            &admission.model,
+            admission.committed_at,
+            now,
+            scope,
+            false,
+        )?;
+        let remaining = self.fence_rechecks()?;
+        Ok(origins
+            .into_iter()
+            .filter(|origin| {
+                !remaining.iter().any(|other| {
+                    other.kind == origin.kind
+                        && other.origin_key == origin.origin_key
+                        && other.evidence == origin.evidence
+                })
+            })
+            .collect())
+    }
+
     fn heal_report_run(
         &self,
         decision: &str,
@@ -215,7 +323,6 @@ impl AccountTx<'_> {
             return Ok(());
         }
         if let Some((admission, size)) = admissions.into_iter().next() {
-            let (principal, id) = (&admission.principal, &admission.admission_id);
             if effects
                 .reported_credential
                 .as_deref()
@@ -228,38 +335,12 @@ impl AccountTx<'_> {
                 );
                 return Ok(());
             }
-            let owner = serde_json::json!(["account_admission", principal, id]).to_string();
-            let origins: Vec<_> = self
-                .fence_rechecks()?
-                .into_iter()
-                .filter(|origin| {
-                    origin.applies(
-                        &admission.provider,
-                        &admission.account_id,
-                        &admission.credential_id,
-                        &admission.model,
-                    ) && origin
-                        .size_class
-                        .is_none_or(|class| Some(class as u32) == size)
-                })
-                .collect();
-            self.heal_report_probe(
-                &owner,
-                Some(decision),
-                &admission.model,
-                admission.committed_at,
-                &origins,
-                now,
-            )?;
-            self.heal_serving_fences_in_scope(
-                &admission.provider,
-                &admission.account_id,
-                &admission.credential_id,
-                &admission.model,
+            self.heal_admission_success(
+                &admission,
                 size,
-                admission.committed_at,
-                now,
+                Some(decision),
                 effects.quota_scope.as_ref(),
+                now,
             )?;
         } else {
             // A decision without an account admission still owns its selection
@@ -279,7 +360,15 @@ impl AccountTx<'_> {
                         |row| row.get(0),
                     )
                     .map_err(err)?;
-                self.heal_report_probe(decision, None, &model, at, &self.fence_rechecks()?, now)?;
+                self.heal_report_probe(
+                    decision,
+                    None,
+                    false,
+                    &model,
+                    at,
+                    &self.fence_rechecks()?,
+                    now,
+                )?;
                 // Only the first report may heal older matching serving evidence
                 // without a probe authorization. If this decision held one (a
                 // `fence_probe_authorization` row it owns), only

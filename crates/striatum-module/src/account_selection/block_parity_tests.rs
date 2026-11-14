@@ -17,11 +17,9 @@ fn old_targets(
         .credential_id
         .as_deref()
         .filter(|id| {
-            (origin.quota
-                || matches!(
-                    origin.kind.as_str(),
-                    "account_route" | "non_quota_route" | "transient_route"
-                ))
+            // Quota is shared by the account's credentials. Credit and backoff
+            // require the queried credential to match the block's credential.
+            origin.quota
                 && crate::credential_fences::credential_account_id(&c.account_ids, id).as_deref()
                     == Some(account)
         })
