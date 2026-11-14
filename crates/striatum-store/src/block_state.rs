@@ -69,6 +69,8 @@ thread_local! {
     /// Rows changed in the block tables by the account command running on
     /// this thread. `None` while no command runs.
     static CAPTURE: RefCell<Option<Vec<(u8, i64)>>> = const { RefCell::new(None) };
+    /// Whether a test seeding seam is writing on this thread.
+    static SEEDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Called by the writer connection's update hook. Returns false when no
@@ -82,6 +84,31 @@ pub(crate) fn capture(table: u8, rowid: i64) -> bool {
         }
         None => false,
     })
+}
+
+/// Whether the write the update hook reports comes from a test seeding seam
+/// such as `with_writer_for_test`. Such writes bypass the account writer on
+/// purpose; they still make the writer reload, but are not violations.
+pub(crate) fn seeding() -> bool {
+    SEEDING.with(|seeding| seeding.get())
+}
+
+/// Marks writes on this thread as test seeding until dropped.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) struct Seeding(bool);
+
+#[cfg(any(test, feature = "test-support"))]
+impl Seeding {
+    pub(crate) fn begin() -> Self {
+        Self(SEEDING.with(|seeding| seeding.replace(true)))
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for Seeding {
+    fn drop(&mut self) {
+        SEEDING.with(|seeding| seeding.set(self.0));
+    }
 }
 
 /// Collects the block rows one account command changes.

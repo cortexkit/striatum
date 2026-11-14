@@ -285,17 +285,22 @@ fn a_failed_command_leaves_no_captured_row() {
 #[test]
 fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
     let rig = rig("block-state-outside");
+    let row = |account: &str| {
+        format!(
+            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
+            NOW + 60_000
+        )
+    };
+    // A test seed bypasses the writer on purpose: it reloads the state but is
+    // not a violation.
     let loads = rig.owner.loads.load(Ordering::Relaxed);
-    let outside = rig.store.block_writes_outside_command();
+    let seeds = rig.store.block_seed_writes_for_test();
+    let seed = row("seeded");
     rig.store
-        .with_writer_for_test(|conn| {
-            conn.execute_batch(&format!(
-                "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');",
-                NOW + 60_000
-            ))
-        })
+        .with_writer_for_test(move |conn| conn.execute_batch(&seed))
         .unwrap();
-    assert_eq!(rig.store.block_writes_outside_command(), outside + 1);
+    assert_eq!(rig.store.block_seed_writes_for_test(), seeds + 1);
+    assert_eq!(rig.store.block_writes_outside_command(), 0);
     assert_eq!(
         rig.published().table_sizes()[10].1,
         0,
@@ -307,7 +312,22 @@ fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
         loads + 1,
         "one reload"
     );
-    rig.check(&[NOW], "after an outside write and a reload");
+    rig.check(&[NOW], "after a seed and a reload");
+    // Any other write outside a command is counted, named and reloaded.
+    rig.store
+        .bypass_account_writer_for_test(&row("bypass"))
+        .unwrap();
+    assert_eq!(rig.store.block_writes_outside_command(), 1);
+    let tables = rig.store.block_tables_written_outside_command();
+    assert_eq!(tables.len(), 1);
+    assert_eq!(tables[0].0, "account_transient_backoff");
+    rig.sql("SELECT 1;".into());
+    assert_eq!(
+        rig.owner.loads.load(Ordering::Relaxed),
+        loads + 2,
+        "one more reload"
+    );
+    rig.check(&[NOW], "after a bypass and a reload");
 }
 
 #[test]

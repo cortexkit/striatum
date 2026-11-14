@@ -25,6 +25,13 @@ struct WriterMetrics {
     /// it before its next batch.
     block_reload: Arc<std::sync::atomic::AtomicBool>,
     block_writes_outside: AtomicU64,
+    /// Block-table rows written by test seeding seams, which bypass the
+    /// account writer on purpose. They reload the state but are not counted
+    /// as violations.
+    block_seed_writes: AtomicU64,
+    /// Each (table, thread) that wrote a block table outside an account
+    /// command, warned about once.
+    block_outside_tables: Mutex<BTreeSet<(String, String)>>,
     #[cfg(any(test, feature = "test-support"))]
     outside_account_writer: AtomicU64,
 }
@@ -227,8 +234,29 @@ impl ConnectionStore {
                     if database == "main" {
                         if let Some(index) = crate::block_state::table_index(table) {
                             if !crate::block_state::capture(index, rowid) {
-                                changes.block_writes_outside.fetch_add(1, Ordering::Relaxed);
                                 changes.block_reload.store(true, Ordering::Release);
+                                if crate::block_state::seeding() {
+                                    changes.block_seed_writes.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    changes.block_writes_outside.fetch_add(1, Ordering::Relaxed);
+                                    let thread = std::thread::current()
+                                        .name()
+                                        .unwrap_or("unnamed")
+                                        .to_owned();
+                                    if changes
+                                        .block_outside_tables
+                                        .lock()
+                                        .unwrap()
+                                        .insert((table.to_owned(), thread.clone()))
+                                    {
+                                        tracing::warn!(
+                                            table,
+                                            thread,
+                                            "block table written outside an account command; \
+                                             the account writer reloads its state before the next batch"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
@@ -368,6 +396,28 @@ impl SqliteRouteStateStore {
             .metrics
             .block_writes_outside
             .load(Ordering::Relaxed)
+    }
+    /// The tables written outside an account command so far, each with the
+    /// thread that wrote it.
+    pub fn block_tables_written_outside_command(&self) -> Vec<(String, String)> {
+        self.store
+            .metrics
+            .block_outside_tables
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+    /// Block-table rows written by test seeding seams.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn block_seed_writes_for_test(&self) -> u64 {
+        self.store.metrics.block_seed_writes.load(Ordering::Relaxed)
+    }
+    /// Whether a block-table write outside an account command is waiting for
+    /// the writer to reload the state.
+    pub fn account_state_reload_pending(&self) -> bool {
+        self.store.metrics.block_reload.load(Ordering::Acquire)
     }
     /// Queue time from command enqueue to batch start, excluding connection wait.
     pub fn account_command_queue_ns(&self) -> u64 {

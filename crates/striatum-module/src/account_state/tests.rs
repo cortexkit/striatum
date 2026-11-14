@@ -642,3 +642,39 @@ fn concurrent_retries_after_a_failed_load_share_one_reload() {
     }
     assert_eq!(loads.load(Ordering::Relaxed) - initial, 1);
 }
+
+#[test]
+#[should_panic(expected = "block tables written outside an account command")]
+fn a_block_write_that_bypasses_the_account_writer_fails_the_next_state_read() {
+    let (_scratch, store) = fixture("state-block-bypass");
+    install(&store);
+    // Not a seeding seam: this stands for production code writing a block
+    // table without a writer command.
+    store
+        .bypass_account_writer_for_test(
+            "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+        )
+        .unwrap();
+    let _ = super::snapshot(&store);
+}
+
+#[test]
+fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
+    let (_scratch, store) = fixture("state-block-seed");
+    let owner = install(&store);
+    let loads = owner.loads.load(Ordering::Relaxed);
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute_batch(
+                "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+            )
+        })
+        .unwrap();
+    assert!(store.block_seed_writes_for_test() > 0);
+    assert_eq!(store.block_writes_outside_command(), 0, "seeding is no violation");
+    let state = super::snapshot(&store).unwrap();
+    assert_eq!(owner.loads.load(Ordering::Relaxed), loads + 1);
+    let fresh = store.account_transaction(AccountState::load).unwrap();
+    assert_eq!(state.blocks, fresh.blocks);
+    assert_eq!(state.blocks.table_sizes()[10], ("account_transient_backoff", 1));
+}

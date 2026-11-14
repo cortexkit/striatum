@@ -69,11 +69,6 @@ impl WriterAccountState {
             let outside = self
                 .block_reload
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
-            if outside && self.working.is_some() {
-                tracing::warn!(
-                    "block tables changed outside an account command; reloading account state"
-                );
-            }
             let reload = bridge.reload_requested() | outside;
             if !reload && self.working.is_some() && self.data_version == Some(version) {
                 return Ok(None);
@@ -199,5 +194,31 @@ impl crate::SqliteRouteStateStore {
         self.account_writer_engine()
             .enqueue_inner(|_, _| Ok(()), true)?
             .wait()
+    }
+
+    /// Before a test reads the published state, reload it if a test seed
+    /// wrote a block table outside an account command since the last batch.
+    /// Production waits for the next batch instead, so a reader never blocks
+    /// on the writer. The writer thread itself never waits on its own queue.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reload_account_state_if_pending_for_test(&self) -> RouteStateResult<()> {
+        if !self.account_state_reload_pending()
+            || self.account_state.get().is_none()
+            || std::thread::current().name() == Some("account-writer")
+        {
+            return Ok(());
+        }
+        self.account_writer_engine()
+            .enqueue_inner(|_, _| Ok(()), true)?
+            .wait()
+    }
+
+    /// Write a block row outside any account command and outside the test
+    /// seeding seams, as a production bypass would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn bypass_account_writer_for_test(&self, sql: &str) -> RouteStateResult<()> {
+        self.store
+            .with_conn(|conn: &rusqlite::Connection| conn.execute_batch(sql))
+            .map_err(crate::err)
     }
 }

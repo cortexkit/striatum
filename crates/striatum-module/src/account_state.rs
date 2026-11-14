@@ -228,6 +228,18 @@ impl StateOwner {
 
 pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
     initialize(store)?;
+    #[cfg(test)]
+    {
+        // A block-table write outside an account command that no test
+        // seeding seam made is a bypass of the account writer: fail the test
+        // rather than answer from a state that missed it.
+        let bypasses = store.block_tables_written_outside_command();
+        assert!(
+            bypasses.is_empty(),
+            "block tables written outside an account command (table, thread): {bypasses:?}"
+        );
+        store.reload_account_state_if_pending_for_test()?;
+    }
     store
         .account_state_bridge()
         .unwrap()
@@ -937,7 +949,7 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         maintenance_reads(),
     );
     println!(
-        "account_state blocks: {} block_read_backs={}",
+        "account_state blocks: {} block_read_backs={} block_writes_outside_command={}",
         published
             .blocks
             .table_sizes()
@@ -946,6 +958,7 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
             .collect::<Vec<_>>()
             .join(" "),
         striatum_store::block_read_backs(),
+        store.block_writes_outside_command(),
     );
 }
 

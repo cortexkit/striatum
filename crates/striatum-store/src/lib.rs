@@ -1531,6 +1531,7 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> RouteStateResult<T> {
+        let _seeding = crate::block_state::Seeding::begin();
         self.store.with_conn(f).map_err(err)
     }
 

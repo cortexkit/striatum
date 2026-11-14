@@ -2263,6 +2263,7 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
+        let _seeding = crate::block_state::Seeding::begin();
         self.direct_account_transaction(f)
     }
 
@@ -2308,6 +2309,7 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<bool>,
     ) -> RouteStateResult<()> {
+        let seeding = crate::block_state::Seeding::begin();
         let result = self
             .store
             .with_conn(|conn: &Connection| {
@@ -2319,6 +2321,7 @@ impl SqliteRouteStateStore {
                 Ok(result)
             })
             .map_err(err)??;
+        drop(seeding);
         if result {
             self.reload_account_state_after_direct_write()?;
         }
