@@ -588,6 +588,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_available_routes",
                                 "select_eligible_routes",
                                 "consumer_declarations",
+                                "consumer_priority",
                                 "select_prefer_prompt_cache",
                                 "select_settings",
                                 "observe_backoff",
@@ -699,7 +700,7 @@ fn additive_engine_projection_preserves_report_effects_and_existing_describe_mem
             {"decision_id":"reported", "engine_reported":1}
         ],
         "describe":{"method":"role.describe", "reply":{"result":{
-            "capabilities":["select", "engine_reports", "engine_evals"],
+            "capabilities":["select", "engine_reports", "engine_evals", "consumer_priority"],
             "ops":["role.describe", "route.engine_report", "route.engine_eval"],
             "requirement_fields":[]
         }}},
