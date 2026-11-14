@@ -14,18 +14,18 @@ pub(crate) struct AccountCall {
 
 impl AccountCall {
     /// A body declaration is trusted only when the daemon-stamped principal is
-    /// `reserved:<module>` and that module is enrolled in routing's `runners`
-    /// settings; never from caller.runner or another module authorized to
-    /// allocate accounts.
+    /// `reserved:<module>` and that module is enrolled through settings or the
+    /// daemon's first-party runner catalog; never from caller.runner or another
+    /// module authorized to allocate accounts.
     pub(crate) fn head_turn_source(
         params: &Value,
         principal: &str,
         config: &crate::config_overrides::LiveConfig,
+        credentials: &crate::broca_credentials::BrocaCredentials,
     ) -> Option<&'static str> {
         (params["head_turn"].as_bool() == Some(true)
             && principal.strip_prefix("reserved:").is_some_and(|module| {
-                config
-                    .v1_runners()
+                crate::routing_v1::runners::enrollment::policies(&config.v1_runners(), credentials)
                     .iter()
                     .any(|runner| runner.module == module)
             }))
@@ -39,6 +39,7 @@ impl AccountCall {
         params: &Value,
         principal: &str,
         config: Option<&crate::config_overrides::LiveConfig>,
+        credentials: Option<&crate::broca_credentials::BrocaCredentials>,
         store: &SqliteRouteStateStore,
     ) -> Self {
         Self::record(
@@ -48,7 +49,9 @@ impl AccountCall {
             params["caller"]["runner"].as_str(),
             None,
             None,
-            config.and_then(|config| Self::head_turn_source(params, principal, config)),
+            config.zip(credentials).and_then(|(config, credentials)| {
+                Self::head_turn_source(params, principal, config, credentials)
+            }),
             params["caller"]["harness"].as_str(),
             store,
         )

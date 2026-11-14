@@ -116,7 +116,9 @@ impl AccountCaller<'_> {
 /// child can look up its parent's reported use without sharing admission ids.
 fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCaller<'a>, Refusal> {
     checking("caller_check");
-    let runners = super::operator_config(deps).v1_runners();
+    let runners = deps.broca_credentials.lock().map(|credentials| {
+        super::runners::enrollment::policies(&super::operator_config(deps).v1_runners(), &credentials)
+    }).unwrap_or_else(|_| super::operator_config(deps).v1_runners());
     if caller.binding_is_current() {
         if let Some(module) = caller.attested_module().filter(|module| {
             runners.iter().any(|runner| runner.module == *module)
@@ -221,11 +223,14 @@ pub(super) fn account_for(
     let head_call_source = if scope_head {
         Some("scope")
     } else if caller.binding_is_current() {
-        account_selection::call_log::AccountCall::head_turn_source(
-            params,
-            &caller.principal,
-            &super::operator_config(deps),
-        )
+        deps.broca_credentials.lock().ok().and_then(|credentials| {
+            account_selection::call_log::AccountCall::head_turn_source(
+                params,
+                &caller.principal,
+                &super::operator_config(deps),
+                &credentials,
+            )
+        })
     } else {
         None
     };
@@ -253,8 +258,8 @@ fn account_for_inner(
     let authority = account_caller(caller, deps)?;
     if params["mode"] == "continue" {
         if super::consumers::is_media_provider(authority.module) {
-            return Err(super::provider_refusal(
-                "account_selection_unavailable",
+            return Err(Refusal::invalid_request(
+                "mode",
                 "Media engine jobs don't continue an earlier admission. Admit each job with its own engine decision (mode admit).",
             ));
         }
@@ -352,8 +357,21 @@ fn account_for_inner(
                 )
             }) {
                 checking("bound_service_tier");
-                return Err(account_unavailable(
-                    "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.",
+                let message = "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.";
+                // An unfamiliar stored tier is not an invalid tier in the
+                // caller's request, so keep the existing refusal for that case.
+                if bound_tier.as_deref().and_then(ServiceTier::parse).is_none() {
+                    return Err(account_unavailable(message));
+                }
+                return Err(Refusal::with(
+                    RefusalCode::InvalidRequest,
+                    message,
+                    &json!({
+                        "field": "service_tier",
+                        "decision_id": decision_id,
+                        "requested_service_tier": request.service_tier,
+                        "bound_service_tier": bound_tier,
+                    }),
                 ));
             }
             if let Some(input) = deps

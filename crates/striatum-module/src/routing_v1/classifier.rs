@@ -5,8 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use cortexkit_role_classifier::describe::ModelEntry as ServedModel;
 use cortexkit_role_routing::select::{Modality, Requirements};
-use striatum_core::{fact_to_route, ModelFact};
 use serde_json::Value;
+use striatum_core::{fact_to_route, ModelFact};
 
 use crate::account_refusal_log::LogLimiter;
 use crate::broca_credentials::BrocaCredentials;
@@ -35,8 +35,10 @@ pub(crate) fn models_from_describe(value: &Value) -> Option<Vec<ServedModel>> {
 
 pub(crate) async fn fetch_describe(
     consumer: &subc_client_rs::SubcConsumer,
-    connection_file: &std::path::Path,
+    _connection_file: &std::path::Path,
     module: &str,
+    settings: &[crate::config_policy::RunnerPolicy],
+    credentials: &crate::SharedBrocaCredentials,
 ) -> Result<Option<Value>, String> {
     let server = consumer
         .server_describe()
@@ -55,23 +57,17 @@ pub(crate) async fn fetch_describe(
         );
         return Ok(None);
     }
-    let bytes = consumer
-        .call(
-            subc_protocol::RouteTarget::ManagementSurface {
-                module_id: module.into(),
-            },
-            subc_protocol::BindIdentity::new(
-                connection_file
-                    .parent()
-                    .unwrap_or(std::path::Path::new(".")),
-                crate::DEFAULT_MODULE_ID,
-                "classifier-models",
-            ),
-            DESCRIBE_REQUEST.to_vec(),
-            describe_options(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+    let bytes = super::runners::enrollment::describe(
+        consumer,
+        module,
+        subc_protocol::BindIdentity::new(crate::DEFAULT_MODULE_ID, "classifier-models"),
+        DESCRIBE_REQUEST.to_vec(),
+        describe_options(),
+        settings,
+        credentials,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     if value.get("result").unwrap_or(&value)["role"] != "classifier/v1" {
         dropped(module, "*", "wrong_describe_role", crate::now_ms() as i64);

@@ -46,6 +46,7 @@ static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod continuation_tests;
 mod zero_config_tests;
+mod first_party_tests;
 mod warm_credential_tests;
 #[path = "media_conformance.rs"]
 mod media_conformance;

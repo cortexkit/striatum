@@ -15,6 +15,7 @@ use crate::{
 
 mod admission;
 mod describe_cache;
+pub(crate) mod enrollment;
 mod harness_choice;
 mod harness_facts;
 #[cfg(test)]
@@ -152,27 +153,38 @@ impl RunnerKey for RunnerPolicy {
 pub(crate) struct RunnerPolicies<'a> {
     policies: Vec<RunnerPolicy>,
     config: Option<&'a crate::config_overrides::LiveConfig>,
+    consumer: Option<&'a crate::config_policy::ConsumerPolicy>,
+    auto_enroll: bool,
 }
 
 impl<'a> RunnerPolicies<'a> {
     pub(crate) fn for_consumer(
         config: &'a crate::config_overrides::LiveConfig,
-        consumer: &crate::config_policy::ConsumerPolicy,
+        consumer: &'a crate::config_policy::ConsumerPolicy,
     ) -> Self {
-        let global = config.v1_runners();
         Self {
-            policies: consumer.runners.as_ref().map_or_else(
-                || global.clone(),
-                |entries| {
-                    entries
-                        .iter()
-                        .filter(|entry| global.iter().any(|allowed| allowed.module == entry.module))
-                        .cloned()
-                        .collect()
-                },
-            ),
+            policies: config.v1_runners(),
             config: Some(config),
+            consumer: Some(consumer),
+            auto_enroll: true,
         }
+    }
+
+    fn enrolled(&self, credentials: &BrocaCredentials) -> Vec<RunnerPolicy> {
+        let global = if self.auto_enroll {
+            enrollment::policies(&self.policies, credentials)
+        } else {
+            self.policies.clone()
+        };
+        self.consumer
+            .and_then(|consumer| consumer.runners.as_ref())
+            .map_or(global.clone(), |entries| {
+                entries
+                    .iter()
+                    .filter(|entry| global.iter().any(|allowed| allowed.module == entry.module))
+                    .cloned()
+                    .collect()
+            })
     }
 }
 
@@ -181,6 +193,8 @@ impl<'a> From<&'a crate::config_overrides::LiveConfig> for RunnerPolicies<'a> {
         Self {
             policies: config.v1_runners(),
             config: Some(config),
+            consumer: None,
+            auto_enroll: true,
         }
     }
 }
@@ -191,6 +205,8 @@ impl From<Vec<RunnerPolicy>> for RunnerPolicies<'_> {
         Self {
             policies,
             config: None,
+            consumer: None,
+            auto_enroll: false,
         }
     }
 }
@@ -215,7 +231,7 @@ impl Registry {
             return registry;
         };
         registry.entries = RunnerPolicies::for_consumer(config, consumer)
-            .policies
+            .enrolled(credentials)
             .into_iter()
             .filter(|policy| policy.module == module)
             .map(|policy| {
@@ -335,7 +351,7 @@ impl Registry {
     ) -> Self {
         let catalog = facts.iter().collect::<crate::broca_credentials::AuthCatalog>();
         let entries = source
-            .policies
+            .enrolled(credentials)
             .into_iter()
             .map(|mut policy| {
                 let wire_declaration = credentials.runner_declarations.get(&policy.module);
@@ -858,7 +874,7 @@ fn report_unknown_pair_tokens_once(
 }
 
 /// Each successful catalog read replaces the declaration snapshot, so removal
-/// or loss of nonce verification also removes a module's previously trusted facts.
+/// or loss of both nonce verification and the first-party mark removes its facts.
 pub(crate) fn declarations_from_catalog(
     modules: &serde_json::Value,
 ) -> std::collections::BTreeMap<String, RunnerDeclaration> {
@@ -871,6 +887,10 @@ pub(crate) fn declarations_from_catalog(
                 .get("nonce_verified")
                 .and_then(serde_json::Value::as_bool)
                 != Some(true)
+                && entry
+                    .get("first_party")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
             {
                 return None;
             }
@@ -943,6 +963,7 @@ pub(crate) fn tier_discovery_modules(
                 .get("nonce_verified")
                 .and_then(serde_json::Value::as_bool)
                 != Some(true)
+                && entry.get("first_party").and_then(serde_json::Value::as_bool) != Some(true)
             {
                 return None;
             }
@@ -966,6 +987,11 @@ pub(crate) async fn refresh_loop(
     use subc_client_rs::{ConsumerOptions, SubcConsumer};
     let mut cache = DescribeCache::default();
     let mut classifiers = super::classifier::DescribeCache::default();
+    let wake = credentials
+        .lock()
+        .expect("credentials lock")
+        .runner_catalog_wake
+        .clone();
     loop {
         let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
@@ -983,27 +1009,6 @@ pub(crate) async fn refresh_loop(
         if let Ok(Ok((consumer, modules))) = result {
             super::consumers::replace_catalog(&modules);
             let policies = crate::config_overrides::live_config(&config_path).v1_runners();
-            let classifier_modules = credentials
-                .lock()
-                .map(|mut credentials| {
-                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
-                })
-                .unwrap_or_default();
-            for module in classifier_modules {
-                let result =
-                    super::classifier::fetch_describe(&consumer, &connection_file, &module).await;
-                if let Ok(mut credentials) = credentials.lock() {
-                    if matches!(result, Ok(None)) {
-                        classifiers.revoke(&module, &mut credentials);
-                    }
-                    classifiers.reply(
-                        &module,
-                        result.as_ref().ok().and_then(Option::as_ref),
-                        &mut credentials,
-                        crate::now_ms() as i64,
-                    );
-                }
-            }
             let tier_modules = if let Ok(mut credentials) = credentials.lock() {
                 let tiers = cache.catalog(
                     &modules,
@@ -1016,10 +1021,44 @@ pub(crate) async fn refresh_loop(
             } else {
                 BTreeSet::new()
             };
+            let classifier_modules = credentials
+                .lock()
+                .map(|mut credentials| {
+                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
+                })
+                .unwrap_or_default();
+            for module in classifier_modules {
+                let result = super::classifier::fetch_describe(
+                    &consumer,
+                    &connection_file,
+                    &module,
+                    &policies,
+                    &credentials,
+                )
+                .await;
+                if let Ok(mut credentials) = credentials.lock() {
+                    if matches!(result, Ok(None)) {
+                        classifiers.revoke(&module, &mut credentials);
+                    }
+                    classifiers.reply(
+                        &module,
+                        result.as_ref().ok().and_then(Option::as_ref),
+                        &mut credentials,
+                        crate::now_ms() as i64,
+                    );
+                }
+            }
             // The routing declaration describes reach, not tier application.
             // Only the runner's own role.describe can establish tier support.
             for module in tier_modules {
-                let describe = fetch_describe(&consumer, &connection_file, &module).await;
+                let describe = fetch_describe(
+                    &consumer,
+                    &connection_file,
+                    &module,
+                    &policies,
+                    &credentials,
+                )
+                .await;
                 if let Ok(mut credentials) = credentials.lock() {
                     cache.reply(
                         &module,
@@ -1033,6 +1072,9 @@ pub(crate) async fn refresh_loop(
             cache.missed_all(&mut credentials, crate::now_ms() as i64);
             classifiers.expire(&mut credentials, crate::now_ms() as i64);
         }
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
+            _ = wake.notified() => {},
+        }
     }
 }

@@ -177,6 +177,9 @@ pub struct CredentialData {
     gateway_grant_warned: bool,
     catalog_providers: AuthCatalog,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    pub(crate) first_party_runners:
+        BTreeMap<String, crate::routing_v1::runners::enrollment::Identity>,
+    pub(crate) runner_catalog_wake: Arc<tokio::sync::Notify>,
     pub(crate) runner_service_tiers:
         BTreeMap<String, cortexkit_role_llm_runner::service_tier::ServiceTiers>,
     pub(crate) runner_routed_accounts: BTreeMap<String, Vec<String>>,
