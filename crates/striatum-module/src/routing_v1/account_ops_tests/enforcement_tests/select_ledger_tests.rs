@@ -60,7 +60,7 @@ async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibil
     }
 }
 
-fn select_body(legacy: bool) -> Value {
+pub(super) fn select_body(legacy: bool) -> Value {
     if legacy {
         json!({"targetAgent":"mason","requirements":{"iq":30,"eq":0},"substrate":"broca","executor":"broca","detail":true})
     } else {
@@ -68,7 +68,7 @@ fn select_body(legacy: bool) -> Value {
     }
 }
 
-fn pressure() -> Vec<Value> {
+pub(super) fn pressure() -> Vec<Value> {
     crate::take_operator_infos()
         .into_iter()
         .filter_map(|line| {
@@ -88,7 +88,7 @@ fn decisions(harness: &Harness) -> usize {
         .unwrap()
 }
 
-fn refused(reply: &(FrameType, Value), legacy: bool, reset: u64) {
+pub(super) fn refused(reply: &(FrameType, Value), legacy: bool, reset: u64) {
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     if legacy {
         assert_eq!(reply.1["code"], "concurrency_full", "{}", reply.1);
@@ -209,7 +209,7 @@ async fn select_ledger_reset_uses_reservation_deadline_in_epoch_milliseconds() {
     }
 }
 
-fn second_model(harness: &Harness, weak: bool) {
+pub(super) fn second_model(harness: &Harness, weak: bool) {
     let mut facts = harness.store().get_facts().unwrap();
     let mut second = facts
         .iter()

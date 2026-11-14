@@ -39,7 +39,7 @@ fn catalog() -> Value {
     json!({"source":"models.dev", "catalog_version":1, "resolved_at_ms":1, "models":models})
 }
 
-fn rig(
+pub(super) fn rig(
     edit_catalog: impl FnOnce(&mut Value),
     edit_describe: impl FnOnce(&mut Value),
 ) -> Arc<Harness> {
