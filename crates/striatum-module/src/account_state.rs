@@ -16,7 +16,7 @@ mod blocks;
 mod inflight;
 
 pub(crate) use admissions::AdmissionState;
-pub(crate) use blocks::{published, writer, BlockReads};
+pub(crate) use blocks::{published, writer, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -168,6 +168,9 @@ impl AccountWorkingState for AccountState {
     }
 }
 
+/// The longest a reader waits for the first publication of the state.
+const FIRST_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Publication swaps one Arc under a short write lock;
 /// readers only hold the read lock long enough to clone it. This provides
 /// atomic snapshot publication without another synchronization dependency.
@@ -235,9 +238,20 @@ impl StateOwner {
         if let Some(snapshot) = self.published.read().unwrap().clone() {
             return Ok(snapshot);
         }
-        let mut ready = self.ready.0.lock().unwrap();
-        while ready.is_none() {
-            ready = self.ready.1.wait(ready).unwrap();
+        // The writer reports every outcome of the first load, but a reader
+        // never waits on it without a bound.
+        let (ready, waited) = self
+            .ready
+            .1
+            .wait_timeout_while(self.ready.0.lock().unwrap(), FIRST_LOAD_WAIT, |ready| {
+                ready.is_none()
+            })
+            .unwrap();
+        if waited.timed_out() {
+            return Err(RouteStateStoreError(format!(
+                "account state not loaded within {}s; retry the operation",
+                FIRST_LOAD_WAIT.as_secs()
+            )));
         }
         if let Some(Err(error)) = ready.as_ref() {
             return Err(RouteStateStoreError(error.clone()));

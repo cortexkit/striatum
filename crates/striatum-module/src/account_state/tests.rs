@@ -162,6 +162,36 @@ fn failed_initial_load_never_publishes_or_allows_serving() {
 }
 
 #[test]
+fn a_writer_that_stops_during_the_first_load_wakes_waiting_readers() {
+    let (_scratch, store) = fixture("state-startup-writer-stops");
+    let owner = Arc::new(StateOwner::default());
+    let (entered, loading) = mpsc::channel();
+    let (resume, paused) = mpsc::channel::<()>();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        let _ = paused.recv();
+        panic!("forced writer stop during the first load");
+    }));
+    let installing = store.clone();
+    let driver = owner.clone();
+    let loader = std::thread::spawn(move || installing.install_account_state_bridge(driver));
+    loading.recv_timeout(Duration::from_secs(2)).unwrap();
+    // A reader arrives while the first load runs and waits for it.
+    let waiting = owner.clone();
+    let (answered, answer) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        answered.send(waiting.snapshot().map(|_| ())).unwrap();
+    });
+    resume.send(()).unwrap();
+    assert!(loader.join().unwrap().is_err());
+    let answer = answer
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the waiting reader is woken when the writer stops");
+    assert!(answer.is_err(), "{answer:?}");
+    reader.join().unwrap();
+}
+
+#[test]
 fn account_for_frame_sent_during_load_is_answered_after_publication() {
     let _clock = crate::InjectedClock::set(crate::routing_v1::request_cpu_bench::FIXTURE_NOW);
     let fixture = crate::routing_v1::request_cpu_bench::production_fixture();

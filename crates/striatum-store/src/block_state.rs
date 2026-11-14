@@ -1113,14 +1113,23 @@ impl BlockState {
         provider: &str,
     ) -> striatum_core::RouteStateResult<Vec<crate::AccountPoolFenceRow>> {
         use striatum_core::accounts::PoolKey;
+        // The healed pools of each fence's evidence, gathered in one pass.
+        let mut healed_by_fence: HashMap<(&str, i64), Vec<&str>> = HashMap::new();
+        for pool in self.success_pools() {
+            healed_by_fence
+                .entry((pool.fence_id.as_str(), pool.evidence_at))
+                .or_default()
+                .push(pool.pool_key_json.as_str());
+        }
         self.active_fence_rows(provider)
             .into_iter()
             .map(|(row, pool_key_json, recovery_set_json)| {
                 let evidence_at = row.observed_at.min(row.created_at);
-                let healed = self
-                    .success_pools()
-                    .filter(|pool| pool.fence_id == row.fence_id && pool.evidence_at == evidence_at)
-                    .map(|pool| serde_json::from_str::<PoolKey>(&pool.pool_key_json))
+                let healed = healed_by_fence
+                    .get(&(row.fence_id.as_str(), evidence_at))
+                    .into_iter()
+                    .flatten()
+                    .map(|pool| serde_json::from_str::<PoolKey>(pool))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(crate::err)?;
                 let mut recovery_set: Vec<PoolKey> =

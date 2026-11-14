@@ -103,6 +103,36 @@ impl WriterAccountState {
         }
     }
 
+    /// Inside a write transaction: load the state again if another
+    /// connection committed since it was loaded. The load reads through the
+    /// open transaction, which already holds the write lock, so nothing can
+    /// commit between this load and the batch's commands.
+    pub(crate) fn reload_if_moved(&mut self, conn: &rusqlite::Connection) -> RouteStateResult<()> {
+        let Some(bridge) = self.bridge.get() else {
+            return Ok(());
+        };
+        if self.working.is_none() {
+            return Ok(());
+        }
+        let version: i64 = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(crate::err)?;
+        if self.data_version == Some(version) {
+            return Ok(());
+        }
+        match bridge.load(&AccountTx::sql(conn)) {
+            Ok(state) => {
+                self.working = Some(state);
+                self.data_version = Some(version);
+                Ok(())
+            }
+            Err(error) => {
+                self.working = None;
+                Err(error)
+            }
+        }
+    }
+
     pub(crate) fn publish(&mut self) {
         if let (Some(bridge), Some(state)) = (self.bridge.get(), self.working.as_deref()) {
             self.generation += 1;

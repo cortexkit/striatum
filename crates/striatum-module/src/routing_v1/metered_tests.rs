@@ -755,6 +755,29 @@ async fn decision_probe_reset_check_cannot_bypass_a_held_slot() {
 }
 
 #[tokio::test]
+async fn a_held_quota_probe_answers_a_reset_time_racer_with_its_interval() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = quota_probe_harness();
+    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
+        provider: "inception".into(), credential_id: "apikey:inception".into(), model: "mercury-3".into(),
+        until_ms: FENCE_NOW as i64 + 60_000, decision_id: "earlier-reset".into(),
+        recorded_at: FENCE_NOW as i64 - 900_000,
+    }).unwrap();
+    let selected = broca_select(&harness, false).await;
+    assert_eq!(broca_selected_route(&selected, false), "inception/mercury-3");
+    // The provider's reset is past, but the selected decision still holds
+    // the quota probe: another admission loses the race for it, and is told
+    // when the holder's interval ends.
+    let _reset = crate::InjectedClock::set(FENCE_NOW + 120_000);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let lost = runner.call("route.account_for", &broca_account_request(&Value::Null, "reset-racer", false)).await;
+    assert_eq!(lost.0, FrameType::Error, "{}", lost.1);
+    assert_eq!(lost.1["code"], "account_pool_exhausted", "{}", lost.1);
+    assert_eq!(lost.1["detail"]["reset_at_ms"], FENCE_NOW + 900_000, "{}", lost.1);
+    assert_eq!(lost.1["detail"]["retry_after_s"], 780, "{}", lost.1);
+}
+
+#[tokio::test]
 async fn decision_probe_reported_admission_cannot_expire_back_to_due() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = quota_probe_harness();

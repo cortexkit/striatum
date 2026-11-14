@@ -62,9 +62,10 @@ impl AccountTx<'_> {
 fn write_batch(
     conn: &Connection,
     batch: &mut [Queued],
-    state: &mut Option<Box<dyn crate::AccountWorkingState>>,
+    writer: &mut crate::account_state::WriterAccountState,
     #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
 ) -> rusqlite::Result<BatchOutcome> {
+    let state = &mut writer.working;
     // Startup must not manufacture a write transaction or a second publication.
     // The loader already published its consistent read before this barrier runs.
     if batch.iter().all(|queued| queued.initialize_only) {
@@ -83,9 +84,20 @@ fn write_batch(
     }
     #[cfg(any(test, feature = "test-support"))]
     let _batch = evaluation_snapshot::AccountBatchGuard::enter();
+    #[cfg(test)]
+    before_begin_for_test(conn);
     let transaction = crate::write_transaction(conn)?;
     #[cfg(any(test, feature = "test-support"))]
     transactions.fetch_add(1, Ordering::Relaxed);
+    // Another connection may have committed between the state's freshness
+    // check and this transaction's start. Holding the write lock now, check
+    // again, and load the state inside the transaction if it moved, so no
+    // command decides on rows older than the ones it writes over.
+    if let Err(error) = writer.reload_if_moved(conn) {
+        transaction.rollback()?;
+        return Ok(BatchOutcome::Diverged(format!("reload account state: {error}")));
+    }
+    let state = &mut writer.working;
     for queued in batch.iter_mut() {
         conn.execute_batch("SAVEPOINT account_command")?;
         let before = state.as_ref().map(|state| state.fork());
@@ -163,7 +175,7 @@ fn run_batch(
         let outcome = write_batch(
             conn,
             batch,
-            &mut state.working,
+            state,
             #[cfg(any(test, feature = "test-support"))]
             transactions,
         );
@@ -185,6 +197,29 @@ fn run_batch(
                 return Err(error.to_string());
             }
         }
+    }
+}
+
+/// A hook run once on the writer thread just before the next batch on the
+/// database at the given path opens its write transaction.
+#[cfg(test)]
+pub(crate) static BEFORE_BEGIN: std::sync::Mutex<Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn before_begin_for_test(conn: &Connection) {
+    let Some(path) = conn.path().map(std::path::PathBuf::from) else {
+        return;
+    };
+    let hook = {
+        let mut hooks = BEFORE_BEGIN.lock().unwrap();
+        hooks
+            .iter()
+            .position(|(target, _)| *target == path)
+            .map(|at| hooks.remove(at).1)
+    };
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -305,6 +340,9 @@ impl AccountWriter {
         exit: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
         let (sender, receiver) = mpsc::channel::<Queued>();
+        // Kept to wake readers still waiting for a first publication if the
+        // writer thread stops before it published.
+        let exit_bridge = bridge.clone();
         let dead = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_dead = dead.clone();
         let thread_exit = exit.clone();
@@ -380,6 +418,9 @@ impl AccountWriter {
                 // caller even if a command panicked before producing a result.
                 thread_dead.store(true, Ordering::Release);
                 if !matches!(result, Ok(Ok(()))) {
+                    if let Some(bridge) = exit_bridge.get() {
+                        bridge.failed("account writer stopped");
+                    }
                     thread_exit();
                 }
             });
@@ -463,9 +504,18 @@ impl Drop for AccountWriter {
 
 impl SqliteRouteStateStore {
     pub(crate) fn initialize_account_writer_state(&self) -> RouteStateResult<()> {
-        self.account_writer_engine()
-            .enqueue_inner(|_, _| Ok(()), true)?
-            .wait()
+        let result = self
+            .account_writer_engine()
+            .enqueue_inner(|_, _| Ok(()), true)
+            .and_then(AccountReply::wait);
+        // A load that failed reports itself, but a writer that could not run
+        // the barrier (no connection, a stopped or never-started thread) does
+        // not: tell the publisher, so readers waiting for the first
+        // publication get the error instead of waiting forever.
+        if let (Err(error), Some(bridge)) = (&result, self.account_state.get()) {
+            bridge.failed(&error.to_string());
+        }
+        result
     }
 
     pub(crate) fn account_writer_engine(&self) -> &AccountWriter {

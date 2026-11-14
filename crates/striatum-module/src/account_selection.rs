@@ -6246,10 +6246,17 @@ pub(crate) fn preflight_model_for_class_with_reset(
         message: error.to_string(),
         reset_at_ms: None,
     };
-    // Fences come from the published block state as well.
-    let fences = crate::account_state::published(ctx.store)
-        .and_then(|blocks| load_fences(&blocks, provider))
-        .map_err(unavailable)?;
+    // Fences come from the same published state as the demand, so one
+    // decision never mixes two generations.
+    let fences = match &state {
+        Some(state) if state.blocks.enabled() => load_fences(
+            &crate::account_state::Published::State(std::sync::Arc::clone(state)),
+            provider,
+        ),
+        _ => crate::account_state::published(ctx.store)
+            .and_then(|blocks| load_fences(&blocks, provider)),
+    }
+    .map_err(unavailable)?;
     let admissions = match &state {
         Some(state) => demand_with(
             |provider, account, floor| Ok(state.admissions.demand(provider, account, floor)),
@@ -6362,6 +6369,10 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// The whole admission inside one write transaction: idempotency, the
 /// compare-and-set, the decision and its commit. The transaction commits
 /// before the reply leaves, so a reply always describes a durable decision.
+/// How long a request whose probe claim was refused while every clock
+/// looked due waits before asking again.
+const LOST_PROBE_RETRY_MS: i64 = 1_000;
+
 fn serve(
     tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
@@ -6750,14 +6761,30 @@ fn serve(
                 // Another request can claim the probe after scoring prepared
                 // this roster. Preserve the actual fence and its retry time;
                 // removing only the credential misreports missing candidates.
-                if let Some(until) = applicable
+                // A slot another request holds stays closed until its claim's
+                // interval ends, even where a provider reset is already due,
+                // so that interval is the retry time. A claim refused while
+                // every clock looks due (its evidence changed under it) is
+                // retried shortly rather than answered without a time.
+                let quota_until = striatum_store::FenceRecheck::quota_group_at(
+                    &applicable,
+                    params.model_decision_id.as_deref(),
+                );
+                let until = applicable
                     .iter()
-                    .map(|origin| origin.due_at())
+                    .map(|origin| {
+                        if origin.quota {
+                            quota_until
+                        } else if origin.claim_owner.is_some() && !owns_probe(origin) {
+                            origin.due_at().max(origin.next_recheck_at)
+                        } else {
+                            origin.due_at()
+                        }
+                    })
                     .filter(|until| *until > now)
                     .max()
-                {
-                    lost_probe_fences.insert(admission.account_id.clone(), until);
-                }
+                    .unwrap_or(now.saturating_add(LOST_PROBE_RETRY_MS));
+                lost_probe_fences.insert(admission.account_id.clone(), until);
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
                     for account in &mut roster.accounts {
@@ -6914,14 +6941,18 @@ fn serve(
             // admit, so that stays `account_selection_unavailable`.
             let mut code = refusal_code(refusal.code);
             if code == "account_selection_unsupported" {
+                // The probe loop removes credentials, not accounts: an
+                // account left with none counts as removed.
                 let probe_emptied = roster
                     .roster
                     .as_ref()
                     .is_some_and(|roster| !roster.accounts.is_empty())
-                    && state
-                        .roster
-                        .as_ref()
-                        .is_none_or(|roster| roster.accounts.is_empty());
+                    && state.roster.as_ref().is_none_or(|roster| {
+                        roster
+                            .accounts
+                            .iter()
+                            .all(|account| account.credentials.is_empty())
+                    });
                 code = if probe_emptied {
                     "account_selection_unavailable"
                 } else {

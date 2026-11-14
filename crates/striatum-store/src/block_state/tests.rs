@@ -164,7 +164,11 @@ impl Rig {
                 "fence_rechecks at {now}, in order: {context}"
             );
         }
-        self.check_readers(&memory, times[0], context);
+        // Compare every reader at each time: a memory reader that ignored a
+        // `now` its SQL reader filters by would differ from it at one of them.
+        for &now in times {
+            self.check_readers(&memory, now, &format!("{context} at {now}"));
+        }
     }
 
     /// Every request reader of the block tables answers from memory exactly
@@ -380,6 +384,171 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     rig.check(&[NOW], "route fence replaced by a transient row");
 }
 
+/// The update hook reports a REPLACE's insert but not the delete of the row
+/// it evicts, which the state finds through the new row's key. If the new row
+/// were deleted or rekeyed later in the same command, nothing would name the
+/// evicted row and memory would keep it. So no production code may resolve a
+/// conflict on a block table by REPLACE: `INSERT OR REPLACE`, `REPLACE
+/// INTO`, `UPDATE OR REPLACE`, or an `ON CONFLICT REPLACE` clause in a
+/// table's DDL. Tests may, to exercise the capture. If this rule is ever
+/// relaxed, the capture must record the evicted row itself instead.
+#[test]
+fn no_production_code_resolves_a_block_table_conflict_by_replace() {
+    use std::path::{Path, PathBuf};
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files(&path, out);
+            } else if matches!(path.extension().and_then(|e| e.to_str()), Some("rs" | "sql")) {
+                out.push(path);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    for krate in std::fs::read_dir(&crates).unwrap() {
+        let krate = krate.unwrap().path();
+        for part in ["src", "migrations", "examples"] {
+            if krate.join(part).is_dir() {
+                files(&krate.join(part), &mut all);
+            }
+        }
+    }
+    // Files compiled only into tests: test files by name, and modules
+    // declared under a `cfg` that names `test`.
+    let mut test_only: Vec<PathBuf> = Vec::new();
+    for path in &all {
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        for pair in lines.windows(2) {
+            let declared = pair[1]
+                .strip_prefix("pub mod ")
+                .or_else(|| pair[1].strip_prefix("pub(crate) mod "))
+                .or_else(|| pair[1].strip_prefix("mod "))
+                .and_then(|rest| rest.strip_suffix(';'));
+            if let (true, Some(name)) = (pair[0].starts_with("#[cfg(") && pair[0].contains("test"), declared) {
+                let dir = path.parent().unwrap();
+                let base = if path.file_stem().is_some_and(|stem| stem == "lib" || stem == "main" || stem == "mod") {
+                    dir.to_path_buf()
+                } else {
+                    dir.join(path.file_stem().unwrap())
+                };
+                test_only.push(base.join(format!("{name}.rs")));
+                test_only.push(base.join(name));
+            }
+        }
+    }
+    let is_test = |path: &Path| {
+        let text = path.to_string_lossy();
+        text.contains("/tests/")
+            || text.ends_with("tests.rs")
+            || text.contains("_tests/")
+            || test_only.iter().any(|prefix| path.starts_with(prefix))
+    };
+    /// The text without `#[cfg(test)] mod name { ... }` blocks.
+    fn without_test_modules(text: &str) -> String {
+        let mut out = String::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("#[cfg(test)]") {
+            let after = &rest[at + "#[cfg(test)]".len()..];
+            let trimmed = after.trim_start();
+            let Some(body) = trimmed.strip_prefix("mod ").and_then(|tail| {
+                let open = tail.find(['{', ';'])?;
+                (tail.as_bytes()[open] == b'{').then(|| &tail[open..])
+            }) else {
+                out.push_str(&rest[..at + "#[cfg(test)]".len()]);
+                rest = after;
+                continue;
+            };
+            out.push_str(&rest[..at]);
+            let mut depth = 0usize;
+            let mut end = body.len();
+            for (index, c) in body.char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = index + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            rest = &body[end..];
+        }
+        out.push_str(rest);
+        out
+    }
+    let boundary = |text: &str, at: usize| {
+        !text[at..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    };
+    let scan = |text: &str| -> Vec<String> {
+        let mut found = Vec::new();
+        let normal = without_test_modules(text)
+            .to_ascii_lowercase()
+            .replace(['"', '`', '\\'], " ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for table in BLOCK_TABLES {
+            for form in ["insert or replace into ", "replace into ", "update or replace "] {
+                let needle = format!("{form}{table}");
+                for (at, _) in normal.match_indices(&needle) {
+                    // `insert or replace into` is reported once, as itself.
+                    let inner = form == "replace into " && normal[..at].ends_with("or ");
+                    if boundary(&normal, at + needle.len()) && !inner {
+                        found.push(needle.clone());
+                    }
+                }
+            }
+            // A conflict clause in the table's own definition.
+            for create in ["create table ", "create table if not exists "] {
+                let needle = format!("{create}{table}");
+                for (at, _) in normal.match_indices(&needle) {
+                    if !boundary(&normal, at + needle.len()) {
+                        continue;
+                    }
+                    let definition = &normal[at..];
+                    let definition = &definition[..definition.find(");").unwrap_or(definition.len())];
+                    if definition.contains("on conflict replace") {
+                        found.push(format!("{table} DDL: on conflict replace"));
+                    }
+                }
+            }
+        }
+        found
+    };
+    // The scan sees every spelling, and skips test modules and other tables.
+    assert_eq!(scan("x(\"INSERT  OR\n   Replace INTO `fence_recheck`(kind) VALUES (1)\")"), ["insert or replace into fence_recheck"]);
+    assert_eq!(scan("replace into account_eligibility values (1)"), ["replace into account_eligibility"]);
+    assert_eq!(scan("UPDATE OR REPLACE pool_key_state SET a=1"), ["update or replace pool_key_state"]);
+    assert_eq!(
+        scan("CREATE TABLE IF NOT EXISTS fence_success_pool (a TEXT UNIQUE ON CONFLICT REPLACE);"),
+        ["fence_success_pool DDL: on conflict replace"]
+    );
+    assert!(scan("INSERT OR REPLACE INTO fence_retired_origin SELECT 1; INSERT OR REPLACE INTO fence_recheck_x VALUES (1)").is_empty());
+    assert!(scan("#[cfg(test)]\nmod tests { fn f() { x(\"INSERT OR REPLACE INTO fence_recheck\") } }").is_empty());
+    assert_eq!(
+        scan("#[cfg(test)]\nmod tests { }\nfn f() { x(\"replace into fence_recheck\") }"),
+        ["replace into fence_recheck"]
+    );
+    let mut violations = Vec::new();
+    let mut scanned = 0;
+    for path in all.iter().filter(|path| !is_test(path)) {
+        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        scanned += 1;
+        violations.extend(scan(&text).into_iter().map(|found| format!("{}: {found}", path.display())));
+    }
+    assert!(scanned > 100, "the scan found the sources: {scanned} files");
+    assert!(violations.is_empty(), "REPLACE on a block table: {violations:#?}");
+}
+
 #[test]
 fn a_whole_table_delete_is_captured() {
     let rig = rig("block-state-truncate");
@@ -531,6 +700,77 @@ fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
         owners(&rig),
         [Some("winner".to_owned()), Some("winner".to_owned())]
     );
+}
+
+#[test]
+fn a_commit_from_another_connection_just_before_a_batch_is_loaded_inside_it() {
+    let rig = rig("block-state-outside-before-begin");
+    let row = |account: &str| {
+        format!(
+            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
+            NOW + 60_000
+        )
+    };
+    rig.sql(row("first"));
+    let path = std::fs::canonicalize(rig._scratch.path().join("state.db")).unwrap();
+    let outside = path.clone();
+    crate::account_writer::BEFORE_BEGIN.lock().unwrap().push((
+        path,
+        Box::new(move || {
+            // Another process commits after the writer's freshness check.
+            let conn = Connection::open(&outside).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.execute_batch(&row("outside")).unwrap();
+        }),
+    ));
+    rig.sql(row("second"));
+    assert!(
+        crate::account_writer::BEFORE_BEGIN.lock().unwrap().is_empty(),
+        "the hook ran"
+    );
+    rig.check(&[NOW], "after an outside commit just before the batch began");
+}
+
+#[test]
+fn a_report_from_an_owner_whose_claim_was_superseded_does_not_match() {
+    let rig = rig("block-state-superseded-report");
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            "p0/m0",
+            "p0/m0",
+            &RouteStateUpdate {
+                observed_at_ms: Some(NOW - 2 * 3_600_000),
+                cooldown_until: Some((NOW + 5 * 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    rig.run(fence_rechecks::sync);
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    let claim = |owner: &'static str, at: i64| {
+        let origins = origins.clone();
+        rig.store
+            .account_command(AccountCommandKind::Maintenance, move |tx| {
+                tx.grant_fence_rechecks(&origins, at, Some(owner))
+            })
+            .unwrap()
+    };
+    // The first owner's one-hour interval ends; a second owner claims the
+    // same evidence's next generation. The first keeps its authorization row,
+    // now naming an older generation.
+    assert!(claim("first", NOW));
+    assert!(claim("second", NOW + 2 * 3_600_000));
+    let matches = |owner: &'static str| {
+        rig.store
+            .account_command(AccountCommandKind::Report, move |tx| {
+                tx.probe_report_matches(owner, None, false)
+            })
+            .unwrap()
+    };
+    assert!(!matches("first"), "a superseded claim cannot settle the probe");
+    assert!(matches("second"));
 }
 
 #[test]
