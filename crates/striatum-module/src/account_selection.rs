@@ -1334,11 +1334,12 @@ impl ClassContext {
             })
             .collect();
         if !recovered.is_empty() {
-            let mut fences = context.fences.clone();
+            let fences = context.fences.clone();
             let fences = crate::account_writer::repair(store, move |tx| {
                 for id in &recovered {
                     tx.clear_fence(id, now_ms, "fresh_headroom")?;
                 }
+                let mut fences = fences.clone();
                 for (provider, fences) in &mut fences {
                     *fences = load_fences(tx, provider)?;
                 }
@@ -1428,7 +1429,7 @@ impl ClassContext {
             let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
-                let admission = claimed_admission;
+                let admission = claimed_admission.clone();
                 let origins: Vec<_> = tx
                     .fence_rechecks()?
                     .into_iter()
@@ -2640,7 +2641,7 @@ impl ClassContext {
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
             let owner = owned_owner.as_deref();
-            let credential = owned_credential;
+            let credential = owned_credential.clone();
 
             let origins: Vec<_> = tx
                 .fence_rechecks()?
@@ -5101,7 +5102,7 @@ fn replay_command(
         striatum_store::AccountCommandKind::Replay,
         move |tx| {
             let row = if matches!(row.state.as_str(), "released" | "finished") {
-                row
+                row.clone()
             } else {
                 tx.admission(&principal, &row.admission_id)?
                     .ok_or_else(|| RouteStateStoreError("admission disappeared; retry".into()))?
@@ -5298,8 +5299,10 @@ pub(crate) fn after_roster_prepared(admission_id: &str, hook: impl FnOnce() + Se
         .push((admission_id.to_owned(), Box::new(hook)));
 }
 
+/// Run and remove the test hook registered under `key` (an admission id, or
+/// another stage's key such as `v1-replay-checked:<admission id>`).
 #[cfg(test)]
-fn run_after_roster_hook(admission_id: &str) {
+pub(crate) fn run_after_roster_hook(admission_id: &str) {
     // Take the hook out before running it: it may run another admission,
     // which reaches this point too.
     let hook = {

@@ -54,7 +54,7 @@ fn assert_equivalent(store: &SqliteRouteStateStore, owner: &StateOwner, context:
 
 fn run<T: Send + 'static>(
     store: &SqliteRouteStateStore,
-    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
+    command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
     crate::account_writer::execute(store, AccountCommandKind::Repair, command)
 }
@@ -925,4 +925,162 @@ fn live_sized_admission_state_costs() {
         );
     }
     assert_equivalent(&store, &owner, "after live-size commands");
+}
+
+/// One command in a batch finding the state disagreeing with SQL rolls the
+/// whole batch back; the writer reloads the state and runs the batch again.
+/// A command earlier in the batch that computed from the stale state must not
+/// have its stale reply published, and the detecting command must succeed on
+/// the fresh state instead of failing.
+#[test]
+fn a_batch_with_a_diverged_command_runs_again_on_fresh_state() {
+    let (_scratch, store) = fixture("batch-divergence");
+    let _owner = install(&store);
+    let first = admission("p", "first", "pin-1", 1, 1_000, 60_000);
+    let hash = first.hash.clone();
+    run(&store, move |tx| admit(tx, &first, true)).unwrap();
+    // A write the state never saw (the writer's own connection does not
+    // report it as a change): the lease moves from 61,000 to 66,000.
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute(
+                "UPDATE account_affinity SET lease_valid_until = lease_valid_until + 5000",
+                [],
+            )
+        })
+        .unwrap();
+    // Hold the writer on a command until A and B are both queued, so the two
+    // run in one batch.
+    let (started, running) = std::sync::mpsc::channel::<()>();
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = std::sync::Mutex::new(held);
+    let blocker = store
+        .enqueue_account_state_command(AccountCommandKind::Repair, move |_, _| {
+            let _ = started.send(());
+            let _ = held.lock().unwrap().recv();
+            Ok(())
+        })
+        .unwrap();
+    running.recv().unwrap();
+    // A only reads the lease.
+    let lease = {
+        let hash = hash.clone();
+        store
+            .enqueue_account_state_command(AccountCommandKind::Repair, move |tx, state| {
+                let tx = AccountCommand::new(tx, state);
+                Ok(tx.affinity("p", &hash, PROVIDER)?.unwrap().lease_valid_until)
+            })
+            .unwrap()
+    };
+    // B ends the pin's lease at 62,000: the state, still at 61,000, sees
+    // nothing to end, while SQL, at 66,000, ends it.
+    let ended = store
+        .enqueue_account_state_command(AccountCommandKind::Repair, move |tx, state| {
+            AccountCommand::new(tx, state).end_lease("pin-1", 62_000)
+        })
+        .unwrap();
+    release.send(()).unwrap();
+    blocker.wait().unwrap();
+    assert_eq!(lease.wait().unwrap(), Some(66_000), "A replied from the stale state");
+    assert!(ended.wait().unwrap(), "B must succeed on the reloaded state");
+    assert_eq!(
+        store.account_writer_batch_sizes_for_test().last(),
+        Some(&2),
+        "A and B ran in one batch"
+    );
+}
+
+/// The lease-end write a continuation decides must name the pin, generation
+/// and lease end the state saw. If SQL has moved on, it is a divergence, not
+/// an overwrite of the newer lease.
+#[test]
+fn a_decided_lease_end_does_not_overwrite_a_lease_the_state_did_not_see() {
+    let (_scratch, store) = fixture("lease-end-cas");
+    let _owner = install(&store);
+    let first = admission("p", "first", "pin-1", 1, 1_000, 60_000);
+    run(&store, move |tx| admit(tx, &first, true)).unwrap();
+    let mut state = store.account_transaction(AccountState::load).unwrap();
+    // SQL's lease moves on after the state read 61,000.
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute("UPDATE account_affinity SET lease_valid_until = 70000", [])
+        })
+        .unwrap();
+    let result = store.account_transaction(move |tx| {
+        let mut command = AccountCommand::new(tx, Some(&mut state as &mut dyn AccountWorkingState));
+        command.decide_for_test(|admissions| {
+            admissions.end_lease("pin-1", 50_000);
+        })
+    });
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains(striatum_store::STATE_DIVERGED), "{error}");
+    let lease: Option<i64> = store
+        .with_writer_for_test(|conn| {
+            conn.query_row("SELECT lease_valid_until FROM account_affinity", [], |row| row.get(0))
+        })
+        .unwrap();
+    assert_eq!(lease, Some(70_000));
+}
+
+/// A transition the state finds not applicable (the admission is not open
+/// in memory) must not be skipped silently when SQL still holds the row in a
+/// state the transition applies to.
+#[test]
+fn a_decided_transition_the_state_skips_is_confirmed_against_sql() {
+    let (_scratch, store) = fixture("unchanged-guard");
+    let _owner = install(&store);
+    let first = admission("p", "first", "pin-1", 1, 1_000, 60_000);
+    run(&store, move |tx| admit(tx, &first, true)).unwrap();
+    let mut state = store.account_transaction(AccountState::load).unwrap();
+    // The state forgets the open admission, as a missed update would.
+    state.admissions.open = Default::default();
+    let result = store.account_transaction(move |tx| {
+        let mut command = AccountCommand::new(tx, Some(&mut state as &mut dyn AccountWorkingState));
+        command.decide_for_test(|admissions| {
+            admissions.finish("p", "first", 2_000);
+        })
+    });
+    let error = result.unwrap_err().to_string();
+    assert!(error.contains(striatum_store::STATE_DIVERGED), "{error}");
+}
+
+/// Releasing an expired admission's probe checks the admission first. One
+/// that started meanwhile keeps its probe authorization and is left as it is.
+#[test]
+fn a_probe_release_leaves_a_started_admission_and_its_authorization_alone() {
+    let (_scratch, store) = fixture("probe-release-started");
+    let _owner = install(&store);
+    let first = admission("p", "first", "pin-1", 1, 1_000, 60_000);
+    run(&store, move |tx| {
+        admit(tx, &first, true)?;
+        tx.mark_admission_started("p", "first", "run", 2_000, false)
+            .map(|_| ())
+    })
+    .unwrap();
+    let owner = serde_json::json!(["account_admission", "p", "first"]).to_string();
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute(
+                "INSERT INTO fence_probe_authorization VALUES (?1, 'kind', 'origin', 'evidence', 1, 1, 1)",
+                [&owner],
+            )
+        })
+        .unwrap();
+    store
+        .account_transaction(move |tx| {
+            let _ = tx.release_admission_probes(vec![("p".into(), "first".into(), owner.clone())], 100_000)?;
+            Ok(())
+        })
+        .unwrap();
+    let (authorizations, state): (i64, String) = store
+        .with_writer_for_test(|conn| {
+            conn.query_row(
+                "SELECT (SELECT count(*) FROM fence_probe_authorization), \
+                   (SELECT state FROM account_admission WHERE admission_id = 'first')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+        })
+        .unwrap();
+    assert_eq!((authorizations, state.as_str()), (1, "started"));
 }

@@ -502,7 +502,7 @@ impl crate::AccountTx<'_> {
                     pin_id: row.get(6)?,
                     pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
                     state: row.get(8)?,
-                    charged: row.get::<_, i64>(9)? != 0,
+                    charged: row.get::<_, i64>(9)? == 1,
                     committed_at: row.get(10)?,
                     started: row.get(11)?,
                 })

@@ -1013,6 +1013,7 @@ impl Drop for InjectedClock {
 /// [`run_route_handler_off_async_workers`]), so the state of the thread that
 /// dispatched the handler is installed there for the handler's lifetime.
 #[cfg(test)]
+#[derive(Clone)]
 struct TestThreadState {
     now_ms: Option<u64>,
     warnings: OperatorWarnings,

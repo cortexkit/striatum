@@ -602,7 +602,7 @@ pub(crate) fn live_with_eligibility(
         }
         let now = crate::account_selection::now_ms();
         crate::account_writer::repair(store, move |tx| {
-            for repair in repairs {
+            for repair in &repairs {
                 match repair {
                     ListingRepair::SignedOut(fence, fingerprint) => {
                         tx.update_signed_out_fingerprint(&fence, &fingerprint)?
@@ -619,8 +619,8 @@ pub(crate) fn live_with_eligibility(
                     }
                 }
             }
-            if let Some(listings) = listings {
-                tx.reconcile_account_eligibility(&listings)?;
+            if let Some(listings) = &listings {
+                tx.reconcile_account_eligibility(listings)?;
             }
             Ok(())
         })

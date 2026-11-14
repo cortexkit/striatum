@@ -41,7 +41,7 @@ impl SqliteRouteStateStore {
         failed: bool,
         effects: &V1ReportEffects,
         usage: Option<&V1ReportUsage>,
-        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        reconcile: impl FnMut(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
         // Its continuation use runs SQL alone; the module reports through
@@ -79,8 +79,9 @@ impl SqliteRouteStateStore {
         failed: bool,
         effects: &V1ReportEffects,
         usage: Option<&V1ReportUsage>,
-        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
-        use_continuation: impl FnOnce(
+        // Both may run again if the writer re-runs the report's batch.
+        mut reconcile: impl FnMut(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        mut use_continuation: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
                 &str,
@@ -97,7 +98,7 @@ impl SqliteRouteStateStore {
         let error = error.map(str::to_owned);
         let effects = effects.clone();
         let usage = usage.cloned();
-        let command = move |account: &AccountTx<'_>,
+        let mut command = move |account: &AccountTx<'_>,
                             state: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
             let decision_id = decision_id.as_str();
             let delivery_key = delivery_key.as_str();

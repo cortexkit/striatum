@@ -999,6 +999,16 @@ fn compare_block_functions(
 // planner preferred scanning all of account_admission (hundreds of thousands
 // of rows live) and probing the authorization index for each one, which held
 // the account writer for hundreds of milliseconds on every Tick.
+/// What [`AccountTx::release_admission_probes`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReleasedAdmissionProbes {
+    /// Admissions whose probe was released: each was unstarted, in
+    /// `reserved` or `expired`.
+    pub released: usize,
+    /// Of those, the admissions it moved from `reserved` to `expired`.
+    pub expired: Vec<(String, String)>,
+}
+
 pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
     "SELECT DISTINCT a.principal,a.admission_id,p.owner
     FROM fence_probe_authorization p CROSS JOIN account_admission a
@@ -1137,22 +1147,41 @@ impl AccountTx<'_> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
         self.release_admission_probes(expired, now)
+            .map(|released| released.expired)
     }
 
     /// Release the probes of unstarted admissions already found expired, each
-    /// given as (principal, admission id, authorization owner). Returns the
-    /// admissions it moved from `reserved` to `expired`.
+    /// given as (principal, admission id, authorization owner).
     pub fn release_admission_probes(
         &self,
         expired: Vec<(String, String, String)>,
         now: i64,
-    ) -> RouteStateResult<Vec<(String, String)>> {
+    ) -> RouteStateResult<ReleasedAdmissionProbes> {
+        let mut released = ReleasedAdmissionProbes::default();
         if expired.is_empty() {
-            return Ok(Vec::new());
+            return Ok(released);
         }
         sync(self.conn).map_err(err)?;
-        let mut marked = Vec::new();
         for (principal, admission, owner) in expired {
+            // Only an admission that is still unstarted, in `reserved` or
+            // `expired`, gives up its probe; one that started or closed keeps
+            // its authorization. (`expired` is included because a replay
+            // expires an admission without releasing its probe.) The check
+            // comes first, so nothing changes for an admission that fails it.
+            let unstarted = self
+                .conn
+                .execute(
+                    "UPDATE account_admission SET state = state WHERE principal=?1 \
+                       AND admission_id=?2 AND state IN ('reserved','expired') \
+                       AND started_at IS NULL",
+                    params![principal, admission],
+                )
+                .map_err(err)?
+                == 1;
+            if !unstarted {
+                continue;
+            }
+            released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
             self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
@@ -1164,10 +1193,10 @@ impl AccountTx<'_> {
                 params![owner,now]).map_err(err)?;
             self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
             if self.mark_admission_expired(&principal, &admission)? {
-                marked.push((principal, admission));
+                released.expired.push((principal, admission));
             }
         }
-        Ok(marked)
+        Ok(released)
     }
 
     /// Anonymous decisions may report a credential discovered only at launch.

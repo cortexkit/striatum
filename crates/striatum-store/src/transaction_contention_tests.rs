@@ -36,7 +36,7 @@ fn assert_writer_waits(
     let writer_handshake = shared_handshake.clone();
     store
         .account_command(AccountCommandKind::Maintenance, move |_| {
-            BUSY_HANDSHAKE.with(|slot| *slot.borrow_mut() = Some(writer_handshake));
+            BUSY_HANDSHAKE.with(|slot| *slot.borrow_mut() = Some(writer_handshake.clone()));
             Ok(())
         })
         .unwrap();

@@ -139,11 +139,15 @@ fn latest_from_row(row: &Row<'_>) -> rusqlite::Result<LatestAdmissionRow> {
     })
 }
 
-/// A continuation row that carries a whole offer. The schema allows a
-/// decision without a reservation or deadline; the SQL writers never treat
-/// such a row as an offer (their filters need both), so neither does the state.
-const OFFER_ROW: &str = "c.decision_id IS NOT NULL AND c.reservation_id IS NOT NULL \
-     AND c.valid_until_ms IS NOT NULL";
+/// A continuation row that carries an offer. The load refuses a row with only
+/// some of its decision, reservation and deadline (migration 088 cleared any
+/// that existed), so a decision means a whole offer here, as in the SQL paths.
+const OFFER_ROW: &str = "c.decision_id IS NOT NULL";
+
+/// A continuation row with some but not all of its offer columns.
+const PARTIAL_OFFER_ROW: &str = "NOT ((decision_id IS NULL AND reservation_id IS NULL \
+     AND valid_until_ms IS NULL) OR (decision_id IS NOT NULL AND reservation_id IS NOT NULL \
+     AND valid_until_ms IS NOT NULL))";
 
 const CONTINUATION_COLUMNS: &str = "c.rowid, c.principal, c.selection_id, c.run_id, \
      c.admission_id, c.previous_decision_id, c.decision_id, c.reservation_id, c.valid_until_ms, \
@@ -203,6 +207,28 @@ impl AccountTx<'_> {
     /// Load the admission group's rows for the module's state. Must run in
     /// the writer's read-only load transaction.
     pub fn load_admission_group(&self) -> RouteStateResult<AdmissionGroupRows> {
+        if continuations_exist(self.conn).map_err(err)? {
+            let partial: Option<(i64, String, String)> = self
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT rowid, principal, selection_id FROM account_continue \
+                         WHERE {PARTIAL_OFFER_ROW} ORDER BY rowid LIMIT 1"
+                    ),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(err)?;
+            if let Some((rowid, principal, selection)) = partial {
+                return Err(err(format!(
+                    "account_continue row {rowid} (principal {principal}, selection \
+                     {selection}) has only some of decision_id, reservation_id and \
+                     valid_until_ms; routing writes all three or none, so the account \
+                     state refuses to load it"
+                )));
+            }
+        }
         (|| -> rusqlite::Result<AdmissionGroupRows> {
             let conn = self.conn;
             // The probe-scope columns arrive with the fence-recheck schema.
@@ -239,7 +265,7 @@ impl AccountTx<'_> {
                 |row| {
                     Ok(AdmissionScanRow {
                         latest: latest_from_row(row)?,
-                        charged: row.get::<_, i64>(12)? != 0,
+                        charged: row.get::<_, i64>(12)? == 1,
                         request_bytes: to_u64(row.get(13)?),
                         started: row.get(14)?,
                     })
@@ -327,8 +353,7 @@ impl AccountTx<'_> {
             .query_row(
                 "SELECT rowid, reservation_id FROM account_continue \
                  WHERE principal = ?1 AND admission_id = ?2 AND used_at_ms IS NOT NULL \
-                   AND decision_id IS NOT NULL AND reservation_id IS NOT NULL \
-                   AND valid_until_ms IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+                 ORDER BY rowid DESC LIMIT 1",
                 params![principal, admission_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -433,22 +458,57 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// End one conversation's lease at `at`, by primary key. Returns whether
-    /// the row existed.
+    /// End one conversation's lease at `at`, by primary key, only while the
+    /// row still has the pin, generation and lease end the caller saw.
+    /// Returns whether it did.
     pub fn set_affinity_lease_end(
         &self,
-        principal: &str,
-        conversation_hash: &str,
-        provider: &str,
+        conversation: &(String, String, String),
+        pin: (&str, u64),
+        previous: Option<i64>,
         at: i64,
     ) -> RouteStateResult<bool> {
         self.conn
             .execute(
                 "UPDATE account_affinity SET lease_valid_until = ?4 \
-                 WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3",
-                params![principal, conversation_hash, provider, at],
+                 WHERE principal = ?1 AND conversation_hash = ?2 AND provider = ?3 \
+                   AND pin_id = ?5 AND pin_generation = ?6 AND lease_valid_until IS ?7",
+                params![
+                    conversation.0,
+                    conversation.1,
+                    conversation.2,
+                    at,
+                    pin.0,
+                    pin.1 as i64,
+                    previous
+                ],
             )
             .map(|changed| changed == 1)
+            .map_err(err)
+    }
+
+    /// Whether an admission is in one of `states`, without reading it: a
+    /// primary-key UPDATE that leaves the row as it is and counts the match.
+    /// The state uses it to confirm a transition it found not applicable, so
+    /// the check writes nothing and reads no group data on the request path.
+    pub fn admission_in_states(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        states: &[String],
+    ) -> RouteStateResult<bool> {
+        let list = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&principal, &admission_id];
+        values.extend(states.iter().map(|state| state as &dyn rusqlite::ToSql));
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE account_admission SET state = state \
+                     WHERE principal = ?1 AND admission_id = ?2 AND state IN ({list})"
+                ),
+                values.as_slice(),
+            )
+            .map(|changed| changed > 0)
             .map_err(err)
     }
 
@@ -473,3 +533,4 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 }
+

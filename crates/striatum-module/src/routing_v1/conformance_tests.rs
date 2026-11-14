@@ -427,6 +427,27 @@ impl Route {
         .await
     }
 
+    /// Run `route.account_for` through the v1 handler on this thread, without
+    /// the frame loop, so a test hook inside it can run a competing request.
+    pub(super) fn account_for_direct(
+        &self,
+        params: &Value,
+    ) -> Result<Value, cortexkit_role_routing::errors::Refusal> {
+        let config_path = self.harness.config_path.lock().unwrap().clone();
+        let credentials = Arc::clone(&self.harness.broca_credentials.lock().unwrap());
+        super::accounts::account_for(
+            params,
+            &super::Caller::for_route(self.channel, self.epoch),
+            &super::Deps {
+                quota_cache: &self.harness.quota_cache,
+                store: &self.harness.store,
+                routing_config_path: &config_path,
+                operator_config_path: &config_path,
+                broca_credentials: &credentials,
+            },
+        )
+    }
+
     pub(super) fn request_frame(&self, method: &str, params: &Value) -> Frame {
         Frame::build(
             FrameType::Request,

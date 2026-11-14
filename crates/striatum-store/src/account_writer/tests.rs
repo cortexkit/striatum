@@ -16,7 +16,7 @@ fn fixture(name: &str) -> (cortexkit_test_support::ScratchDir, SqliteRouteStateS
 }
 
 fn queued<T: Send + 'static>(
-    f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    mut f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> (Queued, mpsc::Receiver<RouteStateResult<T>>) {
     let (reply, receiver) = mpsc::channel();
     (
@@ -26,13 +26,10 @@ fn queued<T: Send + 'static>(
             command:
                 Box::new(
                     TypedCommand {
-                        run:
-                            Some(
-                                move |tx: &AccountTx<'_>,
-                                      _: Option<
-                                    &mut (dyn crate::AccountWorkingState + 'static),
-                                >| f(tx),
-                            ),
+                        run: move |tx: &AccountTx<'_>,
+                                   _: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
+                            f(tx)
+                        },
                         result: None,
                         reply,
                         timing: Arc::new(Mutex::new(StoreStageTiming::default())),

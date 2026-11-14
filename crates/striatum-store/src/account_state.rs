@@ -128,11 +128,30 @@ impl crate::SqliteRouteStateStore {
     /// Load the module's state again after an earlier load failed, through
     /// the same read-only barrier as the first load. The writer stays alive
     /// across load failures, so a caller can retry instead of restarting.
+    ///
+    /// Single flight: callers that arrive while a retry runs wait for it and
+    /// share its result, instead of each reloading the whole state in turn.
     pub fn retry_account_state_load(&self) -> RouteStateResult<()> {
+        use std::sync::atomic::Ordering;
+        let arrived = self.account_state_retries.load(Ordering::Acquire);
+        let mut flight = self.account_state_retry.lock().unwrap();
+        if self.account_state_retries.load(Ordering::Acquire) != arrived {
+            // A retry finished while this caller waited for the lock.
+            return match flight.as_ref() {
+                None => Ok(()),
+                Some(error) => Err(crate::err(error.clone())),
+            };
+        }
         if let Some(bridge) = self.account_state.get() {
+            if bridge.snapshot().is_ok() {
+                return Ok(());
+            }
             bridge.request_reload();
         }
-        self.initialize_account_writer_state()
+        let result = self.initialize_account_writer_state();
+        *flight = result.as_ref().err().map(ToString::to_string);
+        self.account_state_retries.fetch_add(1, Ordering::Release);
+        result
     }
 
     /// Refuse a store-level writer that changes the admission group's tables

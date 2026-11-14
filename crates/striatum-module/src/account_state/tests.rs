@@ -515,24 +515,31 @@ fn a_failed_load_is_retried_by_the_next_command_instead_of_stopping_the_writer()
     assert!(owner.published.read().unwrap().is_some());
 }
 
-/// The schema allows a continuation with a decision but no reservation or
-/// deadline. The SQL writers never treat such a row as an offer, so the load
-/// must not either, rather than failing on it.
+/// The routing writer records an offer's decision, reservation and deadline
+/// together or not at all, and migration 088 cleared every other shape. A row
+/// with only some of them stops the load with an error naming the row, rather
+/// than loading as something SQL would read differently.
 #[test]
-fn a_continuation_with_a_decision_but_no_reservation_loads_as_no_offer() {
-    let (_scratch, store) = fixture("state-null-offer");
+fn a_continuation_with_a_partial_offer_is_refused_at_load_naming_the_row() {
+    let (_scratch, store) = fixture("state-partial-offer");
     store
         .with_writer_for_test(|conn| {
             conn.execute(
                 "INSERT INTO account_continue (principal, selection_id, request_json, \
                    answer_json, run_id, admission_id, previous_decision_id, decision_id) \
-                 VALUES ('p', 's', '{}', '{}', 'run', 'original', 'root', 'decision')",
+                 VALUES ('p', 'partial', '{}', '{}', 'run', 'original', 'root', 'decision')",
                 [],
             )
         })
         .unwrap();
-    let owner = install(&store);
-    assert_eq!(snapshot(&owner).admissions.offers.len(), 0);
+    let error = store
+        .install_account_state_bridge(Arc::new(StateOwner::default()))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("principal p, selection partial") && error.contains("refuses to load"),
+        "{error}"
+    );
 }
 
 /// Once the module's state is installed, the store-level writers that change
@@ -563,12 +570,22 @@ fn state_blind_admission_writers_refuse_once_state_is_installed() {
         )
         .is_err());
 
-    // Source check: no module code reaches them by name.
+    // Source check: no module code reaches them by name. The raw SQL writers
+    // that persist the state's own decisions are called only from the module
+    // command type in account_state.rs, which keeps the state in step.
     let forbidden = [
         "store.prune_account_admissions(",
         "store.prune_account_affinities(",
         "store.prune_account_continuations(",
         ".v1_commit_report(",
+    ];
+    let command_only = [
+        ".release_admission_probes(",
+        ".set_admission_lifecycle(",
+        ".set_affinity_lease_end(",
+        ".admission_in_states(",
+        ".settle_continuation_offer(",
+        "_returning(",
     ];
     let mut pending = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
     let mut offenders = Vec::new();
@@ -579,8 +596,15 @@ fn state_blind_admission_writers_refuse_once_state_is_installed() {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
+                let tests = path.ends_with("account_state/tests.rs")
+                    || path.ends_with("account_state/admission_tests.rs");
                 for name in forbidden {
-                    if text.contains(name) && !path.ends_with("account_state/tests.rs") {
+                    if text.contains(name) && !tests {
+                        offenders.push(format!("{}: {name}", path.display()));
+                    }
+                }
+                for name in command_only {
+                    if text.contains(name) && !tests && !path.ends_with("src/account_state.rs") {
                         offenders.push(format!("{}: {name}", path.display()));
                     }
                 }
@@ -588,4 +612,33 @@ fn state_blind_admission_writers_refuse_once_state_is_installed() {
         }
     }
     assert!(offenders.is_empty(), "state-blind writers called: {offenders:?}");
+}
+
+/// After a failed load, requests that arrive together retry it once and share
+/// that attempt's result, instead of each reloading the whole state in turn.
+#[test]
+fn concurrent_retries_after_a_failed_load_share_one_reload() {
+    let (_scratch, store) = fixture("state-single-flight");
+    let store = Arc::new(store);
+    let owner = Arc::new(StateOwner::default());
+    let loads = Arc::new(AtomicU64::new(0));
+    let counted = loads.clone();
+    *owner.load_hook.lock().unwrap() = Some(Box::new(move || {
+        counted.fetch_add(1, Ordering::Relaxed);
+        // Long enough for every caller below to arrive while it runs.
+        std::thread::sleep(Duration::from_millis(300));
+        Err(RouteStateStoreError("load keeps failing".into()))
+    }));
+    assert!(store.install_account_state_bridge(owner).is_err());
+    let initial = loads.load(Ordering::Relaxed);
+    let callers: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            std::thread::spawn(move || crate::account_state::initialize(&store))
+        })
+        .collect();
+    for caller in callers {
+        assert!(caller.join().unwrap().is_err());
+    }
+    assert_eq!(loads.load(Ordering::Relaxed) - initial, 1);
 }

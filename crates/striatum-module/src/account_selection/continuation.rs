@@ -144,7 +144,7 @@ pub(crate) fn continue_account(
         .map(|record| serde_json::from_str(&record.body_json))
         .transpose()
         .map_err(unavailable)?;
-    let mut parsed = original
+    let parsed = original
         .as_ref()
         .map(|body| {
             let mut body = body.clone();
@@ -310,7 +310,10 @@ pub(crate) fn continue_account(
             let Some(Ok((mut roster, route_fenced, _))) = prepared.clone() else {
                 return Ok(ContinueAnswer::Hold(ContinueHold::new("account_selection_unavailable",json!("no compatible account is available"))));
             };
-            let params = parsed.as_mut().unwrap();
+            // A copy: the writer may run this command again, and each run
+            // must start from the request as parsed.
+            let mut params = parsed.clone().unwrap();
+            let params = &mut params;
             // The exhausted account must leave even if its quota reading still has headroom.
             if let Some(roster) = &mut roster.roster {
                 for account in &mut roster.accounts {

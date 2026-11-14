@@ -292,8 +292,21 @@ pub(crate) struct ChainReservation {
 pub(crate) enum Effect {
     /// Write the admission's lifecycle columns; it was in state `from`.
     Admission { row: AccountAdmissionRow, from: String },
-    /// End one conversation's lease.
-    LeaseEnded { conversation: ConversationKey, at: i64 },
+    /// End one conversation's lease. The write requires the pin, generation
+    /// and lease end the state saw, as `end_lease`'s SQL requires its pin.
+    LeaseEnded {
+        conversation: ConversationKey,
+        pin_id: String,
+        pin_generation: u64,
+        previous: Option<i64>,
+        at: i64,
+    },
+    /// A transition the state found not applicable: the admission is not
+    /// open in one of `from`. SQL must agree.
+    Unchanged {
+        admission: RowKey,
+        from: Vec<String>,
+    },
     /// An offer was used or released.
     Offer {
         selection: RowKey,
@@ -758,12 +771,20 @@ impl AdmissionState {
         change: impl FnOnce(&mut AccountAdmissionRow),
     ) -> bool {
         let id = key(principal, admission_id);
-        let Some(open) = self.open.get(&id) else {
-            return false;
-        };
-        if !from.contains(&open.row.state.as_str()) {
+        if !self
+            .open
+            .get(&id)
+            .is_some_and(|open| from.contains(&open.row.state.as_str()))
+        {
+            // Persisted only where the state decides; a mirrored writer has
+            // already compared SQL's own result and discards this.
+            self.pending.push(Effect::Unchanged {
+                admission: id,
+                from: from.iter().map(|state| (*state).to_owned()).collect(),
+            });
             return false;
         }
+        let open = self.open.get(&id).expect("checked above");
         let mut row = open.row.clone();
         let from = row.state.clone();
         let was_started = row.started_at.is_some();
@@ -906,12 +927,16 @@ impl AdmissionState {
         for conversation in keys.iter() {
             if let Some(row) = self.affinity.get_mut(conversation) {
                 if row.lease_valid_until.is_none_or(|until| until > at) {
+                    let effect = Effect::LeaseEnded {
+                        conversation: conversation.clone(),
+                        pin_id: row.pin_id.clone(),
+                        pin_generation: row.pin_generation,
+                        previous: row.lease_valid_until,
+                        at,
+                    };
                     Arc::make_mut(row).lease_valid_until = Some(at);
                     changed = true;
-                    self.pending.push(Effect::LeaseEnded {
-                        conversation: conversation.clone(),
-                        at,
-                    });
+                    self.pending.push(effect);
                 }
             }
         }

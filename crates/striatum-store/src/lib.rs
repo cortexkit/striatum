@@ -67,7 +67,11 @@ pub mod group_reads;
 #[cfg(any(test, feature = "test-support"))]
 mod block_parity_fixture;
 mod key_pool;
-pub use fence_rechecks::{BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope};
+pub use fence_rechecks::{
+    BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope, ReleasedAdmissionProbes,
+};
+#[cfg(test)]
+mod continuation_migration_tests;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
@@ -327,7 +331,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 86] {
+fn route_state_migrations() -> [Migration; 87] {
     [
         Migration {
             version: 1,
@@ -672,6 +676,10 @@ fn route_state_migrations() -> [Migration; 86] {
         Migration {
             version: 87,
             statements: include_str!("../migrations/087_login_methods_coverage.sql"),
+        },
+        Migration {
+            version: 88,
+            statements: include_str!("../migrations/088_continuation_whole_offers.sql"),
         },
     ]
 }
@@ -1140,6 +1148,12 @@ pub struct SqliteRouteStateStore {
     store: std::sync::Arc<evaluation_snapshot::ConnectionStore>,
     account_writer: std::sync::OnceLock<account_writer::AccountWriter>,
     account_state: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,
+    /// Single-flight retries of a failed account state load: held while one
+    /// runs, with the last one's error.
+    account_state_retry: Mutex<Option<String>>,
+    /// How many single-flight retries have finished. Read without the lock,
+    /// so a caller can tell that a retry finished while it waited.
+    account_state_retries: AtomicU64,
     maintenance: Option<Mutex<Connection>>,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
@@ -1696,6 +1710,8 @@ impl SqliteRouteStateStore {
             store: std::sync::Arc::new(store),
             account_writer: std::sync::OnceLock::new(),
             account_state: std::sync::Arc::new(std::sync::OnceLock::new()),
+            account_state_retry: Mutex::new(None),
+            account_state_retries: AtomicU64::new(0),
             call_counts: Default::default(),
             class_vectors: Mutex::new(HashMap::new()),
             usage_generation: AtomicU64::new(0),

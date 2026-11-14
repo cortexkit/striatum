@@ -8,9 +8,20 @@ use std::time::Instant;
 const MAX_BATCH: usize = 32;
 
 /// Error text a module command returns when SQL changed a different number of
-/// rows than its working state expected. The writer then discards the working
-/// state and reloads it before the next batch.
+/// rows than its working state expected. The writer then rolls the whole batch
+/// back, reloads the state and runs the batch once more (see `write_batch`).
 pub const STATE_DIVERGED: &str = "account state diverged from SQL";
+
+/// How a batch ended.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchOutcome {
+    Committed,
+    /// Only the startup barrier ran: nothing to commit or publish.
+    Barrier,
+    /// A command found the working state disagreeing with SQL. Every command
+    /// in the batch was rolled back and the working state dropped.
+    Diverged(String),
+}
 
 impl AccountTx<'_> {
     pub(crate) fn pool_sql<T>(
@@ -53,7 +64,7 @@ fn write_batch(
     batch: &mut [Queued],
     state: &mut Option<Box<dyn crate::AccountWorkingState>>,
     #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
-) -> rusqlite::Result<bool> {
+) -> rusqlite::Result<BatchOutcome> {
     // Startup must not manufacture a write transaction or a second publication.
     // The loader already published its consistent read before this barrier runs.
     if batch.iter().all(|queued| queued.initialize_only) {
@@ -68,14 +79,14 @@ fn write_batch(
                 )
                 .expect("initialization barrier cannot fail");
         }
-        return Ok(false);
+        return Ok(BatchOutcome::Barrier);
     }
     #[cfg(any(test, feature = "test-support"))]
     let _batch = evaluation_snapshot::AccountBatchGuard::enter();
     let transaction = crate::write_transaction(conn)?;
     #[cfg(any(test, feature = "test-support"))]
     transactions.fetch_add(1, Ordering::Relaxed);
-    for queued in batch {
+    for queued in batch.iter_mut() {
         conn.execute_batch("SAVEPOINT account_command")?;
         let before = state.as_ref().map(|state| state.fork());
         let status = queued.command.run(
@@ -86,12 +97,14 @@ fn write_batch(
         );
         if let Err(error) = status {
             *state = before;
-            // The command found its working state disagreeing with SQL. Its
-            // own changes roll back below; drop the state too, so the rest of
-            // the batch runs on SQL alone and the next batch loads afresh,
-            // instead of every later command repeating the same mismatch.
+            // The command found its working state disagreeing with SQL. The
+            // commands before it in this batch computed from the same state,
+            // so their replies may be stale too: undo the whole batch and drop
+            // the state. The caller reloads it and runs the batch again.
             if error.to_string().contains(STATE_DIVERGED) {
                 *state = None;
+                transaction.rollback()?;
+                return Ok(BatchOutcome::Diverged(error.to_string()));
             }
             // A full rollback requested by a SQLite trigger, disk-full and
             // I/O failures can destroy the
@@ -110,7 +123,53 @@ fn write_batch(
     }
     #[cfg(any(test, feature = "test-support"))]
     crash_for_test("before_commit");
-    evaluation_snapshot::timed_commit(transaction).map(|()| true)
+    evaluation_snapshot::timed_commit(transaction).map(|()| BatchOutcome::Committed)
+}
+
+/// Run a batch on a state loaded for it. If a command finds the state
+/// disagreeing with SQL, nothing of the batch was committed and every command
+/// is deterministic in its inputs, the stored rows and the state: reload the
+/// state and run the whole batch once more, so every caller gets an answer
+/// computed from current rows. A second disagreement fails the whole batch;
+/// the next batch loads afresh.
+fn run_batch(
+    conn: &Connection,
+    batch: &mut [Queued],
+    state: &mut crate::account_state::WriterAccountState,
+    #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
+) -> Result<bool, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        if let Err(error) = state.refresh(conn) {
+            return Err(format!("load account state: {error}"));
+        }
+        let outcome = write_batch(
+            conn,
+            batch,
+            &mut state.working,
+            #[cfg(any(test, feature = "test-support"))]
+            transactions,
+        );
+        match outcome {
+            Ok(BatchOutcome::Committed) => {
+                state.publish();
+                return Ok(true);
+            }
+            Ok(BatchOutcome::Barrier) => return Ok(false),
+            Ok(BatchOutcome::Diverged(error)) => {
+                state.invalidate();
+                if attempts == 2 {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "account state diverged; reloading and running the batch again");
+            }
+            Err(error) => {
+                state.invalidate();
+                return Err(error.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -148,7 +207,7 @@ trait Command: Send {
 }
 
 struct TypedCommand<F, T> {
-    run: Option<F>,
+    run: F,
     result: Option<RouteStateResult<T>>,
     reply: mpsc::Sender<RouteStateResult<T>>,
     timing: Arc<Mutex<StoreStageTiming>>,
@@ -156,7 +215,7 @@ struct TypedCommand<F, T> {
 
 impl<F, T> Command for TypedCommand<F, T>
 where
-    F: FnOnce(
+    F: FnMut(
             &AccountTx<'_>,
             Option<&mut (dyn crate::AccountWorkingState + 'static)>,
         ) -> RouteStateResult<T>
@@ -168,7 +227,9 @@ where
         tx: &AccountTx<'_>,
         state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
     ) -> RouteStateResult<()> {
-        let result = self.run.take().expect("command runs once")(tx, state);
+        // A batch that is run again (see `run_batch`) runs each command again;
+        // only the last run's result is replied.
+        let result = (self.run)(tx, state);
         let status = result.as_ref().map(|_| ()).map_err(err);
         self.result = Some(result);
         status
@@ -268,22 +329,13 @@ impl AccountWriter {
                             // here would turn one bad read into a restart loop.
                             let result: Result<bool, String> = store
                                 .with_conn(|conn| {
-                                    if let Err(error) = state.refresh(conn) {
-                                        return Ok(Err(format!("load account state: {error}")));
-                                    }
-                                    let result = write_batch(
+                                    Ok(run_batch(
                                         conn,
                                         &mut batch,
-                                        &mut state.working,
+                                        &mut state,
                                         #[cfg(any(test, feature = "test-support"))]
                                         &transactions,
-                                    );
-                                    match &result {
-                                        Ok(true) => state.publish(),
-                                        Ok(false) => {}
-                                        Err(_) => state.invalidate(),
-                                    }
-                                    Ok(result.map_err(|error| error.to_string()))
+                                    ))
                                 })
                                 .unwrap_or_else(|error| Err(error.to_string()));
                             let after = SqliteRouteStateStore::thread_stage_timing();
@@ -335,7 +387,7 @@ impl AccountWriter {
 
     fn enqueue<T: Send + 'static>(
         &self,
-        f: impl FnOnce(
+        f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
             ) -> RouteStateResult<T>
@@ -347,7 +399,7 @@ impl AccountWriter {
 
     pub(crate) fn enqueue_inner<T: Send + 'static>(
         &self,
-        f: impl FnOnce(
+        f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
             ) -> RouteStateResult<T>
@@ -367,7 +419,7 @@ impl AccountWriter {
                 enqueued: Instant::now(),
                 initialize_only,
                 command: Box::new(TypedCommand {
-                    run: Some(f),
+                    run: f,
                     result: None,
                     reply,
                     timing: timing.clone(),
@@ -416,7 +468,7 @@ impl SqliteRouteStateStore {
     pub fn enqueue_account_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        mut f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
         self.enqueue_account_state_command(kind, move |tx, _| f(tx))
     }
@@ -426,7 +478,7 @@ impl SqliteRouteStateStore {
     pub fn enqueue_account_state_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
-        f: impl FnOnce(
+        mut f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
             ) -> RouteStateResult<T>
@@ -466,7 +518,7 @@ impl SqliteRouteStateStore {
     pub fn account_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<T> {
         if self.store.is_projection() {
             return self.projection_command(f);

@@ -589,6 +589,36 @@ async fn engine_admission_binding_expiry_and_replay_use_the_shared_allocator() {
     );
 }
 
+/// An identical admission can commit between this request's replay check and
+/// its decision binding. If the binding then refuses (here the engine decision
+/// expired meanwhile), the request must answer as the committed admission did,
+/// not with `unknown_decision`.
+#[tokio::test]
+async fn engine_admission_refused_after_its_twin_committed_replays_the_twin() {
+    let harness = setup(vec![engine("remote", false)]);
+    let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+    credentials.apply_listing(&listing(vec![key("opaque-media")], true), crate::now_ms());
+    harness.set_credentials(credentials);
+    let route = Arc::new(harness.bind(reserved("colliculus"), None).await);
+    let answer = selected(&route, &request()).await;
+    let params = json!({"admission_id":"twin","conversation_key":"job","provider":"media-vendor",
+        "model":"remote","decision_id":answer["decision_id"],"hold_wait_max_s":0});
+    let twin = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (route, params, twin, credentials) =
+            (route.clone(), params.clone(), twin.clone(), harness.credentials());
+        crate::account_selection::after_roster_prepared("v1-replay-checked:twin", move || {
+            *twin.lock().unwrap() = Some(route.account_for_direct(&params));
+            credentials.lock().unwrap().engine_clock_offset_ms = 600_000;
+        });
+    }
+    let late = route.account_for_direct(&params);
+    let twin = twin.lock().unwrap().take().expect("the twin ran inside the request");
+    let twin = twin.expect("the twin was admitted");
+    assert_eq!(twin["admission"]["state"], "reserved");
+    assert_eq!(late.map_err(|refusal| refusal.code), Ok(twin));
+}
+
 #[tokio::test]
 async fn remote_engines_are_automatic_without_llm_spending_opt_in() {
     let harness = setup(vec![engine("remote", false)]);

@@ -8,7 +8,7 @@ use striatum_store::{AccountCommandKind, AccountTx, SqliteRouteStateStore};
 
 pub(crate) fn repair<T: Send + 'static>(
     store: &SqliteRouteStateStore,
-    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
+    command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
     execute(store, AccountCommandKind::Repair, command)
 }
@@ -43,20 +43,24 @@ pub(crate) fn prune_unserved_unpicked_facts(
     store.prune_unserved_unpicked_facts()
 }
 
+/// `command` may run more than once: if a command in its batch finds the
+/// in-memory state disagreeing with SQL, the writer rolls the batch back,
+/// reloads the state and runs every command again. A command must therefore
+/// compute only from its captured inputs, the transaction and the state.
 pub(crate) fn execute<T: Send + 'static>(
     store: &SqliteRouteStateStore,
     kind: AccountCommandKind,
-    command: impl FnOnce(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
+    mut command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
     if !store.is_account_evaluation_projection() {
         crate::account_state::initialize(store)?;
     }
     #[cfg(test)]
     let inputs = crate::TestThreadState::capture();
-    let command = move |tx: &AccountTx<'_>,
+    let mut command = move |tx: &AccountTx<'_>,
                         state: Option<&mut (dyn AccountWorkingState + 'static)>| {
         #[cfg(test)]
-        let _inputs = inputs.install();
+        let _inputs = inputs.clone().install();
         command(&mut AccountCommand::new(tx, state))
     };
     if store.is_account_evaluation_projection() {

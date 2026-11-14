@@ -485,6 +485,16 @@ impl AccountCommand<'_> {
         Ok(())
     }
 
+    /// Run a state-deciding change as the continuation writers do, for tests
+    /// that set the state up by hand.
+    #[cfg(test)]
+    pub(crate) fn decide_for_test(
+        &mut self,
+        change: impl FnOnce(&mut AdmissionState),
+    ) -> RouteStateResult<()> {
+        self.decide(change)
+    }
+
     /// Decide a change on the state, then persist the writes it decided.
     fn decide<T>(&mut self, change: impl FnOnce(&mut AdmissionState) -> T) -> RouteStateResult<T> {
         let sql = self.sql;
@@ -500,9 +510,31 @@ impl AccountCommand<'_> {
                         )));
                     }
                 }
-                admissions::Effect::LeaseEnded { conversation, at } => {
-                    if !sql.set_affinity_lease_end(&conversation.0, &conversation.1, &conversation.2, at)? {
-                        return Err(diverged(format!("affinity {conversation:?} is missing in SQL")));
+                admissions::Effect::LeaseEnded {
+                    conversation,
+                    pin_id,
+                    pin_generation,
+                    previous,
+                    at,
+                } => {
+                    if !sql.set_affinity_lease_end(
+                        &conversation,
+                        (&pin_id, pin_generation),
+                        previous,
+                        at,
+                    )? {
+                        return Err(diverged(format!(
+                            "affinity {conversation:?} is not pin {pin_id} generation \
+                             {pin_generation} with lease {previous:?} in SQL"
+                        )));
+                    }
+                }
+                admissions::Effect::Unchanged { admission, from } => {
+                    if sql.admission_in_states(&admission.0, &admission.1, &from)? {
+                        return Err(diverged(format!(
+                            "admission {} is {from:?} in SQL but not open so in state",
+                            admission.1
+                        )));
                     }
                 }
                 admissions::Effect::Offer {
@@ -734,12 +766,31 @@ impl AccountCommand<'_> {
             return Ok(());
         };
         let expired = state.expired_probe_admissions(self.sql.probe_authorization_owners()?, now);
-        let marked = self.sql.release_admission_probes(expired, now)?;
-        self.mirror(|state| {
-            for (principal, admission) in marked {
-                state.expire(&principal, &admission);
-            }
-        });
+        let chosen: Vec<(String, String)> = expired
+            .iter()
+            .map(|(principal, admission, _)| (principal.clone(), admission.clone()))
+            .collect();
+        let released = self.sql.release_admission_probes(expired, now)?;
+        // The state chose only admissions it holds as unstarted; SQL must have
+        // released every one of them, and expired exactly those the state
+        // holds as reserved.
+        if released.released != chosen.len() {
+            return Err(diverged(format!(
+                "release_expired_admission_probes: state chose {} unstarted admissions, \
+                 SQL released {}",
+                chosen.len(),
+                released.released
+            )));
+        }
+        for (principal, admission) in &chosen {
+            let sql_expired = released
+                .expired
+                .iter()
+                .any(|(p, a)| p == principal && a == admission);
+            self.mirror_checked(sql_expired, "release_expired_admission_probes", |state| {
+                state.expire(principal, admission)
+            })?;
+        }
         Ok(())
     }
 

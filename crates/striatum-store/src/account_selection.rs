@@ -1314,7 +1314,7 @@ fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
         pin_id: row.get(10)?,
         pin_generation: to_u64(row.get(11)?),
         state: row.get(12)?,
-        charged: row.get::<_, i64>(13)? != 0,
+        charged: row.get::<_, i64>(13)? == 1,
         request_bytes: to_u64(row.get(14)?),
         request_bytes_estimated: row.get::<_, i64>(15)? != 0,
         committed_at: row.get(16)?,
