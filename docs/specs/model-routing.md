@@ -285,8 +285,10 @@ or settings are updated, and requests look it up from an immutable snapshot;
 429 responses never teach it a limit.
 `concurrency.enforcement_enabled` defaults to `false`. With enforcement on,
 selection removes a route only when it has at least one eligible account and
-every eligible account is at its effective cap. Eligibility uses the allocator's
-account-preflight probe, without looking up conversation affinity. Variants share
+every eligible account is at its effective cap. An account counts as eligible
+when the allocator would admit it for that model right now (its blocks, quota
+reserve and sign-in state), judged without any conversation's account affinity,
+because a selection serves no particular conversation yet. Variants share
 their model's cap count; paid pools use the pool provider stored by admission.
 The ledger filter runs after the quality gate and before caller-supplied
 `concurrency_slots`, never widens the shortlist, and records no waiter.
