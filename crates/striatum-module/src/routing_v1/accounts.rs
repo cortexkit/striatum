@@ -223,11 +223,14 @@ pub(super) fn account_for(
     let head_call_source = if scope_head {
         Some("scope")
     } else if caller.binding_is_current() {
-        account_selection::call_log::AccountCall::head_turn_source(
-            params,
-            &caller.principal,
-            &super::operator_config(deps),
-        )
+        deps.broca_credentials.lock().ok().and_then(|credentials| {
+            account_selection::call_log::AccountCall::head_turn_source(
+                params,
+                &caller.principal,
+                &super::operator_config(deps),
+                &credentials,
+            )
+        })
     } else {
         None
     };

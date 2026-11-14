@@ -4911,6 +4911,7 @@ pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpRe
             &params,
             principal,
             ctx.classes.as_ref().map(|classes| classes.config.as_ref()),
+            ctx.classes.as_ref().map(|classes| &classes.credentials),
             ctx.store,
         )
     });

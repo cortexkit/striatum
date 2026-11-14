@@ -2,6 +2,40 @@
 
 use super::*;
 
+#[tokio::test]
+async fn head_turn_auto_enrolled_first_party_runner_is_trusted_on_both_surfaces() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        let (harness, _) = setup("synthetic", false);
+        caps(&harness, 1, true);
+        let runner = harness.bind(reserved("class-runner"), None).await;
+        fill(&runner, A, "full", 1).await;
+        harness.edit_config(|config| config["runners"] = json!([]));
+        {
+            let shared = harness.credentials();
+            let mut credentials = shared.lock().unwrap();
+            crate::routing_v1::runners::DescribeCache::default().catalog(
+                &json!([{"module_id":"class-runner","first_party":true,
+                    "incarnation":"daemon-a","spawn":7,
+                    "role_declarations":{"routing/v1":{"runner":{
+                        "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"},
+                            {"wire_api":"anthropic.messages","auth_method":"apikey"}]
+                    }}}}]),
+                &[], &mut credentials, NOW as i64,
+            );
+        }
+        assert!(harness.operator_config().v1_runners().is_empty());
+        lines();
+        let admitted = admitted_on(&runner, &flagged(on(A, "automatic-head"), legacy)).await;
+        assert_eq!(admitted["account"]["account_id"], A);
+        assert_eq!(count(&harness, A, NOW), 2);
+        let (calls, pressure) = lines();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["head_call_source"], "head_turn");
+        assert!(pressure.is_empty(), "{pressure:?}");
+    }
+}
+
 fn account_choice(admitted: &Value) -> Value {
     let account = &admitted["account"];
     json!({"provider":account["provider"],"account_id":account["account_id"],

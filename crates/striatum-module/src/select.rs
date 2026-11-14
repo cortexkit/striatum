@@ -1254,10 +1254,12 @@ async fn handle_select_request_attempt(
         let principal = route_principal(channel, epoch);
         let request: serde_json::Value = serde_json::from_slice(&frame.body).unwrap_or_default();
         let call = (envelope.method == account_selection::ACCOUNT_FOR_OP).then(|| {
+            let credentials = broca_credentials.lock().ok();
             account_selection::call_log::AccountCall::legacy(
                 &request["params"],
                 &principal,
                 Some(&live_config),
+                credentials.as_deref(),
                 store,
             )
         });

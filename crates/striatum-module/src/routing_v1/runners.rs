@@ -874,7 +874,7 @@ fn report_unknown_pair_tokens_once(
 }
 
 /// Each successful catalog read replaces the declaration snapshot, so removal
-/// or loss of nonce verification also removes a module's previously trusted facts.
+/// or loss of both nonce verification and the first-party mark removes its facts.
 pub(crate) fn declarations_from_catalog(
     modules: &serde_json::Value,
 ) -> std::collections::BTreeMap<String, RunnerDeclaration> {
