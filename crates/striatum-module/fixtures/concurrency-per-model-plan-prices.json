@@ -1,0 +1,16 @@
+{
+  "prices": [
+    {
+      "provider_id": "synthetic-plans",
+      "tier": "per-model",
+      "concurrency": {
+        "limit": 3,
+        "scope": "account_model",
+        "per_model": { "synthetic-plans/model-a": 2 },
+        "review_by_ms": 1790683200001,
+        "source_ref": "https://example.invalid/concurrency",
+        "quote": "Synthetic plan with a lower limit for one model."
+      }
+    }
+  ]
+}

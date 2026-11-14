@@ -1,0 +1,39 @@
+{
+  "consumers": [
+    {
+      "kind": "transcribe",
+      "name": "colliculus.voice_message",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "synthesize",
+      "name": "colliculus.speech",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "image",
+      "name": "colliculus.image",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "video",
+      "name": "colliculus.video",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "realtime",
+      "name": "colliculus.dictation_token",
+      "selectors": [
+        "callosum"
+      ]
+    }
+  ]
+}

@@ -77,8 +77,7 @@ fn concurrency_enforcement_switch_defaults_off_and_preserves_resolved_caps() {
 
 fn prices(scope: &str, limit: Value) -> Value {
     json!({"prices":[{"provider_id":"google","tier":"ultra","concurrency":{
-        "scope":scope,"limit":limit,"review_by_ms":T+1,
-        "per_model":{"google/m1":1}
+        "scope":scope,"limit":limit,"review_by_ms":T+1
     }}]})
 }
 
@@ -117,6 +116,158 @@ pub(crate) fn inputs(scope: &str, settings: Value) -> CapInputs {
     input.publish_roster(&roster(Some("ultra")));
     input.publish_settings(&serde_json::from_value(settings).unwrap());
     input
+}
+
+pub(crate) fn per_model_prices() -> Value {
+    serde_json::from_str(include_str!(
+        "../fixtures/concurrency-per-model-plan-prices.json"
+    ))
+    .unwrap()
+}
+
+fn per_model_inputs() -> CapInputs {
+    let mut input = CapInputs::default();
+    input.accounts.insert(
+        ("synthetic-plans".into(), "a".into()),
+        Some("per-model".into()),
+    );
+    input.publish_catalog(&per_model_prices(), T);
+    input
+}
+
+#[test]
+fn cap_per_model_fixture_limits_scopes_and_whole_overrides() {
+    let mut input = per_model_inputs();
+    assert_eq!(
+        input.resolved.cap("synthetic-plans", "a", "model-a").limit,
+        Some(2)
+    );
+    assert_eq!(
+        input.resolved.cap("synthetic-plans", "a", "model-b").limit,
+        Some(3)
+    );
+    assert_eq!(
+        input.resolved.cap_count("synthetic-plans", "a", "model-a"),
+        crate::account_state::InflightScope::AccountModel("model-a")
+    );
+    for (kind, key) in [
+        ("providers", "synthetic-plans"),
+        ("plans", "synthetic-plans/per-model"),
+        ("models", "synthetic-plans/model-a"),
+        ("accounts", "synthetic-plans/a"),
+    ] {
+        for limit in [json!(4), json!("none")] {
+            let mut settings = json!({});
+            settings[kind][key] = json!({"limit":limit});
+            input.publish_settings(&serde_json::from_value(settings).unwrap());
+            assert_eq!(
+                input.resolved.cap("synthetic-plans", "a", "model-a"),
+                EffectiveCap {
+                    limit: limit.as_u64(),
+                    scope: CapScope::AccountModel
+                },
+                "{kind}/{key} must replace the catalog model limit"
+            );
+            assert_eq!(
+                input.resolved.cap("synthetic-plans", "a", "model-b").limit,
+                if kind == "models" {
+                    Some(3)
+                } else {
+                    limit.as_u64()
+                }
+            );
+        }
+    }
+    input.publish_settings(&CapSettings::default());
+    let mut prices = per_model_prices();
+    prices["prices"][0]["concurrency"]["scope"] = json!("account");
+    input.publish_catalog(&prices, T);
+    for model in ["model-a", "model-b"] {
+        assert_eq!(
+            input.resolved.cap("synthetic-plans", "a", model),
+            EffectiveCap {
+                limit: Some(3),
+                scope: CapScope::Account
+            }
+        );
+    }
+}
+
+#[test]
+fn cap_per_model_keys_share_settings_admission_identity_matching() {
+    let mut input = CapInputs::default();
+    input.accounts.insert(
+        ("anthropic-platform".into(), "a".into()),
+        Some("per-model".into()),
+    );
+    let mut prices = per_model_prices();
+    prices["prices"][0]["provider_id"] = json!("anthropic-platform");
+    prices["prices"][0]["concurrency"]["per_model"] = json!({
+        "anthropic-platform/model-a":2,
+        "anthropic/model-b":1
+    });
+    input.publish_catalog(&prices, T);
+    for settings in [
+        json!({}),
+        json!({"models":{"anthropic-platform/model-a":{"limit":2}}}),
+    ] {
+        input.publish_settings(&serde_json::from_value(settings).unwrap());
+        assert_eq!(
+            input
+                .resolved
+                .cap("anthropic-platform", "a", " Model-A ")
+                .limit,
+            Some(2)
+        );
+        for model in [
+            "model-b",
+            "anthropic-platform/model-a",
+            "model-a[variant]",
+            "model-a/pool",
+        ] {
+            assert_eq!(
+                input.resolved.cap("anthropic-platform", "a", model).limit,
+                Some(3)
+            );
+        }
+        assert_eq!(input.resolved.cap("anthropic", "a", "model-a").limit, None);
+    }
+}
+
+#[test]
+fn cap_per_model_publications_replace_cached_snapshots() {
+    let mut prices = per_model_prices();
+    prices["prices"][0]["provider_id"] = json!("google");
+    prices["prices"][0]["tier"] = json!("ultra");
+    prices["prices"][0]["concurrency"]["per_model"] = json!({"google/m1":2});
+    let mut input = CapInputs::default();
+    input.publish_roster(&roster(Some("ultra")));
+    input.publish_catalog(&prices, T);
+    let settings = CapSettings::default();
+    let first = input.resolved_for_settings(&settings);
+    assert_eq!(first.cap("google", "a", "m1").limit, Some(2));
+    assert!(Arc::ptr_eq(&first, &input.resolved_for_settings(&settings)));
+    prices["prices"][0]["concurrency"]["per_model"]["google/m1"] = json!(1);
+    input.publish_catalog(&prices, T);
+    let changed = input.resolved_for_settings(&settings);
+    assert!(!Arc::ptr_eq(&first, &changed));
+    assert_eq!(changed.cap("google", "a", "m1").limit, Some(1));
+    assert_eq!(first.cap("google", "a", "m1").limit, Some(2));
+    input.publish_roster(&roster(None));
+    assert_eq!(
+        input
+            .resolved_for_settings(&settings)
+            .cap("google", "a", "m1")
+            .limit,
+        None
+    );
+    input.publish_roster(&roster(Some("ultra")));
+    input.publish_settings(
+        &serde_json::from_value(json!({"plans":{"google/ultra":{"limit":4}}})).unwrap(),
+    );
+    assert_eq!(input.resolved.cap("google", "a", "m1").limit, Some(4));
+    input.publish_settings(&settings);
+    assert_eq!(input.resolved.cap("google", "a", "m1").limit, Some(1));
 }
 
 #[test]

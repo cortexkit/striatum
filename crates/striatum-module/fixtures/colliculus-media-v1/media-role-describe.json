@@ -1,0 +1,223 @@
+{
+  "call_silence_timeout_s": 60,
+  "engines": [
+    {
+      "bias_limit": {
+        "max": 50,
+        "unit": "phrase"
+      },
+      "formats": [
+        "audio/mp4",
+        "audio/mpeg",
+        "audio/wav",
+        "audio/flac"
+      ],
+      "kind": "transcribe",
+      "languages": [
+        "en",
+        "tr",
+        "de",
+        "fr",
+        "es",
+        "it",
+        "pt",
+        "nl"
+      ],
+      "latency_class": "interactive",
+      "local": false,
+      "max_duration_ms": 1500000,
+      "max_input_bytes": 26214400,
+      "model": "gpt-transcribe",
+      "provider": "openai"
+    },
+    {
+      "formats": [
+        "image/png",
+        "image/jpeg",
+        "image/webp"
+      ],
+      "kind": "image",
+      "latency_class": "interactive",
+      "local": false,
+      "model": "gpt-image-2.6-flare",
+      "provider": "openai",
+      "qualities": [
+        "auto",
+        "low",
+        "medium",
+        "high"
+      ],
+      "sizes": [
+        "1024x1024",
+        "1536x1024",
+        "1024x1536",
+        "auto"
+      ]
+    },
+    {
+      "formats": [
+        "audio/L16;rate=24000;channels=1"
+      ],
+      "kind": "stream_transcribe",
+      "latency_class": "realtime",
+      "local": false,
+      "max_duration_ms": 3600000,
+      "model": "gpt-live-transcribe",
+      "provider": "openai"
+    },
+    {
+      "formats": [
+        "audio/L16;rate=24000;channels=1"
+      ],
+      "kind": "realtime",
+      "latency_class": "realtime",
+      "local": false,
+      "max_duration_ms": 3600000,
+      "model": "gpt-live-transcribe",
+      "provider": "openai"
+    },
+    {
+      "bias_limit": {
+        "max": 100,
+        "unit": "phrase"
+      },
+      "formats": [
+        "audio/wav",
+        "audio/mpeg",
+        "audio/flac"
+      ],
+      "kind": "transcribe",
+      "languages": [
+        "en",
+        "tr",
+        "de",
+        "fr",
+        "es",
+        "it",
+        "pt",
+        "nl"
+      ],
+      "latency_class": "interactive",
+      "local": false,
+      "max_duration_ms": 3600000,
+      "max_input_bytes": 14680064,
+      "model": "gemini-3.8-flash",
+      "provider": "google"
+    },
+    {
+      "formats": [
+        "audio/wav"
+      ],
+      "kind": "synthesize",
+      "latency_class": "interactive",
+      "local": false,
+      "model": "gemini-3.8-flash-tts",
+      "provider": "google",
+      "voices": [
+        "Zephyr",
+        "Puck",
+        "Charon",
+        "Kore",
+        "Fenrir",
+        "Leda",
+        "Orus",
+        "Aoede",
+        "Callirrhoe",
+        "Autonoe",
+        "Enceladus",
+        "Iapetus",
+        "Umbriel",
+        "Algieba",
+        "Despina",
+        "Erinome",
+        "Algenib",
+        "Rasalgethi",
+        "Laomedeia",
+        "Achernar",
+        "Alnilam",
+        "Schedar",
+        "Gacrux",
+        "Pulcherrima",
+        "Achird",
+        "Zubenelgenubi",
+        "Vindemiatrix",
+        "Sadachbia",
+        "Sadaltager",
+        "Sulafat"
+      ]
+    },
+    {
+      "formats": [
+        "image/jpeg"
+      ],
+      "kind": "image",
+      "latency_class": "interactive",
+      "local": false,
+      "model": "gemini-3.1-flash-image",
+      "provider": "google",
+      "qualities": [
+        "512",
+        "1K",
+        "2K",
+        "4K"
+      ],
+      "sizes": [
+        "1:1",
+        "1:4",
+        "1:8",
+        "2:3",
+        "3:2",
+        "3:4",
+        "4:1",
+        "4:3",
+        "4:5",
+        "5:4",
+        "8:1",
+        "9:16",
+        "16:9",
+        "21:9"
+      ]
+    },
+    {
+      "formats": [
+        "audio/mpeg",
+        "audio/wav"
+      ],
+      "kind": "synthesize",
+      "latency_class": "interactive",
+      "local": false,
+      "max_input_bytes": 160000,
+      "model": "eleven_flash_v2_5",
+      "provider": "elevenlabs",
+      "voices": [
+        "JBFqnCBsd6RMkjVDRZzb"
+      ]
+    },
+    {
+      "formats": [
+        "video/mp4"
+      ],
+      "kind": "video",
+      "latency_class": "batch",
+      "local": false,
+      "max_duration_ms": 15000,
+      "model": "gemini-omni-1.2-flash",
+      "provider": "google",
+      "resolutions": [
+        "360p",
+        "720p",
+        "1080p",
+        "4k"
+      ]
+    }
+  ],
+  "groups": [
+    "jobs",
+    "usage_feed",
+    "bias_packs",
+    "stream_transcribe",
+    "realtime"
+  ],
+  "jobs_survive_restart": true,
+  "token_max_ttl_ms": 60000
+}

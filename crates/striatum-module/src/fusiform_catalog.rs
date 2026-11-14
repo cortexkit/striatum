@@ -47,6 +47,7 @@ pub const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PlanConcurrencyCatalog {
     caps: BTreeMap<(String, String), crate::concurrency_caps::EffectiveCap>,
+    per_model: BTreeMap<(String, String), BTreeMap<String, u64>>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -85,6 +86,18 @@ impl PlanConcurrencyCatalog {
                             scope,
                         },
                     );
+                    if scope == CapScope::AccountModel {
+                        let models = value["per_model"]
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|(key, value)| {
+                                value.as_u64().filter(|n| *n > 0).map(|n| (key.clone(), n))
+                            })
+                            .collect();
+                        out.per_model
+                            .insert((provider.to_owned(), tier.to_owned()), models);
+                    }
                     value["review_by_ms"]
                         .as_i64()
                         .filter(|review| *review < now)
@@ -109,6 +122,10 @@ impl PlanConcurrencyCatalog {
         self.caps
             .get(&(provider.to_owned(), tier.to_owned()))
             .copied()
+    }
+
+    pub(crate) fn model_caps(&self, provider: &str, tier: &str) -> Option<&BTreeMap<String, u64>> {
+        self.per_model.get(&(provider.to_owned(), tier.to_owned()))
     }
 }
 

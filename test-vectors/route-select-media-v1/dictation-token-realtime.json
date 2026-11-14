@@ -1,0 +1,1 @@
+{"request":{"method":"route.select","params":{"consumer":"colliculus.dictation_token","kind":"realtime","privacy":"remote_allowed","requirements":{}}},"reply":{"result":{"decision_id":"dec_00000000000a","engine":{"caller_local":false,"local":false,"model":"gpt-live-transcribe","module":"colliculus","provider":"openai"},"expires_at_ms":1750000600000}}}

@@ -113,6 +113,11 @@ struct AccountCaps {
     models: HashMap<String, EffectiveCap>,
 }
 
+fn model_for_provider<'a>(key: &'a str, provider: &str) -> Option<&'a str> {
+    let (p, model) = key.split_once('/')?;
+    (p == provider).then_some(model)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ProviderCaps {
     default: AccountCaps,
@@ -324,17 +329,33 @@ impl CapInputs {
             models: HashMap::new(),
         };
         if account_override.is_none() {
-            for (key, value) in &settings.models {
-                if let Some((p, model)) = key.split_once('/') {
-                    if p == provider {
-                        out.models.insert(
-                            model.to_owned(),
-                            EffectiveCap {
-                                limit: value.limit.value(),
-                                scope: CapScope::AccountModel,
-                            },
-                        );
+            // A winning setting replaces the catalog limit as a whole. Its
+            // inherited scope must not bring the catalog's model limits along.
+            if general.is_none() {
+                if let Some(models) = tier.and_then(|tier| self.catalog.model_caps(provider, tier))
+                {
+                    for (key, limit) in models {
+                        if let Some(model) = model_for_provider(key, provider) {
+                            out.models.insert(
+                                model.to_owned(),
+                                EffectiveCap {
+                                    limit: Some(*limit),
+                                    scope: CapScope::AccountModel,
+                                },
+                            );
+                        }
                     }
+                }
+            }
+            for (key, value) in &settings.models {
+                if let Some(model) = model_for_provider(key, provider) {
+                    out.models.insert(
+                        model.to_owned(),
+                        EffectiveCap {
+                            limit: value.limit.value(),
+                            scope: CapScope::AccountModel,
+                        },
+                    );
                 }
             }
         }
