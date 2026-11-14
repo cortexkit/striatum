@@ -99,6 +99,7 @@ pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use account_selection::AccountServingCounts;
+pub use account_selection::ContinuationSourceRow;
 pub use account_selection::{
     AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
     AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,

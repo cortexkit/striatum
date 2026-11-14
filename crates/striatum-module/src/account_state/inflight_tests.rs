@@ -4,6 +4,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 use striatum_store::{AccountCommandKind, AccountPinRow};
 
+#[path = "offer_tests.rs"]
+mod offers;
+
 const T: i64 = 1_790_683_200_000;
 const MINUTE: i64 = 60_000;
 

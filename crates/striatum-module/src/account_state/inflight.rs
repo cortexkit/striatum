@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use striatum_store::AccountAdmissionRow;
+use striatum_store::{AccountAdmissionRow, ContinuationSourceRow, PrunedContinuation};
 
 use super::admissions::{AdmissionState, Effect, RowKey, ShardedMap};
 
@@ -30,23 +30,43 @@ struct InflightEntry {
     model: String,
     run_id: Option<String>,
     renewal: bool,
+    started: bool,
+    started_at: Option<i64>,
     until_ms: i64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InflightLedger {
     accounts: ShardedMap<AccountKey, Arc<BTreeMap<RowKey, InflightEntry>>>,
+    /// Only offers retain source identities, not historical admission rows.
+    /// Used evidence must survive a source closing while another row of the
+    /// run is still started, so it is independent of the open-admission index.
+    sources: ShardedMap<RowKey, Arc<ContinuationSourceRow>>,
+    successions: ShardedMap<RowKey, Arc<BTreeMap<String, ContinuationSourceRow>>>,
 }
 
 impl InflightLedger {
-    pub(crate) fn from_rows<'a>(
-        rows: impl IntoIterator<Item = &'a AccountAdmissionRow>,
+    pub(crate) fn from_admissions(
+        admissions: &AdmissionState,
+        sources: Vec<ContinuationSourceRow>,
         now: i64,
     ) -> Self {
+        let mut ledger = Self::default();
+        for source in sources {
+            if source.used_at_ms.is_some() {
+                ledger.record_succession(source);
+            } else {
+                ledger.cache_source(source);
+            }
+        }
         // Build each account once; repeatedly touching a growing account while
         // loading would turn a large set of live rows into a quadratic scan.
         let mut accounts: BTreeMap<AccountKey, BTreeMap<RowKey, InflightEntry>> = BTreeMap::new();
-        for row in rows {
+        for (_, open) in admissions.open.iter() {
+            let row = &open.row;
+            if ledger.succeeded(row) {
+                continue;
+            }
             if let Some(entry) = Self::entry(row, now) {
                 accounts
                     .entry((row.provider.clone(), row.account_id.clone()))
@@ -54,11 +74,60 @@ impl InflightLedger {
                     .insert((row.principal.clone(), row.admission_id.clone()), entry);
             }
         }
-        let mut ledger = Self::default();
         for (account, entries) in accounts {
             ledger.accounts.insert(account, Arc::new(entries));
         }
         ledger
+    }
+
+    pub(crate) fn cache_source(&mut self, source: ContinuationSourceRow) {
+        self.sources.insert(
+            (source.principal.clone(), source.selection_id.clone()),
+            Arc::new(source),
+        );
+    }
+
+    fn record_succession(&mut self, source: ContinuationSourceRow) {
+        let run = (source.principal.clone(), source.run_id.clone());
+        if !self.successions.contains_key(&run) {
+            self.successions
+                .insert(run.clone(), Arc::new(BTreeMap::new()));
+        }
+        Arc::make_mut(self.successions.get_mut(&run).expect("inserted above"))
+            .insert(source.selection_id.clone(), source);
+    }
+
+    fn succeeded(&self, row: &AccountAdmissionRow) -> bool {
+        row.state == "started"
+            && row.run_id.as_ref().is_some_and(|run| {
+                self.successions
+                    .get(&(row.principal.clone(), run.clone()))
+                    .is_some_and(|offers| {
+                        offers.values().any(|offer| {
+                            offer.provider == row.provider
+                                && offer.account_id == row.account_id
+                                && (offer.left_admission_id == row.admission_id
+                                    || (row.request_mode != "renew"
+                                        && row
+                                            .started_at
+                                            .is_some_and(|at| Some(at) < offer.used_at_ms)))
+                        })
+                    })
+            })
+    }
+
+    pub(crate) fn prune_continuations(&mut self, deleted: &[PrunedContinuation]) {
+        for row in deleted {
+            self.sources
+                .remove(&(row.principal.clone(), row.selection_id.clone()));
+            let run = (row.principal.clone(), row.run_id.clone());
+            if let Some(offers) = self.successions.get_mut(&run) {
+                Arc::make_mut(offers).remove(&row.selection_id);
+                if offers.is_empty() {
+                    self.successions.remove(&run);
+                }
+            }
+        }
     }
 
     /// Lapse does not change a durable lifecycle state. Removing old entries
@@ -103,6 +172,8 @@ impl InflightLedger {
             model: row.model.clone(),
             run_id: row.run_id.clone(),
             renewal: row.request_mode == "renew",
+            started: row.state == "started",
+            started_at: row.started_at,
             until_ms,
         })
     }
@@ -110,6 +181,9 @@ impl InflightLedger {
     pub(crate) fn update(&mut self, row: &AccountAdmissionRow, now: i64) {
         let admission = (row.principal.clone(), row.admission_id.clone());
         self.remove(&row.provider, &row.account_id, &admission, now);
+        if self.succeeded(row) {
+            return;
+        }
         let Some(entry) = Self::entry(row, now) else {
             return;
         };
@@ -137,6 +211,36 @@ impl InflightLedger {
                 Effect::Unchanged { admission, .. } => {
                     if let Some(open) = admissions.open.get(admission) {
                         self.touch(&open.row.provider, &open.row.account_id, now);
+                    }
+                }
+                Effect::Offer {
+                    selection, used_at, ..
+                } => {
+                    let Some(source) = self.sources.remove(selection) else {
+                        continue;
+                    };
+                    let Some(used_at) = used_at else {
+                        continue;
+                    };
+                    let mut offer = (*source).clone();
+                    offer.used_at_ms = Some(*used_at);
+                    self.record_succession(offer.clone());
+                    self.touch(&offer.provider, &offer.account_id, now);
+                    let account = (offer.provider.clone(), offer.account_id.clone());
+                    if let Some(entries) = self.accounts.get_mut(&account) {
+                        // The explicitly left row is succeeded even at the same
+                        // millisecond. Other rows started then are new holds.
+                        Arc::make_mut(entries).retain(|(_, id), entry| {
+                            !(entry.principal == offer.principal
+                                && entry.run_id.as_deref() == Some(&offer.run_id)
+                                && entry.started
+                                && (id == &offer.left_admission_id
+                                    || (!entry.renewal
+                                        && entry.started_at.is_some_and(|at| at < *used_at))))
+                        });
+                        if entries.is_empty() {
+                            self.accounts.remove(&account);
+                        }
                     }
                 }
                 _ => {}
