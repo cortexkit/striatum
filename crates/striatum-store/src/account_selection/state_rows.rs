@@ -262,10 +262,10 @@ impl AccountTx<'_> {
                     Ok(AdmissionStateRow {
                         row: admission_from_row(row)?,
                         input_size_class: row
-                            .get::<_, Option<i64>>(26)?
+                            .get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
                             .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
-                        model_decision_id: row.get(27)?,
-                        rowid: row.get(28)?,
+                        model_decision_id: row.get(ADMISSION_COLUMN_COUNT + 1)?,
+                        rowid: row.get(ADMISSION_COLUMN_COUNT + 2)?,
                     })
                 },
             )?;
@@ -589,10 +589,11 @@ impl AccountTx<'_> {
                 |row| {
                     Ok(AdmissionStateRow {
                         row: admission_from_row(row)?,
-                        input_size_class: row.get::<_, Option<i64>>(25)?
+                        input_size_class: row
+                            .get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
                             .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
-                        model_decision_id: row.get(26)?,
-                        rowid: row.get(27)?,
+                        model_decision_id: row.get(ADMISSION_COLUMN_COUNT + 1)?,
+                        rowid: row.get(ADMISSION_COLUMN_COUNT + 2)?,
                     })
                 },
             )
@@ -621,7 +622,7 @@ impl AccountTx<'_> {
             |row| {
                 Ok((
                     admission_from_row(row)?,
-                    row.get::<_, Option<i64>>(26)?
+                    row.get::<_, Option<i64>>(ADMISSION_COLUMN_COUNT)?
                         .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
                 ))
             },
