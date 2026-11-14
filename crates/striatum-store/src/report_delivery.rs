@@ -116,7 +116,7 @@ impl SqliteRouteStateStore {
             // Decisions can seat several runs. Delivery deduplication, not the
             // first decision outcome, owns each run's successful probe settlement.
             if outcome == RouteOutcome::Completed && !effects.preserve_probe {
-                account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, now)
+                account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
                     .map_err(sql_error)?;
             }
             if let Some(usage) = usage { insert_usage(&tx, decision_id, usage)?; }
@@ -141,6 +141,7 @@ impl AccountTx<'_> {
         decision: &str,
         run: Option<&str>,
         effects: &V1ReportEffects,
+        first: bool,
         now: i64,
     ) -> RouteStateResult<()> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
@@ -222,13 +223,53 @@ impl AccountTx<'_> {
             // A decision without an account admission still owns its selection
             // probe. The decision clock is the conservative launch bound when
             // no admission supplies a run-specific clock.
-            let (model, at): (String, i64) = self.conn.query_row(
-                "SELECT selected_model_id,COALESCE((SELECT created_at_ms FROM routing_v1_decision
+            let (model, identity, at): (String, Option<String>, i64) = self.conn.query_row(
+                "SELECT selected_model_id,provider_identity_json,COALESCE((SELECT created_at_ms FROM routing_v1_decision
                  WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",
-                [decision], |row| Ok((row.get(0)?, row.get(1)?)),
+                [decision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).map_err(err)?;
             if self.probe_report_matches(decision, effects.reported_credential.as_deref(), false)? {
+                let authorized: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
+                        [decision],
+                        |row| row.get(0),
+                    )
+                    .map_err(err)?;
                 self.heal_report_probe(decision, None, &model, at, &self.fence_rechecks()?, now)?;
+                // Only the first report may heal older matching serving evidence
+                // without authorization. If this decision held a probe proof,
+                // only the exact generation and launch-time checks above may
+                // settle it; ordinary recovery must not bypass those checks.
+                if authorized || !first {
+                    return Ok(());
+                }
+                let identity = identity.and_then(|raw| {
+                    serde_json::from_str::<striatum_core::route_state_store::ProviderOutcome>(&raw)
+                        .ok()
+                });
+                if let Some((provider, credential)) = &effects.lift_credential {
+                    if identity
+                        .as_ref()
+                        .and_then(|identity| identity.credential_id.as_deref())
+                        .is_none_or(|id| id == credential)
+                    {
+                        let account = identity.as_ref().map_or(credential.as_str(), |identity| {
+                            identity.account_ref.as_str()
+                        });
+                        self.heal_serving_fences_in_scope(
+                            provider,
+                            account,
+                            credential,
+                            &model,
+                            None,
+                            at,
+                            now,
+                            effects.quota_scope.as_ref(),
+                        )?;
+                    }
+                }
             }
         }
         Ok(())

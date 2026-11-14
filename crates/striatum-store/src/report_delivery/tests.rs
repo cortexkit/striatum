@@ -28,7 +28,10 @@ fn report_outcome_for_run(
             outcome,
             None,
             false,
-            &V1ReportEffects::default(),
+            &V1ReportEffects {
+                lift_credential: Some(("example".into(), "key".into())),
+                ..Default::default()
+            },
             None,
             |_| Ok(()),
             now,
