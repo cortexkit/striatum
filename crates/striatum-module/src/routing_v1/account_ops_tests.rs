@@ -8,6 +8,7 @@ use subc_protocol::FrameType;
 use super::account_classes_tests::setup;
 use super::conformance_tests::{reserved, Harness, Route};
 
+mod enforcement_tests;
 mod shadow_lines_tests;
 
 const NOW: u64 = 1_800_000_000_000;

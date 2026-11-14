@@ -402,6 +402,25 @@ impl AccountCommand<'_> {
             .count_for_model(caps, provider, account, model, now)
     }
 
+    /// When the request's cap count on `account` first falls below `cap`,
+    /// read from the working state like the count itself.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn inflight_next_free_at(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        cap: u64,
+        now: i64,
+    ) -> Option<i64> {
+        self.state.as_deref().and_then(|state| {
+            state
+                .inflight
+                .next_free_at(caps, provider, account, model, cap, now)
+        })
+    }
+
     pub(crate) fn inflight_conversation(
         &self,
         caps: &crate::concurrency_caps::ResolvedCaps,

@@ -11,7 +11,7 @@ use cortexkit_role_routing::account::{
     parse_account_for_request_serving, Account, AccountForAnswer, AccountForRequest, AccountPin,
     AccountReason, AccountReasonCode, Admission,
 };
-use cortexkit_role_routing::errors::{Refusal, RefusalCode};
+use cortexkit_role_routing::errors::{NoRouteReason, Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request_serving, AccountObserveAnswer, Observation,
 };
@@ -738,6 +738,8 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 /// with empty detail. A legacy `account_selection_unsupported` that reaches
 /// this adapter means no credential of the right kind served the request,
 /// so it becomes the untimed `auth_required`, never a transient retry.
+/// `concurrency_full` becomes `no_route` with that reason and the allocator's
+/// `reset_at_ms`: a wait for a free slot, never an unavailable allocator.
 /// This arm is the backstop.
 fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refusal {
     if let Some(detail) = detail {
@@ -751,6 +753,14 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
     };
     let mut refusal = match code {
         "account_hold" => Refusal::account_hold(wait_until().unwrap_or_else(now_ms)),
+        // The allocator's own instant, unconverted: a time derived from
+        // `retry_after_s` would round it to seconds from a later clock read.
+        "concurrency_full" => Refusal::no_route(
+            NoRouteReason::ConcurrencyFull,
+            detail
+                .and_then(|detail| detail.get("reset_at_ms"))
+                .and_then(Value::as_u64),
+        ),
         "account_pool_exhausted" => Refusal::account_pool_exhausted(
             // A route fence states its end exactly; the allocator's own
             // exhaustion states only a wait.
