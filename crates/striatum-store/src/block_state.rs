@@ -289,6 +289,13 @@ const HELD_ROWS: [&str; 16] = [
 
 static RECONCILE_RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Calls of the reconcile so far, to run its full comparison on every
+/// [`FULL_RECONCILE_EVERY`]th.
+static RECONCILE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many reconciles apart the full comparison runs: six ten-second ticks.
+const FULL_RECONCILE_EVERY: u64 = 6;
+
 /// How many times the periodic reconcile found the state's rows differing
 /// from SQL and had it reloaded. Any count means a write reached a block
 /// table without the capture seeing it.
@@ -1567,6 +1574,18 @@ impl crate::AccountTx<'_> {
                 return Err(crate::err(diverged(format_args!(
                     "{table}: state holds {memory:?} (rows, highest rowid), SQL {stored:?}"
                 ))));
+            }
+        }
+        // Counts and rowids cannot see a row changed in place. Every few
+        // calls (about once a minute at the tick's period), compare a full
+        // load, about a millisecond at live size.
+        let call = RECONCILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call % FULL_RECONCILE_EVERY == FULL_RECONCILE_EVERY - 1 {
+            let loaded = BlockState::load(self.conn).map_err(crate::err)?;
+            if loaded != *blocks {
+                RECONCILE_RELOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("block state differs from a full load of SQL; reloading it");
+                return Err(crate::err(diverged("block state differs from a full load")));
             }
         }
         Ok(())

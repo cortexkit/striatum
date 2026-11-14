@@ -1150,6 +1150,94 @@ fn retirement_without_a_replace_policy_leaves_the_rows_the_replace_left() {
         .unwrap();
 }
 
+/// A whole-account block on several pools clears only once a success has
+/// healed every pool in its recovery set. The clear is decided on that set
+/// and on the successes recorded, and names both: a state from before the
+/// set grew decides to clear, SQL holds the larger set, and the batch runs
+/// again on a fresh load, which keeps the block.
+#[test]
+fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
+    use striatum_core::accounts::{PoolKey, PoolScope};
+    let rig = rig("block-state-recovery-set-cas");
+    let older = NOW - 600_000;
+    let covered = pool_key(5);
+    let uncovered = serde_json::to_string(&PoolKey {
+        window_minutes: Some(300),
+        scope: PoolScope::EveryModel,
+        name: Some("gemini".into()),
+    })
+    .unwrap();
+    rig.sql(format!(
+        "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
+         VALUES ('whole','p0','a0','{{}}','{{}}','broca_account_limit',{older},'x',{older},NULL,'[{covered}]');"
+    ));
+    let before_it_grew = rig.published();
+    rig.sql(format!(
+        "UPDATE account_fence SET recovery_set_json='[{covered},{uncovered}]' WHERE fence_id='whole';"
+    ));
+    let loads = rig.decide_next_on(before_it_grew);
+    rig.store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.heal_serving_fences_in_scope(
+                "p0",
+                "a0",
+                "c0",
+                "m0",
+                None,
+                NOW,
+                NOW + 1,
+                Some(&crate::QuotaSuccessScope {
+                    family: striatum_core::accounts::ModelFamily::Other,
+                    pool: None,
+                }),
+            )
+        })
+        .unwrap();
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+    let active: i64 = rig
+        .store
+        .with_reader_for_test(|conn| {
+            conn.query_row("SELECT count(*) FROM account_fence WHERE cleared_at IS NULL", [], |r| r.get(0))
+        })
+        .unwrap();
+    assert_eq!(active, 1, "the block waits for its uncovered pool");
+    rig.check(&[NOW], "after the heal");
+}
+
+/// A block row changed in place without the capture seeing it keeps every
+/// table's row count and highest rowid, so the per-tick comparison misses
+/// it. A full comparison with a fresh load, every sixth tick, finds it.
+#[test]
+fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
+    let rig = rig("block-state-full-reconcile");
+    rig.sql(format!(
+        "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');",
+        NOW + 60_000
+    ));
+    UNSEEN.with(|unseen| unseen.set(true));
+    rig.store
+        .bypass_account_writer_for_test(&format!(
+            "UPDATE account_transient_backoff SET retry_at_ms={} WHERE account_id='a';",
+            NOW + 120_000
+        ))
+        .unwrap();
+    UNSEEN.with(|unseen| unseen.set(false));
+    let tick = || {
+        rig.store
+            .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW))
+            .unwrap()
+    };
+    let reloads = block_reconcile_reloads();
+    tick();
+    assert_eq!(block_reconcile_reloads(), reloads, "counts and rowids match");
+    assert_ne!(rig.published(), rig.fresh(), "the state still misses the change");
+    for _ in 0..5 {
+        tick();
+    }
+    assert_eq!(block_reconcile_reloads() - reloads, 1, "the full comparison found it");
+    rig.check(&[NOW], "after the full comparison");
+}
+
 #[test]
 fn a_commit_from_another_connection_just_before_a_batch_is_loaded_inside_it() {
     let rig = rig("block-state-outside-before-begin");
