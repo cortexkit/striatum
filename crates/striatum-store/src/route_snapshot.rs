@@ -5,7 +5,8 @@
 //!
 //! One overlay serves two sources of rows. The store's `build_snapshot` and
 //! `get_provider_cooldown` read SQL; they stay the oracle, and the answer for
-//! a store without the block schema or a private projection. The in-memory
+//! a store without the block schema or an account-evaluation projection
+//! (a private copy of the store that holds no account state). The in-memory
 //! block state holds every `model_route_state` and `provider_cooldown_state`
 //! row, decoded by the same row decoders below, and answers request paths
 //! through [`crate::BlockState::route_state_snapshot`] and
