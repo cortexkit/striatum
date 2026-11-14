@@ -398,6 +398,7 @@ pub(super) fn resolve_select_request(
         params,
         operator_policy,
         &std::collections::BTreeMap::new(),
+        false,
     )
 }
 
@@ -408,6 +409,7 @@ fn resolve_select_request_with_catalog_targets(
     params: &SelectParams,
     operator_policy: &impl select_policy::PolicySource,
     catalog_targets: &std::collections::BTreeMap<String, String>,
+    operator_ladder: bool,
 ) -> Result<ResolvedSelectRequest, NoRouteError> {
     let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
         (requirements, params.required_capabilities)
@@ -446,7 +448,9 @@ fn resolve_select_request_with_catalog_targets(
     // A request that names its model (an admission pin or a work run's
     // `model=`) keeps operator-excluded routes in the available set: `exclude`
     // keeps a route out of automatic choice only. An admission pin's automatic
-    // fallback still applies the operator's exclusions during admission.
+    // fallback still applies the operator's exclusions during admission. An
+    // operator ladder also names its choices, but scoring still enforces provider,
+    // model and consumer restrictions other than pin-only rules.
     let availability_policy = operator_policy.compiled_policy();
     let policy = striatum_core::launch_policy::resolve_compiled_routing_policy(
         params.available_models.iter().cloned(),
@@ -454,7 +458,7 @@ fn resolve_select_request_with_catalog_targets(
         &ModelRoutingPolicyInput::default(),
         &provider_auth_types(params.provider_auth_types.as_ref()),
         catalog_targets,
-        params.pin.is_none() && params.model_pin.is_none(),
+        params.pin.is_none() && params.model_pin.is_none() && !operator_ladder,
     );
     let uses_host_availability = (params.executor.is_some() || params.is_host_run())
         && !is_broca_substrate(params.substrate.as_deref());
@@ -1654,10 +1658,17 @@ async fn handle_select_request_attempt(
         availability.note = None;
     }
     let resolve_started = Instant::now();
+    let consumer_id = variant_policy::consumer_group(params.consumer).unwrap_or("");
+    let consumer_policy = operator_config.consumer_policy(
+        consumer_id,
+        &config_policy::ConsumerPolicy::default(),
+        &std::collections::BTreeMap::new(),
+    );
     let mut resolved_request = match resolve_select_request_with_catalog_targets(
         &params,
         operator_config.as_ref(),
         &catalog_targets,
+        consumer_policy.operator_ladder(),
     ) {
         Ok(resolved) => {
             add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
@@ -1718,12 +1729,6 @@ async fn handle_select_request_attempt(
         }
     };
     let pricing_started = Instant::now();
-    let consumer_id = variant_policy::consumer_group(params.consumer).unwrap_or("");
-    let consumer_policy = operator_config.consumer_policy(
-        consumer_id,
-        &config_policy::ConsumerPolicy::default(),
-        &std::collections::BTreeMap::new(),
-    );
     // Apply the configured payment-class policy even when a legacy caller names
     // its consumer through targetAgent rather than the consumer member.
     let payment_consumer = params
@@ -2023,7 +2028,7 @@ async fn handle_select_request_attempt(
             && (!mapped_availability.models.contains(&route.route_key)
                 || mapped_availability.rejected.contains_key(&route.route_key))
             && !candidate_filters.contains_key(&route.route_key)
-            && operator_config.route_allowed(consumer_id, &route.route_key, false)
+            && operator_config.route_allowed(consumer_id, &route.route_key, consumer_policy.operator_ladder())
             && select_policy::choose_runner(
                 &configured_runners,
                 consumer_policy.runner.as_deref(),
@@ -2289,7 +2294,7 @@ async fn handle_select_request_attempt(
                     )
                 }
             })
-            .map(|(selected, _)| selected)
+            .map(|(selected, _, _)| selected)
             .map_err(|error| match error {
                 select_policy::OrderFailure::Pin(refusal) => refusal,
                 select_policy::OrderFailure::Score(_) => unreachable!("a request pin is terminal"),
@@ -2631,7 +2636,7 @@ async fn handle_select_request_attempt(
             .and_then(|project| operator_config.project_pin(project, consumer_id))
             .map(str::to_owned)
     });
-    let attempt = |snap: ModelRouteStateSnapshot| -> Result<SelectedModelRoute, NoRouteError> {
+    let attempt = |snap: ModelRouteStateSnapshot| -> Result<(SelectedModelRoute, Option<String>), NoRouteError> {
         let pass = select_policy::SelectionPass {
             snapshot: &snap,
             ..pass
@@ -2657,7 +2662,7 @@ async fn handle_select_request_attempt(
                 error
             })
         })
-        .map(|(selected, _)| selected)
+        .map(|(selected, _, variant)| (selected, variant))
         .map_err(|error| match error {
             select_policy::OrderFailure::Pin(error) | select_policy::OrderFailure::Score(error) => {
                 error
@@ -2670,7 +2675,7 @@ async fn handle_select_request_attempt(
     let selection_started = Instant::now();
     let selection = match attempt(snapshot.clone()) {
         Ok(selected) => Ok(selected),
-        Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted => {
+        Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted && !consumer_policy.operator_ladder() => {
             // Break-glass: in a subscription environment "all routes exhausted" is a
             // common steady state and stalls the orchestrator. Retry ONCE against a
             // snapshot that clears the single earliest-reset route.
@@ -2703,7 +2708,7 @@ async fn handle_select_request_attempt(
                 .collect();
             match relax_earliest_reset(&snapshot, &rejected_candidates) {
                 Some(relaxed) => match attempt(relaxed.snapshot) {
-                    Ok(mut selected) => {
+                    Ok((mut selected, variant)) => {
                         let reset_label = relaxed.resets_at.map_or_else(
                             || "unknown".to_string(),
                             |resets_at| (resets_at as i64).to_string(),
@@ -2715,7 +2720,7 @@ async fn handle_select_request_attempt(
                                 relaxed.route_key, reset_label
                             ),
                         );
-                        Ok(selected)
+                        Ok((selected, variant))
                     }
                     Err(_) => Err(no_route),
                 },
@@ -2734,7 +2739,7 @@ async fn handle_select_request_attempt(
     // no-selection row and surfaces the typed routing failure.
     let policy_sources = policy_sources_line(&operator_policy);
     match selection {
-        Ok(mut selected) => {
+        Ok((mut selected, ladder_variant)) => {
             let Some(module) = runner_module(&selected) else {
                 return send_route_error(
                     writer,
@@ -2753,6 +2758,16 @@ async fn handle_select_request_attempt(
             record_ladder(selected_harness);
             add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
             let finish_started = Instant::now();
+            if let Err(refusal) = work_model_pin::validate_variant(
+                &selected.route_key,
+                &selected.model.provider_id,
+                &selected.model.model_id,
+                ladder_variant.as_deref(),
+                config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                &catalog_targets,
+            ) {
+                return send_route_error(writer, ver, channel, epoch, corr, &refusal.code, &refusal.message).await;
+            }
             let variant_choice = apply_variant_policy(
                 &mut selected,
                 &operator_config,
@@ -2763,7 +2778,7 @@ async fn handle_select_request_attempt(
                     .as_deref()
                     .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
                     .and_then(|pin| pin.variant)
-                    .as_deref(),
+                    .as_deref().or(ladder_variant.as_deref()),
             );
             selected.explanation.push(policy_sources.clone());
             if let Some(line) = &executor_workload {

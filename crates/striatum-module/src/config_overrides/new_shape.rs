@@ -298,7 +298,11 @@ impl LiveConfig {
     }
 
     pub(crate) fn route_policy_refusal(&self, consumer: &str, route: &str) -> Option<String> {
-        self.config.route_refusal(consumer, route, false)
+        self.route_policy_refusal_with_pin(consumer, route, false)
+    }
+
+    pub(crate) fn route_policy_refusal_with_pin(&self, consumer: &str, route: &str, pinned: bool) -> Option<String> {
+        self.config.route_refusal(consumer, route, pinned)
     }
 
     /// Resolve entity restrictions from this snapshot for the full request name.
@@ -397,12 +401,12 @@ impl LiveConfig {
             .is_none()
     }
 
-    pub(crate) fn automatic_exclusions(&self, consumer: &str, facts: &[ModelFact]) -> Vec<String> {
+    pub(crate) fn selection_exclusions(&self, consumer: &str, facts: &[ModelFact], pinned: bool) -> Vec<String> {
         facts
             .iter()
             .filter_map(|fact| {
                 let route = striatum_core::fact_to_route(fact).route_key;
-                (!self.route_allowed_on_plane(consumer, &route, false, fact.billing_plane.as_ref()))
+                (!self.route_allowed_on_plane(consumer, &route, pinned, fact.billing_plane.as_ref()))
                     .then_some(route)
             })
             .collect()
