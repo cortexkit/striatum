@@ -1,6 +1,6 @@
-# Media `route.select` samples v1.1
+# Media `route.select` samples v1.2
 
-This expansion is prepared for the Git release tag `route-select-media-v1.1`; all six original pairs
+This expansion is prepared for the Git release tag `route-select-media-v1.2`; all 21 previous pairs
 are byte-identical. Production advertises `select_kind`
 and `select_media`, using routing contract 0.7.28 and conformance-test crate
 0.10.32. The regeneration test calls the real module frame dispatcher with
@@ -34,6 +34,8 @@ inherits that catalog grade and has known-zero ranking cost, with no price.
 | `ladder.json` | Settings switch voice messages to ladder mode: a missing entry and the pin-only model are skipped, then the priced engine wins. |
 | `no-route.json` | The same ladder with `privacy: "local_only"` cannot use any engine. The reply is `no_route` with only the contract's reason in its detail. |
 | `voice-message-caller-local.json` | Back in demand mode, Callosum offers its phone engine for the same 30-second voice message. Its catalog grade equals the remote engine's; known-zero cost wins, and the reply has `caller_local: true`, `index: 0`, and no module or price. |
+| `voice-message-caller-local-en.json` | The phone's `apple/phone-transcriber` offers English (`en-US`), WAV, realtime transcription with a 600000-ms duration limit. With a 30-second English request, its grade 80 and known-zero cost win; the reply has `caller_local: true`, `index: 0`, and no price. |
+| `voice-message-caller-local-fr.json` | The same phone offer cannot meet the request's `fr-FR` language. In this pair's isolated fixture, the priced `media-vendor/fixture-transcribe` module engine declares `fr` and wins instead. |
 
 ## Added refusal and redemption pairs
 
@@ -99,7 +101,7 @@ cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(=routin
 (cd test-vectors/route-select-media-v1 && shasum -a 256 -c SHA256SUMS)
 ```
 
-The ordinary test regenerates all 21 pairs in memory and compares every byte,
+The ordinary test regenerates all 23 pairs in memory and compares every byte,
 the checksum manifest and exact directory membership. The reachability pair is
 additionally regenerated under all 14 causes listed above. Only the explicit
 update command writes samples. Existing engine vectors and replay goldens are
