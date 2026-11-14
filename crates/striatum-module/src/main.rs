@@ -59,6 +59,7 @@ mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
 #[cfg(test)]
+#[path = "test_exe/tests.rs"]
 mod test_exe;
 mod tier_settings;
 mod variant_policy;
