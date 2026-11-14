@@ -348,7 +348,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         // rather than as a `store_error` refusal.
         checking("account_context");
         if flags.enabled && !crate::broca_credentials::wait_for_first_listing(deps.broca_credentials) {
-            return Err(op_refusal(crate::broca_credentials::listing_not_ready()));
+            return Err(op_refusal(crate::broca_credentials::listing_not_ready(params)));
         }
         let mut ctx = account_ctx(deps, flags, &policy)
             .map_err(|refusal| account_unavailable(refusal.message))?;

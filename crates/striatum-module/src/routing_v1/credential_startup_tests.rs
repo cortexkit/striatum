@@ -58,7 +58,7 @@ async fn cold_start(legacy: bool) {
         "{}",
         missing.1
     );
-    assert_eq!(missing.1["detail"]["retry_after_s"], 1, "{}", missing.1);
+    assert_eq!(missing.1["detail"]["retry_after_s"], 3, "{}", missing.1);
     assert!(started.elapsed() >= std::time::Duration::from_millis(1400));
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
 
@@ -146,7 +146,7 @@ async fn cold_start_media_waits_for_a_view_but_loaded_empty_means_auth_required(
         "{}",
         missing.1
     );
-    assert_eq!(missing.1["detail"]["retry_after_s"], 1, "{}", missing.1);
+    assert_eq!(missing.1["detail"]["retry_after_s"], 3, "{}", missing.1);
     harness
         .credentials()
         .lock()

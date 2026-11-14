@@ -293,13 +293,21 @@ pub(crate) fn wait_for_first_listing(credentials: &SharedBrocaCredentials) -> bo
     *ready
 }
 
-pub(crate) fn listing_not_ready() -> crate::account_selection::OpReply {
+pub(crate) fn listing_not_ready(params: &serde_json::Value) -> crate::account_selection::OpReply {
+    // Keep the 3-second startup retry interval and candidate explanation, so
+    // this earlier check does not change an existing caller's retry behavior.
+    let exclusions: Vec<_> = params["candidates"]["accounts"]
+        .as_array().into_iter().flatten()
+        .map(|candidate| serde_json::json!({"account_id": candidate["account_id"],
+            "reason": "routing just started and hasn't read the credential list yet"}))
+        .collect();
     crate::account_selection::OpReply::typed(
         "account_selection_unavailable",
         "Routing is awaiting its first credential listing; retry shortly.",
-        serde_json::json!({"code": "account_selection_unavailable", "retry_after_s": 1,
+        serde_json::json!({"code": "account_selection_unavailable", "retry_after_s": 3,
+            "retry_after_ms": 3000,
             "cause": "credential_listing_not_loaded",
-            "decision_id": null, "exclusions": []}),
+            "decision_id": params["decision_id"], "exclusions": exclusions}),
     )
 }
 
