@@ -1778,6 +1778,60 @@ impl ClassContext {
                 || self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id))
     }
 
+    /// When a request may retry a credential whose one probe another
+    /// selection holds reserved: the later of the hold's end and the next
+    /// check of the credential's blocks that are not due. `None` when no
+    /// reservation keeps this credential out.
+    fn reserved_probe_retry_at(
+        &self,
+        provider: &str,
+        model: &str,
+        row: &cortexkit_claustrum_client::ListedCredential,
+    ) -> Option<i64> {
+        let until = self
+            .probe_eligible(provider, model, &row.id)
+            .then(|| self.probe_reserved_until(provider, &row.id))
+            .flatten()?;
+        Some(
+            self.rechecks
+                .iter()
+                .filter(|origin| {
+                    self.origin_applies(origin, provider, self.account_id(row), &row.id, model)
+                        && !self.origin_due(origin, self.account_id(row), model)
+                })
+                .map(|origin| self.recheck_hint(origin, self.account_id(row), model))
+                .max()
+                .map_or(until, |at| at.max(until)),
+        )
+    }
+
+    /// The accounts a request may use that the class context left out of
+    /// its roster because another selection holds their probe reserved, with
+    /// when each may be retried.
+    fn reserved_probe_accounts(
+        &self,
+        provider: &str,
+        model: &str,
+        params: &AccountForParams,
+    ) -> Vec<(String, i64)> {
+        self.credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| {
+                params.candidates.as_ref().is_none_or(|candidates| {
+                    candidates.accounts.iter().any(|candidate| {
+                        candidate.credential_id == row.id
+                            && candidate.account_id == self.account_id(row)
+                    })
+                })
+            })
+            .filter_map(|row| {
+                self.reserved_probe_retry_at(provider, model, row)
+                    .map(|until| (self.account_id(row).to_owned(), until))
+            })
+            .collect()
+    }
+
     fn probe_eligible(&self, provider: &str, model: &str, credential: &str) -> bool {
         let account =
             crate::credential_fences::credential_account_id(&self.account_ids, credential)
@@ -2590,16 +2644,21 @@ impl ClassContext {
         provider: &str,
         model: &str,
         priced: bool,
-    ) -> Result<String, (String, String)> {
+    ) -> Result<String, LaunchRefusal> {
         match self
             .probe(provider, model, priced, false, None, "launch-preflight")
             .outcome
         {
             Outcome::Admit(admission) => Ok(admission.credential_id),
-            _ => Err((
-                "no_eligible_account".into(),
-                format!("{provider}/{model}: no eligible account"),
-            )),
+            // Selection scored this route as admissible; refusing it now
+            // means its evidence changed or another request took its probe
+            // since. Answer when to retry, as a lost probe binding does.
+            _ => Err(LaunchRefusal::Lost {
+                retry_at: self
+                    .blocked_reset(provider, model, priced)
+                    .flatten()
+                    .unwrap_or(self.now_ms.saturating_add(120_000)),
+            }),
         }
     }
 
@@ -2669,9 +2728,7 @@ impl ClassContext {
                 Some(retry_at) => Err(LaunchRefusal::Lost { retry_at }),
             };
         }
-        let credential = self
-            .launch_credential(provider, model, priced)
-            .map_err(|(code, message)| LaunchRefusal::Refused { code, message })?;
+        let credential = self.launch_credential(provider, model, priced)?;
         let account =
             crate::credential_fences::credential_account_id(&self.account_ids, &credential)
                 .unwrap_or_else(|| credential.clone());
@@ -2683,7 +2740,9 @@ impl ClassContext {
         let claimed = crate::account_writer::repair(store, move |tx| {
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
-            let owner = owned_owner.as_deref();
+            // The claim is made for this owner, or for the selection's probe
+            // owner when it names none; a clock that owner holds is its own.
+            let owner = owned_owner.as_deref().or(context.probe_owner.as_deref());
             let credential = owned_credential.clone();
 
             let origins: Vec<_> = tx
@@ -2714,11 +2773,7 @@ impl ClassContext {
                 return Ok(Err(lost()));
             }
             Ok(
-                if tx.grant_fence_rechecks(
-                    &origins,
-                    context.now_ms,
-                    owner.or(context.probe_owner.as_deref()),
-                )? {
+                if tx.grant_fence_rechecks(&origins, context.now_ms, owner)? {
                     Ok(())
                 } else {
                     Err(lost())
@@ -5749,6 +5804,30 @@ fn route_fence_refusal(
     ))
 }
 
+/// The answer to a request that lost a probe race and was admitted nowhere:
+/// the timed `account_pool_exhausted`, at `until` (the earlier of the lost
+/// probe's retry time and any reset the refusal knew). Never an untimed code,
+/// which a runner would read as a missing login.
+fn lost_probe_refusal(until: i64, now: i64, decision_id: Value, exclusions: Value) -> OpReply {
+    let retry_after_s = u64::try_from(until.saturating_sub(now))
+        .unwrap_or(0)
+        .div_ceil(1000);
+    OpReply::typed(
+        "account_pool_exhausted",
+        format!(
+            "no account admitted: a probe this request needed is in use until {}",
+            rfc3339(until)
+        ),
+        json!({
+            "code": "account_pool_exhausted",
+            "retry_after_s": retry_after_s,
+            "decision_id": decision_id,
+            "exclusions": exclusions,
+            "reset_at_ms": until,
+        }),
+    )
+}
+
 /// The contract code for an empty eligible roster with class-aware routing.
 /// A route fence that closed every usable account is already answered as
 /// `account_pool_exhausted` by `route_fence_refusal`. What remains is split
@@ -5964,36 +6043,7 @@ fn empty_roster_refusal(
     let mut fenced_cause = false;
     let mut row_resets: Vec<Option<i64>> = Vec::new();
     for row in &rows {
-        if let Some(until) = classes
-            .probe_eligible(provider, model, &row.id)
-            .then(|| classes.probe_reserved_until(provider, &row.id))
-            .flatten()
-        {
-            let until = classes
-                .rechecks
-                .iter()
-                .filter(|origin| {
-                    classes.origin_applies(
-                        origin,
-                        provider,
-                        classes.account_id(row),
-                        &row.id,
-                        model,
-                    ) && !classes.origin_due(
-                        origin,
-                        classes.account_id(row),
-                        model,
-                    )
-                })
-                .map(|origin| {
-                    classes.recheck_hint(
-                        origin,
-                        classes.account_id(row),
-                        model,
-                    )
-                })
-                .max()
-                .map_or(until, |at| at.max(until));
+        if let Some(until) = classes.reserved_probe_retry_at(provider, model, row) {
             fenced_cause = true;
             row_resets.push(Some(until));
             let code = classes
@@ -6855,6 +6905,17 @@ fn serve(
             }
         }
     };
+    // An account the class context left out because another selection holds
+    // its probe reserved is a lost race as well.
+    if !matches!(decision.outcome, Outcome::Admit(_)) {
+        if let Some(classes) = &ctx.classes {
+            for (account, until) in
+                classes.reserved_probe_accounts(provider, &normalize(&params.model), params)
+            {
+                lost_probe_fences.entry(account).or_insert(until);
+            }
+        }
+    }
     if !matches!(decision.outcome, Outcome::Admit(_)) && !lost_probe_fences.is_empty() {
         let mut remaining = state.roster.clone();
         if let Some(roster) = &mut remaining {
@@ -6875,7 +6936,7 @@ fn serve(
             if let Some(reply) = empty_roster_refusal(
                 classes,
                 provider,
-                &params.model,
+                &normalize(&params.model),
                 roster.context["priced_per_token"]
                     .as_bool()
                     .unwrap_or(false),
@@ -6883,7 +6944,23 @@ fn serve(
                 now,
                 Some(params),
             ) {
-                return Ok(reply);
+                // A reserved probe is a lost race too: the timed rule below
+                // applies, whatever the emptied roster's own code says.
+                return Ok(match lost_probe_fences.values().copied().min() {
+                    Some(lost) => {
+                        let (decision_id, exclusions, reset) = match &reply {
+                            OpReply::Error { detail: Some(detail), .. } => (
+                                detail["decision_id"].clone(),
+                                detail["exclusions"].clone(),
+                                detail["reset_at_ms"].as_i64(),
+                            ),
+                            _ => (Value::Null, json!([]), None),
+                        };
+                        let exclusions = if exclusions.is_null() { json!([]) } else { exclusions };
+                        lost_probe_refusal(reset.map_or(lost, |reset| reset.min(lost)), now, decision_id, exclusions)
+                    }
+                    None => reply,
+                });
             }
         }
     }
@@ -7035,20 +7112,11 @@ fn serve(
             // probe it lost is retried at a known time, and an untimed code
             // such as `auth_required` would make the runner stop for a login.
             if let Some(lost) = lost_probe_fences.values().copied().min() {
-                let until = reset.map_or(lost, |reset| reset.min(lost));
-                let retry_after_s = u64::try_from(until.saturating_sub(now))
-                    .unwrap_or(0)
-                    .div_ceil(1000);
-                return Ok(OpReply::typed(
-                    "account_pool_exhausted",
-                    format!("no account admitted: a probe this request needed is in use until {}", rfc3339(until)),
-                    json!({
-                        "code": "account_pool_exhausted",
-                        "retry_after_s": retry_after_s,
-                        "decision_id": decision_id,
-                        "exclusions": wire_exclusions(&decision),
-                        "reset_at_ms": until,
-                    }),
+                return Ok(lost_probe_refusal(
+                    reset.map_or(lost, |reset| reset.min(lost)),
+                    now,
+                    json!(decision_id),
+                    json!(wire_exclusions(&decision)),
                 ));
             }
             Ok(OpReply::typed(
