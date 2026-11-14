@@ -368,6 +368,86 @@ pub(crate) fn register_on(
     upsert_clock_on(tx, &state, &origin)
 }
 
+/// A number as SQLite computes it: an integer, or a real once integer
+/// arithmetic overflows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SqlNumber {
+    Integer(i64),
+    Real(f64),
+}
+
+impl SqlNumber {
+    /// `a + b` as SQLite adds two integers: on overflow the sum is real.
+    fn add(a: i64, b: i64) -> Self {
+        a.checked_add(b)
+            .map_or(Self::Real(a as f64 + b as f64), Self::Integer)
+    }
+
+    /// `CAST(x AS INTEGER)`: a real truncates toward zero and saturates at
+    /// the integer range, as Rust's `as` does.
+    fn cast_integer(self) -> i64 {
+        match self {
+            Self::Integer(value) => value,
+            Self::Real(value) => value as i64,
+        }
+    }
+
+    /// Order as SQLite orders an integer and a real: by exact value, not
+    /// by rounding the integer to a real.
+    fn cmp(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn real_vs_integer(real: f64, integer: i64) -> Ordering {
+            if real < -9_223_372_036_854_775_808.0 {
+                return Ordering::Less;
+            }
+            if real >= 9_223_372_036_854_775_808.0 {
+                return Ordering::Greater;
+            }
+            let whole = real.trunc() as i64;
+            whole.cmp(&integer).then_with(|| {
+                (real - real.trunc()).partial_cmp(&0.0).unwrap_or(Ordering::Equal)
+            })
+        }
+        match (self, other) {
+            (Self::Integer(a), Self::Integer(b)) => a.cmp(&b),
+            (Self::Real(a), Self::Real(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            (Self::Real(a), Self::Integer(b)) => real_vs_integer(a, b),
+            (Self::Integer(a), Self::Real(b)) => real_vs_integer(b, a).reverse(),
+        }
+    }
+}
+
+/// A new clock's `next_recheck_at` and `reset_check_at`, exactly as
+/// `upsert_clocks` computes them in SQL:
+/// `CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE
+/// MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER)`
+/// and `CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END`,
+/// including SQLite's promotion of an overflowing sum to a real and its
+/// saturating cast.
+pub(crate) fn clock_schedule(
+    quota: bool,
+    evidence_at: i64,
+    deadline: Option<f64>,
+    reset_at: Option<f64>,
+) -> (i64, Option<f64>) {
+    let next = if quota {
+        SqlNumber::add(evidence_at, 900_000)
+    } else {
+        let cap = SqlNumber::add(evidence_at, 3_600_000);
+        let first = deadline.map_or(cap, SqlNumber::Real);
+        // SQLite's min() keeps the first of equal arguments.
+        if cap.cmp(first) == std::cmp::Ordering::Less {
+            cap
+        } else {
+            first
+        }
+    };
+    let reset = reset_at.filter(|reset| {
+        quota && SqlNumber::Real(*reset).cmp(SqlNumber::Integer(evidence_at)) == std::cmp::Ordering::Greater
+    });
+    (next.cast_integer(), reset)
+}
+
 /// The clock `upsert_clocks` writes for one origin: its evidence, class and
 /// schedule. A changed evidence value is new evidence, not a probe.
 fn upsert_clock_on(
@@ -376,21 +456,7 @@ fn upsert_clock_on(
     origin: &ViewOrigin,
 ) -> rusqlite::Result<()> {
     let quota = origin.quota.unwrap_or(false);
-    // `CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE
-    // MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER)`
-    let next = if quota {
-        origin.evidence_at + 900_000
-    } else {
-        let cap = origin.evidence_at + 3_600_000;
-        match origin.deadline {
-            Some(deadline) if deadline < cap as f64 => deadline as i64,
-            _ => cap,
-        }
-    };
-    // `CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END`
-    let reset = origin
-        .reset_at
-        .filter(|reset| quota && *reset > origin.evidence_at as f64);
+    let (next, reset) = clock_schedule(quota, origin.evidence_at, origin.deadline, origin.reset_at);
     match state.clock(&origin.kind, &origin.origin_key) {
         None => {
             state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
@@ -1079,11 +1145,35 @@ fn claim_states(
         .collect()
 }
 
+/// The keyed check of one owner's probe authorizations against the state.
+pub(crate) fn authorization_check_sql() -> String {
+    format!(
+        "{} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key",
+        crate::block_state::STATE_CHECK
+    )
+}
+
+/// The keyed check of the clock an authorization names against the state.
+pub(crate) fn probe_clock_check_sql() -> String {
+    format!(
+        "{} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
+                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2",
+        crate::block_state::STATE_CHECK
+    )
+}
+
 /// Claim every origin's probe clock or none of them, deciding on `blocks`
 /// when given (the command's working state) and on SQL otherwise. The caller
 /// synchronizes the clocks first. Each clock update is keyed and names the
 /// state it was decided on; a clock SQL holds differently fails the command
 /// with [`crate::block_state::diverged`].
+///
+/// It checks only the clocks it is given. Which clocks apply was decided by
+/// the caller from the state (a route clear, for one, removes a clock), so an
+/// empty or shortened list claims nothing and checks nothing: the caller must
+/// have checked the rows that chose the list, as pool leases do with
+/// `check_lease_inputs` before calling it.
 fn claim_decided(
     conn: &Connection,
     blocks: Option<&crate::BlockState>,
@@ -1674,12 +1764,11 @@ impl AccountTx<'_> {
         owner: &str,
         clocks: bool,
     ) -> RouteStateResult<()> {
-        use crate::block_state::{diverged, ProbeAuthorization, STATE_CHECK};
+        use crate::block_state::{diverged, ProbeAuthorization};
         let held = blocks.authorizations_of(owner);
         let stored = self
             .conn
-            .prepare_cached(&format!("{STATE_CHECK} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
-                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key"))
+            .prepare_cached(&authorization_check_sql())
             .map_err(err)?
             .query_map([owner], |r| {
                 Ok(ProbeAuthorization {
@@ -1708,8 +1797,7 @@ impl AccountTx<'_> {
             });
             let stored = self
                 .conn
-                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
-                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2"))
+                .prepare_cached(&probe_clock_check_sql())
                 .map_err(err)?
                 .query_row([&row.kind, &row.origin_key], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))

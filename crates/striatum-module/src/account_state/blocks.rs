@@ -29,7 +29,7 @@ use striatum_store::{
     SqliteRouteStateStore,
 };
 
-use super::{snapshot, AccountCommand, AccountState};
+use super::{AccountCommand, AccountState};
 
 /// The time `SqliteRouteStateStore::fence_rechecks` evaluates expiry at: the
 /// store's clock when the read runs (the wall clock, or a replayed request's

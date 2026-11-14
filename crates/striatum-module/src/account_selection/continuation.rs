@@ -97,7 +97,6 @@ pub(crate) fn continue_account_with_call(
     ctx: &Ctx<'_>,
     call: Option<call_log::AccountCall>,
 ) -> Result<Value, Refusal> {
-    let now_ms = ctx.now_ms;
     // Expired offers are released by the command below before it decides
     // (`AccountCommand::release_expired`); this read sends no command.
     // A recorded selection replays inside the writer command below, where

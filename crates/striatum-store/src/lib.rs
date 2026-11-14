@@ -64,6 +64,8 @@ mod engine_measurements;
 mod fence_rechecks;
 mod block_state;
 mod route_snapshot;
+#[cfg(any(test, feature = "test-support"))]
+pub use block_state::reviewed_exempt_reads;
 pub use block_state::{
     block_read_backs, block_reconcile_reloads, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
@@ -724,6 +726,51 @@ pub const WAL_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 pub const READER_CACHE_SIZE_KIB: i64 = -8192;
 /// Maximum SQLite busy wait for a truncating checkpoint; retry on the next tick.
 pub const WAL_TRUNCATE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Marks a route-state writer's read of the row it is about to write
+/// (`record_provider_cooldown`, `update_route_state`, the route-outcome
+/// recorder in `set_decision_outcome`, `clear_failure_backoff`). Each reads
+/// by primary key or the indexed `provider_id`, inside the account command
+/// that writes, and its result decides only that statement's own write: the
+/// merge is decided in SQL, the single decider for these writes, so the
+/// in-memory state cannot be stale for it. The block read trace counts these
+/// apart, and a test pins each statement's text.
+macro_rules! route_write_read {
+    () => {
+        "/* route state write read */ "
+    };
+}
+
+/// The marker [`route_write_read`] puts on those reads, for the read trace.
+pub(crate) const ROUTE_WRITE_READ: &str = route_write_read!();
+
+// The marked reads, one constant per statement, so the reviewed list of
+// exempt reads (`reviewed_exempt_reads`) names exactly these texts.
+pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(route_write_read!(), "SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1");
+pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_write_read!(), "SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
+                    ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
+                     (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
+                      AND COALESCE(m.wall_observed_at,m.last_error_at,m.updated_at)=COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
+                      AND m.last_error IS p.last_error
+                      AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
+                      AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))");
+pub(crate) const ROUTE_READ_PROVIDER_EXISTING: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+                                last_error, last_error_at, wall_class
+                         FROM provider_cooldown_state WHERE provider_key = ?1");
+pub(crate) const ROUTE_READ_ROUTE_PRIOR_OBSERVED: &str = concat!(route_write_read!(), "SELECT wall_observed_at FROM model_route_state WHERE route_key=?1");
+pub(crate) const ROUTE_READ_ROUTE_EXISTING: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+                                latency_ema_ms, success_ema, failure_count, quota_error_count,
+                                last_error, last_error_at, wall_class
+                         FROM model_route_state WHERE route_key = ?1");
+pub(crate) const ROUTE_READ_ROUTE_EXISTING_AFTER: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+                                last_error, last_error_at, wall_class
+                         FROM provider_cooldown_state WHERE provider_key = ?1");
+pub(crate) const ROUTE_READ_OUTCOME_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
+                                failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
+                         FROM model_route_state WHERE route_key=?1");
+pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
+                                failure_backoff_reason
+                         FROM model_route_state WHERE route_key = ?1");
 
 impl SqliteRouteStateStore {
     /// Stored providers only; score aliases added to a request are not catalog
@@ -7534,23 +7581,18 @@ impl crate::AccountTx<'_> {
                 // commit together or roll back together.
                 let tx = c;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
-                let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1",[&provider_key],|row|row.get(0)).optional()?.flatten();
+                // Read only to decide this writer's own write of the row (see `route_write_read`).
+                let prior_at:Option<i64>=tx.query_row(ROUTE_READ_PROVIDER_PRIOR_OBSERVED,[&provider_key],|row|row.get(0)).optional()?.flatten();
                 if new_wall && prior_at.is_some_and(|at|at>observed_at) {return Ok(());}
                 // Replace inherited provider evidence only. An independent
                 // model refusal keeps its own deadline and evidence generation.
-                let mut inherited=tx.prepare("SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
-                    ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
-                     (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
-                      AND COALESCE(m.wall_observed_at,m.last_error_at,m.updated_at)=COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
-                      AND m.last_error IS p.last_error
-                      AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
-                      AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))")?
+                // Read only to decide this writer's own write of the row (see `route_write_read`).
+                let mut inherited=tx.prepare(ROUTE_READ_PROVIDER_INHERITED_ROUTES)?
                     .query_map([&provider_key],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 let existing = tx
                     .query_row(
-                        "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1",
+                        // Read only to decide this writer's own write of the row (see `route_write_read`).
+                        ROUTE_READ_PROVIDER_EXISTING,
                         [&provider_key],
                         |row| {
                             Ok(ExistingProviderState {
@@ -7718,14 +7760,13 @@ impl crate::AccountTx<'_> {
                 let tx = c;
                 let (provider_id, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let new_wall=update.cooldown_until.is_some() || update.quota_exhausted_until.is_some();
-                let prior_at:Option<i64>=tx.query_row("SELECT wall_observed_at FROM model_route_state WHERE route_key=?1",[route_key],|row|row.get(0)).optional()?.flatten();
+                // Read only to decide this writer's own write of the row (see `route_write_read`).
+                let prior_at:Option<i64>=tx.query_row(ROUTE_READ_ROUTE_PRIOR_OBSERVED,[route_key],|row|row.get(0)).optional()?.flatten();
                 if new_wall && prior_at.is_some_and(|at|at>observed_at) {return Ok(());}
                 let existing = tx
                     .query_row(
-                        "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                latency_ema_ms, success_ema, failure_count, quota_error_count,
-                                last_error, last_error_at, wall_class
-                         FROM model_route_state WHERE route_key = ?1",
+                        // Read only to decide this writer's own write of the row (see `route_write_read`).
+                        ROUTE_READ_ROUTE_EXISTING,
                         [route_key],
                         |r| {
                             Ok(ExistingState {
@@ -7754,9 +7795,8 @@ impl crate::AccountTx<'_> {
                 }
                 let provider = tx
                     .query_row(
-                        "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1",
+                        // Read only to decide this writer's own write of the row (see `route_write_read`).
+                        ROUTE_READ_ROUTE_EXISTING_AFTER,
                         [&provider_key],
                         |r| {
                             Ok(ExistingProviderState {
@@ -7995,9 +8035,8 @@ impl crate::AccountTx<'_> {
                 }
                 let existing: Option<(i64, Option<f64>, Option<String>,i64)> = tx
                     .query_row(
-                        "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
-                         FROM model_route_state WHERE route_key=?1",
+                        // Read only to decide this writer's own write of the row (see `route_write_read`).
+                        ROUTE_READ_OUTCOME_FAILURE_STATE,
                         [&route_key],
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?)),
                     )
@@ -8105,9 +8144,8 @@ impl crate::AccountTx<'_> {
             let tx = c;
             let prior = tx
                 .query_row(
-                    "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason
-                         FROM model_route_state WHERE route_key = ?1",
+                    // Read only to decide this writer's own write of the row (see `route_write_read`).
+                    ROUTE_READ_CLEAR_FAILURE_STATE,
                     [route_key],
                     |row| {
                         Ok(FailureBackoffState {

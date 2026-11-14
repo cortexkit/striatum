@@ -502,11 +502,13 @@ impl crate::AccountTx<'_> {
         }
     }
 
-    /// A lease is granted on key states and clocks read from the working
-    /// state, and its insert names none of them. So before granting it,
-    /// check that SQL holds each provider's clocks and key rows exactly as
-    /// the state does; a difference raises `STATE_DIVERGED`, and the batch
-    /// runs again on a fresh load. Without a state SQL decided.
+    /// A lease is granted, reused, released or refused on key states, clocks
+    /// and route clears read from the working state, and on sync's finding
+    /// that no other source row needs a clock; none of its writes names
+    /// them. So before deciding, check that SQL holds each provider's block
+    /// rows exactly as the state does (`BlockState::check_provider_rows`); a
+    /// difference raises `STATE_DIVERGED`, and the batch runs again on a
+    /// fresh load. Without a state SQL decided.
     fn check_lease_inputs(&self, providers: &[&str]) -> rusqlite::Result<()> {
         let Some(state) = self
             .working_blocks()
@@ -745,6 +747,9 @@ impl crate::AccountTx<'_> {
             if !lease_providers.contains(&request.provider) {
                 lease_providers.push(request.provider);
             }
+            // Every decision below (reuse, refusal, release, a new pick)
+            // rests on these providers' rows as the state shows them.
+            self.check_lease_inputs(&lease_providers)?;
             for key in request.keys {
                 let quota_at=crate::FenceRecheck::quota_group_at(origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)),None);
                 for origin in origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)) {
@@ -768,7 +773,6 @@ impl crate::AccountTx<'_> {
                     return Ok(PoolAcquireOutcome::Exhausted(blocked));
                 }
                 if still_admissible {
-                    self.check_lease_inputs(&lease_providers)?;
                     let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,workspace,credential)).cloned().collect();
                     if !self.claim_for_lease(&origins,now,lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
                     if !origins.is_empty() {conn.execute("UPDATE pool_key_lease SET fence_probe=1 WHERE lease_id=?1",[lease])?;}
@@ -806,7 +810,6 @@ impl crate::AccountTx<'_> {
                 Ok(pick) => pick,
                 Err(blocked) => return Ok(PoolAcquireOutcome::Exhausted(blocked)),
             };
-            self.check_lease_inputs(&lease_providers)?;
             let origins:Vec<_>=origins.iter().filter(|origin|applies(origin,&pick.workspace,&pick.credential_id)).cloned().collect();
             let lease = lease_id(now);
             if !self.claim_for_lease(&origins,now,&lease).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))? {return Err(rusqlite::Error::InvalidQuery);}
@@ -863,12 +866,14 @@ impl crate::AccountTx<'_> {
                         return Ok(None);
                     };
                     crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+                    // The refusal below and the grant both rest on the
+                    // provider's rows as the state shows them.
+                    self.check_lease_inputs(&[provider])?;
                     if self.clock_rechecks_on()?.iter().any(|origin|origin.provider==provider) {
                         // Rehydrating an unknown lease cannot prove that it
                         // owns a fenced account's one probe authorization.
                         return Ok(None);
                     }
-                    self.check_lease_inputs(&[provider])?;
                     let workspace: String = conn
                         .query_row(
                             "SELECT workspace FROM pool_session_affinity

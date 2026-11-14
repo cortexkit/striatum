@@ -11,28 +11,27 @@
 //! lease table, which is no block table.
 //!
 //! Reads inside the writer are forbidden too: the clock synchronization
-//! (`sync`/`register`) decides on the command's working state. The claim and
-//! probe decisions (claims, decision-probe binding, report matching,
-//! authorization transfer and the check that a probe authorization names a
-//! reported credential) and the
+//! (`sync`/`register`), the claim and probe decisions (claims,
+//! decision-probe binding, report matching, authorization transfer and the
+//! check that a probe authorization names a reported credential), the
 //! healers (success healing, failed and neutral probe outcomes, credential
-//! classification) decide on the command's working state, so their SQL must
-//! not run on the writer either. The state's own load and read-backs are
-//! counted apart.
+//! classification) and pool decisions all decide on the command's working
+//! state. The trace finds reads with SQLite's authorizer, so views,
+//! sub-queries, comma joins and triggers cannot hide one. Exempt and counted
+//! apart: the state's own load and read-backs; the keyed checks a decision
+//! makes of the rows it read from the state; and the route-state writers'
+//! keyed reads of the row each is about to write. Every exempt statement
+//! must be on the store's reviewed list, each proven keyed there.
 
 use std::collections::BTreeSet;
 
 use super::*;
-use striatum_store::group_reads::{reads_tables, BLOCK_READ_TABLES};
+use striatum_store::group_reads::reads_tables;
 
 async fn ok(route: &super::super::conformance_tests::Route, method: &str, params: Value) -> Value {
     let reply = route.call(method, &params).await;
     assert_eq!(reply.0, FrameType::Response, "{method}: {}", reply.1);
     reply.1["result"].clone()
-}
-
-fn switched() -> Vec<&'static str> {
-    BLOCK_READ_TABLES.to_vec()
 }
 
 /// Each SQL reader the request paths used to call, run on a pooled reader:
@@ -103,9 +102,12 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
 /// The statements the route-state snapshot and the provider cooldown lookup
 /// run when they read SQL, on the writer (the connection the store's
 /// `build_snapshot` and `get_provider_cooldown` use): their reads of the
-/// route and provider rows. The snapshot's probe-clock reads, and the
-/// quarantine read, are left out: the clock synchronization and pool
-/// acquisition still run the same statements on the writer.
+/// route and provider rows. The snapshot's reads of the probe clocks
+/// (`fence_recheck`) and of the route and provider rows that hold one
+/// account's error (which it leaves out of the clocks)
+/// are left out here because the SQL clock synchronization this oracle runs
+/// first issues the same statements; the request mix below forbids every
+/// block read on the writer anyway.
 fn route_state_oracle() -> BTreeSet<String> {
     use striatum_core::RouteStateStore;
     let harness = harness_with_routed_accounts(Some(&["apikey"]));
@@ -139,8 +141,9 @@ fn route_state_oracle() -> BTreeSet<String> {
 /// The statements each claim, probe and healing decision ran on the writer
 /// when it decided on SQL. Each runs once through a test seam, whose
 /// transaction has no account state, on a fresh store holding one due
-/// provider wall. The clock synchronization's own statements are left out:
-/// it still reads SQL before every decision.
+/// provider wall. The SQL clock synchronization's own statements, which
+/// this seam runs before every decision, are left out so each decision's
+/// list holds only its own reads; no request path runs either.
 fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
     let harness = harness_with_routed_accounts(Some(&["apikey"]));
     let store = harness.store();
@@ -162,8 +165,8 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
         .account_transaction(|tx| tx.sync_fence_rechecks())
         .unwrap();
     let mut sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
-    // The effective-recheck read is left out too: pool acquisition, which
-    // the pool group owns, still runs it on the writer.
+    // The `tx.fence_rechecks()` read is left out too, for the same reason:
+    // the seam's SQL claim paths run it before deciding.
     store
         .account_transaction(|tx| tx.fence_rechecks())
         .unwrap();
@@ -303,8 +306,9 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     // Negatives for the route-state snapshot: the trace sees its SQL.
     let route_state_text = route_state_oracle();
     let trace = store.trace_block_reads_for_test().unwrap();
-    let switched = switched();
     let mut writer_reads = Vec::new();
+    let mut exempt: BTreeSet<String> = BTreeSet::new();
+    let mut route_writes: BTreeSet<String> = BTreeSet::new();
     let reloads = striatum_store::block_reconcile_reloads();
     let mut check = |op: &str| {
         // Every block write the op made ran inside an account command: the
@@ -316,14 +320,10 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             store.block_tables_written_outside_command()
         );
         let seen = trace.take();
-        let ordinary: Vec<_> = seen
-            .reader
-            .iter()
-            .filter(|sql| reads_tables(sql, &switched))
-            .collect();
         assert!(
-            ordinary.is_empty(),
-            "{op} read block tables on a pooled reader: {ordinary:#?}"
+            seen.reader.is_empty(),
+            "{op} read block tables on a pooled reader: {:#?}",
+            seen.reader
         );
         let switched_on_writer: Vec<_> = seen
             .writer
@@ -361,7 +361,9 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             "{op} read block tables on the writer: {:#?}",
             seen.writer
         );
-        writer_reads.push((op.to_owned(), seen.maintenance, seen.checks));
+        writer_reads.push((op.to_owned(), seen.maintenance, seen.checks.len(), seen.route_writes.len()));
+        route_writes.extend(seen.route_writes.iter().cloned());
+        exempt.extend(seen.checks.into_iter().chain(seen.route_writes));
     };
 
     let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}"),"affinity":"block-reads"})).await;
@@ -382,6 +384,19 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     check("pool_acquire");
     ok(&operator, "route.pool_release", json!({"provider":POOL,"session":"block-session","leaseId":lease["leaseId"],"endSession":true})).await;
     check("pool_release");
+    // A renewal of a lease the store does not know rehydrates it; then a
+    // pool key walled directly, and another unknown renewal, which refuses
+    // on the wall's clock.
+    operator
+        .call("route.pool_renew", &json!({"provider":POOL,"session":"block-rehydrate","leaseId":"block-unknown-lease","credentialId":lease["credentialId"]}))
+        .await;
+    check("pool_renew of an unknown lease");
+    ok(&operator, "route.pool_wall", json!({"provider":POOL,"credentialId":lease["credentialId"],"kind":"rate_limited","untilMs":now+60_000})).await;
+    check("pool_wall");
+    operator
+        .call("route.pool_renew", &json!({"provider":POOL,"session":"block-rehydrate-2","leaseId":"block-unknown-lease-2","credentialId":lease["credentialId"]}))
+        .await;
+    check("pool_renew of an unknown lease on a walled pool");
     ok(&runner, "route.account_for", json!({"mode":"continue","run_id":"block-run","admission_id":"block-reads","conversation_key":"block-reads","previous_decision_id":selected["decision_id"],"selection_id":"block-continuation",
         "exhausted":{"credential_id":admitted["account"]["credential_id"],"account":admitted["account"]["account_id"],"limit_window":"five_hour","observed_at_ms":now,"resets_at_ms":now+300_000}})).await;
     check("continue after exhaustion");
@@ -405,6 +420,15 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     let plain_admission = ok(&runner, "route.account_for", json!({"provider":BORROWED,"model":"model-a","decision_id":plain["decision_id"],"conversation_key":"block-plain","admission_id":"block-plain"})).await;
     check("account_for plain");
     let plain_key = plain_admission["account"]["credential_id"].clone();
+    // A failed run on a plain route, then a completed one.
+    let failing = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    check("select a plain route to fail");
+    ok(&owner, "route.report", json!({"decision_id":failing["decision_id"],"outcome":"failed"})).await;
+    check("report failed");
+    let recovering = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    check("select a plain route to complete");
+    ok(&owner, "route.report", json!({"decision_id":recovering["decision_id"],"outcome":"completed"})).await;
+    check("report completed after a failure");
     // A credential refusal reported for a second plain decision: the report
     // reconciles quota holds inside its command.
     let refused = ok(
@@ -431,6 +455,11 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     )
     .await;
     check("cooldown status");
+    // A transient backoff observed for the plain admission's account.
+    ok(&runner, "route.account_observe", json!({"event_id":"block-backoff","kind":"transient_backoff","admission_id":"block-plain",
+        "served_account_id":plain_admission["account"]["account_id"],"credential_id":plain_key,"retry_at_ms":now+60_000})).await;
+    check("observe transient backoff");
+
     // Every reader now has rows to return.
     assert!(!store.account_eligibility().unwrap().is_empty());
     assert!(!store.credential_entitlement_fences().unwrap().is_empty());
@@ -465,19 +494,38 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     check("pool_acquire with fences");
 
     // A tick reconciles the state with SQL; after the whole mix it finds
-    // nothing the capture missed.
+    // nothing the capture missed. Its own statements (the reconcile's
+    // counts, the expiry releases, the sync) read no block table either.
     crate::account_writer::tick(store, now as i64).unwrap();
+    check("tick");
     assert_eq!(
         striatum_store::block_reconcile_reloads(),
         reloads,
         "the tick's reconcile reloaded a state the request mix left unequal to SQL"
     );
     assert_eq!(store.block_writes_outside_command(), 0);
-    for (op, maintenance, checks) in &writer_reads {
+    for (op, maintenance, checks, route_writes) in &writer_reads {
         eprintln!(
-            "block reads: {op}: 0 ordinary, {maintenance} state maintenance, {checks} keyed state checks"
+            "block reads: {op}: 0 ordinary, {maintenance} state maintenance, {checks} keyed state checks, {route_writes} route-writer reads"
         );
     }
+    // Every exempt read the mix ran is one the store's reviewed list names,
+    // and `every_exempt_read_is_keyed` proves each of those keyed.
+    let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
+    let reviewed: BTreeSet<String> = striatum_store::reviewed_exempt_reads()
+        .iter()
+        .map(|sql| normalize(sql))
+        .collect();
+    let unreviewed: Vec<String> = exempt
+        .iter()
+        .map(|sql| normalize(sql))
+        .filter(|sql| !reviewed.contains(sql))
+        .collect();
+    assert!(unreviewed.is_empty(), "exempt reads not on the reviewed list: {unreviewed:#?}");
+    assert!(!exempt.is_empty(), "the mix ran checked decisions");
+    // Route-writer reads the mix ran (the store's own test drives each of
+    // the four writers and pins their statements).
+    eprintln!("route-writer reads: {}", route_writes.len());
 }
 
 fn oracle_reads_text(
