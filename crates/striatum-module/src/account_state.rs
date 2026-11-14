@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::{cell::RefCell, collections::BTreeSet};
 
 use striatum_core::route_state_store::{RouteStateResult, RouteStateStoreError};
 use striatum_store::{
@@ -11,8 +12,10 @@ use striatum_store::{
 };
 
 mod admissions;
+mod inflight;
 
 pub(crate) use admissions::AdmissionState;
+pub(crate) use inflight::{InflightLedger, InflightScope};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AccountState {
@@ -21,16 +24,24 @@ pub(crate) struct AccountState {
     /// Maintained by every admission, affinity and continuation writer and
     /// read by request paths instead of those tables.
     pub(crate) admissions: AdmissionState,
+    pub(crate) inflight: InflightLedger,
 }
 
 impl AccountState {
     // The writer calls this once inside a read transaction, with no attached
     // working state. Quota readings and the vault roster are deliberately absent.
     fn load(tx: &AccountTx<'_>) -> RouteStateResult<Self> {
+        Self::load_at(tx, crate::account_selection::now_ms())
+    }
+
+    fn load_at(tx: &AccountTx<'_>, now: i64) -> RouteStateResult<Self> {
+        let rows = tx.load_admission_group()?;
+        let inflight = InflightLedger::from_rows(rows.open.iter().map(|open| &open.row), now);
         Ok(Self {
             generation: 0,
             selection_salt: tx.existing_salt()?.map(Arc::new),
-            admissions: AdmissionState::from_rows(tx.load_admission_group()?),
+            admissions: AdmissionState::from_rows(rows),
+            inflight,
         })
     }
 }
@@ -150,6 +161,8 @@ struct StateOwner {
     loads: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     load_hook: Mutex<Option<Box<dyn Fn() -> RouteStateResult<()> + Send>>>,
+    #[cfg(test)]
+    load_now_ms: Option<i64>,
 }
 
 impl AccountStateBridge for StateOwner {
@@ -160,6 +173,10 @@ impl AccountStateBridge for StateOwner {
             if let Some(hook) = self.load_hook.lock().unwrap().as_ref() {
                 hook()?;
             }
+        }
+        #[cfg(test)]
+        if let Some(now) = self.load_now_ms {
+            return AccountState::load_at(tx, now).map(|state| Box::new(state) as _);
         }
         AccountState::load(tx).map(|state| Box::new(state) as _)
     }
@@ -232,6 +249,8 @@ pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<Ac
 pub(crate) struct AccountCommand<'a> {
     sql: &'a AccountTx<'a>,
     state: Option<&'a mut AccountState>,
+    now_ms: i64,
+    visited_accounts: RefCell<BTreeSet<(String, String)>>,
 }
 
 impl<'a> AccountCommand<'a> {
@@ -241,6 +260,8 @@ impl<'a> AccountCommand<'a> {
     ) -> Self {
         Self {
             sql,
+            now_ms: crate::account_selection::now_ms(),
+            visited_accounts: RefCell::default(),
             state: state.map(|state| {
                 state
                     .as_any_mut()
@@ -280,6 +301,37 @@ impl<'a> AccountCommand<'a> {
 // working state, which already holds every earlier change of its batch.
 // Without a state (private SQL projections) they are the SQL reads.
 impl AccountCommand<'_> {
+    // A replay or a read-only writer command can visit an account without a
+    // lifecycle effect. Remember its key so command cleanup still drops lapsed
+    // entries without scanning any other account or changing durable rows.
+    fn visit_account(&self, provider: &str, account: &str) {
+        if self.state.is_some() {
+            self.visited_accounts
+                .borrow_mut()
+                .insert((provider.to_owned(), account.to_owned()));
+        }
+    }
+
+    /// A writer count also discards lapsed entries for the account it visits.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "cap enforcement will consume ledger counts")
+    )]
+    pub(crate) fn inflight_count(
+        &mut self,
+        provider: &str,
+        account: &str,
+        scope: InflightScope<'_>,
+        now: i64,
+    ) -> usize {
+        let state = self
+            .state
+            .as_deref_mut()
+            .expect("ledger needs module state");
+        state.inflight.touch(provider, account, now);
+        state.inflight.count(provider, account, scope, now)
+    }
+
     fn admission_state(&self) -> Option<&AdmissionState> {
         self.state.as_deref().map(|state| &state.admissions)
     }
@@ -295,10 +347,15 @@ impl AccountCommand<'_> {
             return self.sql.admission(principal, admission_id);
         };
         if let Some(open) = state.open_admission(principal, admission_id) {
+            self.visit_account(&open.row.provider, &open.row.account_id);
             return Ok(Some(open.row.clone()));
         }
         keyed_exception();
-        self.sql.admission_by_key(principal, admission_id)
+        let row = self.sql.admission_by_key(principal, admission_id)?;
+        if let Some(row) = &row {
+            self.visit_account(&row.provider, &row.account_id);
+        }
+        Ok(row)
     }
 
     /// The admission only if it is open (`reserved`, `started`, `expired`),
@@ -310,9 +367,10 @@ impl AccountCommand<'_> {
         admission_id: &str,
     ) -> RouteStateResult<Option<AccountAdmissionRow>> {
         match self.admission_state() {
-            Some(state) => Ok(state
-                .open_admission(principal, admission_id)
-                .map(|open| open.row.clone())),
+            Some(state) => Ok(state.open_admission(principal, admission_id).map(|open| {
+                self.visit_account(&open.row.provider, &open.row.account_id);
+                open.row.clone()
+            })),
             None => Ok(self
                 .sql
                 .admission(principal, admission_id)?
@@ -330,7 +388,10 @@ impl AccountCommand<'_> {
         match self.admission_state() {
             Some(state) => Ok(state
                 .open_admission(principal, admission_id)
-                .and_then(|open| open.input_size_class)),
+                .and_then(|open| {
+                    self.visit_account(&open.row.provider, &open.row.account_id);
+                    open.input_size_class
+                })),
             None => self.sql.admission_size_class(principal, admission_id),
         }
     }
@@ -342,12 +403,16 @@ impl AccountCommand<'_> {
         provider: &str,
     ) -> RouteStateResult<Option<AccountAffinityRow>> {
         match self.admission_state() {
-            Some(state) => Ok(state.affinity(principal, hash, provider).cloned()),
+            Some(state) => Ok(state.affinity(principal, hash, provider).map(|row| {
+                self.visit_account(&row.provider, &row.account_id);
+                row.clone()
+            })),
             None => self.sql.affinity(principal, hash, provider),
         }
     }
 
     pub(crate) fn pin_has_started(&self, affinity: &AccountAffinityRow) -> RouteStateResult<bool> {
+        self.visit_account(&affinity.provider, &affinity.account_id);
         match self.admission_state() {
             Some(state) => Ok(state.pin_has_started(affinity)),
             None => self.sql.pin_has_started(affinity),
@@ -362,7 +427,11 @@ impl AccountCommand<'_> {
         now: i64,
     ) -> RouteStateResult<Option<String>> {
         match self.admission_state() {
-            Some(state) => Ok(state.parent_used_account(principal, hash, provider, now)),
+            Some(state) => Ok(state
+                .parent_used_account(principal, hash, provider, now)
+                .inspect(|account| {
+                    self.visit_account(provider, account);
+                })),
             None => self.sql.parent_used_account(principal, hash, provider, now),
         }
     }
@@ -373,6 +442,7 @@ impl AccountCommand<'_> {
         account_id: &str,
         committed_after: Option<i64>,
     ) -> RouteStateResult<Vec<AccountDemandRow>> {
+        self.visit_account(provider, account_id);
         match self.admission_state() {
             Some(state) => Ok(state.demand(provider, account_id, committed_after)),
             None => self.sql.demand(provider, account_id, committed_after),
@@ -457,9 +527,10 @@ impl AccountCommand<'_> {
 
     /// Apply a change SQL has already made to the state.
     fn mirror(&mut self, change: impl FnOnce(&mut AdmissionState)) {
-        if let Some(state) = self.admissions() {
-            change(state);
-            state.pending.clear();
+        if let Some(state) = self.state.as_deref_mut() {
+            change(&mut state.admissions);
+            state.inflight.apply(&state.admissions, self.now_ms);
+            state.admissions.pending.clear();
         }
     }
 
@@ -472,11 +543,12 @@ impl AccountCommand<'_> {
         writer: &str,
         change: impl FnOnce(&mut AdmissionState) -> bool,
     ) -> RouteStateResult<()> {
-        let Some(state) = self.admissions() else {
+        let Some(state) = self.state.as_deref_mut() else {
             return Ok(());
         };
-        let applied = change(state);
-        state.pending.clear();
+        let applied = change(&mut state.admissions);
+        state.inflight.apply(&state.admissions, self.now_ms);
+        state.admissions.pending.clear();
         if applied != sql_changed {
             return Err(diverged(format!(
                 "{writer}: SQL changed {sql_changed}, state changed {applied}"
@@ -498,9 +570,13 @@ impl AccountCommand<'_> {
     /// Decide a change on the state, then persist the writes it decided.
     fn decide<T>(&mut self, change: impl FnOnce(&mut AdmissionState) -> T) -> RouteStateResult<T> {
         let sql = self.sql;
-        let state = self.admissions().expect("decide needs a working state");
-        let decided = change(state);
-        for effect in std::mem::take(&mut state.pending) {
+        let state = self
+            .state
+            .as_deref_mut()
+            .expect("decide needs a working state");
+        let decided = change(&mut state.admissions);
+        state.inflight.apply(&state.admissions, self.now_ms);
+        for effect in std::mem::take(&mut state.admissions.pending) {
             match effect {
                 admissions::Effect::Observed {
                     admission,
@@ -566,6 +642,9 @@ impl AccountCommand<'_> {
         self.sql.insert_admission(row)?;
         let rowid = self.sql.last_insert_rowid();
         self.mirror(|state| state.insert_admission(row, rowid));
+        if let Some(state) = self.state.as_deref_mut() {
+            state.inflight.update(row, self.now_ms);
+        }
         Ok(())
     }
 
@@ -619,6 +698,7 @@ impl AccountCommand<'_> {
         row: &AccountAdmissionRow,
         at: i64,
     ) -> RouteStateResult<()> {
+        self.visit_account(&row.provider, &row.account_id);
         if self.state.is_none() {
             return self.sql.observe_admission(row, at);
         }
@@ -660,6 +740,7 @@ impl AccountCommand<'_> {
         row: &AccountAffinityRow,
         expected: Option<(&str, u64)>,
     ) -> RouteStateResult<bool> {
+        self.visit_account(&row.provider, &row.account_id);
         let changed = self.sql.put_affinity(row, expected)?;
         self.mirror_checked(changed, "put_affinity", |state| {
             state.put_affinity(row, expected)
@@ -828,6 +909,16 @@ impl AccountCommand<'_> {
         limit: usize,
     ) -> RouteStateResult<usize> {
         let deleted = self.sql.prune_account_admissions_returning(before, limit)?;
+        if let Some(state) = self.state.as_deref_mut() {
+            for row in &deleted {
+                state.inflight.remove(
+                    &row.provider,
+                    &row.account_id,
+                    &(row.principal.clone(), row.admission_id.clone()),
+                    self.now_ms,
+                );
+            }
+        }
         let sql = self.sql;
         if let Some(state) = self.admissions() {
             for conversation in state.prune_admissions(&deleted) {
@@ -880,8 +971,11 @@ impl AccountCommand<'_> {
 
 impl Drop for AccountCommand<'_> {
     fn drop(&mut self) {
-        if let Some(state) = self.admissions() {
-            state.settle();
+        if let Some(state) = self.state.as_deref_mut() {
+            state.admissions.settle();
+            for (provider, account) in self.visited_accounts.get_mut().iter() {
+                state.inflight.touch(provider, account, self.now_ms);
+            }
         }
     }
 }
@@ -949,5 +1043,7 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(test)]
+mod inflight_tests;
 #[cfg(test)]
 mod tests;
