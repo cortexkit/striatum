@@ -2,7 +2,7 @@
 
 use cortexkit_role_routing::{
     engine_measurements::{self as measurements, EngineIdentity, EvalScore, EvaluationSet},
-    errors::{NoRouteReason, Refusal, RefusalCode},
+    errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode},
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
     select_media::{self as media, SelectMediaAnswer, SelectMediaRequest},
 };
@@ -17,6 +17,9 @@ mod ranking;
 
 #[path = "media_pricing.rs"]
 mod pricing;
+
+#[path = "media_ordering.rs"]
+mod ordering;
 
 pub(super) fn now(deps: &Deps<'_>) -> u64 {
     #[cfg(test)]
@@ -131,15 +134,20 @@ fn select_request(
     let consumers = super::consumers::effective(&config);
     consumers.admit(&request.consumer, caller)?;
     let policy = media.map(|media| {
-        // Resolve only the media demand level. The consumer registry's general
+        // Resolve only media defaults. The consumer registry's general
         // policy view also carries language-model requirements (context, tools)
         // that don't apply to engines, so build a policy holding just the
-        // declaration's default `iq` (its demand level on the kind's grade
-        // scale) and let the request's own `iq` and operator settings override it.
+        // declaration's level and ladder and let operator settings override them.
+        let defaults = consumers.defaults_for(&request.consumer);
         let declared = std::collections::BTreeMap::from([(
             request.consumer.clone(),
             crate::config_policy::ConsumerPolicy {
-                iq: consumers.defaults_for(&request.consumer).iq.map(f64::from),
+                iq: defaults.iq.map(f64::from),
+                mode: defaults
+                    .ladder
+                    .as_ref()
+                    .map(|_| crate::config_policy::ConsumerMode::Ladder),
+                ladder: defaults.ladder,
                 ..Default::default()
             },
         )]);
@@ -152,6 +160,39 @@ fn select_request(
             &declared,
         )
     });
+    // The settings resolver folds pins into ladders. Read the pin first so an
+    // unavailable explicit choice cannot fall through to another engine.
+    let pin = media.and_then(|media| media.pin.clone()).or_else(|| {
+        policy.as_ref()?.pin.as_ref().map(|pin| {
+            pin.variant.as_ref().map_or_else(
+                || pin.model.clone(),
+                |variant| format!("{}:{variant}", pin.model),
+            )
+        })
+    });
+    if let Some(pin) = &pin {
+        if !config.media_route_allowed(&request.consumer, pin, true) {
+            // The policy diagnostic names the effective rule, including model
+            // overrides of provider rules. Only consumer restrictions are an
+            // exclusion; a provider's model allowlist is an availability gate.
+            let excluded = config
+                .route_policy_refusal(&request.consumer, pin)
+                .is_some_and(|rule| {
+                    rule.split_whitespace().next().is_some_and(|source| {
+                        source.ends_with(".only_for") || source.ends_with(".not_for")
+                    })
+                });
+            return Err(Refusal::pin_unavailable(
+                pin,
+                if excluded {
+                    PinUnavailableReason::Excluded
+                } else {
+                    PinUnavailableReason::NotAvailable
+                },
+                None,
+            ));
+        }
+    }
     if super::describe::capabilities().contains(&"consumer_declarations") {
         let declared = consumers.defaults_for(&request.consumer);
         super::consumers::kind::resolve(
@@ -212,6 +253,15 @@ fn select_request(
                 .map(|(index, engine)| EngineCandidate::caller_local(index, engine)),
         );
     }
+    // Preserve declaration identity before any availability gate removes a
+    // module engine: a same-named caller offer must never stand in for it.
+    let declared_routes = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidate.selected.caller_local && candidate.engine.kind == request.kind
+        })
+        .map(|candidate| format!("{}/{}", candidate.engine.provider, candidate.engine.model))
+        .collect();
     // Withdrawal applies to media and caller-local engines before ranking.
     // Resolved facts also carry it when a credential uses a different provider
     // name from the catalog's provider name.
@@ -300,7 +350,7 @@ fn select_request(
             None,
         );
         let policy_allowed = if media.is_some() {
-            config.media_route_allowed(&request.consumer, &key, false)
+            config.media_route_allowed(&request.consumer, &key, pin.as_deref() == Some(&key))
         } else {
             config.route_allowed(&request.consumer, &key, true)
         };
@@ -433,6 +483,13 @@ fn select_request(
         .collect();
     if let Some(media) = media {
         if let Some(fact) = missing_media_catalog_requirement(media) {
+            if let Some(pin) = &pin {
+                return Err(Refusal::pin_unavailable(
+                    pin,
+                    PinUnavailableReason::NotAvailable,
+                    None,
+                ));
+            }
             let mut refusal = Refusal::no_route(NoRouteReason::MissingCapability, None);
             refusal.message = format!("catalog rows have no {fact} fact");
             return Err(refusal);
@@ -441,7 +498,7 @@ fn select_request(
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             // Local engines bypass the compatibility selector's reachability
             // fence, so apply policy as admission instead of a transient fence.
-            config.media_route_allowed(&request.consumer, &key, false)
+            config.media_route_allowed(&request.consumer, &key, pin.as_deref() == Some(&key))
                 && media
                     .exclude
                     .as_ref()
@@ -470,7 +527,20 @@ fn select_request(
             .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
             .map(|kind| &kind.grades)
             .unwrap_or(&empty);
-        ranking::pick(&request, &candidates, grades, &top_routes, policy)?
+        if let Some(pin) = &pin {
+            ordering::entry(&request, &candidates, &declared_routes, pin).ok_or_else(|| {
+                Refusal::pin_unavailable(pin, PinUnavailableReason::NotAvailable, None)
+            })?
+        } else if policy.mode == Some(crate::config_policy::ConsumerMode::Ladder) {
+            policy
+                .ladder
+                .iter()
+                .flatten()
+                .find_map(|entry| ordering::entry(&request, &candidates, &declared_routes, entry))
+                .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?
+        } else {
+            ranking::pick(&request, &candidates, grades, &top_routes, policy)?
+        }
     } else {
         wire::select_engine(&request, &candidates)?
     };
