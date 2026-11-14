@@ -702,6 +702,135 @@ fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
     );
 }
 
+/// A success heals only blocks older than its admission, so a refusal
+/// recorded after the admission survives it. Here the newer refusal reaches
+/// SQL after the state the heal first decides on: that state still shows the
+/// older refusal, so the keyed delete finds no such row, the batch rolls
+/// back, and it runs again on a fresh load, which keeps the newer refusal.
+#[test]
+fn a_heal_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
+    let rig = rig("block-state-stale-heal");
+    let until = NOW + 3_600_000;
+    let older = NOW - 600_000;
+    let newer = NOW + 600_000;
+    rig.sql(format!(
+        "INSERT INTO account_route_fence VALUES ('p0','c0','m0',{until},'d',{older},{older},'quota');"
+    ));
+    let before_the_refusal = rig.published();
+    rig.sql(format!(
+        "UPDATE account_route_fence SET last_reported_at={newer} WHERE credential_id='c0';"
+    ));
+    let heal = || {
+        rig.store
+            .account_command(AccountCommandKind::Report, |tx| {
+                tx.heal_serving_fences_in_scope("p0", "a0", "c0", "m0", None, NOW, NOW + 1, None)
+            })
+    };
+    let reported = |rig: &Rig| {
+        rig.store
+            .with_reader_for_test(|conn| {
+                conn.prepare("SELECT last_reported_at FROM account_route_fence")?
+                    .query_map([], |r| r.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+    };
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.owner.stale.lock().unwrap().push(before_the_refusal.clone());
+    rig.owner.request_reload();
+    heal().unwrap();
+    assert_eq!(rig.owner.loads.load(Ordering::Relaxed) - loads, 2, "the stale run, then a fresh one");
+    assert_eq!(reported(&rig), [newer], "the refusal after the admission stands");
+    rig.check(&[NOW], "after the rerun");
+
+    // Stale on the rerun too: the batch fails with the divergence and
+    // writes nothing.
+    rig.owner
+        .stale
+        .lock()
+        .unwrap()
+        .extend([before_the_refusal.clone(), before_the_refusal]);
+    rig.owner.request_reload();
+    let error = heal().unwrap_err().to_string();
+    assert!(error.contains(crate::STATE_DIVERGED), "{error}");
+    assert_eq!(reported(&rig), [newer]);
+}
+
+/// A success clears only blocks of the account and login that served it and
+/// older than its admission. A whole-account block on a pool clears once the
+/// success's scope covers its pool; a block on a pool the scope does not
+/// cover stays.
+#[test]
+fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission() {
+    use striatum_core::accounts::{PoolKey, PoolScope};
+    let rig = rig("block-state-heal-scope");
+    let until = NOW + 3_600_000;
+    let older = NOW - 600_000;
+    let newer = NOW + 600_000;
+    let shared = pool_key(5);
+    let named = serde_json::to_string(&PoolKey {
+        window_minutes: Some(300),
+        scope: PoolScope::EveryModel,
+        name: Some("gemini".into()),
+    })
+    .unwrap();
+    let fence = |id: &str, account: &str, pool: &str| {
+        format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
+            VALUES ('{id}','p0','{account}','{{}}','{{}}','broca_account_limit',{older},'x',{older},'{pool}','[]');")
+    };
+    rig.sql(format!(
+        "INSERT INTO account_route_fence VALUES ('p0','c0','m0',{until},'d',{older},{older},'quota');
+         INSERT INTO account_route_fence VALUES ('p0','c1','m0',{until},'d',{older},{older},'quota');
+         INSERT INTO account_route_fence VALUES ('p0','c0','m1',{until},'d',{older},{older},'quota');
+         INSERT INTO credential_entitlement_fences VALUES ('p0','c0','billing_exhausted',NULL,{newer});
+         INSERT INTO credential_entitlement_fences VALUES ('p0','c1','billing_exhausted',NULL,{older});
+         {}{}{}",
+        fence("shared", "a0", &shared),
+        fence("named", "a0", &named),
+        fence("other-account", "a1", &shared),
+    ));
+    rig.store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.heal_serving_fences_in_scope(
+                "p0",
+                "a0",
+                "c0",
+                "m0",
+                None,
+                NOW,
+                NOW + 1,
+                Some(&crate::QuotaSuccessScope {
+                    family: striatum_core::accounts::ModelFamily::Other,
+                    pool: None,
+                }),
+            )
+        })
+        .unwrap();
+    let remaining = rig
+        .store
+        .with_reader_for_test(|conn| {
+            let list = |sql: &str| -> rusqlite::Result<Vec<String>> {
+                conn.prepare(sql)?.query_map([], |r| r.get(0))?.collect()
+            };
+            Ok((
+                list("SELECT credential_id||'/'||model FROM account_route_fence ORDER BY 1")?,
+                list("SELECT credential_id FROM credential_entitlement_fences ORDER BY 1")?,
+                list("SELECT fence_id FROM account_fence WHERE cleared_at IS NULL ORDER BY 1")?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        remaining,
+        (
+            vec!["c0/m1".to_owned(), "c1/m0".to_owned()],
+            vec!["c0".to_owned(), "c1".to_owned()],
+            vec!["named".to_owned(), "other-account".to_owned()],
+        ),
+        "only the serving login's route, and its account's block on the covered pool, heal"
+    );
+    rig.check(&[NOW], "after the heal");
+}
+
 #[test]
 fn a_commit_from_another_connection_just_before_a_batch_is_loaded_inside_it() {
     let rig = rig("block-state-outside-before-begin");
@@ -773,6 +902,57 @@ fn a_report_from_an_owner_whose_claim_was_superseded_does_not_match() {
     assert!(matches("second"));
 }
 
+/// A test request that a later one superseded heals nothing: its success
+/// finds the block's clock on the later generation, even once that later
+/// test was released without an outcome and the clock has no owner.
+#[test]
+fn a_superseded_test_request_heals_nothing() {
+    let rig = rig("block-state-superseded-heal");
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            "p0/m0",
+            "p0/m0",
+            &RouteStateUpdate {
+                observed_at_ms: Some(NOW - 2 * 3_600_000),
+                cooldown_until: Some((NOW + 5 * 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    rig.run(fence_rechecks::sync);
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    let claim = |owner: &'static str, at: i64| {
+        let origins = origins.clone();
+        rig.store
+            .account_command(AccountCommandKind::Maintenance, move |tx| {
+                tx.grant_fence_rechecks(&origins, at, Some(owner))
+            })
+            .unwrap()
+    };
+    assert!(claim("first", NOW));
+    assert!(claim("second", NOW + 2 * 3_600_000));
+    rig.store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.release_inconclusive_probe("second", "p0", "m0", NOW + 2 * 3_600_000 + 1)
+        })
+        .unwrap();
+    let later = NOW + 3 * 3_600_000;
+    rig.store
+        .account_command(AccountCommandKind::Report, move |tx| {
+            let origins = tx.fence_rechecks()?;
+            tx.heal_report_probe("first", None, false, "m0", later, &origins, later)
+        })
+        .unwrap();
+    assert_eq!(
+        rig.store.fence_rechecks().unwrap().len(),
+        1,
+        "the superseded test's success heals no block"
+    );
+    rig.check(&[NOW], "after the superseded success");
+}
+
 #[test]
 fn a_fork_shares_every_table() {
     let rig = rig("block-state-fork");
@@ -829,7 +1009,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
     let offset = rng.below(4);
     let at = rng.time(now);
     let until = rng.time(now) + 3_600_000;
-    match rng.below(36) {
+    match rng.below(44) {
         0 => {
             let id = if rng.below(2) == 0 {
                 format!("f{}", rng.below(4))
@@ -958,7 +1138,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             "sync"
         }
         18 => {
-            let owner = format!("owner{}", rng.below(3));
+            let owner = owner_name(rng.below(3));
             rig.run(move |conn| {
                 let origins = fence_rechecks::read(conn)?;
                 if let Some(origin) = origins.get(offset as usize) {
@@ -1058,7 +1238,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             ));
             "replace a listing's eligibility"
         }
-        31..=34 => decide_both(rig, rng, now),
+        31..=42 => decide_both(rig, rng, now),
         _ => {
             let result = rig.store.account_command(AccountCommandKind::Maintenance, move |tx| {
                 tx.pool_sql(|conn| {
@@ -1072,13 +1252,14 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
     }
 }
 
-/// The claim and probe decisions a command takes: one chosen at random, run
-/// first deciding on SQL inside a savepoint that is then rolled back, and
-/// then deciding on the command's working state, with the same arguments.
-/// The answers and the clock and authorization rows each leaves must be
-/// equal.
+/// The claim, probe and healing decisions a command takes: one chosen at
+/// random, run first deciding on SQL inside a savepoint that is then rolled
+/// back, and then deciding on the command's working state, with the same
+/// arguments. The answers and every block table's rows each leaves must be
+/// equal. A healer has no answer of its own; its answer is whether it changed
+/// any block row.
 fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
-    const DECISIONS: [&str; 8] = [
+    const DECISIONS: [&str; 15] = [
         "decide: grant",
         "decide: admission claim",
         "decide: authorized admission claim",
@@ -1087,23 +1268,61 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
         "decide: report matches probe",
         "decide: authorization names credential",
         "decide: transfer authorization",
+        "heal: authorized probe",
+        "heal: serving fences",
+        "heal: origins",
+        "heal: report probe",
+        "heal: admission success",
+        "heal: failed probe",
+        "heal: inconclusive probe",
     ];
-    let which = rng.below(DECISIONS.len() as u64) as usize;
+    // Classification is decided apart: it answers the stored class.
+    let which = rng.below(DECISIONS.len() as u64 + 1) as usize;
     let first = rng.below(4) as usize;
     let count = 1 + rng.below(2) as usize;
     let at = now + [0, 900_000, 3_600_000, 4 * 3_600_000][rng.below(4) as usize];
-    let owner = format!("owner{}", rng.below(3));
-    let other = format!("owner{}", rng.below(3));
+    let owner = owner_name(rng.below(3));
+    let other = owner_name(rng.below(3));
+    let provider = rng.pick(&PROVIDERS).to_owned();
     let credential = rng.pick(&CREDENTIALS).to_owned();
     let model = rng.pick(&MODELS).to_owned();
     let preserve = rng.below(4) == 0;
     let named = rng.below(2) == 0;
+    // Before, between or after the generated evidence times.
+    let admitted = now + [-3_600_000, 0, 3_600_000][rng.below(3) as usize];
+    let size = [None, Some(16), Some(17)][rng.below(3) as usize];
+    let scope = (rng.below(3) != 0).then(|| crate::QuotaSuccessScope {
+        family: striatum_core::accounts::ModelFamily::Other,
+        pool: None,
+    });
+    let flag = rng.below(2) == 0;
+    let anchored = rng.below(4) != 0;
+    let edge = rng.below(3) as i64 - 1;
     let (sql, memory) = rig
         .store
         .account_command(AccountCommandKind::Maintenance, move |tx| {
             let decide = |tx: &crate::AccountTx<'_>| -> RouteStateResult<String> {
                 let origins = fence_rechecks::read(tx.conn).map_err(err)?;
                 let chosen: Vec<_> = origins.iter().skip(first).take(count).cloned().collect();
+                let before = block_rows(tx.conn)?;
+                let healed = |done: RouteStateResult<()>| -> RouteStateResult<bool> {
+                    done?;
+                    Ok(block_rows(tx.conn)? != before)
+                };
+                let effective: Vec<FenceRecheck> =
+                    tx.fence_rechecks()?.into_iter().skip(first).take(count).collect();
+                // Most heals are tried at the edge of their first block: on
+                // its own provider, login and model, admitted just before, at
+                // or just after its evidence.
+                let anchor = effective.first().filter(|_| anchored && which >= 8);
+                let provider = anchor.map_or_else(|| provider.clone(), |o| o.provider.clone());
+                let credential = anchor
+                    .and_then(|o| o.credential_id.clone())
+                    .unwrap_or_else(|| credential.clone());
+                let model = anchor
+                    .and_then(|o| o.model.clone())
+                    .unwrap_or_else(|| model.clone());
+                let admitted = anchor.map_or(admitted, |o| o.evidence_at + edge);
                 let answer = match which {
                     0 => tx.grant_fence_rechecks(&chosen, at, Some(&owner)),
                     1 => tx.claim_fence_rechecks_for_admission(&chosen, at, Some(&owner)),
@@ -1117,27 +1336,59 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                     4 => tx.bind_decision_probe(&chosen, &owner, &other, "a0", &credential, at),
                     5 => tx.probe_report_matches(&owner, named.then_some(&*credential), preserve),
                     6 => tx.probe_authorization_names_credential(&owner, &credential, &model),
-                    _ => tx.transfer_probe_authorization(&owner, &other).map(|()| true),
-                };
-                let mut rows = Vec::new();
-                for sql in [
-                    "SELECT kind,origin_key,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,
-                     last_claimed_at,claim_owner,claim_generation,cleared_at FROM fence_recheck ORDER BY kind,origin_key",
-                    "SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
-                     FROM fence_probe_authorization ORDER BY owner,kind,origin_key",
-                ] {
-                    let mut statement = tx.conn.prepare(sql).map_err(err)?;
-                    let columns = statement.column_count();
-                    let mut query = statement.query([]).map_err(err)?;
-                    while let Some(row) = query.next().map_err(err)? {
-                        let values = (0..columns)
-                            .map(|at| row.get::<_, Value>(at))
-                            .collect::<rusqlite::Result<Vec<_>>>()
-                            .map_err(err)?;
-                        rows.push(format!("{values:?}"));
+                    7 => tx.transfer_probe_authorization(&owner, &other).map(|()| true),
+                    8 => healed(tx.heal_authorized_probe(&owner, &provider, &model, at)),
+                    9 => healed(tx.heal_serving_fences_in_scope(
+                        &provider,
+                        "a0",
+                        &credential,
+                        &model,
+                        size,
+                        admitted,
+                        at,
+                        scope.as_ref(),
+                    )),
+                    10 => healed(tx.heal_origins(&effective, &model, admitted, at, scope.as_ref(), flag)),
+                    11 => {
+                        let effective = tx.fence_rechecks()?;
+                        healed(tx.heal_report_probe(
+                            &owner,
+                            Some(other.as_str()),
+                            flag,
+                            &model,
+                            admitted,
+                            &effective,
+                            at,
+                        ))
                     }
-                }
-                Ok(format!("{answer:?} {rows:#?}"))
+                    12 => {
+                        let admission = admission_row(&provider, &credential, &model, admitted);
+                        healed(
+                            tx.heal_admission_success(&admission, size, Some(other.as_str()), scope.as_ref(), at)
+                                .map(drop),
+                        )
+                    }
+                    13 => healed(tx.fail_authorized_probe(&owner, at, flag)),
+                    14 => healed(tx.release_inconclusive_probe(&owner, &provider, &model, at)),
+                    _ => {
+                        // A credential with a refusal on record, when there
+                        // is one, so the classification has a clock to set.
+                        let refused: Option<(String, String)> = tx
+                            .conn
+                            .query_row(
+                                "SELECT provider_id,credential_id FROM credential_entitlement_fences
+                                 ORDER BY rowid LIMIT 1 OFFSET ?1",
+                                [first as i64 % 2],
+                                |r| Ok((r.get(0)?, r.get(1)?)),
+                            )
+                            .optional()
+                            .map_err(err)?;
+                        let (provider, credential) =
+                            refused.unwrap_or((provider.clone(), credential.clone()));
+                        tx.classify_credential_quota(&provider, &credential, flag)
+                    }
+                };
+                Ok(format!("{answer:?} {:#?}", block_rows(tx.conn)?))
             };
             tx.conn.execute_batch("SAVEPOINT oracle").map_err(err)?;
             let sql = decide(&crate::AccountTx::sql(tx.conn))?;
@@ -1147,13 +1398,80 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             Ok((sql, decide(tx)?))
         })
         .unwrap();
+    let name = DECISIONS.get(which).copied().unwrap_or("decide: classify credential");
     DECIDED.with(|decided| {
         decided
             .borrow_mut()
-            .push((DECISIONS[which], memory.starts_with("Ok(true)"), sql == memory))
+            .push((name, memory.starts_with("Ok(true)"), sql == memory))
     });
-    assert_eq!(memory, sql, "{}: the state's decision equals SQL's", DECISIONS[which]);
-    DECISIONS[which]
+    assert_eq!(memory, sql, "{name}: the state's decision equals SQL's");
+    name
+}
+
+/// The generated probe owners: two decisions and one admission of
+/// principal `x`, whose owner name the admission healer derives.
+fn owner_name(index: u64) -> String {
+    match index {
+        0 | 1 => format!("owner{index}"),
+        _ => serde_json::json!(["account_admission", "x", "adm0"]).to_string(),
+    }
+}
+
+/// An admission of principal `x` on account `a0`, committed at `committed_at`.
+fn admission_row(
+    provider: &str,
+    credential: &str,
+    model: &str,
+    committed_at: i64,
+) -> crate::AccountAdmissionRow {
+    crate::AccountAdmissionRow {
+        principal: "x".into(),
+        admission_id: "adm0".into(),
+        request_fingerprint: String::new(),
+        request_mode: "admit".into(),
+        decision_id: "owner1".into(),
+        conversation_hash: String::new(),
+        provider: provider.into(),
+        model: model.into(),
+        account_id: "a0".into(),
+        credential_id: credential.into(),
+        pin_id: String::new(),
+        pin_generation: 0,
+        state: "started".into(),
+        charged: true,
+        request_bytes: 0,
+        request_bytes_estimated: false,
+        committed_at,
+        admission_valid_until: committed_at,
+        lease_valid_until: committed_at,
+        reply_json: String::new(),
+        run_id: None,
+        started_at: Some(committed_at),
+        started_late: false,
+        released_at: None,
+        finished_at: None,
+        last_observed_at: None,
+    }
+}
+
+/// Every block table's rows, each as its columns' values, in rowid order.
+fn block_rows(conn: &Connection) -> RouteStateResult<Vec<String>> {
+    let mut rows = Vec::new();
+    for table in BLOCK_TABLES {
+        let mut statement = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
+            .map_err(err)?;
+        let columns = statement.column_count();
+        let mut query = statement.query([]).map_err(err)?;
+        while let Some(row) = query.next().map_err(err)? {
+            let values = (0..columns)
+                .map(|at| row.get::<_, Value>(at))
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(err)?;
+            rows.push(format!("{table} {values:?}"));
+        }
+    }
+    Ok(rows)
 }
 
 thread_local! {
@@ -1310,7 +1628,10 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     // answer of its own.
     for name in operations
         .keys()
-        .filter(|name| name.starts_with("decide: ") && **name != "decide: transfer authorization")
+        .filter(|name| {
+            (name.starts_with("decide: ") || name.starts_with("heal: "))
+                && **name != "decide: transfer authorization"
+        })
     {
         for answer in [true, false] {
             assert!(
@@ -1319,7 +1640,7 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
             );
         }
     }
-    assert_eq!(operations.len(), 31 + 8, "every operation ran: {operations:?}");
+    assert_eq!(operations.len(), 31 + 16, "every operation ran: {operations:?}");
     let Reached {
         credential_quota_from_hold,
         route_hidden_by_provider,

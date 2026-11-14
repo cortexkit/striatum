@@ -383,7 +383,7 @@ fn clear_quota_holds_in(
     let prefix = quota_hold_prefix(fence);
     for block in tx.active_pool_fences(&fence.provider_id)? {
         if block.evidence.fence_id.starts_with(&prefix) {
-            tx.clear_fence(&block.evidence.fence_id, now, reason)?;
+            tx.clear_held_fence(&block.evidence, now, reason)?;
         }
     }
     Ok(())
@@ -410,7 +410,7 @@ pub(crate) fn lift_after_success_in(
             return Ok(false);
         }
         clear_quota_holds_in(tx, &fence, "run_succeeded", now)?;
-        tx.clear_credential_entitlement_fence(provider, credential)?;
+        tx.clear_held_entitlement_fence(&fence)?;
         return Ok(true);
     }
     Ok(false)

@@ -2049,6 +2049,23 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// End a standing block that a decision read as `row`: the update is
+    /// keyed and names the row's evidence, so it fails with
+    /// [`crate::block_state::diverged`] if SQL no longer holds that block.
+    pub fn clear_held_fence(&self, row: &AccountFenceRow, at: i64, reason: &str) -> RouteStateResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
+                 WHERE fence_id = ?1 AND cleared_at IS NULL AND observed_at = ?4 \
+                   AND created_at = ?5 AND fence_json = ?6",
+                params![row.fence_id, at, reason, row.observed_at, row.created_at, row.fence_json],
+            )
+            .map_err(err)?;
+        crate::block_state::expect_changes(changed, 1, format_args!("clear of fence {}", row.fence_id))
+            .map_err(err)
+    }
+
     /// Replace a standing whole-account block's recovery set, which only
     /// grows as later readings report more pools.
     pub fn set_fence_recovery_set(

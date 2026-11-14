@@ -700,17 +700,21 @@ impl WallFields {
     /// as late.
     fn covers(&self, route: &Self) -> bool {
         use std::cmp::Ordering::{Equal, Greater};
-        let same_error = match (&self.last_error, &route.last_error) {
-            (Value::Null, Value::Null) => true,
-            (a, b) => sql_cmp(a, b) == Some(Equal),
-        };
-        same_error
+        self.same_error(route)
             && sql_cmp(&self.observed, &route.observed) == Some(Equal)
             && matches!(
                 sql_cmp(&self.cooldown, &route.cooldown),
                 Some(Equal | Greater)
             )
             && matches!(sql_cmp(&self.quota, &route.quota), Some(Equal | Greater))
+    }
+
+    /// `route.last_error IS self.last_error`.
+    fn same_error(&self, route: &Self) -> bool {
+        match (&self.last_error, &route.last_error) {
+            (Value::Null, Value::Null) => true,
+            (a, b) => sql_cmp(a, b) == Some(std::cmp::Ordering::Equal),
+        }
     }
 }
 
@@ -1286,6 +1290,169 @@ impl BlockState {
                 Held::SuccessPool(row) => Some(row),
                 _ => None,
             })
+    }
+
+    /// The stored probe clock of one origin, cleared or not, with its
+    /// `cleared_at`.
+    pub(crate) fn clock(&self, kind: &str, origin_key: &str) -> Option<(&Block, Option<i64>)> {
+        self.stored_clocks()
+            .find(|(block, _)| block.kind == kind && block.origin_key == origin_key)
+    }
+
+    /// Every stored probe clock, cleared or not, with its `cleared_at`, in no
+    /// particular order.
+    pub(crate) fn stored_clocks(&self) -> impl Iterator<Item = (&Block, Option<i64>)> {
+        self.rows_of(CLOCK_TABLE).filter_map(|(_, held)| match held {
+            Held::Clock(block, cleared) => Some((block, *cleared)),
+            _ => None,
+        })
+    }
+
+    /// One active account fence, with its pool key and recovery set as JSON.
+    pub(crate) fn account_fence(
+        &self,
+        fence_id: &str,
+    ) -> Option<(&crate::AccountFenceRow, Option<&str>, &str)> {
+        self.raws(ACCOUNT_FENCE_TABLE).find_map(|(_, raw)| match raw {
+            Raw::AccountFence {
+                row,
+                pool_key_json,
+                recovery_set_json,
+            } if row.fence_id == fence_id => {
+                Some((row, pool_key_json.as_deref(), recovery_set_json.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    /// The `account_route_fence` row of one credential's model, of any wall
+    /// class, with its class and its latest report time.
+    pub(crate) fn account_route_fence(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+    ) -> Option<(&crate::AccountRouteFence, Option<&str>, Option<i64>)> {
+        self.raws(ROUTE_FENCE_TABLE).find_map(|(_, raw)| match raw {
+            Raw::RouteFence {
+                row,
+                wall_class,
+                last_reported_at,
+            } if row.provider == provider
+                && row.credential_id == credential
+                && row.model == model =>
+            {
+                Some((row, wall_class.as_deref(), *last_reported_at))
+            }
+            _ => None,
+        })
+    }
+
+    /// The `account_non_quota_route_fence` row of one credential's model and
+    /// wall kind, with its latest report time (the evidence time of its
+    /// origin).
+    pub(crate) fn non_quota_route_fence(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        wall_kind: &str,
+    ) -> Option<(&crate::AccountRouteFence, i64)> {
+        self.rows_of(NON_QUOTA_ROUTE_FENCE_TABLE)
+            .find_map(|(_, held)| match held {
+                Held::Source {
+                    origins,
+                    raw: Raw::NonQuotaRouteFence { row, wall_kind: kind },
+                    ..
+                } if row.provider == provider
+                    && row.credential_id == credential
+                    && row.model == model
+                    && kind == wall_kind =>
+                {
+                    origins.first().map(|origin| (row, origin.evidence_at))
+                }
+                _ => None,
+            })
+    }
+
+    /// One size refusal, from the quota table or the non-quota one.
+    pub(crate) fn size_refusal(
+        &self,
+        quota: bool,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        size_class: i64,
+    ) -> Option<&crate::AccountSizeRefusal> {
+        let table = if quota { SIZE_TABLE } else { NON_QUOTA_SIZE_TABLE };
+        self.raws(table).find_map(|(_, raw)| match raw {
+            Raw::Size(row)
+                if row.provider == provider
+                    && row.credential_id == credential
+                    && row.model == model
+                    && i64::from(row.size_class) == size_class =>
+            {
+                Some(row)
+            }
+            _ => None,
+        })
+    }
+
+    /// The origin of `kind` and key that its source row selects, before the
+    /// view's cross-row predicates: a route origin hidden by its provider's
+    /// row is still returned. `None` when the row is gone or no longer
+    /// selects that origin (for a wall, when its deadlines are all NULL).
+    pub(crate) fn source_origin(&self, kind: &str, origin_key: &str) -> Option<&ViewOrigin> {
+        self.sources()
+            .flat_map(|(_, _, origins, _, _)| origins)
+            .find(|origin| origin.kind == kind && origin.origin_key == origin_key)
+    }
+
+    /// The route rows a success on provider evidence observed at
+    /// `evidence_at` recovers with it: rows of that provider stamped by the
+    /// same evidence (the same error, observed at that time, before
+    /// `admitted_at`, with deadlines no later than the provider row's) that
+    /// still hold a cooldown or quota deadline. Each comes with its route
+    /// origin's evidence and the two wall fields a keyed update names.
+    pub(crate) fn routes_stamped_by_provider(
+        &self,
+        provider: &str,
+        evidence_at: i64,
+        admitted_at: i64,
+    ) -> Vec<(String, String, Value, Value)> {
+        use std::cmp::Ordering::{Equal, Less};
+        let Some(covering) = self.sources().find_map(|(_, _, _, link, _)| match link {
+            Link::Provider { key, wall, .. } if key == provider => Some(wall),
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        self.sources()
+            .filter_map(|(_, _, origins, link, _)| match link {
+                Link::Route {
+                    key,
+                    provider: owner,
+                    wall,
+                    ..
+                } if owner == provider
+                    && covering.same_error(wall)
+                    && sql_cmp(&wall.observed, &Value::Integer(evidence_at)) == Some(Equal)
+                    && sql_cmp(&wall.observed, &Value::Integer(admitted_at)) == Some(Less)
+                    && matches!(sql_cmp(&wall.cooldown, &covering.cooldown), Some(Less | Equal))
+                    && matches!(sql_cmp(&wall.quota, &covering.quota), Some(Less | Equal)) =>
+                {
+                    origins.iter().find(|origin| origin.kind == "route").map(|origin| {
+                        (
+                            key.clone(),
+                            origin.evidence.clone(),
+                            wall.last_error.clone(),
+                            wall.observed.clone(),
+                        )
+                    })
+                }
+                _ => None,
+            })
+            .collect()
     }
 }
 

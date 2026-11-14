@@ -12,12 +12,14 @@
 //! - "route-state snapshot": the clocks `route.select`'s route-state
 //!   snapshot overlays.
 //!
-//! Reads inside the writer are listed, not forbidden: the store's own heal,
-//! sync and report statements still read the block tables there. The claim
-//! and probe decisions (claims, decision-probe binding, report matching,
-//! authorization transfer and the anonymous-credential check) decide on the
-//! command's working state, so their SQL must not run on the writer either.
-//! The state's own load and read-backs are counted apart.
+//! Reads inside the writer are listed, not forbidden: the store's own sync
+//! and report statements still read the block tables there. The claim and
+//! probe decisions (claims, decision-probe binding, report matching,
+//! authorization transfer and the anonymous-credential check) and the
+//! healers (success healing, failed and neutral probe outcomes, credential
+//! classification) decide on the command's working state, so their SQL must
+//! not run on the writer either. The state's own load and read-backs are
+//! counted apart.
 
 use std::collections::BTreeSet;
 
@@ -85,14 +87,22 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
         .account_read(|tx| tx.probe_authorization_owners())
         .unwrap();
     record("probe_authorization_owners");
+    store
+        .account_read(|tx| tx.report_credential_refusals())
+        .unwrap();
+    record("report_credential_refusals");
+    store
+        .account_read(|tx| tx.report_route_fences(0))
+        .unwrap();
+    record("report_route_fences");
     seen
 }
 
-/// The statements each claim and probe decision ran on the writer when it
-/// decided on SQL. Each runs once through a test seam, whose transaction has
-/// no account state, on a fresh store holding one due provider wall. The
-/// clock synchronization's own statements are left out: it still reads SQL
-/// before every decision.
+/// The statements each claim, probe and healing decision ran on the writer
+/// when it decided on SQL. Each runs once through a test seam, whose
+/// transaction has no account state, on a fresh store holding one due
+/// provider wall. The clock synchronization's own statements are left out:
+/// it still reads SQL before every decision.
 fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
     let harness = harness_with_routed_accounts(Some(&["apikey"]));
     let store = harness.store();
@@ -113,7 +123,13 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
     store
         .account_transaction(|tx| tx.sync_fence_rechecks())
         .unwrap();
-    let sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
+    let mut sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
+    // The effective-recheck read is left out too: pool acquisition, which
+    // the pool group owns, still runs it on the writer.
+    store
+        .account_transaction(|tx| tx.fence_rechecks())
+        .unwrap();
+    sync.extend(trace.take().writer);
     let origins = store.fence_rechecks().unwrap();
     assert_eq!(origins.len(), 1, "{origins:?}");
     trace.take();
@@ -143,6 +159,62 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
         .account_transaction(|tx| tx.transfer_probe_authorization("first", "second"))
         .unwrap();
     record("authorization transfer");
+    // The healers, each on a probe it holds: a failed probe (inconclusive,
+    // so its clock is due again at once), a neutral release, then a
+    // success, on SQL as before.
+    store
+        .account_transaction(|tx| tx.fail_authorized_probe("second", now, true))
+        .unwrap();
+    record("heal: failed probe");
+    let regrant = |owner: &'static str| {
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| tx.grant_fence_rechecks(&origins, now, Some(owner)))
+            .unwrap());
+        trace.take();
+    };
+    regrant("third");
+    store
+        .account_transaction(|tx| {
+            tx.release_inconclusive_probe("third", "oracle-provider", "model", now)
+        })
+        .unwrap();
+    record("heal: inconclusive release");
+    store
+        .account_transaction(|tx| {
+            tx.classify_credential_quota("oracle-provider", "c", true)
+        })
+        .unwrap();
+    record("heal: credential classification");
+    // A success on SQL heals the provider wall the serving login's origins
+    // include; a newer wall then gives the authorized success a block.
+    store
+        .account_transaction(|tx| {
+            tx.heal_serving_fences("oracle-provider", "a", "c", "model", None, now, now + 1)
+        })
+        .unwrap();
+    record("heal: serving fences");
+    striatum_core::RouteStateStore::record_provider_cooldown(
+        store.as_ref(),
+        "oracle-provider",
+        "oracle-provider/model",
+        "oracle-provider/model",
+        &striatum_core::route_state_store::RouteStateUpdate {
+            observed_at_ms: Some(now - 3_600_000),
+            cooldown_until: Some((now + 3_600_000) as f64),
+            last_error: Some("provider capacity".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    trace.take();
+    regrant("fourth");
+    store
+        .account_transaction(|tx| {
+            tx.heal_authorized_probe("fourth", "oracle-provider", "model", now + 1)
+        })
+        .unwrap();
+    record("heal: authorized probe");
     seen
 }
 
@@ -219,7 +291,7 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             .collect();
         assert!(
             decided_on_sql.is_empty(),
-            "{op} decided a claim or probe on SQL: {decided_on_sql:#?}"
+            "{op} decided a claim, probe or heal on SQL: {decided_on_sql:#?}"
         );
         writer_reads.push((op.to_owned(), seen.writer, seen.exempt, seen.maintenance));
     };
@@ -265,6 +337,17 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     let plain_admission = ok(&runner, "route.account_for", json!({"provider":BORROWED,"model":"model-a","decision_id":plain["decision_id"],"conversation_key":"block-plain","admission_id":"block-plain"})).await;
     check("account_for plain");
     let plain_key = plain_admission["account"]["credential_id"].clone();
+    // A credential refusal reported for a second plain decision: the report
+    // reconciles quota holds inside its command.
+    let refused = ok(
+        &owner,
+        "route.select",
+        json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+    )
+    .await;
+    check("select a plain route to refuse");
+    ok(&owner, "route.report", json!({"decision_id":refused["decision_id"],"outcome":"refused","credential_id":plain_key,"runner_code":"billing_exhausted"})).await;
+    check("report credential refusal");
     ok(&runner, "route.account_observe", json!({"event_id":"block-ineligible","kind":"scoped_not_found","admission_id":"block-plain","credential_id":plain_key,"view_digest":"key-pool-listing"})).await;
     check("observe scoped not-found");
     ok(&runner, "route.account_observe", json!({"event_id":"block-credit","kind":"account_limit_exhausted","admission_id":"block-plain","limit_window":"credit"})).await;
@@ -346,5 +429,7 @@ fn oracle_reads_text(
     let _ = store.account_read(|tx| tx.admission_exclusions("p", "a"));
     let _ = store.account_read(|tx| tx.exclusion_count("p", "c"));
     let _ = store.account_read(|tx| tx.probe_authorization_owners());
+    let _ = store.account_read(|tx| tx.report_credential_refusals());
+    let _ = store.account_read(|tx| tx.report_route_fences(0));
     trace.take().reader.into_iter().collect()
 }

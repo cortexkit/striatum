@@ -169,15 +169,17 @@ pub(super) fn report_at(
             usage.as_ref(),
             move |tx| {
                 if reconcile {
-                    // This report hook receives no working state, so the
-                    // command reads SQL here.
+                    // The writer gives the report's transaction its working
+                    // state, so these reads and the reconcile's decisions
+                    // answer from it, with the report's own writes laid over.
+                    let command = crate::account_state::AccountCommand::new(tx, None);
                     crate::account_selection::refresh_credential_quota_holds_in(
-                        &crate::account_state::AccountCommand::new(tx, None),
+                        &command,
                         &account_ids,
                         &quota,
                         &config,
-                        tx.report_credential_refusals()?,
-                        &tx.report_route_fences(now as i64)?,
+                        command.report_credential_refusals()?,
+                        &command.report_route_fences(now as i64)?,
                         now as i64,
                     )?;
                 }

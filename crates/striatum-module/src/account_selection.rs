@@ -4005,7 +4005,7 @@ fn reconcile_credential_quota_holds(
             for block in tx.active_pool_fences(&refusal.provider_id)? {
                 if block.evidence.fence_id.starts_with(&prefix) {
                     *changed = true;
-                    if write { writer(tx)?.clear_fence(&block.evidence.fence_id, now, "entitlement_not_quota")?; }
+                    if write { writer(tx)?.clear_held_fence(&block.evidence, now, "entitlement_not_quota")?; }
                 }
             }
             kept.push(refusal);

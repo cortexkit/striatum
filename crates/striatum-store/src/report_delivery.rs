@@ -242,14 +242,24 @@ impl AccountTx<'_> {
             if origin.kind == "account" {
                 let key: Vec<serde_json::Value> =
                     serde_json::from_str(&origin.origin_key).map_err(err)?;
-                let pool: Option<String> = self
-                    .conn
-                    .query_row(
-                        "SELECT pool_key_json FROM account_fence WHERE fence_id=?1",
-                        [key[0].as_str()],
-                        |row| row.get(0),
-                    )
-                    .map_err(err)?;
+                let pool: Option<String> = match self.working_blocks()? {
+                    // Only active fences are held; one already cleared has
+                    // nothing left to heal.
+                    Some(blocks) => {
+                        match key[0].as_str().and_then(|id| blocks.account_fence(id)) {
+                            Some((_, pool, _)) => pool.map(str::to_owned),
+                            None => continue,
+                        }
+                    }
+                    None => self
+                        .conn
+                        .query_row(
+                            "SELECT pool_key_json FROM account_fence WHERE fence_id=?1",
+                            [key[0].as_str()],
+                            |row| row.get(0),
+                        )
+                        .map_err(err)?,
+                };
                 if let Some(pool) = pool {
                     let pool = serde_json::from_str(&pool).map_err(err)?;
                     if !scope.is_some_and(|scope| scope.used(&pool, &admission.model)) {
@@ -352,14 +362,17 @@ impl AccountTx<'_> {
                 [decision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).map_err(err)?;
             if self.probe_report_matches(decision, effects.reported_credential.as_deref(), false)? {
-                let authorized: bool = self
-                    .conn
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
-                        [decision],
-                        |row| row.get(0),
-                    )
-                    .map_err(err)?;
+                let authorized: bool = match self.working_blocks()? {
+                    Some(blocks) => !blocks.authorizations_of(decision).is_empty(),
+                    None => self
+                        .conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
+                            [decision],
+                            |row| row.get(0),
+                        )
+                        .map_err(err)?,
+                };
                 self.heal_report_probe(
                     decision,
                     None,
@@ -490,6 +503,20 @@ impl AccountTx<'_> {
         credential: &str,
     ) -> RouteStateResult<()> {
         self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2",params![provider,credential]).map(|_|()).map_err(err)
+    }
+
+    /// Delete a credential refusal that a decision read as `fence`: keyed and
+    /// naming every column, so it fails with [`crate::block_state::diverged`]
+    /// if SQL holds another refusal for the credential.
+    pub fn clear_held_entitlement_fence(
+        &self,
+        fence: &striatum_core::route_state_store::CredentialEntitlementFence,
+    ) -> RouteStateResult<()> {
+        let changed = self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2
+            AND code=?3 AND listing_fingerprint IS ?4 AND observed_at_ms=?5",
+            params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms]).map_err(err)?;
+        crate::block_state::expect_changes(changed, 1,
+            format_args!("clear of credential refusal {} {}", fence.provider_id, fence.credential_id)).map_err(err)
     }
 
     pub fn report_credential_refusals(
