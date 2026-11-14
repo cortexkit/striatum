@@ -81,6 +81,26 @@ Routing decision: the durable selected route, request, candidate explanations, p
 - Seat routing: an exact provider/model pin has precedence and fails if unavailable or below the 0.90 floor; otherwise ordered model, provider, and family recommendations are considered with known-family diversity. (`crates/striatum-core/src/seat_routing.rs:222-327`, `crates/striatum-core/src/seat_routing.rs:329-435`)
 
 ## State
+- Consumer scheduling classes are `interactive`, `blocking`, `worker` and
+  `background`. Routing advertises `consumer_priority` and reads declarations'
+  `priority` independently of demand defaults. The nearest declared value on
+  the dotted consumer chain applies within one owner; unknown, undeclared and
+  multiply-owned names default to `worker`. A transitional name outside its
+  module's namespace may still declare priority without losing demand defaults
+  or ownership. The global settings key `consumer_priorities` is a map such as
+  `{"prefrontal-core":"worker","prefrontal-core.head":"interactive"}`.
+  Settings beat every declaration, including a child's explicit class. Whole
+  dotted segments match, with the longest matching override winning. The same
+  resolver serves selection and account admission; legacy selection resolves
+  its `targetAgent` as the consumer name. Classes do not change allocation or
+  stored replies while enforcement is off. In particular, an interactive
+  consumer never turns an unscoped account call into a head call.
+- `routing select call` emits one informational JSON line per `select` call,
+  including refused calls, with `surface` (`route.select` for legacy or
+  `routing/v1`), `consumer` (legacy `targetAgent`, null if absent), `class` and
+  `head_request`. A class of `interactive` marks a head request even with free
+  routes; membership in `head_agents` alone does not. Internal retries emit no
+  extra per-call lines. This event observes classification, not enforcement.
 - Account admission shadow events are informational JSON lines, emitted even
   while concurrency enforcement is off. `routing account call` has fixed members
   `surface` (`route.account_for` for legacy or `routing/v1`), `principal` (the
@@ -94,7 +114,8 @@ Routing decision: the durable selected route, request, candidate explanations, p
   never the runner module or the decision's selected harness. Harness does not
   affect admission identity, allocation or cap counts.
 - `routing account concurrency would refuse` has fixed members `surface`,
-  `consumer` (the runner module if no decision is bound), `model`, and `accounts`
+  `consumer` (the runner module if no decision is bound), `class` (the bound
+  decision consumer's class, or `worker` without a bound decision), `model`, and `accounts`
   (an array of `{account_id, count, cap}`; null cap means uncapped). It reports
   the count test only, without changing any pick, refusal or stored reply:
   at least one account is eligible under the ordinary allocator, but none the

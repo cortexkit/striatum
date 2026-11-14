@@ -1783,10 +1783,9 @@ const NOT_APPLICABLE: &[&str] = &[
     "unrequested_harness_uses_declaration",
 ];
 
-// The concurrency campaign owns consumer_priority and the concurrency_full
-// refusal reason: scheduling priority and account concurrency limits are not
-// implemented here. The conformance kit's run_suite has no priority check yet;
-// concurrency_full is a refusal reason, not a capability. Keep both unserved.
+// Consumer priority is read for classification, but concurrency refusals are
+// not served until account concurrency enforcement is implemented.
+// concurrency_full is a refusal reason, not a capability.
 // Media selection stays isolated until the kit accepts valid floating-point
 // unit rates and the caller-local cost policy is approved for production.
 const PENDING_READERS: &[(&str, &[&str])] = &[
@@ -1813,7 +1812,6 @@ const PENDING_READERS: &[(&str, &[&str])] = &[
             "select_media_report_admission",
         ],
     ),
-    ("consumer_priority", &[]),
 ];
 const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
 
