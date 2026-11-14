@@ -2938,7 +2938,9 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
         let mut now = NOW;
         for index in 0..100 {
             let operation = step(&rig, &mut rng, now);
-            let at = crate::now_ms();
+            // At, an hour after or two hours after the generated evidence:
+            // late enough that expired origins are archived.
+            let at = now + [0, 3_600_000, 7_200_000][rng.below(3) as usize];
             let (sql, memory, origins) = rig
                 .store
                 .account_command(AccountCommandKind::Maintenance, move |tx| {
