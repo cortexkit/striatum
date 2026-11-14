@@ -52,7 +52,7 @@ pub(crate) fn execute<T: Send + 'static>(
     kind: AccountCommandKind,
     mut command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
-    if !store.is_account_evaluation_projection() {
+    if !store.is_private_account_copy() {
         crate::account_state::initialize(store)?;
     }
     #[cfg(test)]
@@ -63,7 +63,7 @@ pub(crate) fn execute<T: Send + 'static>(
         let _inputs = inputs.clone().install();
         command(&mut AccountCommand::new(tx, state))
     };
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         store.account_command(kind, move |tx| command(tx, None))
     } else {
         store.enqueue_account_state_command(kind, command)?.wait()
@@ -334,4 +334,30 @@ pub(crate) fn prune_retired_fence_origins(
     limit: usize,
 ) -> RouteStateResult<usize> {
     store.prune_retired_fence_origins(before, limit)
+}
+
+/// Apply the shared repair decision on the live writer transaction.
+pub(crate) fn apply_block_repair(
+    tx: &AccountTx<'_>,
+    repair: DryRunRepair,
+    now: i64,
+) -> RouteStateResult<bool> {
+    match repair {
+        DryRunRepair::ClearFence(id, reason) => {
+            tx.clear_fence(&id, now, &reason)?;
+        }
+        DryRunRepair::ClearHeld(row, reason) => {
+            tx.clear_held_fence(&row, now, &reason)?;
+        }
+        DryRunRepair::ClearCredential(provider, credential) => {
+            tx.clear_credential_entitlement_fence(&provider, &credential)?;
+        }
+        DryRunRepair::Classify(provider, credential, quota) => {
+            return tx.classify_credential_quota(&provider, &credential, quota)
+        }
+        DryRunRepair::InsertFence(fence) => {
+            tx.insert_pool_fence(&fence)?;
+        }
+    }
+    Ok(false)
 }

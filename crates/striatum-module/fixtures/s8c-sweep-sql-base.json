@@ -1,0 +1,1492 @@
+{
+  "anchor_version": 5,
+  "concurrency": {
+    "accounts": [
+      {
+        "account_id": "catalog-account-example-provider-apikey",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-provider"
+      },
+      {
+        "account_id": "account-1",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-subscription"
+      },
+      {
+        "account_id": "account-2",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-subscription"
+      }
+    ],
+    "enforcement_enabled": false
+  },
+  "consumer": "example_summary",
+  "head_choices": {
+    "catalog_version": "41",
+    "models": [
+      {
+        "billing": "per_token",
+        "model": "model-a",
+        "pin_only": false,
+        "provider": "example-provider",
+        "service_tiers": [
+          "standard"
+        ],
+        "variants": []
+      },
+      {
+        "billing": "per_token",
+        "model": "model-b",
+        "pin_only": false,
+        "provider": "example-provider",
+        "service_tiers": [
+          "standard"
+        ],
+        "variants": []
+      },
+      {
+        "billing": "subscription",
+        "model": "model-c",
+        "pin_only": false,
+        "provider": "example-subscription",
+        "service_tiers": [
+          "standard"
+        ],
+        "variants": []
+      },
+      {
+        "billing": "subscription",
+        "model": "model-d",
+        "pin_only": false,
+        "provider": "example-subscription",
+        "service_tiers": [
+          "standard"
+        ],
+        "variants": []
+      }
+    ],
+    "runner_module": "broca"
+  },
+  "panels": [
+    {
+      "class": "audit",
+      "funnel": {
+        "adequacyEligible": 4,
+        "callerAdmitted": 4,
+        "capabilityEligible": 4,
+        "catalog": 4,
+        "distinctFamilies": 4,
+        "gateOrder": [
+          "deprecated_upstream",
+          "unscored_awaiting_placement",
+          "excluded_by_operator",
+          "excluded",
+          "unavailable",
+          "capability",
+          "quota_or_backoff",
+          "package_fit",
+          "sibling_collapse",
+          "family_labeled",
+          "phase_adequacy",
+          "distinct_families",
+          "initially_admitted"
+        ],
+        "initiallyAdmitted": 2,
+        "operatorAdmitted": 4,
+        "packageFit": 4,
+        "quotaEligible": 4,
+        "reachable": 4,
+        "scored": 4
+      },
+      "policy": {
+        "by": "iq",
+        "extra": 0,
+        "extra_by": "random",
+        "floor": 0,
+        "source": "settings",
+        "top_k": 2,
+        "width": 2
+      },
+      "seats": [
+        {
+          "chosen_by": "top-2 seat ranked 1 by iq; clears class floor 0",
+          "cost_usd": null,
+          "family": "model-b",
+          "phase": "top",
+          "rank": 1,
+          "route": "example-provider/model-b",
+          "slot": 0,
+          "variant": null
+        },
+        {
+          "chosen_by": "top-2 seat ranked 2 by iq; clears class floor 0",
+          "cost_usd": null,
+          "family": "model-d",
+          "phase": "top",
+          "rank": 2,
+          "route": "example-subscription/model-d",
+          "slot": 1,
+          "variant": null
+        }
+      ],
+      "seed": "sweep",
+      "seed_source": "request",
+      "shortfall": null
+    }
+  ],
+  "results": [
+    {
+      "adequate": [
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {},
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {},
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "example-provider/model-b",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {},
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-subscription/model-c",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {},
+          "normalized_cost": 0.13333333333333333,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 4.0,
+            "reasoning": 4.0
+          },
+          "route": "example-subscription/model-d",
+          "task_pricing": {
+            "finalCostUsd": 4.0,
+            "listCostUsd": 4.0,
+            "normalizedCost": 0.13333333333333333,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "unmeasured"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 0.0,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        }
+      ],
+      "iq": 0.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "example-provider/model-b",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 1800.0,
+        "eq": 1800.0
+      }
+    },
+    {
+      "adequate": [
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 5.0,
+              "target": 630.8295177474783
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 5.0,
+              "target": 630.8295177474783
+            }
+          },
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "example-provider/model-b",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 5.0,
+              "target": 630.8295177474783
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-subscription/model-c",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 5.0,
+              "target": 630.8295177474783
+            }
+          },
+          "normalized_cost": 0.13333333333333333,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 4.0,
+            "reasoning": 4.0
+          },
+          "route": "example-subscription/model-d",
+          "task_pricing": {
+            "finalCostUsd": 4.0,
+            "listCostUsd": 4.0,
+            "normalizedCost": 0.13333333333333333,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "unmeasured"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 630.8295177474783,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        }
+      ],
+      "iq": 5.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "example-provider/model-b",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 1800.0,
+        "eq": 1800.0
+      }
+    },
+    {
+      "adequate": [
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 50.0,
+              "target": 1412.2513762141514
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 50.0,
+              "target": 1412.2513762141514
+            }
+          },
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "example-provider/model-b",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 50.0,
+              "target": 1412.2513762141514
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-subscription/model-c",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 50.0,
+              "target": 1412.2513762141514
+            }
+          },
+          "normalized_cost": 0.13333333333333333,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 4.0,
+            "reasoning": 4.0
+          },
+          "route": "example-subscription/model-d",
+          "task_pricing": {
+            "finalCostUsd": 4.0,
+            "listCostUsd": 4.0,
+            "normalizedCost": 0.13333333333333333,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "unmeasured"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 1412.2513762141514,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        }
+      ],
+      "iq": 50.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "example-provider/model-b",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 1800.0,
+        "eq": 1800.0
+      }
+    },
+    {
+      "adequate": [
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 100.0,
+              "target": 1800.0
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 100.0,
+              "target": 1800.0
+            }
+          },
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "example-provider/model-b",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 100.0,
+              "target": 1800.0
+            }
+          },
+          "normalized_cost": 1.0,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": null,
+            "reasoning": null
+          },
+          "route": "example-subscription/model-c",
+          "task_pricing": {
+            "finalCostUsd": null,
+            "listCostUsd": null,
+            "normalizedCost": 1.0,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        },
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1800.0,
+              "fit": 1.0,
+              "requirement": 100.0,
+              "target": 1800.0
+            }
+          },
+          "normalized_cost": 0.13333333333333333,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 4.0,
+            "reasoning": 4.0
+          },
+          "route": "example-subscription/model-d",
+          "task_pricing": {
+            "finalCostUsd": 4.0,
+            "listCostUsd": 4.0,
+            "normalizedCost": 0.13333333333333333,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "unmeasured"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 1800.0,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        }
+      ],
+      "iq": 100.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "example-provider/model-b",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 1800.0,
+        "eq": 1800.0
+      }
+    }
+  ]
+}

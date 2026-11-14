@@ -12,6 +12,9 @@ use super::dispatch_tests::configured;
 #[path = "what_if_concurrency_tests.rs"]
 mod concurrency;
 
+#[path = "what_if_sweep_tests.rs"]
+mod sweep;
+
 async fn operator(harness: &std::sync::Arc<Harness>) -> Route {
     harness.bind(json!({"kind": "direct"}), None).await
 }

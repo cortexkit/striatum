@@ -65,7 +65,8 @@ mod fence_rechecks;
 mod block_state;
 mod route_snapshot;
 pub use block_state::{
-    block_read_backs, block_reconcile_reloads, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
+    block_read_backs, block_reconcile_reloads, BlockRows, BlockState, DryRunRepair,
+    ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub mod group_reads;
@@ -1187,7 +1188,7 @@ pub fn dev_descriptor(module_id: &str, sqlite_path: impl Into<String>) -> Storag
 /// and applies the `route_state` migration set (run-once, including the seed).
 pub struct SqliteRouteStateStore {
     catalog_cache_identity: AtomicU64,
-    store: std::sync::Arc<evaluation_snapshot::ConnectionStore>,
+    store: std::sync::Arc<connection_store::ConnectionStore>,
     account_writer: std::sync::OnceLock<account_writer::AccountWriter>,
     account_state: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,
     /// Single-flight retries of a failed account state load: held while one
@@ -1226,14 +1227,15 @@ pub struct SqliteRouteStateStore {
     account_write_transactions: std::sync::Arc<AtomicU64>,
 }
 
-mod evaluation_snapshot;
+mod account_writer;
+mod connection_store;
 mod account_writer;
 pub use account_writer::{AccountCommandKind, AccountReply, STATE_DIVERGED};
 mod account_state;
 pub use account_state::{AccountStateBridge, AccountWorkingState, ACCOUNT_STATE_LOAD_PENDING};
 #[cfg(any(test, feature = "test-support"))]
-pub use evaluation_snapshot::record_stage_timing_for_test;
-pub use evaluation_snapshot::{scope_stage_timing, StoreStageTiming};
+pub use connection_store::record_stage_timing_for_test;
+pub use connection_store::{scope_stage_timing, StoreStageTiming};
 
 /// What a cached catalog fingerprint is valid for: this connection's count of
 /// `model_facts` writes (bumped by the temporary triggers that
@@ -1742,7 +1744,7 @@ impl SqliteRouteStateStore {
             },
         )
         .map_err(err)?;
-        let mut result = Self::from_inner(evaluation_snapshot::ConnectionStore::live(store));
+        let mut result = Self::from_inner(connection_store::ConnectionStore::live(store));
         if !memory {
             let StorageBackend::Sqlite { path } = &descriptor.backend else {
                 unreachable!()
@@ -1763,7 +1765,7 @@ impl SqliteRouteStateStore {
         Ok(result)
     }
 
-    fn from_inner(store: evaluation_snapshot::ConnectionStore) -> Self {
+    fn from_inner(store: connection_store::ConnectionStore) -> Self {
         Self {
             maintenance: None,
             store: std::sync::Arc::new(store),
@@ -2056,7 +2058,7 @@ impl SqliteRouteStateStore {
         self.share_canonical_scores(&mut facts, &canonical_ids);
         operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
         let facts: Vec<_> = facts.into_iter().zip(present).collect();
-        if let Some(tx) = tx { crate::evaluation_snapshot::timed_commit(tx)?; }
+        if let Some(tx) = tx { crate::connection_store::timed_commit(tx)?; }
         if cacheable && read_catalog_fingerprint_key(c).ok() != key {
             continue;
         }
@@ -3646,7 +3648,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     )
                     .optional()?;
                 let Some(sources) = sources else {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    crate::connection_store::timed_commit(tx)?;
                     return Ok(Vec::new());
                 };
                 let candidates = [
@@ -3696,7 +3698,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                         should_clear(CatalogFactField::SupportsToolUse),
                     ],
                 )?;
-                crate::evaluation_snapshot::timed_commit(tx)?;
+                crate::connection_store::timed_commit(tx)?;
                 Ok(cleared)
             })
             .map_err(err)
@@ -3791,7 +3793,7 @@ impl RouteStateStore for SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let tx = write_transaction(c)?;
                 tx.execute("DELETE FROM model_facts WHERE route_key = ?1", [route_key])?;
-                crate::evaluation_snapshot::timed_commit(tx)
+                crate::connection_store::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -3807,7 +3809,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                     "UPDATE model_facts SET source = 'seed' WHERE route_key = ?1",
                     [route_key],
                 )?;
-                crate::evaluation_snapshot::timed_commit(tx)
+                crate::connection_store::timed_commit(tx)
             })
             .map_err(err)
     }
@@ -3961,7 +3963,7 @@ impl RouteStateStore for SqliteRouteStateStore {
                        WHERE created_at < ?1 ORDER BY created_at LIMIT ?2)",
                     params![created_before_ms, i64::try_from(limit).unwrap_or(i64::MAX)],
                 )?;
-                crate::evaluation_snapshot::timed_commit(tx)?;
+                crate::connection_store::timed_commit(tx)?;
                 Ok(panels + decisions)
             })
             .map_err(err)
@@ -5964,7 +5966,7 @@ mod tests {
                         fail_ledger_row(&tx, &id, recent, Some("refused"))?;
                     }
                 }
-                crate::evaluation_snapshot::timed_commit(tx)
+                crate::connection_store::timed_commit(tx)
             })
             .unwrap();
         let (copy_rows, copy_steps) = vm_steps_during(&store, || {
@@ -6392,7 +6394,7 @@ mod tests {
                         fail_ledger_row(&tx, &id, HEAD_NOW - 60_000, Some("refused"))?;
                     }
                 }
-                crate::evaluation_snapshot::timed_commit(tx)
+                crate::connection_store::timed_commit(tx)
             })
             .unwrap();
 

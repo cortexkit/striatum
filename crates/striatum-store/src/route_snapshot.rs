@@ -47,16 +47,16 @@ pub(crate) use provider_cooldown_columns;
 /// write that changed it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RouteStateRow {
-    route_key: String,
-    capacity_key: String,
+    pub(crate) route_key: String,
+    pub(crate) capacity_key: String,
     cooldown_until: Option<f64>,
     quota_exhausted_until: Option<f64>,
-    quota_pressure: Option<f64>,
-    latency_ema_ms: Option<f64>,
-    success_ema: Option<f64>,
+    pub(crate) quota_pressure: Option<f64>,
+    pub(crate) latency_ema_ms: Option<f64>,
+    pub(crate) success_ema: Option<f64>,
     failure_backoff_until: Option<f64>,
     failure_backoff_reason: Option<String>,
-    last_error: Option<String>,
+    pub(crate) last_error: Option<String>,
     wall_class: Option<String>,
     wall_unscoped: bool,
 }

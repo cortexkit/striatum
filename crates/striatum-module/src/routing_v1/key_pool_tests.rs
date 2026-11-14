@@ -1223,3 +1223,79 @@ fn a_legacy_launch_that_loses_its_route_probe_is_told_when_to_retry() {
         "the winner's one-hour interval is the retry time"
     );
 }
+
+/// A pool wall and an unused live continuation must survive replacing the SQL
+/// copy with the sweep's captured pool clocks and offer ledger.
+#[tokio::test]
+async fn s8c_pool_wall_and_open_offer_match_the_sql_reference() {
+    let now = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(now);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let operator = harness.bind(json!({"kind":"direct"}), None).await;
+    let request = json!({"consumer":"mason","iqs":[0,30,100]});
+    let (ty, plain) = operator.call("route.what_if", &request).await;
+    assert_eq!(ty, FrameType::Response, "{plain}");
+    assert!(
+        plain["result"]["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["pick"]["route"] == format!("{POOL}/{POOL_MODEL_SHORT}")),
+        "{plain}"
+    );
+    let (ty, wall) = operator.call("route.pool_wall", &json!({"provider":POOL,"credentialId":"apikey:pool-vendor:main","kind":"rate_limited","untilMs":now+60_000})).await;
+    assert_eq!(ty, FrameType::Response, "{wall}");
+    harness
+        .store()
+        .account_transaction(|tx| {
+            tx.record_continuation(
+                "pool-test",
+                "open-offer",
+                &striatum_store::V1Recorded {
+                    body_json: "{}".into(),
+                    answer_json: "{}".into(),
+                },
+                "run",
+                "admission",
+                "previous",
+                Some(("decision", "reservation", now as i64 + 60_000)),
+            )
+        })
+        .unwrap();
+    harness.store().reload_account_state_for_test().unwrap();
+    let before = super::what_if_tests::rows(&harness);
+    let trace = harness.store().trace_account_reads_for_test().unwrap();
+    trace.take();
+    let snapshots = crate::account_state::SNAPSHOT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let batches = harness.store().account_writer_batch_sizes_for_test();
+    let (ty, reply) = operator.call("route.what_if", &request).await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    let mut answer = reply["result"].clone();
+    answer.as_object_mut().unwrap().remove("snapshot_ms");
+    answer.as_object_mut().unwrap().remove("elapsed_ms");
+    let reads = trace.take();
+    if std::env::var_os("STRIATUM_SWEEP_SQL_ORACLE").is_none() {
+        assert_eq!(
+            crate::account_state::SNAPSHOT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+                - snapshots,
+            1
+        );
+        assert!(reads.reader.is_empty(), "{:?}", reads.reader);
+        assert!(reads.writer.is_empty(), "{:?}", reads.writer);
+    }
+    assert_ne!(answer["results"], plain["result"]["results"]);
+    assert_eq!(before, super::what_if_tests::rows(&harness));
+    assert_eq!(
+        batches,
+        harness.store().account_writer_batch_sizes_for_test()
+    );
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/s8c-pool-wall-open-offer-sql-base.json");
+    if std::env::var_os("STRIATUM_RECORD_SWEEP").is_some() {
+        std::fs::write(path, serde_json::to_string_pretty(&answer).unwrap() + "\n").unwrap();
+    } else {
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(answer, recorded);
+    }
+}

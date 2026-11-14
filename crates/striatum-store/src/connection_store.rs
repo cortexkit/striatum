@@ -1,5 +1,5 @@
-//! Private account evidence for an operator evaluation. Never copies routing's
-//! decision/usage history and never opens a writer on the source database.
+//! Connection ownership, capture hooks and cumulative writer timing.
+//! Test-only SQL copies remain an independent reference for checking repairs.
 
 use super::*;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use std::sync::Arc;
 // A projection needs neither a lease file nor a migration/seed pass.
 enum Backend {
     Live(SqliteStore),
+    #[cfg(any(test, feature = "test-support"))]
     Projection(Mutex<Connection>),
 }
 
@@ -25,7 +26,7 @@ struct WriterMetrics {
     /// it before its next batch.
     block_reload: Arc<std::sync::atomic::AtomicBool>,
     block_writes_outside: AtomicU64,
-    /// Block-table rows written by test seeding seams, which bypass the
+    /// Block-table rows written by test seeding code, which bypass the
     /// account writer on purpose. They reload the state but are not counted
     /// as violations.
     block_seed_writes: AtomicU64,
@@ -200,7 +201,12 @@ pub(super) struct ConnectionStore {
 
 impl ConnectionStore {
     pub(crate) fn is_projection(&self) -> bool {
-        matches!(self.backend, Backend::Projection(_))
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            return matches!(self.backend, Backend::Projection(_));
+        }
+        #[cfg(not(any(test, feature = "test-support")))]
+        false
     }
 
     pub(crate) fn block_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
@@ -293,6 +299,7 @@ impl ConnectionStore {
         };
         match &backend {
             Backend::Live(store) => store.with_conn(install).expect("installing writer hooks"),
+            #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(conn) => install(&conn.lock().unwrap()).unwrap(),
         }
         Self { backend, metrics }
@@ -301,6 +308,7 @@ impl ConnectionStore {
     pub fn live(store: SqliteStore) -> Self {
         Self::new(Backend::Live(store))
     }
+    #[cfg(any(test, feature = "test-support"))]
     pub fn projection(conn: Mutex<Connection>) -> Self {
         Self::new(Backend::Projection(conn))
     }
@@ -335,6 +343,7 @@ impl ConnectionStore {
         };
         match &self.backend {
             Backend::Live(store) => store.with_conn(measured),
+            #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(connection) => {
                 measured(&connection.lock().unwrap_or_else(|error| error.into_inner()))
                     .map_err(|error| cortexkit_store::StoreError::Backend(error.to_string()))
@@ -358,6 +367,7 @@ impl ConnectionStore {
                 });
                 result
             }),
+            #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(_) => self.with_conn(f),
         }
     }
@@ -365,12 +375,14 @@ impl ConnectionStore {
     pub fn epoch(&self) -> u64 {
         match &self.backend {
             Backend::Live(store) => store.epoch(),
+            #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(_) => 0,
         }
     }
 }
 
 impl SqliteRouteStateStore {
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn projection_command<T>(
         &self,
         command: impl FnOnce(&crate::AccountTx<'_>) -> RouteStateResult<T>,
@@ -409,7 +421,7 @@ impl SqliteRouteStateStore {
             .cloned()
             .collect()
     }
-    /// Block-table rows written by test seeding seams.
+    /// Block-table rows written by test seeding code.
     #[cfg(any(test, feature = "test-support"))]
     pub fn block_seed_writes_for_test(&self) -> u64 {
         self.store.metrics.block_seed_writes.load(Ordering::Relaxed)
@@ -449,7 +461,8 @@ impl SqliteRouteStateStore {
     /// Copy only the evidence account preparation reads. Reconciliation may
     /// mutate this disposable in-memory store, but cannot reach the source.
     /// The pooled, read-only transaction ends before constructing the copy.
-    pub fn account_evaluation_snapshot(&self, now_ms: i64) -> RouteStateResult<Self> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn private_account_copy_for_test(&self, now_ms: i64) -> RouteStateResult<Self> {
         let tables = [
             ("model_facts", "1".to_string()),
             ("routing_operator_decommissioned", "1".to_string()),
@@ -604,7 +617,7 @@ mod tests {
             })
             .unwrap();
 
-        let snapshot = store.account_evaluation_snapshot(now).unwrap();
+        let snapshot = store.private_account_copy_for_test(now).unwrap();
         assert_eq!(
             count(&snapshot, "SELECT COUNT(*) FROM fence_probe_authorization"),
             1

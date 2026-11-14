@@ -5741,10 +5741,9 @@ async fn s4b_what_if_fresh_headroom_repairs_only_its_snapshot() {
         "fresh headroom must actually recover the preview's account: {}",
         answer.1
     );
-    // These two acquisitions are catalogue-change key reads on the writer
-    // connection, not read-first repair acquisitions; the route-state
-    // snapshot is built from the account state and takes none. Moving facts
-    // reads off the writer should bring the acquisition count to zero.
+    // One checkout reads catalogue facts/generation; the other reads observed
+    // speed aggregates. The warm class-vector cache and account snapshot take
+    // no writer checkout, and the dry run sends no repair command.
     assert_eq!(
         harness.store().writer_acquisition_count_for_test() - acquisitions,
         2
@@ -5786,7 +5785,7 @@ fn s4b_patched_headroom_snapshot_and_writable_control_repair_independently() {
     harness.edit_config(|config| config["accounts"]["soft_quota_remaining_percent"] = json!(95.0));
     let rows = s4b_repair_rows(&harness);
     let acquisitions = harness.store().writer_acquisition_count_for_test();
-    let snapshot = harness.store().account_evaluation_snapshot(now).unwrap();
+    let snapshot = harness.store().private_account_copy_for_test(now).unwrap();
     let snapshot_commits = snapshot.writer_commit_count_for_test();
     let projected = crate::account_selection::ClassContext::load(
         &snapshot,

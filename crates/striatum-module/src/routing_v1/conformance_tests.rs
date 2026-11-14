@@ -162,6 +162,10 @@ impl Harness {
         self.dir.join("store.db")
     }
 
+    pub(super) fn config_path_for_test(&self) -> PathBuf {
+        self.config_path.lock().unwrap().clone()
+    }
+
     pub(super) fn operator_config(&self) -> Arc<crate::config_overrides::LiveConfig> {
         crate::config_overrides::live_config(&self.config_path.lock().unwrap())
     }

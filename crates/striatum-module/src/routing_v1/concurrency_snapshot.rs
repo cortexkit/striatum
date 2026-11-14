@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::{json, Value};
-use striatum_core::RouteStateStore;
 
 use crate::account_state::{AccountState, InflightScope};
 use crate::concurrency_caps::{CapScope, ResolvedCaps};
@@ -22,13 +21,13 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn capture(
+    pub(super) fn from_snapshot(
         deps: &Deps<'_>,
         config: &crate::config_overrides::LiveConfig,
-        catalog_store: &striatum_store::SqliteRouteStateStore,
+        state: Arc<AccountState>,
+        facts: &[striatum_core::ModelFact],
         now: i64,
     ) -> Result<Self, Refusal> {
-        let state = crate::account_state::snapshot(deps.store).map_err(store_refusal)?;
         let mut credentials = deps
             .broca_credentials
             .lock()
@@ -46,7 +45,6 @@ impl Snapshot {
                 .entry((provider.to_owned(), account.to_owned()))
                 .or_default();
         }
-        let facts = catalog_store.get_facts().map_err(store_refusal)?;
         let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let quota = crate::ACCOUNT_QUOTA
             .get()

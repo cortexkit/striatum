@@ -235,7 +235,8 @@ pub(super) type ProfileLookup =
 pub(super) struct Evaluation<'a> {
     pub live_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub operator_config: std::sync::Arc<config_overrides::LiveConfig>,
-    pub account_store: &'a crate::SharedStore,
+    pub accounts: &'a crate::account_selection::Sweep,
+    pub inputs: &'a RequestInputs,
     pub iq: f64,
     pub eq: Option<f64>,
     pub evidence: std::sync::Mutex<striatum_core::model_router::RouteEvaluation>,
@@ -632,10 +633,11 @@ fn record_pinned_refusal(
 /// Catalog/configuration data shared by a tier fallback or all seats of a panel.
 /// Account evidence and route state are deliberately not retained here: an
 /// earlier seat can consume a probe or add an in-flight request.
+#[derive(Clone)]
 pub(super) struct RequestInputs {
     pub(super) live_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
-    catalog_snapshot: striatum_store::CatalogFactsSnapshot,
+    pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
 }
@@ -645,6 +647,9 @@ impl RequestInputs {
         deps: &Deps<'_>,
         evaluation: Option<&Evaluation<'_>>,
     ) -> Result<Self, Refusal> {
+        if let Some(view) = evaluation {
+            return Ok(view.inputs.clone());
+        }
         let live_config = evaluation.map_or_else(
             || config_overrides::live_config(deps.routing_config_path),
             |view| view.live_config.clone(),
@@ -681,16 +686,20 @@ impl RequestInputs {
         })
     }
 
-    pub(super) fn prepare(
+    pub(super) fn prepare_for_sweep(
         &self,
         deps: &Deps<'_>,
+        sweep: Option<&crate::account_selection::Sweep>,
     ) -> Result<crate::PreparedSelectionInputs, Refusal> {
         let now = now_ms() as f64;
         // Read after the previous seat's admission, before this seat reserves
         // its own probes. Only the immutable catalog is shared between seats.
-        let mut snapshot = crate::account_state::published(deps.store)
-            .and_then(|blocks| blocks.route_state_snapshot(now))
-            .map_err(store_refusal)?;
+        let mut snapshot = match sweep {
+            Some(sweep) => sweep.route_snapshot(deps.store, now),
+            None => crate::account_state::published(deps.store)
+                .and_then(|blocks| blocks.route_state_snapshot(now)),
+        }
+        .map_err(store_refusal)?;
         let (
             windows,
             available,
@@ -906,7 +915,7 @@ async fn prepare_selection(
         snapshot,
         quota_signal_json,
         quota_note: _,
-    } = shared.prepare(deps)?;
+    } = shared.prepare_for_sweep(deps, evaluation.map(|view| view.accounts))?;
     let catalog_targets = &shared.catalog_targets;
     let sources = SelectionPolicySources {
         live_config: &live_config,
@@ -914,16 +923,17 @@ async fn prepare_selection(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &catalog_targets,
     };
-    let priced = crate::select::price_selection_inputs_with_catalog(
+    let priced = crate::select::price_selection_inputs_for_sweep(
         &mut facts,
         quota_signal_json,
         &sources,
         Some(&catalog_snapshot),
-        evaluation.map_or(deps.store, |view| view.account_store),
+        deps.store,
         deps.broca_credentials,
         true,
         priced_per_token,
         evaluation.is_none(),
+        evaluation.map(|view| view.accounts),
     )
     .map_err(|error| store_refusal(error.to_string()))?;
 
