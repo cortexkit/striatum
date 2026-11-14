@@ -1023,13 +1023,18 @@ impl AccountTx<'_> {
     /// Read-only previews synthesize clocks, so materialize them before setting
     /// their due time; otherwise a quota origin may have no durable clock yet.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn arm_observe_retest_for_test(&self, provider: &str) -> RouteStateResult<()> {
+    pub fn arm_observe_retest_for_test(
+        &self,
+        provider: &str,
+        account: &str,
+        credential: &str,
+    ) -> RouteStateResult<()> {
         sync(self.conn).map_err(err)?;
         self.conn
             .execute(
                 "UPDATE fence_recheck SET next_recheck_at=0,reset_check_at=NULL,claim_owner=NULL
-            WHERE provider=?1",
-                [provider],
+            WHERE provider=?1 AND (account_id=?2 OR credential_id=?3)",
+                params![provider, account, credential],
             )
             .map(|_| ())
             .map_err(err)

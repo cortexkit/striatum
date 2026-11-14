@@ -1794,11 +1794,7 @@ impl ClassContext {
             .credential_id
             .as_deref()
             .filter(|id| {
-                (origin.quota
-                    || matches!(
-                        origin.kind.as_str(),
-                        "account_route" | "non_quota_route" | "transient_route"
-                    ))
+                origin.quota
                     && crate::credential_fences::credential_account_id(&self.account_ids, id)
                         .as_deref()
                         == Some(account)
@@ -2090,18 +2086,24 @@ impl ClassContext {
     }
 
     /// A new conversation has no cache to preserve. Prefer an open account,
-    /// but keep the roster intact when retrying a transient is the only option.
+    /// but a blocked credential must not hide an unblocked sibling credential.
     fn avoid_transient_accounts(&self, roster: &mut RosterBuild, provider: &str, model: &str) {
-        let fenced = self.accounts_fenced_by(&self.transient_route_fences, provider, model);
+        let accounts = self.accounts_fenced_by(&self.transient_route_fences, provider, model);
+        let fenced = |account: &AccountView| {
+            accounts.contains_key(&account.account_id)
+                && account.credentials.iter().all(|credential| {
+                    self.rechecks.iter().any(|origin| {
+                        origin.kind == "transient_route"
+                            && origin.applies(
+                                provider, &account.account_id, &credential.credential_id, model,
+                            )
+                            && !self.origin_due(origin, &account.account_id, model)
+                    })
+                })
+        };
         if let Some(roster) = &mut roster.roster {
-            if roster
-                .accounts
-                .iter()
-                .any(|account| !fenced.contains_key(&account.account_id))
-            {
-                roster
-                    .accounts
-                    .retain(|account| !fenced.contains_key(&account.account_id));
+            if roster.accounts.iter().any(|account| !fenced(account)) {
+                roster.accounts.retain(|account| !fenced(account));
             }
         }
     }
@@ -2150,9 +2152,9 @@ impl ClassContext {
         )
     }
 
-    /// Accounts closed by a report for this route or by an account-wide
-    /// backoff observation, each with its deadline. Report fences name the
-    /// credential that served; observations already name the whole account.
+    /// Accounts closed by a shared quota route fence or an account-wide backoff
+    /// observation, each with its deadline. Credential-scoped route backoffs
+    /// reach admission so its atomic probe check can judge the exact credential.
     fn route_fenced_accounts(&self, provider: &str, model: &str) -> BTreeMap<String, i64> {
         // A refusal probe must reach admission to claim its single-request
         // reservation. A quota route fence must not hide that same probe;
@@ -2161,7 +2163,7 @@ impl ClassContext {
         for origin in self.rechecks.iter().filter(|origin| {
             matches!(
                 origin.kind.as_str(),
-                "account_route" | "non_quota_route" | "observation"
+                "account_route" | "observation"
             )
         }) {
             let account = origin.account_id.clone().or_else(|| {
@@ -5634,7 +5636,16 @@ fn route_fence_refusal(
         .roster
         .iter()
         .flat_map(|roster| &roster.accounts)
-        .any(|view| wanted(&view.account_id))
+        .any(|view| {
+            params.candidates.as_ref().is_none_or(|candidates| {
+                candidates.accounts.iter().any(|candidate| {
+                    candidate.account_id == view.account_id
+                        && view.credentials.iter().any(|credential| {
+                            credential.credential_id == candidate.credential_id
+                        })
+                })
+            })
+        })
     {
         return None;
     }
@@ -6373,7 +6384,9 @@ fn serve(
         None => false,
     };
     let mut roster = roster.clone();
-    if !established {
+    // Explicit candidates already bound the choice. Keep their blocked
+    // credentials until the atomic probe check can preserve the refusal cause.
+    if !established && params.candidates.is_none() {
         if let Some(classes) = &ctx.classes {
             classes.avoid_transient_accounts(&mut roster, provider, &params.model);
         }

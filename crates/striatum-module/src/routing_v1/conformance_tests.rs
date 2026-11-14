@@ -1000,7 +1000,7 @@ impl KitSubject {
 }
 
 #[tokio::test]
-async fn observe_success_fixture_arms_real_quota_retest() {
+async fn observe_success_fixture_arms_one_shared_quota_slot() {
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("observe-fixture")),
         observe_blocks: Mutex::new(false),
@@ -1022,28 +1022,37 @@ async fn observe_success_fixture_arms_real_quota_retest() {
     let h = subject.harness();
     let route = h.bind(reserved(fixture::RUNNER_ONE), None).await;
     for (index, account) in [account, sibling].iter().enumerate() {
-        subject
-            .configure_observe_retest_block(
-                &account.account_id,
-                &account.credential_id,
-                "quota",
-                crate::now_ms() - if index == 0 { 1000 } else { 0 },
-            )
-            .await
-            .unwrap();
+        if index == 0 {
+            subject
+                .configure_observe_retest_block(
+                    &account.account_id,
+                    &account.credential_id,
+                    "quota",
+                    crate::now_ms() - 1000,
+                )
+                .await
+                .unwrap();
+        }
         let before = h.store().fence_rechecks().unwrap();
         let reply = route
-        .call(
-            "route.account_for",
-            &json!({
+            .call(
+                "route.account_for",
+                &json!({
                 "provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
                 "conversation_key":format!("retest-{index}"),"admission_id":format!("retest-{index}"),
                 "candidates":{"view_digest":"fixture","accounts":[{
                     "account_id":account.account_id,"credential_id":account.credential_id}]}
-            }),
-        )
-        .await;
+                }),
+            )
+            .await;
         let after = h.store().fence_rechecks().unwrap();
+        if index == 1 {
+            assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+            assert_eq!(reply.1["code"], "account_pool_exhausted");
+            assert_eq!(after[0].last_claimed_at, before[0].last_claimed_at);
+            assert_eq!(after[0].next_recheck_at, before[0].next_recheck_at);
+            continue;
+        }
         assert_eq!(
             reply.0,
             FrameType::Response,
@@ -1664,7 +1673,7 @@ impl RoutingSubject for KitSubject {
         *self.observe_blocks.lock().unwrap() = true;
         tokio::task::spawn_blocking(move || {
             h.store().account_transaction(|tx| {
-                if kind == "quota" {
+                if matches!(kind.as_str(), "quota" | "transient_backoff") {
                     let fence = striatum_store::AccountRouteFence {
                         provider: provider.clone(),
                         credential_id: credential.clone(),
@@ -1673,7 +1682,11 @@ impl RoutingSubject for KitSubject {
                         decision_id: "kit-success".into(),
                         recorded_at: at,
                     };
-                    tx.record_account_route_fence(&fence)?;
+                    if kind == "quota" {
+                        tx.record_account_route_fence(&fence)?;
+                    } else {
+                        tx.record_transient_account_route_fence(&fence)?;
+                    }
                 } else {
                     tx.record_credential_refusal(
                         &striatum_core::route_state_store::CredentialRefusal {
@@ -1681,7 +1694,6 @@ impl RoutingSubject for KitSubject {
                             credential_id: credential.clone(),
                             code: match kind.as_str() {
                                 "credential_refused" => "credential_refused",
-                                "transient_backoff" => "credential_refused",
                                 "credit" => "billing_exhausted",
                                 _ => {
                                     return Err(
@@ -1697,7 +1709,7 @@ impl RoutingSubject for KitSubject {
                         at,
                     )?;
                 }
-                tx.arm_observe_retest_for_test(&provider)
+                tx.arm_observe_retest_for_test(&provider, &account, &credential)
             })
         })
         .await

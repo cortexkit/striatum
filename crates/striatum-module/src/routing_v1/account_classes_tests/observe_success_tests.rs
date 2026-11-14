@@ -122,8 +122,11 @@ async fn observe_success_duplicate_applies_once_even_after_reblock() {
         assert_eq!(replay["duplicate"], true);
         assert_eq!(replay["effects"], json!([]));
         let mut other_shape = params.clone();
-        if legacy { other_shape.as_object_mut().unwrap().remove("caller"); }
-        else { other_shape["caller"] = json!({"runner":"broca"}); }
+        if legacy {
+            other_shape.as_object_mut().unwrap().remove("caller");
+        } else {
+            other_shape["caller"] = json!({"runner":"broca"});
+        }
         let replay = observed(&route, &other_shape).await;
         assert_eq!(replay["id"], first["id"]);
         assert_eq!(replay["duplicate"], true);
@@ -369,4 +372,201 @@ async fn observe_success_backoff_probe_heals_exact_credential() {
     let origins = h.store().fence_rechecks().unwrap();
     assert_eq!(origins.len(), 1);
     assert_eq!(origins[0].credential_id.as_deref(), Some(KEYS[1]));
+}
+
+async fn assert_sole_offered_block_is_timed(kind: &str) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let h = paid_anthropic_harness();
+    let route = h.bind(reserved("broca"), None).await;
+    let until = if matches!(kind, "credit" | "credential_refused") {
+        NOW + 3_600_000 - 1
+    } else {
+        NOW + 5000
+    };
+    match kind {
+        "quota" => {
+            let scope = FenceScope::General(GeneralWindow::FiveHour);
+            let fence = Fence {
+                account_id: KEYS[0].into(),
+                pool: Some(scope.into()),
+                recovery_set: Vec::new(),
+                observed_at_ms: NOW as i64 - 1,
+                reset: ResetTime::At(until as i64),
+                retry_hint_ms: None,
+                source: ConfirmationSource::BrocaAccountLimit,
+            };
+            h.store()
+                .account_transaction(|tx| {
+                    tx.insert_fence(&AccountFenceRow {
+                        fence_id: "sole-offered-quota".into(),
+                        provider: POOL.into(),
+                        account_id: KEYS[0].into(),
+                        scope_json: serde_json::to_string(&scope).unwrap(),
+                        fence_json: serde_json::to_string(&fence).unwrap(),
+                        source: "broca_limit_exhausted".into(),
+                        observed_at: NOW as i64 - 1,
+                        principal: "reserved:broca".into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: NOW as i64 - 1,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    })
+                })
+                .unwrap();
+        }
+        "credit" | "credential_refused" => {
+            h.store()
+                .record_credential_entitlement_fence(
+                    &CredentialRefusal {
+                        provider_id: POOL.into(),
+                        credential_id: KEYS[0].into(),
+                        code: if kind == "credit" {
+                            "billing_exhausted"
+                        } else {
+                            kind
+                        }
+                        .into(),
+                    },
+                    None,
+                    NOW as i64 - 1,
+                )
+                .unwrap();
+        }
+        "transient_route" => {
+            h.store()
+                .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+                    provider: POOL.into(),
+                    credential_id: KEYS[0].into(),
+                    model: MODEL.into(),
+                    until_ms: until as i64,
+                    recorded_at: NOW as i64 - 1,
+                    decision_id: "real-transient-refusal".into(),
+                })
+                .unwrap();
+        }
+        "transient_account" => {
+            result(
+                route
+                    .call("route.account_for", &single_key_request("block-source"))
+                    .await,
+            );
+            observe_ok(
+                &route,
+                &json!({"event_id":"account-backoff","kind":"transient_backoff",
+                "admission_id":"block-source","served_account_id":KEYS[0],"credential_id":KEYS[0],
+                "retry_at_ms":until}),
+            )
+            .await;
+        }
+        _ => panic!("unknown block kind {kind}"),
+    }
+    let mut request = single_key_request("blocked-listed-key");
+    request["hold_wait_max_s"] = json!(0);
+    let (frame, body) = route.call("route.account_for", &request).await;
+    assert_eq!(frame, FrameType::Error, "{kind}: {body}");
+    assert_eq!(body["code"], "account_pool_exhausted", "{kind}: {body}");
+    assert_eq!(body["detail"]["reset_at_ms"], until, "{kind}: {body}");
+}
+
+#[tokio::test]
+async fn sole_offered_quota_block_returns_timed_pool_exhaustion() {
+    assert_sole_offered_block_is_timed("quota").await;
+}
+
+#[tokio::test]
+async fn sole_offered_credit_block_returns_timed_pool_exhaustion() {
+    assert_sole_offered_block_is_timed("credit").await;
+}
+
+#[tokio::test]
+async fn sole_offered_credential_refused_block_returns_timed_pool_exhaustion() {
+    assert_sole_offered_block_is_timed("credential_refused").await;
+}
+
+#[tokio::test]
+async fn sole_offered_transient_route_block_returns_timed_pool_exhaustion() {
+    assert_sole_offered_block_is_timed("transient_route").await;
+}
+
+#[tokio::test]
+async fn sole_offered_transient_account_block_returns_timed_pool_exhaustion() {
+    assert_sole_offered_block_is_timed("transient_account").await;
+}
+
+async fn assert_sibling_block_scope(kind: &str) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let h = paid_anthropic_harness();
+    let credentials = h.credentials();
+    let mut listing = credentials.lock().unwrap();
+    let mut rows = listing.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|r| r.id == KEYS[1])
+        .unwrap()
+        .account_id = Some(KEYS[0].into());
+    let mut other = rows.iter().find(|r| r.id == KEYS[0]).unwrap().clone();
+    other.id = "apikey:anthropic:other".into();
+    rows.push(other);
+    listing.apply_listing(
+        &ScopedCredentialListing {
+            view: "sibling-block-scope".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    drop(listing);
+    let until = NOW + 5000;
+    let fence = striatum_store::AccountRouteFence {
+        provider: POOL.into(),
+        credential_id: KEYS[0].into(),
+        model: MODEL.into(),
+        until_ms: until as i64,
+        recorded_at: NOW as i64 - 1,
+        decision_id: "credential-scoped-refusal".into(),
+    };
+    match kind {
+        "quota" => h.store().record_account_route_fence(&fence),
+        "credit" => h.store().record_billing_account_route_fence(&fence),
+        "transient_route" => h.store().record_transient_account_route_fence(&fence),
+        _ => unreachable!(),
+    }
+    .unwrap();
+    let route = h.bind(reserved("broca"), None).await;
+    let mut sibling = single_key_request("sibling-unblocked");
+    sibling["hold_wait_max_s"] = json!(0);
+    sibling["candidates"]["accounts"][0]["credential_id"] = json!(KEYS[1]);
+    let reply = route.call("route.account_for", &sibling).await;
+    if kind == "quota" {
+        assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
+        assert_eq!(reply.1["code"], "account_pool_exhausted", "{}", reply.1);
+        assert_eq!(reply.1["detail"]["reset_at_ms"], until, "{}", reply.1);
+        return;
+    }
+    let admitted = result(reply);
+    assert_eq!(admitted["account"]["credential_id"], KEYS[1]);
+    let mut success = success_observation("sibling-unblocked", true);
+    success["credential_id"] = json!(KEYS[1]);
+    assert_eq!(observed(&route, &success).await["effects"], json!([]));
+    let mut blocked = single_key_request("original-still-blocked");
+    blocked["hold_wait_max_s"] = json!(0);
+    let (frame, body) = route.call("route.account_for", &blocked).await;
+    assert_eq!(frame, FrameType::Error, "{body}");
+    assert_eq!(body["code"], "account_pool_exhausted", "{body}");
+    assert_eq!(body["detail"]["reset_at_ms"], until, "{body}");
+}
+
+#[tokio::test]
+async fn same_account_sibling_is_admitted_under_transient_backoff() {
+    assert_sibling_block_scope("transient_route").await;
+}
+
+#[tokio::test]
+async fn same_account_sibling_is_admitted_under_credit_route_block() {
+    assert_sibling_block_scope("credit").await;
+}
+
+#[tokio::test]
+async fn same_account_sibling_remains_blocked_under_shared_quota() {
+    assert_sibling_block_scope("quota").await;
 }
