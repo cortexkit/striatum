@@ -13,6 +13,9 @@ mod retention;
 #[path = "cap_tests.rs"]
 mod caps;
 
+#[path = "reset_tests.rs"]
+mod reset;
+
 const T: i64 = 1_790_683_200_000;
 const MINUTE: i64 = 60_000;
 

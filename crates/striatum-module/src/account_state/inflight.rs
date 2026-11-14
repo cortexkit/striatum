@@ -313,6 +313,40 @@ impl InflightLedger {
         })
     }
 
+    /// The earliest instant after `now` at which this model's cap count is
+    /// below `cap` with no further command, or `None` when no entry in it closes
+    /// soon enough to free a slot. Counts are evaluated at each entry deadline
+    /// rather than subtracting one per closing row: a renewal beside its
+    /// conversation's run, or a second row of one run, closes without
+    /// removing a hold, and an over-cap count must fall more than once.
+    pub(crate) fn next_free_at(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        cap: u64,
+        now: i64,
+    ) -> Option<i64> {
+        let model = crate::account_selection::normalize(model);
+        let scope = caps.cap_count(provider, account, &model);
+        let entries = self
+            .accounts
+            .get(&(provider.to_owned(), account.to_owned()))?;
+        let mut deadlines: Vec<i64> = entries
+            .values()
+            .filter(|entry| {
+                now < entry.until_ms && caps.cap_count(provider, account, &entry.model) == scope
+            })
+            .map(|entry| entry.until_ms)
+            .collect();
+        deadlines.sort_unstable();
+        deadlines.dedup();
+        deadlines
+            .into_iter()
+            .find(|at| (self.count_for_scope(caps, provider, account, scope, *at) as u64) < cap)
+    }
+
     /// Include live models absent from today's catalog, so a catalog withdrawal
     /// cannot hide a run that still consumes capacity.
     pub(crate) fn active_models(&self, now: i64) -> BTreeMap<AccountKey, BTreeSet<String>> {
