@@ -175,12 +175,14 @@ Continue mode answers which other account can take the paused run, so the same-a
 
 ## Account concurrency cap settings
 
-The root `concurrency` object contains four optional maps. Keys match the
-provider and model stored on an admission, not a catalog alias or a runner:
+The root `concurrency` object contains the `enforcement_enabled` switch and
+four optional maps. Map keys match the provider and model stored on an
+admission, not a catalog alias or a runner:
 
 ```json
 {
   "concurrency": {
+    "enforcement_enabled": false,
     "providers": {"google": {"limit": 6, "scope": "account"}},
     "plans": {"google/ultra_5x": {"limit": 4}},
     "models": {"anthropic-platform/claude-opus-5": {"limit": 2}},
@@ -218,7 +220,11 @@ remain usable without a catalog cap. The reader currently ignores
 model unless a setting wins. Cap policy is rebuilt when plan prices, the roster
 or settings are updated, and requests look it up from an immutable snapshot;
 429 responses never teach it a limit.
-These settings define cap policy only; admission enforcement is separate.
+`concurrency.enforcement_enabled` defaults to `false`. The switch is reserved
+for admission enforcement; currently neither value changes picks, refusals or
+stored replies, and neither records waiters. Operators can inspect the ledger's
+cap counts with [`route.what_if`](../route-what-if.md) before enforcement is
+connected. Cap policy and reporting are active with either switch value.
 
 ## Open items
 - The historical fixed free-bucket and missing window-slack findings are addressed for live quota-priced subscriptions by the economics above. Legacy pure-core snapshots without account economics retain their old free-bucket behavior. (`crates/striatum-core/src/model_router.rs`, `route_order_keys`)
