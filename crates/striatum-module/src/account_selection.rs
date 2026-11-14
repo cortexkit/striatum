@@ -6996,7 +6996,9 @@ fn serve(
         }
     };
     if gate.refused() {
-        return gate.refuse(tx, ctx, params, principal, provider, &decision, roster);
+        return gate.refuse(
+            tx, ctx, params, principal, &hash, provider, &decision, roster,
+        );
     }
     // An account the class context left out because another selection holds
     // its probe reserved is a lost race as well.
@@ -7102,20 +7104,39 @@ fn serve(
         )?;
     }
     match &decision.outcome {
-        Outcome::Admit(admission) => commit_admission(
-            tx,
-            ctx,
-            principal,
-            params,
-            provider,
-            &hash,
-            affinity_row.as_ref(),
-            &decision_id,
-            &decision,
-            admission,
-            request_fingerprint,
-            roster,
-        ),
+        Outcome::Admit(admission) => {
+            // Read before the insert: afterwards every request of the
+            // conversation would look like a renewal of a holder.
+            let taken = gate.slot_taken(
+                tx,
+                ctx,
+                params,
+                principal,
+                &hash,
+                provider,
+                &admission.account_id,
+            );
+            let reply = commit_admission(
+                tx,
+                ctx,
+                principal,
+                params,
+                provider,
+                &hash,
+                affinity_row.as_ref(),
+                &decision_id,
+                &decision,
+                admission,
+                request_fingerprint,
+                roster,
+            )?;
+            // Taking a slot on a count it waits on ends the conversation's
+            // wait; a slot elsewhere leaves it waiting.
+            if let (Some(count), OpReply::Result(_)) = (&taken, &reply) {
+                tx.took_slot(&(principal.to_owned(), hash.clone()), count);
+            }
+            Ok(reply)
+        }
         Outcome::Hold(hold) => {
             tx.insert_hold(&AccountHoldRow {
                 decision_id: decision_id.clone(),

@@ -10,8 +10,14 @@
 //! refused instead. Only when every account the allocator would admit is full
 //! is the request refused `concurrency_full`; a request no account would admit
 //! with the ledger ignored keeps its existing answer.
+//!
+//! A free slot is not always room. A conversation refused for concurrency
+//! becomes a waiter, and a request may not take a free slot that a waiter
+//! ranked ahead of it needs: such an account counts as full for that request.
 
 use super::*;
+use crate::account_state::{CapCount, InflightLedger, InflightScope, Waiter};
+use cortexkit_role_routing::declarations::ConsumerPriority;
 
 /// Retry time when no count is known to fall sooner. Runs report no expected
 /// length, so a slot can free at any moment through a finish.
@@ -41,6 +47,9 @@ pub(super) struct Gate {
     refused: bool,
     removed: Vec<(String, Vec<CredentialRecord>)>,
     full: Vec<FullAccount>,
+    /// The request's priority class, resolved once and only when a waiter
+    /// makes it matter.
+    class: std::cell::Cell<Option<ConsumerPriority>>,
 }
 
 impl Gate {
@@ -55,6 +64,7 @@ impl Gate {
             refused: false,
             removed: Vec::new(),
             full: Vec::new(),
+            class: std::cell::Cell::new(None),
         }
     }
 
@@ -105,7 +115,13 @@ impl Gate {
             return Check::Room;
         }
         let count = tx.inflight_count_for_model(caps, provider, account, &params.model, ctx.now_ms);
-        if (count as u64) < cap {
+        // No waiter holds a slot against a head call.
+        if (count as u64) < cap
+            && (self.head_call
+                || !self.held_for_waiters(
+                    tx, ctx, params, principal, hash, provider, account, count, cap,
+                ))
+        {
             return Check::Room;
         }
         let kept = matches!(admission.affinity, AffinityOutcome::Retained { .. });
@@ -169,7 +185,9 @@ impl Gate {
 
     /// Answer the refusal. Its only store write is the decision row: no
     /// admission, hold, fence or affinity change, and no probe was claimed for
-    /// a full account because the check runs before the claim.
+    /// a full account because the check runs before the claim. The refused
+    /// conversation becomes a waiter in the working state, which is memory
+    /// only.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn refuse(
         &self,
@@ -177,6 +195,7 @@ impl Gate {
         ctx: &CommandContext,
         params: &AccountForParams,
         principal: &str,
+        hash: &str,
         provider: &str,
         decision: &Decision,
         roster: &RosterBuild,
@@ -184,20 +203,43 @@ impl Gate {
         let now = ctx.now_ms;
         let caps = &ctx.concurrency_caps;
         let ceiling = now.saturating_add(RESET_CEILING_MS);
-        let reset_at_ms = self
+        let reset_at_ms = match self.waiting_ahead(tx, ctx, params, principal, hash) {
+            Some(ahead) if !ahead.is_empty() => {
+                self.free_with_waiters(tx, ctx, params, provider, &ahead, ceiling)
+            }
+            _ => self
+                .full
+                .iter()
+                .filter_map(|full| {
+                    tx.inflight_next_free_at(
+                        caps,
+                        provider,
+                        &full.account_id,
+                        &params.model,
+                        full.cap,
+                        now,
+                    )
+                })
+                .fold(ceiling, i64::min),
+        };
+        // A head call is never refused, so this is never one. The waiter
+        // waits on every count it was refused on: the kept account alone, or
+        // each eligible account of the route.
+        let mut counts: Vec<_> = self
             .full
             .iter()
-            .filter_map(|full| {
-                tx.inflight_next_free_at(
-                    caps,
-                    provider,
-                    &full.account_id,
-                    &params.model,
-                    full.cap,
-                    now,
-                )
-            })
-            .fold(ceiling, i64::min);
+            .map(|full| cap_count(caps, provider, &full.account_id, &params.model))
+            .collect();
+        counts.sort();
+        counts.dedup();
+        let class = self.class(ctx, params);
+        tx.record_waiter(
+            (principal.to_owned(), hash.to_owned()),
+            class,
+            reset_at_ms,
+            counts,
+            now,
+        );
         let mut accounts: Vec<_> = self
             .full
             .iter()
@@ -251,4 +293,240 @@ impl Gate {
             ),
         ))
     }
+
+    /// The request's class: that of the consumer on the decision it is bound
+    /// to, or `worker` when it is bound to none.
+    fn class(&self, ctx: &CommandContext, params: &AccountForParams) -> ConsumerPriority {
+        if let Some(class) = self.class.get() {
+            return class;
+        }
+        let class = params
+            .call
+            .as_ref()
+            .map_or_else(ConsumerPriority::default, |call| call.class(ctx));
+        self.class.set(Some(class));
+        class
+    }
+
+    /// The live waiters ranked ahead of this request, or `None` without
+    /// module state.
+    fn waiting_ahead(
+        &self,
+        tx: &crate::account_state::AccountCommand<'_>,
+        ctx: &CommandContext,
+        params: &AccountForParams,
+        principal: &str,
+        hash: &str,
+    ) -> Option<Vec<Waiter>> {
+        let (_, waiters) = tx.concurrency_view()?;
+        let conversation = (principal.to_owned(), hash.to_owned());
+        // Resolving the class reads the consumer registry: skip it when no
+        // other conversation is waiting.
+        if waiters
+            .live(ctx.now_ms)
+            .all(|(other, _)| *other == conversation)
+        {
+            return Some(Vec::new());
+        }
+        let class = self.class(ctx, params);
+        Some(
+            waiters
+                .ahead(&conversation, class, ctx.now_ms)
+                .into_iter()
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// Whether the free slot this request would take on `account` is needed
+    /// by the waiters ranked ahead of it.
+    #[allow(clippy::too_many_arguments)]
+    fn held_for_waiters(
+        &self,
+        tx: &crate::account_state::AccountCommand<'_>,
+        ctx: &CommandContext,
+        params: &AccountForParams,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+        account: &str,
+        count: usize,
+        cap: u64,
+    ) -> bool {
+        let Some(ahead) = self.waiting_ahead(tx, ctx, params, principal, hash) else {
+            return false;
+        };
+        if ahead.is_empty() {
+            return false;
+        }
+        let Some((ledger, _)) = tx.concurrency_view() else {
+            return false;
+        };
+        let caps = &ctx.concurrency_caps;
+        let request = cap_count(caps, provider, account, &params.model);
+        let ahead: Vec<_> = ahead.iter().collect();
+        let free = (cap as usize).saturating_sub(count);
+        !takes(ledger, caps, &request, free, &ahead, ctx.now_ms)
+    }
+
+    /// The earliest instant before `ceiling` at which, with no further
+    /// command, this request would find a slot it may take on one of the
+    /// counts it was refused on. Counts fall only when an entry closes and
+    /// waiters only end, so those are the instants to look at, each judged
+    /// with the waiters still live then.
+    fn free_with_waiters(
+        &self,
+        tx: &crate::account_state::AccountCommand<'_>,
+        ctx: &CommandContext,
+        params: &AccountForParams,
+        provider: &str,
+        ahead: &[Waiter],
+        ceiling: i64,
+    ) -> i64 {
+        let Some((ledger, _)) = tx.concurrency_view() else {
+            return ceiling;
+        };
+        let now = ctx.now_ms;
+        let caps = &ctx.concurrency_caps;
+        let requests: Vec<_> = self
+            .full
+            .iter()
+            .map(|full| {
+                (
+                    cap_count(caps, provider, &full.account_id, &params.model),
+                    full.cap,
+                )
+            })
+            .collect();
+        let mut instants: Vec<i64> = requests
+            .iter()
+            .map(|(count, _)| count)
+            .chain(ahead.iter().flat_map(|waiter| &waiter.counts))
+            .flat_map(|count| {
+                ledger.deadlines(caps, &count.provider, &count.account, scope(count), now)
+            })
+            .chain(ahead.iter().map(Waiter::ends_at))
+            .filter(|at| *at > now && *at < ceiling)
+            .collect();
+        instants.sort_unstable();
+        instants.dedup();
+        instants
+            .into_iter()
+            .find(|at| {
+                let live: Vec<_> = ahead.iter().filter(|waiter| waiter.live(*at)).collect();
+                requests.iter().any(|(count, cap)| {
+                    let free = (*cap as usize).saturating_sub(count_at(ledger, caps, count, *at));
+                    takes(ledger, caps, count, free, &live, *at)
+                })
+            })
+            .unwrap_or(ceiling)
+    }
+
+    /// The count an admission of this request on `account` takes a slot on,
+    /// when it adds a hold there. A renewal of a conversation that already
+    /// holds the count adds none, so it ends no wait.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn slot_taken(
+        &self,
+        tx: &crate::account_state::AccountCommand<'_>,
+        ctx: &CommandContext,
+        params: &AccountForParams,
+        principal: &str,
+        hash: &str,
+        provider: &str,
+        account: &str,
+    ) -> Option<CapCount> {
+        let caps = &ctx.concurrency_caps;
+        let renews = params.mode == RequestMode::Renew
+            && tx.inflight_conversation(
+                caps,
+                provider,
+                account,
+                &params.model,
+                principal,
+                hash,
+                ctx.now_ms,
+            );
+        (!renews).then(|| cap_count(caps, provider, account, &params.model))
+    }
+}
+
+/// The cap count a request for `model` adds to on `account`.
+fn cap_count(
+    caps: &crate::concurrency_caps::ResolvedCaps,
+    provider: &str,
+    account: &str,
+    model: &str,
+) -> CapCount {
+    let model = normalize(model);
+    CapCount {
+        provider: provider.to_owned(),
+        account: account.to_owned(),
+        model: match caps.cap_count(provider, account, &model) {
+            InflightScope::Account => None,
+            InflightScope::AccountModel(model) => Some(model.to_owned()),
+        },
+    }
+}
+
+fn scope(count: &CapCount) -> InflightScope<'_> {
+    count
+        .model
+        .as_deref()
+        .map_or(InflightScope::Account, InflightScope::AccountModel)
+}
+
+/// The cap of a count; a shared count is capped by the account's default.
+fn limit(caps: &crate::concurrency_caps::ResolvedCaps, count: &CapCount) -> Option<u64> {
+    match &count.model {
+        Some(model) => caps.cap(&count.provider, &count.account, model).limit,
+        None => {
+            let cap = caps.default_cap(&count.provider, &count.account);
+            (cap.scope == crate::concurrency_caps::CapScope::Account)
+                .then_some(cap.limit)
+                .flatten()
+        }
+    }
+}
+
+fn count_at(
+    ledger: &InflightLedger,
+    caps: &crate::concurrency_caps::ResolvedCaps,
+    count: &CapCount,
+    at: i64,
+) -> usize {
+    ledger.count_for_scope(caps, &count.provider, &count.account, scope(count), at)
+}
+
+/// Whether a request may take one of the `free` slots on `request` at `at`:
+/// there is one, and taking it leaves as many of the waiters `ahead` able to
+/// hold distinct free slots of their own as before.
+fn takes(
+    ledger: &InflightLedger,
+    caps: &crate::concurrency_caps::ResolvedCaps,
+    request: &CapCount,
+    free: usize,
+    ahead: &[&Waiter],
+    at: i64,
+) -> bool {
+    if free == 0 {
+        return false;
+    }
+    if ahead.is_empty() {
+        return true;
+    }
+    let mut slots = BTreeMap::new();
+    slots.insert(request.clone(), free);
+    for count in ahead.iter().flat_map(|waiter| &waiter.counts) {
+        slots
+            .entry(count.clone())
+            .or_insert_with(|| match limit(caps, count) {
+                Some(cap) => (cap as usize).saturating_sub(count_at(ledger, caps, count, at)),
+                // An uncapped count always has a slot for every waiter.
+                None => ahead.len(),
+            });
+    }
+    let before = crate::account_state::matched_waiters(ahead, &slots);
+    *slots.get_mut(request).expect("inserted above") -= 1;
+    crate::account_state::matched_waiters(ahead, &slots) == before
 }

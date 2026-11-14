@@ -204,9 +204,14 @@ impl AccountCall {
         *self.would_refuse.lock().unwrap() = Some(line);
     }
 
-    fn pressure(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) -> Value {
-        let class = self
-            .consumer
+    /// The priority class of the consumer on the decision this call is bound
+    /// to, never of the runner module that makes it; `worker` when the call
+    /// is bound to none.
+    pub(super) fn class(
+        &self,
+        ctx: &CommandContext,
+    ) -> cortexkit_role_routing::declarations::ConsumerPriority {
+        self.consumer
             .as_deref()
             .zip(ctx.classes.as_ref())
             .and_then(|(consumer, classes)| {
@@ -214,7 +219,11 @@ impl AccountCall {
                     .defaults_for(consumer)
                     .priority
             })
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    fn pressure(&self, ctx: &CommandContext, model: &str, accounts: Vec<Value>) -> Value {
+        let class = self.class(ctx);
         json!({
             "surface":self.surface,"consumer":self.consumer.as_ref().or(self.runner_module.as_ref()),
             "class":class,"model":model,"accounts":accounts
