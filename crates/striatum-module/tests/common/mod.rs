@@ -121,12 +121,11 @@ pub async fn wait_for_catalog(stream: &mut TcpStream, module_id: &str, wait: Dur
     }
 }
 
-fn json_route_open(project_root: &Path) -> Value {
+fn json_route_open(_project_root: &Path) -> Value {
     let target = RouteTarget::ManagementSurface {
         module_id: MODULE_ID.to_string(),
     };
     let identity = BindIdentity::new(
-        project_root.to_path_buf(),
         "striatum-e2e".to_string(),
         "session-1".to_string(),
     );
