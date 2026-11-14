@@ -7162,6 +7162,7 @@ fn commit_admission(
         started_late: false,
         released_at: None,
         finished_at: None,
+        last_observed_at: None,
     })?;
     tx.record_admission_probe_scope(
         principal,
@@ -7453,6 +7454,12 @@ fn record_observation(
                         effects.push(json!({"effect":"continuation_used"}));
                     }
                 }
+            }
+            // Attempts after a move name the original admission but are stored
+            // unbound. Refresh its started reservations before the bound-only
+            // effects, including a reservation this observation just started.
+            if parsed.kind == "attempt" {
+                tx.observe_admission(row, now)?;
             }
             let mismatch = parsed
                 .served_account_id
@@ -11013,6 +11020,154 @@ mod tests {
     }
 
     #[test]
+    fn attempts_refresh_only_named_admission_and_its_started_reservations() {
+        let mut fixture = fixture("last-observation");
+        result(fixture.call(
+            &fixture.ctx(true, NOW),
+            ACCOUNT_FOR_OP,
+            BROCA,
+            admit_params("original", "broca:observed-run", "broca"),
+        ));
+        let observe = |kind: &str, event: &str| {
+            json!({
+                "event_id": event, "caller": {"runner": "broca"}, "kind": kind,
+                "admission_id": "original", "run_id": "run", "observed_at_ms": NOW - 999_999
+            })
+        };
+        let row = |fixture: &Fixture, id: &str| {
+            fixture
+                .store()
+                .account_transaction(|tx| tx.admission(BROCA, id))
+                .unwrap()
+                .unwrap()
+        };
+        result(fixture.call(
+            &fixture.ctx(true, NOW - 100),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            observe("attempt", "before-start"),
+        ));
+        assert_eq!(row(&fixture, "original").last_observed_at, Some(NOW - 100));
+        result(fixture.call(
+            &fixture.ctx(true, NOW),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            observe("admission_started", "start"),
+        ));
+        assert_eq!(row(&fixture, "original").last_observed_at, Some(NOW));
+        let original = row(&fixture, "original");
+        let other_account = if original.account_id == ACCOUNT_A {
+            ACCOUNT_B
+        } else {
+            ACCOUNT_A
+        };
+        crate::account_writer::repair(fixture.store(), move |tx| {
+            for id in ["moved", "older-move", "unused", "other-admission"] {
+                let mut reservation = original.clone();
+                reservation.admission_id = id.into();
+                reservation.state = "reserved".into();
+                reservation.run_id = None;
+                reservation.started_at = None;
+                reservation.last_observed_at = None;
+                reservation.account_id = other_account.into();
+                tx.insert_admission(&reservation)?;
+                if id == "other-admission" {
+                    tx.mark_admission_started(BROCA, id, "run", NOW, false)?;
+                } else {
+                    tx.record_continuation(
+                        BROCA,
+                        id,
+                        &striatum_store::V1Recorded {
+                            body_json: "{}".into(),
+                            answer_json: "{}".into(),
+                        },
+                        "run",
+                        "original",
+                        id,
+                        Some((
+                            id,
+                            id,
+                            if id == "unused" {
+                                NOW + 50
+                            } else {
+                                NOW + 60_000
+                            },
+                        )),
+                    )?;
+                    if id == "older-move" {
+                        tx.use_continuation(id, NOW + 10)?;
+                    }
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(row(&fixture, "older-move").last_observed_at, Some(NOW + 10));
+        let mut attempt = observe("attempt", "moved-attempt");
+        attempt["served_account_id"] = json!(other_account);
+        let reply = result(fixture.call(
+            &fixture.ctx(true, NOW + 100),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            attempt.clone(),
+        ));
+        assert_eq!(reply["observation"]["bound"], false);
+        assert!(reply["observation"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|effect| effect["effect"] == "served_account_mismatch"));
+        for id in ["original", "moved", "older-move"] {
+            assert_eq!(row(&fixture, id).last_observed_at, Some(NOW + 100), "{id}");
+        }
+        assert_eq!(row(&fixture, "unused").last_observed_at, None);
+        assert_eq!(row(&fixture, "other-admission").last_observed_at, Some(NOW));
+        // A replay and a caller's own timestamp cannot grant more liveness.
+        let duplicate = result(fixture.call(
+            &fixture.ctx(true, NOW + 500),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            attempt.clone(),
+        ));
+        assert_eq!(duplicate["observation"]["duplicate"], true);
+        assert_eq!(row(&fixture, "moved").last_observed_at, Some(NOW + 100));
+        fixture.reopen();
+        attempt["event_id"] = json!("after-restart");
+        let later = NOW + 2 * 3_600_000;
+        result(fixture.call(
+            &fixture.ctx(true, later),
+            ACCOUNT_OBSERVE_OP,
+            BROCA,
+            attempt,
+        ));
+        for id in ["original", "moved", "older-move"] {
+            assert_eq!(row(&fixture, id).last_observed_at, Some(later), "{id}");
+            let in_memory = crate::account_writer::repair(fixture.store(), move |tx| {
+                Ok(tx.open_admission(BROCA, id)?.unwrap().last_observed_at)
+            })
+            .unwrap();
+            assert_eq!(in_memory, Some(later));
+        }
+        assert_eq!(row(&fixture, "other-admission").last_observed_at, Some(NOW));
+        // The working copy must not publish a time from a failed command.
+        let failed: RouteStateResult<()> =
+            crate::account_writer::repair(fixture.store(), move |tx| {
+                let original = tx.admission(BROCA, "original")?.unwrap();
+                tx.observe_admission(&original, later + 100)?;
+                Err(striatum_core::route_state_store::RouteStateStoreError(
+                    "rollback".into(),
+                ))
+            });
+        assert!(failed.is_err());
+        assert_eq!(row(&fixture, "moved").last_observed_at, Some(later));
+        let in_memory = crate::account_writer::repair(fixture.store(), |tx| {
+            Ok(tx.open_admission(BROCA, "moved")?.unwrap().last_observed_at)
+        })
+        .unwrap();
+        assert_eq!(in_memory, Some(later));
+    }
+
+    #[test]
     fn observations_and_releases_act_only_on_the_principals_own_admission() {
         let fixture = fixture("observe");
         let ctx = fixture.ctx(true, NOW);
@@ -11956,6 +12111,7 @@ mod tests {
                         started_late: false,
                         released_at: None,
                         finished_at: Some(committed_at + 1),
+                        last_observed_at: None,
                     })?;
                 }
                 Ok(())

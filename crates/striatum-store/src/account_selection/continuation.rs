@@ -118,7 +118,7 @@ impl AccountTx<'_> {
     pub fn use_continuation(&self, decision: &str, now: i64) -> RouteStateResult<()> {
         self.release_expired_continuations(now)?;
         self.conn.execute(
-            "UPDATE account_admission SET state='started', started_at=?2, run_id=(SELECT run_id FROM account_continue WHERE decision_id=?1) WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE decision_id=?1 AND used_at_ms IS NULL AND released_at_ms IS NULL)", params![decision,now],
+            "UPDATE account_admission SET state='started', started_at=?2, last_observed_at=MAX(COALESCE(last_observed_at, ?2), ?2), run_id=(SELECT run_id FROM account_continue WHERE decision_id=?1) WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE decision_id=?1 AND used_at_ms IS NULL AND released_at_ms IS NULL)", params![decision,now],
         ).map_err(err)?;
         self.conn.execute(
             "UPDATE account_continue SET used_at_ms=?2 WHERE decision_id=?1 AND used_at_ms IS NULL AND released_at_ms IS NULL", params![decision,now],
