@@ -227,11 +227,15 @@ async fn seat_panel(
     dry: Option<&DryRun<'_>>,
 ) -> Result<(scoring::SelectedPanel, Vec<Seat>, Option<PanelShortfall>), Refusal> {
     let shared = panel_inputs(deps, dry)?;
-    let (panel, _, mut rejected) =
+    let (panel, _, mut rejected, canonical_ids) =
         candidates(request, &[], &[], caller, deps, dry, &shared).await?;
     let mut seats = Vec::new();
     let mut families = HashSet::new();
+    let mut models = HashSet::new();
+    let mut attempted = HashSet::new();
+    let mut vacancies = Vec::new();
     for member in &panel.members {
+        attempted.insert(member.route_key.clone());
         let family = family(member.family.as_deref());
         if families.contains(&family) {
             let mut cause = PanelRejectedCandidate::new(&member.route_key, "family_duplicate");
@@ -261,9 +265,89 @@ async fn seat_panel(
         match admission {
             SeatAdmission::Seated(seat) => {
                 families.insert(family);
+                models.extend(
+                    canonical_ids
+                        .get(&member.route_key)
+                        .filter(|id| !id.trim().is_empty())
+                        .cloned(),
+                );
                 seats.push(seat);
             }
-            SeatAdmission::Rejected(cause) => rejected.push(cause),
+            SeatAdmission::Rejected(cause) => {
+                if concurrency_rejection(&cause) {
+                    vacancies.push(slot);
+                }
+                rejected.push(cause);
+            }
+        }
+    }
+    // Keep successful original seats before filling holes: a spare must not
+    // displace a later seat's family or canonical model. The scorer already
+    // applied the class floor and package fit to these phase-ordered spares.
+    for slot in vacancies {
+        for spare in &panel.runner_up {
+            if spare.phase
+                != if slot < policy.top_k as u64 {
+                    scoring::PanelPhase::TopK
+                } else {
+                    scoring::PanelPhase::Extra
+                }
+                || !attempted.insert(spare.route_key.clone())
+                || families.contains(&family(spare.family.as_deref()))
+                || canonical_ids
+                    .get(&spare.route_key)
+                    .is_some_and(|id| !id.trim().is_empty() && models.contains(id))
+            {
+                continue;
+            }
+            let member = scoring::PanelMember {
+                route_key: spare.route_key.clone(),
+                prompt_params: spare.prompt_params.clone(),
+                family: spare.family.clone(),
+                temperature: None,
+                max_output_tokens: spare.max_output_tokens,
+                context_window: spare.context_window,
+            };
+            let admission = match dry {
+                None => admit_seat(
+                    request,
+                    &member,
+                    slot,
+                    policy.top_k as u64,
+                    caller,
+                    deps,
+                    &shared,
+                )
+                .await?
+                .map(Seat::Live),
+                Some(dry) => evaluate_seat(
+                    request,
+                    &member,
+                    slot,
+                    policy.top_k as u64,
+                    None,
+                    caller,
+                    deps,
+                    dry,
+                    &shared,
+                )
+                .await?
+                .map(Seat::Evaluated),
+            };
+            match admission {
+                SeatAdmission::Seated(seat) => {
+                    families.insert(family(member.family.as_deref()));
+                    models.extend(
+                        canonical_ids
+                            .get(&member.route_key)
+                            .filter(|id| !id.trim().is_empty())
+                            .cloned(),
+                    );
+                    seats.push(seat);
+                    break;
+                }
+                SeatAdmission::Rejected(cause) => rejected.push(cause),
+            }
         }
     }
     seats.sort_by_key(Seat::slot);
@@ -277,6 +361,12 @@ async fn seat_panel(
         )
     });
     Ok((panel, seats, shortfall))
+}
+
+fn concurrency_rejection(cause: &PanelRejectedCandidate) -> bool {
+    cause.detail.as_ref().is_some_and(|detail| {
+        detail["code"] == "no_route" && detail["detail"]["reason"] == "concurrency_full"
+    })
 }
 
 fn panel_shortfall(
@@ -532,7 +622,7 @@ async fn replace(
         .map(|s| family(s.family.as_deref()))
         .collect();
     let shared = panel_inputs(deps, None)?;
-    let (panel, package_blocked, mut rejected) = candidates(
+    let (panel, package_blocked, mut rejected, _) = candidates(
         &state.request,
         &exclude,
         &families,
@@ -612,7 +702,15 @@ async fn candidates(
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
     shared: &super::select::RequestInputs,
-) -> Result<(scoring::SelectedPanel, bool, Vec<PanelRejectedCandidate>), Refusal> {
+) -> Result<
+    (
+        scoring::SelectedPanel,
+        bool,
+        Vec<PanelRejectedCandidate>,
+        HashMap<String, String>,
+    ),
+    Refusal,
+> {
     let config = &shared.operator_config;
     let live = &shared.live_config;
     // Validate the requested project id against the caller's daemon-stamped
@@ -955,7 +1053,7 @@ async fn candidates(
         }
         candidate
     }));
-    Ok((panel, package_blocked, rejected))
+    Ok((panel, package_blocked, rejected, context.canonical_ids))
 }
 
 fn package_fit(tokens: u64, fact: &striatum_core::ModelFact) -> PanelPackageFit {

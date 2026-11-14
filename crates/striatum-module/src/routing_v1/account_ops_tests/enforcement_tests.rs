@@ -12,6 +12,7 @@ use striatum_store::AccountCommandKind;
 use super::*;
 use crate::account_state::InflightScope;
 
+mod fixed_routes_panels_tests;
 mod head_turn_tests;
 mod priority_tests;
 mod select_ledger_tests;

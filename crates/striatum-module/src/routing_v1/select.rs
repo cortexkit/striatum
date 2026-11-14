@@ -1757,12 +1757,10 @@ async fn select_at_tier_attempt(
                 .as_deref()
                 .map(|pin| selection.pin(pin, &available))
             {
-                // A full pin waits for its route rather than authorizing a move.
-                if refusal.detail.get("reason").and_then(Value::as_str) != Some("concurrency_full")
-                {
-                    pin_reason = Some(refused_pin_reason(&refusal));
-                    request_pin = None;
-                }
+                // Explicit fallback authorizes another route, including when
+                // the pin's eligible accounts have no concurrency capacity.
+                pin_reason = Some(refused_pin_reason(&refusal));
+                request_pin = None;
             }
         }
         let mut ladder_variant = None;
