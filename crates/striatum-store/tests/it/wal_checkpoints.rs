@@ -30,6 +30,25 @@ fn all_readers(store: &SqliteRouteStateStore, remaining: usize) {
 }
 
 #[test]
+fn writer_uses_memory_temp_store() {
+    let (_dir, store) = open("writer-temp-store");
+    let (temp_store, tracking): (i64, bool) = store
+        .with_writer_for_test(|conn| {
+            Ok((
+                conn.pragma_query_value(None, "temp_store", |row| row.get(0))?,
+                conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_temp_schema WHERE name='catalog_facts_writes')",
+                    [],
+                    |row| row.get(0),
+                )?,
+            ))
+        })
+        .unwrap();
+    assert_eq!(temp_store, 2, "SQLite MEMORY is 2");
+    assert!(tracking, "configuring temp_store must preserve catalog tracking");
+}
+
+#[test]
 fn open_configures_writer_and_every_reader_including_later_checkouts() {
     let (_dir, store) = open("wal-pragmas");
     store

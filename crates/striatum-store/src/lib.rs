@@ -333,7 +333,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 88] {
+fn route_state_migrations() -> [Migration; 89] {
     [
         Migration {
             version: 1,
@@ -686,6 +686,10 @@ fn route_state_migrations() -> [Migration; 88] {
         Migration {
             version: 89,
             statements: include_str!("../migrations/089_admission_last_observed.sql"),
+        },
+        Migration {
+            version: 90,
+            statements: include_str!("../migrations/090_account_affinity_by_pin.sql"),
         },
     ]
 }
@@ -1650,17 +1654,22 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
+        // Changing temp_store discards existing TEMP objects, so configure it
+        // before installing the catalog write counter and its TEMP triggers.
+        store
+            .with_conn(|conn| {
+                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                // Savepoint statement journals otherwise create and delete a
+                // temp file per account command once they spill out of memory.
+                conn.pragma_update(None, "temp_store", "MEMORY")
+            })
+            .map_err(err)?;
         // A failure here costs only the cache: every fingerprint read finds the
         // tracking missing, computes the value fresh and tries to install it again.
         if let Err(error) = store.with_conn(install_catalog_change_tracking) {
             tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
         }
-        store
-            .with_conn(|conn| {
-                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                conn.pragma_update(None, "synchronous", "NORMAL")
-            })
-            .map_err(err)?;
         // Hold each checkout until the next is configured, filling the lazy pool.
         // Move this to cortexkit-store 0.4's open_sqlite_with_init hook when upgrading,
         // so replacements after failed rollbacks get the larger cache too. A rare

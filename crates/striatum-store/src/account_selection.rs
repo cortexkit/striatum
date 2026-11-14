@@ -25,6 +25,9 @@ use super::{err, SqliteRouteStateStore};
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
 
+const END_LEASE_SQL: &str = "UPDATE account_affinity SET lease_valid_until = ?2 \
+    WHERE pin_id = ?1 AND (lease_valid_until IS NULL OR lease_valid_until > ?2)";
+
 /// Read account-wide observation backoffs with `(now_ms, oldest_receipt_ms)`.
 /// The bound-kind predicates match migration 79's sparse partial index.
 pub const OBSERVATION_BACKOFFS_SQL: &str =
@@ -47,6 +50,37 @@ pub enum CredentialProbeClaim {
 #[cfg(test)]
 mod account_fact_tests {
     use super::*;
+
+    #[test]
+    fn end_lease_query_plan_uses_affinity_pin_index() {
+        let scratch = cortexkit_test_support::ScratchDir::new("end-lease-query-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "end-lease-query-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .with_writer_for_test(|conn| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {END_LEASE_SQL}"))?;
+                let plan = statement
+                    .query_map(params!["pin", 200], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(
+                    plan.iter().any(|line| line.contains(
+                        "SEARCH account_affinity USING INDEX account_affinity_by_pin (pin_id=?)"
+                    )),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("SCAN account_affinity")),
+                    "{plan:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn headroom_clear_preserves_a_newer_refusal_and_other_provider() {
@@ -1734,11 +1768,7 @@ impl AccountTx<'_> {
     /// conversation's current pin. Affinity itself stays.
     pub fn end_lease(&self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
         self.conn
-            .execute(
-                "UPDATE account_affinity SET lease_valid_until = ?2 \
-                 WHERE pin_id = ?1 AND (lease_valid_until IS NULL OR lease_valid_until > ?2)",
-                params![pin_id, at],
-            )
+            .execute(END_LEASE_SQL, params![pin_id, at])
             .map(|changed| changed >= 1)
             .map_err(err)
     }
