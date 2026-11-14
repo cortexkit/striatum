@@ -1,8 +1,6 @@
 # Store entry points that write account-state tables, including trigger effects.
 # Production module callers use account_writer.rs.
 # AccountTx operations are connection scoped, not store entry points.
-# The private what-if SQL projection may execute the same operations directly.
-@projection crates/striatum-store/src/evaluation_snapshot.rs::projection_command
 direct_account_transaction
 account_transaction
 account_repair

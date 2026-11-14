@@ -17,7 +17,7 @@ mod inflight;
 mod waiters;
 
 pub(crate) use admissions::AdmissionState;
-pub(crate) use blocks::{published, writer, BlockReads, Published};
+pub(crate) use blocks::{published, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
 pub(crate) use waiters::{matched as matched_waiters, CapCount, Waiter, Waiters};
 
@@ -105,7 +105,7 @@ pub(crate) fn open_preflight_admission(
     principal: &str,
     admission_id: &str,
 ) -> RouteStateResult<Option<AccountAdmissionRow>> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return store.account_read(|tx| tx.admission(principal, admission_id));
     }
     Ok(snapshot(store)?
@@ -123,7 +123,7 @@ pub(crate) fn closed_admission(
     principal: &str,
     admission_id: &str,
 ) -> RouteStateResult<Option<AccountAdmissionRow>> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return Ok(None);
     }
     keyed_exception();
@@ -135,7 +135,7 @@ pub(crate) fn has_expired_continuations(
     store: &SqliteRouteStateStore,
     now: i64,
 ) -> RouteStateResult<bool> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return store.account_read(|tx| tx.has_expired_continuations(now));
     }
     Ok(snapshot(store)?.admissions.has_expired_offers(now))
@@ -148,7 +148,7 @@ pub(crate) fn has_expired_admission_probes(
     store: &SqliteRouteStateStore,
     now: i64,
 ) -> RouteStateResult<bool> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return store.account_read(|tx| tx.has_expired_admission_probes(now));
     }
     let state = snapshot(store)?;
@@ -310,7 +310,13 @@ impl StateOwner {
     }
 }
 
+#[cfg(test)]
+pub(crate) static SNAPSHOT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
+    #[cfg(test)]
+    SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
     initialize(store)?;
     #[cfg(test)]
     {

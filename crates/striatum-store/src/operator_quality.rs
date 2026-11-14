@@ -250,7 +250,7 @@ mod tests {
         assert!(read(&store).decommissioned);
         assert_eq!(read(&store).score_provenance,ScoreProvenance::Override);
         assert_ne!(store.catalog_fingerprint().unwrap(),before);
-        assert!(read(&store.account_evaluation_snapshot(123).unwrap()).decommissioned);
+        assert!(read(&store.private_account_copy_for_test(123).unwrap()).decommissioned);
         assert!(!store.get_fact_by_route_key("vendor/retired").unwrap().unwrap().decommissioned);
         store.store.with_conn(|c|c.execute_batch("CREATE TEMP TRIGGER reject_withdrawal BEFORE INSERT ON routing_operator_decommissioned BEGIN SELECT RAISE(ABORT, 'rejected'); END;")).unwrap();
         let grades = BTreeMap::from([("vendor/retired".into(),OperatorQuality {model:"vendor/retired".into(),elo:1900.0,eq:1900.0})]);

@@ -1,5 +1,5 @@
 use super::*;
-use crate::evaluation_snapshot::StoreStageTiming;
+use crate::connection_store::StoreStageTiming;
 use crate::{dev_descriptor, RouteStateStore};
 use std::sync::{Arc, Mutex};
 
@@ -44,7 +44,7 @@ fn old_prune_after_begin(
     for sql in old_delete_statements() {
         tx.execute(&sql, [])?;
     }
-    crate::evaluation_snapshot::timed_commit(tx)?;
+    crate::connection_store::timed_commit(tx)?;
     Ok(unserved)
 }
 

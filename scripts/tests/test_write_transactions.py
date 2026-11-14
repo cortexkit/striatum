@@ -137,18 +137,16 @@ fn handler() { crate::account_writer::repair(store, move |tx| {
                 self.assertEqual(len(errors), 1, errors)
                 self.assertIn("/live.rs:", errors[0])
 
-    def test_projection_allowance_is_one_exact_function(self):
+    def test_projection_allowance_is_rejected(self):
         scratch = ROOT / "target/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as directory:
-            root = Path(directory)
-            projection = root / "crates/striatum-store/src/evaluation_snapshot.rs"
-            projection.parent.mkdir(parents=True)
-            projection.write_text("fn projection_command() { self.direct_account_transaction(command); }")
-            entries = {"direct_account_transaction"}
-            self.assertEqual(GUARD["account_writer_violations"](root, entries), [])
-            projection.write_text("fn ordinary_request() { self.direct_account_transaction(command); }")
-            self.assertEqual(len(GUARD["account_writer_violations"](root, entries)), 1)
+            entries = Path(directory) / "entries.txt"
+            entries.write_text("account_transaction\n")
+            self.assertEqual(GUARD["read_account_entries"](entries), {"account_transaction"})
+            entries.write_text("@projection path::function\naccount_transaction\n")
+            with self.assertRaisesRegex(ValueError, "invalid account writer entry"):
+                GUARD["read_account_entries"](entries)
 
     def test_a_test_filename_does_not_exempt_production_code(self):
         scratch = ROOT / "target/scratch"
