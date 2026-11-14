@@ -4,13 +4,13 @@
 //! readers while real handlers run, and check that none of the request
 //! readers that now answer from the state reads SQL.
 //!
-//! Two reads are declared exceptions (`group_reads::declared_exception`)
-//! and still read SQL, because their callers do not yet take the account
-//! state:
-//! - "pool key states": key-pool lease state joined with the probe clocks,
-//!   which the pool group owns.
-//! - "route-state snapshot": the clocks `route.select`'s route-state
-//!   snapshot overlays.
+//! One read is a declared exception (`group_reads::declared_exception`)
+//! and still reads SQL, because its caller does not yet take the account
+//! state: "pool key states", key-pool lease state joined with the probe
+//! clocks, which the pool group owns. The route-state snapshot that
+//! `route.select` scores against and `route.cooldown_status` answers from,
+//! with the provider cooldown row, is built from the state's route and
+//! provider rows.
 //!
 //! Reads inside the writer are listed, not forbidden: the store's own sync
 //! and report statements still read the block tables there. The claim and
@@ -97,6 +97,46 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
         .unwrap();
     record("report_route_fences");
     seen
+}
+
+/// The statements the route-state snapshot and the provider cooldown lookup
+/// run when they read SQL, on the writer (the connection the store's
+/// `build_snapshot` and `get_provider_cooldown` use): their reads of the
+/// route and provider rows. The snapshot's probe-clock reads, and the
+/// quarantine read, are left out: the clock synchronization and pool
+/// acquisition still run the same statements on the writer.
+fn route_state_oracle() -> BTreeSet<String> {
+    use striatum_core::RouteStateStore;
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let store = harness.store();
+    let trace = store.trace_block_reads_for_test().unwrap();
+    store
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+    let shared: BTreeSet<String> = trace.take().writer.into_iter().collect();
+    store.build_snapshot(1_000.0).unwrap();
+    let snapshot = trace.take();
+    assert!(
+        snapshot.exempt.is_empty(),
+        "the SQL snapshot is no declared exception: {snapshot:#?}"
+    );
+    store.get_provider_cooldown(POOL).unwrap();
+    let provider = trace.take();
+    let rows: BTreeSet<String> = snapshot
+        .writer
+        .into_iter()
+        .chain(provider.writer)
+        .filter(|sql| {
+            reads_tables(sql, &["model_route_state", "provider_cooldown_state"])
+                && !shared.contains(sql)
+        })
+        .collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "the trace sees the SQL snapshot's route rows and the provider lookup: {rows:#?}"
+    );
+    rows
 }
 
 /// The statements each claim, probe and healing decision ran on the writer
@@ -263,6 +303,8 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         .into_iter()
         .flat_map(|(_, statements)| statements)
         .collect();
+    // Negatives for the route-state snapshot: the trace sees its SQL.
+    let route_state_text = route_state_oracle();
     let trace = store.trace_block_reads_for_test().unwrap();
     let switched = switched();
     let mut writer_reads = Vec::new();
@@ -294,6 +336,26 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         assert!(
             decided_on_sql.is_empty(),
             "{op} decided a claim, probe or heal on SQL: {decided_on_sql:#?}"
+        );
+        let route_state_on_sql: Vec<_> = seen
+            .writer
+            .iter()
+            .chain(&seen.reader)
+            .chain(seen.exempt.iter().map(|(_, sql)| sql))
+            .filter(|sql| route_state_text.contains(sql.as_str()))
+            .collect();
+        assert!(
+            route_state_on_sql.is_empty(),
+            "{op} read the route-state snapshot or a provider row from SQL: {route_state_on_sql:#?}"
+        );
+        let snapshot_exceptions: Vec<_> = seen
+            .exempt
+            .iter()
+            .filter(|(reason, _)| *reason != "pool key states")
+            .collect();
+        assert!(
+            snapshot_exceptions.is_empty(),
+            "{op} made a declared exception other than the pool's: {snapshot_exceptions:#?}"
         );
         writer_reads.push((op.to_owned(), seen.writer, seen.exempt, seen.maintenance));
     };
@@ -358,6 +420,13 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     check("observe credential refused");
     ok(&owner, "route.report", json!({"decision_id":plain["decision_id"],"outcome":"refused","credential_id":plain_key,"runner_code":"size_shaped_429","request_input_tokens":169_000,"reset_at_ms":now+60_000})).await;
     check("report size refusal");
+    ok(
+        &owner,
+        "route.cooldown_status",
+        json!({"routeKey":format!("{POOL}/{POOL_MODEL_SHORT}"),"capacityKey":format!("{POOL}/{POOL_MODEL_SHORT}"),"now":now}),
+    )
+    .await;
+    check("cooldown status");
     // Every reader now has rows to return.
     assert!(!store.account_eligibility().unwrap().is_empty());
     assert!(!store.credential_entitlement_fences().unwrap().is_empty());

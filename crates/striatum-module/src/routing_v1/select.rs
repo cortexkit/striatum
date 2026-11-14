@@ -29,7 +29,7 @@ use striatum_core::model_router::{
     SelectedModelRoute,
 };
 use striatum_core::slot_saturation::{ConcurrencySlotState, ConcurrencySlots};
-use striatum_core::{fact_to_route, ModelFact, ModelRequirements, RouteStateStore, RoutingConfig};
+use striatum_core::{fact_to_route, ModelFact, ModelRequirements, RoutingConfig};
 use striatum_store::V1Decision;
 
 use super::{now_ms, operator_config, provider_refusal, store_refusal, Caller, Deps};
@@ -683,7 +683,9 @@ impl RequestInputs {
         let now = now_ms() as f64;
         // Read after the previous seat's admission, before this seat reserves
         // its own probes. Only the immutable catalog is shared between seats.
-        let mut snapshot = deps.store.build_snapshot(now).map_err(store_refusal)?;
+        let mut snapshot = crate::account_state::published(deps.store)
+            .and_then(|blocks| blocks.route_state_snapshot(now))
+            .map_err(store_refusal)?;
         let (
             windows,
             available,

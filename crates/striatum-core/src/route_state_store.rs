@@ -151,6 +151,33 @@ pub struct ProviderCooldownState {
     pub wall_class: Option<RouteWallClass>,
 }
 
+/// The answer of `route.cooldown_status`: whether a route is cooled at `now`.
+/// It is when its provider's row holds a cooldown or quota deadline after
+/// `now`, or when the route's own state or its capacity's shared state holds
+/// a cooldown, quota or failure deadline after `now`.
+pub fn route_cooled(
+    provider: Option<&ProviderCooldownState>,
+    snapshot: &ModelRouteStateSnapshot,
+    route_key: &str,
+    capacity_key: &str,
+    now: f64,
+) -> bool {
+    let after = |until: Option<f64>| until.is_some_and(|until| until > now);
+    let provider_cooled = provider
+        .is_some_and(|state| after(state.cooldown_until) || after(state.quota_exhausted_until));
+    provider_cooled
+        || snapshot
+            .by_route
+            .get(route_key)
+            .into_iter()
+            .chain(snapshot.by_capacity.get(capacity_key))
+            .any(|state| {
+                after(state.cooldown_until)
+                    || after(state.quota_exhausted_until)
+                    || after(state.failure_backoff_until)
+            })
+}
+
 /// Terminal outcome recorded against a route decision (audit + routing learning).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteOutcome {
