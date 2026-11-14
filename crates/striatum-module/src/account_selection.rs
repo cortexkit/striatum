@@ -5180,6 +5180,8 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
 
 mod continuation;
 #[cfg(test)]
+pub(crate) use continuation::inject_continuation_preparation_failure;
+#[cfg(test)]
 pub(crate) use continuation::continue_account;
 pub(crate) use continuation::continue_account_with_call;
 pub(crate) mod call_log;
