@@ -191,8 +191,21 @@ impl crate::SqliteRouteStateStore {
     /// Single flight: callers that arrive while a retry runs wait for it and
     /// share its result, instead of each reloading the whole state in turn.
     pub fn retry_account_state_load(&self) -> RouteStateResult<()> {
+        self.retry_account_state_load_after(self.account_state_retry_count())
+    }
+
+    /// How many retries of the load have finished, for
+    /// [`Self::retry_account_state_load_after`].
+    pub fn account_state_retry_count(&self) -> u64 {
+        self.account_state_retries.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// [`Self::retry_account_state_load`] for a caller that saw the load
+    /// fail after `arrived` retries had finished: a retry that finished
+    /// since (one this caller may have waited on) answers it instead of a
+    /// new load.
+    pub fn retry_account_state_load_after(&self, arrived: u64) -> RouteStateResult<()> {
         use std::sync::atomic::Ordering;
-        let arrived = self.account_state_retries.load(Ordering::Acquire);
         let mut flight = self.account_state_retry.lock().unwrap();
         if self.account_state_retries.load(Ordering::Acquire) != arrived {
             // A retry finished while this caller waited for the lock.

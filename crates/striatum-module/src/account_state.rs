@@ -1183,13 +1183,16 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
     let Some(bridge) = store.account_state_bridge() else {
         return store.install_account_state_bridge(Arc::new(StateOwner::default()));
     };
+    // Counted before reading: a reader that waited on a retry another
+    // caller started shares that retry's answer instead of loading again.
+    let arrived = store.account_state_retry_count();
     match bridge.snapshot() {
         Ok(_) => Ok(()),
         // The first load is still running: answer that. A retry would
         // queue a second load behind it and wait for both without a bound.
         Err(error) if error.to_string().contains(FIRST_LOAD_PENDING) => Err(error),
         Err(_) => {
-            store.retry_account_state_load()?;
+            store.retry_account_state_load_after(arrived)?;
             bridge.snapshot().map(|_| ())
         }
     }
