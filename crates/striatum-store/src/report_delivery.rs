@@ -161,11 +161,10 @@ impl SqliteRouteStateStore {
                 }
                 report_outcome(&tx, decision_id, outcome, error, now)?;
             }
-            // Core reuses one decision for several runs (Athena seats, mason
-            // retries), and each run reports separately under a `run:` delivery
-            // key. Each new delivery settles that run's own test request, so
-            // healing keys on the delivery rather than on the decision's first
-            // recorded outcome.
+            // Core can reuse one routing decision for several runs, and each
+            // run reports separately under a `run:` delivery key. Each new
+            // delivery settles that run's own test request, so healing keys on
+            // the delivery rather than on the decision's first recorded outcome.
             if outcome == RouteOutcome::Completed && !effects.preserve_probe {
                 account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
                     .map_err(sql_error)?;

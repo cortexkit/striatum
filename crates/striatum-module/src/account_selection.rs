@@ -7314,8 +7314,10 @@ pub(crate) fn observe_authorized(
         );
     }
     checking("account_observe_parse");
-    // Legacy callers keep their open envelope, but the success member has the
-    // same capability gate and validation as the closed routing/v1 shape.
+    // Legacy callers send an older request shape that this handler reads
+    // leniently. An `attempt_outcome` member still goes through the published
+    // routing/v1 parser, which refuses it unless routing advertises the success
+    // capability and the member is well formed.
     if params.get("attempt_outcome").is_some() {
         if let Err(refusal) = cortexkit_role_routing::observe::parse_account_observe_request_serving(
             params,

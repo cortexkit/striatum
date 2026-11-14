@@ -1020,8 +1020,10 @@ pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
 
 impl AccountTx<'_> {
     /// Arm real fixture blocks without changing their evidence or admissions.
-    /// Read-only previews synthesize clocks, so materialize them before setting
-    /// their due time; otherwise a quota origin may have no durable clock yet.
+    /// A block's retest clock is a `fence_recheck` row, and reads derive a
+    /// default clock for any block that has none stored. `sync` writes those
+    /// missing rows first, so the update below has a row to make due even for
+    /// a quota block that has only been read so far.
     #[cfg(any(test, feature = "test-support"))]
     pub fn arm_observe_retest_for_test(
         &self,
