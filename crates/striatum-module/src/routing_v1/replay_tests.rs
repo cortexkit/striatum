@@ -1002,6 +1002,12 @@ async fn broca_foreign_candidates_are_unservable_with_credential_ids() {
     )
     .unwrap();
     assert_eq!(fields["reason"], "candidates_filter");
+    assert_eq!(fields["eligible_credential_ids"], json!(["oauth:openai:example-a"]));
+    assert_eq!(fields["eligible_credential_count"], 1);
+    assert_eq!(fields["offered_credential_ids"], json!([
+        "oauth:anthropic:example-a", "oauth:anthropic:example-b",
+    ]));
+    assert_eq!(fields["offered_credential_count"], 2);
     assert_eq!(
         fields["exclusions"],
         "acct-openai-a:not_in_runner_candidates"
