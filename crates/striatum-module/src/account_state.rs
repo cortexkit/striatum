@@ -34,6 +34,42 @@ pub(crate) struct AccountState {
 }
 
 impl AccountState {
+    /// This state as the two expiry releases leave it at `now`: the probes of
+    /// unstarted admissions past their deadline released (their clocks
+    /// reopened one generation on, their authorizations gone, the admissions
+    /// expired), then the continuation offers past their deadline released.
+    /// These are the transitions the Tick and every command make before
+    /// deciding (`AccountCommand::release_expired`), applied in memory with
+    /// the same decisions (`BlockState::apply_probe_release`,
+    /// `AdmissionState::release_expired_continuations`). A reader sees an
+    /// expired item released without sending a command.
+    pub(crate) fn as_of(self: Arc<Self>, now: i64) -> Arc<Self> {
+        let owners = if self.blocks.enabled() {
+            self.blocks.authorization_owners()
+        } else {
+            Vec::new()
+        };
+        let probes = self.admissions.expired_probe_admissions(owners, now);
+        if probes.is_empty() && !self.admissions.has_expired_offers(now) {
+            return self;
+        }
+        let mut state = (*self).clone();
+        for (principal, admission, owner) in probes {
+            // Reopened as of the admission's own deadline, as the command
+            // records it (`release_admission_probes`).
+            let deadline = state
+                .admissions
+                .open_admission(&principal, &admission)
+                .map_or(now, |open| open.row.admission_valid_until.min(now));
+            state.blocks.apply_probe_release(&owner, deadline);
+            state.admissions.expire(&principal, &admission);
+        }
+        state.admissions.release_expired_continuations(now);
+        state.inflight.apply(&state.admissions, now);
+        state.admissions.pending.clear();
+        Arc::new(state)
+    }
+
     // The writer calls this once inside a read transaction, with no attached
     // working state. Quota readings and the vault roster are deliberately absent.
     fn load(tx: &AccountTx<'_>) -> RouteStateResult<Self> {
@@ -102,7 +138,7 @@ pub(crate) fn open_preflight_admission(
     if store.is_account_evaluation_projection() {
         return store.account_read(|tx| tx.admission(principal, admission_id));
     }
-    Ok(snapshot(store)?
+    Ok(published_at(store, crate::account_selection::now_ms())?
         .admissions
         .open_admission(principal, admission_id)
         .map(|open| open.row.clone()))
@@ -123,37 +159,6 @@ pub(crate) fn closed_admission(
     keyed_exception();
     store.account_read(|tx| tx.admission_by_key(principal, admission_id))
 }
-
-/// The published state's answer to `has_expired_continuations`.
-pub(crate) fn has_expired_continuations(
-    store: &SqliteRouteStateStore,
-    now: i64,
-) -> RouteStateResult<bool> {
-    if store.is_account_evaluation_projection() {
-        return store.account_read(|tx| tx.has_expired_continuations(now));
-    }
-    Ok(snapshot(store)?.admissions.has_expired_offers(now))
-}
-
-/// The published state's answer to `has_expired_admission_probes`: the
-/// probe authorizations' owners and whether each is an expired unstarted
-/// admission both come from the state.
-pub(crate) fn has_expired_admission_probes(
-    store: &SqliteRouteStateStore,
-    now: i64,
-) -> RouteStateResult<bool> {
-    if store.is_account_evaluation_projection() {
-        return store.account_read(|tx| tx.has_expired_admission_probes(now));
-    }
-    let state = snapshot(store)?;
-    let owners = if state.blocks.enabled() {
-        state.blocks.authorization_owners()
-    } else {
-        store.account_read(|tx| tx.probe_authorization_owners())?
-    };
-    Ok(!state.admissions.expired_probe_admissions(owners, now).is_empty())
-}
-
 
 impl AccountWorkingState for AccountState {
     fn fork(&self) -> Box<dyn AccountWorkingState> {
@@ -302,6 +307,16 @@ impl StateOwner {
             .expect("ready state must be published");
         Ok(snapshot)
     }
+}
+
+/// The published state as request paths read it at `now`: expired probes
+/// and continuation offers already released ([`AccountState::as_of`]).
+/// [`snapshot`] is the state exactly as stored, for the writer and tests.
+pub(crate) fn published_at(
+    store: &SqliteRouteStateStore,
+    now: i64,
+) -> RouteStateResult<Arc<AccountState>> {
+    Ok(snapshot(store)?.as_of(now))
 }
 
 pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
@@ -1094,6 +1109,32 @@ impl AccountCommand<'_> {
             self.mirror_checked(sql_expired, "release_expired_admission_probes", |state| {
                 state.expire(principal, admission)
             })?;
+        }
+        Ok(())
+    }
+
+    /// Release at `now`, inside this command and before it decides, what
+    /// the readers' `AccountState::as_of` view already shows released:
+    /// expired unstarted admissions' probes, then expired continuation
+    /// offers. Every command that claims a probe or uses a continuation
+    /// calls this first. A command without a working state (a projection)
+    /// releases nothing here; it writes nothing when nothing expired.
+    pub(crate) fn release_expired(&mut self, now: i64) -> RouteStateResult<()> {
+        let Some(state) = self.state.as_deref() else {
+            return Ok(());
+        };
+        let owners = if state.blocks.enabled() {
+            state.blocks.authorization_owners()
+        } else {
+            Vec::new()
+        };
+        let probes = !state.admissions.expired_probe_admissions(owners, now).is_empty();
+        let offers = state.admissions.has_expired_offers(now);
+        if probes {
+            self.release_expired_admission_probes(now)?;
+        }
+        if offers {
+            self.release_expired_continuations(now)?;
         }
         Ok(())
     }

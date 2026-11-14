@@ -28,7 +28,8 @@ impl Snapshot {
         catalog_store: &striatum_store::SqliteRouteStateStore,
         now: i64,
     ) -> Result<Self, Refusal> {
-        let state = crate::account_state::snapshot(deps.store).map_err(store_refusal)?;
+        let state =
+            crate::account_state::published_at(deps.store, now).map_err(store_refusal)?;
         let mut credentials = deps
             .broca_credentials
             .lock()

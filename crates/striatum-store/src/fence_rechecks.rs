@@ -1899,31 +1899,36 @@ impl AccountTx<'_> {
             // its authorization. (`expired` is included because a replay
             // expires an admission without releasing its probe.) The check
             // comes first, so nothing changes for an admission that fails it.
-            let unstarted = self
+            let deadline: Option<i64> = self
                 .conn
-                .execute(
+                .query_row(
                     "UPDATE account_admission SET state = state WHERE principal=?1 \
                        AND admission_id=?2 AND state IN ('reserved','expired') \
-                       AND started_at IS NULL",
+                       AND started_at IS NULL RETURNING admission_valid_until",
                     params![principal, admission],
+                    |row| row.get(0),
                 )
-                .map_err(err)?
-                == 1;
-            if !unstarted {
+                .optional()
+                .map_err(err)?;
+            let Some(deadline) = deadline else {
                 continue;
-            }
+            };
+            // The probe reopens as of the admission's own deadline, not when
+            // a command noticed it lapsed, so every releaser (a reader's view
+            // of the state, any command, the Tick) records the same time. The
+            // deadline has passed, so the reopened probe is due at once.
+            let now = deadline.min(now);
             released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
             match self.working_blocks()? {
                 Some(blocks) => {
-                    let held = blocks.authorizations_of(&owner);
-                    let clocks = blocks.live_clocks();
-                    for row in &held {
-                        let current = clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
-                            clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
-                                && clock.claim_generation == row.claim_generation
-                        });
+                    // The same decision the account state's `as_of` view
+                    // applies in memory (`BlockState::apply_probe_release`).
+                    let release = blocks.probe_release(&owner);
+                    let held: Vec<_> = release.iter().map(|(row, _)| row.clone()).collect();
+                    for (row, current) in &release {
+                        let current = *current;
                         // Run for a clock the state calls superseded too: SQL
                         // must then change nothing, or it disagrees.
                         let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,

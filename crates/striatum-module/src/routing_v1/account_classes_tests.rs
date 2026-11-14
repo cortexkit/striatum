@@ -5364,6 +5364,10 @@ fn s4b_seed_trigger(
                     )
                 })
                 .unwrap();
+            // The load reads the expired offer as released through the
+            // state's `as_of` view and sends no command; the Tick or the
+            // next command releases it durably (asserted by the caller).
+            return 0;
         }
         "listing" => {
             let fingerprint = match credentials.listing_fingerprint("oauth:test") {
@@ -5566,6 +5570,20 @@ fn s4b_each_context_repair_is_durable_and_not_repeated() {
             1,
             "{trigger}: only the catalog key check"
         );
+        if trigger == "continuation" {
+            // The Tick releases the offer durably, stamped at its own
+            // deadline (`now`, the offer's `valid_until_ms`).
+            crate::account_writer::tick(harness.store(), now + 5_000).unwrap();
+            let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+            let released: Option<i64> = conn
+                .query_row(
+                    "SELECT released_at_ms FROM account_continue WHERE selection_id='expired-offer'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(released, Some(now), "{trigger}: released at its deadline");
+        }
     }
 }
 

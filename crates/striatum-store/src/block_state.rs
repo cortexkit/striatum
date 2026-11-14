@@ -1727,6 +1727,68 @@ impl BlockState {
         rows
     }
 
+    /// What releasing `owner`'s probe gives up, as `release_admission_probes`
+    /// decides it: each authorization `owner` holds, with whether its clock
+    /// is still the one it claimed (uncleared, same evidence, evidence time
+    /// and claim generation). Only such a clock is reopened.
+    pub fn probe_release(&self, owner: &str) -> Vec<(ProbeAuthorization, bool)> {
+        let clocks = self.live_clocks();
+        self.authorizations_of(owner)
+            .into_iter()
+            .map(|row| {
+                let current = clocks
+                    .get(&(row.kind.as_str(), row.origin_key.as_str()))
+                    .is_some_and(|clock| {
+                        clock.evidence == row.evidence
+                            && clock.evidence_at == row.evidence_at
+                            && clock.claim_generation == row.claim_generation
+                    });
+                (row, current)
+            })
+            .collect()
+    }
+
+    /// Apply in memory exactly what `release_admission_probes` writes for
+    /// `owner` at `now`, from the same [`Self::probe_release`] decision:
+    /// each current clock is due at `now`, unclaimed, one generation on, and
+    /// every authorization of `owner` is gone. A reader sees an expired
+    /// admission's probe released before any command releases it.
+    pub fn apply_probe_release(&mut self, owner: &str, now: i64) {
+        for (row, current) in self.probe_release(owner) {
+            if !current {
+                continue;
+            }
+            let found = self.tables[CLOCK_TABLE].rows.iter().find_map(|(rowid, (key, held))| {
+                match &**held {
+                    Held::Clock(block, None)
+                        if block.kind == row.kind && block.origin_key == row.origin_key =>
+                    {
+                        Some((*rowid, key.clone(), block.clone()))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some((rowid, key, mut block)) = found {
+                block.next_recheck_at = now;
+                block.last_claimed_at = None;
+                block.claim_owner = None;
+                block.claim_generation += 1;
+                self.tables[CLOCK_TABLE].put(rowid, &key, Some(&Arc::new(Held::Clock(block, None))));
+            }
+        }
+        let held: Vec<(i64, String)> = self.tables[AUTHORIZATION_TABLE]
+            .rows
+            .iter()
+            .filter_map(|(rowid, (key, held))| match &**held {
+                Held::Authorization(row) if row.owner == owner => Some((*rowid, key.clone())),
+                _ => None,
+            })
+            .collect();
+        for (rowid, key) in held {
+            self.tables[AUTHORIZATION_TABLE].put(rowid, &key, None);
+        }
+    }
+
     /// Every stored probe clock that is not cleared, by kind and origin key.
     pub(crate) fn live_clocks(&self) -> HashMap<(&str, &str), &Block> {
         self.rows_of(CLOCK_TABLE)

@@ -288,7 +288,9 @@ pub(crate) fn published(store: &SqliteRouteStateStore) -> RouteStateResult<Publi
     if store.is_account_evaluation_projection() {
         return Ok(Published::Sql(store));
     }
-    let state = snapshot(store)?;
+    // Expired probes and offers read as released: the next command
+    // releases them before it decides (`AccountCommand::release_expired`).
+    let state = super::published_at(store, crate::account_selection::now_ms())?;
     Ok(if state.blocks.enabled() {
         Published::State(state)
     } else {

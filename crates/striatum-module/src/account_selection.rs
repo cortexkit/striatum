@@ -1135,21 +1135,30 @@ impl ClassContext {
     ) -> Result<Self, String> {
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
-        if crate::account_state::has_expired_admission_probes(store, now_ms)
-            .map_err(|error| error.to_string())?
-        {
-            crate::account_writer::repair(store, move |tx| {
-                tx.release_expired_admission_probes(now_ms)
-            })
-            .map_err(|error| error.to_string())?;
-        }
-        if crate::account_state::has_expired_continuations(store, now_ms)
-            .map_err(|error| error.to_string())?
-        {
-            crate::account_writer::repair(store, move |tx| {
-                tx.release_expired_continuations(now_ms)
-            })
-            .map_err(|error| error.to_string())?;
+        // Expired admission probes and continuation offers read as released
+        // through the published state's `as_of` view; the next command
+        // releases them durably, so this read sends none. A private SQL
+        // projection holds no state to read through: it releases them with
+        // a command first, as before.
+        if store.is_account_evaluation_projection() {
+            if store
+                .account_read(|tx| tx.has_expired_admission_probes(now_ms))
+                .map_err(|error| error.to_string())?
+            {
+                crate::account_writer::repair(store, move |tx| {
+                    tx.release_expired_admission_probes(now_ms)
+                })
+                .map_err(|error| error.to_string())?;
+            }
+            if store
+                .account_read(|tx| tx.has_expired_continuations(now_ms))
+                .map_err(|error| error.to_string())?
+            {
+                crate::account_writer::repair(store, move |tx| {
+                    tx.release_expired_continuations(now_ms)
+                })
+                .map_err(|error| error.to_string())?;
+            }
         }
         let refusals = crate::credential_fences::live_with_eligibility(store, credentials, true)?;
         let probe_scope = std::sync::Arc::downgrade(credentials);
@@ -1478,7 +1487,10 @@ impl ClassContext {
             let decision = decision.to_owned();
             let owner = hold.owner.clone();
             let claimed_admission = admission.clone();
+            let release_at = self.now_ms;
             let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
+                // What the selection read as released is released first.
+                tx.release_expired(release_at)?;
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
                 let admission = claimed_admission.clone();
@@ -2712,7 +2724,9 @@ impl ClassContext {
             let owned_provider = provider.to_owned();
             let owned_model = model.to_owned();
             let owned_owner = owner.map(str::to_owned);
+            let release_at = context.now_ms;
             let granted = crate::account_writer::repair(store, move |tx| {
+                tx.release_expired(release_at)?;
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
                 let owner = owned_owner.as_deref();
@@ -2752,7 +2766,9 @@ impl ClassContext {
         let owned_model = model.to_owned();
         let owned_owner = owner.map(str::to_owned);
         let owned_credential = credential.clone();
+        let release_at = context.now_ms;
         let claimed = crate::account_writer::repair(store, move |tx| {
+            tx.release_expired(release_at)?;
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
             // The claim is made for this owner, or for the selection's probe
@@ -5433,6 +5449,9 @@ fn prepare_and_admit(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
         move |tx| {
+            // Expired probes and offers the selection read as released are
+            // released before the admission decides.
+            tx.release_expired(command_ctx.now_ms)?;
             tx.release_expired_continuations(command_ctx.now_ms)?;
             let reply = serve(
                 tx,
@@ -6397,7 +6416,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
         None
     } else {
         Some(
-            crate::account_state::snapshot(ctx.store).map_err(|error| PreflightRefusal {
+            crate::account_state::published_at(ctx.store, ctx.now_ms).map_err(|error| PreflightRefusal {
                 code: "account_selection_unavailable".into(),
                 message: error.to_string(),
                 reset_at_ms: None,
