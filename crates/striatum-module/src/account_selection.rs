@@ -7551,8 +7551,13 @@ fn apply_bound_observation(
                     .decision_context(&admission.decision_id)?
                     .and_then(|context| serde_json::from_str::<Value>(&context).ok())
                     .is_some_and(|context| context["media_admission"] == true);
-                if media
-                    && !tx.admission_reported_failure(principal, id)?
+                // A run can finish on another login. Ending its lifecycle does
+                // not prove that the admitted account and credential recovered.
+                let media_success = media
+                    && parsed.served_account_id.as_deref() == Some(admission.account_id.as_str())
+                    && parsed.credential_id.as_deref() == Some(admission.credential_id.as_str())
+                    && !tx.admission_reported_failure(principal, id)?;
+                if media_success
                     && crate::credential_fences::lift_after_success_in(
                         tx,
                         &admission.provider,
@@ -7567,7 +7572,7 @@ fn apply_bound_observation(
                         "credential_id": admission.credential_id,
                     }));
                 }
-                if media && !tx.admission_reported_failure(principal, id)? {
+                if media_success {
                     tx.heal_authorized_probe(
                         &admission_probe_owner(&admission.principal, &admission.admission_id),
                         &admission.provider,
