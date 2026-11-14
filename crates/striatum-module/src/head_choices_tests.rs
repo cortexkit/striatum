@@ -174,6 +174,157 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
     (harness, credentials)
 }
 
+fn broca_live_catalog_fixture() -> Arc<Harness> {
+    let input: Value = serde_json::from_str(include_str!(
+        "../fixtures/head-choices-broca-live-inputs-20261114.json"
+    ))
+    .unwrap();
+    let harness = Harness::new("broca-live-head-choices");
+    for existing in harness.store().get_facts().unwrap() {
+        harness
+            .store()
+            .delete_fact(&make_route_key(
+                &existing.provider_id,
+                &existing.model_id,
+                existing.variant.as_deref(),
+            ))
+            .unwrap();
+    }
+    let mut facts = Vec::new();
+    for row in input["model_facts"].as_array().unwrap() {
+        let mut model = fact(
+            row["provider_id"].as_str().unwrap(),
+            row["model_id"].as_str().unwrap(),
+        );
+        model.scores = serde_json::from_str(row["scores_json"].as_str().unwrap()).unwrap();
+        model.family = row["family"].as_str().map(str::to_owned);
+        model.context_window = row["context_window"].as_f64();
+        model.max_output_tokens = row["max_output_tokens"].as_u64();
+        model.cost_tier = row["cost_tier"].as_f64();
+        model.cost_per_m_tok_out = row["cost_per_mtok_out"].as_f64();
+        model.supports_vision = row["supports_vision"].as_i64().map(|v| v != 0);
+        model.supports_tool_use = row["supports_tool_use"].as_i64().map(|v| v != 0);
+        model.prompt_defaults = row["prompt_defaults_json"]
+            .as_str()
+            .map(|v| serde_json::from_str(v).unwrap());
+        model.auth_methods = row["auth_methods_json"]
+            .as_str()
+            .map(|v| serde_json::from_str(v).unwrap());
+        model.login_methods_documented = row["login_methods_documented"].as_i64() == Some(1);
+        model.upstream_status = row["upstream_status"].as_str().map(str::to_owned);
+        let source = striatum_core::FactSource::parse(row["source"].as_str().unwrap());
+        harness.store().upsert_fact(&model, source).unwrap();
+        facts.push(model);
+    }
+    let catalog = json!({
+        "catalog_version": input["catalog_version"], "resolved_at_ms": 1794680117849_i64,
+        "quality_scores": {"graded_by":"operator", "graded_at_ms":1794404263000_i64},
+        "models": input["catalog_models"]
+    });
+    let snapshot =
+        fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+    let (updates, cursor) = snapshot.parts();
+    harness
+        .store()
+        .apply_fusiform_catalog(updates, cursor)
+        .unwrap();
+    fusiform_catalog::apply_mapped_catalog(harness.store(), &snapshot, None, None).unwrap();
+    let mut credentials = BrocaCredentials::default();
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "broca-live-redacted".into(),
+            credentials: input["credentials"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    let strings = |key: &str| {
+                        row[key]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|v| v.as_str().unwrap().to_owned())
+                            .collect()
+                    };
+                    ListedCredential {
+                        id: row["id"].as_str().unwrap().into(),
+                        account_id: row["account_id"].as_str().map(str::to_owned),
+                        state: row["state"].as_str().unwrap().into(),
+                        categories: strings("categories"),
+                        provider_ids: strings("provider_ids"),
+                        serves: strings("serves"),
+                        credential_type: row["type"].as_str().unwrap().into(),
+                        auth_method: row["auth_method"].as_str().map(str::to_owned),
+                        plan_tier: row["plan_tier"].as_str().map(str::to_owned),
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        },
+        crate::now_ms(),
+    );
+    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.wire_apis = input["catalog_models"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter_map(|(key, row)| {
+            row["wire.family"]
+                .as_str()
+                .map(|wire| (key.clone(), wire.to_owned()))
+        })
+        .collect();
+    credentials.wire_api_models = input["catalog_models"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .filter(|(_, row)| {
+            let api = &row["wire.api"];
+            api.get("value").unwrap_or(api).as_str().is_some_and(|s| !s.trim().is_empty())
+        })
+        .map(|(key, _)| key.clone())
+        .collect();
+    let mut billing = fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
+        .with_test_catalog(&serde_json::to_vec(&catalog).unwrap());
+    for plane in input["billing_planes"].as_array().unwrap() {
+        billing = billing.with_test_plane(&serde_json::to_vec(plane).unwrap());
+    }
+    credentials.publish_billing_catalog(billing);
+    let served: Value = serde_json::from_str(include_str!(
+        "../fixtures/service-tier-v1/fusiform-served-payloads.json"
+    ))
+    .unwrap();
+    credentials.publish_plan_prices(&served["plan.prices — every curated row"]["response"]);
+    credentials.runner_declarations.insert(
+        "broca".into(),
+        super::runners::parse_declaration(&input["runner_declaration"])
+            .unwrap()
+            .unwrap(),
+    );
+    credentials.runner_service_tiers.insert(
+        "broca".into(),
+        super::runners::service_tiers_from_describe(&json!({
+            "capabilities":["service_tier"], "service_tiers":input["runner_service_tiers"]
+        }))
+        .unwrap(),
+    );
+    harness.edit_config(|config| {
+        config["consumers"] = json!({"head": {"owner": "occipital"}});
+        for key in [
+            "providers",
+            "models",
+            "runners",
+            "head_agents",
+            "overqualification",
+        ] {
+            config[key] = input["policy"][key].clone();
+        }
+    });
+    harness.set_credentials(credentials);
+    harness
+}
+
 async fn query(harness: &Arc<Harness>, runner: &str) -> Value {
     let route = harness.bind(reserved("occipital"), None).await;
     let (ty, reply) = route
@@ -871,6 +1022,8 @@ async fn serving_bytes_match_tagged_vectors() {
             ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
+    let live_harness = broca_live_catalog_fixture();
+    let live_route = live_harness.bind(reserved("occipital"), None).await;
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../test-vectors/route-head-choices-v1");
     let update = std::env::var_os("UPDATE_ROUTE_HEAD_CHOICES_VECTORS").is_some();
@@ -886,12 +1039,14 @@ async fn serving_bytes_match_tagged_vectors() {
         ("harness-narrowed.json", harness_runner, Some("claude-code")),
         ("harness-runner-wide.json", harness_runner, Some("opencode2")),
         ("harness-unavailable.json", harness_runner, Some("pi")),
+        ("broca-live-catalog.json", "broca", None),
     ] {
         let mut request = json!({"method":"route.head_choices","params":{"runner_module":runner}});
         if let Some(selected_harness) = selected_harness {
             request["params"]["harness"] = json!(selected_harness);
         }
-        let (ty, bytes) = route
+        let selected_route = if runner == "broca" { &live_route } else { &route };
+        let (ty, bytes) = selected_route
             .call_raw("route.head_choices", &request["params"])
             .await;
         let body: Value = serde_json::from_slice(&bytes).unwrap();
@@ -911,6 +1066,14 @@ async fn serving_bytes_match_tagged_vectors() {
             check_contract(runner, &body["result"]);
             if ["missing", non_starting_runner].contains(&runner) {
                 assert_eq!(body["result"]["models"], json!([]), "{name}");
+            }
+            if runner == "broca" {
+                let models = body["result"]["models"].as_array().unwrap();
+                assert_eq!(models.len(), 25);
+                assert!(models.iter().any(|model| model["pin_only"] == true));
+                assert!(models.iter().any(|model| model["billing"] == "per_token"));
+                assert!(models.iter().any(|model| model["service_tiers"]
+                    .as_array().unwrap().iter().any(|tier| tier == "fast")));
             }
             match selected_harness {
                 Some("claude-code") => {
