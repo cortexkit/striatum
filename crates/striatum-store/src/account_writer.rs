@@ -72,7 +72,7 @@ fn write_batch(
             queued
                 .command
                 .run(
-                    &AccountTx { conn },
+                    &AccountTx::sql(conn),
                     state
                         .as_mut()
                         .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
@@ -89,11 +89,15 @@ fn write_batch(
     for queued in batch.iter_mut() {
         conn.execute_batch("SAVEPOINT account_command")?;
         let before = state.as_ref().map(|state| state.fork());
+        // The fork equals the working state until the command ends (its
+        // block rows change only below), so the command's claim decisions
+        // read the fork's block tables without a second copy.
+        let blocks = before.as_ref().and_then(|before| before.blocks());
         // Every block row this command changes, triggers included, is copied
         // into the working state before the savepoint is released.
         let capture = crate::block_state::Capture::begin();
         let status = queued.command.run(
-            &AccountTx { conn },
+            &AccountTx::with_blocks(conn, blocks),
             state
                 .as_mut()
                 .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),

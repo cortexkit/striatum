@@ -27,6 +27,9 @@ impl AccountWorkingState for TestState {
     fn apply_block_rows(&mut self, rows: &BlockRows) {
         self.0.apply(rows);
     }
+    fn blocks(&self) -> Option<&BlockState> {
+        Some(&self.0)
+    }
 }
 
 /// A publisher holding only the block state, standing in for the module's.
@@ -35,11 +38,17 @@ struct TestOwner {
     published: Mutex<Option<Arc<TestState>>>,
     reload: AtomicBool,
     loads: std::sync::atomic::AtomicU64,
+    /// States the next loads return instead of reading SQL, last first: a
+    /// stale state stands in for one that drifted from SQL.
+    stale: Mutex<Vec<BlockState>>,
 }
 
 impl AccountStateBridge for TestOwner {
     fn load(&self, tx: &crate::AccountTx<'_>) -> RouteStateResult<Box<dyn AccountWorkingState>> {
         self.loads.fetch_add(1, Ordering::Relaxed);
+        if let Some(stale) = self.stale.lock().unwrap().pop() {
+            return Ok(Box::new(TestState(stale)));
+        }
         Ok(Box::new(TestState(tx.load_block_state()?)))
     }
     fn publish(&self, state: &dyn AccountWorkingState, _generation: u64) {
@@ -456,6 +465,75 @@ fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
 }
 
 #[test]
+fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
+    let rig = rig("block-state-stale-claim");
+    // A provider wall observed two hours ago: its one-hour probe is due.
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            "p0/m0",
+            "p0/m0",
+            &RouteStateUpdate {
+                observed_at_ms: Some(NOW - 2 * 3_600_000),
+                cooldown_until: Some((NOW + 3_600_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    rig.run(fence_rechecks::sync);
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    assert_eq!(origins.len(), 1, "{origins:?}");
+    let before_the_winner = rig.published();
+    let claim = |owner: &'static str| {
+        let origins = origins.clone();
+        rig.store
+            .account_command(AccountCommandKind::Maintenance, move |tx| {
+                tx.grant_fence_rechecks(&origins, NOW, Some(owner))
+            })
+    };
+    assert!(claim("winner").unwrap());
+
+    // The loser's batch first decides on the state from before the winner
+    // claimed: the clock looks due, but SQL holds the winner's claim. The
+    // keyed update finds no such row, the batch rolls back, and it runs again
+    // on a fresh load, which refuses the loser.
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.owner.stale.lock().unwrap().push(before_the_winner.clone());
+    rig.owner.request_reload();
+    assert!(!claim("loser").unwrap(), "the rerun sees the winner's claim");
+    assert_eq!(rig.owner.loads.load(Ordering::Relaxed) - loads, 2);
+    let owners = |rig: &Rig| {
+        rig.store
+            .with_reader_for_test(|conn| {
+                conn.prepare("SELECT claim_owner FROM fence_recheck UNION ALL SELECT owner FROM fence_probe_authorization")?
+                    .query_map([], |r| r.get::<_, Option<String>>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        owners(&rig),
+        [Some("winner".to_owned()), Some("winner".to_owned())]
+    );
+
+    // Stale on the rerun too: the batch fails with the divergence and
+    // writes nothing.
+    rig.owner
+        .stale
+        .lock()
+        .unwrap()
+        .extend([before_the_winner.clone(), before_the_winner]);
+    rig.owner.request_reload();
+    let error = claim("loser").unwrap_err().to_string();
+    assert!(error.contains(crate::STATE_DIVERGED), "{error}");
+    assert_eq!(
+        owners(&rig),
+        [Some("winner".to_owned()), Some("winner".to_owned())]
+    );
+}
+
+#[test]
 fn a_fork_shares_every_table() {
     let rig = rig("block-state-fork");
     rig.run(|conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW));
@@ -511,7 +589,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
     let offset = rng.below(4);
     let at = rng.time(now);
     let until = rng.time(now) + 3_600_000;
-    match rng.below(32) {
+    match rng.below(36) {
         0 => {
             let id = if rng.below(2) == 0 {
                 format!("f{}", rng.below(4))
@@ -740,6 +818,7 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             ));
             "replace a listing's eligibility"
         }
+        31..=34 => decide_both(rig, rng, now),
         _ => {
             let result = rig.store.account_command(AccountCommandKind::Maintenance, move |tx| {
                 tx.pool_sql(|conn| {
@@ -751,6 +830,97 @@ fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             "failed command"
         }
     }
+}
+
+/// The claim and probe decisions a command takes: one chosen at random, run
+/// first deciding on SQL inside a savepoint that is then rolled back, and
+/// then deciding on the command's working state, with the same arguments.
+/// The answers and the clock and authorization rows each leaves must be
+/// equal.
+fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
+    const DECISIONS: [&str; 8] = [
+        "decide: grant",
+        "decide: admission claim",
+        "decide: authorized admission claim",
+        "decide: plain claim",
+        "decide: bind decision probe",
+        "decide: report matches probe",
+        "decide: authorization names credential",
+        "decide: transfer authorization",
+    ];
+    let which = rng.below(DECISIONS.len() as u64) as usize;
+    let first = rng.below(4) as usize;
+    let count = 1 + rng.below(2) as usize;
+    let at = now + [0, 900_000, 3_600_000, 4 * 3_600_000][rng.below(4) as usize];
+    let owner = format!("owner{}", rng.below(3));
+    let other = format!("owner{}", rng.below(3));
+    let credential = rng.pick(&CREDENTIALS).to_owned();
+    let model = rng.pick(&MODELS).to_owned();
+    let preserve = rng.below(4) == 0;
+    let named = rng.below(2) == 0;
+    let (sql, memory) = rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            let decide = |tx: &crate::AccountTx<'_>| -> RouteStateResult<String> {
+                let origins = fence_rechecks::read(tx.conn).map_err(err)?;
+                let chosen: Vec<_> = origins.iter().skip(first).take(count).cloned().collect();
+                let answer = match which {
+                    0 => tx.grant_fence_rechecks(&chosen, at, Some(&owner)),
+                    1 => tx.claim_fence_rechecks_for_admission(&chosen, at, Some(&owner)),
+                    2 => tx.claim_fence_rechecks_for_authorized_admission(
+                        &chosen,
+                        at,
+                        Some(&owner),
+                        &other,
+                    ),
+                    3 => tx.claim_fence_rechecks(&chosen, at),
+                    4 => tx.bind_decision_probe(&chosen, &owner, &other, "a0", &credential, at),
+                    5 => tx.probe_report_matches(&owner, named.then_some(&*credential), preserve),
+                    6 => tx.probe_authorization_names_credential(&owner, &credential, &model),
+                    _ => tx.transfer_probe_authorization(&owner, &other).map(|()| true),
+                };
+                let mut rows = Vec::new();
+                for sql in [
+                    "SELECT kind,origin_key,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,
+                     last_claimed_at,claim_owner,claim_generation,cleared_at FROM fence_recheck ORDER BY kind,origin_key",
+                    "SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+                     FROM fence_probe_authorization ORDER BY owner,kind,origin_key",
+                ] {
+                    let mut statement = tx.conn.prepare(sql).map_err(err)?;
+                    let columns = statement.column_count();
+                    let mut query = statement.query([]).map_err(err)?;
+                    while let Some(row) = query.next().map_err(err)? {
+                        let values = (0..columns)
+                            .map(|at| row.get::<_, Value>(at))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map_err(err)?;
+                        rows.push(format!("{values:?}"));
+                    }
+                }
+                Ok(format!("{answer:?} {rows:#?}"))
+            };
+            tx.conn.execute_batch("SAVEPOINT oracle").map_err(err)?;
+            let sql = decide(&crate::AccountTx::sql(tx.conn))?;
+            tx.conn
+                .execute_batch("ROLLBACK TO oracle; RELEASE oracle")
+                .map_err(err)?;
+            Ok((sql, decide(tx)?))
+        })
+        .unwrap();
+    DECIDED.with(|decided| {
+        decided
+            .borrow_mut()
+            .push((DECISIONS[which], memory.starts_with("Ok(true)"), sql == memory))
+    });
+    assert_eq!(memory, sql, "{}: the state's decision equals SQL's", DECISIONS[which]);
+    DECISIONS[which]
+}
+
+thread_local! {
+    /// Each decision `decide_both` compared: its name, whether the state
+    /// answered `true`, and whether it matched SQL.
+    static DECIDED: std::cell::RefCell<Vec<(&'static str, bool, bool)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn pool_key(window: u32) -> String {
@@ -895,7 +1065,21 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     }
     // Coverage first: a comparison over sequences that never reached these
     // states would prove nothing about them.
-    assert_eq!(operations.len(), 31, "every operation ran: {operations:?}");
+    let decided = DECIDED.with(|decided| decided.take());
+    // Every decision answered both ways, except a transfer, which has no
+    // answer of its own.
+    for name in operations
+        .keys()
+        .filter(|name| name.starts_with("decide: ") && **name != "decide: transfer authorization")
+    {
+        for answer in [true, false] {
+            assert!(
+                decided.iter().any(|(decision, yes, _)| decision == name && *yes == answer),
+                "{name} answered {answer} at least once: {decided:?}"
+            );
+        }
+    }
+    assert_eq!(operations.len(), 31 + 8, "every operation ran: {operations:?}");
     let Reached {
         credential_quota_from_hold,
         route_hidden_by_provider,

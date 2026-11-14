@@ -1497,6 +1497,30 @@ pub const ACCOUNT_DEMAND_SQL: &str =
 /// commits or rolls back as one.
 pub struct AccountTx<'a> {
     pub(crate) conn: &'a Connection,
+    /// The block state of the writer's working copy when the command runs
+    /// in the account writer with the module's state loaded. Claim and probe
+    /// decisions read it instead of SQL; `None` (a projection, a test seam,
+    /// the state loader) makes them read SQL.
+    pub(crate) blocks: Option<&'a crate::BlockState>,
+    /// `blocks` with the rows this command has changed so far laid over it,
+    /// and how many captured rows that copy includes, so each read applies
+    /// only the rows captured since the last one.
+    pub(crate) overlay: std::cell::RefCell<Option<(usize, crate::BlockState)>>,
+}
+
+impl<'a> AccountTx<'a> {
+    /// A transaction whose decisions read SQL.
+    pub(crate) fn sql(conn: &'a Connection) -> Self {
+        Self::with_blocks(conn, None)
+    }
+
+    pub(crate) fn with_blocks(conn: &'a Connection, blocks: Option<&'a crate::BlockState>) -> Self {
+        Self {
+            conn,
+            blocks,
+            overlay: std::cell::RefCell::new(None),
+        }
+    }
 }
 
 mod continuation;
@@ -2343,7 +2367,7 @@ impl SqliteRouteStateStore {
                 } else {
                     None
                 };
-                let result = f(&AccountTx { conn });
+                let result = f(&AccountTx::sql(conn));
                 if result.is_ok() {
                     if let Some(tx) = tx {
                         crate::evaluation_snapshot::timed_commit(tx)?;
@@ -2386,7 +2410,7 @@ impl SqliteRouteStateStore {
             .with_conn(|conn: &Connection| {
                 let before = conn.total_changes();
                 let tx = self.begin_account_write(conn)?;
-                let result = f(&AccountTx { conn: &tx });
+                let result = f(&AccountTx::sql(&tx));
                 if result.is_ok() {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                     wrote = conn.total_changes() != before;
@@ -2414,7 +2438,7 @@ impl SqliteRouteStateStore {
             .store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
-                let result = f(&AccountTx { conn: &tx });
+                let result = f(&AccountTx::sql(&tx));
                 if matches!(result, Ok(true)) {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }

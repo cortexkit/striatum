@@ -162,6 +162,10 @@ impl AccountWorkingState for AccountState {
     fn apply_block_rows(&mut self, rows: &striatum_store::BlockRows) {
         self.blocks.apply(rows);
     }
+
+    fn blocks(&self) -> Option<&striatum_store::BlockState> {
+        Some(&self.blocks)
+    }
 }
 
 /// Publication swaps one Arc under a short write lock;

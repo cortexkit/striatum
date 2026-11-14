@@ -15,6 +15,11 @@ pub trait AccountWorkingState: Send {
     /// writer calls it after the command's statements ran and before its
     /// savepoint is released, so a failed command's rows never arrive.
     fn apply_block_rows(&mut self, rows: &crate::BlockRows);
+    /// The block tables this copy holds, if it holds them. Commands decide
+    /// probe claims on them instead of reading SQL.
+    fn blocks(&self) -> Option<&crate::BlockState> {
+        None
+    }
 }
 
 /// Implemented by the module's snapshot publisher, without a store-to-module
@@ -76,7 +81,7 @@ impl WriterAccountState {
             let tx =
                 rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)
                     .map_err(crate::err)?;
-            let state = bridge.load(&AccountTx { conn: &tx })?;
+            let state = bridge.load(&AccountTx::sql(&tx))?;
             tx.commit().map_err(crate::err)?;
             Ok(Some((state, version)))
         };

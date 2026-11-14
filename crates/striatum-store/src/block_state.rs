@@ -1234,6 +1234,42 @@ impl BlockState {
             })
     }
 
+    /// One owner's probe authorizations, ordered by kind and origin key.
+    pub(crate) fn authorizations_of(&self, owner: &str) -> Vec<ProbeAuthorization> {
+        let mut rows: Vec<ProbeAuthorization> = self
+            .authorizations()
+            .filter(|row| row.owner == owner)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
+        rows
+    }
+
+    /// Every stored probe clock that is not cleared, by kind and origin key.
+    pub(crate) fn live_clocks(&self) -> HashMap<(&str, &str), &Block> {
+        self.rows_of(CLOCK_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::Clock(block, None) => {
+                    Some(((block.kind.as_str(), block.origin_key.as_str()), block))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Every stored probe clock whose claim owner is `owner`, with its
+    /// `cleared_at`.
+    pub(crate) fn clocks_claimed_by(&self, owner: &str) -> Vec<(&Block, Option<i64>)> {
+        self.rows_of(CLOCK_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::Clock(block, cleared) if block.claim_owner.as_deref() == Some(owner) => {
+                    Some((block, *cleared))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Success pools, in no particular order.
     pub fn success_pools(&self) -> impl Iterator<Item = &SuccessPool> {
         self.rows_of(SUCCESS_POOL_TABLE)
@@ -1280,6 +1316,66 @@ impl crate::AccountTx<'_> {
             return Ok(BlockRows::default());
         }
         read_back(self.conn, &captured).map_err(crate::err)
+    }
+
+    /// The block tables this command decides on: the writer's working state
+    /// with the rows this command has changed so far laid over it, so a
+    /// decision sees the command's own earlier writes. `None` outside the
+    /// account writer or without a loaded state, where callers read SQL.
+    ///
+    /// The overlay is kept between calls and extended with the rows
+    /// captured since, each read back by rowid. A row changed again is
+    /// captured again, so the copy never keeps an older value of it.
+    pub fn working_blocks(
+        &self,
+    ) -> striatum_core::RouteStateResult<Option<std::borrow::Cow<'_, BlockState>>> {
+        use std::borrow::Cow;
+        let Some(base) = self.blocks.filter(|blocks| blocks.enabled()) else {
+            return Ok(None);
+        };
+        let mut overlay = self.overlay.borrow_mut();
+        let done = overlay.as_ref().map_or(0, |(applied, _)| *applied);
+        let new: Vec<(u8, i64)> = CAPTURE.with(|capture| {
+            capture
+                .borrow()
+                .as_ref()
+                .and_then(|rows| rows.get(done..))
+                .map(<[_]>::to_vec)
+                .unwrap_or_default()
+        });
+        if done == 0 && new.is_empty() {
+            return Ok(Some(Cow::Borrowed(base)));
+        }
+        let (applied, blocks) = overlay.get_or_insert_with(|| (0, base.clone()));
+        if !new.is_empty() {
+            blocks.apply(&read_back(self.conn, &new).map_err(crate::err)?);
+            *applied += new.len();
+        }
+        Ok(Some(Cow::Owned(blocks.clone())))
+    }
+}
+
+/// The error a claim or probe write returns when SQL did not hold the row
+/// the working state decided on. The writer rolls the batch back, reloads
+/// the state and runs the batch again (`account_writer::STATE_DIVERGED`).
+pub(crate) fn diverged(what: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(
+        format!("{}: {what}", crate::STATE_DIVERGED).into(),
+    )
+}
+
+/// Fail with [`diverged`] unless a keyed write changed exactly `expected` rows.
+pub(crate) fn expect_changes(
+    changed: usize,
+    expected: usize,
+    what: impl std::fmt::Display,
+) -> rusqlite::Result<()> {
+    if changed == expected {
+        Ok(())
+    } else {
+        Err(diverged(format_args!(
+            "{what}: expected {expected} changed rows, SQL changed {changed}"
+        )))
     }
 }
 

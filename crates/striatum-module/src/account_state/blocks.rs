@@ -136,6 +136,11 @@ impl AccountCommand<'_> {
     /// The working state's block tables with this command's own writes so
     /// far laid over a copy, or `None` to read SQL.
     fn working_blocks(&self) -> RouteStateResult<Option<Cow<'_, BlockState>>> {
+        // The writer gives the command's transaction the same block tables,
+        // with the command's own writes kept laid over them between reads.
+        if let Some(blocks) = self.sql.working_blocks()? {
+            return Ok(Some(blocks));
+        }
         let Some(state) = self.state.as_deref() else {
             return Ok(None);
         };

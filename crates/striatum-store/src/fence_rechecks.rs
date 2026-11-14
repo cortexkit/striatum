@@ -692,12 +692,16 @@ pub(crate) fn derive_blocks(
     Ok(loaded)
 }
 
+/// Claim `origins` on SQL after synchronizing the clocks, as a connection
+/// without the account state would.
+#[cfg(test)]
 pub(crate) fn claim(
     conn: &Connection,
     origins: &[FenceRecheck],
     now: i64,
 ) -> rusqlite::Result<bool> {
-    claim_owned(conn, origins, now, None, None, None)
+    sync(conn)?;
+    claim_decided(conn, None, origins, now, None, None, None)
 }
 
 pub(crate) fn claim_with_authorization(
@@ -706,44 +710,102 @@ pub(crate) fn claim_with_authorization(
     now: i64,
     owner: &str,
 ) -> rusqlite::Result<bool> {
-    claim_owned(conn, origins, now, None, None, Some(owner))
+    sync(conn)?;
+    claim_decided(conn, None, origins, now, None, None, Some(owner))
 }
 
-fn claim_owned(
+/// The claim fields of the probe clock that holds one origin's exact
+/// evidence, as a claim decides on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaimState {
+    quota: bool,
+    next: i64,
+    reset: Option<i64>,
+    owner: Option<String>,
+    generation: i64,
+}
+
+/// Each origin's uncleared clock that still holds the origin's evidence:
+/// from the working state when the command has one, else from SQL.
+fn claim_states(
     conn: &Connection,
+    blocks: Option<&crate::BlockState>,
+    origins: &[&FenceRecheck],
+) -> rusqlite::Result<Vec<Option<ClaimState>>> {
+    if let Some(blocks) = blocks {
+        let clocks = blocks.live_clocks();
+        return Ok(origins
+            .iter()
+            .map(|origin| {
+                clocks
+                    .get(&(origin.kind.as_str(), origin.origin_key.as_str()))
+                    .filter(|clock| {
+                        clock.evidence_at == origin.evidence_at && clock.evidence == origin.evidence
+                    })
+                    .map(|clock| ClaimState {
+                        quota: clock.lifetime == LifetimeClass::Quota,
+                        next: clock.next_recheck_at,
+                        reset: clock.reset_check_at,
+                        owner: clock.claim_owner.clone(),
+                        generation: clock.claim_generation,
+                    })
+            })
+            .collect());
+    }
+    origins
+        .iter()
+        .map(|origin| {
+            conn.query_row(
+                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
+             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
+                params![origin.kind, origin.origin_key, origin.evidence_at, origin.evidence],
+                |row| {
+                    Ok(ClaimState {
+                        quota: row.get(0)?,
+                        next: row.get(1)?,
+                        reset: row.get(2)?,
+                        owner: row.get(3)?,
+                        generation: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .collect()
+}
+
+/// Claim every origin's probe clock or none of them, deciding on `blocks`
+/// when given (the command's working state) and on SQL otherwise. The caller
+/// synchronizes the clocks first. Each clock update is keyed and names the
+/// state it was decided on; a clock SQL holds differently fails the command
+/// with [`crate::block_state::diverged`].
+fn claim_decided(
+    conn: &Connection,
+    blocks: Option<&crate::BlockState>,
     origins: &[FenceRecheck],
     now: i64,
     consume_owner: Option<&str>,
     grant_owner: Option<&str>,
     authorization: Option<&str>,
 ) -> rusqlite::Result<bool> {
-    sync(conn)?;
+    // A clock is claimed once per call, even if a caller lists its origin
+    // twice: a second update would not find the state the first one left.
+    let mut seen = std::collections::HashSet::new();
+    let origins: Vec<&FenceRecheck> = origins
+        .iter()
+        .filter(|origin| seen.insert((origin.kind.as_str(), origin.origin_key.as_str())))
+        .collect();
     // Check the entire conjunction before updating any clock. BEGIN IMMEDIATE
     // serializes distinct connections; a lost race consumes none of the clocks.
     let mut states = Vec::new();
     let mut quota_next = i64::MIN;
     let mut quota_evidence = i64::MIN;
     let mut quota_resets = Vec::new();
-    for origin in origins {
-        let state = conn
-            .query_row(
-                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
-             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
-                params![origin.kind, origin.origin_key, origin.evidence_at,origin.evidence],
-                |row| {
-                    Ok((
-                        row.get::<_, bool>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((quota, next, reset, owner, generation)) = state else {
+    for (origin, state) in origins.iter().copied().zip(claim_states(conn, blocks, &origins)?) {
+        let Some(state) = state else {
             return Ok(false);
         };
+        let ClaimState { quota, next, reset, ref owner, .. } = state;
         if quota != origin.quota {
             return Ok(false);
         }
@@ -762,7 +824,7 @@ fn claim_owned(
             quota_evidence = quota_evidence.max(origin.evidence_at);
             quota_resets.extend(reset);
         }
-        states.push((origin, owned, due, generation));
+        states.push((origin, owned, due, state));
     }
     // Quota representations of the same selected account share one periodic
     // check. A reset after its latest refusal adds a check for the whole
@@ -775,13 +837,17 @@ fn claim_owned(
     {
         return Ok(false);
     }
-    for (origin, owned, due, prior_generation) in states {
+    // The clock state each update was decided on, after the keyed columns.
+    const DECIDED: &str = "evidence=:evidence AND evidence_at=:evidence_at AND cleared_at IS NULL
+        AND quota=:quota AND next_recheck_at=:next AND reset_check_at IS :reset
+        AND claim_owner IS :owner AND claim_generation=:generation";
+    for (origin, owned, due, state) in states {
         // Admission changes the launch time but preserves the claim generation.
         // A cancellation can release only that claim, not a later request's.
         let generation = if owned && !due {
-            prior_generation
+            state.generation
         } else {
-            prior_generation.saturating_add(1)
+            state.generation.saturating_add(1)
         };
         for owner in [authorization.or(grant_owner), consume_owner]
             .into_iter()
@@ -793,26 +859,49 @@ fn claim_owned(
                 claim_generation=excluded.claim_generation",
                 params![owner,origin.kind,origin.origin_key,origin.evidence,origin.evidence_at,now,generation])?;
         }
-        if owned && !due {
-            conn.execute(
-                "UPDATE fence_recheck SET claim_owner=?3,
-                    reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END
-                    WHERE kind=?1 AND origin_key=?2",
-                params![origin.kind, origin.origin_key, grant_owner, now],
-            )?;
-            continue;
-        }
-        let interval = if origin.quota {
-            QUOTA_FENCE_RECHECK_MS
-        } else {
-            NON_QUOTA_FENCE_MAX_MS
+        let decided = rusqlite::named_params! {
+            ":kind": origin.kind, ":key": origin.origin_key, ":evidence": origin.evidence,
+            ":evidence_at": origin.evidence_at, ":quota": state.quota, ":next": state.next,
+            ":reset": state.reset, ":owner": state.owner, ":generation": state.generation,
+            ":grant": grant_owner, ":now": now,
         };
-        conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=?4,claim_owner=?5,claim_generation=?6,
-            reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END WHERE kind=?1 AND origin_key=?2",
-            params![origin.kind,origin.origin_key,now.saturating_add(interval),now,grant_owner,generation])?;
+        let changed = if owned && !due {
+            conn.execute(
+                &format!(
+                    "UPDATE fence_recheck SET claim_owner=:grant,
+                    reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
+                    WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
+                ),
+                decided,
+            )?
+        } else {
+            let interval = if origin.quota {
+                QUOTA_FENCE_RECHECK_MS
+            } else {
+                NON_QUOTA_FENCE_MAX_MS
+            };
+            let mut with_next = decided.to_vec();
+            let next = now.saturating_add(interval);
+            with_next.push((":renewed", &next as &dyn rusqlite::ToSql));
+            with_next.push((":generation_new", &generation as &dyn rusqlite::ToSql));
+            conn.execute(
+                &format!(
+                    "UPDATE fence_recheck SET next_recheck_at=:renewed,last_claimed_at=:now,claim_owner=:grant,
+                    claim_generation=:generation_new,reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
+                    WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
+                ),
+                with_next.as_slice(),
+            )?
+        };
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("claim of {} {}", origin.kind, origin.origin_key),
+        )?;
     }
     Ok(true)
 }
+
 
 impl SqliteRouteStateStore {
     pub fn load_blocks(&self, now: i64) -> RouteStateResult<LoadedBlocks> {
@@ -1123,8 +1212,7 @@ impl AccountTx<'_> {
         }
         if origins.iter().all(|origin| origin.claim_owner.as_deref() == Some(from)) {
             self.transfer_probe_authorization(from, decision)?;
-            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
-                params![from,decision]).map_err(err)?;
+            self.rebind_claim_owner(from, decision)?;
         } else if !self.grant_fence_rechecks(origins, now, Some(decision))? {
             return Ok(false);
         }
@@ -1142,6 +1230,20 @@ impl AccountTx<'_> {
     pub fn probe_report_matches(&self, owner: &str, credential: Option<&str>, preserve: bool) -> RouteStateResult<bool> {
         if !enabled(self.conn).map_err(err)? { return Ok(true); }
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            let authorizations = blocks.authorizations_of(owner);
+            if authorizations.is_empty() { return Ok(true); }
+            if preserve { return Ok(false); }
+            let clocks = blocks.live_clocks();
+            let current = authorizations.iter().any(|authorization| {
+                clocks.get(&(authorization.kind.as_str(), authorization.origin_key.as_str())).is_some_and(|clock| {
+                    clock.evidence == authorization.evidence && clock.evidence_at == authorization.evidence_at
+                        && clock.claim_generation == authorization.claim_generation
+                })
+            });
+            if !current { return Ok(false); }
+            return self.decision_names_credential(owner, credential);
+        }
         let authorized: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)", [owner], |row| row.get(0)).map_err(err)?;
         if !authorized { return Ok(true); }
@@ -1152,9 +1254,75 @@ impl AccountTx<'_> {
              AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation
              WHERE a.owner=?1 AND r.cleared_at IS NULL)", [owner], |row| row.get(0)).map_err(err)?;
         if !current { return Ok(false); }
+        self.decision_names_credential(owner, credential)
+    }
+
+    /// Whether the decision's remembered serving identity names `credential`;
+    /// true when no credential is reported.
+    fn decision_names_credential(&self, decision: &str, credential: Option<&str>) -> RouteStateResult<bool> {
         let Some(credential) = credential else { return Ok(true); };
         self.conn.query_row("SELECT COALESCE(json_extract(provider_identity_json,'$.credentialId')=?2,0)
-            FROM model_route_decisions WHERE id=?1", params![owner,credential], |row| row.get(0)).map_err(err)
+            FROM model_route_decisions WHERE id=?1", params![decision,credential], |row| row.get(0)).map_err(err)
+    }
+
+    /// Claim, renew or consume `origins`' clocks for the named owners after
+    /// synchronizing them, deciding on the working state when the command
+    /// has one.
+    fn claim_owned(
+        &self,
+        origins: &[FenceRecheck],
+        now: i64,
+        consume_owner: Option<&str>,
+        grant_owner: Option<&str>,
+        authorization: Option<&str>,
+    ) -> RouteStateResult<bool> {
+        sync(self.conn).map_err(err)?;
+        let blocks = self.working_blocks()?;
+        claim_decided(self.conn, blocks.as_deref(), origins, now, consume_owner, grant_owner, authorization)
+            .map_err(err)
+    }
+
+    /// Hand every clock claimed by `from` to `to`. With a working state each
+    /// clock is updated by key and must still hold the claim the state shows.
+    fn rebind_claim_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        let Some(blocks) = self.working_blocks()? else {
+            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                params![from,to]).map_err(err)?;
+            return Ok(());
+        };
+        for (clock, _) in blocks.clocks_claimed_by(from) {
+            let changed = self.conn.execute("UPDATE fence_recheck SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
+                AND claim_owner=?4 AND evidence=?5 AND evidence_at=?6 AND claim_generation=?7",
+                params![clock.kind,clock.origin_key,to,from,clock.evidence,clock.evidence_at,clock.claim_generation]).map_err(err)?;
+            crate::block_state::expect_changes(changed, 1,
+                format_args!("rebind of {} {} from {from}", clock.kind, clock.origin_key)).map_err(err)?;
+        }
+        Ok(())
+    }
+
+    /// Delete every probe authorization `owner` holds. With a working state
+    /// each row is deleted by key and must hold the values the state shows,
+    /// and none may be left over.
+    fn delete_authorizations(
+        &self,
+        owner: &str,
+        held: Option<&[crate::block_state::ProbeAuthorization]>,
+    ) -> RouteStateResult<()> {
+        if let Some(held) = held {
+            for row in held {
+                let changed = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
+                    AND evidence=?4 AND evidence_at=?5 AND claimed_at=?6 AND claim_generation=?7",
+                    params![owner,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
+                crate::block_state::expect_changes(changed, 1,
+                    format_args!("authorization of {owner} for {} {}", row.kind, row.origin_key)).map_err(err)?;
+            }
+        }
+        let left = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+        if held.is_some() {
+            crate::block_state::expect_changes(left, 0, format_args!("authorizations of {owner} the state does not hold"))
+                .map_err(err)?;
+        }
+        Ok(())
     }
 
     /// Failure consumes the exact authorized generation from the time it was
@@ -1271,14 +1439,38 @@ impl AccountTx<'_> {
             released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
-            self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
-                 claim_generation=claim_generation+1
-                WHERE r.cleared_at IS NULL AND EXISTS (
-                    SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
-                      AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
-                      AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
-                params![owner,now]).map_err(err)?;
-            self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+            match self.working_blocks()? {
+                Some(blocks) => {
+                    let held = blocks.authorizations_of(&owner);
+                    let clocks = blocks.live_clocks();
+                    for row in &held {
+                        let current = clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
+                            clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                                && clock.claim_generation == row.claim_generation
+                        });
+                        if !current {
+                            continue;
+                        }
+                        let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
+                            claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND cleared_at IS NULL
+                            AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6",
+                            params![row.kind,row.origin_key,now,row.evidence,row.evidence_at,row.claim_generation]).map_err(err)?;
+                        crate::block_state::expect_changes(changed, 1,
+                            format_args!("release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+                    }
+                    self.delete_authorizations(&owner, Some(&held))?;
+                }
+                None => {
+                    self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
+                         claim_generation=claim_generation+1
+                        WHERE r.cleared_at IS NULL AND EXISTS (
+                            SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
+                              AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
+                              AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
+                        params![owner,now]).map_err(err)?;
+                    self.delete_authorizations(&owner, None)?;
+                }
+            }
             if self.mark_admission_expired(&principal, &admission)? {
                 released.expired.push((principal, admission));
             }
@@ -1296,6 +1488,16 @@ impl AccountTx<'_> {
         model: &str,
     ) -> RouteStateResult<bool> {
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            let clocks = blocks.live_clocks();
+            return Ok(blocks.authorizations_of(owner).iter().any(|row| {
+                clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
+                    clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.scope.credential_id.as_deref() == Some(credential)
+                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
+                })
+            }));
+        }
         self.conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a
@@ -1312,6 +1514,20 @@ impl AccountTx<'_> {
     pub fn transfer_probe_authorization(&self, from: &str, to: &str) -> RouteStateResult<()> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
+        }
+        if let Some(blocks) = self.working_blocks()? {
+            // Moving an owner's rows to itself changes nothing.
+            if from == to {
+                return Ok(());
+            }
+            let held = blocks.authorizations_of(from);
+            for row in &held {
+                self.conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
+                    evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,claim_generation=excluded.claim_generation",
+                    params![to,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
+            }
+            return self.delete_authorizations(from, Some(&held));
         }
         self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
             FROM fence_probe_authorization WHERE owner=?1
@@ -1507,7 +1723,7 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, None, owner).map_err(err)
+        self.claim_owned(origins, now, owner, None, owner)
     }
     pub fn claim_fence_rechecks_for_authorized_admission(
         &self,
@@ -1516,7 +1732,7 @@ impl AccountTx<'_> {
         owner: Option<&str>,
         admission: &str,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, None, Some(admission)).map_err(err)
+        self.claim_owned(origins, now, owner, None, Some(admission))
     }
     pub fn grant_fence_rechecks(
         &self,
@@ -1524,7 +1740,7 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, owner, owner).map_err(err)
+        self.claim_owned(origins, now, owner, owner, owner)
     }
     /// Success can heal only evidence older than this request's admission. A
     /// late completion of an older run must not erase a more recent refusal.
@@ -1747,7 +1963,7 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<bool> {
-        claim(self.conn, origins, now).map_err(err)
+        self.claim_owned(origins, now, None, None, None)
     }
 }
 
