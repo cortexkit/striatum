@@ -17,10 +17,12 @@ use subc_protocol::FrameType;
 use crate::routing_v1::{
     conformance_tests::{reserved, Harness, Route},
     consumers, describe,
+    engines::MEDIA_KINDS,
 };
 
 const NOW: i64 = 1_750_000_000_000;
 const VOICE: &str = "colliculus.voice_message";
+const DICTATION: &str = "colliculus.dictation_token";
 
 fn served_row(route: &str) -> Value {
     let payloads: Value =
@@ -103,6 +105,51 @@ fn voice_request() -> Value {
         "requirements":{"duration_ms":30000,"format":"audio/wav"}})
 }
 
+fn fixture_for_dictation(with_realtime: bool) -> Arc<Harness> {
+    let harness = super::super::setup(vec![]);
+    let mut media: Value = serde_json::from_str(include_str!(
+        "../../fixtures/colliculus-media-v1/media-role-describe.json"
+    ))
+    .unwrap();
+    let routing: Value = serde_json::from_str(include_str!(
+        "../../fixtures/colliculus-media-v1/routing-v1-declaration.json"
+    ))
+    .unwrap();
+    assert_eq!(media["engines"].as_array().unwrap().len(), 9);
+    assert_eq!(routing["consumers"].as_array().unwrap().len(), 5);
+    if !with_realtime {
+        // Keep stream_transcribe: the same model cannot satisfy a different kind.
+        media["engines"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|engine| engine["kind"] != "realtime");
+        assert_eq!(media["engines"].as_array().unwrap().len(), 8);
+    }
+    consumers::replace_catalog(&json!([{
+        "module_id":"colliculus", "nonce_verified":true, "role_declarations":{
+            "routing/v1":routing, "media-provider/v1":media
+        }
+    }]));
+    harness.edit_config(|config| {
+        config["consumers"][DICTATION] = json!({"mode":"demand","iq":40});
+    });
+    let mut key = super::super::key("opaque-openai-media");
+    key.provider_ids = vec!["openai".into()];
+    harness.set_credentials(super::super::media_credentials(vec![key]));
+    let mut live = served_row("openai/gpt-live-transcribe");
+    live["quality.grade"] = json!(80);
+    let catalog = json!({
+        "catalog_version":41,"resolved_at_ms":NOW,
+        "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
+        "models":{"openai/gpt-live-transcribe":live}
+    });
+    let snapshot =
+        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
+            .unwrap();
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    harness
+}
+
 #[derive(Default)]
 struct Samples(BTreeMap<String, Vec<u8>>);
 
@@ -127,12 +174,8 @@ impl Samples {
                 assert_eq!(result["engine"]["module"], "colliculus");
             }
             assert_eq!(result["expires_at_ms"], NOW + 600_000);
-            let request = parse_select_media_request(
-                params,
-                &describe::capabilities(),
-                &["transcribe", "synthesize"],
-            )
-            .unwrap();
+            let request =
+                parse_select_media_request(params, &describe::capabilities(), MEDIA_KINDS).unwrap();
             let answer: SelectMediaAnswer = serde_json::from_value(result.clone()).unwrap();
             check_answer(&request, &answer).unwrap();
             // A typed round-trip also rejects extra wire members that serde would ignore.
@@ -299,7 +342,33 @@ async fn serving_bytes_match_media_vectors() {
     capture_refusals(&mut samples).await;
     capture_unavailable(&mut samples).await;
     capture_phone_languages(&mut samples).await;
+    capture_dictation(&mut samples).await;
     samples.verify();
+}
+
+async fn capture_dictation(samples: &mut Samples) {
+    let request = json!({"consumer":DICTATION,"kind":"realtime",
+        "requirements":{},"privacy":"remote_allowed"});
+    for (name, with_realtime) in [
+        ("dictation-token-realtime", true),
+        ("dictation-token-no-engine", false),
+    ] {
+        let harness = fixture_for_dictation(with_realtime);
+        let phone = harness.bind(reserved("callosum"), None).await;
+        let selected = samples
+            .capture(
+                name,
+                &harness,
+                &phone,
+                &request,
+                with_realtime.then_some("gpt-live-transcribe"),
+            )
+            .await;
+        if with_realtime {
+            assert_eq!(selected["result"]["engine"]["provider"], "openai");
+            assert_eq!(selected["result"]["engine"]["caller_local"], false);
+        }
+    }
 }
 
 async fn capture_phone_languages(samples: &mut Samples) {
