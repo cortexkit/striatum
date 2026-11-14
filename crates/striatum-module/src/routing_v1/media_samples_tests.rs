@@ -11,6 +11,7 @@ use cortexkit_role_routing::select_media::{
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use striatum_core::{route_state_store::RouteStateUpdate, RouteStateStore};
 use subc_protocol::FrameType;
 
 use crate::routing_v1::{
@@ -129,14 +130,45 @@ impl Samples {
             assert_eq!(value["code"], "no_route", "{name}: {value}");
             assert_eq!(value["detail"], json!({"reason":"no_available_model"}));
         }
+        self.insert(name, &request, &reply.body);
+        value
+    }
+
+    async fn capture_method(
+        &mut self,
+        name: &str,
+        harness: &Harness,
+        route: &Route,
+        method: &str,
+        params: &Value,
+        error: Option<(&str, Option<Value>)>,
+    ) -> Value {
+        let frame = route.request_frame(method, params);
+        let request = frame.body.clone();
+        let reply = harness.handle(frame).await;
+        let value: Value = serde_json::from_slice(&reply.body).unwrap();
+        if let Some((code, detail)) = error {
+            assert_eq!(reply.header.ty, FrameType::Error, "{name}: {value}");
+            assert_eq!(value["code"], code, "{name}: {value}");
+            if let Some(detail) = detail {
+                assert_eq!(value["detail"], detail, "{name}: {value}");
+            }
+            assert!(value.get("retry_at_ms").is_none(), "{name}: {value}");
+        } else {
+            assert_eq!(reply.header.ty, FrameType::Response, "{name}: {value}");
+        }
+        self.insert(name, &request, &reply.body);
+        value
+    }
+
+    fn insert(&mut self, name: &str, request: &[u8], reply: &[u8]) {
         // Keep the captured bodies verbatim; reserializing would hide wire-order drift.
         let mut pair = b"{\"request\":".to_vec();
-        pair.extend_from_slice(&request);
+        pair.extend_from_slice(request);
         pair.extend_from_slice(b",\"reply\":");
-        pair.extend_from_slice(&reply.body);
+        pair.extend_from_slice(reply);
         pair.push(b'}');
         assert!(self.0.insert(format!("{name}.json"), pair).is_none());
-        value
     }
 
     fn verify(self) {
@@ -191,6 +223,7 @@ async fn serving_bytes_match_media_vectors() {
         )
         .await;
     assert_eq!(selected["result"]["price"]["basis"], "metered");
+    let decision = selected["result"]["decision_id"].clone();
     assert_eq!(
         selected["result"]["price"]["rates"]["input_audio.per_second"]["rate"],
         0.000075
@@ -250,6 +283,9 @@ async fn serving_bytes_match_media_vectors() {
         config["consumers"][VOICE]["mode"] = json!("demand");
     });
     capture_phone_voice(&mut samples, &harness, &phone).await;
+    capture_redemption(&mut samples, &harness, &colliculus, &decision).await;
+    capture_refusals(&mut samples).await;
+    capture_unavailable(&mut samples).await;
     samples.verify();
 }
 
@@ -274,6 +310,359 @@ async fn capture_phone_voice(samples: &mut Samples, harness: &Harness, phone: &R
     assert_eq!(selected["result"]["engine"]["index"], 0);
     assert!(selected["result"]["engine"].get("module").is_none());
     assert!(selected["result"].get("price").is_none());
+}
+
+async fn capture_redemption(
+    samples: &mut Samples,
+    harness: &Arc<Harness>,
+    executor: &Route,
+    decision: &Value,
+) {
+    let mut request = json!({
+        "admission_id":"media-before-expiry","conversation_key":"voice-message",
+        "provider":"media-vendor","model":"fixture-transcribe",
+        "decision_id":decision,"hold_wait_max_s":0
+    });
+    let admitted = samples
+        .capture_method(
+            "decision-admitted",
+            harness,
+            executor,
+            "route.account_for",
+            &request,
+            None,
+        )
+        .await;
+    assert_eq!(admitted["result"]["admission"]["state"], "reserved");
+    assert_eq!(
+        admitted["result"]["account"]["provider"],
+        request["provider"]
+    );
+    let binding = harness
+        .store()
+        .v1_decision(decision.as_str().unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.runner_module, "colliculus");
+    assert_eq!(binding.provider, request["provider"].as_str().unwrap());
+    assert_eq!(binding.model, request["model"].as_str().unwrap());
+
+    let foreign = harness.bind(reserved("stranger"), None).await;
+    request["admission_id"] = json!("media-wrong-caller");
+    samples
+        .capture_method(
+            "decision-caller-mismatch",
+            harness,
+            &foreign,
+            "route.account_for",
+            &request,
+            Some(("account_not_authorized", None)),
+        )
+        .await;
+
+    harness.credentials().lock().unwrap().engine_clock_offset_ms = 600_001;
+    request["admission_id"] = json!("media-after-expiry");
+    samples
+        .capture_method(
+            "decision-expired",
+            harness,
+            executor,
+            "route.account_for",
+            &request,
+            Some(("unknown_decision", None)),
+        )
+        .await;
+    harness.credentials().lock().unwrap().engine_clock_offset_ms = 0;
+}
+
+async fn capture_refusals(samples: &mut Samples) {
+    let harness = fixture();
+    let phone = harness.bind(reserved("callosum"), None).await;
+    for (name, patch, code, field) in [
+        (
+            "unknown-consumer",
+            json!({"consumer":"unknown.media"}),
+            "unknown_consumer",
+            None,
+        ),
+        (
+            "invalid-request",
+            json!({"effect_id":"not-supported"}),
+            "invalid_request",
+            Some("effect_id"),
+        ),
+        (
+            "kind-mismatch",
+            json!({"kind":"synthesize"}),
+            "invalid_request",
+            Some("kind"),
+        ),
+        (
+            "invalid-requirements",
+            json!({"requirements":{"duration_ms":-1}}),
+            "invalid_requirements",
+            Some("duration_ms"),
+        ),
+        (
+            "requirements-unmet",
+            json!({"requirements":{"language":"fr"}}),
+            "no_route",
+            None,
+        ),
+    ] {
+        let mut request = voice_request();
+        for (key, value) in patch.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        let detail = (code == "no_route").then(|| json!({"reason":"no_available_model"}));
+        let reply = samples
+            .capture_method(
+                name,
+                &harness,
+                &phone,
+                "route.select",
+                &request,
+                Some((code, detail)),
+            )
+            .await;
+        if let Some(field) = field {
+            assert_eq!(reply["detail"]["field"], field);
+        }
+    }
+    for (name, principal) in [
+        ("caller-not-owner", reserved("stranger")),
+        ("caller-direct", json!({"kind":"direct"})),
+    ] {
+        let route = harness.bind(principal, None).await;
+        samples
+            .capture_method(
+                name,
+                &harness,
+                &route,
+                "route.select",
+                &voice_request(),
+                Some(("consumer_not_owned", None)),
+            )
+            .await;
+    }
+    let channel = harness.reserve_channel();
+    let flow = harness.bind_frame(json!({
+        "op":"route.bind","route_channel":channel,"epoch":1,
+        "target":{"kind":"management_surface","module_id":crate::DEFAULT_MODULE_ID},
+        "identity":{"project_root":cortexkit_test_support::scratch_root(),"harness":"media-samples","session":"flow-session"},
+        "principal":reserved("callosum"),
+        "scope":{"owner":reserved("callosum"),"ref":"phone-media-flow","scope_epoch":1,
+            "kind":"head","owner_authorized":false,"attributes":{"flow_id":"fixture-flow"}}
+    }), channel, 1).await;
+    samples
+        .capture_method(
+            "flow-scope-not-supported",
+            &harness,
+            &flow,
+            "route.select",
+            &voice_request(),
+            Some(("flow_scope_not_supported", None)),
+        )
+        .await;
+
+    consumers::replace_catalog(&json!([{"module_id":"colliculus","nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":[{"name":VOICE,"kind":"transcribe","selectors":["callosum"]}]}}}]));
+    samples
+        .capture_method(
+            "no-engines",
+            &harness,
+            &phone,
+            "route.select",
+            &voice_request(),
+            Some(("no_route", Some(json!({"reason":"no_available_model"})))),
+        )
+        .await;
+
+    consumers::replace_catalog(
+        &json!([{"module_id":"colliculus","nonce_verified":true,"role_declarations":{
+            "routing/v1":{"consumers":[{"name":"colliculus.video","kind":"video","selectors":["callosum"]}]},
+        "media-provider/v1":{"engines":[{"kind":"video","provider":"media-vendor","model":"fixture-video","local":false,
+            "formats":["video/mp4"],"languages":["en"],"latency_class":"interactive"}]}
+        }}]),
+    );
+    let video = json!({"consumer":"colliculus.video","kind":"video","privacy":"remote_allowed",
+        "requirements":{"output_duration_ms":1000}});
+    samples
+        .capture_method(
+            "missing-capability",
+            &harness,
+            &phone,
+            "route.select",
+            &video,
+            Some(("no_route", Some(json!({"reason":"missing_capability"})))),
+        )
+        .await;
+}
+
+async fn capture_unavailable(samples: &mut Samples) {
+    for cause in [
+        "route-cooldown",
+        "route-quota-exhausted",
+        "route-failure-backoff",
+        "credential-entitlement-fenced",
+        "credential-billing-fenced",
+        "credential-refused",
+        "pool-billing-wall",
+        "pool-rate-limit-wall",
+        "account-route-fence",
+        "listing-missing",
+        "listing-stale",
+        "listing-failed",
+        "listing-grant-missing",
+        "no-admissible-media-credential",
+    ] {
+        let harness = fixture();
+        let until = NOW + 60_000;
+        let store = harness.store();
+        match cause {
+            "route-cooldown" | "route-quota-exhausted" | "route-failure-backoff" => {
+                for model in ["fixture-transcribe", "fixture-premium"] {
+                    let key = format!("media-vendor/{model}");
+                    store
+                        .update_route_state(
+                            &key,
+                            &key,
+                            &RouteStateUpdate {
+                                cooldown_until: (cause == "route-cooldown").then_some(until as f64),
+                                quota_exhausted_until: (cause == "route-quota-exhausted")
+                                    .then_some(until as f64),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    if cause == "route-failure-backoff" {
+                        rusqlite::Connection::open(harness.store_path()).unwrap().execute(
+                            "UPDATE model_route_state SET failure_backoff_until=?1 WHERE route_key=?2",
+                            rusqlite::params![until, key],
+                        ).unwrap();
+                    }
+                }
+                if cause == "route-failure-backoff" {
+                    // Publish the external SQL commit to the writer's account snapshot.
+                    store.reload_account_state_for_test().unwrap();
+                }
+            }
+            "credential-entitlement-fenced"
+            | "credential-billing-fenced"
+            | "credential-refused" => {
+                store
+                    .record_credential_entitlement_fence(
+                        &striatum_core::route_state_store::CredentialRefusal {
+                            provider_id: "media-vendor".into(),
+                            credential_id: "opaque-media".into(),
+                            code: match cause {
+                                "credential-entitlement-fenced" => "ENTITLEMENT_ERROR",
+                                "credential-billing-fenced" => "billing_exhausted",
+                                _ => "credential_refused",
+                            }
+                            .into(),
+                        },
+                        None,
+                        NOW,
+                    )
+                    .unwrap();
+            }
+            "pool-billing-wall" | "pool-rate-limit-wall" => {
+                store
+                    .pool_wall(
+                        "media-vendor",
+                        "opaque-media",
+                        if cause == "pool-billing-wall" {
+                            striatum_store::PoolWallKind::Billing
+                        } else {
+                            striatum_store::PoolWallKind::RateLimited
+                        },
+                        until,
+                        "synthetic provider wall",
+                        NOW,
+                    )
+                    .unwrap();
+            }
+            "account-route-fence" => {
+                for model in ["fixture-transcribe", "fixture-premium"] {
+                    store
+                        .record_account_route_fence(&striatum_store::AccountRouteFence {
+                            provider: "media-vendor".into(),
+                            credential_id: "opaque-media".into(),
+                            model: model.into(),
+                            until_ms: until,
+                            decision_id: String::new(),
+                            recorded_at: NOW,
+                        })
+                        .unwrap();
+                }
+            }
+            _ => {
+                let mut row = super::super::key("opaque-media");
+                if cause == "no-admissible-media-credential" {
+                    row.categories = vec!["llm-provider".into()];
+                }
+                let mut credentials = crate::broca_credentials::BrocaCredentials::default();
+                if cause != "listing-missing" {
+                    credentials.apply_listing(
+                        &super::super::listing(vec![row], cause != "listing-grant-missing"),
+                        if cause == "listing-stale" {
+                            1
+                        } else {
+                            NOW as u64
+                        },
+                    );
+                }
+                if cause == "listing-failed" {
+                    credentials.note_failure("synthetic listing failure");
+                }
+                credentials.catalog_snapshot = harness
+                    .credentials()
+                    .lock()
+                    .unwrap()
+                    .catalog_snapshot
+                    .clone();
+                harness.set_credentials(credentials);
+            }
+        }
+        let phone = harness.bind(reserved("callosum"), None).await;
+        let mut captured = Samples::default();
+        captured
+            .capture_method(
+                "reachability-unavailable",
+                &harness,
+                &phone,
+                "route.select",
+                &voice_request(),
+                Some(("no_route", Some(json!({"reason":"no_available_model"})))),
+            )
+            .await;
+        let (name, pair) = captured.0.pop_first().unwrap();
+        if let Some(previous) = samples.0.get(&name) {
+            // These causes intentionally share one sample only while every wire byte agrees.
+            assert_eq!(previous, &pair, "reachability cause {cause}");
+        } else {
+            samples.0.insert(name, pair);
+        }
+    }
+
+    let harness = fixture();
+    let phone = harness.bind(reserved("callosum"), None).await;
+    // Removing an actual selection table exercises storage failure through the handler.
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute("DROP TABLE routing_engine_eval", [])
+        .unwrap();
+    samples
+        .capture_method(
+            "store-error",
+            &harness,
+            &phone,
+            "route.select",
+            &voice_request(),
+            Some(("store_error", None)),
+        )
+        .await;
 }
 
 #[tokio::test]
