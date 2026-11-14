@@ -977,18 +977,20 @@ async fn broca_decision_tier_pool_admit() -> (std::sync::Arc<Harness>, Route, Va
 }
 
 #[tokio::test]
-async fn broca_foreign_candidates_keep_unavailable_with_exclusions() {
+async fn broca_foreign_candidates_are_unservable_with_credential_ids() {
     let _clock = crate::InjectedClock::set(NOW as u64);
     let (_harness, runner, params) = broca_decision_tier_pool_admit().await;
     crate::take_operator_warnings();
     let (ty, reply) = runner.call("route.account_for", &params).await;
     assert_eq!(ty, subc_protocol::FrameType::Error, "{reply}");
-    assert_eq!(reply["code"], "account_selection_unavailable", "{reply}");
+    assert_eq!(reply["code"], "account_unservable", "{reply}");
     assert_eq!(
-        reply["detail"]["exclusions"],
-        json!([{
-            "account_id":"acct-openai-a", "reason":"not_in_runner_candidates",
-        }]),
+        reply["detail"],
+        json!({"reason":"candidates_disjoint",
+            "offered_credential_ids":["oauth:anthropic:example-a", "oauth:anthropic:example-b"],
+            "offered_credential_count":2,
+            "eligible_credential_ids":["oauth:openai:example-a"],
+            "eligible_credential_count":1}),
         "{reply}"
     );
     let lines = crate::take_operator_warnings();

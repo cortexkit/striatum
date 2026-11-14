@@ -5442,29 +5442,22 @@ fn prepare_and_admit(
             ) {
                 return Err(reply);
             }
-            if roster
-                .roster
-                .as_ref()
-                .is_none_or(|roster| roster.accounts.is_empty())
-            {
+            if let Some(reply) = disjoint_candidates_refusal(&parsed, ctx, &roster, class) {
+                return Err(reply);
+            }
+            if roster.roster.as_ref().is_none_or(|roster| roster.accounts.is_empty()) {
+                // No eligible set is available to prove a stable disagreement.
+                // Keep temporary exclusions on the existing retry path.
                 let accounts: BTreeSet<_> = classes.facts.iter()
                     .filter(|fact| fact.provider_id == provider && fact.model_id == normalize(&parsed.model))
                     .flat_map(|fact| classes.class(fact, class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly).rows)
-                    .map(|row| classes.account_id(row).to_owned())
-                    .collect();
-                return Err(because(
-                    "candidates_filter",
-                    // An empty candidate list needs a permanent refusal, not
-                    // a timed retry or reauthentication. The pinned routing
-                    // contract does not yet declare account_selection_unsupported;
-                    // retain the existing code until that contract addition lands.
-                    OpReply::typed(
-                        "account_selection_unavailable",
-                        "The runner's candidate list leaves out every account that can serve this model, so routing admitted none. Each exclusion names an account the runner didn't offer. Offer those accounts as candidates, or send no candidate list to let routing choose.",
-                        json!({"code":"account_selection_unavailable", "retry_after_s":null, "decision_id":null,
+                    .map(|row| classes.account_id(row).to_owned()).collect();
+                return Err(because("candidates_filter", OpReply::typed(
+                    "account_selection_unavailable",
+                    "The runner's candidate list leaves out every account that can serve this model, so routing admitted none. Each exclusion names an account the runner didn't offer. Offer those accounts as candidates, or send no candidate list to let routing choose.",
+                    json!({"code":"account_selection_unavailable", "retry_after_s":null, "decision_id":null,
                         "exclusions":accounts.into_iter().map(|account| json!({"account_id":account,"reason":"not_in_runner_candidates"})).collect::<Vec<_>>()}),
-                    ),
-                ));
+                )));
             }
         } else if roster
             .roster
@@ -5610,6 +5603,12 @@ fn prepare_roster(
     if let Some(id) = parsed.model_decision_id.as_deref() {
         match ctx.store.decision_service_tier(id) {
             Ok(Some((tier, allowed))) => {
+                if cortexkit_role_routing::service_tier::ServiceTier::parse(&tier).is_none() {
+                    return Err(unservable_refusal(
+                        cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
+                        vec![], vec![],
+                    ));
+                }
                 // A decision made by the older select (every core mason launch)
                 // has no v1 row naming its runner. The runner asking is then the
                 // one that will serve the run, so its tier support is checked.
@@ -5745,13 +5744,70 @@ fn service_tier_refusal_detail(
     detail
 }
 
-fn bound_service_tier_refusal(params: &AccountForParams) -> OpReply {
+fn unservable_refusal(
+    reason: cortexkit_role_routing::errors::AccountUnservableReason,
+    offered: Vec<String>,
+    eligible: Vec<String>,
+) -> OpReply {
+    let refusal = cortexkit_role_routing::errors::Refusal::account_unservable(reason, offered, eligible);
+    OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
+}
+
+fn disjoint_candidates_refusal(
+    params: &AccountForParams,
+    ctx: &Ctx<'_>,
+    roster: &RosterBuild,
+    class: striatum_core::accounts::AllowedAccountClass,
+) -> Option<OpReply> {
+    let candidates = params.candidates.as_ref()?;
+    if roster.roster.iter().flat_map(|r| &r.accounts).any(|account| {
+        account.credentials.iter().any(|credential| {
+            candidates.accounts.iter().any(|candidate| {
+                candidate.account_id == account.account_id
+                    && candidate.credential_id == credential.credential_id
+            })
+        })
+    }) {
+        return None;
+    }
+    let classes = ctx.classes.as_ref()?;
+    let eligible_rows: Vec<_> = classes.facts.iter()
+        .filter(|fact| fact.provider_id == normalize(&params.provider)
+            && fact.model_id == normalize(&params.model))
+        .flat_map(|fact| classes.eligible_rows(
+            classes.class(fact, class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly).rows,
+            fact,
+        ))
+        .collect();
+    let eligible: BTreeSet<_> = eligible_rows.iter().map(|row| row.id.clone()).collect();
+    // Temporary exclusions are not a disagreement with the runner's list.
+    if eligible.is_empty()
+        || candidates.accounts.iter().any(|candidate| eligible.contains(&candidate.credential_id))
+    {
+        return None;
+    }
+    let accounts: BTreeSet<_> = eligible_rows.iter().map(|row| classes.account_id(row)).collect();
+    crate::account_refusal_log::allocator_refusal(&json!({"exclusions":
+        accounts.into_iter().map(|account| json!({
+            "account_id":account, "reason":"not_in_runner_candidates",
+        })).collect::<Vec<_>>()
+    }));
+    Some(because("candidates_filter", unservable_refusal(
+        cortexkit_role_routing::errors::AccountUnservableReason::CandidatesDisjoint,
+        candidates.accounts.iter().map(|candidate| candidate.credential_id.clone())
+            .collect::<BTreeSet<_>>().into_iter().collect(),
+        eligible.into_iter().collect(),
+    )))
+}
+
+fn bound_service_tier_refusal(_params: &AccountForParams) -> OpReply {
     checking("bound_service_tier");
-    OpReply::typed(
-        "account_selection_unavailable",
-        "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
-        service_tier_refusal_detail(params, "bound_service_tier_unavailable", None),
-    )
+    let mut refusal = cortexkit_role_routing::errors::Refusal::account_unservable(
+        cortexkit_role_routing::errors::AccountUnservableReason::BoundTierUnavailable,
+        vec![], vec![],
+    );
+    refusal.message = "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.".into();
+    OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
 }
 
 fn prepare_service_tier(
@@ -5773,9 +5829,9 @@ fn prepare_service_tier(
     // credentials. Do not step down or re-rank that stored credential set.
     if let Some((tier, _)) = bound {
         let tier = ServiceTier::parse(&tier).ok_or_else(|| {
-            OpReply::error(
-                "account_selection_unavailable",
-                "The service tier recorded on this routing decision isn't one routing knows, so it can't keep an account bound to it. Ask routing for a new decision.",
+            unservable_refusal(
+                cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
+                vec![], vec![],
             )
         })?;
         parsed.service_tier_bound = !tier.is_standard();
@@ -5978,8 +6034,7 @@ fn lost_probe_refusal(until: i64, now: i64, decision_id: Value, exclusions: Valu
 /// beats `account_not_authorized`.
 /// Return `None` when serving credentials exist but the calling model-execution
 /// module offers none of them in its candidate list. The allocator preserves
-/// that disagreement as unavailable with `not_in_runner_candidates` exclusions,
-/// rather than requiring sign-in.
+/// that disagreement as permanent `account_unservable`, rather than requiring sign-in.
 fn empty_roster_refusal(
     classes: &ClassContext,
     provider: &str,

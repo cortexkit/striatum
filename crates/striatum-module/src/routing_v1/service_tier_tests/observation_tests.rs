@@ -520,9 +520,8 @@ async fn current_positive_withdrawal_refuses_bound_fast_without_a_retry_or_step_
         let runner = harness.bind(reserved("broca"), None).await;
         let refused = runner.call("route.account_for", &request).await;
         assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-        assert_eq!(refused.1["code"], "account_selection_unavailable");
-        assert!(refused.1["detail"]["retry_after_s"].is_null());
-        assert_candidate_detail(&refused.1, &request, "bound_service_tier_unavailable");
+        assert_eq!(refused.1["code"], "account_unservable");
+        assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
         assert!(
             refused.1["detail"].get("retry_after_ms").is_none(),
             "{}",
