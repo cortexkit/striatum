@@ -12,8 +12,9 @@
 //! with the provider cooldown row, is built from the state's route and
 //! provider rows.
 //!
-//! Reads inside the writer are listed, not forbidden: the store's own sync
-//! and report statements still read the block tables there. The claim and
+//! Reads inside the writer are forbidden too, except on the two pool paths
+//! (pool acquisition, and a finished run that ends its lease), where the
+//! pool group still syncs clocks and reads key states on SQL. The claim and
 //! probe decisions (claims, decision-probe binding, report matching,
 //! authorization transfer and the check that a probe authorization names a
 //! reported credential) and the
@@ -319,6 +320,17 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             store.block_tables_written_outside_command()
         );
         let seen = trace.take();
+        // The clock synchronization (`sync`/`register`) decides on the
+        // command's working state, so no command reads the block tables on
+        // the writer, except where pool lease state still syncs and reads
+        // them on SQL ("pool key states").
+        if !matches!(op, "pool_acquire" | "observe finish") {
+            assert!(
+                seen.writer.is_empty(),
+                "{op} read block tables on the writer: {:#?}",
+                seen.writer
+            );
+        }
         let ordinary: Vec<_> = seen
             .reader
             .iter()

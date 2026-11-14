@@ -785,7 +785,7 @@ impl AccountTx<'_> {
         before: i64,
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
-        crate::fence_rechecks::sync(self.conn).map_err(err)?;
+        crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)?;
         let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,
             next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
             WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND evidence_at<?3
@@ -2181,8 +2181,8 @@ impl AccountTx<'_> {
             )
             .map_err(err)?;
         if changed == 1 {
-            crate::fence_rechecks::register(
-                self.conn,
+            crate::fence_rechecks::register_on(
+                self,
                 "principal",
                 &serde_json::json!([row.principal, row.admission_id, row.credential_id])
                     .to_string(),
@@ -2349,7 +2349,7 @@ impl AccountTx<'_> {
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .map_err(err)?;
             for key in keys {
-                crate::fence_rechecks::register(self.conn, "observation", &key).map_err(err)?;
+                crate::fence_rechecks::register_on(self, "observation", &key).map_err(err)?;
             }
         }
         Ok(())

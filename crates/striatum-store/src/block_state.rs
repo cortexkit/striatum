@@ -295,6 +295,42 @@ const HELD_ROWS: [&str; 16] = [
     "1",
 ];
 
+/// The primary-key columns of each source table, in the order of the key
+/// `SELECTS` computes for its rows (`json_array(pk…)`).
+const SOURCE_KEYS: [&[&str]; 11] = [
+    &["fence_id"],
+    &["provider_id", "credential_id"],
+    &["provider", "credential_id", "model"],
+    &["provider", "credential_id", "model", "wall_kind"],
+    &["provider", "credential_id"],
+    &["provider_key"],
+    &["route_key"],
+    &["provider", "credential_id", "model", "size_class"],
+    &["provider", "credential_id", "model", "size_class"],
+    &["principal", "admission_id", "credential_id"],
+    &["provider", "account_id"],
+];
+
+/// The source table of an origin kind, and the key column a kind adds to its
+/// origin key (the wall kind of an `account_non_quota_route_fence` row).
+fn source_of(kind: &str) -> Option<(usize, Option<&'static str>)> {
+    Some(match kind {
+        "account" => (ACCOUNT_FENCE_TABLE, None),
+        "credential" => (CREDENTIAL_TABLE, None),
+        "account_route" => (ROUTE_FENCE_TABLE, None),
+        "non_quota_route" => (NON_QUOTA_ROUTE_FENCE_TABLE, Some("billing")),
+        "transient_route" => (NON_QUOTA_ROUTE_FENCE_TABLE, Some("transient")),
+        "pool_billing" | "pool_rate" => (4, None),
+        "provider" => (PROVIDER_TABLE, None),
+        "route" | "failure" => (ROUTE_TABLE, None),
+        "size" => (SIZE_TABLE, None),
+        "non_quota_size" => (NON_QUOTA_SIZE_TABLE, None),
+        "principal" => (EXCLUSION_TABLE, None),
+        "observation" => (10, None),
+        _ => return None,
+    })
+}
+
 static RECONCILE_RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Calls of the reconcile so far, to run its full comparison on every
@@ -953,7 +989,7 @@ impl BlockState {
 
     /// The rows of the `fence_origin` view in the order a full scan of the
     /// view returns them: branch by branch, each table in rowid order.
-    fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
+    pub(crate) fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
         let mut view = self.view_rows();
         view.sort_by_key(|(position, _)| *position);
         view.into_iter().map(|(_, row)| row).collect()
@@ -961,7 +997,7 @@ impl BlockState {
 
     /// The route and provider origins whose rows hold one account's error,
     /// keyed as `fence_rechecks::quarantined_origins` keys them.
-    fn quarantined(&self) -> Vec<(String, String)> {
+    pub(crate) fn quarantined(&self) -> Vec<(String, String)> {
         self.sources()
             .filter_map(|(_, _, _, link, _)| match link {
                 Link::Provider {
@@ -1047,6 +1083,151 @@ impl BlockState {
         )
         .map_err(crate::err)?;
         Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
+    }
+
+    /// Check, by primary key, that SQL holds the source row of origin
+    /// `origin_key` of `kind` exactly as this state does: the same row, or
+    /// none, or a row the state does not hold. A decision about the origin
+    /// (archive it, install or move its clock, drop its clock) runs this
+    /// first, and fails with [`diverged`] when SQL disagrees: these writes
+    /// are keyed on the origin, not on the source values the state read.
+    /// A route origin's presence also depends on its provider's row, and a
+    /// credential origin's class on the account fences named after it; both
+    /// are checked too.
+    pub(crate) fn check_source(
+        &self,
+        conn: &Connection,
+        kind: &str,
+        origin_key: &str,
+        provider: &str,
+    ) -> rusqlite::Result<()> {
+        let Some((table, extra)) = source_of(kind) else {
+            return Ok(());
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(origin_key)
+            .map_err(|error| diverged(format_args!("{kind} origin key {origin_key}: {error}")))?;
+        let mut values: Vec<Value> = parsed
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(text) => Value::Text(text),
+                serde_json::Value::Number(number) => number
+                    .as_i64()
+                    .map(Value::Integer)
+                    .unwrap_or_else(|| Value::Real(number.as_f64().unwrap_or_default())),
+                serde_json::Value::Null => Value::Null,
+                other => Value::Text(other.to_string()),
+            })
+            .collect();
+        values.extend(extra.map(|wall_kind| Value::Text(wall_kind.into())));
+        let columns = SOURCE_KEYS[table];
+        if values.len() != columns.len() {
+            return Err(diverged(format_args!(
+                "{kind} origin key {origin_key} does not name a {} row",
+                BLOCK_TABLES[table]
+            )));
+        }
+        let predicate = columns
+            .iter()
+            .enumerate()
+            .map(|(at, column)| format!("{column}=?{}", at + 1))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let in_sql = conn
+            .prepare_cached(&format!("{STATE_CHECK} {} WHERE {predicate}", SELECTS[table]))?
+            .query_row(rusqlite::params_from_iter(&values), |r| decode(table, r))
+            .optional()?;
+        let key: String = conn.query_row(
+            &format!(
+                "SELECT json_array({})",
+                (1..=values.len()).map(|at| format!("?{at}")).collect::<Vec<_>>().join(",")
+            ),
+            rusqlite::params_from_iter(&values),
+            |r| r.get(0),
+        )?;
+        let held = &self.tables[table];
+        let in_state = held
+            .keys
+            .get(&key)
+            .and_then(|rowid| held.rows.get(rowid).map(|(_, row)| (*rowid, &**row)));
+        let same = match (&in_sql, in_state) {
+            (None | Some((_, _, None)), None) => true,
+            (Some((rowid, _, Some(row))), Some((held_rowid, held_row))) => {
+                *rowid == held_rowid && row == held_row
+            }
+            _ => false,
+        };
+        if !same {
+            return Err(diverged(format_args!(
+                "the {} row of {kind} origin {origin_key} differs from the state's",
+                BLOCK_TABLES[table]
+            )));
+        }
+        match kind {
+            "route" => self.check_source(
+                conn,
+                "provider",
+                &serde_json::json!([provider]).to_string(),
+                provider,
+            ),
+            "credential" => {
+                // The view's quota-hold prefix: the origin key is the same
+                // `json_array(provider_id,credential_id)` text.
+                let prefix = format!("credential-quota:{origin_key}:");
+                // The prefix ends with ':'; ';' is the next character.
+                let end = format!("{};", &prefix[..prefix.len() - 1]);
+                let in_sql = conn
+                    .prepare_cached(&format!(
+                        "{STATE_CHECK} SELECT fence_id FROM account_fence
+                         WHERE fence_id>=?1 AND fence_id<?2 AND cleared_at IS NULL ORDER BY fence_id"
+                    ))?
+                    .query_map([&prefix, &end], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut in_state: Vec<String> = self
+                    .sources()
+                    .filter_map(|(_, _, _, link, _)| match link {
+                        Link::AccountFence(id) if id.starts_with(&prefix) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                in_state.sort();
+                if in_sql != in_state {
+                    return Err(diverged(format_args!(
+                        "the quota holds of credential origin {origin_key} differ from the state's"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Check, by primary key, that SQL holds the probe clock of one origin
+    /// as this state does, or holds none where the state holds none.
+    pub(crate) fn check_clock(
+        &self,
+        conn: &Connection,
+        kind: &str,
+        origin_key: &str,
+    ) -> rusqlite::Result<()> {
+        let in_sql = conn
+            .prepare_cached(&format!(
+                "{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2",
+                SELECTS[CLOCK_TABLE]
+            ))?
+            .query_row([kind, origin_key], |r| decode(CLOCK_TABLE, r))
+            .optional()?
+            .and_then(|(_, _, held)| held);
+        let in_state = self.clock(kind, origin_key).map(|(block, cleared)| {
+            let mut block = block.clone();
+            block.cleared_models.clear();
+            Held::Clock(block, cleared)
+        });
+        if in_sql != in_state {
+            return Err(diverged(format_args!(
+                "the clock of {kind} origin {origin_key} differs from the state's"
+            )));
+        }
+        Ok(())
     }
 
     /// The route-state snapshot at `now`, as `SqliteRouteStateStore::build_snapshot`

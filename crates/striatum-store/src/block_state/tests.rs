@@ -1348,6 +1348,11 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
         "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');",
         NOW + 60_000
     ));
+    // Its clock is installed first, so no sync below decides about the
+    // origin (a decision would check the row and catch the change itself).
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, |tx| tx.sync_fence_rechecks())
+        .unwrap();
     UNSEEN.with(|unseen| unseen.set(true));
     rig.store
         .bypass_account_writer_for_test(&format!(
@@ -2795,4 +2800,180 @@ fn every_production_block_writer_writes_inside_an_account_command() {
         .filter(|(name, rows)| *rows == 0 && !may_be_silent.contains(name))
         .collect();
     assert!(silent.is_empty(), "steps that changed no block row: {silent:?}");
+}
+
+/// One `sync` decision taken on a stale state. `before` runs on two stores;
+/// the state of the first is kept; `change` then runs on both. The first
+/// store's next sync decides on the kept state: the decision checks SQL by
+/// key, finds it differs, and the batch runs again on a fresh load. Its rows
+/// must then equal those a SQL sync leaves on the second store.
+fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
+    let state = rig(name);
+    let oracle = rig(&format!("{name}-oracle"));
+    before(&state);
+    before(&oracle);
+    let stale = state.published();
+    change(&state);
+    change(&oracle);
+    let loads = state.decide_next_on(stale);
+    state
+        .store
+        .account_command(AccountCommandKind::Maintenance, |tx| tx.sync_fence_rechecks())
+        .unwrap();
+    assert_eq!(
+        state.loads_since(loads),
+        2,
+        "{name}: the stale decision is caught and the batch runs on a fresh load"
+    );
+    oracle.run(fence_rechecks::sync);
+    // The clocks, the provider rows the cases write, and the archive (each
+    // store's catalogue seed stamps its own open time on its route rows).
+    let rows = |rig: &Rig| {
+        let mut rows: Vec<String> = rig
+            .store
+            .with_reader_for_test(|conn| Ok(block_rows(conn)))
+            .unwrap()
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.starts_with("fence_recheck ") || row.starts_with("provider_cooldown_state "))
+            .collect();
+        rows.extend(
+            rig.store
+                .with_reader_for_test(|conn| {
+                    conn.prepare("SELECT kind,origin_key,evidence FROM fence_retired_origin ORDER BY rowid")?
+                        .query_map([], |r| Ok(format!("retired {:?}", (r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))))?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap(),
+        );
+        rows
+    };
+    let (from_state, from_sql) = (rows(&state), rows(&oracle));
+    let only_state: Vec<_> = from_state.iter().filter(|row| !from_sql.contains(row)).collect();
+    let only_sql: Vec<_> = from_sql.iter().filter(|row| !from_state.contains(row)).collect();
+    assert_eq!(
+        from_state, from_sql,
+        "{name}: the rows a SQL sync leaves; only after the state's sync: {only_state:#?}; only after SQL's: {only_sql:#?}"
+    );
+    state.check(&[NOW], name);
+}
+
+/// A provider wall written as raw rows, without the clock a writer would
+/// register: until `until`, observed at `observed`, with `error`.
+fn provider_wall(rig: &Rig, until: i64, observed: i64, error: &str) {
+    rig.sql(format!(
+        "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+         VALUES ('p0',{until},{observed},{error},{observed},{observed})
+         ON CONFLICT(provider_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,
+         wall_observed_at=excluded.wall_observed_at,last_error=excluded.last_error;"
+    ));
+}
+
+/// `sync` decides on the command's working state. Each decision it takes
+/// (archive an expired origin, install a clock, renew a clock for new
+/// evidence, drop a clock whose origin is gone, drop a quarantined row's
+/// clock) first checks the rows it decided on against SQL, so a state that
+/// drifted from SQL runs the batch again instead of writing a wrong clock or
+/// ending a live source.
+#[test]
+fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
+    let wall = crate::now_ms();
+    let capacity = "'provider capacity'";
+    let sync = |rig: &Rig| rig.run(fence_rechecks::sync);
+    stale_sync_case(
+        "stale-sync-install",
+        |rig| provider_wall(rig, wall + 3_600_000, wall, capacity),
+        |rig| provider_wall(rig, wall + 7_200_000, wall, capacity),
+    );
+    stale_sync_case(
+        "stale-sync-renew",
+        |rig| {
+            provider_wall(rig, wall + 3_600_000, wall, capacity);
+            sync(rig);
+            provider_wall(rig, wall + 7_200_000, wall, capacity);
+        },
+        |rig| {
+            rig.sql(format!(
+                "UPDATE fence_recheck SET last_claimed_at={wall},claim_owner='other',
+                 claim_generation=claim_generation+1 WHERE kind='provider';"
+            ))
+        },
+    );
+    stale_sync_case(
+        "stale-sync-drop",
+        |rig| {
+            provider_wall(rig, wall + 3_600_000, wall, capacity);
+            sync(rig);
+            rig.sql("DELETE FROM provider_cooldown_state;".into());
+        },
+        |rig| provider_wall(rig, wall + 3_600_000, wall, capacity),
+    );
+    stale_sync_case(
+        "stale-sync-retire",
+        |rig| provider_wall(rig, wall - 3_600_000, wall - 7_200_000, capacity),
+        |rig| provider_wall(rig, wall + 3_600_000, wall - 7_200_000, capacity),
+    );
+    stale_sync_case(
+        "stale-sync-quarantine",
+        |rig| {
+            provider_wall(rig, wall + 3_600_000, wall, capacity);
+            sync(rig);
+            provider_wall(rig, wall + 3_600_000, wall, ERRORS[3]);
+        },
+        |rig| provider_wall(rig, wall + 3_600_000, wall, capacity),
+    );
+}
+
+/// A sync on a state that agrees with SQL writes exactly what the SQL sync
+/// writes, over the generated sequence: after every step, each store syncs
+/// (the first on its state, the second on SQL inside a savepoint it rolls
+/// back) and their block rows must be equal; then `register` of every view
+/// origin is compared the same way.
+#[test]
+fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
+    let mut compared = 0usize;
+    for seed in 1..=4u64 {
+        let rig = rig(&format!("block-state-sync-{seed}"));
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let mut now = NOW;
+        for index in 0..100 {
+            let operation = step(&rig, &mut rng, now);
+            let at = crate::now_ms();
+            let (sql, memory, origins) = rig
+                .store
+                .account_command(AccountCommandKind::Maintenance, move |tx| {
+                    let origins: Vec<(String, String)> = tx
+                        .working_blocks()?
+                        .map(|state| {
+                            state
+                                .view_origins_in_scan_order()
+                                .into_iter()
+                                .map(|origin| (origin.kind, origin.origin_key))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<Vec<String>> {
+                        fence_rechecks::sync_on(tx, at).map_err(err)?;
+                        let mut rows = block_rows(tx.conn)?;
+                        for (kind, key) in &origins {
+                            fence_rechecks::register_on(tx, kind, key).map_err(err)?;
+                            rows.extend(block_rows(tx.conn)?);
+                        }
+                        Ok(rows)
+                    };
+                    tx.conn.execute_batch("SAVEPOINT oracle").map_err(err)?;
+                    let sql = run(&crate::AccountTx::sql(tx.conn))?;
+                    tx.conn
+                        .execute_batch("ROLLBACK TO oracle; RELEASE oracle")
+                        .map_err(err)?;
+                    Ok((sql, run(tx)?, origins.len()))
+                })
+                .unwrap();
+            assert_eq!(memory, sql, "seed={seed} step={index} op={operation}");
+            compared += origins;
+            rig.check(&[now], &format!("seed={seed} step={index} after sync"));
+            now += rng.below(3) as i64 * 600_000;
+        }
+    }
+    assert!(compared > 100, "registers compared: {compared}");
 }

@@ -433,8 +433,8 @@ impl AccountTx<'_> {
             ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
             WHERE excluded.observed_at>=account_non_quota_size_refusal.observed_at",
             params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map_err(err)?;
-        crate::fence_rechecks::register(
-            self.conn,
+        crate::fence_rechecks::register_on(
+            self,
             "non_quota_size",
             &serde_json::json!([
                 fact.provider,
@@ -472,8 +472,8 @@ impl AccountTx<'_> {
                 ],
             )
             .map_err(err)?;
-        crate::fence_rechecks::register(
-            self.conn,
+        crate::fence_rechecks::register_on(
+            self,
             if kind == "transient" {
                 "transient_route"
             } else {
@@ -605,8 +605,8 @@ fn apply_account_effects(
         // A sign-in report must not replace or postpone an independent refusal.
         if changed != 0 && crate::fence_rechecks::enabled(conn)? {
             conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
-            crate::fence_rechecks::register(
-                conn,
+            crate::fence_rechecks::register_on(
+                tx,
                 "credential",
                 &serde_json::json!([refusal.provider_id, refusal.credential_id]).to_string(),
             )?;

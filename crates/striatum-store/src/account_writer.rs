@@ -56,7 +56,7 @@ impl AccountTx<'_> {
     /// The part of a Tick that synchronizes fence rechecks, for a caller that
     /// applies the admission and continuation expiries itself.
     pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
-        crate::fence_rechecks::sync(self.conn).map_err(err)
+        crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)
     }
 }
 

@@ -453,8 +453,8 @@ impl crate::AccountTx<'_> {
             } else {
                 "pool_rate"
             };
-            crate::fence_rechecks::register(
-                self.conn,
+            crate::fence_rechecks::register_on(
+                self,
                 origin,
                 &serde_json::json!([provider, credential_id]).to_string(),
             )

@@ -7193,8 +7193,8 @@ impl crate::AccountTx<'_> {
                       WHERE provider_id = ?1 AND credential_id = ?2",
                 params![provider_id, credential_id, observed_at_ms],
             )?;
-            fence_rechecks::register(
-                &tx,
+            fence_rechecks::register_on(
+                self,
                 "credential",
                 &serde_json::json!([provider_id, credential_id]).to_string(),
             )?;
@@ -7608,7 +7608,7 @@ impl crate::AccountTx<'_> {
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))",params![provider_key,updated_at,update.unscoped_wall,inherited])?;
-                    fence_rechecks::register(&tx,"provider",&serde_json::json!([provider_key]).to_string())?;
+                    fence_rechecks::register_on(self,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
                 Ok(())
             })
@@ -7784,7 +7784,7 @@ impl crate::AccountTx<'_> {
                 )?;
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE route_key=?1",params![route_key,observed_at,update.unscoped_wall])?;
-                    fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
+                    fence_rechecks::register_on(self,"route",&serde_json::json!([route_key]).to_string())?;
                 }
                 Ok(())
             })
@@ -8022,12 +8022,12 @@ impl crate::AccountTx<'_> {
                         )?;
                         tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
                         if failure_backoff_until.is_some() {
-                            fence_rechecks::register(&tx,"failure",&serde_json::json!([route_key]).to_string())?;
+                            fence_rechecks::register_on(self,"failure",&serde_json::json!([route_key]).to_string())?;
                         }
                     }
                 }
 
-                fence_rechecks::register(&tx,"route",&serde_json::json!([route_key]).to_string())?;
+                fence_rechecks::register_on(self,"route",&serde_json::json!([route_key]).to_string())?;
                 Ok(())
             })
             .map_err(err)
