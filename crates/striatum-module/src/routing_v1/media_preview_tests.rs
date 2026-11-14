@@ -57,6 +57,7 @@ async fn media_preview_no_level_reports_top_grade_and_null_unknowns() {
                     .collect::<Vec<_>>(),
                 [
                     "anchor_version",
+                    "concurrency",
                     "consumer",
                     "elapsed_ms",
                     "results",
