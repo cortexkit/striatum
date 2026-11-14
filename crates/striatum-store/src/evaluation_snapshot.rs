@@ -20,6 +20,11 @@ struct WriterMetrics {
     sql_ns: AtomicU64,
     commit_ns: AtomicU64,
     pending_commits: AtomicU64,
+    /// Set when a block table changed outside an account command: the
+    /// in-memory block state then misses that change, so the writer reloads
+    /// it before its next batch.
+    block_reload: Arc<std::sync::atomic::AtomicBool>,
+    block_writes_outside: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     outside_account_writer: AtomicU64,
 }
@@ -191,6 +196,10 @@ impl ConnectionStore {
         matches!(self.backend, Backend::Projection(_))
     }
 
+    pub(crate) fn block_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.metrics.block_reload)
+    }
+
     pub(crate) fn record_command_wait(&self, ns: u64) {
         self.metrics
             .command_queue_ns
@@ -199,19 +208,31 @@ impl ConnectionStore {
     fn new(backend: Backend) -> Self {
         let metrics = Arc::new(WriterMetrics::default());
         let install = |conn: &Connection| {
-            #[cfg(any(test, feature = "test-support"))]
             if matches!(&backend, Backend::Live(_)) {
                 // SQLITE_IGNORE for DELETE disables SQLite's truncate shortcut,
                 // which otherwise skips row hooks for a whole-table delete.
+                // The block state needs every deleted block row reported.
                 conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
-                    if matches!(context.action, rusqlite::hooks::AuthAction::Delete { table_name } if ACCOUNT_TABLES.contains(&table_name)) {
+                    if matches!(context.action, rusqlite::hooks::AuthAction::Delete { table_name }
+                        if crate::block_state::table_index(table_name).is_some()
+                            || (cfg!(any(test, feature = "test-support")) && ACCOUNT_TABLES.contains(&table_name)))
+                    {
                         rusqlite::hooks::Authorization::Ignore
                     } else {
                         rusqlite::hooks::Authorization::Allow
                     }
                 }));
                 let changes = Arc::clone(&metrics);
-                conn.update_hook(Some(move |_, _: &str, table: &str, _| {
+                conn.update_hook(Some(move |_, database: &str, table: &str, rowid: i64| {
+                    if database == "main" {
+                        if let Some(index) = crate::block_state::table_index(table) {
+                            if !crate::block_state::capture(index, rowid) {
+                                changes.block_writes_outside.fetch_add(1, Ordering::Relaxed);
+                                changes.block_reload.store(true, Ordering::Release);
+                            }
+                        }
+                    }
+                    #[cfg(any(test, feature = "test-support"))]
                     if ACCOUNT_TABLES.contains(&table) {
                         if IN_ACCOUNT_BATCH.with(|inside| inside.get()) {
                             ACCOUNT_ROWS_CHANGED.with(|rows| rows.set(rows.get() + 1));
@@ -337,6 +358,15 @@ impl SqliteRouteStateStore {
         self.store
             .metrics
             .outside_account_writer
+            .load(Ordering::Relaxed)
+    }
+    /// Block-table rows changed outside an account command. Each such change
+    /// makes the writer reload the in-memory state before its next batch;
+    /// production code makes none.
+    pub fn block_writes_outside_command(&self) -> u64 {
+        self.store
+            .metrics
+            .block_writes_outside
             .load(Ordering::Relaxed)
     }
     /// Queue time from command enqueue to batch start, excluding connection wait.

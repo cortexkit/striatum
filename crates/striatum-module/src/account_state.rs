@@ -21,6 +21,10 @@ pub(crate) struct AccountState {
     /// Maintained by every admission, affinity and continuation writer and
     /// read by request paths instead of those tables.
     pub(crate) admissions: AdmissionState,
+    /// The block tables as SQL holds them. The writer copies every row a
+    /// command changes into this state, so it always equals a fresh load.
+    /// Request paths do not read it yet.
+    pub(crate) blocks: striatum_store::BlockState,
 }
 
 impl AccountState {
@@ -31,6 +35,7 @@ impl AccountState {
             generation: 0,
             selection_salt: tx.existing_salt()?.map(Arc::new),
             admissions: AdmissionState::from_rows(tx.load_admission_group()?),
+            blocks: tx.load_block_state()?,
         })
     }
 }
@@ -135,6 +140,10 @@ impl AccountWorkingState for AccountState {
 
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+
+    fn apply_block_rows(&mut self, rows: &striatum_store::BlockRows) {
+        self.blocks.apply(rows);
     }
 }
 
@@ -896,6 +905,10 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         loaded.admissions, published.admissions,
         "the request mix left the admission state unequal to a fresh load"
     );
+    assert_eq!(
+        loaded.blocks, published.blocks,
+        "the request mix left the block state unequal to a fresh load"
+    );
     let state = &published.admissions;
     let demand_entries: usize = state.demand.iter().map(|(_, rows)| rows.len()).sum();
     let start = std::time::Instant::now();
@@ -922,6 +935,17 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         start.elapsed().as_micros() / 10,
         striatum_store::keyed_exception_reads(),
         maintenance_reads(),
+    );
+    println!(
+        "account_state blocks: {} block_read_backs={}",
+        published
+            .blocks
+            .table_sizes()
+            .iter()
+            .map(|(table, rows)| format!("{table}={rows}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        striatum_store::block_read_backs(),
     );
 }
 

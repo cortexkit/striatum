@@ -89,12 +89,24 @@ fn write_batch(
     for queued in batch.iter_mut() {
         conn.execute_batch("SAVEPOINT account_command")?;
         let before = state.as_ref().map(|state| state.fork());
+        // Every block row this command changes, triggers included, is copied
+        // into the working state before the savepoint is released.
+        let capture = crate::block_state::Capture::begin();
         let status = queued.command.run(
             &AccountTx { conn },
             state
                 .as_mut()
                 .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
         );
+        let captured = capture.finish();
+        if status.is_ok() && !captured.is_empty() {
+            if let Some(state) = state.as_mut() {
+                // A failed read-back fails the batch: the state would
+                // otherwise miss a committed row.
+                let rows = crate::block_state::read_back(conn, &captured)?;
+                state.apply_block_rows(&rows);
+            }
+        }
         if let Err(error) = status {
             *state = before;
             // The command found its working state disagreeing with SQL. The
@@ -301,7 +313,10 @@ impl AccountWriter {
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || -> RouteStateResult<()> {
-                        let mut state = crate::account_state::WriterAccountState::new(bridge);
+                        let mut state = crate::account_state::WriterAccountState::new(
+                            bridge,
+                            store.block_reload_flag(),
+                        );
                         while let Ok(first) = receiver.recv() {
                             let mut batch = vec![first];
                             // No linger: an idle writer begins immediately. After a

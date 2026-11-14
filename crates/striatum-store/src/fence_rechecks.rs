@@ -251,6 +251,14 @@ fn upsert_clocks(conn: &Connection, kind: Option<&str>, key: Option<&str>) -> ru
     Ok(())
 }
 
+/// Whether a route or provider row holds one account's error rather than a
+/// route or provider wall. Such a row is kept for diagnosis but enforces
+/// nothing, so its origin gets no block.
+pub(crate) fn quarantined_row(unscoped: bool, error: Option<&str>, class: Option<&str>) -> bool {
+    let class = class.and_then(|class| striatum_core::RouteWallClass::parse(class).ok());
+    !unscoped && striatum_core::account_wall::account_scoped_wall(error, class)
+}
+
 pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     let mut quarantined = Vec::new();
     for (table, key, kind) in [
@@ -269,9 +277,7 @@ pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(St
         })?;
         for row in rows {
             let (key, error, class) = row?;
-            let class =
-                class.and_then(|class| striatum_core::RouteWallClass::parse(&class).ok());
-            if striatum_core::account_wall::account_scoped_wall(error.as_deref(), class) {
+            if quarantined_row(false, error.as_deref(), class.as_deref()) {
                 quarantined.push((kind.to_owned(), serde_json::json!([key]).to_string()));
             }
         }
@@ -466,38 +472,9 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     if !enabled(conn)? {
         return Ok(LoadedBlocks::default());
     }
-    let mut clocks = std::collections::BTreeMap::new();
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at FROM fence_recheck")?;
-    for row in statement.query_map([], |r| {
-        let kind: String = r.get(0)?;
-        Ok((
-            Block {
-                cause: cause(&kind)?,
-                kind,
-                origin_key: r.get(1)?,
-                scope: Scope {
-                    provider: r.get(2)?,
-                    account_id: r.get(3)?,
-                    credential_id: r.get(4)?,
-                    model: r.get(5)?,
-                    size_class: r.get(6)?,
-                    principal: r.get(7)?,
-                    admission_id: r.get(8)?,
-                },
-                evidence: r.get(9)?,
-                evidence_at: r.get(10)?,
-                lifetime: LifetimeClass::from_quota(r.get(11)?),
-                classified: r.get(12)?,
-                next_recheck_at: r.get(13)?,
-                reset_check_at: r.get(14)?,
-                last_claimed_at: r.get(15)?,
-                claim_owner: r.get(16)?,
-                claim_generation: r.get(17)?,
-                cleared_models: Vec::new(),
-            },
-            r.get::<_, Option<i64>>(18)?,
-        ))
-    })? {
+    let mut clocks = Clocks::new();
+    let mut statement = conn.prepare(&format!("SELECT {CLOCK_COLUMNS} FROM fence_recheck"))?;
+    for row in statement.query_map([], |r| clock_row(r, 0))? {
         let (block, cleared) = row?;
         clocks.insert(
             (block.kind.clone(), block.origin_key.clone()),
@@ -507,51 +484,164 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     let mut statement = conn.prepare(
         "SELECT kind,origin_key,evidence,model FROM fence_recheck_route_clear ORDER BY model",
     )?;
-    for row in statement.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })? {
-        let (kind, key, evidence, model) = row?;
-        if let Some((block, _)) = clocks.get_mut(&(kind, key)) {
-            if block.evidence == evidence {
-                block.cleared_models.push(model);
+    let clears = statement
+        .query_map([], |r| {
+            Ok(RouteClear {
+                kind: r.get(0)?,
+                origin_key: r.get(1)?,
+                evidence: r.get(2)?,
+                model: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    attach_route_clears(&mut clocks, &clears);
+    let quarantined = quarantined_origins(conn)?;
+    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
+    let origins = statement
+        .query_map([], |r| view_origin(r, 0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    derive_blocks(clocks, &quarantined, origins, now)
+}
+
+/// The `fence_recheck` columns [`clock_row`] decodes, in its order.
+pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
+
+/// Stored clocks keyed by source kind and origin key, each with its
+/// `cleared_at`.
+pub(crate) type Clocks = std::collections::BTreeMap<(String, String), (Block, Option<i64>)>;
+
+/// One `fence_recheck` row, decoded from [`CLOCK_COLUMNS`] starting at `at`.
+pub(crate) fn clock_row(
+    r: &rusqlite::Row<'_>,
+    at: usize,
+) -> rusqlite::Result<(Block, Option<i64>)> {
+    let kind: String = r.get(at)?;
+    Ok((
+        Block {
+            cause: cause(&kind)?,
+            kind,
+            origin_key: r.get(at + 1)?,
+            scope: Scope {
+                provider: r.get(at + 2)?,
+                account_id: r.get(at + 3)?,
+                credential_id: r.get(at + 4)?,
+                model: r.get(at + 5)?,
+                size_class: r.get(at + 6)?,
+                principal: r.get(at + 7)?,
+                admission_id: r.get(at + 8)?,
+            },
+            evidence: r.get(at + 9)?,
+            evidence_at: r.get(at + 10)?,
+            lifetime: LifetimeClass::from_quota(r.get(at + 11)?),
+            classified: r.get(at + 12)?,
+            next_recheck_at: r.get(at + 13)?,
+            reset_check_at: r.get(at + 14)?,
+            last_claimed_at: r.get(at + 15)?,
+            claim_owner: r.get(at + 16)?,
+            claim_generation: r.get(at + 17)?,
+            cleared_models: Vec::new(),
+        },
+        r.get::<_, Option<i64>>(at + 18)?,
+    ))
+}
+
+/// One `fence_recheck_route_clear` row: a model cleared from a route-wide
+/// origin while that origin's evidence is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteClear {
+    pub(crate) kind: String,
+    pub(crate) origin_key: String,
+    pub(crate) evidence: String,
+    pub(crate) model: String,
+}
+
+/// Attach each clear, in the order given, to the clock whose current evidence
+/// it names. A clear recorded for older evidence no longer applies.
+pub(crate) fn attach_route_clears(clocks: &mut Clocks, clears: &[RouteClear]) {
+    for clear in clears {
+        if let Some((block, _)) = clocks.get_mut(&(clear.kind.clone(), clear.origin_key.clone())) {
+            if block.evidence == clear.evidence {
+                block.cleared_models.push(clear.model.clone());
             }
         }
     }
-    let quarantined = quarantined_origins(conn)?;
-    let mut loaded = LoadedBlocks::default();
-    loaded.cleared_evidence = clocks
-        .values()
-        .filter(|(_, cleared)| cleared.is_some())
-        .map(|(block, _)| block.clone())
-        .collect();
-    // The view projects the source tables, not the clock. An unchanged source
-    // signature selects the stored class and schedule; a new one derives them.
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
-    let mut rows = statement.query([])?;
-    while let Some(r) = rows.next()? {
-        let kind: String = r.get(0)?;
-        let key: String = r.get(1)?;
-        if quarantined.contains(&(kind.clone(), key.clone())) {
+}
+
+/// One row of the `fence_origin` view: an origin's current source evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewOrigin {
+    pub kind: String,
+    pub origin_key: String,
+    pub provider: String,
+    pub account_id: Option<String>,
+    pub credential_id: Option<String>,
+    pub model: Option<String>,
+    pub size_class: Option<i64>,
+    pub principal: Option<String>,
+    pub admission_id: Option<String>,
+    pub evidence: String,
+    pub evidence_at: i64,
+    pub quota: Option<bool>,
+    pub deadline: Option<f64>,
+    pub reset_at: Option<f64>,
+}
+
+/// Decode the view's 14 columns starting at `at`, in the view's order.
+pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<ViewOrigin> {
+    Ok(ViewOrigin {
+        kind: r.get(at)?,
+        origin_key: r.get(at + 1)?,
+        provider: r.get(at + 2)?,
+        account_id: r.get(at + 3)?,
+        credential_id: r.get(at + 4)?,
+        model: r.get(at + 5)?,
+        size_class: r.get(at + 6)?,
+        principal: r.get(at + 7)?,
+        admission_id: r.get(at + 8)?,
+        evidence: r.get(at + 9)?,
+        evidence_at: r.get(at + 10)?,
+        quota: r.get(at + 11)?,
+        deadline: r.get(at + 12)?,
+        reset_at: r.get(at + 13)?,
+    })
+}
+
+/// Merge source evidence with the stored clocks. The SQL adapter and the
+/// in-memory block state both call this, so they differ only in where the
+/// rows come from. Clocks must already carry their route clears. An unchanged
+/// source signature selects the stored class and schedule; a new one derives
+/// them.
+pub(crate) fn derive_blocks(
+    mut clocks: Clocks,
+    quarantined: &[(String, String)],
+    origins: impl IntoIterator<Item = ViewOrigin>,
+    now: i64,
+) -> rusqlite::Result<LoadedBlocks> {
+    let mut loaded = LoadedBlocks {
+        blocks: Vec::new(),
+        cleared_evidence: clocks
+            .values()
+            .filter(|(_, cleared)| cleared.is_some())
+            .map(|(block, _)| block.clone())
+            .collect(),
+    };
+    for origin in origins {
+        let key = (origin.kind.clone(), origin.origin_key.clone());
+        if quarantined.contains(&key) {
             continue;
         }
-        let prior = clocks.remove(&(kind.clone(), key.clone()));
-        let evidence: String = r.get(9)?;
+        let prior = clocks.remove(&key);
         if let Some((block, cleared)) = &prior {
-            if block.evidence == evidence {
+            if block.evidence == origin.evidence {
                 if cleared.is_none() {
                     loaded.blocks.push(block.clone());
                 }
                 continue;
             }
         }
-        let evidence_at: i64 = r.get(10)?;
-        let quota = r.get::<_, Option<bool>>(11)?.unwrap_or(false);
-        let deadline = r.get::<_, Option<f64>>(12)?.map(|at| at as i64);
+        let evidence_at = origin.evidence_at;
+        let quota = origin.quota.unwrap_or(false);
+        let deadline = origin.deadline.map(|at| at as i64);
         if !quota && deadline.is_some_and(|at| at < now) {
             continue;
         }
@@ -565,28 +655,25 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
         if last_claimed_at.is_some_and(|at| evidence_at < at) {
             next = next.max(prior.as_ref().unwrap().0.next_recheck_at);
         }
-        let reset = r
-            .get::<_, Option<f64>>(13)?
-            .map(|at| at as i64)
-            .filter(|at| {
-                quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
-            });
+        let reset = origin.reset_at.map(|at| at as i64).filter(|at| {
+            quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
+        });
         loaded.blocks.push(Block {
-            cause: cause(&kind)?,
-            kind,
-            origin_key: key,
+            cause: cause(&origin.kind)?,
+            kind: origin.kind,
+            origin_key: origin.origin_key,
             scope: Scope {
-                provider: r.get(2)?,
-                account_id: r.get(3)?,
-                credential_id: r.get(4)?,
-                model: r.get(5)?,
-                size_class: r.get(6)?,
-                principal: r.get(7)?,
-                admission_id: r.get(8)?,
+                provider: origin.provider,
+                account_id: origin.account_id,
+                credential_id: origin.credential_id,
+                model: origin.model,
+                size_class: origin.size_class,
+                principal: origin.principal,
+                admission_id: origin.admission_id,
             },
             lifetime: LifetimeClass::from_quota(quota),
             classified: false,
-            evidence,
+            evidence: origin.evidence,
             evidence_at,
             next_recheck_at: next,
             reset_check_at: reset,

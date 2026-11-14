@@ -11,6 +11,10 @@ pub trait AccountWorkingState: Send {
     fn fork(&self) -> Box<dyn AccountWorkingState>;
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+    /// Copy the block rows a command changed into this working copy. The
+    /// writer calls it after the command's statements ran and before its
+    /// savepoint is released, so a failed command's rows never arrive.
+    fn apply_block_rows(&mut self, rows: &crate::BlockRows);
 }
 
 /// Implemented by the module's snapshot publisher, without a store-to-module
@@ -32,17 +36,22 @@ pub(crate) struct WriterAccountState {
     pub(crate) working: Option<Box<dyn AccountWorkingState>>,
     data_version: Option<i64>,
     generation: u64,
+    /// Set by the update hook when a block table changed outside an account
+    /// command, which no captured row reports.
+    block_reload: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WriterAccountState {
     pub(crate) fn new(
         bridge: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,
+        block_reload: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             bridge,
             working: None,
             data_version: None,
             generation: 0,
+            block_reload,
         }
     }
 
@@ -56,7 +65,16 @@ impl WriterAccountState {
             let version: i64 = conn
                 .query_row("PRAGMA data_version", [], |row| row.get(0))
                 .map_err(crate::err)?;
-            let reload = bridge.reload_requested();
+            // Both flags are cleared here, whichever is set.
+            let outside = self
+                .block_reload
+                .swap(false, std::sync::atomic::Ordering::AcqRel);
+            if outside && self.working.is_some() {
+                tracing::warn!(
+                    "block tables changed outside an account command; reloading account state"
+                );
+            }
+            let reload = bridge.reload_requested() | outside;
             if !reload && self.working.is_some() && self.data_version == Some(version) {
                 return Ok(None);
             }

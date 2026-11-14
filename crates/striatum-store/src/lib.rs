@@ -62,6 +62,10 @@ mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod engine_measurements;
 mod fence_rechecks;
+mod block_state;
+pub use block_state::{
+    block_read_backs, BlockRows, BlockState, ProbeAuthorization, SuccessPool, BLOCK_TABLES,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub mod group_reads;
 #[cfg(any(test, feature = "test-support"))]
@@ -69,6 +73,7 @@ mod block_parity_fixture;
 mod key_pool;
 pub use fence_rechecks::{
     BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope, ReleasedAdmissionProbes,
+    ViewOrigin,
 };
 #[cfg(test)]
 mod continuation_migration_tests;
