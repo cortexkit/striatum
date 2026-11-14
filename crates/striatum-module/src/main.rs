@@ -36,6 +36,7 @@ mod fusiform_catalog;
 mod head_choices;
 mod key_pool;
 mod legacy_wire;
+mod logging;
 #[cfg(test)]
 mod literal_census_tests;
 mod model_resolution;
@@ -57,6 +58,8 @@ mod substrate_policy;
 mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
+#[cfg(test)]
+mod test_exe;
 mod tier_settings;
 mod variant_policy;
 mod winner_ladder;
@@ -1104,8 +1107,20 @@ fn check_config_at(path: &Path) -> Result<(), ModuleError> {
     config_overrides::initialize_config(path).map_err(ModuleError::Message)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), ModuleError> {
+fn main() -> Result<(), ModuleError> {
+    initialize_logging();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| ModuleError::Message(error.to_string()))?
+        .block_on(async_main())
+}
+
+fn initialize_logging() {
+    logging::install();
+}
+
+async fn async_main() -> Result<(), ModuleError> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.first().is_some_and(|arg| arg == "config-convert") {
         if args.len() != 3 {

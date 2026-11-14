@@ -25,7 +25,7 @@ async fn decision(route: &Route, affinity: &str) -> String {
 }
 
 #[tokio::test]
-async fn report_run_repeat_returns_first_answer_and_usage_but_new_runs_count() {
+pub(super) async fn report_run_repeat_returns_first_answer_and_usage_but_new_runs_count() {
     let (harness, route) = configured().await;
     let id = decision(&route, "repeat").await;
     let body =

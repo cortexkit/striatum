@@ -1,2 +1,3 @@
 # Source path<TAB>enclosing function<TAB>count<TAB>reason for the raw lookup.
 crates/striatum-store/src/test_exe.rs	current_test_exe	1	Routing's test-only helper stages mounted-volume binaries using cortexkit-test-support without a prefrontal dependency.
+crates/striatum-module/src/test_exe.rs	current_test_exe	1	Module logging tests stage their own executable using cortexkit-test-support before spawning a process with an isolated global subscriber.
