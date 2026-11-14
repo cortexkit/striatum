@@ -523,6 +523,40 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// A closed admission and its success-proof metadata in one primary-key
+    /// lookup. Open admissions supply these fields from the module's cache.
+    pub fn admission_success_by_key(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<AdmissionStateRow>> {
+        let scope = if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            "input_size_class,model_decision_id"
+        } else {
+            "NULL,NULL"
+        };
+        note_keyed_exception();
+        self.conn
+            .query_row(
+                &format!(
+                    "SELECT {ADMISSION_COLUMNS},{scope},rowid
+            FROM account_admission {KEYED_EXCEPTION} WHERE principal=?1 AND admission_id=?2"
+                ),
+                params![principal, id],
+                |row| {
+                    Ok(AdmissionStateRow {
+                        row: admission_from_row(row)?,
+                        input_size_class: row.get::<_, Option<i64>>(25)?
+                            .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
+                        model_decision_id: row.get(26)?,
+                        rowid: row.get(27)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(err)
+    }
+
     /// The admissions (at most two, enough to tell an ambiguous run) that a
     /// completed report's decision and run name, each with its probe size
     /// class. Keyed exception: the module's state holds only open admissions
@@ -598,4 +632,3 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 }
-

@@ -36,6 +36,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::SELECT_PRICE,
     "observe_backoff",
     "observe_credential_refused",
+    cortexkit_role_routing::capabilities::ACCOUNT_OBSERVE_SUCCESS,
     cortexkit_role_routing::capabilities::SELECT_HARNESS,
     cortexkit_role_routing::capabilities::RUNNER_HARNESS_FACTS,
     cortexkit_role_routing::capabilities::DECISION_HARNESS,
@@ -154,6 +155,13 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
                 .iter()
                 .map(|field| Value::String((*field).into())),
         );
+        if capabilities.contains(&"select_media") {
+            fields.extend(
+                cortexkit_role_routing::select_media::REQUIREMENT_FIELDS
+                    .iter()
+                    .map(|field| Value::String((*field).into())),
+            );
+        }
     }
     // Describe lists runner modules, not placements. Retain the first entry's
     // policy when several placements name the same module.

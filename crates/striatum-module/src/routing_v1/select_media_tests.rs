@@ -106,6 +106,38 @@ async fn media_entry_selects_all_six_kinds_without_catalog_or_billing() {
 }
 
 #[tokio::test]
+async fn synthesize_accepts_input_characters_and_describes_it_without_pricing() {
+    super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
+        let mut speech = engine("speech", false);
+        speech["kind"] = json!("synthesize");
+        speech["max_input_bytes"] = json!(100);
+        let h = setup(vec![speech.clone()]);
+        declare("synthesize", &[speech]);
+        let route = h.bind(reserved("colliculus"), None).await;
+        let (_, describe) = route.call("role.describe", &json!({})).await;
+        assert!(describe["result"]["requirement_fields"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("input_characters")));
+        let mut params = request();
+        params["kind"] = json!("synthesize");
+        params["requirements"] = json!({"iq":40,"input_characters":4,"input_bytes":9});
+        assert_eq!(select(&route, &params).await["engine"]["model"], "speech");
+        for value in [json!(-1), json!(1.5), json!("4")] {
+            params["requirements"]["input_characters"] = value;
+            refuse(
+                &route,
+                &params,
+                "invalid_requirements",
+                Some("input_characters"),
+            )
+            .await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn media_entry_refuses_unserved_kinds_and_cross_kind_requests() {
     super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         let h = setup(vec![engine("remote", false)]);
