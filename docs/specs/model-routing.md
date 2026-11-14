@@ -81,6 +81,29 @@ Routing decision: the durable selected route, request, candidate explanations, p
 - Seat routing: an exact provider/model pin has precedence and fails if unavailable or below the 0.90 floor; otherwise ordered model, provider, and family recommendations are considered with known-family diversity. (`crates/striatum-core/src/seat_routing.rs:222-327`, `crates/striatum-core/src/seat_routing.rs:329-435`)
 
 ## State
+- Account admission shadow events are informational JSON lines, emitted even
+  while concurrency enforcement is off. `routing account call` has fixed members
+  `surface` (`route.account_for` for legacy or `routing/v1`), `principal` (the
+  authenticated route principal), `runner_module`, `scope_kind`, `scope_owner`,
+  `consumer` (the bound decision's consumer), `harness`, and `head_call`.
+  Missing facts are JSON null. Scope facts come from the daemon-provided route
+  `scope_authority` (not request metadata), including
+  when a runner module authorises the call; only scope kind `head` marks a head
+  call. Legacy calls are never head calls. The harness is only the legacy
+  request's `caller.harness`; routing/v1 has no harness member, so logs null,
+  never the runner module or the decision's selected harness. Harness does not
+  affect admission identity, allocation or cap counts.
+- `routing account concurrency would refuse` has fixed members `surface`,
+  `consumer` (the runner module if no decision is bound), `model`, and `accounts`
+  (an array of `{account_id, count, cap}`; null cap means uncapped). It reports
+  the count test only, without changing any pick, refusal or stored reply:
+  at least one account is eligible under the ordinary allocator, but none the
+  request may take has room for an added reservation. Retained affinity is
+  judged on that account alone. Head calls, admission and continuation replays,
+  and renewals adding no slot emit no would-refuse event. Every call emits one
+  per-call event; every would-refuse request emits one pressure event, without
+  rate limiting. The separate rate-limited `routing refused an account call`
+  warning remains separate, at most once a minute per principal and reason.
 - Migration 82 adds per-origin recheck clocks without rewriting observation history. Existing quota fences recheck immediately; non-quota clocks become `min(existing end, migration time + 1h)`. Evidence dates are not probe dates, reset dates only schedule extra checks, and a previous binary refuses the new schema through the store-ahead guard. Identity-free legacy cooldowns are non-quota even when their reported class says quota: no account reading can verify that label. (`crates/striatum-store/migrations/082_fence_rechecks.sql`)
 - The route state store applies 34 SQLite migrations for model facts and overrides, catalog and AA state, quota and failure state, usage observations, decisions, rejections, and outcomes. (`crates/striatum-store/src/lib.rs:143-282`)
 - Model facts distinguish seed, override, AA-inferred, and unscored sources; seed and override rows block AA inference from replacing their scores. (`crates/striatum-core/src/route_state_store.rs:22-74`)

@@ -163,11 +163,24 @@ pub struct Ctx<'a> {
 
 impl Ctx<'_> {
     fn command_context(&self) -> CommandContext {
+        let concurrency_caps = self
+            .classes
+            .as_ref()
+            .map(|classes| {
+                let mut caps = classes.credentials.concurrency_caps.clone();
+                // A config reload can precede the next credential publication.
+                // Do not change the credential snapshot: its contents key the
+                // serving-index cache, which observing caps must not invalidate.
+                caps.publish_settings(classes.config.concurrency_caps());
+                caps.resolved
+            })
+            .unwrap_or_default();
         CommandContext {
             flags: self.flags.clone(),
             policy: self.policy.clone(),
             now_ms: self.now_ms,
             classes: self.classes.clone(),
+            concurrency_caps,
         }
     }
 
@@ -187,6 +200,7 @@ struct CommandContext {
     policy: AllocatorPolicy,
     now_ms: i64,
     classes: Option<ClassContext>,
+    concurrency_caps: crate::concurrency_caps::ResolvedCaps,
 }
 
 impl CommandContext {
@@ -4504,6 +4518,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(skip)]
+    pub(crate) call: Option<call_log::AccountCall>,
     #[serde(default)]
     service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
@@ -4575,6 +4591,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            call: None,
             service_tier: request.service_tier,
             service_tier_chosen: None,
             service_tier_bound: false,
@@ -4762,7 +4779,25 @@ fn parse_account_for(params: &Value) -> Result<AccountForParams, OpReply> {
 
 /// Handle one account-selection operation. `body` is the whole request
 /// (`{"method", "params"}`); `principal` is the route's attested principal.
+#[cfg(test)]
 pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpReply {
+    let params = decode_params(body).unwrap_or(Value::Null);
+    let call = (method == ACCOUNT_FOR_OP)
+        .then(|| call_log::AccountCall::legacy(&params, principal, ctx.store));
+    let reply = handle_with_call(method, body, principal, ctx, call.clone());
+    if let Some(call) = call {
+        call.finish();
+    }
+    reply
+}
+
+pub(crate) fn handle_with_call(
+    method: &str,
+    body: &[u8],
+    principal: &str,
+    ctx: &Ctx<'_>,
+    call: Option<call_log::AccountCall>,
+) -> OpReply {
     checking("account_selection_enabled");
     // This query bypasses the serving transactions and answers even while
     // serving is off. A warming check never reserves or charges quota.
@@ -4785,7 +4820,7 @@ pub fn handle(method: &str, body: &[u8], principal: &str, ctx: &Ctx<'_>) -> OpRe
         Err(reply) => return reply,
     };
     match method {
-        ACCOUNT_FOR_OP => account_for(&params, principal, ctx),
+        ACCOUNT_FOR_OP => account_for(&params, principal, ctx, call),
         ACCOUNT_OBSERVE_OP => observe(&params, principal, ctx),
         ACCOUNT_RELEASE_OP => release(&params, principal, ctx),
         other => OpReply::error("unknown_method", format!("unknown method '{other}'")),
@@ -5014,14 +5049,23 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
 }
 
 mod continuation;
+#[cfg(test)]
 pub(crate) use continuation::continue_account;
+pub(crate) use continuation::continue_account_with_call;
+pub(crate) mod call_log;
 
-fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
+fn account_for(
+    params: &Value,
+    principal: &str,
+    ctx: &Ctx<'_>,
+    call: Option<call_log::AccountCall>,
+) -> OpReply {
     checking("account_for_parse");
-    let parsed = match parse_account_for(params) {
+    let mut parsed = match parse_account_for(params) {
         Ok(parsed) => parsed,
         Err(reply) => return reply,
     };
+    parsed.call = call;
     account_for_parsed(parsed, principal, ctx, None)
 }
 
@@ -6346,6 +6390,9 @@ fn serve(
     roster: &RosterBuild,
     request_fingerprint: &str,
 ) -> RouteStateResult<OpReply> {
+    if let Some(call) = &params.call {
+        call.reset();
+    }
     checking("admission_transaction");
     let now = ctx.now_ms;
     let policy = ctx.provider_policy(provider);
@@ -6777,6 +6824,11 @@ fn serve(
                 return Ok(reply);
             }
         }
+    }
+    if let Some(call) = &params.call {
+        call.evaluate(
+            tx, ctx, params, principal, &hash, &decision, &state, &inputs,
+        );
     }
     let decision_id = new_id("acd");
     let mut context = json!({ "roster": roster.context });
@@ -7558,6 +7610,7 @@ fn record_observation(
             policy,
             now_ms: ctx.now_ms,
             classes: ctx.classes.clone(),
+            concurrency_caps: ctx.concurrency_caps.clone(),
         };
         apply_bound_observation(
             tx,
