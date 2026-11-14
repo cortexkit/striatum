@@ -271,7 +271,7 @@ async fn panel_estimate_admission_validation_and_normal_flags() {
     let (_, description) = route.call("role.describe", &json!({})).await;
     let groups = description["result"]["capabilities"].as_array().unwrap();
     assert!(groups.contains(&json!("select_panel_estimate")));
-    assert!(!groups.contains(&json!("consumer_priority")));
+    assert!(groups.contains(&json!("consumer_priority")));
     assert!(!groups.contains(&json!("concurrency_full")));
     for value in [json!(false), Value::Null] {
         let mut params = request(10_000);

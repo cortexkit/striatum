@@ -1783,11 +1783,10 @@ const NOT_APPLICABLE: &[&str] = &[
     "unrequested_harness_uses_declaration",
 ];
 
-// The concurrency campaign owns consumer_priority and the concurrency_full
-// refusal reason: scheduling priority and account concurrency limits are not
-// implemented here. The conformance kit's run_suite has no priority check yet;
-// concurrency_full is a refusal reason, not a capability. Keep both unserved.
-const PENDING_READERS: &[(&str, &[&str])] = &[("consumer_priority", &[])];
+// Consumer priority is read for classification, but concurrency refusals are
+// not served until account concurrency enforcement is implemented.
+// concurrency_full is a refusal reason, not a capability.
+const PENDING_READERS: &[(&str, &[&str])] = &[];
 const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
 
 fn assert_no_pending_refusal(reply: &Frame) {

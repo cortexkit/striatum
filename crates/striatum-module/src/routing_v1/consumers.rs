@@ -139,6 +139,7 @@ pub(crate) struct Registry {
     owners: BTreeMap<String, BTreeSet<String>>,
     pub policies: BTreeMap<String, ConsumerPolicy>,
     defaults: BTreeMap<String, DemandDefaults>,
+    priorities: BTreeMap<String, cortexkit_role_routing::declarations::ConsumerPriority>,
 }
 
 impl Catalog {
@@ -253,6 +254,7 @@ impl Catalog {
             owners: BTreeMap::new(),
             policies: BTreeMap::new(),
             defaults: BTreeMap::new(),
+            priorities: config.consumer_priorities(),
         };
         for name in config.v1_consumers() {
             registry.owners.entry(name).or_default();
@@ -420,6 +422,7 @@ impl Registry {
                 };
             }
             inherit!(
+                priority,
                 iq,
                 ladder,
                 placement,
@@ -434,6 +437,17 @@ impl Registry {
                 structured_output
             );
         }
+        // Operator overrides are resolved after inheritance: an ancestor
+        // override must beat even a child's explicit declaration.
+        result.priority = Some(
+            self.priorities
+                .iter()
+                .filter(|(name, _)| crate::config_policy::consumer_matches(name, consumer))
+                .max_by_key(|(name, _)| crate::config_policy::consumer_specificity(name))
+                .map(|(_, priority)| *priority)
+                .or(result.priority)
+                .unwrap_or_default(),
+        );
         result
     }
 
@@ -448,7 +462,7 @@ impl Registry {
         let mut requirements = demand.as_object_mut().unwrap().clone();
         // parse_select_request_with_defaults resolves IQ after admission. The
         // remaining declaration members describe policy or authority, not requirements.
-        for member in ["iq", "ladder", "placement", "selectors", "kind"] {
+        for member in ["priority", "iq", "ladder", "placement", "selectors", "kind"] {
             requirements.remove(member);
         }
         if let Some(request) = params.get("requirements").and_then(Value::as_object) {
@@ -529,6 +543,21 @@ pub(crate) fn legacy_consumer(params: &Value) -> &str {
         .and_then(Value::as_str)
         .or_else(|| params.get("targetAgent").and_then(Value::as_str))
         .unwrap_or("mason")
+}
+
+/// Count requests at the API boundary, not selection attempts: internal
+/// retries must not turn one API call into several log lines.
+pub(crate) fn record_select(surface: &str, consumer: Option<&str>, config: &LiveConfig) {
+    let class = consumer
+        .and_then(|name| effective(config).defaults_for(name).priority)
+        .unwrap_or_default();
+    crate::info_operator(format!(
+        "routing select call {}",
+        serde_json::json!({
+            "surface":surface,"consumer":consumer,"class":class,
+            "head_request":class == cortexkit_role_routing::declarations::ConsumerPriority::Interactive
+        })
+    ));
 }
 
 pub(crate) fn legacy_core_consumer(name: &str) -> bool {

@@ -15,6 +15,7 @@ const ACCOUNT_CONTINUE_RESUME: &str = "account_continue_resume";
 /// runner declarations.
 pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::CONSUMER_DECLARATIONS,
+    cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,
     cortexkit_role_routing::capabilities::SELECT_KIND,
     cortexkit_role_routing::capabilities::SELECT_MEDIA,
     "select_engine",

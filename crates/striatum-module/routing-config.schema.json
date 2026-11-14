@@ -46,6 +46,14 @@
       "default": null,
       "minimum": 1
     },
+    "consumer_priorities": {
+      "description": "Whole dotted consumer names; the longest matching override wins.",
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/PriorityClass"
+      },
+      "default": {}
+    },
     "consumers": {
       "type": "object",
       "additionalProperties": {
@@ -982,6 +990,16 @@
         "by",
         "extraBy",
         "floor"
+      ]
+    },
+    "PriorityClass": {
+      "description": "Operator spelling of the contract's consumer scheduling classes.",
+      "type": "string",
+      "enum": [
+        "interactive",
+        "blocking",
+        "worker",
+        "background"
       ]
     },
     "ProjectPolicy": {

@@ -1340,7 +1340,15 @@ async fn settings_only_names_log_info_at_load_without_health_warnings_or_request
             FrameType::Response
         );
     }
-    assert!(crate::take_operator_infos().is_empty());
+    // Per-call telemetry is expected; declaration diagnostics still belong
+    // only to settings load, not to each request using a settings-only name.
+    assert_eq!(
+        crate::take_operator_infos(),
+        vec![format!(
+            "routing select call {}",
+            json!({"surface":"routing/v1","consumer":"settings-only", "class":"worker","head_request":false})
+        ); 3]
+    );
     assert!(crate::take_operator_warnings().is_empty());
     assert_eq!(consumers::health()["issues"], json!([]));
 }
@@ -2212,4 +2220,84 @@ fn consumer_alias_ownership_conflict_warns_once_at_catalog_load() {
         .any(|issue| issue
             .as_str()
             .is_some_and(|issue| issue.contains("consumer alias ownership conflict"))));
+}
+
+#[tokio::test]
+async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segment() {
+    use cortexkit_role_routing::declarations::ConsumerPriority::*;
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let h = harness();
+    let modules = json!([
+        {"module_id":"basal","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[
+            {"name":"basal","priority":"interactive"},
+            {"name":"basal.block","priority":"blocking"},
+            {"name":"basal.block.deep","priority":"background"},
+            {"name":"basal.worker","priority":"worker"},
+            {"name":"legacy-task","priority":"blocking","eq":23},
+            {"name":"shared","priority":"interactive"}
+        ]}}},
+        {"module_id":"other","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[
+            {"name":"shared","priority":"background"},
+            {"name":"basal.foreign"}
+        ]}}}
+    ]);
+    let catalog = consumers::Catalog::from_catalog(&modules);
+    let registry = catalog.effective(&h.operator_config());
+    for (name, expected) in [
+        ("basal", Interactive),
+        ("basal.child", Interactive),
+        ("basal.block.child", Blocking),
+        ("basal.block.deep.child", Background),
+        ("basal.worker", Worker),
+        ("basal.foreign.child", Worker),
+        ("shared", Worker),
+        ("shared.child", Worker),
+        ("unknown", Worker),
+        ("basal_block", Worker),
+        ("legacy-task.child", Blocking),
+    ] {
+        assert_eq!(
+            registry.defaults_for(name).priority,
+            Some(expected),
+            "{name}"
+        );
+    }
+    // Scheduling metadata must not discard a transitional name's demand or
+    // ownership: those names remain usable until their callers are renamed.
+    assert_eq!(registry.defaults_for("legacy-task").eq, Some(23));
+    consumers::replace_catalog(&modules);
+    let owner = h.bind(reserved("basal"), None).await;
+    let stranger = h.bind(reserved("other"), None).await;
+    assert_eq!(
+        owner.call("route.select", &select("legacy-task")).await.0,
+        FrameType::Response
+    );
+    admission_refused(
+        stranger.call("route.select", &select("legacy-task")).await,
+        "consumer_not_owned",
+        "legacy-task",
+    );
+    h.edit_config(|config| {
+        config["consumer_priorities"] = json!({
+            "basal":"background", "basal.block":"interactive",
+            "shared":"blocking", "unknown":"interactive"
+        });
+    });
+    let registry = catalog.effective(&h.operator_config());
+    for (name, expected) in [
+        ("basal", Background),
+        ("basal.worker", Background),
+        ("basal.block.deep.child", Interactive),
+        ("basal.blocked", Background),
+        ("basal_block", Worker),
+        ("shared.child", Blocking),
+        ("unknown.child", Interactive),
+        ("unknownish", Worker),
+    ] {
+        assert_eq!(
+            registry.defaults_for(name).priority,
+            Some(expected),
+            "{name}"
+        );
+    }
 }

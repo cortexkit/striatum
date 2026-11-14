@@ -154,6 +154,16 @@ pub(crate) struct PricingPatch {
 }
 
 impl LiveConfig {
+    pub(crate) fn consumer_priorities(
+        &self,
+    ) -> BTreeMap<String, cortexkit_role_routing::declarations::ConsumerPriority> {
+        self.config
+            .consumer_priorities
+            .iter()
+            .map(|(name, class)| (name.clone(), (*class).into()))
+            .collect()
+    }
+
     pub(crate) fn concurrency_caps(&self) -> &crate::concurrency_caps::CapSettings {
         &self.config.concurrency
     }
@@ -1247,6 +1257,9 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
 #[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
+    /// Whole dotted consumer names; the longest matching override wins.
+    #[serde(default)]
+    consumer_priorities: BTreeMap<String, crate::config_policy::PriorityClass>,
     #[serde(default)]
     concurrency: crate::concurrency_caps::CapSettings,
     #[serde(flatten)]

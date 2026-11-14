@@ -191,9 +191,19 @@ impl AccountCall {
             accounts.push(json!({"account_id":account,"count":count,"cap":cap}));
         }
         if !room {
+            let class = self
+                .consumer
+                .as_deref()
+                .zip(ctx.classes.as_ref())
+                .and_then(|(consumer, classes)| {
+                    crate::routing_v1::consumers::effective(&classes.config)
+                        .defaults_for(consumer)
+                        .priority
+                })
+                .unwrap_or_default();
             *self.would_refuse.lock().unwrap() = Some(json!({
                 "surface":self.surface,"consumer":self.consumer.as_ref().or(self.runner_module.as_ref()),
-                "model":params.model,"accounts":accounts
+                "class":class,"model":params.model,"accounts":accounts
             }));
         }
     }
