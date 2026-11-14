@@ -536,6 +536,39 @@ async fn current_positive_withdrawal_refuses_bound_fast_without_a_retry_or_step_
     }
 }
 
+/// A bound fast decision whose accounts are all route-fenced for a while
+/// waits for them: the timed refusal, not the untimed "ask for a new
+/// decision" answer of a tier no account serves any more.
+#[tokio::test]
+async fn bound_fast_with_its_accounts_route_fenced_gets_a_timed_wait() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _credentials) = legacy_broca_setup();
+    let request = bound_request(&harness, "fenced-fast", true).await;
+    let until = NOW as i64 + 3_600_000;
+    for credential in ["chatgpt:0", "chatgpt:1", "chatgpt:2"] {
+        harness
+            .store()
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: "openai".into(),
+                credential_id: credential.into(),
+                model: MODEL.into(),
+                until_ms: until,
+                decision_id: String::new(),
+                recorded_at: NOW as i64,
+            })
+            .unwrap();
+    }
+    let runner = harness.bind(reserved("broca"), None).await;
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_ne!(refused.1["code"], "account_selection_unavailable", "{}", refused.1);
+    assert!(
+        refused.1["detail"]["reset_at_ms"].as_i64().is_some_and(|at| at > NOW as i64),
+        "{}",
+        refused.1
+    );
+}
+
 #[tokio::test]
 async fn concurrent_bound_fast_admissions_share_the_on_demand_account_input_load() {
     let _clock = crate::InjectedClock::set(NOW);

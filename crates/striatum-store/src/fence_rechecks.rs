@@ -177,17 +177,40 @@ pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
 }
 
 pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
+    sync_at(conn, crate::now_ms())
+}
+
+/// The expired, unmanaged origins `sync` retires at `now`: their non-quota
+/// deadline passed and no clock holds their evidence.
+const RETIRING: &str = "SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
+    WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
+        WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)";
+
+/// Archive the expired, unmanaged origins of the current snapshot at `now`,
+/// which makes `fence_retire_enforcement` end their source evidence.
+/// Returns how many it archived. An archive row for the same generation is
+/// replaced: deleted first, so the insert that fires the trigger resolves no
+/// conflict. (A conflict policy on that insert would also apply to every
+/// statement of the trigger, which writes the block tables.) The archive
+/// table has no delete trigger.
+pub(crate) fn retire_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
+    conn.execute(
+        &format!(
+            "DELETE FROM fence_retired_origin WHERE (kind,origin_key,evidence) IN
+            (SELECT kind,origin_key,evidence FROM ({RETIRING}))"
+        ),
+        [now],
+    )?;
+    conn.execute(&format!("INSERT INTO fence_retired_origin {RETIRING}"), [now])
+}
+
+/// [`sync`] at a given time.
+pub(crate) fn sync_at(conn: &Connection, now: i64) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
     }
     snapshot_origins(conn)?;
-    let retired = conn.execute(
-        "INSERT OR REPLACE INTO fence_retired_origin
-        SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
-        WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
-            WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)",
-        [crate::now_ms()],
-    )?;
+    let retired = retire_expired(conn, now)?;
     if retired > 0 {
         snapshot_origins(conn)?;
     }
@@ -219,7 +242,7 @@ pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Re
     upsert_clocks(conn, Some(kind), Some(key))
 }
 
-fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
+pub(crate) fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
     // Materialize once and index the compound origin key. A correlated lookup
     // against the UNION view otherwise rebuilds its JSON keys for every clock.
     conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;
@@ -251,6 +274,14 @@ fn upsert_clocks(conn: &Connection, kind: Option<&str>, key: Option<&str>) -> ru
     Ok(())
 }
 
+/// Whether a route or provider row holds one account's error rather than a
+/// route or provider wall. Such a row is kept for diagnosis but enforces
+/// nothing, so its origin gets no block.
+pub(crate) fn quarantined_row(unscoped: bool, error: Option<&str>, class: Option<&str>) -> bool {
+    let class = class.and_then(|class| striatum_core::RouteWallClass::parse(class).ok());
+    !unscoped && striatum_core::account_wall::account_scoped_wall(error, class)
+}
+
 pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
     let mut quarantined = Vec::new();
     for (table, key, kind) in [
@@ -269,9 +300,7 @@ pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(St
         })?;
         for row in rows {
             let (key, error, class) = row?;
-            let class =
-                class.and_then(|class| striatum_core::RouteWallClass::parse(&class).ok());
-            if striatum_core::account_wall::account_scoped_wall(error.as_deref(), class) {
+            if quarantined_row(false, error.as_deref(), class.as_deref()) {
                 quarantined.push((kind.to_owned(), serde_json::json!([key]).to_string()));
             }
         }
@@ -333,7 +362,7 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
     read_effective_at(conn, crate::now_ms())
 }
 
-fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
+pub(crate) fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
     if !enabled(conn)? {
         return Ok(Vec::new());
     }
@@ -466,38 +495,9 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     if !enabled(conn)? {
         return Ok(LoadedBlocks::default());
     }
-    let mut clocks = std::collections::BTreeMap::new();
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at FROM fence_recheck")?;
-    for row in statement.query_map([], |r| {
-        let kind: String = r.get(0)?;
-        Ok((
-            Block {
-                cause: cause(&kind)?,
-                kind,
-                origin_key: r.get(1)?,
-                scope: Scope {
-                    provider: r.get(2)?,
-                    account_id: r.get(3)?,
-                    credential_id: r.get(4)?,
-                    model: r.get(5)?,
-                    size_class: r.get(6)?,
-                    principal: r.get(7)?,
-                    admission_id: r.get(8)?,
-                },
-                evidence: r.get(9)?,
-                evidence_at: r.get(10)?,
-                lifetime: LifetimeClass::from_quota(r.get(11)?),
-                classified: r.get(12)?,
-                next_recheck_at: r.get(13)?,
-                reset_check_at: r.get(14)?,
-                last_claimed_at: r.get(15)?,
-                claim_owner: r.get(16)?,
-                claim_generation: r.get(17)?,
-                cleared_models: Vec::new(),
-            },
-            r.get::<_, Option<i64>>(18)?,
-        ))
-    })? {
+    let mut clocks = Clocks::new();
+    let mut statement = conn.prepare(&format!("SELECT {CLOCK_COLUMNS} FROM fence_recheck"))?;
+    for row in statement.query_map([], |r| clock_row(r, 0))? {
         let (block, cleared) = row?;
         clocks.insert(
             (block.kind.clone(), block.origin_key.clone()),
@@ -507,51 +507,164 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     let mut statement = conn.prepare(
         "SELECT kind,origin_key,evidence,model FROM fence_recheck_route_clear ORDER BY model",
     )?;
-    for row in statement.query_map([], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, String>(3)?,
-        ))
-    })? {
-        let (kind, key, evidence, model) = row?;
-        if let Some((block, _)) = clocks.get_mut(&(kind, key)) {
-            if block.evidence == evidence {
-                block.cleared_models.push(model);
+    let clears = statement
+        .query_map([], |r| {
+            Ok(RouteClear {
+                kind: r.get(0)?,
+                origin_key: r.get(1)?,
+                evidence: r.get(2)?,
+                model: r.get(3)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    attach_route_clears(&mut clocks, &clears);
+    let quarantined = quarantined_origins(conn)?;
+    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
+    let origins = statement
+        .query_map([], |r| view_origin(r, 0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    derive_blocks(clocks, &quarantined, origins, now)
+}
+
+/// The `fence_recheck` columns [`clock_row`] decodes, in its order.
+pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
+
+/// Stored clocks keyed by source kind and origin key, each with its
+/// `cleared_at`.
+pub(crate) type Clocks = std::collections::BTreeMap<(String, String), (Block, Option<i64>)>;
+
+/// One `fence_recheck` row, decoded from [`CLOCK_COLUMNS`] starting at `at`.
+pub(crate) fn clock_row(
+    r: &rusqlite::Row<'_>,
+    at: usize,
+) -> rusqlite::Result<(Block, Option<i64>)> {
+    let kind: String = r.get(at)?;
+    Ok((
+        Block {
+            cause: cause(&kind)?,
+            kind,
+            origin_key: r.get(at + 1)?,
+            scope: Scope {
+                provider: r.get(at + 2)?,
+                account_id: r.get(at + 3)?,
+                credential_id: r.get(at + 4)?,
+                model: r.get(at + 5)?,
+                size_class: r.get(at + 6)?,
+                principal: r.get(at + 7)?,
+                admission_id: r.get(at + 8)?,
+            },
+            evidence: r.get(at + 9)?,
+            evidence_at: r.get(at + 10)?,
+            lifetime: LifetimeClass::from_quota(r.get(at + 11)?),
+            classified: r.get(at + 12)?,
+            next_recheck_at: r.get(at + 13)?,
+            reset_check_at: r.get(at + 14)?,
+            last_claimed_at: r.get(at + 15)?,
+            claim_owner: r.get(at + 16)?,
+            claim_generation: r.get(at + 17)?,
+            cleared_models: Vec::new(),
+        },
+        r.get::<_, Option<i64>>(at + 18)?,
+    ))
+}
+
+/// One `fence_recheck_route_clear` row: a model cleared from a route-wide
+/// origin while that origin's evidence is unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RouteClear {
+    pub(crate) kind: String,
+    pub(crate) origin_key: String,
+    pub(crate) evidence: String,
+    pub(crate) model: String,
+}
+
+/// Attach each clear, in the order given, to the clock whose current evidence
+/// it names. A clear recorded for older evidence no longer applies.
+pub(crate) fn attach_route_clears(clocks: &mut Clocks, clears: &[RouteClear]) {
+    for clear in clears {
+        if let Some((block, _)) = clocks.get_mut(&(clear.kind.clone(), clear.origin_key.clone())) {
+            if block.evidence == clear.evidence {
+                block.cleared_models.push(clear.model.clone());
             }
         }
     }
-    let quarantined = quarantined_origins(conn)?;
-    let mut loaded = LoadedBlocks::default();
-    loaded.cleared_evidence = clocks
-        .values()
-        .filter(|(_, cleared)| cleared.is_some())
-        .map(|(block, _)| block.clone())
-        .collect();
-    // The view projects the source tables, not the clock. An unchanged source
-    // signature selects the stored class and schedule; a new one derives them.
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
-    let mut rows = statement.query([])?;
-    while let Some(r) = rows.next()? {
-        let kind: String = r.get(0)?;
-        let key: String = r.get(1)?;
-        if quarantined.contains(&(kind.clone(), key.clone())) {
+}
+
+/// One row of the `fence_origin` view: an origin's current source evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ViewOrigin {
+    pub kind: String,
+    pub origin_key: String,
+    pub provider: String,
+    pub account_id: Option<String>,
+    pub credential_id: Option<String>,
+    pub model: Option<String>,
+    pub size_class: Option<i64>,
+    pub principal: Option<String>,
+    pub admission_id: Option<String>,
+    pub evidence: String,
+    pub evidence_at: i64,
+    pub quota: Option<bool>,
+    pub deadline: Option<f64>,
+    pub reset_at: Option<f64>,
+}
+
+/// Decode the view's 14 columns starting at `at`, in the view's order.
+pub(crate) fn view_origin(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<ViewOrigin> {
+    Ok(ViewOrigin {
+        kind: r.get(at)?,
+        origin_key: r.get(at + 1)?,
+        provider: r.get(at + 2)?,
+        account_id: r.get(at + 3)?,
+        credential_id: r.get(at + 4)?,
+        model: r.get(at + 5)?,
+        size_class: r.get(at + 6)?,
+        principal: r.get(at + 7)?,
+        admission_id: r.get(at + 8)?,
+        evidence: r.get(at + 9)?,
+        evidence_at: r.get(at + 10)?,
+        quota: r.get(at + 11)?,
+        deadline: r.get(at + 12)?,
+        reset_at: r.get(at + 13)?,
+    })
+}
+
+/// Merge source evidence with the stored clocks. The SQL adapter and the
+/// in-memory block state both call this, so they differ only in where the
+/// rows come from. Clocks must already carry their route clears. An unchanged
+/// source signature selects the stored class and schedule; a new one derives
+/// them.
+pub(crate) fn derive_blocks(
+    mut clocks: Clocks,
+    quarantined: &[(String, String)],
+    origins: impl IntoIterator<Item = ViewOrigin>,
+    now: i64,
+) -> rusqlite::Result<LoadedBlocks> {
+    let mut loaded = LoadedBlocks {
+        blocks: Vec::new(),
+        cleared_evidence: clocks
+            .values()
+            .filter(|(_, cleared)| cleared.is_some())
+            .map(|(block, _)| block.clone())
+            .collect(),
+    };
+    for origin in origins {
+        let key = (origin.kind.clone(), origin.origin_key.clone());
+        if quarantined.contains(&key) {
             continue;
         }
-        let prior = clocks.remove(&(kind.clone(), key.clone()));
-        let evidence: String = r.get(9)?;
+        let prior = clocks.remove(&key);
         if let Some((block, cleared)) = &prior {
-            if block.evidence == evidence {
+            if block.evidence == origin.evidence {
                 if cleared.is_none() {
                     loaded.blocks.push(block.clone());
                 }
                 continue;
             }
         }
-        let evidence_at: i64 = r.get(10)?;
-        let quota = r.get::<_, Option<bool>>(11)?.unwrap_or(false);
-        let deadline = r.get::<_, Option<f64>>(12)?.map(|at| at as i64);
+        let evidence_at = origin.evidence_at;
+        let quota = origin.quota.unwrap_or(false);
+        let deadline = origin.deadline.map(|at| at as i64);
         if !quota && deadline.is_some_and(|at| at < now) {
             continue;
         }
@@ -565,28 +678,25 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
         if last_claimed_at.is_some_and(|at| evidence_at < at) {
             next = next.max(prior.as_ref().unwrap().0.next_recheck_at);
         }
-        let reset = r
-            .get::<_, Option<f64>>(13)?
-            .map(|at| at as i64)
-            .filter(|at| {
-                quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
-            });
+        let reset = origin.reset_at.map(|at| at as i64).filter(|at| {
+            quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
+        });
         loaded.blocks.push(Block {
-            cause: cause(&kind)?,
-            kind,
-            origin_key: key,
+            cause: cause(&origin.kind)?,
+            kind: origin.kind,
+            origin_key: origin.origin_key,
             scope: Scope {
-                provider: r.get(2)?,
-                account_id: r.get(3)?,
-                credential_id: r.get(4)?,
-                model: r.get(5)?,
-                size_class: r.get(6)?,
-                principal: r.get(7)?,
-                admission_id: r.get(8)?,
+                provider: origin.provider,
+                account_id: origin.account_id,
+                credential_id: origin.credential_id,
+                model: origin.model,
+                size_class: origin.size_class,
+                principal: origin.principal,
+                admission_id: origin.admission_id,
             },
             lifetime: LifetimeClass::from_quota(quota),
             classified: false,
-            evidence,
+            evidence: origin.evidence,
             evidence_at,
             next_recheck_at: next,
             reset_check_at: reset,
@@ -605,58 +715,166 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     Ok(loaded)
 }
 
+/// Whether `row` authorizes the test request its clock is on now: the clock
+/// is uncleared, holds the authorized evidence, and is on the authorized
+/// claim generation with no other owner, or, for an admission's own
+/// authorization (`admission_owned`), is claimed by that admission. The
+/// SQL form is [`current_test_join`].
+fn test_is_current(
+    blocks: &crate::BlockState,
+    row: &crate::block_state::ProbeAuthorization,
+    admission_owned: bool,
+) -> bool {
+    blocks.clock(&row.kind, &row.origin_key).is_some_and(|(clock, cleared)| {
+        let owner = clock.claim_owner.as_deref();
+        cleared.is_none()
+            && clock.evidence == row.evidence
+            && clock.evidence_at == row.evidence_at
+            && ((owner.is_none_or(|by| by == row.owner) && clock.claim_generation == row.claim_generation)
+                || (admission_owned && owner == Some(row.owner.as_str())))
+    })
+}
+
+/// [`test_is_current`] as a join of authorization `a` to its clock `r`, with
+/// the admission flag bound at `?{flag}`.
+fn current_test_join(flag: usize) -> String {
+    format!(
+        "JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
+         AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at AND r.cleared_at IS NULL
+         AND (((r.claim_owner IS NULL OR r.claim_owner=a.owner) AND r.claim_generation=a.claim_generation)
+             OR (?{flag} AND r.claim_owner=a.owner))"
+    )
+}
+
+/// The clause naming the uncleared clock a decision read. Its seven values
+/// are bound from `?{first}` on, in this order: evidence, evidence_at, quota,
+/// next_recheck_at, reset_check_at, claim_owner, claim_generation. An update
+/// carrying it changes the clock only if SQL still holds what the working
+/// state showed.
+fn clock_held(first: usize) -> String {
+    let at = |offset: usize| first + offset;
+    format!(
+        "evidence=?{} AND evidence_at=?{} AND cleared_at IS NULL AND quota=?{} AND next_recheck_at=?{}
+         AND reset_check_at IS ?{} AND claim_owner IS ?{} AND claim_generation=?{}",
+        at(0), at(1), at(2), at(3), at(4), at(5), at(6)
+    )
+}
+
+/// Claim `origins` on SQL after synchronizing the clocks, as a connection
+/// without the account state would.
+#[cfg(test)]
 pub(crate) fn claim(
     conn: &Connection,
     origins: &[FenceRecheck],
     now: i64,
 ) -> rusqlite::Result<bool> {
-    claim_owned(conn, origins, now, None, None, None)
+    sync(conn)?;
+    claim_decided(conn, None, origins, now, None, None, None)
 }
 
+#[cfg(test)]
 pub(crate) fn claim_with_authorization(
     conn: &Connection,
     origins: &[FenceRecheck],
     now: i64,
     owner: &str,
 ) -> rusqlite::Result<bool> {
-    claim_owned(conn, origins, now, None, None, Some(owner))
+    sync(conn)?;
+    claim_decided(conn, None, origins, now, None, None, Some(owner))
 }
 
-fn claim_owned(
+/// The claim fields of the probe clock that holds one origin's exact
+/// evidence, as a claim decides on them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaimState {
+    quota: bool,
+    next: i64,
+    reset: Option<i64>,
+    owner: Option<String>,
+    generation: i64,
+}
+
+/// Each origin's uncleared clock that still holds the origin's evidence:
+/// from the working state when the command has one, else from SQL.
+fn claim_states(
     conn: &Connection,
+    blocks: Option<&crate::BlockState>,
+    origins: &[&FenceRecheck],
+) -> rusqlite::Result<Vec<Option<ClaimState>>> {
+    if let Some(blocks) = blocks {
+        let clocks = blocks.live_clocks();
+        return Ok(origins
+            .iter()
+            .map(|origin| {
+                clocks
+                    .get(&(origin.kind.as_str(), origin.origin_key.as_str()))
+                    .filter(|clock| {
+                        clock.evidence_at == origin.evidence_at && clock.evidence == origin.evidence
+                    })
+                    .map(|clock| ClaimState {
+                        quota: clock.lifetime == LifetimeClass::Quota,
+                        next: clock.next_recheck_at,
+                        reset: clock.reset_check_at,
+                        owner: clock.claim_owner.clone(),
+                        generation: clock.claim_generation,
+                    })
+            })
+            .collect());
+    }
+    origins
+        .iter()
+        .map(|origin| {
+            conn.query_row(
+                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
+             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
+                params![origin.kind, origin.origin_key, origin.evidence_at, origin.evidence],
+                |row| {
+                    Ok(ClaimState {
+                        quota: row.get(0)?,
+                        next: row.get(1)?,
+                        reset: row.get(2)?,
+                        owner: row.get(3)?,
+                        generation: row.get(4)?,
+                    })
+                },
+            )
+            .optional()
+        })
+        .collect()
+}
+
+/// Claim every origin's probe clock or none of them, deciding on `blocks`
+/// when given (the command's working state) and on SQL otherwise. The caller
+/// synchronizes the clocks first. Each clock update is keyed and names the
+/// state it was decided on; a clock SQL holds differently fails the command
+/// with [`crate::block_state::diverged`].
+fn claim_decided(
+    conn: &Connection,
+    blocks: Option<&crate::BlockState>,
     origins: &[FenceRecheck],
     now: i64,
     consume_owner: Option<&str>,
     grant_owner: Option<&str>,
     authorization: Option<&str>,
 ) -> rusqlite::Result<bool> {
-    sync(conn)?;
+    // A clock is claimed once per call, even if a caller lists its origin
+    // twice: a second update would not find the state the first one left.
+    let mut seen = std::collections::HashSet::new();
+    let origins: Vec<&FenceRecheck> = origins
+        .iter()
+        .filter(|origin| seen.insert((origin.kind.as_str(), origin.origin_key.as_str())))
+        .collect();
     // Check the entire conjunction before updating any clock. BEGIN IMMEDIATE
     // serializes distinct connections; a lost race consumes none of the clocks.
     let mut states = Vec::new();
     let mut quota_next = i64::MIN;
     let mut quota_evidence = i64::MIN;
     let mut quota_resets = Vec::new();
-    for origin in origins {
-        let state = conn
-            .query_row(
-                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
-             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
-                params![origin.kind, origin.origin_key, origin.evidence_at,origin.evidence],
-                |row| {
-                    Ok((
-                        row.get::<_, bool>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((quota, next, reset, owner, generation)) = state else {
+    for (origin, state) in origins.iter().copied().zip(claim_states(conn, blocks, &origins)?) {
+        let Some(state) = state else {
             return Ok(false);
         };
+        let ClaimState { quota, next, reset, ref owner, .. } = state;
         if quota != origin.quota {
             return Ok(false);
         }
@@ -675,7 +893,7 @@ fn claim_owned(
             quota_evidence = quota_evidence.max(origin.evidence_at);
             quota_resets.extend(reset);
         }
-        states.push((origin, owned, due, generation));
+        states.push((origin, owned, due, state));
     }
     // Quota representations of the same selected account share one periodic
     // check. A reset after its latest refusal adds a check for the whole
@@ -688,13 +906,17 @@ fn claim_owned(
     {
         return Ok(false);
     }
-    for (origin, owned, due, prior_generation) in states {
+    // The clock state each update was decided on, after the keyed columns.
+    const DECIDED: &str = "evidence=:evidence AND evidence_at=:evidence_at AND cleared_at IS NULL
+        AND quota=:quota AND next_recheck_at=:next AND reset_check_at IS :reset
+        AND claim_owner IS :owner AND claim_generation=:generation";
+    for (origin, owned, due, state) in states {
         // Admission changes the launch time but preserves the claim generation.
         // A cancellation can release only that claim, not a later request's.
         let generation = if owned && !due {
-            prior_generation
+            state.generation
         } else {
-            prior_generation.saturating_add(1)
+            state.generation.saturating_add(1)
         };
         for owner in [authorization.or(grant_owner), consume_owner]
             .into_iter()
@@ -706,26 +928,49 @@ fn claim_owned(
                 claim_generation=excluded.claim_generation",
                 params![owner,origin.kind,origin.origin_key,origin.evidence,origin.evidence_at,now,generation])?;
         }
-        if owned && !due {
-            conn.execute(
-                "UPDATE fence_recheck SET claim_owner=?3,
-                    reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END
-                    WHERE kind=?1 AND origin_key=?2",
-                params![origin.kind, origin.origin_key, grant_owner, now],
-            )?;
-            continue;
-        }
-        let interval = if origin.quota {
-            QUOTA_FENCE_RECHECK_MS
-        } else {
-            NON_QUOTA_FENCE_MAX_MS
+        let decided = rusqlite::named_params! {
+            ":kind": origin.kind, ":key": origin.origin_key, ":evidence": origin.evidence,
+            ":evidence_at": origin.evidence_at, ":quota": state.quota, ":next": state.next,
+            ":reset": state.reset, ":owner": state.owner, ":generation": state.generation,
+            ":grant": grant_owner, ":now": now,
         };
-        conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=?4,claim_owner=?5,claim_generation=?6,
-            reset_check_at=CASE WHEN reset_check_at>?4 THEN reset_check_at END WHERE kind=?1 AND origin_key=?2",
-            params![origin.kind,origin.origin_key,now.saturating_add(interval),now,grant_owner,generation])?;
+        let changed = if owned && !due {
+            conn.execute(
+                &format!(
+                    "UPDATE fence_recheck SET claim_owner=:grant,
+                    reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
+                    WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
+                ),
+                decided,
+            )?
+        } else {
+            let interval = if origin.quota {
+                QUOTA_FENCE_RECHECK_MS
+            } else {
+                NON_QUOTA_FENCE_MAX_MS
+            };
+            let mut with_next = decided.to_vec();
+            let next = now.saturating_add(interval);
+            with_next.push((":renewed", &next as &dyn rusqlite::ToSql));
+            with_next.push((":generation_new", &generation as &dyn rusqlite::ToSql));
+            conn.execute(
+                &format!(
+                    "UPDATE fence_recheck SET next_recheck_at=:renewed,last_claimed_at=:now,claim_owner=:grant,
+                    claim_generation=:generation_new,reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
+                    WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
+                ),
+                with_next.as_slice(),
+            )?
+        };
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("claim of {} {}", origin.kind, origin.origin_key),
+        )?;
     }
     Ok(true)
 }
+
 
 impl SqliteRouteStateStore {
     pub fn load_blocks(&self, now: i64) -> RouteStateResult<LoadedBlocks> {
@@ -1059,8 +1304,7 @@ impl AccountTx<'_> {
         }
         if origins.iter().all(|origin| origin.claim_owner.as_deref() == Some(from)) {
             self.transfer_probe_authorization(from, decision)?;
-            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
-                params![from,decision]).map_err(err)?;
+            self.rebind_claim_owner(from, decision)?;
         } else if !self.grant_fence_rechecks(origins, now, Some(decision))? {
             return Ok(false);
         }
@@ -1078,6 +1322,22 @@ impl AccountTx<'_> {
     pub fn probe_report_matches(&self, owner: &str, credential: Option<&str>, preserve: bool) -> RouteStateResult<bool> {
         if !enabled(self.conn).map_err(err)? { return Ok(true); }
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            // The answer gates the report's effects and healing.
+            self.check_probe_inputs(&blocks, owner, !preserve)?;
+            let authorizations = blocks.authorizations_of(owner);
+            if authorizations.is_empty() { return Ok(true); }
+            if preserve { return Ok(false); }
+            let clocks = blocks.live_clocks();
+            let current = authorizations.iter().any(|authorization| {
+                clocks.get(&(authorization.kind.as_str(), authorization.origin_key.as_str())).is_some_and(|clock| {
+                    clock.evidence == authorization.evidence && clock.evidence_at == authorization.evidence_at
+                        && clock.claim_generation == authorization.claim_generation
+                })
+            });
+            if !current { return Ok(false); }
+            return self.decision_names_credential(owner, credential);
+        }
         let authorized: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)", [owner], |row| row.get(0)).map_err(err)?;
         if !authorized { return Ok(true); }
@@ -1088,9 +1348,189 @@ impl AccountTx<'_> {
              AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation
              WHERE a.owner=?1 AND r.cleared_at IS NULL)", [owner], |row| row.get(0)).map_err(err)?;
         if !current { return Ok(false); }
+        self.decision_names_credential(owner, credential)
+    }
+
+    /// Whether the decision's remembered serving identity names `credential`;
+    /// true when no credential is reported.
+    fn decision_names_credential(&self, decision: &str, credential: Option<&str>) -> RouteStateResult<bool> {
         let Some(credential) = credential else { return Ok(true); };
         self.conn.query_row("SELECT COALESCE(json_extract(provider_identity_json,'$.credentialId')=?2,0)
-            FROM model_route_decisions WHERE id=?1", params![owner,credential], |row| row.get(0)).map_err(err)
+            FROM model_route_decisions WHERE id=?1", params![decision,credential], |row| row.get(0)).map_err(err)
+    }
+
+    /// Claim, renew or consume `origins`' clocks for the named owners after
+    /// synchronizing them, deciding on the working state when the command
+    /// has one.
+    fn claim_owned(
+        &self,
+        origins: &[FenceRecheck],
+        now: i64,
+        consume_owner: Option<&str>,
+        grant_owner: Option<&str>,
+        authorization: Option<&str>,
+    ) -> RouteStateResult<bool> {
+        sync(self.conn).map_err(err)?;
+        let blocks = self.working_blocks()?;
+        claim_decided(self.conn, blocks.as_deref(), origins, now, consume_owner, grant_owner, authorization)
+            .map_err(err)
+    }
+
+    /// Claim `origins` for a pool key lease, which holds their authorization.
+    pub(crate) fn claim_for_lease(&self, origins: &[FenceRecheck], now: i64, lease: &str) -> RouteStateResult<bool> {
+        self.claim_owned(origins, now, None, None, Some(lease))
+    }
+
+    /// Hand every clock claimed by `from` to `to`. With a working state each
+    /// clock is updated by key and must still hold the claim the state shows.
+    fn rebind_claim_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        let Some(blocks) = self.working_blocks()? else {
+            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                params![from,to]).map_err(err)?;
+            return Ok(());
+        };
+        for (clock, _) in blocks.clocks_claimed_by(from) {
+            let changed = self.conn.execute("UPDATE fence_recheck SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
+                AND claim_owner=?4 AND evidence=?5 AND evidence_at=?6 AND claim_generation=?7",
+                params![clock.kind,clock.origin_key,to,from,clock.evidence,clock.evidence_at,clock.claim_generation]).map_err(err)?;
+            crate::block_state::expect_changes(changed, 1,
+                format_args!("rebind of {} {} from {from}", clock.kind, clock.origin_key)).map_err(err)?;
+        }
+        // No clock the state does not show may still be claimed by `from`.
+        let left = self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+            params![from,to]).map_err(err)?;
+        crate::block_state::expect_changes(left, 0, format_args!("clocks claimed by {from} the state does not hold"))
+            .map_err(err)
+    }
+
+    /// Fail with [`crate::block_state::diverged`] if SQL holds an uncleared
+    /// clock on `row`'s authorized evidence and generation, which the working
+    /// state decided it does not. With `model`, only a non-quota clock of
+    /// that model or with no model counts, as `release_inconclusive_probe`
+    /// requires. The update sets nothing, so it is a keyed check, not a
+    /// change.
+    fn expect_no_authorized_clock(
+        &self,
+        row: &crate::block_state::ProbeAuthorization,
+        model: Option<&str>,
+    ) -> RouteStateResult<()> {
+        let keyed = "UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
+            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5";
+        let changed = match model {
+            None => self.conn.execute(keyed, params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
+            Some(model) => self.conn.execute(&format!("{keyed} AND quota=0 AND (model IS NULL OR model=?6)"),
+                params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation,model]),
+        }
+        .map_err(err)?;
+        crate::block_state::expect_changes(changed, 0,
+            format_args!("authorized clock of {} {} for {}", row.kind, row.origin_key, row.owner)).map_err(err)
+    }
+
+    /// Compare what a decision read about `owner`'s probe from the working
+    /// state with SQL, keyed by the owner and the origins it holds: its
+    /// authorization rows and, with `clocks`, the clock of each. A decision
+    /// that only reads (whether a report settles a probe, whether a probe
+    /// names a credential) writes nothing a keyed update could check, so it
+    /// checks its inputs instead.
+    fn check_probe_inputs(
+        &self,
+        blocks: &crate::BlockState,
+        owner: &str,
+        clocks: bool,
+    ) -> RouteStateResult<()> {
+        use crate::block_state::{diverged, ProbeAuthorization, STATE_CHECK};
+        let held = blocks.authorizations_of(owner);
+        let stored = self
+            .conn
+            .prepare_cached(&format!("{STATE_CHECK} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key"))
+            .map_err(err)?
+            .query_map([owner], |r| {
+                Ok(ProbeAuthorization {
+                    owner: r.get(0)?,
+                    kind: r.get(1)?,
+                    origin_key: r.get(2)?,
+                    evidence: r.get(3)?,
+                    evidence_at: r.get(4)?,
+                    claimed_at: r.get(5)?,
+                    claim_generation: r.get(6)?,
+                })
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        if stored != held {
+            return Err(err(diverged(format_args!("authorizations of {owner}: state {held:?}, SQL {stored:?}"))));
+        }
+        if !clocks {
+            return Ok(());
+        }
+        for row in &held {
+            let shown = blocks.clock(&row.kind, &row.origin_key).map(|(clock, cleared)| {
+                (clock.evidence.clone(), clock.evidence_at, clock.claim_generation, clock.scope.credential_id.clone(),
+                    clock.scope.model.clone(), cleared, clock.claim_owner.clone())
+            });
+            let stored = self
+                .conn
+                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
+                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2"))
+                .map_err(err)?
+                .query_row([&row.kind, &row.origin_key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                })
+                .optional()
+                .map_err(err)?;
+            if stored != shown {
+                return Err(err(diverged(format_args!(
+                    "clock of {} {}: state {shown:?}, SQL {stored:?}", row.kind, row.origin_key
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    /// Retire every probe authorization `owner` still holds, for an owner
+    /// whose run ended: keyed by the working state's rows when the command
+    /// has one.
+    pub fn retire_probe_authorizations(&self, owner: &str) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        match self.working_blocks()? {
+            Some(blocks) => self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner))),
+            None => self.delete_authorizations(owner, None),
+        }
+    }
+
+    /// Delete one probe authorization the working state holds, by key and
+    /// naming every value the state shows.
+    fn delete_authorization(&self, row: &crate::block_state::ProbeAuthorization) -> RouteStateResult<()> {
+        let changed = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
+            AND evidence=?4 AND evidence_at=?5 AND claimed_at=?6 AND claim_generation=?7",
+            params![row.owner,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
+        crate::block_state::expect_changes(changed, 1,
+            format_args!("authorization of {} for {} {}", row.owner, row.kind, row.origin_key)).map_err(err)
+    }
+
+    /// Delete every probe authorization `owner` holds. With a working state
+    /// each row is deleted by key and must hold the values the state shows,
+    /// and none may be left over.
+    fn delete_authorizations(
+        &self,
+        owner: &str,
+        held: Option<&[crate::block_state::ProbeAuthorization]>,
+    ) -> RouteStateResult<()> {
+        if let Some(held) = held {
+            for row in held {
+                self.delete_authorization(row)?;
+            }
+        }
+        let left = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+        if held.is_some() {
+            crate::block_state::expect_changes(left, 0, format_args!("authorizations of {owner} the state does not hold"))
+                .map_err(err)?;
+        }
+        Ok(())
     }
 
     /// Failure consumes the exact authorized generation from the time it was
@@ -1101,6 +1541,38 @@ impl AccountTx<'_> {
     pub fn fail_authorized_probe(&self, owner: &str, now: i64, inconclusive: bool) -> RouteStateResult<()> {
         if !enabled(self.conn).map_err(err)? { return Ok(()); }
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            let held = blocks.authorizations_of(owner);
+            // Consume each clock still on the authorized evidence and
+            // generation, keyed and naming the state it was decided on.
+            for row in &held {
+                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
+                    cleared.is_none() && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.claim_generation == row.claim_generation
+                });
+                let Some((clock, _)) = held_clock else {
+                    self.expect_no_authorized_clock(row, None)?;
+                    continue;
+                };
+                let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3+CASE WHEN quota=1 THEN ?4 WHEN ?6 THEN 0 ELSE ?5 END,
+                    claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
+                    WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(7)),
+                    params![row.kind,row.origin_key,now,QUOTA_FENCE_RECHECK_MS,NON_QUOTA_FENCE_MAX_MS,inconclusive,
+                        clock.evidence,clock.evidence_at,clock.lifetime == LifetimeClass::Quota,clock.next_recheck_at,
+                        clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
+                crate::block_state::expect_changes(changed, 1,
+                    format_args!("failed probe of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+            }
+            // Other owners' copies of the same generations are retired too.
+            let copies: Vec<_> = blocks.authorizations().filter(|other| other.owner != owner && held.iter().any(|row| {
+                row.kind == other.kind && row.origin_key == other.origin_key && row.evidence == other.evidence
+                    && row.evidence_at == other.evidence_at && row.claim_generation == other.claim_generation
+            })).cloned().collect();
+            for copy in &copies {
+                self.delete_authorization(copy)?;
+            }
+            return self.delete_authorizations(owner, Some(&held));
+        }
         self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2+CASE WHEN quota=1 THEN ?3 WHEN ?5 THEN 0 ELSE ?4 END,
             claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?2 THEN reset_check_at END
             WHERE r.cleared_at IS NULL AND EXISTS (SELECT 1 FROM fence_probe_authorization a
@@ -1207,14 +1679,37 @@ impl AccountTx<'_> {
             released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
-            self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
-                 claim_generation=claim_generation+1
-                WHERE r.cleared_at IS NULL AND EXISTS (
-                    SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
-                      AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
-                      AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
-                params![owner,now]).map_err(err)?;
-            self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+            match self.working_blocks()? {
+                Some(blocks) => {
+                    let held = blocks.authorizations_of(&owner);
+                    let clocks = blocks.live_clocks();
+                    for row in &held {
+                        let current = clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
+                            clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                                && clock.claim_generation == row.claim_generation
+                        });
+                        // Run for a clock the state calls superseded too: SQL
+                        // must then change nothing, or it disagrees.
+                        let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
+                            claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND cleared_at IS NULL
+                            AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6",
+                            params![row.kind,row.origin_key,now,row.evidence,row.evidence_at,row.claim_generation]).map_err(err)?;
+                        crate::block_state::expect_changes(changed, usize::from(current),
+                            format_args!("release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+                    }
+                    self.delete_authorizations(&owner, Some(&held))?;
+                }
+                None => {
+                    self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
+                         claim_generation=claim_generation+1
+                        WHERE r.cleared_at IS NULL AND EXISTS (
+                            SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
+                              AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
+                              AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
+                        params![owner,now]).map_err(err)?;
+                    self.delete_authorizations(&owner, None)?;
+                }
+            }
             if self.mark_admission_expired(&principal, &admission)? {
                 released.expired.push((principal, admission));
             }
@@ -1232,6 +1727,18 @@ impl AccountTx<'_> {
         model: &str,
     ) -> RouteStateResult<bool> {
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            // The answer decides whether the report may heal the probe.
+            self.check_probe_inputs(&blocks, owner, true)?;
+            let clocks = blocks.live_clocks();
+            return Ok(blocks.authorizations_of(owner).iter().any(|row| {
+                clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
+                    clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.scope.credential_id.as_deref() == Some(credential)
+                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
+                })
+            }));
+        }
         self.conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a
@@ -1248,6 +1755,20 @@ impl AccountTx<'_> {
     pub fn transfer_probe_authorization(&self, from: &str, to: &str) -> RouteStateResult<()> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
+        }
+        if let Some(blocks) = self.working_blocks()? {
+            // Moving an owner's rows to itself changes nothing.
+            if from == to {
+                return Ok(());
+            }
+            let held = blocks.authorizations_of(from);
+            for row in &held {
+                self.conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
+                    evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,claim_generation=excluded.claim_generation",
+                    params![to,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
+            }
+            return self.delete_authorizations(from, Some(&held));
         }
         self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
             FROM fence_probe_authorization WHERE owner=?1
@@ -1279,6 +1800,28 @@ impl AccountTx<'_> {
         sync(self.conn).map_err(err)?;
         // An alias/target launch may own origins from multiple providers. Only
         // its exact authorized generations may reopen, regardless of provider.
+        if let Some(blocks) = self.working_blocks()? {
+            let held = blocks.authorizations_of(owner);
+            for row in &held {
+                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
+                    cleared.is_none() && clock.lifetime != LifetimeClass::Quota
+                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
+                        && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
+                        && clock.claim_generation == row.claim_generation
+                });
+                let Some((clock, _)) = held_clock else {
+                    self.expect_no_authorized_clock(row, Some(model))?;
+                    continue;
+                };
+                let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3,claim_owner=NULL
+                    WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(4)),
+                    params![row.kind,row.origin_key,now,clock.evidence,clock.evidence_at,false,clock.next_recheck_at,
+                        clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
+                crate::block_state::expect_changes(changed, 1,
+                    format_args!("inconclusive release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+            }
+            return self.delete_authorizations(owner, Some(&held));
+        }
         self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?3,claim_owner=NULL
             WHERE r.quota=0 AND r.cleared_at IS NULL AND (r.model IS NULL OR r.model=?2)
             AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
@@ -1312,42 +1855,56 @@ impl AccountTx<'_> {
             .iter()
             .filter(|origin| origin.model.as_deref().is_none_or(|value| value == model))
         {
-            let claimed: Option<i64> = self
-                .conn
-                .query_row(
-                    "SELECT claimed_at FROM fence_probe_authorization
-                WHERE owner=?1 AND kind=?2 AND origin_key=?3 AND evidence=?4 AND evidence_at=?5",
-                    params![
-                        owner,
-                        origin.kind,
-                        origin.origin_key,
-                        origin.evidence,
-                        origin.evidence_at
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(err)?;
+            // Only the test request this owner holds now: its authorization
+            // must name the clock's current evidence and claim generation, so
+            // a test a later one superseded heals nothing.
+            let claimed: Option<i64> = match self.working_blocks()? {
+                Some(blocks) => blocks
+                    .authorizations_of(owner)
+                    .into_iter()
+                    .find(|row| {
+                        row.kind == origin.kind
+                            && row.origin_key == origin.origin_key
+                            && row.evidence == origin.evidence
+                            && row.evidence_at == origin.evidence_at
+                            && test_is_current(&blocks, row, false)
+                    })
+                    .map(|row| row.claimed_at),
+                None => self
+                    .conn
+                    .query_row(
+                        &format!("SELECT a.claimed_at FROM fence_probe_authorization a {}
+                    WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3 AND a.evidence=?4 AND a.evidence_at=?5", current_test_join(6)),
+                        params![
+                            owner,
+                            origin.kind,
+                            origin.origin_key,
+                            origin.evidence,
+                            origin.evidence_at,
+                            false
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(err)?,
+            };
             if let Some(at) = claimed.filter(|at| origin.evidence_at < *at) {
                 self.heal_origins(std::slice::from_ref(origin), model, at, now, None, true)?;
             }
         }
-        self.conn
-            .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1",
-                [owner],
-            )
-            .map_err(err)?;
-        Ok(())
+        match self.working_blocks()? {
+            Some(blocks) => self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner))),
+            None => self.delete_authorizations(owner, None),
+        }
     }
 
     /// Settles one run's test request after a successful report. The owner's
     /// authorization must name the block's exact evidence (the refusal that
     /// started it) and its current claim generation (which numbered test this
-    /// was). An admission owner may also retire the same test's duplicate
-    /// authorization held under the decision id (`decision_copy`), but never a
-    /// later run's re-claim. With no admission, the decision itself must still
-    /// own the current claim.
+    /// was), with no other request owning the claim; an admission that owns
+    /// the claim itself is current as well. An admission owner may also
+    /// retire the same test's duplicate authorization held under the
+    /// decision id (`decision_copy`), but never a later run's re-claim.
     pub(crate) fn heal_report_probe(
         &self,
         owner: &str,
@@ -1362,30 +1919,39 @@ impl AccountTx<'_> {
             origin.evidence_at < admitted_at
                 && origin.model.as_deref().is_none_or(|value| value == model)
         }) {
-            let proof: Option<(i64, i64)> = self
-                .conn
-                .query_row(
-                    "SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a
-                 JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
-                 AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at
-                 WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3
-                 AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6
-                 AND (?7 OR ((r.claim_owner IS NULL OR r.claim_owner=a.owner)
-                     AND r.claim_generation=a.claim_generation))
-                 AND r.cleared_at IS NULL",
-                    params![
-                        owner,
-                        origin.kind,
-                        origin.origin_key,
-                        origin.evidence,
-                        origin.evidence_at,
-                        admitted_at,
-                        admission_owned
-                    ],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(err)?;
+            let proof: Option<(i64, i64)> = match self.working_blocks()? {
+                Some(blocks) => blocks
+                    .authorizations_of(owner)
+                    .into_iter()
+                    .find(|row| {
+                        row.kind == origin.kind
+                            && row.origin_key == origin.origin_key
+                            && row.evidence == origin.evidence
+                            && row.evidence_at == origin.evidence_at
+                            && row.claimed_at <= admitted_at
+                    })
+                    .filter(|row| test_is_current(&blocks, row, admission_owned))
+                    .map(|row| (row.claimed_at, row.claim_generation)),
+                None => self
+                    .conn
+                    .query_row(
+                        &format!("SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a {}
+                     WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3
+                     AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6", current_test_join(7)),
+                        params![
+                            owner,
+                            origin.kind,
+                            origin.origin_key,
+                            origin.evidence,
+                            origin.evidence_at,
+                            admitted_at,
+                            admission_owned
+                        ],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .map_err(err)?,
+            };
             let Some((claimed_at, generation)) = proof.filter(|(at, _)| origin.evidence_at < *at)
             else {
                 continue;
@@ -1398,7 +1964,26 @@ impl AccountTx<'_> {
                 None,
                 true,
             )?;
-            self.conn
+            // The owner's row, and the decision's copy of the same test when
+            // the state holds one.
+            let expected = match self.working_blocks()? {
+                Some(blocks) => Some(
+                    1 + usize::from(decision_copy.is_some_and(|copy| {
+                        copy != owner
+                            && blocks.authorizations_of(copy).iter().any(|row| {
+                                row.kind == origin.kind
+                                    && row.origin_key == origin.origin_key
+                                    && row.evidence == origin.evidence
+                                    && row.evidence_at == origin.evidence_at
+                                    && row.claimed_at == claimed_at
+                                    && row.claim_generation == generation
+                            })
+                    })),
+                ),
+                None => None,
+            };
+            let changed = self
+                .conn
                 .execute(
                     "DELETE FROM fence_probe_authorization WHERE (owner=?1 OR owner=?2)
                  AND kind=?3 AND origin_key=?4 AND evidence=?5 AND evidence_at=?6
@@ -1415,6 +2000,14 @@ impl AccountTx<'_> {
                     ],
                 )
                 .map_err(err)?;
+            if let Some(expected) = expected {
+                crate::block_state::expect_changes(
+                    changed,
+                    expected,
+                    format_args!("settled test of {} {} for {owner}", origin.kind, origin.origin_key),
+                )
+                .map_err(err)?;
+            }
         }
         Ok(())
     }
@@ -1444,7 +2037,7 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, None, owner).map_err(err)
+        self.claim_owned(origins, now, owner, None, owner)
     }
     pub fn claim_fence_rechecks_for_authorized_admission(
         &self,
@@ -1453,7 +2046,7 @@ impl AccountTx<'_> {
         owner: Option<&str>,
         admission: &str,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, None, Some(admission)).map_err(err)
+        self.claim_owned(origins, now, owner, None, Some(admission))
     }
     pub fn grant_fence_rechecks(
         &self,
@@ -1461,7 +2054,7 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
-        claim_owned(self.conn, origins, now, owner, owner, owner).map_err(err)
+        self.claim_owned(origins, now, owner, owner, owner)
     }
     /// Success can heal only evidence older than this request's admission. A
     /// late completion of an older run must not erase a more recent refusal.
@@ -1515,7 +2108,251 @@ impl AccountTx<'_> {
         self.heal_origins(&origins, model, admitted_at, now, scope, false)
     }
 
+    /// Heal `origins` after a success: end each one's source evidence where
+    /// it is older than `admitted_at` and clear its clock. With a working
+    /// state every decision reads the state and every write is keyed and
+    /// names the row it was decided on; without one, SQL decides.
     pub(crate) fn heal_origins(
+        &self,
+        origins: &[FenceRecheck],
+        model: &str,
+        admitted_at: i64,
+        now: i64,
+        scope: Option<&QuotaSuccessScope>,
+        authorized: bool,
+    ) -> RouteStateResult<()> {
+        if self.working_blocks()?.is_none() {
+            return self.heal_origins_on_sql(origins, model, admitted_at, now, scope, authorized);
+        }
+        for origin in origins {
+            self.heal_origin(origin, model, admitted_at, now, scope, authorized)?;
+        }
+        Ok(())
+    }
+
+    /// The working state as this command's earlier writes left it. Only
+    /// called once a command is known to have one.
+    fn working(&self) -> RouteStateResult<std::borrow::Cow<'_, crate::BlockState>> {
+        self.working_blocks()?
+            .ok_or_else(|| err("a heal decided on the state lost its working state"))
+    }
+
+    /// [`Self::heal_origins`] for one origin, deciding on the working state.
+    /// Each keyed write names the current values of its row, so it fails
+    /// with [`crate::block_state::diverged`] if SQL holds something else; a
+    /// field the state shows already cleared is not written again.
+    fn heal_origin(
+        &self,
+        origin: &FenceRecheck,
+        model: &str,
+        admitted_at: i64,
+        now: i64,
+        scope: Option<&QuotaSuccessScope>,
+        authorized: bool,
+    ) -> RouteStateResult<()> {
+        use crate::block_state::expect_changes;
+        let provider = origin.provider.as_str();
+        let credential = origin.credential_id.as_deref().unwrap_or("");
+        let key: Vec<serde_json::Value> = serde_json::from_str(&origin.origin_key).map_err(err)?;
+        let what = format!("heal of {} {}", origin.kind, origin.origin_key);
+        let blocks = self.working()?;
+        match origin.kind.as_str() {
+            "account" => {
+                // Only active fences are held: a fence already cleared is
+                // not cleared again.
+                let fence = key[0].as_str().and_then(|id| blocks.account_fence(id));
+                let older = |row: &crate::AccountFenceRow| row.observed_at.min(row.created_at) < admitted_at;
+                if authorized {
+                    if let Some((row, _, _)) = fence.filter(|(row, _, _)| older(row)) {
+                        self.clear_held_fence(row, now, "probe_succeeded")?;
+                    }
+                    return self.clear_held_clock(origin, now);
+                }
+                let (Some(scope), Some((row, pool, recovery))) = (scope, fence) else {
+                    return Ok(());
+                };
+                let needed: Vec<striatum_core::accounts::PoolKey> = match pool {
+                    Some(pool) => vec![serde_json::from_str(pool).map_err(err)?],
+                    None => serde_json::from_str(recovery).map_err(err)?,
+                };
+                if needed.is_empty() {
+                    return Ok(());
+                }
+                let row = row.clone();
+                let (pool_json, recovery_json) = (pool.map(str::to_owned), recovery.to_owned());
+                drop(blocks);
+                for pool in needed.iter().filter(|pool| scope.used(pool, model)) {
+                    self.put_success_pool(&row.fence_id, &serde_json::to_string(pool).map_err(err)?, origin.evidence_at, now)?;
+                }
+                let healed = self
+                    .working()?
+                    .success_pools()
+                    .filter(|pool| pool.fence_id == row.fence_id && pool.evidence_at == origin.evidence_at)
+                    .map(|pool| serde_json::from_str(&pool.pool_key_json).map_err(err))
+                    .collect::<RouteStateResult<Vec<striatum_core::accounts::PoolKey>>>()?;
+                if !needed.iter().all(|pool| healed.contains(pool)) {
+                    return Ok(());
+                }
+                if older(&row) {
+                    // Decided on the fence's pools and on the successes
+                    // recorded for them: the clear names both.
+                    self.clear_held_pool_fence(
+                        &row,
+                        pool_json.as_deref(),
+                        &recovery_json,
+                        (origin.evidence_at, healed.len()),
+                        now,
+                        "run_succeeded",
+                    )?;
+                }
+            }
+            "credential" => {
+                if origin.quota {
+                    let prefix =
+                        format!("credential-quota:{}:", serde_json::json!([provider, credential]));
+                    if blocks
+                        .active_fences(provider)
+                        .iter()
+                        .any(|fence| fence.fence_id.starts_with(&prefix))
+                    {
+                        return Ok(());
+                    }
+                }
+                if let Some(fence) = blocks
+                    .entitlement_fence(provider, credential)
+                    .filter(|fence| fence.observed_at_ms < admitted_at)
+                {
+                    self.clear_held_entitlement_fence(&fence)?;
+                }
+            }
+            "account_route" => {
+                if let Some((row, class, last)) = blocks
+                    .account_route_fence(provider, credential, model)
+                    .filter(|(row, _, last)| last.unwrap_or(row.recorded_at) < admitted_at)
+                {
+                    let changed = self.conn.execute("DELETE FROM account_route_fence WHERE provider=?1 AND credential_id=?2 AND model=?3
+                        AND until_ms=?4 AND recorded_at=?5 AND last_reported_at IS ?6 AND wall_class IS ?7",
+                        params![provider,credential,model,row.until_ms,row.recorded_at,last,class]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "non_quota_route" | "transient_route" => {
+                let kind = if origin.kind == "transient_route" { "transient" } else { "billing" };
+                if let Some((row, last)) = blocks
+                    .non_quota_route_fence(provider, credential, model, kind)
+                    .filter(|(_, last)| *last < admitted_at)
+                {
+                    let changed = self.conn.execute("DELETE FROM account_non_quota_route_fence WHERE provider=?1 AND credential_id=?2
+                        AND model=?3 AND wall_kind=?4 AND until_ms=?5 AND recorded_at=?6 AND last_reported_at=?7",
+                        params![provider,credential,model,kind,row.until_ms,row.recorded_at,last]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "size" | "non_quota_size" => {
+                let quota = origin.kind == "size";
+                let table = if quota { "account_size_refusal" } else { "account_non_quota_size_refusal" };
+                if let Some(row) = origin.size_class.and_then(|class| {
+                    blocks
+                        .size_refusal(quota, provider, credential, model, class)
+                        .filter(|row| row.observed_at < admitted_at)
+                }) {
+                    let changed = self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3
+                        AND size_class=?4 AND expires_at=?5 AND observed_at=?6"),
+                        params![provider,credential,model,row.size_class,row.expires_at,row.observed_at]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "pool_billing" | "pool_rate" => {
+                let (field, evidence) = if origin.kind == "pool_billing" {
+                    ("walled_until", "json_array(walled_until,wall_reason,COALESCE(wall_observed_at,updated_at))")
+                } else {
+                    ("cooldown_until", "json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at))")
+                };
+                if let Some(held) = blocks.source_origin(&origin.kind, &origin.origin_key) {
+                    let changed = self.conn.execute(&format!("UPDATE pool_key_state SET {field}=NULL
+                        WHERE provider=?1 AND credential_id=?2 AND {evidence}=?3"),
+                        params![provider,credential,held.evidence]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "route" => {
+                if let Some(held) = blocks.source_origin("route", &origin.origin_key) {
+                    let changed = self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+                        WHERE route_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2",
+                        params![key[0].as_str(),held.evidence]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "provider" => {
+                // Only the rows stamped by this provider evidence inherit
+                // its recovery. A separate model refusal has its own clock.
+                for (route, evidence, last_error, observed) in
+                    blocks.routes_stamped_by_provider(provider, origin.evidence_at, admitted_at)
+                {
+                    let changed = self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+                        WHERE route_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2
+                        AND last_error IS ?3 AND COALESCE(wall_observed_at,last_error_at,updated_at)=?4",
+                        params![route,evidence,last_error,observed]).map_err(err)?;
+                    expect_changes(changed, 1, format_args!("{what}: route {route}")).map_err(err)?;
+                }
+                if let Some(held) = blocks.source_origin("provider", &origin.origin_key) {
+                    let changed = self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL
+                        WHERE provider_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2",
+                        params![provider,held.evidence]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            "failure" => {
+                if let Some(held) = blocks.source_origin("failure", &origin.origin_key) {
+                    let changed = self.conn.execute("UPDATE model_route_state SET failure_backoff_until=NULL
+                        WHERE route_key=?1 AND json_array(failure_backoff_until,failure_backoff_reason,failure_observed_at)=?2",
+                        params![key[0].as_str(),held.evidence]).map_err(err)?;
+                    expect_changes(changed, 1, &what).map_err(err)?;
+                }
+            }
+            _ => {}
+        }
+        self.clear_held_clock(origin, now)
+    }
+
+    /// Record that `pool` succeeded for one account fence's evidence, keyed
+    /// and naming the success the working state holds for it, if any.
+    fn put_success_pool(&self, fence_id: &str, pool: &str, evidence_at: i64, now: i64) -> RouteStateResult<()> {
+        let held = self
+            .working()?
+            .success_pools()
+            .find(|row| row.fence_id == fence_id && row.pool_key_json == pool)
+            .cloned();
+        let changed = match held {
+            Some(held) => self.conn.execute("UPDATE fence_success_pool SET evidence_at=?3,healed_at=?4
+                WHERE fence_id=?1 AND pool_key_json=?2 AND evidence_at=?5 AND healed_at=?6",
+                params![fence_id,pool,evidence_at,now,held.evidence_at,held.healed_at]),
+            None => self.conn.execute("INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
+                ON CONFLICT(fence_id,pool_key_json) DO NOTHING",
+                params![fence_id,pool,evidence_at,now]),
+        }
+        .map_err(err)?;
+        crate::block_state::expect_changes(changed, 1, format_args!("success of {fence_id} for {pool}"))
+            .map_err(err)
+    }
+
+    /// Clear an origin's stored clock, naming the clock the working state
+    /// holds. An origin with no stored clock has none to clear.
+    fn clear_held_clock(&self, origin: &FenceRecheck, now: i64) -> RouteStateResult<()> {
+        let blocks = self.working()?;
+        let Some((clock, cleared)) = blocks.clock(&origin.kind, &origin.origin_key) else {
+            return Ok(());
+        };
+        let changed = self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2
+            AND evidence=?4 AND evidence_at=?5 AND cleared_at IS ?6 AND next_recheck_at=?7
+            AND claim_owner IS ?8 AND claim_generation=?9",
+            params![origin.kind,origin.origin_key,now,clock.evidence,clock.evidence_at,cleared,
+                clock.next_recheck_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
+        crate::block_state::expect_changes(changed, 1,
+            format_args!("clock heal of {} {}", origin.kind, origin.origin_key)).map_err(err)
+    }
+
+    fn heal_origins_on_sql(
         &self,
         origins: &[FenceRecheck],
         model: &str,
@@ -1671,12 +2508,45 @@ impl AccountTx<'_> {
             return Ok(quota);
         }
         sync(self.conn).map_err(err)?;
+        if let Some(blocks) = self.working_blocks()? {
+            let clocks: Vec<(Block, Option<i64>)> = blocks
+                .stored_clocks()
+                .filter(|(clock, _)| {
+                    clock.kind == "credential"
+                        && clock.scope.provider == provider
+                        && clock.scope.credential_id.as_deref() == Some(credential)
+                })
+                .map(|(clock, cleared)| (clock.clone(), cleared))
+                .collect();
+            for (clock, cleared) in clocks.iter().filter(|(clock, _)| !clock.classified) {
+                let changed = self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,
+                    next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
+                    WHERE kind='credential' AND origin_key=?1 AND classified=0 AND provider=?2 AND credential_id=?4
+                    AND evidence=?5 AND evidence_at=?6 AND quota=?7 AND next_recheck_at=?8 AND cleared_at IS ?9",
+                    params![clock.origin_key,provider,quota,credential,clock.evidence,clock.evidence_at,
+                        clock.lifetime == LifetimeClass::Quota,clock.next_recheck_at,cleared]).map_err(err)?;
+                crate::block_state::expect_changes(changed, 1,
+                    format_args!("classification of credential {}", clock.origin_key)).map_err(err)?;
+            }
+            // The class each clock now holds: a new classification, or the
+            // one an earlier decision stored.
+            return Ok(clocks.first().is_some_and(|(clock, _)| {
+                if clock.classified { clock.lifetime == LifetimeClass::Quota } else { quota }
+            }));
+        }
         self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
             WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND classified=0",params![provider,credential,quota]).map_err(err)?;
         self.conn.query_row("SELECT quota FROM fence_recheck WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![provider,credential],|row|row.get(0)).optional().map(|quota|quota.unwrap_or(false)).map_err(err)
     }
+
+    /// The effective rechecks, as `SqliteRouteStateStore::fence_rechecks`
+    /// reads them: from the command's working state when it has one, which
+    /// evaluates expiry at the same wall clock, else from SQL.
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
-        read_effective(self.conn).map_err(err)
+        match self.working_blocks()? {
+            Some(blocks) => blocks.fence_rechecks(crate::now_ms()),
+            None => read_effective(self.conn).map_err(err),
+        }
     }
 
     pub fn claim_fence_rechecks(
@@ -1684,7 +2554,7 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<bool> {
-        claim(self.conn, origins, now).map_err(err)
+        self.claim_owned(origins, now, None, None, None)
     }
 }
 

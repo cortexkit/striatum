@@ -12,9 +12,11 @@ use striatum_store::{
 };
 
 mod admissions;
+mod blocks;
 mod inflight;
 
 pub(crate) use admissions::AdmissionState;
+pub(crate) use blocks::{published, writer, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,6 +27,10 @@ pub(crate) struct AccountState {
     /// read by request paths instead of those tables.
     pub(crate) admissions: AdmissionState,
     pub(crate) inflight: InflightLedger,
+    /// The block tables as SQL holds them. The writer copies every row a
+    /// command changes into this state, so it always equals a fresh load.
+    /// Request paths read it through `blocks::BlockReads` and `published`.
+    pub(crate) blocks: striatum_store::BlockState,
 }
 
 impl AccountState {
@@ -44,6 +50,7 @@ impl AccountState {
             selection_salt: tx.existing_salt()?.map(Arc::new),
             admissions,
             inflight,
+            blocks: tx.load_block_state()?,
         })
     }
 }
@@ -128,9 +135,9 @@ pub(crate) fn has_expired_continuations(
     Ok(snapshot(store)?.admissions.has_expired_offers(now))
 }
 
-/// The published state's answer to `has_expired_admission_probes`. The probe
-/// authorizations are not in memory, so their owners come from SQL; whether
-/// each owner is an expired unstarted admission comes from the state.
+/// The published state's answer to `has_expired_admission_probes`: the
+/// probe authorizations' owners and whether each is an expired unstarted
+/// admission both come from the state.
 pub(crate) fn has_expired_admission_probes(
     store: &SqliteRouteStateStore,
     now: i64,
@@ -139,7 +146,11 @@ pub(crate) fn has_expired_admission_probes(
         return store.account_read(|tx| tx.has_expired_admission_probes(now));
     }
     let state = snapshot(store)?;
-    let owners = store.account_read(|tx| tx.probe_authorization_owners())?;
+    let owners = if state.blocks.enabled() {
+        state.blocks.authorization_owners()
+    } else {
+        store.account_read(|tx| tx.probe_authorization_owners())?
+    };
     Ok(!state.admissions.expired_probe_admissions(owners, now).is_empty())
 }
 
@@ -156,7 +167,36 @@ impl AccountWorkingState for AccountState {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
         self
     }
+
+    fn apply_block_rows(&mut self, rows: &striatum_store::BlockRows) {
+        self.blocks.apply(rows);
+    }
+
+    fn blocks(&self) -> Option<&striatum_store::BlockState> {
+        Some(&self.blocks)
+    }
 }
+
+/// The longest a reader waits for the first publication of the state.
+const FIRST_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A shorter first-load bound a test sets, in milliseconds; 0 keeps
+/// [`FIRST_LOAD_WAIT`].
+#[cfg(test)]
+static FIRST_LOAD_WAIT_FOR_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn first_load_wait() -> std::time::Duration {
+    #[cfg(test)]
+    match FIRST_LOAD_WAIT_FOR_TEST.load(Ordering::Relaxed) {
+        0 => {}
+        ms => return std::time::Duration::from_millis(ms),
+    }
+    FIRST_LOAD_WAIT
+}
+
+/// The start of the error a reader gets when the first load is still
+/// running at the end of the wait.
+const FIRST_LOAD_PENDING: &str = striatum_store::ACCOUNT_STATE_LOAD_PENDING;
 
 /// Publication swaps one Arc under a short write lock;
 /// readers only hold the read lock long enough to clone it. This provides
@@ -217,6 +257,16 @@ impl AccountStateBridge for StateOwner {
 
     fn request_reload(&self) {
         self.reload.store(true, Ordering::Release);
+        // Before anything is published, a reload is a new first load:
+        // readers wait for it (within the bound) rather than answering the
+        // failure of the load before it and queueing yet another.
+        if self.published.read().unwrap().is_none() {
+            *self.ready.0.lock().unwrap() = None;
+        }
+    }
+
+    fn load_wait(&self) -> std::time::Duration {
+        first_load_wait()
     }
 }
 
@@ -225,9 +275,20 @@ impl StateOwner {
         if let Some(snapshot) = self.published.read().unwrap().clone() {
             return Ok(snapshot);
         }
-        let mut ready = self.ready.0.lock().unwrap();
-        while ready.is_none() {
-            ready = self.ready.1.wait(ready).unwrap();
+        // The writer reports every outcome of the first load, but a reader
+        // never waits on it without a bound.
+        let (ready, waited) = self
+            .ready
+            .1
+            .wait_timeout_while(self.ready.0.lock().unwrap(), first_load_wait(), |ready| {
+                ready.is_none()
+            })
+            .unwrap();
+        if waited.timed_out() {
+            return Err(RouteStateStoreError(format!(
+                "{FIRST_LOAD_PENDING} {}ms; retry the operation",
+                first_load_wait().as_millis()
+            )));
         }
         if let Some(Err(error)) = ready.as_ref() {
             return Err(RouteStateStoreError(error.clone()));
@@ -245,6 +306,18 @@ impl StateOwner {
 
 pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
     initialize(store)?;
+    #[cfg(test)]
+    {
+        // A block-table write outside an account command that no test
+        // seeding seam made is a bypass of the account writer: fail the test
+        // rather than answer from a state that missed it.
+        let bypasses = store.block_tables_written_outside_command();
+        assert!(
+            bypasses.is_empty(),
+            "block tables written outside an account command (table, thread): {bypasses:?}"
+        );
+        store.reload_account_state_if_pending_for_test()?;
+    }
     store
         .account_state_bridge()
         .unwrap()
@@ -969,15 +1042,15 @@ impl AccountCommand<'_> {
         self.decide(|state| state.finish_continuations(principal, admission, run, now))
     }
 
-    /// Fence probe authorizations are not in memory yet, so SQL supplies
-    /// their owners; the state decides which name expired unstarted
-    /// admissions, and SQL releases those probes and expires the admissions.
+    /// The working state supplies the probe authorizations' owners and
+    /// decides which name expired unstarted admissions; SQL releases those
+    /// probes and expires the admissions.
     pub(crate) fn release_expired_admission_probes(&mut self, now: i64) -> RouteStateResult<()> {
         let Some(state) = self.admission_state() else {
             self.sql.release_expired_admission_probes(now)?;
             return Ok(());
         };
-        let expired = state.expired_probe_admissions(self.sql.probe_authorization_owners()?, now);
+        let expired = state.expired_probe_admissions(self.probe_authorization_owners()?, now);
         let chosen: Vec<(String, String)> = expired
             .iter()
             .map(|(principal, admission, _)| (principal.clone(), admission.clone()))
@@ -1007,6 +1080,9 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn tick(&mut self, now_ms: i64) -> RouteStateResult<()> {
+        // A cheap check that the block state still matches SQL; a mismatch
+        // reloads the state and runs the tick again.
+        self.sql.reconcile_block_state()?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
         self.sql.sync_fence_rechecks()
@@ -1107,11 +1183,19 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
     let Some(bridge) = store.account_state_bridge() else {
         return store.install_account_state_bridge(Arc::new(StateOwner::default()));
     };
-    if bridge.snapshot().is_ok() {
-        return Ok(());
+    // Counted before reading: a reader that waited on a retry another
+    // caller started shares that retry's answer instead of loading again.
+    let arrived = store.account_state_retry_count();
+    match bridge.snapshot() {
+        Ok(_) => Ok(()),
+        // The first load is still running: answer that. A retry would
+        // queue a second load behind it and wait for both without a bound.
+        Err(error) if error.to_string().contains(FIRST_LOAD_PENDING) => Err(error),
+        Err(_) => {
+            store.retry_account_state_load_after(arrived)?;
+            bridge.snapshot().map(|_| ())
+        }
     }
-    store.retry_account_state_load()?;
-    bridge.snapshot().map(|_| ())
 }
 
 #[cfg(test)]
@@ -1134,6 +1218,10 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
     assert_eq!(
         loaded.admissions, published.admissions,
         "the request mix left the admission state unequal to a fresh load"
+    );
+    assert_eq!(
+        loaded.blocks, published.blocks,
+        "the request mix left the block state unequal to a fresh load"
     );
     let state = &published.admissions;
     let demand_entries: usize = state.demand.iter().map(|(_, rows)| rows.len()).sum();
@@ -1161,6 +1249,18 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         start.elapsed().as_micros() / 10,
         striatum_store::keyed_exception_reads(),
         maintenance_reads(),
+    );
+    println!(
+        "account_state blocks: {} block_read_backs={} block_writes_outside_command={}",
+        published
+            .blocks
+            .table_sizes()
+            .iter()
+            .map(|(table, rows)| format!("{table}={rows}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        striatum_store::block_read_backs(),
+        store.block_writes_outside_command(),
     );
 }
 

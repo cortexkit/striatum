@@ -217,7 +217,7 @@ fn isolated_batch(fail: bool) -> (Vec<String>, Vec<String>) {
             write_batch(
                 conn,
                 &mut batch,
-                &mut None,
+                &mut stateless(),
                 &store.account_write_transactions,
             )
         })
@@ -285,7 +285,7 @@ fn begin_commit_and_transaction_aborting_statement_fail_every_command() {
                 CREATE TABLE deferred_parent(id PRIMARY KEY);
                 CREATE TABLE deferred_child(parent REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED);")?;
             if fault == "begin" { conn.execute_batch("BEGIN IMMEDIATE")?; }
-            let result = write_batch(conn, &mut batch, &mut None, &store.account_write_transactions);
+            let result = write_batch(conn, &mut batch, &mut stateless(), &store.account_write_transactions);
             if fault == "begin" { conn.execute_batch("ROLLBACK")?; }
             result
         }).unwrap_err().to_string();
@@ -604,4 +604,13 @@ fn live_sized_tick_writer_hold() {
         preview.push(started.elapsed().as_secs_f64() * 1000.0);
     }
     eprintln!("selection preview over {rows} admissions, ms per round: {preview:.1?}");
+}
+
+/// A writer state with no module state installed, as a store without the
+/// account state bridge runs.
+fn stateless() -> crate::account_state::WriterAccountState {
+    crate::account_state::WriterAccountState::new(
+        Arc::new(std::sync::OnceLock::new()),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
 }

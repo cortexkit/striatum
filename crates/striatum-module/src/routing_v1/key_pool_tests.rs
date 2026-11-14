@@ -22,6 +22,7 @@ use subc_protocol::FrameType;
 use super::conformance_tests::{catalog_fact, reserved, Harness};
 use crate::broca_credentials::BrocaCredentials;
 
+mod block_reads_tests;
 mod credential_refused_tests;
 
 mod account_writer {
@@ -1159,5 +1160,66 @@ async fn a_slow_billing_plane_answers_routing_not_ready_within_the_v1_bound() {
     assert!(
         waited < Duration::from_secs(2),
         "the typed refusal must beat a caller's 3 s timeout, waited {waited:?}"
+    );
+}
+
+/// A legacy launch claims its route's probe only when it launches, after
+/// selection scored the route. If another request claimed that probe in
+/// between, the launch is told when to retry, so selection can try another
+/// route or answer a timed wait, never an untimed refusal.
+#[test]
+fn a_legacy_launch_that_loses_its_route_probe_is_told_when_to_retry() {
+    let now = 1_800_000_000_000;
+    let _clock = crate::InjectedClock::set(now);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let store = harness.store();
+    crate::account_state::initialize(store).unwrap();
+    let now = now as i64;
+    striatum_core::RouteStateStore::record_provider_cooldown(
+        store.as_ref(),
+        "launch-provider",
+        "launch-provider/model",
+        "launch-provider/model",
+        &striatum_core::route_state_store::RouteStateUpdate {
+            observed_at_ms: Some(now - 2 * 3_600_000),
+            cooldown_until: Some((now + 3_600_000) as f64),
+            last_error: Some("provider capacity".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let credentials = harness.credentials();
+    let context = crate::account_selection::ClassContext::load(
+        store,
+        &credentials,
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap();
+    // Another request claims the due probe after the context was read.
+    let origins = store.fence_rechecks().unwrap();
+    assert_eq!(origins.len(), 1, "{origins:?}");
+    assert!(crate::account_writer::execute(
+        store,
+        striatum_store::AccountCommandKind::Maintenance,
+        move |tx| tx.grant_fence_rechecks(&origins, now, Some("winner")),
+    )
+    .unwrap());
+    let result = context.claim_launch_credential(
+        store,
+        "launch-provider",
+        "model",
+        false,
+        false,
+        Some("loser"),
+    );
+    // Compared through Debug, so the check also compiles against a refusal
+    // type that carries only a code and a message, and fails there.
+    let shown = format!("{result:?}");
+    assert_eq!(
+        shown,
+        format!("Err(Lost {{ retry_at: {} }})", now + 3_600_000),
+        "the winner's one-hour interval is the retry time"
     );
 }

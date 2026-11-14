@@ -16,12 +16,16 @@ use crate::variant_policy;
 pub(crate) struct Refusal {
     pub code: String,
     pub message: String,
+    /// When a probe this request lost to another request opens again; such a
+    /// refusal is answered as a timed wait.
+    pub retry_at: Option<i64>,
 }
 
 fn refuse(code: &str, message: String) -> Refusal {
     Refusal {
         code: code.into(),
         message,
+        retry_at: None,
     }
 }
 

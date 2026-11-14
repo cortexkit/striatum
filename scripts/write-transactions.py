@@ -134,11 +134,13 @@ def account_writer_violations(root: Path, entries: set[str]) -> list[str]:
         test_ranges = RUST["test_only_ranges"](source, code, pairs)
         tx_scopes = []
         functions = []
-        # A typed helper receives only the transaction connection. The same
-        # method name on that value is not a call to the live store wrapper.
+        # A typed helper receives only the transaction connection, either as
+        # the AccountTx itself or as the module's AccountCommand over it. The
+        # same method name on that value is not a call to the live store
+        # wrapper.
         for function in FUNCTION.finditer(code):
             header = code[function.start():function.end()]
-            names = re.findall(r"\b(\w+)\s*:\s*&\s*(?:[\w:]+::)?AccountTx\b", header)
+            names = re.findall(r"\b(\w+)\s*:\s*&\s*(?:[\w:]+::)?(?:AccountTx|AccountCommand)\b", header)
             end = pairs.get(function.end() - 1, function.end())
             functions.append((function.start(), end, function[1]))
             tx_scopes.extend((function.end(), end, name) for name in names)

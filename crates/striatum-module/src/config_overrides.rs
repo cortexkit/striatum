@@ -1,6 +1,6 @@
 //! Validated, last-good snapshots of the routing-owned global configuration.
 //! Each selection overlays one complete snapshot onto catalog facts; reloads
-//! never rewrite the catalog or replace an in-flight request's configuration.
+//! never rewrite the catalog, nor swap out an in-flight request's configuration.
 
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};

@@ -44,6 +44,7 @@ use sha2::{Digest, Sha256};
 
 use crate::account_quota::{self, AccountEntry, AccountQuotaState, SharedAccountQuota};
 use crate::account_refusal_log::{because, checking};
+use crate::account_state::{writer, AccountCommand, BlockReads};
 use crate::config_overrides::AccountSelectionFlags;
 
 /// Choose the account for one admission, renewal or reassignment.
@@ -247,6 +248,28 @@ pub(crate) struct ClassContext {
 pub(crate) enum ProbeBinding {
     Bound,
     Lost { retry_at: i64 },
+}
+
+/// Why a legacy launch could not claim the probes its route needs.
+#[derive(Debug)]
+pub(crate) enum LaunchRefusal {
+    /// Another request holds the probe, or it is not due yet: the caller
+    /// may try another route, or retry at `retry_at`.
+    Lost { retry_at: i64 },
+    /// A refusal with no retry time, with its contract code.
+    Refused { code: String, message: String },
+}
+
+impl LaunchRefusal {
+    /// A store failure, including a writer batch whose state disagreed with
+    /// SQL on both of its runs: the caller cannot tell whether any account
+    /// is eligible.
+    pub(crate) fn store(error: impl std::fmt::Display) -> Self {
+        Self::Refused {
+            code: "store_error".into(),
+            message: error.to_string(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1134,11 +1157,11 @@ impl ClassContext {
             .lock()
             .map_err(|error| error.to_string())?
             .snapshot();
-        let eligibility = store
-            .account_eligibility()
+        let eligibility = crate::account_state::published(store)
+            .and_then(|blocks| blocks.account_eligibility())
             .map_err(|error| error.to_string())?;
-        let mut size_refusals = store
-            .account_size_refusals(now_ms)
+        let mut size_refusals = crate::account_state::published(store)
+            .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
         let mut catalog: crate::broca_credentials::AuthCatalog = catalog_snapshot.facts.iter().collect();
         catalog.providers = catalog_snapshot.providers.clone();
@@ -1187,7 +1210,9 @@ impl ClassContext {
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
         let account_ids = credentials.quota_account_ids(&quota);
-        let size_clocks = store.fence_rechecks().map_err(|error| error.to_string())?;
+        let size_clocks = crate::account_state::published(store)
+            .and_then(|blocks| blocks.fence_rechecks())
+            .map_err(|error| error.to_string())?;
         for fact in &size_refusals {
             if !size_clocks.iter().any(|origin| {
                 origin.kind == "size"
@@ -1224,22 +1249,26 @@ impl ClassContext {
                 .map_err(|error| error.to_string())?;
             }
         }
-        size_refusals = store
-            .account_size_refusals(now_ms)
+        // Each read below takes the state published after the commands
+        // above, so it sees what they changed.
+        size_refusals = crate::account_state::published(store)
+            .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
-        let mut route_fences = store
+        let blocks = crate::account_state::published(store).map_err(|error| error.to_string())?;
+        let mut route_fences = blocks
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
         let recorded_route_fences = route_fences.clone();
-        let latest_reports = store
-            .account_route_fence_latest_reports()
+        let latest_reports = blocks
+            .route_fence_latest_reports()
             .map_err(|error| error.to_string())?;
-        let transient_route_fences = store
+        let transient_route_fences = blocks
             .transient_account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
+        drop(blocks);
         repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
-        route_fences = store
-            .account_route_fences(now_ms)
+        route_fences = crate::account_state::published(store)
+            .and_then(|blocks| blocks.account_route_fences(now_ms))
             .map_err(|error| error.to_string())?;
         for fence in &mut route_fences {
             if let Some(reset) = crate::credential_fences::exhausted_quota_reset(
@@ -1287,19 +1316,20 @@ impl ClassContext {
             &recorded_route_fences,
             now_ms,
         )?;
-        let fences = store
-            .account_read(|tx| {
-                facts
-                    .iter()
-                    .map(|fact| fact.provider_id.clone())
-                    .chain(media_providers.iter().cloned())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .map(|provider| Ok((provider.clone(), load_fences(tx, &provider)?)))
-                    .collect()
-            })
+        let blocks = crate::account_state::published(store).map_err(|error| error.to_string())?;
+        let fences = facts
+            .iter()
+            .map(|fact| fact.provider_id.clone())
+            .chain(media_providers.iter().cloned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|provider| Ok((provider.clone(), load_fences(&blocks, &provider)?)))
+            .collect::<RouteStateResult<_>>()
             .map_err(|error| error.to_string())?;
-        let rechecks = store.fence_rechecks().map_err(|error| error.to_string())?;
+        let rechecks = blocks
+            .fence_rechecks()
+            .map_err(|error| error.to_string())?;
+        drop(blocks);
         let mut context = Self {
             serving_index: crate::serving_index::ServingIndex::get(
                 &config,
@@ -1355,13 +1385,17 @@ impl ClassContext {
                 }
                 let mut fences = fences.clone();
                 for (provider, fences) in &mut fences {
-                    *fences = load_fences(tx, provider)?;
+                    *fences = load_fences(&*tx, provider)?;
                 }
                 Ok(fences)
             })
             .map_err(|error| error.to_string())?;
             context.replace_fences(fences);
-            context.replace_rechecks(store.fence_rechecks().map_err(|error| error.to_string())?);
+            context.replace_rechecks(
+                crate::account_state::published(store)
+                    .and_then(|blocks| blocks.fence_rechecks())
+                    .map_err(|error| error.to_string())?,
+            );
         }
         Ok(context)
     }
@@ -1403,7 +1437,11 @@ impl ClassContext {
             &self.route_fences,
             self.now_ms,
         )?);
-        self.replace_rechecks(store.fence_rechecks().map_err(|error| error.to_string())?);
+        self.replace_rechecks(
+            crate::account_state::published(store)
+                .and_then(|blocks| blocks.fence_rechecks())
+                .map_err(|error| error.to_string())?,
+        );
         Ok(())
     }
 
@@ -1752,6 +1790,60 @@ impl ClassContext {
                 .refusals
                 .contains(&(fact.provider_id.clone(), row.id.clone()))
                 || self.probe_eligible(&fact.provider_id, &fact.model_id, &row.id))
+    }
+
+    /// When a request may retry a credential whose one probe another
+    /// selection holds reserved: the later of the hold's end and the next
+    /// check of the credential's blocks that are not due. `None` when no
+    /// reservation keeps this credential out.
+    fn reserved_probe_retry_at(
+        &self,
+        provider: &str,
+        model: &str,
+        row: &cortexkit_claustrum_client::ListedCredential,
+    ) -> Option<i64> {
+        let until = self
+            .probe_eligible(provider, model, &row.id)
+            .then(|| self.probe_reserved_until(provider, &row.id))
+            .flatten()?;
+        Some(
+            self.rechecks
+                .iter()
+                .filter(|origin| {
+                    self.origin_applies(origin, provider, self.account_id(row), &row.id, model)
+                        && !self.origin_due(origin, self.account_id(row), model)
+                })
+                .map(|origin| self.recheck_hint(origin, self.account_id(row), model))
+                .max()
+                .map_or(until, |at| at.max(until)),
+        )
+    }
+
+    /// The accounts a request may use that the class context left out of
+    /// its roster because another selection holds their probe reserved, with
+    /// when each may be retried.
+    fn reserved_probe_accounts(
+        &self,
+        provider: &str,
+        model: &str,
+        params: &AccountForParams,
+    ) -> Vec<(String, i64)> {
+        self.credentials
+            .listed_credentials()
+            .iter()
+            .filter(|row| {
+                params.candidates.as_ref().is_none_or(|candidates| {
+                    candidates.accounts.iter().any(|candidate| {
+                        candidate.credential_id == row.id
+                            && candidate.account_id == self.account_id(row)
+                    })
+                })
+            })
+            .filter_map(|row| {
+                self.reserved_probe_retry_at(provider, model, row)
+                    .map(|until| (self.account_id(row).to_owned(), until))
+            })
+            .collect()
     }
 
     fn probe_eligible(&self, provider: &str, model: &str, credential: &str) -> bool {
@@ -2566,22 +2658,30 @@ impl ClassContext {
         provider: &str,
         model: &str,
         priced: bool,
-    ) -> Result<String, (String, String)> {
+    ) -> Result<String, LaunchRefusal> {
         match self
             .probe(provider, model, priced, false, None, "launch-preflight")
             .outcome
         {
             Outcome::Admit(admission) => Ok(admission.credential_id),
-            _ => Err((
-                "no_eligible_account".into(),
-                format!("{provider}/{model}: no eligible account"),
-            )),
+            // Selection scored this route as admissible; refusing it now
+            // means its evidence changed or another request took its probe
+            // since. Return a retry time, as when another request
+            // takes the probe first.
+            _ => Err(LaunchRefusal::Lost {
+                retry_at: self
+                    .blocked_reset(provider, model, priced)
+                    .flatten()
+                    .unwrap_or(self.now_ms.saturating_add(120_000)),
+            }),
         }
     }
 
     /// A legacy send has no later account admission. Claim its selected
     /// origins here, or fail closed when the runner cannot pin the credential
     /// needed for an account-local probe. Route/provider probes need no pin.
+    /// A probe that another request holds, or that is not due yet, is a
+    /// timed refusal, so the caller can try another route or wait.
     pub(crate) fn claim_launch_credential(
         &self,
         store: &SqliteRouteStateStore,
@@ -2590,7 +2690,7 @@ impl ClassContext {
         priced: bool,
         pinnable: bool,
         owner: Option<&str>,
-    ) -> Result<String, (String, String)> {
+    ) -> Result<String, LaunchRefusal> {
         if !self.needs_credential_pin(provider, model)
             && !self.rechecks.iter().any(|origin| {
                 origin.provider == provider
@@ -2628,20 +2728,19 @@ impl ClassContext {
                             && origin.applies(provider, "", "", model)
                     })
                     .collect();
-                tx.grant_fence_rechecks(
+                let granted = tx.grant_fence_rechecks(
                     &origins,
                     context.now_ms,
                     owner.or(context.probe_owner.as_deref()),
-                )
+                )?;
+                Ok((!granted).then(|| {
+                    lost_probe_retry_at(&origins, owner.or(context.probe_owner.as_deref()), context.now_ms)
+                }))
             })
-            .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
-            return if granted {
-                Ok(String::new())
-            } else {
-                Err((
-                    "no_eligible_account".into(),
-                    "the route/provider probe was already claimed or is not due".into(),
-                ))
+            .map_err(LaunchRefusal::store)?;
+            return match granted {
+                None => Ok(String::new()),
+                Some(retry_at) => Err(LaunchRefusal::Lost { retry_at }),
             };
         }
         let credential = self.launch_credential(provider, model, priced)?;
@@ -2656,7 +2755,10 @@ impl ClassContext {
         let claimed = crate::account_writer::repair(store, move |tx| {
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
-            let owner = owned_owner.as_deref();
+            // The claim is made for this owner, or for the selection's probe
+            // owner when it names none; a probe clock (`fence_recheck` row) that owner
+            // already claimed counts as its own claim.
+            let owner = owned_owner.as_deref().or(context.probe_owner.as_deref());
             let credential = owned_credential.clone();
 
             let origins: Vec<_> = tx
@@ -2672,26 +2774,30 @@ impl ClassContext {
                     .iter()
                     .any(|origin| origin.account_id.is_some() || origin.credential_id.is_some())
             {
-                return Ok(false);
+                return Ok(Err(LaunchRefusal::Refused {
+                    code: "no_eligible_account".into(),
+                    message: format!("{provider}/{model}: a probe requires a credential-pinning runner"),
+                }));
             }
+            let lost = || LaunchRefusal::Lost {
+                retry_at: lost_probe_retry_at(&origins, owner, context.now_ms),
+            };
             if !origins.iter().all(|origin| {
                 context.origin_due(origin, &account, model)
                     || owner.is_some() && origin.claim_owner.as_deref() == owner
             }) {
-                return Ok(false);
+                return Ok(Err(lost()));
             }
-            tx.grant_fence_rechecks(
-                &origins,
-                context.now_ms,
-                owner.or(context.probe_owner.as_deref()),
+            Ok(
+                if tx.grant_fence_rechecks(&origins, context.now_ms, owner)? {
+                    Ok(())
+                } else {
+                    Err(lost())
+                },
             )
         })
-        .map_err(|error| ("no_eligible_account".into(), error.to_string()))?;
-        if claimed {
-            Ok(credential)
-        } else {
-            Err(("no_eligible_account".into(),format!("{provider}/{model}: a probe is unavailable or requires a credential-pinning runner")))
-        }
+        .map_err(LaunchRefusal::store)?;
+        claimed.map(|()| credential)
     }
 
     pub(crate) fn needs_credential_pin(&self, provider: &str, model: &str) -> bool {
@@ -3548,7 +3654,10 @@ struct StoredBlockEvidence {
 }
 
 /// Every standing block on `provider`, with its stored row id.
-fn load_blocks(tx: &AccountTx<'_>, provider: &str) -> RouteStateResult<Vec<(String, Fence)>> {
+fn load_blocks(
+    tx: &(impl BlockReads + ?Sized),
+    provider: &str,
+) -> RouteStateResult<Vec<(String, Fence)>> {
     // The pool-key columns are read only when a block stands. A provider with
     // none reads just the base columns, which every schema version has: the
     // upgrade tests serve admissions on a store opened before the pool-key
@@ -3582,7 +3691,7 @@ fn load_blocks(tx: &AccountTx<'_>, provider: &str) -> RouteStateResult<Vec<(Stri
         .collect())
 }
 
-fn load_fences(tx: &AccountTx<'_>, provider: &str) -> RouteStateResult<Vec<Fence>> {
+fn load_fences(tx: &(impl BlockReads + ?Sized), provider: &str) -> RouteStateResult<Vec<Fence>> {
     Ok(load_blocks(tx, provider)?
         .into_iter()
         .map(|(_, fence)| fence)
@@ -3631,7 +3740,7 @@ fn quota_reading_binds_origin(
 /// check never deletes quota evidence. Clearing a recovered block keeps a
 /// later partial reading from bringing it back.
 fn refresh_blocks(
-    tx: &AccountTx<'_>,
+    tx: &AccountCommand<'_>,
     provider: &str,
     accounts: &[AccountView],
     now: EpochMs,
@@ -3684,7 +3793,7 @@ pub(crate) fn refresh_all_blocks(
 }
 
 fn route_fence_recoveries(
-    tx: &AccountTx<'_>,
+    tx: &(impl BlockReads + ?Sized),
     account_ids: &crate::broca_credentials::CredentialAccounts,
     quota: &AccountQuotaState,
     config: &crate::config_overrides::LiveConfig,
@@ -3762,8 +3871,8 @@ pub(crate) fn repair_route_fences(
     if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
         return legacy_route_fence_repair(store, account_ids, quota, config, now_ms);
     }
-    let recoveries = store
-        .account_read(|tx| route_fence_recoveries(tx, account_ids, quota, config, now_ms))
+    let recoveries = crate::account_state::published(store)
+        .and_then(|blocks| route_fence_recoveries(&blocks, account_ids, quota, config, now_ms))
         .map_err(|error| error.to_string())?;
     if recoveries.is_empty() {
         return Ok(());
@@ -3780,7 +3889,7 @@ pub(crate) fn repair_route_fences(
         // Re-read reports and pool requirements under the IMMEDIATE writer.
         // A newer report can invalidate the read snapshot's recovery entirely.
         for (provider, credential, at) in
-            route_fence_recoveries(tx, account_ids, quota, config, now_ms)?
+            route_fence_recoveries(&*tx, account_ids, quota, config, now_ms)?
         {
             tx.clear_account_route_fences_before(&provider, &credential, at)?;
         }
@@ -3891,10 +4000,10 @@ pub(crate) fn refresh_credential_quota_holds(
     }
     let captured_refusals = refusals.clone();
     let mut changed = false;
-    let kept = store
-        .account_read(|tx| {
+    let kept = crate::account_state::published(store)
+        .and_then(|blocks| {
             reconcile_credential_quota_holds(
-                tx,
+                &blocks,
                 credentials,
                 quota,
                 config,
@@ -3959,7 +4068,7 @@ pub(crate) fn refresh_credential_quota_holds(
 /// The credential row remains as refusal evidence and also excludes paid-credit
 /// placement: a billing refusal must not be bypassed by switching payment class.
 pub(crate) fn refresh_credential_quota_holds_in(
-    tx: &AccountTx<'_>,
+    tx: &AccountCommand<'_>,
     credentials: &crate::broca_credentials::CredentialAccounts,
     quota: &AccountQuotaState,
     config: &crate::config_overrides::LiveConfig,
@@ -3970,8 +4079,16 @@ pub(crate) fn refresh_credential_quota_holds_in(
     reconcile_credential_quota_holds(tx, credentials, quota, config, refusals, route_fences, now, true, &mut false)
 }
 
-fn reconcile_credential_quota_holds(
+/// End a credential refusal that fresh quota evidence has lifted.
+fn clear_lifted_refusal(
     tx: &AccountTx<'_>,
+    refusal: &striatum_core::route_state_store::CredentialEntitlementFence,
+) -> RouteStateResult<()> {
+    tx.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)
+}
+
+fn reconcile_credential_quota_holds(
+    tx: &(impl BlockReads + ?Sized),
     credentials: &crate::broca_credentials::CredentialAccounts,
     quota: &AccountQuotaState,
     config: &crate::config_overrides::LiveConfig,
@@ -3992,7 +4109,7 @@ fn reconcile_credential_quota_holds(
             for block in tx.active_pool_fences(&refusal.provider_id)? {
                 if block.evidence.fence_id.starts_with(&prefix) {
                     *changed = true;
-                    if write { tx.clear_fence(&block.evidence.fence_id, now, "entitlement_not_quota")?; }
+                    if write { writer(tx)?.clear_held_fence(&block.evidence, now, "entitlement_not_quota")?; }
                 }
             }
             kept.push(refusal);
@@ -4047,7 +4164,7 @@ fn reconcile_credential_quota_holds(
         };
         *changed |= needs_write;
         let classified = if write && needs_write {
-            tx.classify_credential_quota(&refusal.provider_id, &refusal.credential_id, quota_interpretation)?
+            writer(tx)?.classify_credential_quota(&refusal.provider_id, &refusal.credential_id, quota_interpretation)?
         } else { classified };
         if !classified {
             kept.push(refusal);
@@ -4107,7 +4224,7 @@ fn reconcile_credential_quota_holds(
             if all_recovered {
                 for block in &blocks {
                     *changed = true;
-                    if write { tx.clear_fence(&block.evidence.fence_id, now, "fresh_headroom")?; }
+                    if write { writer(tx)?.clear_fence(&block.evidence.fence_id, now, "fresh_headroom")?; }
                 }
                 return Ok(true);
             }
@@ -4162,7 +4279,7 @@ fn reconcile_credential_quota_holds(
             if let Some(end) = block_end(&fence, reading.as_ref(), now, &policy) {
                 for block in &blocks {
                     *changed = true;
-                    if write { tx.clear_fence(&block.evidence.fence_id, now, &wire_str(&end))?; }
+                    if write { writer(tx)?.clear_fence(&block.evidence.fence_id, now, &wire_str(&end))?; }
                 }
                 return Ok(true);
             }
@@ -4174,6 +4291,7 @@ fn reconcile_credential_quota_holds(
             }) {
                 *changed = true;
                 if write {
+                let tx = writer(tx)?;
                 for block in &blocks {
                     tx.clear_fence(&block.evidence.fence_id, now, "quota_evidence_updated")?;
                 }
@@ -4202,7 +4320,7 @@ fn reconcile_credential_quota_holds(
         })()?;
         if lifted {
             *changed = true;
-            if write { tx.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)?; }
+            if write { clear_lifted_refusal(writer(tx)?, &refusal)?; }
         } else {
             kept.push(refusal);
         }
@@ -4331,7 +4449,7 @@ fn demand_floor(
 }
 
 fn load_exclusions(
-    tx: &AccountTx<'_>,
+    tx: &(impl BlockReads + ?Sized),
     principal: &str,
     admission_id: &str,
 ) -> RouteStateResult<Vec<PrincipalExclusion>> {
@@ -5209,10 +5327,25 @@ fn prepare_and_admit(
         Err(reply) => return Err(reply),
     };
     checking("service_tier");
-    parsed.service_tier_chosen = match prepare_service_tier(&mut parsed, ctx, &mut roster, class) {
-        Ok(tier) => tier,
-        Err(reply) => return Err(reply),
-    };
+    // Accounts a route fence or another selection's reserved probe keeps out
+    // for now, and when the first of them returns: a bound tier those
+    // accounts serve waits for them instead of being refused for good.
+    let held_until = route_fenced
+        .values()
+        .copied()
+        .chain(ctx.classes.iter().flat_map(|classes| {
+            classes
+                .reserved_probe_accounts(&provider, &normalize(&parsed.model), &parsed)
+                .into_iter()
+                .map(|(_, until)| until)
+        }))
+        .filter(|until| *until > ctx.now_ms)
+        .min();
+    parsed.service_tier_chosen =
+        match prepare_service_tier(&mut parsed, ctx, &mut roster, class, held_until) {
+            Ok(tier) => tier,
+            Err(reply) => return Err(reply),
+        };
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return Err(because("route_fence", reply));
     }
@@ -5560,6 +5693,7 @@ fn prepare_service_tier(
     ctx: &Ctx<'_>,
     roster: &mut RosterBuild,
     class: striatum_core::accounts::AllowedAccountClass,
+    held_until: Option<i64>,
 ) -> Result<Option<cortexkit_role_routing::service_tier::ServiceTier>, OpReply> {
     use cortexkit_role_routing::service_tier::{fallback, ServiceTier};
     let bound = parsed
@@ -5589,6 +5723,11 @@ fn prepare_service_tier(
                 })
             })
         {
+            // No account left can serve the tier, but some are only held
+            // out for a while: wait for them, as a lost probe does.
+            if let Some(until) = held_until {
+                return Err(lost_probe_refusal(until, ctx.now_ms, Value::Null, json!([])));
+            }
             return Err(bound_service_tier_refusal(parsed));
         }
         return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
@@ -5730,6 +5869,31 @@ fn route_fence_refusal(
         ),
         detail,
     ))
+}
+
+/// The answer to a request that lost a probe race, or whose accounts are
+/// held out for a while, and was admitted nowhere: the timed
+/// `account_pool_exhausted`, at `until` (the earliest time one of them may
+/// return). Never an untimed code, which a runner would read as a missing
+/// login or a decision to replace.
+fn lost_probe_refusal(until: i64, now: i64, decision_id: Value, exclusions: Value) -> OpReply {
+    let retry_after_s = u64::try_from(until.saturating_sub(now))
+        .unwrap_or(0)
+        .div_ceil(1000);
+    OpReply::typed(
+        "account_pool_exhausted",
+        format!(
+            "no account admitted: the accounts this request needs are held until {}",
+            rfc3339(until)
+        ),
+        json!({
+            "code": "account_pool_exhausted",
+            "retry_after_s": retry_after_s,
+            "decision_id": decision_id,
+            "exclusions": exclusions,
+            "reset_at_ms": until,
+        }),
+    )
 }
 
 /// The contract code for an empty eligible roster with class-aware routing.
@@ -5947,36 +6111,7 @@ fn empty_roster_refusal(
     let mut fenced_cause = false;
     let mut row_resets: Vec<Option<i64>> = Vec::new();
     for row in &rows {
-        if let Some(until) = classes
-            .probe_eligible(provider, model, &row.id)
-            .then(|| classes.probe_reserved_until(provider, &row.id))
-            .flatten()
-        {
-            let until = classes
-                .rechecks
-                .iter()
-                .filter(|origin| {
-                    classes.origin_applies(
-                        origin,
-                        provider,
-                        classes.account_id(row),
-                        &row.id,
-                        model,
-                    ) && !classes.origin_due(
-                        origin,
-                        classes.account_id(row),
-                        model,
-                    )
-                })
-                .map(|origin| {
-                    classes.recheck_hint(
-                        origin,
-                        classes.account_id(row),
-                        model,
-                    )
-                })
-                .max()
-                .map_or(until, |at| at.max(until));
+        if let Some(until) = classes.reserved_probe_retry_at(provider, model, row) {
             fenced_cause = true;
             row_resets.push(Some(until));
             let code = classes
@@ -6268,40 +6403,55 @@ pub(crate) fn preflight_model_for_class_with_reset(
             })?,
         )
     };
-    let (decision, fences) = ctx
-        .store
-        .account_read(|tx| {
-            let fences = load_fences(tx, provider)?;
-            let decision = striatum_core::accounts::decide_with_context(
-                &request,
-                &AllocatorState {
-                    roster: roster.roster.clone(),
-                    affinity: None,
-                    fences: fences.clone(),
-                    principal_exclusions: Vec::new(),
-                    admissions: demand_with(
-                        |provider, account, floor| match &state {
-                            Some(state) => Ok(state.admissions.demand(provider, account, floor)),
-                            None => tx.demand(provider, account, floor),
-                        },
-                        provider,
-                        roster.roster.as_ref(),
-                        &policy,
-                        &inputs,
-                    )?,
-                    operator_override: None,
-                    policy: policy.clone(),
-                },
-                ctx.now_ms,
+    let unavailable = |error: RouteStateStoreError| PreflightRefusal {
+        code: "account_selection_unavailable".into(),
+        message: error.to_string(),
+        reset_at_ms: None,
+    };
+    // Fences come from the same published state as the demand, so one
+    // decision never mixes two generations.
+    let fences = match &state {
+        Some(state) if state.blocks.enabled() => load_fences(
+            &crate::account_state::Published::State(std::sync::Arc::clone(state)),
+            provider,
+        ),
+        _ => crate::account_state::published(ctx.store)
+            .and_then(|blocks| load_fences(&blocks, provider)),
+    }
+    .map_err(unavailable)?;
+    let admissions = match &state {
+        Some(state) => demand_with(
+            |provider, account, floor| Ok(state.admissions.demand(provider, account, floor)),
+            provider,
+            roster.roster.as_ref(),
+            &policy,
+            &inputs,
+        ),
+        None => ctx.store.account_read(|tx| {
+            demand_with(
+                |provider, account, floor| tx.demand(provider, account, floor),
+                provider,
+                roster.roster.as_ref(),
+                &policy,
                 &inputs,
-            );
-            Ok((decision, fences))
-        })
-        .map_err(|error| PreflightRefusal {
-            code: "account_selection_unavailable".into(),
-            message: error.to_string(),
-            reset_at_ms: None,
-        })?;
+            )
+        }),
+    }
+    .map_err(unavailable)?;
+    let decision = striatum_core::accounts::decide_with_context(
+        &request,
+        &AllocatorState {
+            roster: roster.roster.clone(),
+            affinity: None,
+            fences: fences.clone(),
+            principal_exclusions: Vec::new(),
+            admissions,
+            operator_override: None,
+            policy: policy.clone(),
+        },
+        ctx.now_ms,
+        &inputs,
+    );
     match decision.outcome {
         Outcome::Admit(_) => Ok(()),
         Outcome::Hold(hold) => Err(PreflightRefusal {
@@ -6381,6 +6531,40 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// The whole admission inside one write transaction: idempotency, the
 /// compare-and-set, the decision and its commit. The transaction commits
 /// before the reply leaves, so a reply always describes a durable decision.
+/// How long a request whose probe claim was refused while every clock
+/// looked due waits before asking again.
+const LOST_PROBE_RETRY_MS: i64 = 1_000;
+
+/// When a request whose claim on `origins` was refused may try again: the
+/// latest time any of them opens. A slot another request holds stays closed
+/// until its claim's interval ends, even where a provider reset is already
+/// due, so that interval is the retry time; quota origins share one periodic
+/// check. A claim refused while every clock looks due (its evidence changed
+/// under it) is retried shortly rather than answered without a time.
+/// `owner` is the decision that may already own the probe.
+pub(crate) fn lost_probe_retry_at(
+    origins: &[striatum_store::FenceRecheck],
+    owner: Option<&str>,
+    now: i64,
+) -> i64 {
+    let quota_until = striatum_store::FenceRecheck::quota_group_at(origins, owner);
+    origins
+        .iter()
+        .map(|origin| {
+            let owned = owner.is_some() && origin.claim_owner.as_deref() == owner;
+            if origin.quota {
+                quota_until
+            } else if origin.claim_owner.is_some() && !owned {
+                origin.due_at().max(origin.next_recheck_at)
+            } else {
+                origin.due_at()
+            }
+        })
+        .filter(|until| *until > now)
+        .max()
+        .unwrap_or(now.saturating_add(LOST_PROBE_RETRY_MS))
+}
+
 fn serve(
     tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
@@ -6600,7 +6784,7 @@ fn serve(
             .as_ref()
             .map(|row| conversation_affinity(row, now)),
         fences,
-        principal_exclusions: load_exclusions(tx, principal, &params.admission_id)?,
+        principal_exclusions: load_exclusions(&*tx, principal, &params.admission_id)?,
         admissions,
         operator_override: None,
         policy: policy.clone(),
@@ -6772,16 +6956,15 @@ fn serve(
             }
             striatum_store::CredentialProbeClaim::Blocked => {
                 // Another request can claim the probe after scoring prepared
-                // this roster. Preserve the actual fence and its retry time;
-                // removing only the credential misreports missing candidates.
-                if let Some(until) = applicable
-                    .iter()
-                    .map(|origin| origin.due_at())
-                    .filter(|until| *until > now)
-                    .max()
-                {
-                    lost_probe_fences.insert(admission.account_id.clone(), until);
-                }
+                // this roster. Preserve the actual fence and its retry time
+                // (see `lost_probe_retry_at`); removing only the credential
+                // misreports missing candidates.
+                let until = lost_probe_retry_at(
+                    &applicable,
+                    params.model_decision_id.as_deref(),
+                    now,
+                );
+                lost_probe_fences.insert(admission.account_id.clone(), until);
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
                     for account in &mut roster.accounts {
@@ -6793,6 +6976,17 @@ fn serve(
             }
         }
     };
+    // An account the class context left out because another selection holds
+    // its probe reserved is a lost race as well.
+    if !matches!(decision.outcome, Outcome::Admit(_)) {
+        if let Some(classes) = &ctx.classes {
+            for (account, until) in
+                classes.reserved_probe_accounts(provider, &normalize(&params.model), params)
+            {
+                lost_probe_fences.entry(account).or_insert(until);
+            }
+        }
+    }
     if !matches!(decision.outcome, Outcome::Admit(_)) && !lost_probe_fences.is_empty() {
         let mut remaining = state.roster.clone();
         if let Some(roster) = &mut remaining {
@@ -6813,7 +7007,7 @@ fn serve(
             if let Some(reply) = empty_roster_refusal(
                 classes,
                 provider,
-                &params.model,
+                &normalize(&params.model),
                 roster.context["priced_per_token"]
                     .as_bool()
                     .unwrap_or(false),
@@ -6821,7 +7015,23 @@ fn serve(
                 now,
                 Some(params),
             ) {
-                return Ok(reply);
+                // A reserved probe is a lost race too: the timed rule below
+                // applies, whatever the emptied roster's own code says.
+                return Ok(match lost_probe_fences.values().copied().min() {
+                    Some(lost) => {
+                        let (decision_id, exclusions, reset) = match &reply {
+                            OpReply::Error { detail: Some(detail), .. } => (
+                                detail["decision_id"].clone(),
+                                detail["exclusions"].clone(),
+                                detail["reset_at_ms"].as_i64(),
+                            ),
+                            _ => (Value::Null, json!([]), None),
+                        };
+                        let exclusions = if exclusions.is_null() { json!([]) } else { exclusions };
+                        lost_probe_refusal(reset.map_or(lost, |reset| reset.min(lost)), now, decision_id, exclusions)
+                    }
+                    None => reply,
+                });
             }
         }
     }
@@ -6943,14 +7153,18 @@ fn serve(
             // admit, so that stays `account_selection_unavailable`.
             let mut code = refusal_code(refusal.code);
             if code == "account_selection_unsupported" {
+                // The probe loop removes credentials, not accounts: an
+                // account left with none counts as removed.
                 let probe_emptied = roster
                     .roster
                     .as_ref()
                     .is_some_and(|roster| !roster.accounts.is_empty())
-                    && state
-                        .roster
-                        .as_ref()
-                        .is_none_or(|roster| roster.accounts.is_empty());
+                    && state.roster.as_ref().is_none_or(|roster| {
+                        roster
+                            .accounts
+                            .iter()
+                            .all(|account| account.credentials.is_empty())
+                    });
                 code = if probe_emptied {
                     "account_selection_unavailable"
                 } else {
@@ -6969,6 +7183,18 @@ fn serve(
                 code,
                 "account_pool_exhausted" | "account_pool_reserve_limited"
             );
+            // A request that lost a probe race to another request is never
+            // refused untimed, whatever refused the accounts it had left: the
+            // probe it lost is retried at a known time, and an untimed code
+            // such as `auth_required` would make the runner stop for a login.
+            if let Some(lost) = lost_probe_fences.values().copied().min() {
+                return Ok(lost_probe_refusal(
+                    reset.map_or(lost, |reset| reset.min(lost)),
+                    now,
+                    json!(decision_id),
+                    json!(wire_exclusions(&decision)),
+                ));
+            }
             Ok(OpReply::typed(
                 code,
                 format!("no account admitted: {code}"),
@@ -7582,7 +7808,7 @@ fn record_observation(
         }
     }
     if parsed.kind == "credential_refused" {
-        apply_credential_refused(tx, ctx, parsed, admission.as_ref(), &mut effects)?;
+        apply_credential_refused(&*tx, ctx, parsed, admission.as_ref(), &mut effects)?;
     } else if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
         let until = parsed
             .retry_at_ms
@@ -7637,7 +7863,7 @@ fn record_observation(
 }
 
 fn apply_credential_refused(
-    tx: &AccountTx<'_>,
+    tx: &AccountCommand<'_>,
     ctx: &CommandContext,
     parsed: &ObserveParams,
     admission: Option<&AccountAdmissionRow>,
@@ -7781,27 +8007,26 @@ fn apply_bound_observation(
                     }));
                 }
                 if media_success {
-                    tx.heal_authorized_probe(
-                        &admission_probe_owner(&admission.principal, &admission.admission_id),
-                        &admission.provider,
-                        &admission.model,
-                        now,
-                    )?;
-                    tx.heal_serving_fences_in_scope(
-                        &admission.provider,
-                        &admission.account_id,
-                        &admission.credential_id,
-                        &admission.model,
+                    // The shared admission-success healing, with the run's
+                    // pool scope, as for a served attempt.
+                    tx.heal_admission_success(
+                        admission,
                         size_class,
-                        admission.committed_at,
-                        now,
+                        success_admission.and_then(|row| row.model_decision_id.as_deref()),
                         Some(&striatum_store::QuotaSuccessScope {
                             family: ctx
                                 .provider_policy(&admission.provider)
                                 .family_for_model(&admission.model),
                             pool: request_pool(None, &admission.provider, &admission.model),
                         }),
+                        now,
                     )?;
+                    // The finished run's probe authorizations are spent,
+                    // whether or not they healed a block.
+                    tx.retire_probe_authorizations(&admission_probe_owner(
+                        &admission.principal,
+                        &admission.admission_id,
+                    ))?;
                 }
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
