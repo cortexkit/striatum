@@ -2722,6 +2722,9 @@ async fn handle_select_request_attempt(
         };
     let attempt = |snap: ModelRouteStateSnapshot| {
         if !enforce_concurrency {
+            if ledger.full_routes.is_empty() {
+                return attempt_with_concurrency(snap, None);
+            }
             if let Err(error) = attempt_with_concurrency(snap.clone(), Some(&ledger)) {
                 crate::select_concurrency::record(
                     "route.select",

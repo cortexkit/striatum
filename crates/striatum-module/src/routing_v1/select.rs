@@ -1629,7 +1629,7 @@ async fn select_at_tier_attempt(
         now as i64,
     )
     .map_err(store_refusal)?;
-    let use_concurrency = std::cell::Cell::new(true);
+    let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
     let selection = Selection {
         concurrency: &concurrency,
         use_concurrency: &use_concurrency,
@@ -1905,7 +1905,7 @@ async fn select_at_tier_attempt(
         _ => false,
     };
     if (concurrency_failure && crate::select_concurrency::head(&operator_config, &consumer))
-        || !live_config.concurrency_caps().enforcement_enabled
+        || (!live_config.concurrency_caps().enforcement_enabled && use_concurrency.get())
     {
         if concurrency_failure
             && evaluation.is_none()
