@@ -2385,6 +2385,49 @@ impl ClassContext {
         )
     }
 
+    /// Probe each roster account independently, without an affinity lookup or a
+    /// reservation. A blocked sibling must not hide a full eligible account.
+    pub(crate) fn select_eligible_accounts(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Vec<String> {
+        let Some(roster) = self.roster_for(provider, model, priced).roster else {
+            return Vec::new();
+        };
+        let request = synthetic_request(provider, model, "demand-preflight".into());
+        let mut inputs = self.allocation_context(provider, model);
+        inputs.hold_ok = Some(false);
+        roster
+            .accounts
+            .iter()
+            .filter_map(|account| {
+                let mut only = roster.clone();
+                only.accounts = vec![account.clone()];
+                let decision = striatum_core::accounts::decide_with_context(
+                    &request,
+                    &AllocatorState {
+                        roster: Some(only),
+                        affinity: None,
+                        fences: self.probe_fences(
+                            provider,
+                            model,
+                            self.fences.get(provider).cloned().unwrap_or_default(),
+                        ),
+                        principal_exclusions: Vec::new(),
+                        admissions: Vec::new(),
+                        operator_override: None,
+                        policy: self.config.allocator_policy_ref(provider).clone(),
+                    },
+                    self.now_ms,
+                    &inputs,
+                );
+                matches!(decision.outcome, Outcome::Admit(_)).then(|| account.account_id.clone())
+            })
+            .collect()
+    }
+
     /// Inspect the requesting payment class with the allocator's own filters.
     /// A new session has no account affinity and must leave the allocator's
     /// minimum quota headroom intact. Those floors make an account unavailable

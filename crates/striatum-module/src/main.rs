@@ -50,6 +50,7 @@ mod routing_v1;
 mod stage_timing;
 mod runtime_lag;
 mod select;
+mod select_concurrency;
 mod select_policy;
 mod selection_harness;
 mod service_tiers;
@@ -4474,7 +4475,9 @@ async fn send_no_route(
     // whose expiry earliestReset reports; clients need not parse the message.
     let mut body_value = if matches!(
         err.reason,
-        RouteFailureReason::AllRoutesInadequate | RouteFailureReason::QuotaOrCooldownExhausted
+        RouteFailureReason::ConcurrencyFull
+            | RouteFailureReason::AllRoutesInadequate
+            | RouteFailureReason::QuotaOrCooldownExhausted
     ) {
         let mut obj = serde_json::Map::new();
         obj.insert("code".into(), json!(code));
