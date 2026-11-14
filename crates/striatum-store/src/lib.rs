@@ -331,7 +331,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 87] {
+fn route_state_migrations() -> [Migration; 88] {
     [
         Migration {
             version: 1,
@@ -680,6 +680,10 @@ fn route_state_migrations() -> [Migration; 87] {
         Migration {
             version: 88,
             statements: include_str!("../migrations/088_continuation_whole_offers.sql"),
+        },
+        Migration {
+            version: 89,
+            statements: include_str!("../migrations/089_account_affinity_by_pin.sql"),
         },
     ]
 }
@@ -1652,7 +1656,10 @@ impl SqliteRouteStateStore {
         store
             .with_conn(|conn| {
                 conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                conn.pragma_update(None, "synchronous", "NORMAL")
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                // Savepoint statement journals otherwise create and delete a
+                // temp file per account command once they spill out of memory.
+                conn.pragma_update(None, "temp_store", "MEMORY")
             })
             .map_err(err)?;
         // Hold each checkout until the next is configured, filling the lazy pool.
