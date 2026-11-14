@@ -1309,6 +1309,62 @@ fn a_report_from_an_owner_whose_claim_was_superseded_does_not_match() {
     assert!(matches("second"));
 }
 
+/// The same superseded test request, settled through an authorized success
+/// (the legacy and media paths) or as an admission's run, heals nothing
+/// either: only an admission that itself owns the clock's claim is current
+/// on another generation.
+#[test]
+fn a_superseded_test_request_heals_nothing_by_any_settling_path() {
+    for path in ["authorized success", "admission run"] {
+        let rig = rig("block-state-superseded-heal-paths");
+        rig.store
+            .record_provider_cooldown(
+                "p0",
+                "p0/m0",
+                "p0/m0",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(NOW - 2 * 3_600_000),
+                    cooldown_until: Some((NOW + 5 * 3_600_000) as f64),
+                    last_error: Some("provider capacity".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        rig.run(fence_rechecks::sync);
+        let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+        for (owner, at) in [("first", NOW), ("second", NOW + 2 * 3_600_000)] {
+            let origins = origins.clone();
+            assert!(rig
+                .store
+                .account_command(AccountCommandKind::Maintenance, move |tx| {
+                    tx.grant_fence_rechecks(&origins, at, Some(owner))
+                })
+                .unwrap());
+        }
+        rig.store
+            .account_command(AccountCommandKind::Report, |tx| {
+                tx.release_inconclusive_probe("second", "p0", "m0", NOW + 2 * 3_600_000 + 1)
+            })
+            .unwrap();
+        let later = NOW + 3 * 3_600_000;
+        rig.store
+            .account_command(AccountCommandKind::Report, move |tx| match path {
+                "authorized success" => tx.heal_authorized_probe("first", "p0", "m0", later),
+                _ => {
+                    let origins = tx.fence_rechecks()?;
+                    tx.heal_report_probe("first", None, true, "m0", later, &origins, later)
+                }
+            })
+            .unwrap();
+        assert_eq!(
+            rig.store.fence_rechecks().unwrap().len(),
+            1,
+            "{path}: the superseded test's success heals no block"
+        );
+        rig.check(&[NOW], path);
+    }
+}
+
 /// A test request that a later one superseded heals nothing: its success
 /// finds the block's clock on the later generation, even once that later
 /// test was released without an outcome and the clock has no owner.

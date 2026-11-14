@@ -7862,27 +7862,26 @@ fn apply_bound_observation(
                     }));
                 }
                 if media_success {
-                    tx.heal_authorized_probe(
-                        &admission_probe_owner(&admission.principal, &admission.admission_id),
-                        &admission.provider,
-                        &admission.model,
-                        now,
-                    )?;
-                    tx.heal_serving_fences_in_scope(
-                        &admission.provider,
-                        &admission.account_id,
-                        &admission.credential_id,
-                        &admission.model,
+                    // The shared admission-success healing, with the run's
+                    // pool scope, as for a served attempt.
+                    tx.heal_admission_success(
+                        admission,
                         size_class,
-                        admission.committed_at,
-                        now,
+                        success_admission.and_then(|row| row.model_decision_id.as_deref()),
                         Some(&striatum_store::QuotaSuccessScope {
                             family: ctx
                                 .provider_policy(&admission.provider)
                                 .family_for_model(&admission.model),
                             pool: request_pool(None, &admission.provider, &admission.model),
                         }),
+                        now,
                     )?;
+                    // The finished run's probe authorizations are spent,
+                    // whether or not they healed a block.
+                    tx.retire_probe_authorizations(&admission_probe_owner(
+                        &admission.principal,
+                        &admission.admission_id,
+                    ))?;
                 }
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));

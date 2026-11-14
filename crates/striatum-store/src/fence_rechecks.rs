@@ -715,6 +715,37 @@ pub(crate) fn derive_blocks(
     Ok(loaded)
 }
 
+/// Whether `row` authorizes the test request its clock is on now: the clock
+/// is uncleared, holds the authorized evidence, and is on the authorized
+/// claim generation with no other owner, or, for an admission's own
+/// authorization (`admission_owned`), is claimed by that admission. The
+/// SQL form is [`current_test_join`].
+fn test_is_current(
+    blocks: &crate::BlockState,
+    row: &crate::block_state::ProbeAuthorization,
+    admission_owned: bool,
+) -> bool {
+    blocks.clock(&row.kind, &row.origin_key).is_some_and(|(clock, cleared)| {
+        let owner = clock.claim_owner.as_deref();
+        cleared.is_none()
+            && clock.evidence == row.evidence
+            && clock.evidence_at == row.evidence_at
+            && ((owner.is_none_or(|by| by == row.owner) && clock.claim_generation == row.claim_generation)
+                || (admission_owned && owner == Some(row.owner.as_str())))
+    })
+}
+
+/// [`test_is_current`] as a join of authorization `a` to its clock `r`, with
+/// the admission flag bound at `?{flag}`.
+fn current_test_join(flag: usize) -> String {
+    format!(
+        "JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
+         AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at AND r.cleared_at IS NULL
+         AND (((r.claim_owner IS NULL OR r.claim_owner=a.owner) AND r.claim_generation=a.claim_generation)
+             OR (?{flag} AND r.claim_owner=a.owner))"
+    )
+}
+
 /// The clause naming the uncleared clock a decision read. Its seven values
 /// are bound from `?{first}` on, in this order: evidence, evidence_at, quota,
 /// next_recheck_at, reset_check_at, claim_owner, claim_generation. An update
@@ -1458,6 +1489,19 @@ impl AccountTx<'_> {
         Ok(())
     }
 
+    /// Retire every probe authorization `owner` still holds, for an owner
+    /// whose run ended: keyed by the working state's rows when the command
+    /// has one.
+    pub fn retire_probe_authorizations(&self, owner: &str) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        match self.working_blocks()? {
+            Some(blocks) => self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner))),
+            None => self.delete_authorizations(owner, None),
+        }
+    }
+
     /// Delete one probe authorization the working state holds, by key and
     /// naming every value the state shows.
     fn delete_authorization(&self, row: &crate::block_state::ProbeAuthorization) -> RouteStateResult<()> {
@@ -1811,6 +1855,9 @@ impl AccountTx<'_> {
             .iter()
             .filter(|origin| origin.model.as_deref().is_none_or(|value| value == model))
         {
+            // Only the test request this owner holds now: its authorization
+            // must name the clock's current evidence and claim generation, so
+            // a test a later one superseded heals nothing.
             let claimed: Option<i64> = match self.working_blocks()? {
                 Some(blocks) => blocks
                     .authorizations_of(owner)
@@ -1820,19 +1867,21 @@ impl AccountTx<'_> {
                             && row.origin_key == origin.origin_key
                             && row.evidence == origin.evidence
                             && row.evidence_at == origin.evidence_at
+                            && test_is_current(&blocks, row, false)
                     })
                     .map(|row| row.claimed_at),
                 None => self
                     .conn
                     .query_row(
-                        "SELECT claimed_at FROM fence_probe_authorization
-                    WHERE owner=?1 AND kind=?2 AND origin_key=?3 AND evidence=?4 AND evidence_at=?5",
+                        &format!("SELECT a.claimed_at FROM fence_probe_authorization a {}
+                    WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3 AND a.evidence=?4 AND a.evidence_at=?5", current_test_join(6)),
                         params![
                             owner,
                             origin.kind,
                             origin.origin_key,
                             origin.evidence,
-                            origin.evidence_at
+                            origin.evidence_at,
+                            false
                         ],
                         |row| row.get(0),
                     )
@@ -1852,10 +1901,10 @@ impl AccountTx<'_> {
     /// Settles one run's test request after a successful report. The owner's
     /// authorization must name the block's exact evidence (the refusal that
     /// started it) and its current claim generation (which numbered test this
-    /// was). An admission owner may also retire the same test's duplicate
-    /// authorization held under the decision id (`decision_copy`), but never a
-    /// later run's re-claim. With no admission, the decision itself must still
-    /// own the current claim.
+    /// was), with no other request owning the claim; an admission that owns
+    /// the claim itself is current as well. An admission owner may also
+    /// retire the same test's duplicate authorization held under the
+    /// decision id (`decision_copy`), but never a later run's re-claim.
     pub(crate) fn heal_report_probe(
         &self,
         owner: &str,
@@ -1881,28 +1930,14 @@ impl AccountTx<'_> {
                             && row.evidence_at == origin.evidence_at
                             && row.claimed_at <= admitted_at
                     })
-                    .filter(|row| {
-                        blocks.clock(&row.kind, &row.origin_key).is_some_and(|(clock, cleared)| {
-                            cleared.is_none()
-                                && clock.evidence == row.evidence
-                                && clock.evidence_at == row.evidence_at
-                                && (admission_owned
-                                    || (clock.claim_owner.as_deref().is_none_or(|by| by == row.owner)
-                                        && clock.claim_generation == row.claim_generation))
-                        })
-                    })
+                    .filter(|row| test_is_current(&blocks, row, admission_owned))
                     .map(|row| (row.claimed_at, row.claim_generation)),
                 None => self
                     .conn
                     .query_row(
-                        "SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a
-                     JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
-                     AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at
+                        &format!("SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a {}
                      WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3
-                     AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6
-                     AND (?7 OR ((r.claim_owner IS NULL OR r.claim_owner=a.owner)
-                         AND r.claim_generation=a.claim_generation))
-                     AND r.cleared_at IS NULL",
+                     AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6", current_test_join(7)),
                         params![
                             owner,
                             origin.kind,
