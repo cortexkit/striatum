@@ -394,6 +394,47 @@ reasoning-catalogue reads are exempt catalogue reads, not a T-read escape hatch
 for an account operation. `read_counts_offline` in `S/reasoning_catalog.rs` reads
 the persisted roster only offline and is not a daemon reader.
 
+## S8b-2 recorded exceptions to "no block-table SQL reads on request paths"
+
+After S8b-2 every request-path decision about block rows reads the account
+state, and the block read trace (`S/group_reads.rs`, authorizer-based) fails on
+any other read. Three classes of SQL read remain, each counted apart by the
+trace and each statement pinned in `S/block_state.rs::reviewed_exempt_reads`
+(proven keyed by `every_exempt_read_is_keyed`, which rejects any table scan in
+its query plan):
+
+* **Decision checks (`STATE_CHECK`).** A decision taken on the state reads, by
+  key, the rows it decided on and raises `STATE_DIVERGED` if SQL differs
+  (claims, probe answers, healing, sync, pool leases, admissions).
+* **Route-state writers' own-row reads (`ROUTE_WRITE_READ`), owner-approved
+  bounded exception.** These four writers read the row they are about to write,
+  inside the account command that writes it, by primary key or the indexed
+  `provider_id`. The merge is decided in SQL, which is the single decider for
+  these writes, and a read's result decides only that statement's own write:
+  * `record_provider_cooldown`: prior provider observation time, inherited
+    route rows, the existing provider row;
+  * `update_route_state`: prior route observation time, the existing route row
+    (two reads);
+  * the route-outcome recorder in `set_decision_outcome`: the route's failure
+    streak and backoff;
+  * `clear_failure_backoff`: the route's failure streak and backoff, for its
+    prior-state reply.
+  Each statement is a `ROUTE_READ_*` constant in `S/lib.rs`. Pinned by
+  `the_route_state_writers_read_only_their_own_rows_through_reviewed_statements`.
+* **Reviewed reading triggers.** Schema triggers that read block tables when a
+  write fires them, each keyed (`S/group_reads.rs::REVIEWED_TRIGGERS`):
+  * `model_route_state_inherit_fence_scope`: `provider_cooldown_state` by
+    `provider_key = NEW.provider_id`;
+  * `model_facts_inherit_provider_cooldown`: `provider_cooldown_state` by
+    `provider_key = NEW.provider_id`;
+  * `fence_retire_enforcement`: each source table by the primary key in
+    `NEW.origin_key`; `model_route_state` by the indexed `provider_id`, with
+    `provider_cooldown_state` by `provider_key`.
+  A read from any other trigger counts as an ordinary read and fails the trace.
+
+The state's own load and read-backs (`MAINTENANCE_READ`) keep it current and
+are not request reads.
+
 ## Mixed-table columns
 
 Here **ordering** means a writer's **report-ordering guard**, not a selector's

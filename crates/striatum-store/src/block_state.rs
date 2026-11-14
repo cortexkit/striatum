@@ -87,7 +87,7 @@ thread_local! {
     /// Whether a test seeding seam is writing on this thread.
     static SEEDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether a test makes writes on this thread that the capture misses.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) static UNSEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -95,7 +95,7 @@ thread_local! {
 /// account command is running on this thread, which means the write bypassed
 /// the account writer.
 pub(crate) fn capture(table: u8, rowid: i64) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if UNSEEN.with(std::cell::Cell::get) {
         // A write the capture misses, and nothing reports.
         return true;
@@ -2174,6 +2174,28 @@ impl crate::AccountTx<'_> {
                 tracing::warn!("block state differs from a full load of SQL; reloading it");
                 return Err(crate::err(diverged("block state differs from a full load")));
             }
+        }
+        Ok(())
+    }
+
+    /// Check that SQL holds every block row of each of `providers` as the
+    /// working state does (`BlockState::check_provider_rows`), raising
+    /// `STATE_DIVERGED` on a difference. A decision that chose which probe
+    /// clocks apply from the state (a route clear removes one; an account
+    /// fence decides whether its clock applies; sync's finding that no
+    /// other source row needs a clock) runs this before it claims or
+    /// admits, because neither the claim nor the admission names the rows
+    /// that left a clock out. The empty provider names the principal
+    /// clocks. Without a working state SQL decided, and there is nothing to
+    /// check.
+    pub fn check_decision_inputs(&self, providers: &[&str]) -> striatum_core::RouteStateResult<()> {
+        let Some(state) = self.working_blocks()? else {
+            return Ok(());
+        };
+        for provider in providers {
+            state
+                .check_provider_rows(self.conn, provider)
+                .map_err(crate::err)?;
         }
         Ok(())
     }

@@ -510,16 +510,8 @@ impl crate::AccountTx<'_> {
     /// difference raises `STATE_DIVERGED`, and the batch runs again on a
     /// fresh load. Without a state SQL decided.
     fn check_lease_inputs(&self, providers: &[&str]) -> rusqlite::Result<()> {
-        let Some(state) = self
-            .working_blocks()
-            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))?
-        else {
-            return Ok(());
-        };
-        for provider in providers {
-            state.check_provider_rows(self.conn, provider)?;
-        }
-        Ok(())
+        self.check_decision_inputs(providers)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))
     }
 
     /// The stored, uncleared clocks: from the working state, or SQL

@@ -1507,6 +1507,9 @@ impl ClassContext {
                         ) && !context.origin_recovered(origin, &admission.account_id)
                     })
                     .collect();
+                // The rows that chose these origins (and left others out)
+                // are checked before the claim, which names only these.
+                tx.check_decision_inputs(&[provider, ""])?;
                 let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
                 let claimed = tx.bind_decision_probe(
                     &origins,
@@ -2742,6 +2745,7 @@ impl ClassContext {
                             && origin.applies(provider, "", "", model)
                     })
                     .collect();
+                tx.check_decision_inputs(&[provider, ""])?;
                 let granted = tx.grant_fence_rechecks(
                     &origins,
                     context.now_ms,
@@ -2785,6 +2789,7 @@ impl ClassContext {
                         && !context.origin_recovered(origin, &account)
                 })
                 .collect();
+            tx.check_decision_inputs(&[provider, ""])?;
             if !pinnable
                 && origins
                     .iter()
@@ -6712,6 +6717,10 @@ fn serve(
                 })
         })
         .collect();
+    // Which clocks apply to this admission, and whether any does, was read
+    // from the working state; the admission and its claim name none of the
+    // rows that left a clock out. Check them first.
+    tx.check_decision_inputs(&[provider, ""])?;
     let targets = |origin: &striatum_store::FenceRecheck,
                    account: &str,
                    credential: &str| {

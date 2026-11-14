@@ -551,3 +551,63 @@ fn oracle_reads_text(
     let _ = store.account_read(|tx| tx.report_route_fences(0));
     trace.take().reader.into_iter().collect()
 }
+
+/// An admission decides which probe clocks apply from the working state, and
+/// neither the admission nor its claim names the rows that left a clock
+/// out. When the state still holds a route clear that SQL has dropped, the
+/// clear would lift a live provider wall for the model; the admission
+/// checks its provider's rows first, so the batch runs again on a fresh
+/// load and the request waits for the wall's probe.
+#[tokio::test]
+async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_waits() {
+    let now = 1_800_000_000_000u64;
+    let _clock = crate::InjectedClock::set(now);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let owner = harness.bind(reserved("example-consumer"), None).await;
+    let runner = harness.bind(reserved("zeta-runner"), None).await;
+    let store = harness.store();
+    crate::account_state::initialize(store).unwrap();
+    striatum_core::RouteStateStore::record_provider_cooldown(
+        store.as_ref(),
+        BORROWED,
+        PLAIN,
+        PLAIN,
+        &striatum_core::route_state_store::RouteStateUpdate {
+            observed_at_ms: Some(now as i64 - 1_000),
+            cooldown_until: Some((now + 3_600_000) as f64),
+            last_error: Some("provider capacity".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    store
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+    store
+        .with_writer_for_test(|conn| {
+            conn.execute_batch(&format!(
+                "INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'model-a',evidence
+                 FROM fence_recheck WHERE kind='provider' AND provider='{BORROWED}';"
+            ))
+        })
+        .unwrap();
+    // The clear lifts the provider wall for model-a.
+    let plain = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    // SQL drops the clear where neither the capture nor a reload sees it.
+    store
+        .write_unseen_for_test("DELETE FROM fence_recheck_route_clear;")
+        .unwrap();
+    let reply = runner
+        .call(
+            "route.account_for",
+            &json!({"provider":BORROWED,"model":"model-a","decision_id":plain["decision_id"],
+                "conversation_key":"stale-clear","admission_id":"stale-clear"}),
+        )
+        .await;
+    assert_eq!(reply.0, FrameType::Error, "the live provider wall holds the admission: {}", reply.1);
+    assert!(
+        reply.1["detail"]["reset_at_ms"].as_i64().is_some_and(|at| at > now as i64),
+        "the request is told when to retry: {}",
+        reply.1
+    );
+}
