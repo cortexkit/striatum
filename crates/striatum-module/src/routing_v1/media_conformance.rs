@@ -73,6 +73,11 @@ impl Inputs {
                         key => format!("rate.{key}"),
                     };
                     row[&key] = catalog_rate(&rate.rate)?;
+                    // The wire's absent minimum is zero, not an unknown
+                    // catalog minimum that would disable equal-rate ties.
+                    if rate.minimum.is_none() {
+                        row[&key]["minimum_quantity"] = json!({"kind":"none"});
+                    }
                     if let Some(quantity) =
                         rate.minimum.as_ref().and_then(serde_json::Number::as_u64)
                     {
