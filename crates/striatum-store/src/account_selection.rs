@@ -25,6 +25,9 @@ use super::{err, SqliteRouteStateStore};
 /// retired shadow mode; retention purges those rows.)
 pub const DECISION_MODE_SERVE: &str = "serve";
 
+const END_LEASE_SQL: &str = "UPDATE account_affinity SET lease_valid_until = ?2 \
+    WHERE pin_id = ?1 AND (lease_valid_until IS NULL OR lease_valid_until > ?2)";
+
 /// Read account-wide observation backoffs with `(now_ms, oldest_receipt_ms)`.
 /// The bound-kind predicates match migration 79's sparse partial index.
 pub const OBSERVATION_BACKOFFS_SQL: &str =
@@ -47,6 +50,37 @@ pub enum CredentialProbeClaim {
 #[cfg(test)]
 mod account_fact_tests {
     use super::*;
+
+    #[test]
+    fn end_lease_query_plan_uses_affinity_pin_index() {
+        let scratch = cortexkit_test_support::ScratchDir::new("end-lease-query-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "end-lease-query-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .with_writer_for_test(|conn| {
+                let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {END_LEASE_SQL}"))?;
+                let plan = statement
+                    .query_map(params!["pin", 200], |row| row.get::<_, String>(3))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                assert!(
+                    plan.iter().any(|line| line.contains(
+                        "SEARCH account_affinity USING INDEX account_affinity_by_pin (pin_id=?)"
+                    )),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan
+                        .iter()
+                        .any(|line| line.contains("SCAN account_affinity")),
+                    "{plan:?}"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
 
     #[test]
     fn headroom_clear_preserves_a_newer_refusal_and_other_provider() {
@@ -1108,6 +1142,8 @@ pub struct AccountAdmissionRow {
     pub started_late: bool,
     pub released_at: Option<i64>,
     pub finished_at: Option<i64>,
+    /// Routing's latest attempt time, or the start time if later.
+    pub last_observed_at: Option<i64>,
 }
 
 /// The demand one charged admission contributes to its account.
@@ -1280,7 +1316,7 @@ const ADMISSION_COLUMNS: &str = "principal, admission_id, request_fingerprint, r
      decision_id, conversation_hash, provider, model, account_id, credential_id, pin_id, \
      pin_generation, state, charged, request_bytes, request_bytes_estimated, committed_at, \
      admission_valid_until, lease_valid_until, reply_json, run_id, started_at, started_late, \
-     released_at, finished_at";
+     released_at, finished_at, last_observed_at";
 
 fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
     Ok(AccountAdmissionRow {
@@ -1309,6 +1345,7 @@ fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
         started_late: row.get::<_, i64>(22)? != 0,
         released_at: row.get(23)?,
         finished_at: row.get(24)?,
+        last_observed_at: row.get(25)?,
     })
 }
 
@@ -1546,7 +1583,7 @@ impl AccountTx<'_> {
                 &format!(
                     "INSERT INTO account_admission ({ADMISSION_COLUMNS}) VALUES \
                      (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-                      ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                      ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
                 ),
                 params![
                     row.principal,
@@ -1574,6 +1611,7 @@ impl AccountTx<'_> {
                     i64::from(row.started_late),
                     row.released_at,
                     row.finished_at,
+                    row.last_observed_at,
                 ],
             )
             .map(|_| ())
@@ -1611,7 +1649,7 @@ impl AccountTx<'_> {
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'started', run_id = ?3, started_at = ?4, \
-                 started_late = ?5 \
+                 started_late = ?5, last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
                  WHERE principal = ?1 AND admission_id = ?2 AND state IN ('reserved', 'expired')",
                 params![principal, admission_id, run_id, at, i64::from(late)],
             )
@@ -1806,11 +1844,7 @@ impl AccountTx<'_> {
     /// conversation's current pin. Affinity itself stays.
     pub fn end_lease(&self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
         self.conn
-            .execute(
-                "UPDATE account_affinity SET lease_valid_until = ?2 \
-                 WHERE pin_id = ?1 AND (lease_valid_until IS NULL OR lease_valid_until > ?2)",
-                params![pin_id, at],
-            )
+            .execute(END_LEASE_SQL, params![pin_id, at])
             .map(|changed| changed >= 1)
             .map_err(err)
     }

@@ -120,12 +120,26 @@ pub(super) struct BackgroundState {
     pub(super) operator_config_path: PathBuf,
 }
 
-pub(super) fn start(
+pub(super) async fn start(
     config: &ModuleConfig,
     store: &SharedStore,
     quota_cache: &SharedQuotaCache,
     catalog_health: &SharedCatalogHealth,
 ) -> Result<BackgroundState, ModuleError> {
+    // Restore both quota identities and the full credential listing before any
+    // request can run. Store reads belong on the blocking pool, not Tokio workers.
+    let restore_store = Arc::clone(store);
+    let (restored, mut credentials) = tokio::task::spawn_blocking(move || {
+        let state = account_quota::restore_account_state(restore_store.as_ref());
+        let mut credentials = BrocaCredentials::default();
+        account_quota::restore_credential_listing(restore_store.as_ref(), &mut credentials);
+        (state, credentials)
+    })
+    .await
+    .map_err(|error| ModuleError::Message(format!("restore account roster: {error}")))?;
+    credentials.connection_file_path = Some(config.connection_file_path.clone());
+    let broca_credentials = Arc::new(Mutex::new(credentials));
+    let account_state = Arc::new(Mutex::new(restored));
     // Old audit, usage and account-selection rows are deleted in small batches
     // on their own timer. Each retention pass re-reads how long every table keeps its
     // rows from the routing file's `retention` block.
@@ -146,10 +160,7 @@ pub(super) fn start(
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
     );
-    // Restore per-account views before the quota event consumer starts.
-    let account_state: account_quota::SharedAccountQuota = Arc::new(Mutex::new(
-        account_quota::restore_account_state(store.as_ref()),
-    ));
+    // The quota event consumer starts from the restored per-account views.
     loops.spawn(
         "quota events",
         quota_events::run(
@@ -159,9 +170,6 @@ pub(super) fn start(
             Arc::clone(&store),
         ),
     );
-    let broca_credentials = Arc::new(Mutex::new(BrocaCredentials::default()));
-    broca_credentials.lock().unwrap().connection_file_path =
-        Some(config.connection_file_path.clone());
     loops.spawn(
         "runner declarations",
         routing_v1::runners::refresh_loop(
@@ -170,14 +178,22 @@ pub(super) fn start(
             config_overrides::config_path(),
         ),
     );
-    // Restore credential serving methods from cached account identities before
-    // the first catalog poll; API-only providers wait for the non-secret listing.
-    account_quota::refresh_serving_methods(
-        &account_state,
-        store,
-        &broca_credentials,
-        &config_overrides::config_path(),
+    // Derive serving methods from the restored listing before the first catalog poll.
+    let (join_state, join_store, join_credentials) = (
+        Arc::clone(&account_state),
+        Arc::clone(store),
+        Arc::clone(&broca_credentials),
     );
+    tokio::task::spawn_blocking(move || {
+        account_quota::refresh_serving_methods(
+            &join_state,
+            &join_store,
+            &join_credentials,
+            &config_overrides::config_path(),
+        )
+    })
+    .await
+    .map_err(|error| ModuleError::Message(format!("restore serving methods: {error}")))?;
     if ACCOUNT_QUOTA.set(Arc::clone(&account_state)).is_ok() {
         let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
             cortexkit_claustrum_client::ClaustrumCredentialResolver::new(

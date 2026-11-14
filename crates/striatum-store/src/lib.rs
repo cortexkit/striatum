@@ -77,6 +77,8 @@ pub use fence_rechecks::{
 };
 #[cfg(test)]
 mod continuation_migration_tests;
+#[cfg(test)]
+mod last_observation_tests;
 mod reasoning_catalog;
 mod retention;
 mod routing_v1;
@@ -336,7 +338,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 87] {
+fn route_state_migrations() -> [Migration; 89] {
     [
         Migration {
             version: 1,
@@ -685,6 +687,14 @@ fn route_state_migrations() -> [Migration; 87] {
         Migration {
             version: 88,
             statements: include_str!("../migrations/088_continuation_whole_offers.sql"),
+        },
+        Migration {
+            version: 89,
+            statements: include_str!("../migrations/089_admission_last_observed.sql"),
+        },
+        Migration {
+            version: 90,
+            statements: include_str!("../migrations/090_account_affinity_by_pin.sql"),
         },
     ]
 }
@@ -1650,17 +1660,22 @@ impl SqliteRouteStateStore {
             )));
         }
         validate_family_spellings(&store)?;
+        // Changing temp_store discards existing TEMP objects, so configure it
+        // before installing the catalog write counter and its TEMP triggers.
+        store
+            .with_conn(|conn| {
+                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                conn.pragma_update(None, "synchronous", "NORMAL")?;
+                // Savepoint statement journals otherwise create and delete a
+                // temp file per account command once they spill out of memory.
+                conn.pragma_update(None, "temp_store", "MEMORY")
+            })
+            .map_err(err)?;
         // A failure here costs only the cache: every fingerprint read finds the
         // tracking missing, computes the value fresh and tries to install it again.
         if let Err(error) = store.with_conn(install_catalog_change_tracking) {
             tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
         }
-        store
-            .with_conn(|conn| {
-                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                conn.pragma_update(None, "synchronous", "NORMAL")
-            })
-            .map_err(err)?;
         // Hold each checkout until the next is configured, filling the lazy pool.
         // Move this to cortexkit-store 0.4's open_sqlite_with_init hook when upgrading,
         // so replacements after failed rollbacks get the larger cache too. A rare
@@ -4412,9 +4427,26 @@ mod tests {
                 INSERT INTO provider_reset_fences VALUES ('p/m','mason','a','cred',2000000,1000000);")?;
             Ok(())
         }).unwrap();
-        let old_admission = legacy
-            .account_transaction(|tx| tx.admission("p", "adm-1"))
-            .unwrap()
+        // Today's typed row includes columns the old schema does not have.
+        // Freeze every old column and compare its stored value after upgrade.
+        let (old_columns, old_admission) = legacy
+            .store
+            .with_conn(|conn| {
+                let mut statement = conn.prepare(
+                    "SELECT * FROM account_admission WHERE principal='p' AND admission_id='adm-1'",
+                )?;
+                let columns: Vec<String> = statement
+                    .column_names()
+                    .iter()
+                    .map(|name| format!("\"{}\"", name.replace('"', "\"\"")))
+                    .collect();
+                let values = statement.query_row([], |row| {
+                    (0..columns.len())
+                        .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })?;
+                Ok((columns, values))
+            })
             .unwrap();
         let old_fences = legacy
             .account_transaction(|tx| tx.active_fences("anthropic"))
@@ -4426,9 +4458,23 @@ mod tests {
         let restarted = SqliteRouteStateStore::open(&descriptor).unwrap();
         assert_eq!(
             restarted
-                .account_transaction(|tx| tx.admission("p", "adm-1"))
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        &format!(
+                    "SELECT {} FROM account_admission WHERE principal='p' AND admission_id='adm-1'",
+                    old_columns.join(","),
+                ),
+                        [],
+                        |row| {
+                            (0..old_columns.len())
+                                .map(|i| row.get::<_, rusqlite::types::Value>(i))
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                        },
+                    )
+                })
                 .unwrap(),
-            Some(old_admission)
+            old_admission
         );
         let blocks = restarted
             .account_transaction(|tx| tx.active_pool_fences("anthropic"))
@@ -6305,6 +6351,7 @@ mod tests {
                             && !line.starts_with("account_fence column recovery_set_json ")
                             && !line.starts_with("account_admission column input_size_class ")
                             && !line.starts_with("account_admission column model_decision_id ")
+                            && !line.starts_with("account_admission column last_observed_at ")
                             && !line.starts_with(
                                 "account_admission index account_admission_model_decision ",
                             )
