@@ -299,7 +299,11 @@ fn select_request(
             &candidate.engine.model,
             None,
         );
-        let policy_allowed = config.route_allowed(&request.consumer, &key, true);
+        let policy_allowed = if media.is_some() {
+            config.media_route_allowed(&request.consumer, &key, false)
+        } else {
+            config.route_allowed(&request.consumer, &key, true)
+        };
         if policy_allowed
             && (candidate.engine.local
                 || active_media_providers.contains(&candidate.engine.provider))
@@ -319,12 +323,9 @@ fn select_request(
                 || state.credential_refusal.is_some();
         }
         if !candidate.engine.local && candidate.engine.kind == request.kind {
-            // Media engines have no subscription alternative and no pin
-            // operation, so a pin-only rule (provider or model) would make an
-            // engine unusable rather than "pinned only". Evaluate operator rules
-            // as a pinned request does: `not_for` and consumer exclusions still
-            // refuse an engine, while pin-only rules and the LLM-only metered
-            // default do not.
+            // route.select_engine ignores every pin-only rule; media route.select
+            // enforces model pin-only rules but not chat provider spending rules.
+            // Both operations still refuse only_for and not_for exclusions.
             candidate.fenced |= !policy_allowed;
             candidate.fenced |= !accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
@@ -440,7 +441,7 @@ fn select_request(
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             // Local engines bypass the compatibility selector's reachability
             // fence, so apply policy as admission instead of a transient fence.
-            config.route_allowed(&request.consumer, &key, true)
+            config.media_route_allowed(&request.consumer, &key, false)
                 && media
                     .exclude
                     .as_ref()

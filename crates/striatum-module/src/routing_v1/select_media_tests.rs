@@ -9,6 +9,9 @@ mod ranking;
 #[path = "media_pricing_tests.rs"]
 mod pricing;
 
+#[path = "media_policy_tests.rs"]
+mod policy;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");

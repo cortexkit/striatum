@@ -3,6 +3,12 @@ use crate::config_policy::{
     consumer_matches, is_slot, resolve_consumer_policy, slot_consumer, ConsumerPolicy, EntityPolicy,
 };
 
+#[derive(Clone, Copy)]
+enum PinOnlyScope {
+    ProviderAndModel,
+    Model,
+}
+
 impl RoutingConfigFile {
     /// Materialize the temporary interfaces used by the existing selection pass.
     /// Only the entity-shaped fields are read from disk; the grouped views are
@@ -347,6 +353,21 @@ impl LiveConfig {
         self.config.route_refusal(consumer, route, pinned).is_none()
     }
 
+    /// Media engines have no subscription alternative, so chat provider pin-only
+    /// rules must not disable automatic media choice. Model pin-only rules still
+    /// bind; the built-in rule requiring metered chat routes to be pinned does not.
+    pub(crate) fn media_route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
+        self.config
+            .route_refusal_detail_with_pin_scope(
+                consumer,
+                route,
+                pinned,
+                false,
+                PinOnlyScope::Model,
+            )
+            .is_none()
+    }
+
     /// Metered billing needs an explicit pin unless the operator opts the
     /// provider or route into automatic selection. Quota-backed API plans are
     /// subscriptions; an unknown API price is not permission to spend.
@@ -463,8 +484,27 @@ impl RoutingConfigFile {
         pinned: bool,
         default_pin_only: bool,
     ) -> Option<(String, bool)> {
+        self.route_refusal_detail_with_pin_scope(
+            consumer,
+            route,
+            pinned,
+            default_pin_only,
+            PinOnlyScope::ProviderAndModel,
+        )
+    }
+
+    fn route_refusal_detail_with_pin_scope(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        default_pin_only: bool,
+        pin_only_scope: PinOnlyScope,
+    ) -> Option<(String, bool)> {
         let provider = route.split('/').next().unwrap_or(route);
         let provider_rules = self.providers.get(provider).map(|policy| &policy.rules);
+        let provider_pin_rules =
+            provider_rules.filter(|_| matches!(pin_only_scope, PinOnlyScope::ProviderAndModel));
         let provider_source = |field: &str| format!("providers.{provider}.{field}");
         let mut only_for = provider_rules
             .and_then(|rules| rules.only_for.as_ref())
@@ -472,11 +512,11 @@ impl RoutingConfigFile {
         let mut not_for = provider_rules
             .and_then(|rules| rules.not_for.as_ref())
             .map(|names| (provider_source("not_for"), names));
-        let mut pin_only = provider_rules
+        let mut pin_only = provider_pin_rules
             .and_then(|rules| rules.pin_only)
             .map(|value| (provider_source("pin_only"), value));
         let mut subscription = provider_rules.and_then(|rules| rules.subscription);
-        let mut pin_only_for = provider_rules
+        let mut pin_only_for = provider_pin_rules
             .and_then(|rules| rules.pin_only_for.as_ref())
             .map(|names| (provider_source("pin_only_for"), names));
         let mut models: Vec<_> = self
