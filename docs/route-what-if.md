@@ -142,8 +142,8 @@ by the operator route's bound scope still applies, just as it does to `route.sel
 
 ## Result
 
-The management response's `result` contains `consumer`, `results`, `anchor_version`, `snapshot_ms`
-and `elapsed_ms`, plus `head_choices` when requested (the unchanged
+The management response's `result` contains `consumer`, `results`, `anchor_version`, `snapshot_ms`,
+`elapsed_ms` and `concurrency`, plus `head_choices` when requested (the unchanged
 `route.head_choices` response shape) and `panels` when `panel` is supplied. Each
 `results` row contains:
 
@@ -191,6 +191,55 @@ A refused row has `pick: null` and `refusal: {code, detail}`; the other fields
 remain present. If selection stops before model admission (for example no
 runner is available), bar/frontier objects and candidate arrays can be empty.
 Malformed requests and unauthorized callers are top-level errors, not rows.
+
+### Account concurrency snapshot
+
+Both model sweeps and media previews include `concurrency`, independently of
+the enforcement switch:
+
+```json
+{
+  "concurrency": {
+    "enforcement_enabled": false,
+    "accounts": [{
+      "provider": "example-provider",
+      "account_id": "vault-account-id",
+      "cap_counts": [
+        {"scope": "account", "model": null, "holds_in_flight": 2, "effective_cap": 6},
+        {"scope": "account_model", "model": "special-model", "holds_in_flight": 1, "effective_cap": 2}
+      ]
+    }]
+  }
+}
+```
+
+`enforcement_enabled` is the captured `concurrency.enforcement_enabled` setting
+(default `false`). It does not yet change picks or refusals with either value,
+and no waiters are created. The report shows counts and caps, not a refusal;
+it never refuses a caller for concurrency.
+
+`accounts` is ordered by `provider`, then `account_id`. It includes known cap
+accounts, listed credential accounts and accounts retained by the in-flight
+ledger, including uncapped accounts. Each account's `cap_counts` starts with
+the shared `account` count (`model: null`), followed by its `account_model`
+counts in model-id order. Per-model counts cover models in the catalog, live
+ledger entries and model overrides whose effective scope is `account_model`.
+Models sharing the account count are not duplicated as per-model counts.
+
+`effective_cap` is a positive integer, or `null` when no cap applies to that
+count. An account whose default scope is `account_model` has an uncapped
+shared count; each model's limit is reported on its own count. A model override
+is counted apart from a shared cap even when that override lifts its limit.
+`holds_in_flight` is exactly the ledger count compared against that cap:
+started runs, unstarted reservations and live continuation-offer reservations,
+grouped and lapsed by the ledger's rules. Each row contributes to only its
+effective cap count, never both the shared and a per-model count.
+
+The report retains an immutable published account-state snapshot (including
+its in-flight ledger) and a resolved-cap snapshot before the sweep. Counts
+are evaluated at one captured routing-clock instant, not reloaded from SQL or
+recalculated from the eligibility projection. Reporting changes neither the
+published ledger nor cap policy.
 
 ## Panel dry run
 
@@ -296,6 +345,8 @@ lock, creates no lease file, reserves no probe, and never copies anything back.
 measures the whole call so the operator can check latency against the production
 database's current account-evidence volume. Separate
 calls may see different live quota, catalog or configuration refreshes.
+The concurrency report uses the separate immutable module-owned account-state
+and cap snapshots described above, not SQL reads for counts.
 
 ## Compare dormant pricing
 

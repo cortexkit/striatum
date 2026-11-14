@@ -142,6 +142,14 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         RoleDescribe::new(consumers, true),
         |describe, capability| describe.with_capability(*capability),
     );
+    if capabilities.contains(&cortexkit_role_routing::capabilities::SELECT_MEDIA) {
+        // Advertise the handler's fixed wire kinds, even before any engine is
+        // declared. Availability affects selection, not the supported protocol.
+        describe.kinds = super::engines::MEDIA_KINDS
+            .iter()
+            .map(|kind| cortexkit_role_routing::placement::Kind::parse(kind))
+            .collect();
+    }
     for &(op, group) in cortexkit_role_routing::capabilities::OP_GROUPS {
         if capabilities.contains(&group) && !describe.ops.iter().any(|name| name == op) {
             describe.ops.push(op.into());

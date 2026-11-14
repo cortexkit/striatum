@@ -605,6 +605,8 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "report_attempt_outcomes",
                                 "account_observe_success",
                                 "decision_harness",
+                                "select_kind",
+                                "select_media",
                             ][..],
                         ),
                         (
@@ -624,7 +626,28 @@ fn project_additive_shape_members(value: &mut Value) {
                         // Classifier selection (routing 0.7.4) reads these.
                         (
                             "requirement_fields",
-                            &["questions", "input_tokens", "max_cost_usd"][..],
+                            &[
+                                "questions",
+                                "input_tokens",
+                                "max_cost_usd",
+                                "language",
+                                "voice",
+                                "format",
+                                "duration_ms",
+                                "input_bytes",
+                                "input_characters",
+                                "reference_formats",
+                                "bias",
+                                "size",
+                                "resolution",
+                                "quality",
+                                "latency_class",
+                                "metric",
+                                "output_duration_ms",
+                                "aspect_ratio",
+                                "audio",
+                                "metric_limit",
+                            ][..],
                         ),
                     ] {
                         result[field]
@@ -632,6 +655,10 @@ fn project_additive_shape_members(value: &mut Value) {
                             .unwrap()
                             .retain(|entry| !added.contains(&entry.as_str().unwrap_or("")));
                     }
+                    // The historical describe predates media selection. Its
+                    // top-level kind list is checked directly against production
+                    // rather than added to this unchanged recording.
+                    result.as_object_mut().unwrap().remove("kinds");
                 }
             }
             if object.get("method").and_then(Value::as_str) == Some("route.account_status") {

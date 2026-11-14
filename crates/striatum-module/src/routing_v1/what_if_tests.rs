@@ -9,6 +9,9 @@ use subc_protocol::FrameType;
 use super::conformance_tests::{reserved, Harness, Route};
 use super::dispatch_tests::configured;
 
+#[path = "what_if_concurrency_tests.rs"]
+mod concurrency;
+
 async fn operator(harness: &std::sync::Arc<Harness>) -> Route {
     harness.bind(json!({"kind": "direct"}), None).await
 }

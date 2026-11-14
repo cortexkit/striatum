@@ -3,6 +3,7 @@ use super::*;
 mod account_decision_tests;
 mod inflight_tests;
 mod request_reads_tests;
+mod shadow_lines_tests;
 mod signed_out_tests;
 
 fn result(reply: (FrameType, Value)) -> Value {
@@ -69,6 +70,7 @@ async fn paused_with_pin(pinned: bool) -> (KitSubject, Route, Route, Value) {
 async fn paused_in_scope(pinned: bool, scope: Option<&str>) -> (KitSubject, Route, Route, Value) {
     let subject = KitSubject {
         observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
         harness: Mutex::new(Harness::new("continue")),
     };
     subject

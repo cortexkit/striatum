@@ -30,6 +30,7 @@
       "$ref": "#/$defs/CapSettings",
       "default": {
         "accounts": {},
+        "enforcement_enabled": false,
         "models": {},
         "plans": {},
         "providers": {}
@@ -289,6 +290,11 @@
             "$ref": "#/$defs/CapOverride"
           },
           "default": {}
+        },
+        "enforcement_enabled": {
+          "description": "Defaults off so operators can inspect counts before enabling enforcement.",
+          "type": "boolean",
+          "default": false
         },
         "models": {
           "type": "object",

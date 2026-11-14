@@ -5,6 +5,19 @@ use serde_json::{json, Value};
 
 const T: i64 = 1_790_683_200_000;
 
+#[test]
+fn concurrency_enforcement_switch_defaults_off_and_preserves_resolved_caps() {
+    let defaults = serde_json::to_value(CapSettings::default()).unwrap();
+    assert_eq!(defaults["enforcement_enabled"], json!(false));
+    let off = inputs("account_model", json!({"enforcement_enabled":false}));
+    let on = inputs("account_model", json!({"enforcement_enabled":true}));
+    assert_eq!(off.resolved, on.resolved);
+    assert_eq!(
+        serde_json::to_value(on.settings).unwrap()["enforcement_enabled"],
+        json!(true)
+    );
+}
+
 fn prices(scope: &str, limit: Value) -> Value {
     json!({"prices":[{"provider_id":"google","tier":"ultra","concurrency":{
         "scope":scope,"limit":limit,"review_by_ms":T+1,

@@ -208,12 +208,36 @@ pub(super) fn account_for(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    crate::account_refusal_log::record("route.account_for", &caller.principal, params, || {
-        account_for_inner(params, caller, deps)
-    })
+    let runner = account_caller(caller, deps)
+        .ok()
+        .filter(|authority| authority.session.is_none());
+    // Runner authorization takes precedence, but does not erase the route's
+    // session scope: calls in head scope commonly arrive through runner modules.
+    let head_call = caller
+        .scope_authority
+        .as_ref()
+        .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Head);
+    let call = account_selection::call_log::AccountCall::routing(
+        params,
+        caller,
+        runner.as_ref().map(|authority| authority.module),
+        head_call,
+        deps.store,
+    );
+    let reply =
+        crate::account_refusal_log::record("route.account_for", &caller.principal, params, || {
+            account_for_inner(params, caller, deps, &call)
+        });
+    call.finish();
+    reply
 }
 
-fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
+fn account_for_inner(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+    call: &account_selection::call_log::AccountCall,
+) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
     if params["mode"] == "continue" {
         if super::consumers::is_media_provider(authority.module) {
@@ -222,7 +246,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
                 "Media engine jobs don't continue an earlier admission. Admit each job with its own engine decision (mode admit).",
             ));
         }
-        return continue_account(params, caller, &authority, deps);
+        return continue_account(params, caller, &authority, deps, call);
     }
     checking("account_for_shape");
     super::refuse_unknown_members(params, FOR_MEMBERS)?;
@@ -333,7 +357,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             }
         }
 
-        let parsed = account_selection::AccountForParams::from_v1(
+        let mut parsed = account_selection::AccountForParams::from_v1(
             &request,
             authority.admission_key(&request.admission_id),
             authority.module.to_owned(),
@@ -341,6 +365,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
             params,
         )
         .map_err(op_refusal)?;
+        parsed.call = Some(call.clone());
         let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
         let policy =
             config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
@@ -502,6 +527,7 @@ fn continue_account(
     caller: &Caller,
     authority: &AccountCaller<'_>,
     deps: &Deps<'_>,
+    call: &account_selection::call_log::AccountCall,
 ) -> Result<Value, Refusal> {
     checking("continuation_parse");
     super::refuse_unknown_members(
@@ -538,7 +564,7 @@ fn continue_account(
     checking("account_context");
     let ctx = account_ctx(deps, flags, &policy).map_err(|r| account_unavailable(r.message))?;
     checking("continuation_allocation");
-    account_selection::continue_account(
+    account_selection::continue_account_with_call(
         &request,
         &authority.principal,
         authority.module,
@@ -547,6 +573,7 @@ fn continue_account(
             .as_ref()
             .and_then(|scope| scope.project_id.as_deref()),
         &ctx,
+        Some(call.clone()),
     )
 }
 

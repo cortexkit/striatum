@@ -53,6 +53,8 @@ pub(crate) struct ModelCapOverride {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct CapSettings {
+    /// Defaults off so operators can inspect counts before enabling enforcement.
+    pub(crate) enforcement_enabled: bool,
     pub(crate) providers: BTreeMap<String, CapOverride>,
     pub(crate) plans: BTreeMap<String, CapOverride>,
     pub(crate) models: BTreeMap<String, ModelCapOverride>,
@@ -124,6 +126,36 @@ pub(crate) struct ResolvedCaps {
 }
 
 impl ResolvedCaps {
+    pub(crate) fn accounts(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.providers.iter().flat_map(|(provider, caps)| {
+            caps.accounts
+                .keys()
+                .map(move |account| (provider.as_str(), account.as_str()))
+        })
+    }
+
+    pub(crate) fn default_cap(&self, provider: &str, account: &str) -> EffectiveCap {
+        self.providers
+            .get(provider)
+            .map(|caps| caps.accounts.get(account).unwrap_or(&caps.default).default)
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn model_exceptions(&self, provider: &str, account: &str) -> Vec<String> {
+        self.providers
+            .get(provider)
+            .map(|caps| {
+                caps.accounts
+                    .get(account)
+                    .unwrap_or(&caps.default)
+                    .models
+                    .keys()
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub(crate) fn cap(&self, provider: &str, account: &str, model: &str) -> EffectiveCap {
         let model = crate::account_selection::normalize(model);
         let Some(provider) = self.providers.get(provider) else {

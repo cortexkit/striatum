@@ -14,10 +14,6 @@ type AccountKey = (String, String);
 
 /// A model contributes either to the shared account count or its own count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "cap resolution will supply the count scope")
-)]
 pub(crate) enum InflightScope<'a> {
     Account,
     AccountModel(&'a str),
@@ -267,13 +263,6 @@ impl InflightLedger {
         })
     }
 
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "admission enforcement consumes resolved caps in a later change"
-        )
-    )]
     pub(crate) fn count_for_model(
         &self,
         caps: &crate::concurrency_caps::ResolvedCaps,
@@ -284,9 +273,60 @@ impl InflightLedger {
     ) -> usize {
         let model = crate::account_selection::normalize(model);
         let count = caps.cap_count(provider, account, &model);
+        self.count_for_scope(caps, provider, account, count, now)
+    }
+
+    pub(crate) fn conversation(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        model: &str,
+        principal: &str,
+        conversation: &str,
+        now: i64,
+    ) -> bool {
+        let model = crate::account_selection::normalize(model);
+        let scope = caps.cap_count(provider, account, &model);
+        self.accounts
+            .get(&(provider.to_owned(), account.to_owned()))
+            .is_some_and(|entries| {
+                entries.values().any(|entry| {
+                    now < entry.until_ms
+                        && entry.principal == principal
+                        && entry.conversation_hash == conversation
+                        && caps.cap_count(provider, account, &entry.model) == scope
+                })
+            })
+    }
+
+    pub(crate) fn count_for_scope(
+        &self,
+        caps: &crate::concurrency_caps::ResolvedCaps,
+        provider: &str,
+        account: &str,
+        scope: InflightScope<'_>,
+        now: i64,
+    ) -> usize {
         self.count_matching(provider, account, now, |entry| {
-            caps.cap_count(provider, account, &entry.model) == count
+            caps.cap_count(provider, account, &entry.model) == scope
         })
+    }
+
+    /// Include live models absent from today's catalog, so a catalog withdrawal
+    /// cannot hide a run that still consumes capacity.
+    pub(crate) fn active_models(&self, now: i64) -> BTreeMap<AccountKey, BTreeSet<String>> {
+        self.accounts
+            .iter()
+            .map(|(key, entries)| {
+                let models = entries
+                    .values()
+                    .filter(|entry| now < entry.until_ms)
+                    .map(|entry| entry.model.clone())
+                    .collect();
+                (key.clone(), models)
+            })
+            .collect()
     }
 
     fn count_matching(

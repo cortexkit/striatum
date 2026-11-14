@@ -89,6 +89,8 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
             .account_evaluation_snapshot(engines::now(deps) as i64)
             .map_err(store_refusal)?,
     );
+    let concurrency =
+        super::concurrency::Snapshot::capture(deps, &live, &store, engines::now(deps) as i64)?;
     let joined = super::super::consumers::media_routes(
         credentials
             .lock()
@@ -158,6 +160,7 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
     }
     Ok(
         json!({"consumer": request.consumer, "results":results, "snapshot_ms":snapshot_ms,
-        "anchor_version":live.scoring_anchor_version(), "elapsed_ms":started.elapsed().as_secs_f64()*1000.0}),
+        "anchor_version":live.scoring_anchor_version(), "concurrency":concurrency.report(),
+        "elapsed_ms":started.elapsed().as_secs_f64()*1000.0}),
     )
 }

@@ -78,12 +78,24 @@ fn record_signed_out(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn continue_account(
     request: &ContinueRequest,
     principal: &str,
     runner: &str,
     project: Option<&str>,
     ctx: &Ctx<'_>,
+) -> Result<Value, Refusal> {
+    continue_account_with_call(request, principal, runner, project, ctx, None)
+}
+
+pub(crate) fn continue_account_with_call(
+    request: &ContinueRequest,
+    principal: &str,
+    runner: &str,
+    project: Option<&str>,
+    ctx: &Ctx<'_>,
+    call: Option<call_log::AccountCall>,
 ) -> Result<Value, Refusal> {
     let now_ms = ctx.now_ms;
     if crate::account_state::has_expired_continuations(ctx.store, now_ms).map_err(unavailable)? {
@@ -159,6 +171,7 @@ pub(crate) fn continue_account(
             body["pool"] = json!(request.exhausted.pool);
             serde_json::from_value::<AccountForParams>(body).map(|mut params| {
                 params.admission_id_generated = true;
+                params.call = call.clone();
                 params
             })
         })

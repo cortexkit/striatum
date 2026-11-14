@@ -47,6 +47,8 @@ static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 mod continuation_tests;
 mod zero_config_tests;
 mod warm_credential_tests;
+#[path = "media_conformance.rs"]
+mod media_conformance;
 
 /// The provider id the account allocator's quota readings are filed under
 /// for the kit's subscription accounts; any id other than the routing
@@ -844,6 +846,7 @@ pub(super) fn install_head_snapshot(harness: &Harness) {
 struct KitSubject {
     harness: Mutex<Arc<Harness>>,
     observe_blocks: Mutex<bool>,
+    media: Mutex<media_conformance::Inputs>,
 }
 
 struct KitRoute {
@@ -1004,6 +1007,7 @@ async fn observe_success_fixture_arms_one_shared_quota_slot() {
     let subject = KitSubject {
         harness: Mutex::new(Harness::new("observe-fixture")),
         observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
     };
     let mut catalog = fixture::catalog();
     let account = catalog
@@ -1069,6 +1073,7 @@ impl RoutingSubject for KitSubject {
 
     async fn reset(&self) -> Result<(), String> {
         *self.harness.lock().unwrap() = Harness::new("kit");
+        *self.media.lock().unwrap() = Default::default();
         Ok(())
     }
 
@@ -1078,6 +1083,9 @@ impl RoutingSubject for KitSubject {
     ) -> Result<(), String> {
         let harness = self.harness();
         *harness.selection_profiles.lock().unwrap() = selection_facts(&harness, facts);
+        let mut media = self.media.lock().unwrap();
+        media.facts = facts.clone();
+        media.install(&harness)?;
         Ok(())
     }
 
@@ -1447,6 +1455,8 @@ impl RoutingSubject for KitSubject {
             },
             crate::now_ms(),
         );
+        drop(credentials);
+        self.media.lock().unwrap().install(&self.harness())?;
         Ok(())
     }
 
@@ -1475,6 +1485,9 @@ impl RoutingSubject for KitSubject {
                 )
             })
             .collect();
+        let mut media = self.media.lock().unwrap();
+        media.costs = facts.to_vec();
+        media.install(&self.harness())?;
         Ok(())
     }
 
@@ -1774,7 +1787,8 @@ const NOT_APPLICABLE: &[&str] = &[
 // refusal reason: scheduling priority and account concurrency limits are not
 // implemented here. The conformance kit's run_suite has no priority check yet;
 // concurrency_full is a refusal reason, not a capability. Keep both unserved.
-// select_kind and select_media remain pending until media selection is implemented.
+// Media selection stays isolated until the kit accepts valid floating-point
+// unit rates and the caller-local cost policy is approved for production.
 const PENDING_READERS: &[(&str, &[&str])] = &[
     ("select_kind", &["placement_select_kind"]),
     (
@@ -1857,6 +1871,7 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     }
     let subject = KitSubject {
         observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
         harness: Mutex::new(Harness::new("kit")),
     };
     for reason in PENDING_REFUSAL_REASONS {

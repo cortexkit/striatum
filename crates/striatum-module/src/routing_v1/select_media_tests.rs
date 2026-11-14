@@ -24,10 +24,161 @@ mod outcomes;
 #[path = "media_preview_tests.rs"]
 mod preview;
 
+#[path = "media_contract_tests.rs"]
+mod contract;
+
+#[path = "media_samples_tests.rs"]
+mod samples;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");
     value["result"].clone()
+}
+
+async fn advertised_media<T>(future: impl std::future::Future<Output = T>) -> T {
+    // Before rollout, exercise the same handler under an isolated declaration.
+    // Once served, these checks use production's groups without an override.
+    if super::super::describe::CAPABILITIES.contains(&"select_media") {
+        future.await
+    } else {
+        super::super::describe::with_candidate_capabilities(
+            &["select_kind", "select_media"],
+            future,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn production_describe_advertises_fixed_media_kinds_without_engines() {
+    advertised_media(async {
+        let h = setup(vec![]);
+        let route = h.bind(reserved("colliculus"), None).await;
+        let (frame, reply) = route.call("role.describe", &json!({})).await;
+        assert_eq!(frame, FrameType::Response, "{reply}");
+        let describe = &reply["result"];
+        let groups = describe["capabilities"].as_array().unwrap();
+        for group in ["select_kind", "select_media"] {
+            assert_eq!(groups.iter().filter(|value| **value == group).count(), 1);
+        }
+        assert_eq!(
+            describe["kinds"],
+            json!([
+                "transcribe",
+                "stream_transcribe",
+                "synthesize",
+                "realtime",
+                "image",
+                "video"
+            ])
+        );
+        assert!(!describe["kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("search")));
+        for kind in [
+            "transcribe",
+            "stream_transcribe",
+            "synthesize",
+            "realtime",
+            "image",
+            "video",
+        ] {
+            let mut params = request();
+            params["kind"] = json!(kind);
+            refuse(&route, &params, "no_route", None).await;
+        }
+        let mut params = request();
+        params["kind"] = json!("search");
+        refuse(&route, &params, "invalid_request", Some("kind")).await;
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn production_select_serves_all_six_media_kinds() {
+    advertised_media(async {
+        let kinds = [
+            "transcribe",
+            "stream_transcribe",
+            "synthesize",
+            "realtime",
+            "image",
+            "video",
+        ];
+        let engines: Vec<_> = kinds
+            .iter()
+            .map(|kind| {
+                let mut value = engine(kind, false);
+                value["kind"] = json!(kind);
+                value
+            })
+            .collect();
+        let h = setup(engines.clone());
+        let route = h.bind(reserved("colliculus"), None).await;
+        for kind in kinds {
+            declare(kind, &engines);
+            let mut params = request();
+            params["kind"] = json!(kind);
+            assert_eq!(select(&route, &params).await["engine"]["model"], kind);
+            params.as_object_mut().unwrap().remove("kind");
+            assert_eq!(select(&route, &params).await["engine"]["model"], kind);
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn production_media_request_pin_bypasses_pin_only_but_not_consumer_exclusions() {
+    advertised_media(async {
+        let h = setup(vec![engine("a-auto", false), engine("z-pinned", false)]);
+        let route = h.bind(reserved("colliculus"), None).await;
+        for rule in [
+            json!({"pin_only":true}),
+            json!({"pin_only_for":["colliculus"]}),
+        ] {
+            h.edit_config(|config| config["models"]["media-vendor/z-pinned"] = rule);
+            let mut params = request();
+            assert_eq!(select(&route, &params).await["engine"]["model"], "a-auto");
+            params["pin"] = json!("media-vendor/z-pinned");
+            assert_eq!(select(&route, &params).await["engine"]["model"], "z-pinned");
+            for restriction in [
+                json!({"not_for":["colliculus"]}),
+                json!({"only_for":["other"]}),
+            ] {
+                h.edit_config(|config| {
+                    config["models"]["media-vendor/z-pinned"] = restriction;
+                });
+                let refused = refuse(&route, &params, "pin_unavailable", None).await;
+                assert_eq!(
+                    refused["detail"],
+                    json!({"pin":"media-vendor/z-pinned","reason":"excluded"})
+                );
+            }
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn production_select_engine_keeps_accuracy_first_with_media_advertised() {
+    let h = setup(vec![
+        ranking::engine("a-graded", false),
+        ranking::engine("z-accurate", false),
+    ]);
+    ranking::catalog(
+        &h,
+        &[
+            ("a-graded", "transcription", Some(100.0), Some(1)),
+            ("z-accurate", "transcription", Some(60.0), Some(2)),
+        ],
+    );
+    ranking::measure(&h, "a-graded", 0.8);
+    ranking::measure(&h, "z-accurate", 0.9);
+    let route = h.bind(reserved("colliculus"), None).await;
+    let answer = selected(&route, &ranking::job()).await;
+    assert_eq!(answer["engine"]["model"], "z-accurate");
 }
 
 async fn refuse(route: &Route, params: &Value, code: &str, field: Option<&str>) -> Value {
