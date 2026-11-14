@@ -10,13 +10,34 @@ use crate::config_policy::{BelowBarPolicy, ConsumerPolicy};
 
 type Candidate = EngineCandidate<EvalScore, FactNumber>;
 
-pub(super) fn pick<'a>(
+pub(super) struct Ranked<'a> {
+    pub top: Option<f64>,
+    pub bar: Option<f64>,
+    pub adequate: Vec<&'a Candidate>,
+    fallback: Vec<&'a Candidate>,
+}
+
+impl<'a> Ranked<'a> {
+    pub fn pick(&self, policy: &ConsumerPolicy) -> Result<&'a Candidate, Refusal> {
+        self.adequate
+            .first()
+            .copied()
+            .or_else(|| {
+                (policy.below_bar != Some(BelowBarPolicy::Refuse))
+                    .then(|| self.fallback.first().copied())
+                    .flatten()
+            })
+            .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))
+    }
+}
+
+pub(super) fn rank<'a>(
     request: &wire::SelectEngineRequest,
     candidates: &'a [Candidate],
     grades: &BTreeMap<String, f64>,
     top_routes: &BTreeSet<String>,
     policy: &ConsumerPolicy,
-) -> Result<&'a Candidate, Refusal> {
+) -> Ranked<'a> {
     let key =
         |candidate: &Candidate| format!("{}/{}", candidate.engine.provider, candidate.engine.model);
     let grade = |candidate: &Candidate| {
@@ -73,29 +94,27 @@ pub(super) fn pick<'a>(
             })
             .then_with(|| identity(a, b))
     };
-    if let Some(bar) = bar {
-        if let Some(winner) = candidates
-            .iter()
-            .filter(|candidate| usable(candidate))
-            .filter(|candidate| grade(candidate).is_some_and(|grade| grade >= bar))
-            .min_by(|a, b| {
-                cost(a.cost, b.cost)
-                    .then_with(|| grade(b).cmp(&grade(a)))
-                    .then_with(|| b.accuracy.cmp(&a.accuracy))
-                    .then_with(|| identity(a, b))
-            })
-        {
-            return Ok(winner);
-        }
-        if policy.below_bar == Some(BelowBarPolicy::Refuse) {
-            return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
-        }
-    }
-    candidates
+    let mut fallback: Vec<_> = candidates
         .iter()
         .filter(|candidate| usable(candidate))
-        .min_by(no_level)
-        .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))
+        .collect();
+    fallback.sort_by(no_level);
+    let mut adequate = fallback.clone();
+    if let Some(bar) = bar {
+        adequate.retain(|candidate| grade(candidate).is_some_and(|grade| grade >= bar));
+        adequate.sort_by(|a, b| {
+            cost(a.cost, b.cost)
+                .then_with(|| grade(b).cmp(&grade(a)))
+                .then_with(|| b.accuracy.cmp(&a.accuracy))
+                .then_with(|| identity(a, b))
+        });
+    }
+    Ranked {
+        top: top.map(|n| n.0),
+        bar: bar.map(|n| n.0),
+        adequate,
+        fallback,
+    }
 }
 
 fn cost(a: Option<FactNumber>, b: Option<FactNumber>) -> Ordering {
