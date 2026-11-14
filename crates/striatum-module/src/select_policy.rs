@@ -268,6 +268,7 @@ pub(crate) fn select_in_order(
     let mut rejected = Vec::new();
     let mut last = None;
     let mut concurrency_error = None;
+    let mut concurrency_reset: Option<(f64, Option<String>)> = None;
     let mut earliest_reset: Option<(f64, Option<String>)> = None;
     for pin in policy.ladder.iter().flatten() {
         let (key, variant) = if policy.operator_ladder() {
@@ -296,8 +297,12 @@ pub(crate) fn select_in_order(
                 return Ok(selected);
             }
             Err(error) => {
-                if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull
-                {
+                if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull {
+                    if let Some(reset) = error.earliest_reset {
+                        if concurrency_reset.as_ref().is_none_or(|(previous, _)| reset < *previous) {
+                            concurrency_reset = Some((reset, error.earliest_reset_route.clone()));
+                        }
+                    }
                     concurrency_error = Some(error.clone());
                 }
                 if let Some(reset) = error.earliest_reset {
@@ -326,6 +331,9 @@ pub(crate) fn select_in_order(
         .or(last)
         .unwrap_or_else(|| attempt(&std::collections::HashSet::new(), None, None).unwrap_err());
     error.rejected = rejected;
+    if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull {
+        earliest_reset = concurrency_reset;
+    }
     if let Some((reset, route)) = earliest_reset {
         error.earliest_reset = Some(reset);
         error.earliest_reset_route = route;

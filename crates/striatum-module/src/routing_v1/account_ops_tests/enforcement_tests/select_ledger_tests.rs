@@ -50,6 +50,9 @@ async fn select_ledger_full_surfaces_reset_audit_logs_and_heads() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
     caps(&harness, 1, true);
+    harness.edit_config(|config| {
+        config["head_agents"] = json!(["mason"]);
+    });
     let runner = harness.bind(reserved("class-runner"), None).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
     fill(&runner, A, "a", 1).await;
@@ -59,6 +62,8 @@ async fn select_ledger_full_surfaces_reset_audit_logs_and_heads() {
             let mut body = select_body(legacy);
             if pin {
                 body[if legacy { "modelPin" } else { "pin" }] = json!("synthetic/model:xhigh");
+            } else if !legacy {
+                body["prefer"] = json!(["synthetic/model"]);
             }
             pressure();
             let before = decisions(&harness);
@@ -105,6 +110,9 @@ async fn select_ledger_ignores_affinity_but_excludes_full_with_blocked_sibling()
             FrameType::Response
         );
     }
+    let mut kept = fresh("kept");
+    kept["conversation_key"] = json!("a-0");
+    assert_concurrency_full(&runner.call("route.account_for", &kept).await, NOW + 30_000);
     block(&harness, B, (NOW + 100_000) as i64);
     for legacy in [false, true] {
         refused(
@@ -234,6 +242,29 @@ async fn select_ledger_skips_full_prefer_before_caller_slots_without_widening_qu
     let credentials = harness.credentials().lock().unwrap().clone();
     harness.install_facts(&facts);
     harness.set_credentials(credentials);
+    refused(
+        &consumer.call("route.select", &select_body(false)).await,
+        false,
+        NOW + 30_000,
+    );
+    // A ladder's blocked entry is not one of the cap counts that caused the
+    // concurrency refusal, so its earlier cooldown cannot shorten the wait.
+    harness
+        .store()
+        .update_route_state(
+            "synthetic/other",
+            "synthetic/other",
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 12_000) as f64),
+                observed_at_ms: Some(NOW as i64),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    harness.edit_config(|config| {
+        config["consumers"]["mason"]["mode"] = json!("ladder");
+        config["consumers"]["mason"]["ladder"] = json!(["synthetic/model", "synthetic/other"]);
+    });
     refused(
         &consumer.call("route.select", &select_body(false)).await,
         false,
