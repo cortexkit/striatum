@@ -60,6 +60,7 @@ const FOR_MEMBERS: &[&str] = &[
     "hold_ok",
     "request_input_tokens",
     "service_tier",
+    "head_turn",
 ];
 
 const OBSERVE_MEMBERS: &[&str] = &[
@@ -213,15 +214,26 @@ pub(super) fn account_for(
         .filter(|authority| authority.session.is_none());
     // Runner authorization takes precedence, but does not erase the route's
     // session scope: calls in head scope commonly arrive through runner modules.
-    let head_call = caller
+    let scope_head = caller
         .scope_authority
         .as_ref()
         .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Head);
+    let head_call_source = if scope_head {
+        Some("scope")
+    } else if caller.binding_is_current() {
+        account_selection::call_log::AccountCall::head_turn_source(
+            params,
+            &caller.principal,
+            &super::operator_config(deps),
+        )
+    } else {
+        None
+    };
     let call = account_selection::call_log::AccountCall::routing(
         params,
         caller,
         runner.as_ref().map(|authority| authority.module),
-        head_call,
+        head_call_source,
         deps.store,
     );
     let reply =
@@ -540,6 +552,7 @@ fn continue_account(
             "previous_decision_id",
             "exhausted",
             "selection_id",
+            "head_turn",
         ],
     )?;
     super::shapes::closed(

@@ -605,6 +605,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "runner_harness_facts",
                                 "report_attempt_outcomes",
                                 "account_observe_success",
+                                "account_head_turn",
                                 "decision_harness",
                                 "select_kind",
                                 "select_media",
