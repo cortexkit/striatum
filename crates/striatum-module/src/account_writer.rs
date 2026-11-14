@@ -267,14 +267,25 @@ pub(crate) fn prune_account_admissions(
     })
 }
 
-pub(crate) fn prune_account_affinities(
+pub(crate) fn prune_account_pins(
     store: &SqliteRouteStateStore,
     before: i64,
     limit: usize,
+) -> RouteStateResult<usize> {
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.prune_account_pins(before, limit)
+    })
+}
+
+pub(crate) fn prune_account_affinities(
+    store: &SqliteRouteStateStore,
+    keys: Vec<AffinityRetentionKey>,
+    before: i64,
+    lease_before: i64,
 ) -> RouteStateResult<AffinityRetentionBatch> {
     // Pruning is a writer command so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_affinities(before, limit)
+        tx.prune_account_affinities(&keys, before, lease_before)
     })
 }
 
