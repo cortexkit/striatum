@@ -242,9 +242,12 @@ impl AccountTx<'_> {
                     .map_err(err)?;
                 self.heal_report_probe(decision, None, &model, at, &self.fence_rechecks()?, now)?;
                 // Only the first report may heal older matching serving evidence
-                // without authorization. If this decision held a probe proof,
-                // only the exact generation and launch-time checks above may
-                // settle it; ordinary recovery must not bypass those checks.
+                // without a probe authorization. If this decision held one (a
+                // `fence_probe_authorization` row it owns), only
+                // `heal_report_probe` above may settle it: that requires the
+                // authorization's exact evidence and claim generation, claimed
+                // no later than the decision's creation. Ordinary serving
+                // recovery must not bypass those checks.
                 if authorized || !first {
                     return Ok(());
                 }
