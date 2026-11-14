@@ -5741,12 +5741,13 @@ async fn s4b_what_if_fresh_headroom_repairs_only_its_snapshot() {
         "fresh headroom must actually recover the preview's account: {}",
         answer.1
     );
-    // These three acquisitions are catalogue-change key reads on the writer
-    // connection, not read-first repair acquisitions. Moving facts reads off
-    // the writer should bring the acquisition count to zero.
+    // These two acquisitions are catalogue-change key reads on the writer
+    // connection, not read-first repair acquisitions; the route-state
+    // snapshot is built from the account state and takes none. Moving facts
+    // reads off the writer should bring the acquisition count to zero.
     assert_eq!(
         harness.store().writer_acquisition_count_for_test() - acquisitions,
-        3
+        2
     );
     assert_eq!(harness.store().writer_commit_count_for_test(), commits);
     assert_eq!(s4b_repair_rows(&harness), rows);

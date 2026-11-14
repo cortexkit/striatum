@@ -648,8 +648,8 @@ pub(super) fn prepare_selection_inputs(
     let (catalog_snapshot, facts) = store
         .get_facts_with_observed_speed_and_generation(now, pricing)
         .map_err(|e| format!("reading facts from route-state store: {e}"))?;
-    let mut snapshot = store
-        .build_snapshot(now)
+    let mut snapshot = crate::account_state::published(store)
+        .and_then(|blocks| blocks.route_state_snapshot(now))
         .map_err(|e| format!("building route-state snapshot: {e}"))?;
     // Retain cached windows through a transient quota outage: dropping
     // last-known pressure the moment one refresh fails would make every blip

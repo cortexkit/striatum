@@ -3700,10 +3700,27 @@ async fn handle_cooldown_status(
                 .await;
             }
         };
+    // The provider row and the route-state snapshot both come from one
+    // published account state, which holds every route and provider row.
+    let blocks = match account_state::published(store) {
+        Ok(blocks) => blocks,
+        Err(error) => {
+            return send_route_error(
+                writer,
+                ver,
+                channel,
+                epoch,
+                corr,
+                "store_error",
+                &format!("cooldown_status: {error}"),
+            )
+            .await;
+        }
+    };
     let provider_state = if let Some(provider_key) =
         derive_provider_key(&params.route_key).or_else(|| derive_provider_key(&params.capacity_key))
     {
-        match store.get_provider_cooldown(provider_key) {
+        match blocks.provider_cooldown(provider_key) {
             Ok(state) => state,
             Err(error) => {
                 return send_route_error(
@@ -3721,7 +3738,7 @@ async fn handle_cooldown_status(
     } else {
         None
     };
-    let snapshot = match store.build_snapshot(params.now as f64) {
+    let snapshot = match blocks.route_state_snapshot(params.now as f64) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             return send_route_error(
@@ -3736,31 +3753,13 @@ async fn handle_cooldown_status(
             .await;
         }
     };
-    let provider_cooled = provider_state.as_ref().is_some_and(|state| {
-        state
-            .cooldown_until
-            .is_some_and(|until| until > params.now as f64)
-            || state
-                .quota_exhausted_until
-                .is_some_and(|until| until > params.now as f64)
-    });
-    let cooled = provider_cooled
-        || snapshot
-            .by_route
-            .get(&params.route_key)
-            .into_iter()
-            .chain(snapshot.by_capacity.get(&params.capacity_key))
-            .any(|state| {
-                state
-                    .cooldown_until
-                    .is_some_and(|until| until > params.now as f64)
-                    || state
-                        .quota_exhausted_until
-                        .is_some_and(|until| until > params.now as f64)
-                    || state
-                        .failure_backoff_until
-                        .is_some_and(|until| until > params.now as f64)
-            });
+    let cooled = striatum_core::route_state_store::route_cooled(
+        provider_state.as_ref(),
+        &snapshot,
+        &params.route_key,
+        &params.capacity_key,
+        params.now as f64,
+    );
     let body =
         serde_json::to_vec(&json!({"result": {"cooled": cooled}})).map_err(ModuleError::Json)?;
     let response = Frame::build_with_version(
