@@ -2200,7 +2200,29 @@ async fn handle_select_request_attempt(
             None
         };
 
+    let admission_pin = params
+        .pin
+        .as_ref()
+        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
+    let ledger_pin = params
+        .model_pin
+        .as_deref()
+        .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
+        .filter(|_| params.pin_fallback == select_policy::PinFallback::None)
+        .map(|pin| crate::select_concurrency::pin_capacity(pin, &facts));
+    let ledger = crate::select_concurrency::capture(
+        store.as_ref(),
+        classes.as_ref(),
+        &facts,
+        priced_per_token,
+        now as i64,
+        |fact| crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref()),
+    )
+    .map_err(|error| ModuleError::Message(error.to_string()))?;
+    let head_request = crate::select_concurrency::head(&operator_config, &target_agent);
+    let enforce_concurrency = live_config.concurrency_caps().enforcement_enabled;
     let pass = select_policy::SelectionPass {
+        concurrency: enforce_concurrency.then_some(&ledger),
         consumer: consumer_id,
         target_agent: &target_agent,
         requirements,
@@ -2222,10 +2244,6 @@ async fn handle_select_request_attempt(
         operator_config: &operator_config,
     };
 
-    let admission_pin = params
-        .pin
-        .as_ref()
-        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
     let mut pin_rejected = None;
     if let Some(pin) = params
         .model_pin
@@ -2352,6 +2370,30 @@ async fn handle_select_request_attempt(
                 select_policy::OrderFailure::Score(_) => unreachable!("a request pin is terminal"),
             })
         };
+        if let Ok(selected) = &selection {
+            if ledger.accounts(&selected.route_key).is_some() {
+                let no_route = ledger.refusal(&[selected.route_key.clone()]);
+                crate::select_concurrency::record(
+                    "route.select",
+                    &target_agent,
+                    &operator_config,
+                    &no_route,
+                );
+                if enforce_concurrency && !head_request {
+                    let decision = decision_input_for(
+                        &target_agent,
+                        &requirements,
+                        None,
+                        Some(&no_route),
+                        &params,
+                        Some(&provenance),
+                        Some(&policy_sources_line(&operator_policy)),
+                    );
+                    record_failed_selection_decision(store.as_ref(), &decision);
+                    return send_no_route(writer, ver, channel, epoch, corr, &no_route, None).await;
+                }
+            }
+        }
         let selection = selection.map(|mut selected| {
             let explicit = admission_pin.as_ref().map_or_else(
                 || work_model_pin::named_variant(pin, &facts),
@@ -2688,38 +2730,69 @@ async fn handle_select_request_attempt(
             .and_then(|project| operator_config.project_pin(project, consumer_id))
             .map(str::to_owned)
     });
-    let attempt = |snap: ModelRouteStateSnapshot| -> Result<(SelectedModelRoute, Option<String>), NoRouteError> {
-        let pass = select_policy::SelectionPass {
-            snapshot: &snap,
-            ..pass
-        };
-        pass.select(&available, None, project_pin.as_deref(), None, |pin| {
-            let allowed = available
-                .iter()
-                .filter(|key| operator_config.route_allowed(consumer_id, key, true))
-                .cloned()
-                .collect();
-            work_model_pin::select_with_availability(
-                pin,
-                pass.input(&allowed, snap.clone()),
-                &routing_config,
-                concurrency_slots.as_ref(),
-                config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                &catalog_targets,
-                &mapped_availability.rejected,
-            )
-            .map_err(|refusal| {
-                let mut error = pass.score(&HashSet::new()).unwrap_err();
-                error.message = refusal.message;
-                error
+    let attempt_with_concurrency =
+        |snap: ModelRouteStateSnapshot,
+         concurrency|
+         -> Result<(SelectedModelRoute, Option<String>), NoRouteError> {
+            let pass = select_policy::SelectionPass {
+                snapshot: &snap,
+                concurrency,
+                ..pass
+            };
+            pass.select(&available, None, project_pin.as_deref(), None, |pin| {
+                let allowed = available
+                    .iter()
+                    .filter(|key| operator_config.route_allowed(consumer_id, key, true))
+                    .cloned()
+                    .collect();
+                let selected = work_model_pin::select_with_availability(
+                    pin,
+                    pass.input(&allowed, snap.clone()),
+                    &routing_config,
+                    concurrency_slots.as_ref(),
+                    config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
+                    &catalog_targets,
+                    &mapped_availability.rejected,
+                )
+                .map_err(|refusal| {
+                    let mut error = pass.score(&HashSet::new()).unwrap_err();
+                    error.message = refusal.message;
+                    error
+                })?;
+                if let Some(ledger) = concurrency {
+                    if ledger.accounts(&selected.route_key).is_some() {
+                        return Err(ledger.refusal(&[selected.route_key.clone()]));
+                    }
+                }
+                Ok(selected)
             })
-        })
-        .map(|(selected, _, variant)| (selected, variant))
-        .map_err(|error| match error {
-            select_policy::OrderFailure::Pin(error) | select_policy::OrderFailure::Score(error) => {
-                error
+            .map(|(selected, _, variant)| (selected, variant))
+            .map_err(|error| match error {
+                select_policy::OrderFailure::Pin(error)
+                | select_policy::OrderFailure::Score(error) => error,
+            })
+        };
+    let attempt = |snap: ModelRouteStateSnapshot| {
+        if !enforce_concurrency {
+            if ledger.full_routes.is_empty() {
+                return attempt_with_concurrency(snap, None);
             }
-        })
+            if let Err(error) = attempt_with_concurrency(snap.clone(), Some(&ledger)) {
+                crate::select_concurrency::record(
+                    "route.select",
+                    &target_agent,
+                    &operator_config,
+                    &error,
+                );
+            }
+            return attempt_with_concurrency(snap, None);
+        }
+        match attempt_with_concurrency(snap.clone(), Some(&ledger)) {
+            Err(error) if head_request && error.reason == RouteFailureReason::ConcurrencyFull => {
+                attempt_with_concurrency(snap, None)
+            }
+            result => result,
+        }
     };
 
     // First attempt against the live snapshot.
@@ -3071,10 +3144,22 @@ async fn handle_select_request_attempt(
             }
         }
         Err(mut no_route) => {
+            crate::select_concurrency::record(
+                "route.select",
+                &target_agent,
+                &operator_config,
+                &no_route,
+            );
             if let Some(until) = *lost_probe_until {
                 return send_route_error_body(
-                    writer, ver, channel, epoch, corr, lost_probe_wait(until),
-                ).await;
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    lost_probe_wait(until),
+                )
+                .await;
             }
             // Head-specific exclusions and non-relaxable billing walls explain the
             // same no-route result. Keep them on one message path so callers receive

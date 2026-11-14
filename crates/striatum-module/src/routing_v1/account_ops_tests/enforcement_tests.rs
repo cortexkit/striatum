@@ -14,6 +14,7 @@ use crate::account_state::InflightScope;
 
 mod head_turn_tests;
 mod priority_tests;
+mod select_ledger_tests;
 
 const A: &str = "oauth-account";
 const B: &str = "apikey-account";

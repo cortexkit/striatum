@@ -299,9 +299,9 @@ async fn a_waiter_holds_back_one_slot_in_total_whatever_it_waits_on() {
     let t = NOW + 40_000;
     let clock = crate::InjectedClock::set(NOW);
     let (harness, runner, owner) = enforced().await;
+    let x = bound(&owner, "urgent", fresh("x")).await;
     running(&runner, A, "ha").await;
     running(&runner, B, "hb").await;
-    let x = bound(&owner, "urgent", fresh("x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, t - 10_000);
     assert_eq!(
         waiters(&harness, NOW),
@@ -328,10 +328,10 @@ async fn the_waiters_ahead_are_counted_together_not_first_fit() {
     for x_first in [true, false] {
         let clock = crate::InjectedClock::set(NOW);
         let (harness, runner, owner) = enforced().await;
-        running(&runner, A, "ha").await;
-        running(&runner, B, "hb").await;
         let x = bound(&owner, "urgent", fresh("x")).await;
         let w = bound(&owner, "urgent", on(A, "w")).await;
+        running(&runner, A, "ha").await;
+        running(&runner, B, "hb").await;
         let bodies = if x_first { [x, w] } else { [w, x] };
         for body in bodies {
             assert_concurrency_full(&runner.call("route.account_for", &body).await, t - 10_000);
@@ -356,12 +356,17 @@ async fn the_waiters_ahead_are_counted_together_not_first_fit() {
     for w_waits in [true, false] {
         let clock = crate::InjectedClock::set(NOW);
         let (_harness, runner, owner) = enforced().await;
+        let x = bound(&owner, "urgent", fresh("x")).await;
+        let w = if w_waits {
+            Some(bound(&owner, "urgent", on(B, "w")).await)
+        } else {
+            None
+        };
         running(&runner, A, "ha").await;
         running(&runner, B, "hb").await;
-        let x = bound(&owner, "urgent", fresh("x")).await;
         assert_concurrency_full(&runner.call("route.account_for", &x).await, t - 10_000);
         if w_waits {
-            let w = bound(&owner, "urgent", on(B, "w")).await;
+            let w = w.unwrap();
             assert_concurrency_full(&runner.call("route.account_for", &w).await, t - 10_000);
         }
         finish(&runner, "ha").await;
