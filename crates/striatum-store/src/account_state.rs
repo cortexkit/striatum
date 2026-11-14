@@ -196,6 +196,14 @@ impl crate::SqliteRouteStateStore {
             .wait()
     }
 
+    /// Reload and republish the module's state now, as the next writer batch
+    /// would after another connection's commit. For tests that write the
+    /// store through their own connection, as another process would.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn reload_account_state_for_test(&self) -> RouteStateResult<()> {
+        self.reload_account_state_after_direct_write()
+    }
+
     /// Before a test reads the published state, reload it if a test seed
     /// wrote a block table outside an account command since the last batch.
     /// Production waits for the next batch instead, so a reader never blocks
