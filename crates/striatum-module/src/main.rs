@@ -43,6 +43,8 @@ mod model_resolution;
 mod panel_policy;
 mod project_settings;
 mod quota_bus;
+#[cfg(test)]
+mod test_daemon;
 mod quota_consumer;
 mod quota_events;
 mod retention;

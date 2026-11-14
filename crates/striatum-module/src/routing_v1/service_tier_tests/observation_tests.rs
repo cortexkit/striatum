@@ -37,7 +37,7 @@ impl DescribePeer {
         let daemon = [0_u8; 16];
         std::fs::write(&path, serde_json::to_vec(&json!({
             "schema":1,"endpoints":[{"host":"127.0.0.1","port":listener.local_addr().unwrap().port()}],
-            "key":key.to_vec(),"daemon_id":daemon.to_vec(),"pid":std::process::id(),"daemon_ver":"test"
+            "key":key.to_vec(),"daemon_id":daemon.to_vec(),"pid":std::process::id(),"daemon_ver":"0.40.0"
         })).unwrap()).unwrap();
         #[cfg(unix)]
         {
@@ -51,10 +51,10 @@ impl DescribePeer {
                 return;
             }
             let (mut stream, _) = listener.accept().await.unwrap();
-            authenticate_server(&mut stream, &key, &daemon, "test", Duration::from_secs(5))
+            authenticate_server(&mut stream, &key, &daemon, "0.40.0", Duration::from_secs(5))
                 .await
                 .unwrap();
-            let open = read_frame(&mut stream).await.unwrap().unwrap();
+            let open = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
             let body: Value = serde_json::from_slice(&open.body).unwrap();
             assert_eq!(body["op"], "route.open");
             let target = match &reply {
@@ -190,10 +190,10 @@ async fn parallel_economics_peer(
         let plans_queried = plans_queried.clone();
         let prices = prices.clone();
         tasks.spawn(async move {
-            authenticate_server(&mut stream, &key, &daemon, "test", Duration::from_secs(5))
+            authenticate_server(&mut stream, &key, &daemon, "0.40.0", Duration::from_secs(5))
                 .await
                 .unwrap();
-            let open = read_frame(&mut stream).await.unwrap().unwrap();
+            let open = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
             let body: Value = serde_json::from_slice(&open.body).unwrap();
             assert_eq!(body["op"], "route.open");
             respond(
