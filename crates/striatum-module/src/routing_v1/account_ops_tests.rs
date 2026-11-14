@@ -8,6 +8,7 @@ use subc_protocol::FrameType;
 use super::account_classes_tests::setup;
 use super::conformance_tests::{reserved, Harness, Route};
 
+mod enforcement_tests;
 mod shadow_lines_tests;
 
 const NOW: u64 = 1_800_000_000_000;
@@ -151,7 +152,7 @@ async fn session_authority_requires_a_current_head_scope_and_verified_host_capab
 }
 
 #[tokio::test]
-async fn session_ids_and_affinity_are_scoped_by_owner_and_ref_and_parent_use_is_shared_only_within_owner(
+pub(super) async fn session_ids_and_affinity_are_scoped_by_owner_and_ref_and_parent_use_is_shared_only_within_owner(
 ) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);

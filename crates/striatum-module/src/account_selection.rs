@@ -5171,6 +5171,7 @@ mod continuation;
 pub(crate) use continuation::continue_account;
 pub(crate) use continuation::continue_account_with_call;
 pub(crate) mod call_log;
+mod concurrency_gate;
 
 fn account_for(
     params: &Value,
@@ -6792,10 +6793,14 @@ fn serve(
     let request = params.request(principal, affinity_row.is_none());
     let mut reserved_probe = false;
     let mut lost_probe_fences = BTreeMap::new();
+    let mut gate = concurrency_gate::Gate::new(ctx, params);
     let decision = loop {
         let mut decision =
             striatum_core::accounts::decide_with_context(&request, &state, now, &inputs);
         let Outcome::Admit(admission) = &decision.outcome else {
+            if gate.exhausted(&mut state) {
+                continue;
+            }
             break decision;
         };
         let credential = admission.credential_id.clone();
@@ -6838,7 +6843,12 @@ fn serve(
             .cloned()
             .collect();
         if applicable.is_empty() {
-            break decision;
+            match gate.check(
+                tx, ctx, params, principal, &hash, provider, admission, &mut state,
+            ) {
+                concurrency_gate::Check::Next => continue,
+                concurrency_gate::Check::Room | concurrency_gate::Check::Full => break decision,
+            }
         }
         let owns_probe = |origin: &striatum_store::FenceRecheck| {
             params.model_decision_id.is_some() && origin.claim_owner == params.model_decision_id
@@ -6886,6 +6896,15 @@ fn serve(
                 account_id: affinity.account_id.clone(),
             };
             break decision;
+        }
+        // Before the probe claim: a full account consumes no probe. After the
+        // short hold above, which is the allocator's own answer and comes first.
+        match gate.check(
+            tx, ctx, params, principal, &hash, provider, admission, &mut state,
+        ) {
+            concurrency_gate::Check::Room => {}
+            concurrency_gate::Check::Next => continue,
+            concurrency_gate::Check::Full => break decision,
         }
         let claim = || {
             let ready = applicable.iter().all(|origin| {
@@ -6976,6 +6995,9 @@ fn serve(
             }
         }
     };
+    if gate.refused() {
+        return gate.refuse(tx, ctx, params, principal, provider, &decision, roster);
+    }
     // An account the class context left out because another selection holds
     // its probe reserved is a lost race as well.
     if !matches!(decision.outcome, Outcome::Admit(_)) {
@@ -7035,7 +7057,7 @@ fn serve(
             }
         }
     }
-    if let Some(call) = &params.call {
+    if let Some(call) = params.call.as_ref().filter(|_| !gate.enforced()) {
         call.evaluate(
             tx, ctx, params, principal, &hash, &decision, &state, &inputs,
         );

@@ -140,6 +140,17 @@ fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
 }
 
 #[test]
+fn one_shot_output_modes_add_no_stderr_logging() {
+    let home = Home::new();
+    for mode in ["--print-manifest", "--print-config-schema"] {
+        let output = home.run_with_args(true, &[mode]);
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert!(!output.stdout.is_empty(), "{mode} must still print its output");
+    }
+}
+
+#[test]
 fn check_config_binary_prints_five_anonymous_count_lines_offline() {
     let home = Home::new();
     let primary = home.config_dir(true).join("striatum.jsonc");

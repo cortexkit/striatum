@@ -55,7 +55,7 @@ async fn account_shadow_continue_counts_full_replacements_once_but_not_head_or_r
         if !head {
             assert_eq!(
                 events[0],
-                json!({"surface":"routing/v1","consumer":fixture::SUMMARY,
+                json!({"surface":"routing/v1","consumer":fixture::SUMMARY,"class":"worker",
                 "model":"model-c","accounts":replacements.iter().map(|account|
                     json!({"account_id":account,"count":1,"cap":1})).collect::<Vec<_>>()})
             );

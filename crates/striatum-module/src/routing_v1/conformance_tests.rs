@@ -340,8 +340,14 @@ impl Harness {
         drop(route_epochs);
         drop(writer);
         let reply = replies.recv().await.expect("every request gets a reply");
-        assert_no_pending_refusal(&reply);
+        assert_no_pending_refusal(&reply, || self.enforced());
         reply
+    }
+
+    fn enforced(&self) -> bool {
+        self.operator_config()
+            .concurrency_caps()
+            .enforcement_enabled
     }
 
     /// Run a pre-rebind request frame through the production handler after a
@@ -366,7 +372,7 @@ impl Harness {
         .await
         .unwrap();
         let reply = replies.recv().await.unwrap();
-        assert_no_pending_refusal(&reply);
+        assert_no_pending_refusal(&reply, || self.enforced());
         (
             reply.header.ty,
             serde_json::from_slice(&reply.body).unwrap(),
@@ -1783,41 +1789,13 @@ const NOT_APPLICABLE: &[&str] = &[
     "unrequested_harness_uses_declaration",
 ];
 
-// The concurrency campaign owns consumer_priority and the concurrency_full
-// refusal reason: scheduling priority and account concurrency limits are not
-// implemented here. The conformance kit's run_suite has no priority check yet;
-// concurrency_full is a refusal reason, not a capability. Keep both unserved.
-// Media selection stays isolated until the kit accepts valid floating-point
-// unit rates and the caller-local cost policy is approved for production.
-const PENDING_READERS: &[(&str, &[&str])] = &[
-    ("select_kind", &["placement_select_kind"]),
-    (
-        "select_media",
-        &[
-            "select_media_input_characters",
-            "select_media_privacy",
-            "select_media_requirements",
-            "select_media_video",
-            "select_media_ranking",
-            "select_media_ladder",
-            "select_media_llm_refuses_media",
-            "select_media_refuses_llm",
-            "select_media_metric_limit",
-            "select_media_unlisted_kind",
-            "select_media_answer",
-            "select_media_pin",
-            "select_media_price",
-            "select_media_demand",
-            "select_media_ungraded_level",
-            "select_media_policy",
-            "select_media_report_admission",
-        ],
-    ),
-    ("consumer_priority", &[]),
-];
-const PENDING_REFUSAL_REASONS: &[&str] = &["concurrency_full"];
+// Consumer priority is read for classification. concurrency_full is a refusal
+// reason, not a capability: `route.account_for` serves it only with
+// concurrency enforcement on, and `select` does not serve it yet.
+const PENDING_READERS: &[(&str, &[&str])] = &[];
+const PENDING_REFUSAL_REASONS: &[&str] = &[];
 
-fn assert_no_pending_refusal(reply: &Frame) {
+fn assert_no_pending_refusal(reply: &Frame, enforced: impl FnOnce() -> bool) {
     if reply.header.ty == FrameType::Error {
         let body: Value = serde_json::from_slice(&reply.body).unwrap();
         if body["code"] == "no_route" {
@@ -1825,6 +1803,12 @@ fn assert_no_pending_refusal(reply: &Frame) {
             assert!(
                 !PENDING_REFUSAL_REASONS.contains(&reason),
                 "served refusal {reason} still marked pending: {body}"
+            );
+            // Enforcement defaults off, and off it must answer as before:
+            // no request, kit case or burst over a cap is refused for it.
+            assert!(
+                reason != "concurrency_full" || enforced(),
+                "concurrency_full served with enforcement off: {body}"
             );
         }
     }
@@ -1962,7 +1946,7 @@ async fn candidate_capabilities_reach_readers_without_leaking_to_production_call
                 &select,
                 &super::describe::capabilities()
             )
-            .is_err()
+            .is_ok()
         );
         assert!(
             cortexkit_role_routing::report::parse_report_request_serving(

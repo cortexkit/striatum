@@ -1081,6 +1081,15 @@ pub(super) async fn handle_select_request(
 ) -> Result<(), ModuleError> {
     let mut lost_probe_until: Option<i64> = None;
     let mut lost_probe_routes = HashSet::new();
+    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
+        if body["method"] == ROUTE_SELECT_OP {
+            routing_v1::consumers::record_select(
+                "route.select",
+                body["params"]["targetAgent"].as_str(),
+                &config_overrides::live_config(operator_config_path),
+            );
+        }
+    }
     loop {
         let mut probe_lost = false;
         handle_select_request_attempt(
