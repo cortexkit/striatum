@@ -143,7 +143,8 @@ async fn account_for_refusal_preserves_allocator_reset_without_is_wait() {
 }
 
 fn verify(samples: BTreeMap<String, Vec<u8>>) {
-    let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/concurrency-full-v1");
+    let directory =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/route-concurrency-full-v1");
     let update = std::env::var_os("UPDATE_CONCURRENCY_FULL_SAMPLES").is_some();
     let mut expected: BTreeSet<_> = samples.keys().cloned().collect();
     expected.extend(["README.md".into(), "SHA256SUMS".into()]);

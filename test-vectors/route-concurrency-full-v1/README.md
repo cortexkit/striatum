@@ -44,5 +44,5 @@ check the refusal semantics independently of the recorded files.
 order, excluding the manifest itself. Independently verify from the worktree root:
 
 ```sh
-(cd crates/striatum-module/fixtures/concurrency-full-v1 && shasum -a 256 -c SHA256SUMS)
+(cd test-vectors/route-concurrency-full-v1 && shasum -a 256 -c SHA256SUMS)
 ```
