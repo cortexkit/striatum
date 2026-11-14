@@ -427,6 +427,27 @@ impl Route {
         .await
     }
 
+    /// Run `route.account_for` through the v1 handler on this thread, without
+    /// the frame loop, so a test hook inside it can run a competing request.
+    pub(super) fn account_for_direct(
+        &self,
+        params: &Value,
+    ) -> Result<Value, cortexkit_role_routing::errors::Refusal> {
+        let config_path = self.harness.config_path.lock().unwrap().clone();
+        let credentials = Arc::clone(&self.harness.broca_credentials.lock().unwrap());
+        super::accounts::account_for(
+            params,
+            &super::Caller::for_route(self.channel, self.epoch),
+            &super::Deps {
+                quota_cache: &self.harness.quota_cache,
+                store: &self.harness.store,
+                routing_config_path: &config_path,
+                operator_config_path: &config_path,
+                broca_credentials: &credentials,
+            },
+        )
+    }
+
     pub(super) fn request_frame(&self, method: &str, params: &Value) -> Frame {
         Frame::build(
             FrameType::Request,
@@ -989,7 +1010,8 @@ async fn observe_success_fixture_arms_real_quota_retest() {
         .accounts
         .iter()
         .find(|a| a.provider == fixture::SUBSCRIPTION_PROVIDER)
-        .unwrap().clone();
+        .unwrap()
+        .clone();
     let mut sibling = account.clone();
     sibling.credential_id = "success-sibling".into();
     let mut other = account.clone();
@@ -1001,16 +1023,16 @@ async fn observe_success_fixture_arms_real_quota_retest() {
     let route = h.bind(reserved(fixture::RUNNER_ONE), None).await;
     for (index, account) in [account, sibling].iter().enumerate() {
         subject
-        .configure_observe_retest_block(
-            &account.account_id,
-            &account.credential_id,
-            "quota",
-            crate::now_ms() - if index == 0 { 1000 } else { 0 },
-        )
-        .await
-        .unwrap();
-    let before = h.store().fence_rechecks().unwrap();
-    let reply = route
+            .configure_observe_retest_block(
+                &account.account_id,
+                &account.credential_id,
+                "quota",
+                crate::now_ms() - if index == 0 { 1000 } else { 0 },
+            )
+            .await
+            .unwrap();
+        let before = h.store().fence_rechecks().unwrap();
+        let reply = route
         .call(
             "route.account_for",
             &json!({
@@ -1021,14 +1043,14 @@ async fn observe_success_fixture_arms_real_quota_retest() {
             }),
         )
         .await;
-    let after = h.store().fence_rechecks().unwrap();
-    assert_eq!(
-        reply.0,
-        FrameType::Response,
-        "reply={} before={before:?} after={after:?}",
-        reply.1
-    );
-    assert!(after.iter().any(|o| o.last_claimed_at.is_some()));
+        let after = h.store().fence_rechecks().unwrap();
+        assert_eq!(
+            reply.0,
+            FrameType::Response,
+            "reply={} before={before:?} after={after:?}",
+            reply.1
+        );
+        assert!(after.iter().any(|o| o.last_claimed_at.is_some()));
     }
 }
 

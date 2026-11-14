@@ -136,6 +136,7 @@ impl SqliteRouteStateStore {
     /// after its account's latest reading, so an admission this old charges
     /// nothing a fresh reading could still need.
     pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.refuse_state_blind_admission_write("prune_account_admissions")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_admissions(before, limit)
         })
@@ -167,6 +168,7 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<AffinityRetentionBatch> {
+        self.refuse_state_blind_admission_write("prune_account_affinities")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_affinities(before, limit)
         })
@@ -340,6 +342,7 @@ impl SqliteRouteStateStore {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        self.refuse_state_blind_admission_write("prune_account_continuations")?;
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
             tx.prune_account_continuations(before, limit)
         })
@@ -462,8 +465,19 @@ impl SqliteRouteStateStore {
 
 impl crate::AccountTx<'_> {
     pub fn prune_account_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        self.prune_account_admissions_returning(before, limit)
+            .map(|deleted| deleted.len())
+    }
+
+    /// The same retention delete, returning each deleted row's identity so the
+    /// module's in-memory admission indexes can drop exactly those rows.
+    pub fn prune_account_admissions_returning(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
         self.command_sql(|conn: &Connection| {
-            conn.execute(
+            let mut statement = conn.prepare(
                 "DELETE FROM account_admission WHERE rowid IN ( \
                        SELECT rowid FROM account_admission \
                          INDEXED BY account_admission_by_committed \
@@ -472,9 +486,28 @@ impl crate::AccountTx<'_> {
                          AND COALESCE(started_at, 0) < ?1 \
                          AND COALESCE(released_at, 0) < ?1 \
                          AND COALESCE(finished_at, 0) < ?1 \
-                       ORDER BY committed_at LIMIT ?2)",
-                params![before, limit_param(limit)],
-            )
+                       ORDER BY committed_at LIMIT ?2) \
+                 RETURNING rowid, principal, admission_id, conversation_hash, provider, \
+                   account_id, pin_id, pin_generation, state, charged, committed_at, \
+                   started_at IS NOT NULL",
+            )?;
+            let rows = statement.query_map(params![before, limit_param(limit)], |row| {
+                Ok(crate::PrunedAdmission {
+                    rowid: row.get(0)?,
+                    principal: row.get(1)?,
+                    admission_id: row.get(2)?,
+                    conversation_hash: row.get(3)?,
+                    provider: row.get(4)?,
+                    account_id: row.get(5)?,
+                    pin_id: row.get(6)?,
+                    pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    state: row.get(8)?,
+                    charged: row.get::<_, i64>(9)? == 1,
+                    committed_at: row.get(10)?,
+                    started: row.get(11)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(err)
     }
@@ -484,8 +517,20 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<AffinityRetentionBatch> {
+        self.prune_account_affinities_returning(before, limit)
+            .map(|(batch, _)| batch)
+    }
+
+    /// The same retention delete, also returning the deleted conversation keys
+    /// (principal, conversation hash, provider) for the module's state.
+    #[allow(clippy::type_complexity)]
+    pub fn prune_account_affinities_returning(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<(AffinityRetentionBatch, Vec<(String, String, String)>)> {
         if limit == 0 {
-            return Ok(AffinityRetentionBatch::default());
+            return Ok((AffinityRetentionBatch::default(), Vec::new()));
         }
         self.command_sql(|conn: &Connection| {
             let tx = conn;
@@ -507,6 +552,7 @@ impl crate::AccountTx<'_> {
                 rows.collect::<rusqlite::Result<_>>()?
             };
             let mut batch = AffinityRetentionBatch::default();
+            let mut deleted = Vec::new();
             {
                 let mut delete_pins = tx.prepare(
                     "DELETE FROM account_pin \
@@ -519,12 +565,20 @@ impl crate::AccountTx<'_> {
                 for (principal, conversation_hash, provider) in &keys {
                     batch.pins +=
                         delete_pins.execute(params![principal, conversation_hash, provider])?;
-                    batch.affinities +=
+                    let affinities =
                         delete_affinity.execute(params![principal, conversation_hash, provider])?;
+                    batch.affinities += affinities;
+                    if affinities > 0 {
+                        deleted.push((
+                            principal.clone(),
+                            conversation_hash.clone(),
+                            provider.clone(),
+                        ));
+                    }
                 }
             }
 
-            Ok(batch)
+            Ok((batch, deleted))
         })
         .map_err(err)
     }
@@ -671,9 +725,19 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        self.prune_account_continuations_returning(before, limit)
+            .map(|deleted| deleted.len())
+    }
+
+    /// The same retention delete, returning each deleted row's identity so the
+    /// module's in-memory continuation indexes can drop exactly those rows.
+    pub fn prune_account_continuations_returning(
+        &self,
+        before: i64,
+        limit: usize,
+    ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
         self.retention_write(|tx| {
-            tx.execute(
-                &format!(
+            let mut statement = tx.prepare(&format!(
                     "DELETE FROM account_continue WHERE rowid IN ( \
                        SELECT c.rowid FROM account_continue c \
                        WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
@@ -685,10 +749,23 @@ impl crate::AccountTx<'_> {
                              AND (a.state IN {LIVE_ADMISSION_STATES} \
                                OR COALESCE(a.finished_at, 0) >= ?1 \
                                OR COALESCE(a.released_at, 0) >= ?1)) \
-                       ORDER BY c.rowid LIMIT ?2)"
-                ),
-                params![before, limit_param(limit)],
-            )
+                       ORDER BY c.rowid LIMIT ?2) \
+                     RETURNING rowid, principal, selection_id, admission_id, run_id, \
+                       previous_decision_id, decision_id, used_at_ms IS NOT NULL"
+            ))?;
+            let rows = statement.query_map(params![before, limit_param(limit)], |row| {
+                Ok(crate::PrunedContinuation {
+                    rowid: row.get(0)?,
+                    principal: row.get(1)?,
+                    selection_id: row.get(2)?,
+                    admission_id: row.get(3)?,
+                    run_id: row.get(4)?,
+                    previous_decision_id: row.get(5)?,
+                    decision_id: row.get(6)?,
+                    used: row.get(7)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
         })
     }
 

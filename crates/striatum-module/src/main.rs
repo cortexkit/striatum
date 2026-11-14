@@ -18,6 +18,7 @@ mod account_quota;
 mod account_refusal_log;
 mod account_selection;
 mod account_writer;
+mod account_state;
 mod serving_index;
 mod background;
 #[cfg(test)]
@@ -1012,6 +1013,7 @@ impl Drop for InjectedClock {
 /// [`run_route_handler_off_async_workers`]), so the state of the thread that
 /// dispatched the handler is installed there for the handler's lifetime.
 #[cfg(test)]
+#[derive(Clone)]
 struct TestThreadState {
     now_ms: Option<u64>,
     warnings: OperatorWarnings,
@@ -1317,6 +1319,23 @@ where
     // 33-fact seed, once). The store backs route.select's facts + runtime snapshot.
     let descriptor = resolve_storage_descriptor(&ack.storage, &config.module_id)?;
     let store = open_route_state_store(&descriptor)?;
+    // HELLO negotiates the storage descriptor supplied by HELLO_ACK, so it
+    // cannot wait for loading. Do not start background tasks or dispatch queued
+    // requests until account state is published; early requests wait, not fail.
+    // The load blocks on the account writer, so it runs on the blocking pool,
+    // never on a runtime worker. A failed load does not stop the module: the
+    // writer stays up, and each account request or Tick loads again.
+    let loading = Arc::clone(&store);
+    match tokio::task::spawn_blocking(move || account_state::initialize(loading.as_ref())).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(
+            %error,
+            "account state did not load; account requests retry the load"
+        ),
+        Err(error) => {
+            return Err(ModuleError::Message(format!("load account state: {error}")));
+        }
+    }
     // Variant overrides name efforts the catalog must publish. Config loaded
     // before the store opened got only shape checks; check it now, and every
     // later reload, against the stored catalog.

@@ -1,6 +1,7 @@
 use super::*;
 
 mod account_decision_tests;
+mod request_reads_tests;
 mod signed_out_tests;
 
 fn result(reply: (FrameType, Value)) -> Value {

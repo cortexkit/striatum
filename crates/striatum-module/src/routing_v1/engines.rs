@@ -15,6 +15,9 @@ use super::{store_refusal, Caller, Deps};
 #[path = "media_ranking.rs"]
 mod ranking;
 
+#[path = "media_pricing.rs"]
+mod pricing;
+
 pub(super) fn now(deps: &Deps<'_>) -> u64 {
     #[cfg(test)]
     let offset = deps
@@ -251,24 +254,56 @@ fn select_request(
     } else {
         Default::default()
     };
+    let mut media_prices = std::collections::BTreeMap::new();
     for candidate in &mut candidates {
-        candidate.cost = catalog
-            .as_ref()
-            .filter(|_| media.is_none() || !candidate.selected.caller_local)
-            .and_then(|catalog| {
-                catalog.engine_cost(
-                    &request,
-                    &candidate.engine.provider,
-                    &candidate.engine.model,
-                )
-            })
-            .map(FactNumber);
+        candidate.cost = if media.is_some() {
+            // Offers are caller-owned, even when their names collide with a
+            // catalog route. The media contract's `Engine` declaration carries
+            // no cost, so a caller-local offer stays unpriced.
+            if candidate.selected.caller_local {
+                None
+            } else {
+                media_prices
+                    .entry(format!(
+                        "{}/{}",
+                        candidate.engine.provider, candidate.engine.model
+                    ))
+                    .or_insert_with(|| {
+                        catalog.as_ref().and_then(|catalog| {
+                            pricing::estimate(
+                                catalog,
+                                &request,
+                                &candidate.engine.provider,
+                                &candidate.engine.model,
+                            )
+                        })
+                    })
+                    .as_ref()
+                    .map(|estimate| FactNumber(estimate.cost))
+            }
+        } else {
+            catalog
+                .as_ref()
+                .filter(|_| media.is_none() || !candidate.selected.caller_local)
+                .and_then(|catalog| {
+                    catalog.engine_cost(
+                        &request,
+                        &candidate.engine.provider,
+                        &candidate.engine.model,
+                    )
+                })
+                .map(FactNumber)
+        };
         let key = striatum_core::make_route_key(
             &candidate.engine.provider,
             &candidate.engine.model,
             None,
         );
-        let policy_allowed = config.route_allowed(&request.consumer, &key, true);
+        let policy_allowed = if media.is_some() {
+            config.media_route_allowed(&request.consumer, &key, false)
+        } else {
+            config.route_allowed(&request.consumer, &key, true)
+        };
         if policy_allowed
             && (candidate.engine.local
                 || active_media_providers.contains(&candidate.engine.provider))
@@ -288,12 +323,9 @@ fn select_request(
                 || state.credential_refusal.is_some();
         }
         if !candidate.engine.local && candidate.engine.kind == request.kind {
-            // Media engines have no subscription alternative and no pin
-            // operation, so a pin-only rule (provider or model) would make an
-            // engine unusable rather than "pinned only". Evaluate operator rules
-            // as a pinned request does: `not_for` and consumer exclusions still
-            // refuse an engine, while pin-only rules and the LLM-only metered
-            // default do not.
+            // route.select_engine ignores every pin-only rule; media route.select
+            // enforces model pin-only rules but not chat provider spending rules.
+            // Both operations still refuse only_for and not_for exclusions.
             candidate.fenced |= !policy_allowed;
             candidate.fenced |= !accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
@@ -409,7 +441,7 @@ fn select_request(
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             // Local engines bypass the compatibility selector's reachability
             // fence, so apply policy as admission instead of a transient fence.
-            config.route_allowed(&request.consumer, &key, true)
+            config.media_route_allowed(&request.consumer, &key, false)
                 && media
                     .exclude
                     .as_ref()
@@ -442,16 +474,39 @@ fn select_request(
     } else {
         wire::select_engine(&request, &candidates)?
     };
+    let pricing = (!winner.selected.caller_local)
+        .then(|| {
+            media_prices.get(&format!(
+                "{}/{}",
+                winner.engine.provider, winner.engine.model
+            ))
+        })
+        .flatten()
+        .and_then(Option::as_ref);
+    let mut score = serde_json::json!({"accuracy": winner.accuracy.map(EvalScore::get), "cost": winner.cost.map(|value| value.0)});
+    if let Some(pricing) = pricing {
+        score["objective"] = serde_json::json!({"taskPricing": pricing.detail()});
+    }
     let scope = caller.scope.as_ref();
     let decision = DecisionInput {
-        decision_kind: "engine".into(), consumer: Some(request.consumer.clone()), target_agent: request.consumer.clone(),
+        decision_kind: "engine".into(),
+        consumer: Some(request.consumer.clone()),
+        target_agent: request.consumer.clone(),
         project_id: scope.and_then(|scope| scope.project_id.clone()),
         workdir: scope.and_then(|scope| scope.workdir.clone()),
-        requirements_json: params.to_string(), selected_route_key: Some(striatum_core::make_route_key(&winner.engine.provider, &winner.engine.model, None)),
-        selected_provider_id: Some(winner.engine.provider.clone()), selected_model_id: Some(winner.engine.model.clone()),
-        score_json: serde_json::json!({"accuracy": winner.accuracy.map(EvalScore::get), "cost": winner.cost.map(|value| value.0)}).to_string(),
-        rejected_json: "[]".into(), allowed_account_class: AllowedAccountClass::PricedPerTokenOnly,
-        quota_signal_json: Some(inputs.quota_signal_json), ..Default::default()
+        requirements_json: params.to_string(),
+        selected_route_key: Some(striatum_core::make_route_key(
+            &winner.engine.provider,
+            &winner.engine.model,
+            None,
+        )),
+        selected_provider_id: Some(winner.engine.provider.clone()),
+        selected_model_id: Some(winner.engine.model.clone()),
+        score_json: score.to_string(),
+        rejected_json: "[]".into(),
+        allowed_account_class: AllowedAccountClass::PricedPerTokenOnly,
+        quota_signal_json: Some(inputs.quota_signal_json),
+        ..Default::default()
     };
     let id = deps
         .store
@@ -459,7 +514,10 @@ fn select_request(
         .map_err(store_refusal)?;
     let answer = SelectEngineAnswer::new(&id, now + wire::DECISION_TTL_MS, winner.selected.clone());
     let value = if let Some(request) = media {
-        let answer = SelectMediaAnswer::new(&id, answer.expires_at_ms, winner.selected.clone());
+        let mut answer = SelectMediaAnswer::new(&id, answer.expires_at_ms, winner.selected.clone());
+        if !winner.engine.local {
+            answer.price = pricing.and_then(|pricing| pricing.price.clone());
+        }
         media::check_answer(request, &answer)?;
         serde_json::to_value(answer)
     } else {

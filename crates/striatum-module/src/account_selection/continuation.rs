@@ -86,23 +86,14 @@ pub(crate) fn continue_account(
     ctx: &Ctx<'_>,
 ) -> Result<Value, Refusal> {
     let now_ms = ctx.now_ms;
-    if ctx
-        .store
-        .account_read(|tx| tx.has_expired_continuations(now_ms))
-        .map_err(unavailable)?
-    {
+    if crate::account_state::has_expired_continuations(ctx.store, now_ms).map_err(unavailable)? {
         crate::account_writer::repair(ctx.store, move |tx| {
             tx.release_expired_continuations(now_ms)
         })
         .map_err(unavailable)?;
     }
-    if let Some(first) = ctx
-        .store
-        .account_read(|tx| tx.continuation(principal, &request.selection_id))
-        .map_err(unavailable)?
-    {
-        return standing(first, request);
-    }
+    // A recorded selection replays inside the writer command below, where
+    // the keyed lookup sees every earlier command, including this batch's.
     for (field, value) in [
         (
             "exhausted.observed_at_ms",
@@ -153,7 +144,7 @@ pub(crate) fn continue_account(
         .map(|record| serde_json::from_str(&record.body_json))
         .transpose()
         .map_err(unavailable)?;
-    let mut parsed = original
+    let parsed = original
         .as_ref()
         .map(|body| {
             let mut body = body.clone();
@@ -166,7 +157,10 @@ pub(crate) fn continue_account(
             body["expected_pin"] = Value::Null;
             body["admission_id"] = json!(new_id("continue"));
             body["pool"] = json!(request.exhausted.pool);
-            serde_json::from_value::<AccountForParams>(body)
+            serde_json::from_value::<AccountForParams>(body).map(|mut params| {
+                params.admission_id_generated = true;
+                params
+            })
         })
         .transpose()
         .map_err(unavailable)?;
@@ -316,7 +310,10 @@ pub(crate) fn continue_account(
             let Some(Ok((mut roster, route_fenced, _))) = prepared.clone() else {
                 return Ok(ContinueAnswer::Hold(ContinueHold::new("account_selection_unavailable",json!("no compatible account is available"))));
             };
-            let params = parsed.as_mut().unwrap();
+            // A copy: the writer may run this command again, and each run
+            // must start from the request as parsed.
+            let mut params = parsed.clone().unwrap();
+            let params = &mut params;
             // The exhausted account must leave even if its quota reading still has headroom.
             if let Some(roster) = &mut roster.roster {
                 for account in &mut roster.accounts {

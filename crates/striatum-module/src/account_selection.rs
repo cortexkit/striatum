@@ -1098,8 +1098,7 @@ impl ClassContext {
     ) -> Result<Self, String> {
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
-        if store
-            .account_read(|tx| tx.has_expired_admission_probes(now_ms))
+        if crate::account_state::has_expired_admission_probes(store, now_ms)
             .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
@@ -1107,8 +1106,7 @@ impl ClassContext {
             })
             .map_err(|error| error.to_string())?;
         }
-        if store
-            .account_read(|tx| tx.has_expired_continuations(now_ms))
+        if crate::account_state::has_expired_continuations(store, now_ms)
             .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
@@ -1336,11 +1334,12 @@ impl ClassContext {
             })
             .collect();
         if !recovered.is_empty() {
-            let mut fences = context.fences.clone();
+            let fences = context.fences.clone();
             let fences = crate::account_writer::repair(store, move |tx| {
                 for id in &recovered {
                     tx.clear_fence(id, now_ms, "fresh_headroom")?;
                 }
+                let mut fences = fences.clone();
                 for (provider, fences) in &mut fences {
                     *fences = load_fences(tx, provider)?;
                 }
@@ -1430,7 +1429,7 @@ impl ClassContext {
             let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
-                let admission = claimed_admission;
+                let admission = claimed_admission.clone();
                 let origins: Vec<_> = tx
                     .fence_rechecks()?
                     .into_iter()
@@ -2642,7 +2641,7 @@ impl ClassContext {
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
             let owner = owned_owner.as_deref();
-            let credential = owned_credential;
+            let credential = owned_credential.clone();
 
             let origins: Vec<_> = tx
                 .fence_rechecks()?
@@ -4234,6 +4233,24 @@ fn load_demand(
     policy: &AllocatorPolicy,
     context: &striatum_core::accounts::AllocationContext,
 ) -> RouteStateResult<Vec<AdmissionDemand>> {
+    demand_with(
+        |provider, account, floor| tx.demand(provider, account, floor),
+        provider,
+        roster,
+        policy,
+        context,
+    )
+}
+
+/// [`load_demand`] over any source of `ACCOUNT_DEMAND_SQL` rows: SQL, or the
+/// account state, which keeps the same rows in memory.
+fn demand_with(
+    mut read: impl FnMut(&str, &str, Option<i64>) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
+    provider: &str,
+    roster: Option<&Roster>,
+    policy: &AllocatorPolicy,
+    context: &striatum_core::accounts::AllocationContext,
+) -> RouteStateResult<Vec<AdmissionDemand>> {
     // One read per account; a repeated account keeps its lowest floor.
     let mut floors: BTreeMap<&str, Option<EpochMs>> = BTreeMap::new();
     for view in roster.map_or(&[][..], |roster| &roster.accounts) {
@@ -4246,7 +4263,7 @@ fn load_demand(
     let mut demand = Vec::new();
     for (account_id, floor) in floors {
         demand.extend(
-            tx.demand(provider, account_id, floor)?
+            read(provider, account_id, floor)?
                 .into_iter()
                 .filter_map(|row| {
                     let state: AdmissionState = serde_json::from_value(json!(row.state)).ok()?;
@@ -4491,6 +4508,11 @@ pub(crate) struct AccountForParams {
     service_tier_chosen: Option<cortexkit_role_routing::service_tier::ServiceTier>,
     #[serde(skip)]
     service_tier_bound: bool,
+    /// Routing generated `admission_id` itself (a continuation's reservation),
+    /// so no earlier admission can hold it and the writer skips its keyed
+    /// existence check.
+    #[serde(skip)]
+    admission_id_generated: bool,
     #[serde(default)]
     parent_conversation_key: Option<String>,
     #[serde(default)]
@@ -4554,6 +4576,7 @@ impl AccountForParams {
             service_tier: request.service_tier,
             service_tier_chosen: None,
             service_tier_bound: false,
+            admission_id_generated: false,
             parent_conversation_key: serde_json::from_value(optional("parent_conversation_key"))
                 .map_err(|e| invalid(e.to_string()))?,
             hold_ok: serde_json::from_value(optional("hold_ok"))
@@ -5001,7 +5024,7 @@ fn account_for(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
 }
 
 pub(crate) fn account_for_parsed(
-    mut parsed: AccountForParams,
+    parsed: AccountForParams,
     principal: &str,
     ctx: &Ctx<'_>,
     finish: Option<crate::routing_v1::accounts::AdmissionRecord>,
@@ -5030,36 +5053,83 @@ pub(crate) fn account_for_parsed(
     };
     let request_fingerprint = fingerprint(&parsed);
     checking("admission_replay");
-    match ctx
-        .store
-        .account_read(|tx| tx.admission(principal, &parsed.admission_id))
-    {
-        Ok(Some(_)) => {
-            let principal = principal.to_owned();
-            let now = ctx.now_ms;
-            return crate::account_writer::execute(
-                ctx.store,
-                striatum_store::AccountCommandKind::Replay,
-                move |tx| {
-                    let row = tx
-                        .admission(&principal, &parsed.admission_id)?
-                        .ok_or_else(|| {
-                            RouteStateStoreError("admission disappeared; retry".into())
-                        })?;
-                    let reply = replay(tx, &principal, row, &request_fingerprint, now)?;
-                    finish_reply(tx, reply, finish.as_ref(), now)
-                },
-            )
-            .unwrap_or_else(store_error);
+    let admission_id = parsed.admission_id.clone();
+    // An admission the published state holds open replays at once. Any other
+    // id goes on: the writer command checks it against SQL by key before
+    // allocating, and a refusal before the writer checks it here, so a closed
+    // admission always replays its stored answer.
+    match crate::account_state::open_preflight_admission(ctx.store, principal, &admission_id) {
+        Ok(Some(row)) => {
+            return replay_command(ctx, principal, row, request_fingerprint, finish);
         }
         Ok(None) => {}
         Err(error) => return store_error(error),
     }
+    let mut finish = finish;
+    match prepare_and_admit(
+        parsed,
+        principal,
+        ctx,
+        provider,
+        request_fingerprint.clone(),
+        &mut finish,
+    ) {
+        Ok(reply) => reply,
+        Err(refusal) => {
+            match crate::account_state::closed_admission(ctx.store, principal, &admission_id) {
+                Ok(Some(row)) => replay_command(ctx, principal, row, request_fingerprint, finish),
+                Ok(None) => refusal,
+                Err(error) => store_error(error),
+            }
+        }
+    }
+}
+
+/// Replay `row` in a writer command. An open admission may have moved on
+/// since it was read, so the command reads it again; a closed one never
+/// changes, so its row is used as read.
+fn replay_command(
+    ctx: &Ctx<'_>,
+    principal: &str,
+    row: AccountAdmissionRow,
+    request_fingerprint: String,
+    finish: Option<crate::routing_v1::accounts::AdmissionRecord>,
+) -> OpReply {
+    let principal = principal.to_owned();
+    let now = ctx.now_ms;
+    crate::account_writer::execute(
+        ctx.store,
+        striatum_store::AccountCommandKind::Replay,
+        move |tx| {
+            let row = if matches!(row.state.as_str(), "released" | "finished") {
+                row.clone()
+            } else {
+                tx.admission(&principal, &row.admission_id)?
+                    .ok_or_else(|| RouteStateStoreError("admission disappeared; retry".into()))?
+            };
+            let reply = replay(tx, &principal, row, &request_fingerprint, now)?;
+            finish_reply(tx, reply, finish.as_ref(), now)
+        },
+    )
+    .unwrap_or_else(store_error)
+}
+
+/// Prepare the roster and run the admission command. `Err` is a refusal made
+/// before the writer, which the caller must check against a closed admission
+/// of the same id before answering.
+fn prepare_and_admit(
+    mut parsed: AccountForParams,
+    principal: &str,
+    ctx: &Ctx<'_>,
+    provider: String,
+    request_fingerprint: String,
+    finish: &mut Option<crate::routing_v1::accounts::AdmissionRecord>,
+) -> Result<OpReply, OpReply> {
     checking("roster_prepare");
     let bound_tier = match parsed.model_decision_id.as_deref() {
         Some(id) => match ctx.store.decision_service_tier(id) {
             Ok(tier) => tier.map(|(tier, _)| tier),
-            Err(error) => return store_error(error),
+            Err(error) => return Err(store_error(error)),
         },
         None => None,
     };
@@ -5079,26 +5149,26 @@ pub(crate) fn account_for_parsed(
         })
     });
     if let Some(reason) = unobserved {
-        return because(
+        return Err(because(
             "service_tier_input_unobserved",
             OpReply::typed(
                 "account_selection_unavailable",
                 "Routing has just started and hasn't yet loaded what it needs to judge this service tier. Retry in 3 seconds; a bound decision keeps its tier.",
                 service_tier_refusal_detail(&parsed, reason, Some(3_000)),
             ),
-        );
+        ));
     }
     let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
-        Err(reply) => return reply,
+        Err(reply) => return Err(reply),
     };
     checking("service_tier");
     parsed.service_tier_chosen = match prepare_service_tier(&mut parsed, ctx, &mut roster, class) {
         Ok(tier) => tier,
-        Err(reply) => return reply,
+        Err(reply) => return Err(reply),
     };
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
-        return because("route_fence", reply);
+        return Err(because("route_fence", reply));
     }
     #[cfg(test)]
     run_after_roster_hook(&parsed.admission_id);
@@ -5125,7 +5195,7 @@ pub(crate) fn account_for_parsed(
                 ctx.now_ms,
                 Some(&parsed),
             ) {
-                return reply;
+                return Err(reply);
             }
             if roster
                 .roster
@@ -5137,7 +5207,7 @@ pub(crate) fn account_for_parsed(
                     .flat_map(|fact| classes.class(fact, class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly).rows)
                     .map(|row| classes.account_id(row).to_owned())
                     .collect();
-                return because(
+                return Err(because(
                     "candidates_filter",
                     // An empty candidate list needs a permanent refusal, not
                     // a timed retry or reauthentication. The pinned routing
@@ -5149,7 +5219,7 @@ pub(crate) fn account_for_parsed(
                         json!({"code":"account_selection_unavailable", "retry_after_s":null, "decision_id":null,
                         "exclusions":accounts.into_iter().map(|account| json!({"account_id":account,"reason":"not_in_runner_candidates"})).collect::<Vec<_>>()}),
                     ),
-                );
+                ));
             }
         } else if roster
             .roster
@@ -5162,7 +5232,7 @@ pub(crate) fn account_for_parsed(
             // of the right kind serves it. That is `auth_required`, untimed:
             // the runner needs a login it does not have.
             checking("missing_model_credentials");
-            return OpReply::typed(
+            return Err(OpReply::typed(
                 "auth_required",
                 format!("routing selects no accounts for provider `{provider}`"),
                 json!({
@@ -5171,14 +5241,15 @@ pub(crate) fn account_for_parsed(
                     "decision_id": null,
                     "exclusions": [],
                 }),
-            );
+            ));
         }
     }
     // The roster is read before the transaction: no lock or fetch happens
     // while the selection transaction is open.
     let command_ctx = ctx.command_context();
     let principal = principal.to_owned();
-    crate::account_writer::execute(
+    let finish = finish.take();
+    Ok(crate::account_writer::execute(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
         move |tx| {
@@ -5194,7 +5265,7 @@ pub(crate) fn account_for_parsed(
             )?;
             finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)
         })
-        .unwrap_or_else(store_error)
+        .unwrap_or_else(store_error))
 }
 
 fn finish_reply(
@@ -5228,8 +5299,10 @@ pub(crate) fn after_roster_prepared(admission_id: &str, hook: impl FnOnce() + Se
         .push((admission_id.to_owned(), Box::new(hook)));
 }
 
+/// Run and remove the test hook registered under `key` (an admission id, or
+/// another stage's key such as `v1-replay-checked:<admission id>`).
 #[cfg(test)]
-fn run_after_roster_hook(admission_id: &str) {
+pub(crate) fn run_after_roster_hook(admission_id: &str) {
     // Take the hook out before running it: it may run another admission,
     // which reaches this point too.
     let hook = {
@@ -6127,6 +6200,19 @@ pub(crate) fn preflight_model_for_class_with_reset(
         .map_or_else(Default::default, |classes| {
             classes.allocation_context(provider, model)
         });
+    // Demand comes from the published account state; a private projection
+    // has none and reads SQL.
+    let state = if ctx.store.is_account_evaluation_projection() {
+        None
+    } else {
+        Some(
+            crate::account_state::snapshot(ctx.store).map_err(|error| PreflightRefusal {
+                code: "account_selection_unavailable".into(),
+                message: error.to_string(),
+                reset_at_ms: None,
+            })?,
+        )
+    };
     let (decision, fences) = ctx
         .store
         .account_read(|tx| {
@@ -6138,8 +6224,11 @@ pub(crate) fn preflight_model_for_class_with_reset(
                     affinity: None,
                     fences: fences.clone(),
                     principal_exclusions: Vec::new(),
-                    admissions: load_demand(
-                        tx,
+                    admissions: demand_with(
+                        |provider, account, floor| match &state {
+                            Some(state) => Ok(state.admissions.demand(provider, account, floor)),
+                            None => tx.demand(provider, account, floor),
+                        },
                         provider,
                         roster.roster.as_ref(),
                         &policy,
@@ -6238,7 +6327,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
 /// compare-and-set, the decision and its commit. The transaction commits
 /// before the reply leaves, so a reply always describes a durable decision.
 fn serve(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
@@ -6249,7 +6338,14 @@ fn serve(
     checking("admission_transaction");
     let now = ctx.now_ms;
     let policy = ctx.provider_policy(provider);
-    if let Some(existing) = tx.admission(principal, &params.admission_id)? {
+    // An admission not open in memory may be closed in SQL: check by key here,
+    // before allocating, so a closed admission replays its stored answer.
+    let existing = if params.admission_id_generated {
+        tx.open_admission(principal, &params.admission_id)?
+    } else {
+        tx.admission(principal, &params.admission_id)?
+    };
+    if let Some(existing) = existing {
         return replay(tx, principal, existing, request_fingerprint, now);
     }
     let salt = tx.salt(now, fresh_salt)?;
@@ -6316,7 +6412,13 @@ fn serve(
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
-    let admissions = load_demand(tx, provider, roster.roster.as_ref(), &policy, &inputs)?;
+    let admissions = demand_with(
+        |provider, account, floor| tx.demand(provider, account, floor),
+        provider,
+        roster.roster.as_ref(),
+        &policy,
+        &inputs,
+    )?;
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
     let origins: Vec<_> = tx
@@ -6821,7 +6923,7 @@ fn serve(
 /// back (marked `expired` once its start window has passed) and charges
 /// nothing; different identity fields are a conflict.
 fn replay(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     principal: &str,
     existing: AccountAdmissionRow,
     request_fingerprint: &str,
@@ -6880,7 +6982,7 @@ fn pin_conflict(current: Option<&AccountAffinityRow>, expected: &PinRef) -> OpRe
 
 #[allow(clippy::too_many_arguments)]
 fn commit_admission(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     params: &AccountForParams,
@@ -7207,7 +7309,11 @@ pub(crate) fn observe_authorized(
         ) {
             let mut detail = refusal.detail;
             detail.insert("code".into(), json!(refusal.code.as_str()));
-            return OpReply::typed(refusal.code.as_str(), refusal.message, Value::Object(detail));
+            return OpReply::typed(
+                refusal.code.as_str(),
+                refusal.message,
+                Value::Object(detail),
+            );
         }
     }
     let parsed: ObserveParams = match serde_json::from_value(params.clone()) {
@@ -7275,7 +7381,7 @@ pub(crate) fn observe_authorized(
 }
 
 fn record_observation(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     admission_principal: &str,
@@ -7286,7 +7392,7 @@ fn record_observation(
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let runner = normalize(&parsed.caller.runner);
-    let existing = if allow_served_account || admission_principal != principal {
+    let existing = if parsed.attempt_outcome.is_some() || allow_served_account || admission_principal != principal {
         tx.observation_by_principal_event(principal, &parsed.event_id)?
     } else {
         tx.observation_by_event(principal, &runner, &parsed.event_id)?
@@ -7304,7 +7410,14 @@ fn record_observation(
     let observation_id = new_id("aco");
     // `routing_v1::accounts` resolves the admission's principal before the
     // transaction; a decision owner's event stays under the owner's principal.
+    let success_admission = match (&parsed.attempt_outcome, &parsed.admission_id) {
+        (Some(_), Some(id)) => tx.admission_for_success(admission_principal, id)?,
+        _ => None,
+    };
     let admission = match &parsed.admission_id {
+        Some(_) if parsed.attempt_outcome.is_some() => {
+            success_admission.as_ref().map(|r| r.row.clone())
+        }
         Some(id) => tx.admission(admission_principal, id)?,
         None => None,
     };
@@ -7428,6 +7541,7 @@ fn record_observation(
             principal,
             parsed,
             row,
+            success_admission.as_ref(),
             &observation_id,
             roster_digests,
             &mut effects,
@@ -7529,11 +7643,12 @@ fn apply_credential_refused(
 
 #[allow(clippy::too_many_arguments)]
 fn apply_bound_observation(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     parsed: &ObserveParams,
     admission: &AccountAdmissionRow,
+    success_admission: Option<&striatum_store::AdmissionStateRow>,
     observation_id: &str,
     roster_digests: &BTreeMap<String, ProviderRosterFacts>,
     effects: &mut Vec<Value>,
@@ -7554,6 +7669,8 @@ fn apply_bound_observation(
             }
         }
         "run_finished" => {
+            // Read while the admission is still open: finishing closes it.
+            let size_class = tx.admission_size_class(principal, id)?;
             if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
@@ -7598,7 +7715,7 @@ fn apply_bound_observation(
                         &admission.account_id,
                         &admission.credential_id,
                         &admission.model,
-                        tx.admission_size_class(principal, &admission.admission_id)?,
+                        size_class,
                         admission.committed_at,
                         now,
                         Some(&striatum_store::QuotaSuccessScope {
@@ -7650,9 +7767,17 @@ fn apply_bound_observation(
                         &admission.model,
                     ),
                 };
-                for origin in tx.heal_admission_success(admission, Some(&scope), now)? {
-                    effects.push(json!({"effect":"block_cleared", "kind":origin.kind,
-                        "origin_key":origin.origin_key}));
+                if let Some(probe) = success_admission {
+                    for origin in tx.heal_admission_success(
+                        admission,
+                        probe.input_size_class,
+                        probe.model_decision_id.as_deref(),
+                        Some(&scope),
+                        now,
+                    )? {
+                        effects.push(json!({"effect":"block_cleared", "kind":origin.kind,
+                            "origin_key":origin.origin_key}));
+                    }
                 }
             }
             header_fences(
@@ -9327,7 +9452,7 @@ mod tests {
             .store()
             .account_transaction(|tx| {
                 serve(
-                    tx,
+                    &mut crate::account_state::AccountCommand::new(tx, None),
                     &ctx.command_context(),
                     BROCA,
                     &parsed,
@@ -9593,7 +9718,7 @@ mod tests {
             .store()
             .account_transaction(|tx| {
                 serve(
-                    tx,
+                    &mut crate::account_state::AccountCommand::new(tx, None),
                     &ctx.command_context(),
                     "runner",
                     &parsed,

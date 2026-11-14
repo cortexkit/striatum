@@ -999,6 +999,16 @@ fn compare_block_functions(
 // planner preferred scanning all of account_admission (hundreds of thousands
 // of rows live) and probing the authorization index for each one, which held
 // the account writer for hundreds of milliseconds on every Tick.
+/// What [`AccountTx::release_admission_probes`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReleasedAdmissionProbes {
+    /// Admissions whose probe was released: each was unstarted, in
+    /// `reserved` or `expired`.
+    pub released: usize,
+    /// Of those, the admissions it moved from `reserved` to `expired`.
+    pub expired: Vec<(String, String)>,
+}
+
 pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
     "SELECT DISTINCT a.principal,a.admission_id,p.owner
     FROM fence_probe_authorization p CROSS JOIN account_admission a
@@ -1098,6 +1108,23 @@ impl AccountTx<'_> {
         Ok(())
     }
 
+    /// Every owner holding a probe authorization, without joining admissions:
+    /// a caller that holds the admission rows in memory decides which owners
+    /// are expired unstarted admissions, then passes them to
+    /// [`Self::release_admission_probes`].
+    pub fn probe_authorization_owners(&self) -> RouteStateResult<Vec<String>> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(Vec::new());
+        }
+        self.conn
+            .prepare("SELECT DISTINCT owner FROM fence_probe_authorization ORDER BY owner")
+            .map_err(err)?
+            .query_map([], |row| row.get(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<String>>>()
+            .map_err(err)
+    }
+
     /// Preview cleanup without acquiring a writer. The write path checks again
     /// because a runner may start the admission after this snapshot is read.
     pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
@@ -1113,9 +1140,13 @@ impl AccountTx<'_> {
     /// quota interval limits real sends after a provider refused a request, not
     /// reservations; releasing an unused probe restores that budget without
     /// adding a send.
-    pub fn release_expired_admission_probes(&self, now: i64) -> RouteStateResult<()> {
+    /// Returns the admissions it moved from `reserved` to `expired`.
+    pub fn release_expired_admission_probes(
+        &self,
+        now: i64,
+    ) -> RouteStateResult<Vec<(String, String)>> {
         if !enabled(self.conn).map_err(err)? {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let expired = self
             .conn
@@ -1131,11 +1162,42 @@ impl AccountTx<'_> {
             .map_err(err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
+        self.release_admission_probes(expired, now)
+            .map(|released| released.expired)
+    }
+
+    /// Release the probes of unstarted admissions already found expired, each
+    /// given as (principal, admission id, authorization owner).
+    pub fn release_admission_probes(
+        &self,
+        expired: Vec<(String, String, String)>,
+        now: i64,
+    ) -> RouteStateResult<ReleasedAdmissionProbes> {
+        let mut released = ReleasedAdmissionProbes::default();
         if expired.is_empty() {
-            return Ok(());
+            return Ok(released);
         }
         sync(self.conn).map_err(err)?;
         for (principal, admission, owner) in expired {
+            // Only an admission that is still unstarted, in `reserved` or
+            // `expired`, gives up its probe; one that started or closed keeps
+            // its authorization. (`expired` is included because a replay
+            // expires an admission without releasing its probe.) The check
+            // comes first, so nothing changes for an admission that fails it.
+            let unstarted = self
+                .conn
+                .execute(
+                    "UPDATE account_admission SET state = state WHERE principal=?1 \
+                       AND admission_id=?2 AND state IN ('reserved','expired') \
+                       AND started_at IS NULL",
+                    params![principal, admission],
+                )
+                .map_err(err)?
+                == 1;
+            if !unstarted {
+                continue;
+            }
+            released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
             self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
@@ -1146,9 +1208,11 @@ impl AccountTx<'_> {
                       AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
                 params![owner,now]).map_err(err)?;
             self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
-            self.mark_admission_expired(&principal, &admission)?;
+            if self.mark_admission_expired(&principal, &admission)? {
+                released.expired.push((principal, admission));
+            }
         }
-        Ok(())
+        Ok(released)
     }
 
     /// Anonymous decisions may report a credential discovered only at launch.
@@ -1270,9 +1334,13 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    /// A report settles only its launch's exact evidence. Admission owners can
-    /// retire their matching decision copy, but never another run's generation.
-    /// Without an admission, the decision must still own the current claim.
+    /// Settles one run's test request after a successful report. The owner's
+    /// authorization must name the block's exact evidence (the refusal that
+    /// started it) and its current claim generation (which numbered test this
+    /// was). An admission owner may also retire the same test's duplicate
+    /// authorization held under the decision id (`decision_copy`), but never a
+    /// later run's re-claim. With no admission, the decision itself must still
+    /// own the current claim.
     pub(crate) fn heal_report_probe(
         &self,
         owner: &str,

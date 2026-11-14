@@ -121,6 +121,13 @@ async fn observe_success_duplicate_applies_once_even_after_reblock() {
         assert_eq!(replay["id"], first["id"]);
         assert_eq!(replay["duplicate"], true);
         assert_eq!(replay["effects"], json!([]));
+        let mut other_shape = params.clone();
+        if legacy { other_shape.as_object_mut().unwrap().remove("caller"); }
+        else { other_shape["caller"] = json!({"runner":"broca"}); }
+        let replay = observed(&route, &other_shape).await;
+        assert_eq!(replay["id"], first["id"]);
+        assert_eq!(replay["duplicate"], true);
+        assert_eq!(replay["effects"], json!([]));
         credential_block(&h, KEYS[0], NOW as i64 + 1);
         let replay = observed(&route, &params).await;
         assert_eq!(replay["duplicate"], true);
@@ -243,10 +250,123 @@ async fn observe_success_whole_account_probe_preserves_unknown_named_pool() {
     h.store()
         .account_read(|tx| {
             let fences = tx.active_fences(POOL)?;
-            assert_eq!(fences.len(), 2);
-            assert!(fences.iter().any(|fence| fence.fence_id == "named"));
-            assert!(fences.iter().any(|fence| fence.fence_id == sibling_hold));
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].fence_id, "named");
             Ok(())
         })
         .unwrap();
+}
+
+#[tokio::test]
+async fn observe_success_quota_is_shared_by_credentials_but_not_accounts() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let h = paid_anthropic_harness();
+    let credentials = h.credentials();
+    let mut listing = credentials.lock().unwrap();
+    let mut rows = listing.listed_credentials().to_vec();
+    rows.iter_mut()
+        .find(|r| r.id == KEYS[1])
+        .unwrap()
+        .account_id = Some(KEYS[0].into());
+    let mut other = rows.iter().find(|r| r.id == KEYS[0]).unwrap().clone();
+    other.id = "apikey:anthropic:other".into();
+    rows.push(other);
+    listing.apply_listing(
+        &ScopedCredentialListing {
+            view: "shared-quota".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
+    drop(listing);
+    let at = NOW as i64 - 900_001;
+    for account in [KEYS[0], "apikey:anthropic:other"] {
+        let scope = FenceScope::General(GeneralWindow::FiveHour);
+        let fence = Fence {
+            account_id: account.into(),
+            pool: Some(scope.into()),
+            recovery_set: Vec::new(),
+            observed_at_ms: at,
+            reset: ResetTime::Missing,
+            retry_hint_ms: None,
+            source: ConfirmationSource::BrocaAccountLimit,
+        };
+        h.store()
+            .account_transaction(|tx| {
+                tx.insert_fence(&AccountFenceRow {
+                    fence_id: format!("shared/{account}"),
+                    provider: POOL.into(),
+                    account_id: account.into(),
+                    scope_json: serde_json::to_string(&scope).unwrap(),
+                    fence_json: serde_json::to_string(&fence).unwrap(),
+                    source: "broca_limit_exhausted".into(),
+                    observed_at: at,
+                    principal: "reserved:broca".into(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: at,
+                    cleared_at: None,
+                    cleared_reason: None,
+                })
+            })
+            .unwrap();
+    }
+    let route = h.bind(reserved("broca"), None).await;
+    let mut request = single_key_request("shared-quota");
+    request["candidates"]["accounts"][0]["credential_id"] = json!(KEYS[1]);
+    let admitted = result(route.call("route.account_for", &request).await);
+    assert_eq!(admitted["account"]["account_id"], KEYS[0]);
+    assert_eq!(admitted["account"]["credential_id"], KEYS[1]);
+    let mut success = success_observation("shared-quota", true);
+    success["credential_id"] = json!(KEYS[1]);
+    assert!(!observed(&route, &success).await["effects"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    result(
+        route
+            .call("route.account_for", &single_key_request("shared-now-open"))
+            .await,
+    );
+    h.store()
+        .account_read(|tx| {
+            let fences = tx.active_fences(POOL)?;
+            assert_eq!(fences.len(), 1);
+            assert_eq!(fences[0].account_id, "apikey:anthropic:other");
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn observe_success_backoff_probe_heals_exact_credential() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let h = paid_anthropic_harness();
+    for credential in KEYS {
+        h.store()
+            .record_transient_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: POOL.into(),
+                credential_id: credential.into(),
+                model: MODEL.into(),
+                until_ms: NOW as i64 - 1,
+                recorded_at: NOW as i64 - 3_600_001,
+                decision_id: "earlier-refusal".into(),
+            })
+            .unwrap();
+    }
+    let route = h.bind(reserved("broca"), None).await;
+    result(
+        route
+            .call("route.account_for", &single_key_request("backoff-probe"))
+            .await,
+    );
+    let answer = observed(&route, &success_observation("backoff-probe", true)).await;
+    assert!(
+        answer["effects"].to_string().contains("transient_route"),
+        "{answer}"
+    );
+    let origins = h.store().fence_rechecks().unwrap();
+    assert_eq!(origins.len(), 1);
+    assert_eq!(origins[0].credential_id.as_deref(), Some(KEYS[1]));
 }

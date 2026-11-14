@@ -629,11 +629,13 @@ impl AccountTx<'_> {
         id: &str,
         size: u32,
         decision: Option<&str>,
-    ) -> RouteStateResult<()> {
+    ) -> RouteStateResult<bool> {
+        // Returns whether the scope was stored: stores without the
+        // fence-recheck schema have no scope columns.
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
-            return Ok(());
+            return Ok(false);
         }
-        self.conn.execute("UPDATE account_admission SET input_size_class=?3,model_decision_id=?4 WHERE principal=?1 AND admission_id=?2",params![principal,id,size,decision]).map(|_|()).map_err(err)
+        self.conn.execute("UPDATE account_admission SET input_size_class=?3,model_decision_id=?4 WHERE principal=?1 AND admission_id=?2",params![principal,id,size,decision]).map(|changed|changed==1).map_err(err)
     }
 
     pub fn size_admission_for_model_decision(
@@ -646,9 +648,13 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(None);
         }
-        self.conn.query_row("SELECT input_size_class,committed_at FROM account_admission
+        // Keyed exception: a report reaches this after its admission has
+        // usually finished, and closed admissions stay in SQL only. The model
+        // decision id is indexed, so this never scans.
+        note_keyed_exception();
+        self.conn.query_row(&format!("SELECT input_size_class,committed_at FROM account_admission {KEYED_EXCEPTION}
             WHERE model_decision_id=?1 AND provider=?2 AND credential_id=?3 AND model=?4 AND input_size_class IS NOT NULL
-            ORDER BY committed_at DESC LIMIT 1",params![decision,provider,credential,model],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(err)
+            ORDER BY committed_at DESC LIMIT 1"),params![decision,provider,credential,model],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(err)
     }
 
     pub fn admission_size_class(&self, principal: &str, id: &str) -> RouteStateResult<Option<u32>> {
@@ -1308,7 +1314,7 @@ fn admission_from_row(row: &Row<'_>) -> rusqlite::Result<AccountAdmissionRow> {
         pin_id: row.get(10)?,
         pin_generation: to_u64(row.get(11)?),
         state: row.get(12)?,
-        charged: row.get::<_, i64>(13)? != 0,
+        charged: row.get::<_, i64>(13)? == 1,
         request_bytes: to_u64(row.get(14)?),
         request_bytes_estimated: row.get::<_, i64>(15)? != 0,
         committed_at: row.get(16)?,
@@ -1381,31 +1387,32 @@ pub struct AccountTx<'a> {
 }
 
 mod continuation;
+mod state_rows;
+pub use state_rows::*;
 
 impl AccountTx<'_> {
     /// The installation-local salt for hashing conversation keys, created with
     /// `fresh` the first time it is needed and never changed afterwards.
     pub fn salt(&self, now: i64, fresh: impl FnOnce() -> String) -> RouteStateResult<String> {
-        let existing: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT salt FROM account_selection_salt WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(err)?;
+        let existing = self.existing_salt()?;
         if let Some(salt) = existing {
             return Ok(salt);
         }
         let salt = fresh();
+        self.insert_selection_salt(&salt, now)?;
+        Ok(salt)
+    }
+
+    /// Persist the module's first salt. The owning command decides whether it
+    /// is absent; this writer never reads the module's working state.
+    pub fn insert_selection_salt(&self, salt: &str, now: i64) -> RouteStateResult<()> {
         self.conn
             .execute(
                 "INSERT INTO account_selection_salt (singleton, salt, created_at) VALUES (1, ?1, ?2)",
                 params![salt, now],
             )
             .map_err(err)?;
-        Ok(salt)
+        Ok(())
     }
 
     pub fn insert_decision(&self, row: &AccountDecisionRecord) -> RouteStateResult<()> {
@@ -2268,16 +2275,29 @@ impl SqliteRouteStateStore {
             self.store.is_projection(),
             "live account writes require a writer command"
         );
-        self.store
+        #[cfg_attr(
+            not(any(test, feature = "test-support")),
+            allow(unused_variables, unused_assignments, unused_mut)
+        )]
+        let mut wrote = false;
+        let result = self
+            .store
             .with_conn(|conn: &Connection| {
+                let before = conn.total_changes();
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if result.is_ok() {
                     crate::evaluation_snapshot::timed_commit(tx)?;
+                    wrote = conn.total_changes() != before;
                 }
                 Ok(result)
             })
-            .map_err(err)?
+            .map_err(err)?;
+        #[cfg(any(test, feature = "test-support"))]
+        if wrote {
+            self.reload_account_state_after_direct_write()?;
+        }
+        result
     }
 
     /// Revalidate a read-path repair under the IMMEDIATE writer. A competing
@@ -2288,16 +2308,21 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<bool>,
     ) -> RouteStateResult<()> {
-        self.store
+        let result = self
+            .store
             .with_conn(|conn: &Connection| {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx { conn: &tx });
                 if matches!(result, Ok(true)) {
                     crate::evaluation_snapshot::timed_commit(tx)?;
                 }
-                Ok(result.map(|_| ()))
+                Ok(result)
             })
-            .map_err(err)?
+            .map_err(err)??;
+        if result {
+            self.reload_account_state_after_direct_write()?;
+        }
+        Ok(())
     }
 
     /// The newest decisions recorded in `mode`, newest first.

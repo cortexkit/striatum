@@ -7,6 +7,22 @@ use std::time::Instant;
 
 const MAX_BATCH: usize = 32;
 
+/// Error text a module command returns when SQL changed a different number of
+/// rows than its working state expected. The writer then rolls the whole batch
+/// back, reloads the state and runs the batch once more (see `write_batch`).
+pub const STATE_DIVERGED: &str = "account state diverged from SQL";
+
+/// How a batch ended.
+#[derive(Debug, PartialEq, Eq)]
+enum BatchOutcome {
+    Committed,
+    /// Only the startup barrier ran: nothing to commit or publish.
+    Barrier,
+    /// A command found the working state disagreeing with SQL. Every command
+    /// in the batch was rolled back and the working state dropped.
+    Diverged(String),
+}
+
 impl AccountTx<'_> {
     pub(crate) fn pool_sql<T>(
         &self,
@@ -33,6 +49,12 @@ impl AccountTx<'_> {
     pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
+        self.sync_fence_rechecks()
+    }
+
+    /// The part of a Tick that synchronizes fence rechecks, for a caller that
+    /// applies the admission and continuation expiries itself.
+    pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
         crate::fence_rechecks::sync(self.conn).map_err(err)
     }
 }
@@ -40,17 +62,50 @@ impl AccountTx<'_> {
 fn write_batch(
     conn: &Connection,
     batch: &mut [Queued],
+    state: &mut Option<Box<dyn crate::AccountWorkingState>>,
     #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
-) -> rusqlite::Result<()> {
+) -> rusqlite::Result<BatchOutcome> {
+    // Startup must not manufacture a write transaction or a second publication.
+    // The loader already published its consistent read before this barrier runs.
+    if batch.iter().all(|queued| queued.initialize_only) {
+        for queued in batch {
+            queued
+                .command
+                .run(
+                    &AccountTx { conn },
+                    state
+                        .as_mut()
+                        .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
+                )
+                .expect("initialization barrier cannot fail");
+        }
+        return Ok(BatchOutcome::Barrier);
+    }
     #[cfg(any(test, feature = "test-support"))]
     let _batch = evaluation_snapshot::AccountBatchGuard::enter();
     let transaction = crate::write_transaction(conn)?;
     #[cfg(any(test, feature = "test-support"))]
     transactions.fetch_add(1, Ordering::Relaxed);
-    for queued in batch {
+    for queued in batch.iter_mut() {
         conn.execute_batch("SAVEPOINT account_command")?;
-        let status = queued.command.run(&AccountTx { conn });
+        let before = state.as_ref().map(|state| state.fork());
+        let status = queued.command.run(
+            &AccountTx { conn },
+            state
+                .as_mut()
+                .map(|state| &mut **state as &mut dyn crate::AccountWorkingState),
+        );
         if let Err(error) = status {
+            *state = before;
+            // The command found its working state disagreeing with SQL. The
+            // commands before it in this batch computed from the same state,
+            // so their replies may be stale too: undo the whole batch and drop
+            // the state. The caller reloads it and runs the batch again.
+            if error.to_string().contains(STATE_DIVERGED) {
+                *state = None;
+                transaction.rollback()?;
+                return Ok(BatchOutcome::Diverged(error.to_string()));
+            }
             // A full rollback requested by a SQLite trigger, disk-full and
             // I/O failures can destroy the
             // transaction, including savepoints. Never run a sibling in
@@ -68,7 +123,53 @@ fn write_batch(
     }
     #[cfg(any(test, feature = "test-support"))]
     crash_for_test("before_commit");
-    evaluation_snapshot::timed_commit(transaction)
+    evaluation_snapshot::timed_commit(transaction).map(|()| BatchOutcome::Committed)
+}
+
+/// Run a batch on a state loaded for it. If a command finds the state
+/// disagreeing with SQL, nothing of the batch was committed and every command
+/// is deterministic in its inputs, the stored rows and the state: reload the
+/// state and run the whole batch once more, so every caller gets an answer
+/// computed from current rows. A second disagreement fails the whole batch;
+/// the next batch loads afresh.
+fn run_batch(
+    conn: &Connection,
+    batch: &mut [Queued],
+    state: &mut crate::account_state::WriterAccountState,
+    #[cfg(any(test, feature = "test-support"))] transactions: &AtomicU64,
+) -> Result<bool, String> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        if let Err(error) = state.refresh(conn) {
+            return Err(format!("load account state: {error}"));
+        }
+        let outcome = write_batch(
+            conn,
+            batch,
+            &mut state.working,
+            #[cfg(any(test, feature = "test-support"))]
+            transactions,
+        );
+        match outcome {
+            Ok(BatchOutcome::Committed) => {
+                state.publish();
+                return Ok(true);
+            }
+            Ok(BatchOutcome::Barrier) => return Ok(false),
+            Ok(BatchOutcome::Diverged(error)) => {
+                state.invalidate();
+                if attempts == 2 {
+                    return Err(error);
+                }
+                tracing::warn!(%error, "account state diverged; reloading and running the batch again");
+            }
+            Err(error) => {
+                state.invalidate();
+                return Err(error.to_string());
+            }
+        }
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -97,12 +198,16 @@ fn stopped() -> RouteStateStoreError {
 }
 
 trait Command: Send {
-    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()>;
+    fn run(
+        &mut self,
+        tx: &AccountTx<'_>,
+        state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+    ) -> RouteStateResult<()>;
     fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming);
 }
 
 struct TypedCommand<F, T> {
-    run: Option<F>,
+    run: F,
     result: Option<RouteStateResult<T>>,
     reply: mpsc::Sender<RouteStateResult<T>>,
     timing: Arc<Mutex<StoreStageTiming>>,
@@ -110,11 +215,21 @@ struct TypedCommand<F, T> {
 
 impl<F, T> Command for TypedCommand<F, T>
 where
-    F: FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send,
+    F: FnMut(
+            &AccountTx<'_>,
+            Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+        ) -> RouteStateResult<T>
+        + Send,
     T: Send,
 {
-    fn run(&mut self, tx: &AccountTx<'_>) -> RouteStateResult<()> {
-        let result = self.run.take().expect("command runs once")(tx);
+    fn run(
+        &mut self,
+        tx: &AccountTx<'_>,
+        state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+    ) -> RouteStateResult<()> {
+        // A batch that is run again (see `run_batch`) runs each command again;
+        // only the last run's result is replied.
+        let result = (self.run)(tx, state);
         let status = result.as_ref().map(|_| ()).map_err(err);
         self.result = Some(result);
         status
@@ -134,6 +249,7 @@ where
 
 struct Queued {
     enqueued: Instant,
+    initialize_only: bool,
     command: Box<dyn Command>,
 }
 
@@ -168,6 +284,7 @@ pub(crate) struct AccountWriter {
 impl AccountWriter {
     fn start(
         store: Arc<evaluation_snapshot::ConnectionStore>,
+        bridge: Arc<std::sync::OnceLock<Arc<dyn crate::AccountStateBridge>>>,
         #[cfg(any(test, feature = "test-support"))] transactions: Arc<AtomicU64>,
         exit: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -182,55 +299,68 @@ impl AccountWriter {
         let spawn = std::thread::Builder::new()
             .name("account-writer".into())
             .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    while let Ok(first) = receiver.recv() {
-                        let mut batch = vec![first];
-                        // No linger: an idle writer begins immediately. After a
-                        // commit, drain only commands already queued, up to 32.
-                        while batch.len() < MAX_BATCH {
-                            match receiver.try_recv() {
-                                Ok(command) => batch.push(command),
-                                Err(_) => break,
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                    || -> RouteStateResult<()> {
+                        let mut state = crate::account_state::WriterAccountState::new(bridge);
+                        while let Ok(first) = receiver.recv() {
+                            let mut batch = vec![first];
+                            // No linger: an idle writer begins immediately. After a
+                            // commit, drain only commands already queued, up to 32.
+                            while batch.len() < MAX_BATCH {
+                                match receiver.try_recv() {
+                                    Ok(command) => batch.push(command),
+                                    Err(_) => break,
+                                }
+                            }
+                            let started = Instant::now();
+                            #[cfg(any(test, feature = "test-support"))]
+                            if batch.iter().any(|queued| !queued.initialize_only) {
+                                sizes.lock().unwrap().push(batch.len());
+                            }
+                            for command in &batch {
+                                store.record_command_wait(
+                                    started.duration_since(command.enqueued).as_nanos() as u64,
+                                );
+                            }
+                            let before = SqliteRouteStateStore::thread_stage_timing();
+                            // A failed state load or connection fails this batch
+                            // only: its callers get the error, the writer keeps
+                            // running, and the next batch loads again. Exiting
+                            // here would turn one bad read into a restart loop.
+                            let result: Result<bool, String> = store
+                                .with_conn(|conn| {
+                                    Ok(run_batch(
+                                        conn,
+                                        &mut batch,
+                                        &mut state,
+                                        #[cfg(any(test, feature = "test-support"))]
+                                        &transactions,
+                                    ))
+                                })
+                                .unwrap_or_else(|error| Err(error.to_string()));
+                            let after = SqliteRouteStateStore::thread_stage_timing();
+                            let timing = StoreStageTiming {
+                                writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
+                                sql_ns: after.sql_ns - before.sql_ns,
+                                commit_ns: after.commit_ns - before.commit_ns,
+                            };
+                            #[cfg(any(test, feature = "test-support"))]
+                            if matches!(result, Ok(true)) {
+                                crash_for_test("after_commit");
+                            }
+                            let failure = result.err();
+                            for queued in batch {
+                                queued.command.publish(failure.as_deref(), timing);
                             }
                         }
-                        let started = Instant::now();
-                        #[cfg(any(test, feature = "test-support"))]
-                        sizes.lock().unwrap().push(batch.len());
-                        for command in &batch {
-                            store.record_command_wait(
-                                started.duration_since(command.enqueued).as_nanos() as u64,
-                            );
-                        }
-                        let before = SqliteRouteStateStore::thread_stage_timing();
-                        let result = store.with_conn(|conn| {
-                            write_batch(
-                                conn,
-                                &mut batch,
-                                #[cfg(any(test, feature = "test-support"))]
-                                &transactions,
-                            )
-                        });
-                        let after = SqliteRouteStateStore::thread_stage_timing();
-                        let timing = StoreStageTiming {
-                            writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
-                            sql_ns: after.sql_ns - before.sql_ns,
-                            commit_ns: after.commit_ns - before.commit_ns,
-                        };
-                        #[cfg(any(test, feature = "test-support"))]
-                        if result.is_ok() {
-                            crash_for_test("after_commit");
-                        }
-                        let failure = result.err().map(|error| error.to_string());
-                        for queued in batch {
-                            queued.command.publish(failure.as_deref(), timing);
-                        }
-                    }
-                }));
+                        Ok(())
+                    },
+                ));
                 drop(receiver);
                 // Dropping receiver and any in-flight batch wakes every blocked
                 // caller even if a command panicked before producing a result.
                 thread_dead.store(true, Ordering::Release);
-                if result.is_err() {
+                if !matches!(result, Ok(Ok(()))) {
                     thread_exit();
                 }
             });
@@ -257,7 +387,25 @@ impl AccountWriter {
 
     fn enqueue<T: Send + 'static>(
         &self,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        f: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_inner(f, false)
+    }
+
+    pub(crate) fn enqueue_inner<T: Send + 'static>(
+        &self,
+        f: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
+        initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T>> {
         if self.dead.load(Ordering::Acquire) {
             return Err(stopped());
@@ -269,8 +417,9 @@ impl AccountWriter {
             .expect("writer sender exists until drop")
             .send(Queued {
                 enqueued: Instant::now(),
+                initialize_only,
                 command: Box::new(TypedCommand {
-                    run: Some(f),
+                    run: f,
                     result: None,
                     reply,
                     timing: timing.clone(),
@@ -294,19 +443,17 @@ impl Drop for AccountWriter {
 }
 
 impl SqliteRouteStateStore {
-    pub fn enqueue_account_command<T: Send + 'static>(
-        &self,
-        kind: AccountCommandKind,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
-    ) -> RouteStateResult<AccountReply<T>> {
-        if self.store.is_projection() {
-            return Err(err(
-                "private projections cannot enqueue account writer commands",
-            ));
-        }
-        let writer = self.account_writer.get_or_init(|| {
+    pub(crate) fn initialize_account_writer_state(&self) -> RouteStateResult<()> {
+        self.account_writer_engine()
+            .enqueue_inner(|_, _| Ok(()), true)?
+            .wait()
+    }
+
+    pub(crate) fn account_writer_engine(&self) -> &AccountWriter {
+        self.account_writer.get_or_init(|| {
             AccountWriter::start(
                 self.store.clone(),
+                self.account_state.clone(),
                 #[cfg(any(test, feature = "test-support"))]
                 self.account_write_transactions.clone(),
                 Arc::new(|| {
@@ -315,17 +462,45 @@ impl SqliteRouteStateStore {
                     std::process::exit(1);
                 }),
             )
-        });
+        })
+    }
+
+    pub fn enqueue_account_command<T: Send + 'static>(
+        &self,
+        kind: AccountCommandKind,
+        mut f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_account_state_command(kind, move |tx, _| f(tx))
+    }
+
+    /// The store transports opaque module-owned state only. Domain computation
+    /// belongs to the callback; SQL helpers do not inspect the working copy.
+    pub fn enqueue_account_state_command<T: Send + 'static>(
+        &self,
+        kind: AccountCommandKind,
+        mut f: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> RouteStateResult<T>
+            + Send
+            + 'static,
+    ) -> RouteStateResult<AccountReply<T>> {
+        if self.store.is_projection() {
+            return Err(err(
+                "private projections cannot enqueue account writer commands",
+            ));
+        }
+        let writer = self.account_writer_engine();
         #[cfg(any(test, feature = "test-support"))]
         let inputs = crate::replay::current();
         #[cfg(any(test, feature = "test-support"))]
         let command_changes = writer.command_changes.clone();
-        let reply = writer.enqueue(move |tx| {
+        let reply = writer.enqueue(move |tx, state| {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
             #[cfg(any(test, feature = "test-support"))]
             let before = evaluation_snapshot::account_rows_changed();
-            let result = f(tx);
+            let result = f(tx, state);
             #[cfg(any(test, feature = "test-support"))]
             command_changes
                 .lock()
@@ -343,7 +518,7 @@ impl SqliteRouteStateStore {
     pub fn account_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
-        f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
+        f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<T> {
         if self.store.is_projection() {
             return self.projection_command(f);

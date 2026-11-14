@@ -77,6 +77,25 @@ pub(crate) struct RequestFixture {
 }
 
 impl RequestFixture {
+    pub(crate) async fn account_request(
+        &self,
+        admission_id: &str,
+    ) -> (subc_protocol::FrameType, Value) {
+        let runner = self
+            .harness
+            .bind(reserved(&self.catalog.runners[0].module), None)
+            .await;
+        runner
+            .call(
+                "route.account_for",
+                &json!({
+                    "provider": "cpu-provider-0", "model": "model-0",
+                    "conversation_key": admission_id, "admission_id": admission_id,
+                }),
+            )
+            .await
+    }
+
     pub(crate) fn edit_config(&self, edit: impl FnOnce(&mut Value)) {
         self.harness.edit_config(edit);
     }
@@ -611,6 +630,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     {
         samples.print(name);
     }
+    crate::account_state::report_admission_state(harness.store());
     if std::env::var_os("STRIATUM_CPU_WAL_TICKS").is_some() {
         println!(
             "reader_cache_cost added_us/checkout=0 added_us/request=0 configuration=open_only"

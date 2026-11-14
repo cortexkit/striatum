@@ -41,7 +41,54 @@ impl SqliteRouteStateStore {
         failed: bool,
         effects: &V1ReportEffects,
         usage: Option<&V1ReportUsage>,
-        reconcile: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        reconcile: impl FnMut(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        now: i64,
+    ) -> RouteStateResult<Option<V1Recorded>> {
+        // Its continuation use runs SQL alone; the module reports through
+        // `v1_commit_report_with_continuation` with its state.
+        self.refuse_state_blind_admission_write("v1_commit_report")?;
+        self.v1_commit_report_with_continuation(
+            decision_id,
+            delivery_key,
+            report_id,
+            recorded,
+            outcome,
+            error,
+            failed,
+            effects,
+            usage,
+            reconcile,
+            |account, _, decision_id, now| account.use_continuation(decision_id, now),
+            now,
+        )
+    }
+
+    /// As [`Self::v1_commit_report`], with the first accepted report's
+    /// continuation use delegated to `use_continuation`. It receives the
+    /// writer's opaque working state, so the module can keep its in-memory
+    /// admission state in step with the rows that use changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn v1_commit_report_with_continuation(
+        &self,
+        decision_id: &str,
+        delivery_key: &str,
+        report_id: &str,
+        recorded: &V1Recorded,
+        outcome: RouteOutcome,
+        error: Option<&str>,
+        failed: bool,
+        effects: &V1ReportEffects,
+        usage: Option<&V1ReportUsage>,
+        // Both may run again if the writer re-runs the report's batch.
+        mut reconcile: impl FnMut(&AccountTx<'_>) -> RouteStateResult<()> + Send + 'static,
+        mut use_continuation: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+                &str,
+                i64,
+            ) -> RouteStateResult<()>
+            + Send
+            + 'static,
         now: i64,
     ) -> RouteStateResult<Option<V1Recorded>> {
         let decision_id = decision_id.to_owned();
@@ -51,7 +98,8 @@ impl SqliteRouteStateStore {
         let error = error.map(str::to_owned);
         let effects = effects.clone();
         let usage = usage.cloned();
-        let result = self.account_command(AccountCommandKind::Report, move |account| {
+        let mut command = move |account: &AccountTx<'_>,
+                            state: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
             let decision_id = decision_id.as_str();
             let delivery_key = delivery_key.as_str();
             let report_id = report_id.as_str();
@@ -91,7 +139,7 @@ impl SqliteRouteStateStore {
             )? == 1;
             if first {
                 let account = AccountTx { conn: &tx };
-                account.use_continuation(decision_id, now).map_err(sql_error)?;
+                use_continuation(&account, state, decision_id, now).map_err(sql_error)?;
                 let settle = account.probe_report_matches(
                     decision_id, effects.reported_credential.as_deref(), effects.preserve_probe).map_err(sql_error)?;
                 if settle { apply_account_effects(&account, effects, now)?; }
@@ -113,8 +161,11 @@ impl SqliteRouteStateStore {
                 }
                 report_outcome(&tx, decision_id, outcome, error, now)?;
             }
-            // Decisions can seat several runs. Delivery deduplication, not the
-            // first decision outcome, owns each run's successful probe settlement.
+            // Core reuses one decision for several runs (Athena seats, mason
+            // retries), and each run reports separately under a `run:` delivery
+            // key. Each new delivery settles that run's own test request, so
+            // healing keys on the delivery rather than on the decision's first
+            // recorded outcome.
             if outcome == RouteOutcome::Completed && !effects.preserve_probe {
                 account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
                     .map_err(sql_error)?;
@@ -124,7 +175,15 @@ impl SqliteRouteStateStore {
             report_crash("before_commit");
             Ok((Some(recorded.clone()), usage.is_some()))
             })().map_err(err)
-        })?;
+        };
+        let result = if self.is_account_evaluation_projection() {
+            self.account_command(AccountCommandKind::Report, move |account| {
+                command(account, None)
+            })?
+        } else {
+            self.enqueue_account_state_command(AccountCommandKind::Report, command)?
+                .wait()?
+        };
         #[cfg(test)]
         report_crash("after_commit");
         // The only in-memory change is a cache invalidation, after commit.
@@ -141,24 +200,21 @@ impl AccountTx<'_> {
     pub fn heal_admission_success(
         &self,
         admission: &AccountAdmissionRow,
+        size: Option<u32>,
+        decision: Option<&str>,
         scope: Option<&crate::QuotaSuccessScope>,
         now: i64,
     ) -> RouteStateResult<Vec<crate::FenceRecheck>> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(Vec::new());
         }
-        let size = self.admission_size_class(&admission.principal, &admission.admission_id)?;
         let owner = serde_json::json!([
             "account_admission",
             admission.principal,
             admission.admission_id
         ])
         .to_string();
-        let decision: Option<String> = self.conn.query_row(
-            "SELECT model_decision_id FROM account_admission WHERE principal=?1 AND admission_id=?2",
-            params![admission.principal, admission.admission_id], |row| row.get(0),
-        ).map_err(err)?;
-        let mut origins: Vec<_> = self
+        let origins: Vec<_> = self
             .fence_rechecks()?
             .into_iter()
             .filter(|origin| {
@@ -180,24 +236,6 @@ impl AccountTx<'_> {
                         .is_none_or(|class| Some(class as u32) == size)
             })
             .collect();
-        // Credential-quota holds are materialized as account fences, whose
-        // origin view has no credential column. The fence id retains the provider
-        // and credential id, so a sibling credential's hold must be excluded here.
-        let credential_prefix = format!(
-            "credential-quota:{}:",
-            serde_json::json!([admission.provider, admission.credential_id])
-        );
-        origins.retain(|origin| {
-            if origin.kind != "account" {
-                return true;
-            }
-            serde_json::from_str::<Vec<serde_json::Value>>(&origin.origin_key)
-                .ok()
-                .and_then(|key| key.first().and_then(|id| id.as_str()).map(str::to_owned))
-                .is_some_and(|id| {
-                    !id.starts_with("credential-quota:") || id.starts_with(&credential_prefix)
-                })
-        });
         // An admission authorized to test a whole-account fence can clear that
         // fence without a quota reading. Pool-scoped fences additionally require
         // the success scope to cover their pool and model.
@@ -225,7 +263,7 @@ impl AccountTx<'_> {
         }
         self.heal_report_probe(
             &owner,
-            decision.as_deref(),
+            decision,
             true,
             &admission.model,
             admission.committed_at,
@@ -277,20 +315,7 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT principal,admission_id FROM account_admission
-             WHERE model_decision_id=?1 AND run_id=?2 LIMIT 2",
-            )
-            .map_err(err)?;
-        let admissions = statement
-            .query_map(params![decision, run], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(err)?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(err)?;
+        let admissions = self.admissions_for_run(decision, run)?;
         if admissions.len() > 1 {
             tracing::warn!(
                 decision,
@@ -299,13 +324,7 @@ impl AccountTx<'_> {
             );
             return Ok(());
         }
-        if let Some((principal, id)) = admissions.first() {
-            // Read in the same transaction as the lookup above, so the row is
-            // there; still, a missing row heals nothing rather than panicking
-            // the writer.
-            let Some(admission) = self.admission(principal, id)? else {
-                return Ok(());
-            };
+        if let Some((admission, size)) = admissions.into_iter().next() {
             if effects
                 .reported_credential
                 .as_deref()
@@ -318,7 +337,13 @@ impl AccountTx<'_> {
                 );
                 return Ok(());
             }
-            self.heal_admission_success(&admission, effects.quota_scope.as_ref(), now)?;
+            self.heal_admission_success(
+                &admission,
+                size,
+                Some(decision),
+                effects.quota_scope.as_ref(),
+                now,
+            )?;
         } else {
             // A decision without an account admission still owns its selection
             // probe. The decision clock is the conservative launch bound when
@@ -349,10 +374,12 @@ impl AccountTx<'_> {
                 // Only the first report may heal older matching serving evidence
                 // without a probe authorization. If this decision held one (a
                 // `fence_probe_authorization` row it owns), only
-                // `heal_report_probe` above may settle it: that requires the
-                // authorization's exact evidence and claim generation, claimed
-                // no later than the decision's creation. Ordinary serving
-                // recovery must not bypass those checks.
+                // `heal_report_probe` above may settle it. That requires the row's
+                // evidence (the refusal that started the block) and its claim
+                // generation (which numbered test request this was) to still match
+                // the block's recheck row, with the claim made no later than the
+                // decision's creation. Ordinary serving recovery must not bypass
+                // those checks.
                 if authorized || !first {
                     return Ok(());
                 }

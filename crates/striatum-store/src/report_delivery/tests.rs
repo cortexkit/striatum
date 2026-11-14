@@ -329,7 +329,7 @@ fn commit(
         move |tx| {
             tx.insert_pool_fence(&AccountPoolFenceRow {
                 evidence: AccountFenceRow {
-                    fence_id,
+                    fence_id: fence_id.clone(),
                     provider: "example".into(),
                     account_id: "account".into(),
                     scope_json: "null".into(),

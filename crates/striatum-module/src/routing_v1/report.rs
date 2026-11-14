@@ -145,7 +145,7 @@ pub(super) fn report_at(
     let config = super::operator_config(deps);
     let standing = deps
         .store
-        .v1_commit_report(
+        .v1_commit_report_with_continuation(
             &request.decision_id,
             &delivery_key,
             &report_id,
@@ -180,6 +180,9 @@ pub(super) fn report_at(
                     )?;
                 }
                 Ok(())
+            },
+            |tx, state, decision, now| {
+                crate::account_state::AccountCommand::new(tx, state).use_continuation(decision, now)
             },
             now as i64,
         )

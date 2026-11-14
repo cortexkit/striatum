@@ -260,7 +260,7 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
         request.conversation_key = scope.reference.clone();
     }
     let principal = authority.recorded_principal();
-    let mut hold_wait_max_s = request
+    let hold_wait_max_s = request
         .hold_wait_max_s
         .unwrap_or(account_selection::DEFAULT_HOLD_WAIT_S);
     // The whole body with defaults applied: two bodies that differ only in a
@@ -274,105 +274,129 @@ fn account_for_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result
     {
         return replay_admission(first, &body_json, &request, &authority, deps);
     }
-    let mut bound_tier = None;
-    let mut engine_decision = false;
-    if let Some(decision_id) = &request.decision_id {
-        checking("decision_binding");
-        // Honoured only from the runner the decision named, for the model it
-        // named; anything else is refused as if the decision never existed.
-        let decision = deps
-            .store
-            .v1_decision(decision_id)
-            .map_err(store_unavailable)?;
-        engine_decision =
-            super::engines::is_decision(deps, decision_id).map_err(store_unavailable)?;
-        if !decision.is_some_and(|decision| {
-            caller.attested_module() == Some(decision.runner_module.as_str())
-                && same_name(&decision.provider, &request.provider)
-                && same_name(&decision.model, &request.model)
-                && (!engine_decision || super::engines::now(deps) < decision.expires_at_ms as u64)
-        }) {
-            return Err(because("unknown_decision", Refusal::unknown_decision()));
-        }
-        bound_tier = deps
-            .store
-            .decision_service_tier(decision_id)
-            .map_err(store_unavailable)?
-            .map(|(tier, _)| tier);
-        if bound_tier.as_deref().is_some_and(|tier| {
-            !check_chosen(
-                request.service_tier.or_else(|| ServiceTier::parse(tier)),
-                Some(tier),
-            )
-        }) {
-            checking("bound_service_tier");
-            return Err(account_unavailable(
-                "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.",
-            ));
-        }
-        if let Some(input) = deps
-            .store
-            .get_decision_by_id(decision_id)
-            .map_err(store_unavailable)?
-        {
-            let input: Value =
-                serde_json::from_str(&input.requirements_json).map_err(store_unavailable)?;
-            if let Some(cap) = input["hold_wait_max_s"].as_u64() {
-                hold_wait_max_s = hold_wait_max_s.min(cap);
+    #[cfg(test)]
+    account_selection::run_after_roster_hook(&format!("v1-replay-checked:{}", request.admission_id));
+    // Every refusal from here on was decided without the admission record: an
+    // identical request may have committed this admission id since the check
+    // above. Look again before refusing, and answer as that admission did.
+    let attempt = (|| -> Result<Value, Refusal> {
+        let request = request.clone();
+        let principal = principal.clone();
+        let body_json = body_json.clone();
+        let mut hold_wait_max_s = hold_wait_max_s;
+        let mut bound_tier = None;
+        let mut engine_decision = false;
+        if let Some(decision_id) = &request.decision_id {
+            checking("decision_binding");
+            // Honoured only from the runner the decision named, for the model it
+            // named; anything else is refused as if the decision never existed.
+            let decision = deps
+                .store
+                .v1_decision(decision_id)
+                .map_err(store_unavailable)?;
+            engine_decision =
+                super::engines::is_decision(deps, decision_id).map_err(store_unavailable)?;
+            if !decision.is_some_and(|decision| {
+                caller.attested_module() == Some(decision.runner_module.as_str())
+                    && same_name(&decision.provider, &request.provider)
+                    && same_name(&decision.model, &request.model)
+                    && (!engine_decision || super::engines::now(deps) < decision.expires_at_ms as u64)
+            }) {
+                return Err(because("unknown_decision", Refusal::unknown_decision()));
+            }
+            bound_tier = deps
+                .store
+                .decision_service_tier(decision_id)
+                .map_err(store_unavailable)?
+                .map(|(tier, _)| tier);
+            if bound_tier.as_deref().is_some_and(|tier| {
+                !check_chosen(
+                    request.service_tier.or_else(|| ServiceTier::parse(tier)),
+                    Some(tier),
+                )
+            }) {
+                checking("bound_service_tier");
+                return Err(account_unavailable(
+                    "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.",
+                ));
+            }
+            if let Some(input) = deps
+                .store
+                .get_decision_by_id(decision_id)
+                .map_err(store_unavailable)?
+            {
+                let input: Value =
+                    serde_json::from_str(&input.requirements_json).map_err(store_unavailable)?;
+                if let Some(cap) = input["hold_wait_max_s"].as_u64() {
+                    hold_wait_max_s = hold_wait_max_s.min(cap);
+                }
             }
         }
-    }
 
-    let parsed = account_selection::AccountForParams::from_v1(
-        &request,
-        authority.admission_key(&request.admission_id),
-        authority.module.to_owned(),
-        hold_wait_max_s,
-        params,
-    )
-    .map_err(op_refusal)?;
-    let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-    let policy =
-        config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
-    // The shared context reports a store failure; for `account_for` that is
-    // transient unavailability, not the open `store_error` code.
-    checking("account_context");
-    let mut ctx = account_ctx(deps, flags, &policy)
-        .map_err(|refusal| account_unavailable(refusal.message))?;
-    if engine_decision || media_caller {
-        let credentials = deps.broca_credentials.lock().map_err(store_unavailable)?;
-        if !credentials.media_listing_ready(now_ms()) {
-            return Err(super::provider_refusal(
-                "account_selection_unavailable",
-                "Routing can't read the media-provider credential list right now: its listing grant is missing or the last listing is stale or failed. Retry shortly; if it persists, the vault's media-provider list grant for routing needs checking.",
-            ));
+        let parsed = account_selection::AccountForParams::from_v1(
+            &request,
+            authority.admission_key(&request.admission_id),
+            authority.module.to_owned(),
+            hold_wait_max_s,
+            params,
+        )
+        .map_err(op_refusal)?;
+        let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
+        let policy =
+            config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
+        // A store failure while building the shared context is reported by
+        // `account_for` as transient unavailability, which callers retry,
+        // rather than as a `store_error` refusal.
+        checking("account_context");
+        let mut ctx = account_ctx(deps, flags, &policy)
+            .map_err(|refusal| account_unavailable(refusal.message))?;
+        if engine_decision || media_caller {
+            let credentials = deps.broca_credentials.lock().map_err(store_unavailable)?;
+            if !credentials.media_listing_ready(now_ms()) {
+                return Err(super::provider_refusal(
+                    "account_selection_unavailable",
+                    "Routing can't read the media-provider credential list right now: its listing grant is missing or the last listing is stale or failed. Retry shortly; if it persists, the vault's media-provider list grant for routing needs checking.",
+                ));
+            }
+            if !credentials
+                .listed_credentials()
+                .iter()
+                .any(|row| crate::account_selection::media_credential_serves(row, &request.provider))
+            {
+                return Err(super::provider_refusal(
+                    "auth_required",
+                    "No active API key in the vault's media-provider category serves this engine's provider. Add or enable one before using this engine.",
+                ));
+            }
+            drop(credentials);
+            ctx.classes
+                .as_mut()
+                .ok_or_else(|| account_unavailable("Routing's account context isn't loaded yet, so it can't choose a media account. Retry shortly."))?
+                .for_engine(&request.provider, &request.model)
+                .map_err(store_unavailable)?;
         }
-        if !credentials
-            .listed_credentials()
-            .iter()
-            .any(|row| crate::account_selection::media_credential_serves(row, &request.provider))
-        {
-            return Err(super::provider_refusal(
-                "auth_required",
-                "No active API key in the vault's media-provider category serves this engine's provider. Add or enable one before using this engine.",
-            ));
+        let record = AdmissionRecord {
+            principal,
+            request,
+            body_json,
+            bound_tier,
+        };
+        match account_selection::account_for_parsed(parsed, &authority.principal, &ctx, Some(record)) {
+            OpReply::Result(result) => Ok(result),
+            error => Err(op_refusal(error)),
         }
-        drop(credentials);
-        ctx.classes
-            .as_mut()
-            .ok_or_else(|| account_unavailable("Routing's account context isn't loaded yet, so it can't choose a media account. Retry shortly."))?
-            .for_engine(&request.provider, &request.model)
-            .map_err(store_unavailable)?;
-    }
-    let record = AdmissionRecord {
-        principal,
-        request,
-        body_json,
-        bound_tier,
+    })();
+    let refusal = match attempt {
+        Ok(answer) => return Ok(answer),
+        Err(refusal) => refusal,
     };
-    match account_selection::account_for_parsed(parsed, &authority.principal, &ctx, Some(record)) {
-        OpReply::Result(result) => Ok(result),
-        error => Err(op_refusal(error)),
+    match deps
+        .store
+        .v1_admission(&principal, &request.admission_id)
+        .map_err(store_unavailable)?
+    {
+        Some(first) => replay_admission(first, &body_json, &request, &authority, deps),
+        None => Err(refusal),
     }
 }
 
@@ -553,7 +577,12 @@ fn replay_admission(
         striatum_store::AccountCommandKind::Replay,
         move |tx| {
             Ok(replay_admission_tx(
-                tx, first, &body_json, &request, &principal, &id,
+                tx,
+                first.clone(),
+                &body_json,
+                &request,
+                &principal,
+                &id,
             ))
         },
     )
@@ -561,7 +590,7 @@ fn replay_admission(
 }
 
 fn replay_admission_tx(
-    tx: &striatum_store::AccountTx<'_>,
+    tx: &crate::account_state::AccountCommand<'_>,
     first: V1Recorded,
     body_json: &str,
     request: &AccountForRequest,
@@ -573,8 +602,9 @@ fn replay_admission_tx(
         return Ok(original);
     }
     let current = (|| {
+        // A started admission is open, so the state answers without SQL.
         if !tx
-            .admission(principal, id)?
+            .open_admission(principal, id)?
             .is_some_and(|row| row.state == "started")
         {
             return Ok(None);
