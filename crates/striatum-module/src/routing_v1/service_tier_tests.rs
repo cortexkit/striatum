@@ -634,6 +634,38 @@ async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() 
 }
 
 #[tokio::test]
+async fn account_bound_tier_mismatch_is_a_permanent_invalid_request() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup(&["pro_200"], true, true);
+    let owner = harness.bind(reserved("tier-owner"), None).await;
+    let selected = owner.call("route.select", &select("fast")).await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let decision = selected.1["result"]["decision_id"].clone();
+    assert_eq!(selected.1["result"]["service_tier_chosen"], "fast");
+    let runner = harness.bind(reserved(RUNNER), None).await;
+    let mut request = account_request("tier-mismatch", Some("standard"));
+    request["decision_id"] = decision.clone();
+    let refused = runner.call("route.account_for", &request).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    assert_eq!(refused.1["detail"], json!({
+        "field":"service_tier", "decision_id":decision,
+        "requested_service_tier":"standard", "bound_service_tier":"fast",
+    }));
+    assert_eq!(
+        cortexkit_role_routing::refusals::retry_class("invalid_request", &refused.1["detail"]),
+        cortexkit_role_routing::refusals::RetryClass::Permanent,
+    );
+    assert!(harness.store().v1_admission(&format!("reserved:{RUNNER}"), "tier-mismatch").unwrap().is_none());
+    harness.store().record_service_tier(decision.as_str().unwrap(), "future-tier", &[]).unwrap();
+    let mut unfamiliar = account_request("unfamiliar-recorded-tier", None);
+    unfamiliar["decision_id"] = decision;
+    let refused = runner.call("route.account_for", &unfamiliar).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_selection_unavailable", "{}", refused.1);
+}
+
+#[tokio::test]
 async fn account_service_tier_bound_decision_keeps_exact_tier_or_refuses() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup(&["unknown", "pro_200"], true, true);
@@ -658,7 +690,7 @@ async fn account_service_tier_bound_decision_keeps_exact_tier_or_refuses() {
     lower["decision_id"] = decision.clone();
     let refused = runner.call("route.account_for", &lower).await;
     assert_eq!(
-        refused.1["code"], "account_selection_unavailable",
+        refused.1["code"], "invalid_request",
         "{}",
         refused.1
     );

@@ -38,6 +38,20 @@ fn request() -> Value {
 }
 
 #[tokio::test]
+async fn media_account_continue_is_a_permanent_invalid_mode() {
+    let harness = setup(vec![engine("remote", false)]);
+    let route = harness.bind(reserved("colliculus"), None).await;
+    let refused = route.call("route.account_for", &json!({"mode":"continue"})).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
+    assert_eq!(refused.1["detail"], json!({"field":"mode"}));
+    assert_eq!(
+        cortexkit_role_routing::refusals::retry_class("invalid_request", &refused.1["detail"]),
+        cortexkit_role_routing::refusals::RetryClass::Permanent,
+    );
+}
+
+#[tokio::test]
 async fn decommissioned_media_engine_is_skipped_even_when_it_is_local() {
     for local in [false,true] {
         let harness = setup(vec![engine("retired",local)]);
