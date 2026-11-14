@@ -3,6 +3,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::account_classes_tests::setup;
@@ -23,10 +24,37 @@ async fn capture(stem: &str) -> Sample {
     let _clock = crate::InjectedClock::set(START);
     let _ids = striatum_store::replay::Inputs::new(START as i64).install();
     let (harness, _) = setup("synthetic", false);
+    if stem == "basal-flow-select" {
+        // The shared harness seeds a larger catalog; none of it belongs in this
+        // publicly pinned Basal sample.
+        let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+        conn.execute(
+            "DELETE FROM model_facts WHERE route_key != ?1",
+            ["synthetic/model"],
+        )
+        .unwrap();
+        let facts = harness.store().get_facts().unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].provider_id, "synthetic");
+        assert_eq!(facts[0].model_id, "model");
+        super::consumers::replace_catalog(&json!([{
+            "module_id":"basal","nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[
+                {"name":"basal.flow","placement":{"module":"broca"}}
+            ]}}
+        }]));
+    }
     harness.edit_config(|config| {
         config["providers"]["synthetic"]["subscription"] = json!(true);
         config["concurrency"] =
             json!({"enforcement_enabled":true,"providers":{"synthetic":{"limit":1}}});
+        if stem == "basal-flow-select" {
+            config["consumers"].as_object_mut().unwrap().remove("flow");
+            config["runners"] = json!([
+                {"module":"class-runner","via_vault":true},
+                {"module":"broca","via_vault":true}
+            ]);
+        }
     });
     let mut quota = crate::account_quota::AccountQuotaState::default();
     crate::account_quota::apply_provider_reply(
@@ -47,6 +75,7 @@ async fn capture(stem: &str) -> Sample {
     *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
     let runner = harness.bind(reserved("class-runner"), None).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
+    let basal = harness.bind(reserved("basal"), None).await;
     // Both eligible accounts hold a real admission reservation. Their expiry,
     // twelve seconds after the refusal, must win over the thirty-second ceiling.
     for (account, credential) in [
@@ -75,6 +104,12 @@ async fn capture(stem: &str) -> Sample {
             json!({"consumer":"mason","requirements":{"iq":30},"detail":true}),
         ),
         "account-for" => (&runner, "route.account_for", account_params.clone()),
+        "basal-flow-select" => (
+            &basal,
+            "route.select",
+            json!({"consumer":"basal.flow","requirements":{"iq":50,"tools":"none"},
+                "eligible_routes":[{"provider":"synthetic","model":"model"}]}),
+        ),
         _ => panic!("unknown sample: {stem}"),
     };
     let frame = route.request_frame(method, &params);
@@ -92,6 +127,20 @@ async fn capture(stem: &str) -> Sample {
         reply: reply.body,
         frame_type: reply.header.ty,
         legacy_reply,
+    }
+}
+
+#[tokio::test]
+async fn basal_flow_select_refuses_only_the_synthetic_route() {
+    let sample = capture("basal-flow-select").await;
+    let request: Value = serde_json::from_slice(&sample.request).unwrap();
+    assert!(request["params"].get("detail").is_none());
+    let body = refusal(&sample);
+    if let Some(rejected) = body["detail"].get("rejected") {
+        let rejected = rejected.as_array().unwrap();
+        assert_eq!(rejected.len(), 1, "{body}");
+        assert_eq!(rejected[0]["routeKey"], "synthetic/model", "{body}");
+        assert_eq!(rejected[0]["reason"], "concurrency_full", "{body}");
     }
 }
 
@@ -183,7 +232,7 @@ fn verify(samples: BTreeMap<String, Vec<u8>>) {
 #[tokio::test]
 async fn handler_samples_regenerate_byte_for_byte() {
     let mut samples = BTreeMap::new();
-    for stem in ["select", "account-for"] {
+    for stem in ["select", "account-for", "basal-flow-select"] {
         let sample = capture(stem).await;
         refusal(&sample);
         // Keep the handler's bytes, not a parsed and reserialized equivalent.

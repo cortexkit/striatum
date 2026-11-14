@@ -24,6 +24,14 @@ fallback. The quota reading remains fresh and neither account is blocked.
   confirms the same reset. Routing emits no `is_wait` member: the pinned
   `cortexkit-role-routing` contract derives wait classification from the
   `concurrency_full` reason.
+* `basal-flow-select.request.json` / `basal-flow-select.reply.json`: attested
+  `reserved:basal` selects its declared consumer `basal.flow`, with Broca as
+  its placement and without a request `detail` member. The request uses Basal's
+  `requirements.iq`, `requirements.tools` and `eligible_routes` fields, with the
+  single synthetic route substituted.
+  The fixture removes all seeded model facts except `synthetic/model`; its two
+  synthetic accounts are filled via the same real admissions as above. This keeps
+  the public sample free of real catalog routes, including in refusal diagnostics.
 
 ## Regeneration and verification
 
@@ -34,13 +42,13 @@ UPDATE_CONCURRENCY_FULL_SAMPLES=1 cargo nextest run --locked -p striatum-module 
 ```
 
 For remote builds with read-only synced sources, regenerate in a writable scratch
-copy and return the four JSON files and `SHA256SUMS`, then install them locally.
+copy and return the six JSON files and `SHA256SUMS`, then install them locally.
 The environment variable enables writes only for generated files, not this README.
 Without it, regeneration happens in memory and any byte difference, missing file,
-unexpected file or manifest drift fails the test. The two additional handler tests
+unexpected file or manifest drift fails the test. The three additional handler tests
 check the refusal semantics independently of the recorded files.
 
-`SHA256SUMS` covers the four JSON files and this README, in bytewise filename
+`SHA256SUMS` covers the six JSON files and this README, in bytewise filename
 order, excluding the manifest itself. Independently verify from the worktree root:
 
 ```sh
