@@ -12,6 +12,9 @@ use striatum_store::{EngineEvaluation, EngineSpeedSample, V1Decision};
 
 use super::{store_refusal, Caller, Deps};
 
+#[path = "media_ranking.rs"]
+mod ranking;
+
 pub(super) fn now(deps: &Deps<'_>) -> u64 {
     #[cfg(test)]
     let offset = deps
@@ -124,6 +127,26 @@ fn select_request(
     let config = super::operator_config(deps);
     let consumers = super::consumers::effective(&config);
     consumers.admit(&request.consumer, caller)?;
+    let policy = media.map(|media| {
+        // Resolve only the media demand default. The registry's policy view
+        // carries language-model requirements (such as context and tools),
+        // while the declaration's IQ is kept in its demand defaults.
+        let declared = std::collections::BTreeMap::from([(
+            request.consumer.clone(),
+            crate::config_policy::ConsumerPolicy {
+                iq: consumers.defaults_for(&request.consumer).iq.map(f64::from),
+                ..Default::default()
+            },
+        )]);
+        config.consumer_policy(
+            &request.consumer,
+            &crate::config_policy::ConsumerPolicy {
+                iq: media.requirements.iq.map(f64::from),
+                ..Default::default()
+            },
+            &declared,
+        )
+    });
     if super::describe::capabilities().contains(&"consumer_declarations") {
         let declared = consumers.defaults_for(&request.consumer);
         super::consumers::kind::resolve(
@@ -153,12 +176,27 @@ fn select_request(
         .map_err(store_refusal)?
         .engine_test_facts
         .clone();
-    for (module, slot) in super::consumers::engine_declarations() {
-        candidates.extend(
-            slot.engines
-                .into_iter()
-                .map(|engine| EngineCandidate::new(module.clone(), engine)),
-        );
+    let joined = media.map(|_| super::consumers::media_routes(catalog.as_ref()));
+    if let Some(joined) = &joined {
+        for route in joined
+            .by_kind
+            .get(request.kind.as_str())
+            .into_iter()
+            .flat_map(|kind| &kind.routes)
+        {
+            candidates.push(EngineCandidate::new(
+                route.module.clone(),
+                route.engine.clone(),
+            ));
+        }
+    } else {
+        for (module, slot) in super::consumers::engine_declarations() {
+            candidates.extend(
+                slot.engines
+                    .into_iter()
+                    .map(|engine| EngineCandidate::new(module.clone(), engine)),
+            );
+        }
     }
     if let Some(local) = &request.caller_local {
         candidates.extend(
@@ -193,27 +231,48 @@ fn select_request(
         now as i64,
     )
     .map_err(store_refusal)?;
-    for candidate in &mut candidates {
-        candidate.cost = media
-            .is_none()
-            .then(|| {
-                catalog
-                    .as_ref()
-                    .and_then(|catalog| {
-                        catalog.engine_cost(
-                            &request,
-                            &candidate.engine.provider,
-                            &candidate.engine.model,
-                        )
+    let mut top_routes = std::collections::BTreeSet::new();
+    let active_media_providers: std::collections::BTreeSet<_> = if media.is_some() {
+        let credentials = deps.broca_credentials.lock().map_err(store_refusal)?;
+        credentials
+            .listed_credentials()
+            .iter()
+            .flat_map(|row| {
+                row.provider_ids
+                    .iter()
+                    .filter(|provider| {
+                        crate::account_selection::media_credential_serves(row, provider)
                     })
-                    .map(FactNumber)
+                    .cloned()
             })
-            .flatten();
+            .collect()
+    } else {
+        Default::default()
+    };
+    for candidate in &mut candidates {
+        candidate.cost = catalog
+            .as_ref()
+            .filter(|_| media.is_none() || !candidate.selected.caller_local)
+            .and_then(|catalog| {
+                catalog.engine_cost(
+                    &request,
+                    &candidate.engine.provider,
+                    &candidate.engine.model,
+                )
+            })
+            .map(FactNumber);
         let key = striatum_core::make_route_key(
             &candidate.engine.provider,
             &candidate.engine.model,
             None,
         );
+        let policy_allowed = config.route_allowed(&request.consumer, &key, true);
+        if policy_allowed
+            && (candidate.engine.local
+                || active_media_providers.contains(&candidate.engine.provider))
+        {
+            top_routes.insert(key.clone());
+        }
         if let Some(state) = inputs.snapshot.by_route.get(&key) {
             candidate.fenced = [
                 state.cooldown_until,
@@ -233,7 +292,7 @@ fn select_request(
             // as a pinned request does: `not_for` and consumer exclusions still
             // refuse an engine, while pin-only rules and the LLM-only metered
             // default do not.
-            candidate.fenced |= !config.route_allowed(&request.consumer, &key, true);
+            candidate.fenced |= !policy_allowed;
             candidate.fenced |= !accounts
                 .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
                 .map_err(store_refusal)?;
@@ -346,10 +405,13 @@ fn select_request(
         }
         candidates.retain(|candidate| {
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
-            media
-                .exclude
-                .as_ref()
-                .is_none_or(|routes| !routes.contains(&key))
+            // Local engines bypass the compatibility selector's reachability
+            // fence, so apply policy as admission instead of a transient fence.
+            config.route_allowed(&request.consumer, &key, true)
+                && media
+                    .exclude
+                    .as_ref()
+                    .is_none_or(|routes| !routes.contains(&key))
                 && media
                     .exclude_providers
                     .as_ref()
@@ -367,25 +429,14 @@ fn select_request(
         }
     }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
-    let winner = if media.is_some() {
-        // Media routes are not yet ranked by the operator's per-kind quality
-        // grade or by a priced estimate of this job, so measured accuracy is the
-        // only ranking fact for now. Identity precedes origin when two modules
-        // offer the same engine.
-        candidates
-            .iter()
-            .filter(|candidate| {
-                wire::select_engine(&request, std::slice::from_ref(*candidate)).is_ok()
-            })
-            .min_by(|a, b| {
-                b.accuracy
-                    .cmp(&a.accuracy)
-                    .then_with(|| a.engine.provider.cmp(&b.engine.provider))
-                    .then_with(|| a.engine.model.cmp(&b.engine.model))
-                    .then_with(|| a.selected.module.cmp(&b.selected.module))
-                    .then_with(|| a.selected.index.cmp(&b.selected.index))
-            })
-            .ok_or_else(|| Refusal::no_route(NoRouteReason::NoAvailableModel, None))?
+    let winner = if let Some(policy) = &policy {
+        let empty = Default::default();
+        let grades = joined
+            .as_ref()
+            .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
+            .map(|kind| &kind.grades)
+            .unwrap_or(&empty);
+        ranking::pick(&request, &candidates, grades, &top_routes, policy)?
     } else {
         wire::select_engine(&request, &candidates)?
     };
