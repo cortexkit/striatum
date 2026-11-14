@@ -5327,7 +5327,7 @@ fn replay_command(
 ) -> OpReply {
     let principal = principal.to_owned();
     let now = ctx.now_ms;
-    crate::account_writer::execute(
+    crate::account_writer::execute_with_error(
         ctx.store,
         striatum_store::AccountCommandKind::Replay,
         move |tx| {
@@ -5341,7 +5341,16 @@ fn replay_command(
             finish_reply(tx, reply, finish.as_ref(), now)
         },
     )
-    .unwrap_or_else(store_error)
+    .unwrap_or_else(admission_error)
+}
+
+fn admission_error(error: crate::routing_v1::accounts::AdmissionError) -> OpReply {
+    match error {
+        crate::routing_v1::accounts::AdmissionError::Store(error) => store_error(error),
+        crate::routing_v1::accounts::AdmissionError::Refusal(refusal) => {
+            OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
+        }
+    }
 }
 
 /// Prepare the roster and run the admission command. `Err` is a refusal made
@@ -5487,7 +5496,7 @@ fn prepare_and_admit(
     let command_ctx = ctx.command_context();
     let principal = principal.to_owned();
     let finish = finish.take();
-    Ok(crate::account_writer::execute(
+    Ok(crate::account_writer::execute_with_error(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
         move |tx| {
@@ -5503,7 +5512,7 @@ fn prepare_and_admit(
             )?;
             finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)
         })
-        .unwrap_or_else(store_error))
+        .unwrap_or_else(admission_error))
 }
 
 fn finish_reply(
@@ -5511,7 +5520,7 @@ fn finish_reply(
     reply: OpReply,
     finish: Option<&crate::routing_v1::accounts::AdmissionRecord>,
     now: i64,
-) -> RouteStateResult<OpReply> {
+) -> Result<OpReply, crate::routing_v1::accounts::AdmissionError> {
     match finish {
         Some(finish) => finish.finish(tx, reply, now),
         None => Ok(reply),
@@ -9970,14 +9979,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(reply.code(), Some("account_selection_unavailable"));
+        assert_eq!(reply.code(), Some("account_unservable"));
         let OpReply::Error { detail, .. } = reply else {
             unreachable!()
         };
-        assert_eq!(
-            detail.unwrap()["exclusions"][0]["reason"],
-            "bound_service_tier_unavailable"
-        );
+        assert_eq!(detail.unwrap(), json!({"reason":"bound_tier_unavailable"}));
     }
 
     #[test]

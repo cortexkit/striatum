@@ -258,21 +258,34 @@ trait Command: Send {
     fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming);
 }
 
-struct TypedCommand<F, T> {
+/// A command's error may carry a domain refusal without losing its type.
+/// Only a store error can request the writer's state-divergence retry.
+pub trait AccountCommandError: From<RouteStateStoreError> + Send + 'static {
+    fn store_error(&self) -> Option<&RouteStateStoreError>;
+}
+
+impl AccountCommandError for RouteStateStoreError {
+    fn store_error(&self) -> Option<&RouteStateStoreError> {
+        Some(self)
+    }
+}
+
+struct TypedCommand<F, T, E = RouteStateStoreError> {
     run: F,
-    result: Option<RouteStateResult<T>>,
-    reply: mpsc::Sender<RouteStateResult<T>>,
+    result: Option<Result<T, E>>,
+    reply: mpsc::Sender<Result<T, E>>,
     timing: Arc<Mutex<StoreStageTiming>>,
 }
 
-impl<F, T> Command for TypedCommand<F, T>
+impl<F, T, E> Command for TypedCommand<F, T, E>
 where
     F: FnMut(
             &AccountTx<'_>,
             Option<&mut (dyn crate::AccountWorkingState + 'static)>,
-        ) -> RouteStateResult<T>
+        ) -> Result<T, E>
         + Send,
     T: Send,
+    E: AccountCommandError,
 {
     fn run(
         &mut self,
@@ -282,7 +295,9 @@ where
         // A batch that is run again (see `run_batch`) runs each command again;
         // only the last run's result is replied.
         let result = (self.run)(tx, state);
-        let status = result.as_ref().map(|_| ()).map_err(err);
+        let status = result.as_ref().map(|_| ()).map_err(|error| {
+            error.store_error().map(err).unwrap_or_else(|| err("account command refused"))
+        });
         self.result = Some(result);
         status
     }
@@ -290,7 +305,7 @@ where
     fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming) {
         *self.timing.lock().unwrap() = timing;
         let result = match failure {
-            Some(error) => Err(err(format!("store_error: {error}; retry the operation"))),
+            Some(error) => Err(err(format!("store_error: {error}; retry the operation")).into()),
             None => self.result.expect("committed command has a result"),
         };
         // A caller may have disconnected after COMMIT. Its durable idempotency
@@ -306,8 +321,8 @@ struct Queued {
 }
 
 /// An owned pending reply. Dropping it does not cancel a queued write.
-pub struct AccountReply<T>(
-    mpsc::Receiver<RouteStateResult<T>>,
+pub struct AccountReply<T, E = RouteStateStoreError>(
+    mpsc::Receiver<Result<T, E>>,
     Arc<Mutex<StoreStageTiming>>,
 );
 
@@ -329,8 +344,11 @@ impl<T> AccountReply<T> {
         }
     }
 
-    pub fn wait(self) -> RouteStateResult<T> {
-        let result = self.0.recv().unwrap_or_else(|_| Err(stopped()));
+}
+
+impl<T, E: AccountCommandError> AccountReply<T, E> {
+    pub fn wait(self) -> Result<T, E> {
+        let result = self.0.recv().unwrap_or_else(|_| Err(stopped().into()));
         // The connection work ran on the writer, but belongs in this caller's
         // timing scope too. Store-wide burst counters still count the batch once.
         evaluation_snapshot::record_stage_timing(*self.1.lock().unwrap());
@@ -463,16 +481,16 @@ impl AccountWriter {
         }
     }
 
-    fn enqueue<T: Send + 'static>(
+    fn enqueue<T: Send + 'static, E: AccountCommandError>(
         &self,
         f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
-            ) -> RouteStateResult<T>
+            ) -> Result<T, E>
             + Send
             + 'static,
-    ) -> RouteStateResult<AccountReply<T>> {
-        self.enqueue_inner(f, false)
+    ) -> RouteStateResult<AccountReply<T, E>> {
+        self.enqueue_inner_with_error(f, false)
     }
 
     pub(crate) fn enqueue_inner<T: Send + 'static>(
@@ -485,6 +503,15 @@ impl AccountWriter {
             + 'static,
         initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_inner_with_error(f, initialize_only)
+    }
+
+    fn enqueue_inner_with_error<T: Send + 'static, E: AccountCommandError>(
+        &self,
+        f: impl FnMut(&AccountTx<'_>, Option<&mut (dyn crate::AccountWorkingState + 'static)>) -> Result<T, E>
+            + Send + 'static,
+        initialize_only: bool,
+    ) -> RouteStateResult<AccountReply<T, E>> {
         if self.dead.load(Ordering::Acquire) {
             return Err(stopped());
         }
@@ -572,13 +599,24 @@ impl SqliteRouteStateStore {
     pub fn enqueue_account_state_command<T: Send + 'static>(
         &self,
         kind: AccountCommandKind,
-        mut f: impl FnMut(
+        f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
             ) -> RouteStateResult<T>
             + Send
             + 'static,
     ) -> RouteStateResult<AccountReply<T>> {
+        self.enqueue_account_state_command_with_error(kind, f)
+    }
+
+    /// Enqueue a command whose typed failure survives its savepoint rollback.
+    /// Batch-level I/O and commit failures still replace it with a store error.
+    pub fn enqueue_account_state_command_with_error<T: Send + 'static, E: AccountCommandError>(
+        &self,
+        kind: AccountCommandKind,
+        mut f: impl FnMut(&AccountTx<'_>, Option<&mut (dyn crate::AccountWorkingState + 'static)>) -> Result<T, E>
+            + Send + 'static,
+    ) -> RouteStateResult<AccountReply<T, E>> {
         if self.store.is_projection() {
             return Err(err(
                 "private projections cannot enqueue account writer commands",
@@ -618,6 +656,17 @@ impl SqliteRouteStateStore {
             return self.projection_command(f);
         }
         self.enqueue_account_command(kind, f)?.wait()
+    }
+
+    pub fn account_command_with_error<T: Send + 'static, E: AccountCommandError>(
+        &self,
+        kind: AccountCommandKind,
+        mut f: impl FnMut(&AccountTx<'_>) -> Result<T, E> + Send + 'static,
+    ) -> Result<T, E> {
+        if self.store.is_projection() {
+            return self.direct_account_transaction_with_error(f);
+        }
+        self.enqueue_account_state_command_with_error(kind, move |tx, _| f(tx))?.wait()
     }
 
     #[cfg(any(test, feature = "test-support"))]

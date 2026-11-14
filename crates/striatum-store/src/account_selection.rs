@@ -2461,6 +2461,13 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
+        self.direct_account_transaction_with_error(f)
+    }
+
+    pub(crate) fn direct_account_transaction_with_error<T, E: From<striatum_core::RouteStateStoreError>>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         #[cfg(not(any(test, feature = "test-support")))]
         assert!(
             self.store.is_projection(),

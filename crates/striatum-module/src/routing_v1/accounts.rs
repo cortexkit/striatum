@@ -435,6 +435,8 @@ fn account_for_inner(
                 .map_err(store_unavailable)?;
         }
         let record = AdmissionRecord {
+            #[cfg(test)]
+            answer_mutation: FINISH_ANSWERS.lock().unwrap().remove(&request.admission_id),
             principal,
             request,
             body_json,
@@ -477,6 +479,38 @@ pub(crate) struct AdmissionRecord {
     request: AccountForRequest,
     body_json: String,
     bound_tier: Option<String>,
+    #[cfg(test)]
+    answer_mutation: Option<fn(&mut Value)>,
+}
+
+#[cfg(test)]
+static FINISH_ANSWERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, fn(&mut Value)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn inject_finish_answer(admission_id: &str, mutation: fn(&mut Value)) {
+    assert!(FINISH_ANSWERS.lock().unwrap().insert(admission_id.into(), mutation).is_none());
+}
+
+#[derive(Debug)]
+pub(crate) enum AdmissionError {
+    Store(striatum_core::RouteStateStoreError),
+    Refusal(Refusal),
+}
+
+impl From<striatum_core::RouteStateStoreError> for AdmissionError {
+    fn from(error: striatum_core::RouteStateStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl striatum_store::AccountCommandError for AdmissionError {
+    fn store_error(&self) -> Option<&striatum_core::RouteStateStoreError> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Refusal(_) => None,
+        }
+    }
 }
 
 impl AdmissionRecord {
@@ -485,19 +519,20 @@ impl AdmissionRecord {
         tx: &striatum_store::AccountTx<'_>,
         reply: OpReply,
         now: i64,
-    ) -> striatum_core::route_state_store::RouteStateResult<OpReply> {
+    ) -> Result<OpReply, AdmissionError> {
         let result = match reply {
             OpReply::Result(result) => result,
             error => return Ok(error),
         };
-        let answer = match self.answer(&result) {
-            Ok(answer) => answer,
-            Err(refusal) => {
-                return Err(striatum_core::route_state_store::RouteStateStoreError(
-                    refusal.message,
-                ))
+        #[cfg(test)]
+        let result = {
+            let mut result = result;
+            if let Some(mutation) = self.answer_mutation {
+                mutation(&mut result);
             }
+            result
         };
+        let answer = self.answer(&result).map_err(AdmissionError::Refusal)?;
         let standing = tx.v1_record_admission(
             &self.principal,
             &self.request.admission_id,
@@ -535,18 +570,10 @@ impl AdmissionRecord {
                 .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
         {
             checking("chosen_service_tier");
-            let mut refusal = account_unavailable(
-            "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
-        );
-            let detail = json!({
-                "code": "account_selection_unavailable",
-                "retry_after_s": null,
-                "decision_id": request.decision_id,
-                "exclusions": request.candidates.iter().flat_map(|candidates| &candidates.accounts)
-                    .map(|candidate| json!({"account_id":candidate.account_id,"reason":"bound_service_tier_unavailable"}))
-                    .collect::<Vec<_>>(),
-            });
-            refusal.detail.extend(detail.as_object().unwrap().clone());
+            let mut refusal = Refusal::account_unservable(
+                AccountUnservableReason::BoundTierUnavailable, vec![], vec![],
+            );
+            refusal.message = "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.".into();
             return Err(refusal);
         }
         Ok(answer)

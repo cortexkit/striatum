@@ -50,8 +50,16 @@ pub(crate) fn prune_unserved_unpicked_facts(
 pub(crate) fn execute<T: Send + 'static>(
     store: &SqliteRouteStateStore,
     kind: AccountCommandKind,
-    mut command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
+    command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
+    execute_with_error(store, kind, command)
+}
+
+pub(crate) fn execute_with_error<T: Send + 'static, E: striatum_store::AccountCommandError>(
+    store: &SqliteRouteStateStore,
+    kind: AccountCommandKind,
+    mut command: impl FnMut(&mut AccountCommand<'_>) -> Result<T, E> + Send + 'static,
+) -> Result<T, E> {
     if !store.is_account_evaluation_projection() {
         crate::account_state::initialize(store)?;
     }
@@ -64,9 +72,9 @@ pub(crate) fn execute<T: Send + 'static>(
         command(&mut AccountCommand::new(tx, state))
     };
     if store.is_account_evaluation_projection() {
-        store.account_command(kind, move |tx| command(tx, None))
+        store.account_command_with_error(kind, move |tx| command(tx, None))
     } else {
-        store.enqueue_account_state_command(kind, command)?.wait()
+        store.enqueue_account_state_command_with_error(kind, command)?.wait()
     }
 }
 

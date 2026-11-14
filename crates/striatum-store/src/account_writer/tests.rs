@@ -1,5 +1,6 @@
 use super::*;
 use std::time::Duration;
+mod typed_error_tests;
 
 fn fixture(name: &str) -> (cortexkit_test_support::ScratchDir, SqliteRouteStateStore) {
     let scratch = cortexkit_test_support::ScratchDir::new(name);

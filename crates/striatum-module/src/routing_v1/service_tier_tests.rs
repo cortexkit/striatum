@@ -13,6 +13,7 @@ use super::{
 };
 use crate::broca_credentials::BrocaCredentials;
 mod unservable_tests;
+mod finish_rollback_tests;
 
 const NOW: u64 = 1_800_000_000_000;
 const MODEL: &str = "gpt-6.1-sol";
