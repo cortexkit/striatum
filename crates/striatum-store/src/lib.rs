@@ -1238,7 +1238,6 @@ pub struct SqliteRouteStateStore {
 
 mod account_writer;
 mod connection_store;
-mod account_writer;
 pub use account_writer::{AccountCommandKind, AccountReply, STATE_DIVERGED};
 mod account_state;
 pub use account_state::{AccountStateBridge, AccountWorkingState, ACCOUNT_STATE_LOAD_PENDING};

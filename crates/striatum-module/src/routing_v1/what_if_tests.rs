@@ -15,6 +15,16 @@ mod concurrency;
 #[path = "what_if_sweep_tests.rs"]
 mod sweep;
 
+pub(super) fn seed_open_offer(
+    harness: &Harness,
+    provider: &str,
+    model: &str,
+    account: &str,
+    credential: &str,
+) {
+    sweep::seed_open_offer(harness, provider, model, account, credential);
+}
+
 async fn operator(harness: &std::sync::Arc<Harness>) -> Route {
     harness.bind(json!({"kind": "direct"}), None).await
 }

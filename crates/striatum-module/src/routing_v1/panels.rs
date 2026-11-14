@@ -266,10 +266,6 @@ async fn seat_panel(
             SeatAdmission::Seated(seat) => {
                 families.insert(family);
                 seats.push(seat);
-                if let Some(dry) = dry {
-                    dry.accounts
-                        .after_evaluation(deps.routing_config_path, true, seats.len());
-                }
             }
             SeatAdmission::Rejected(cause) => rejected.push(cause),
         }
@@ -477,7 +473,7 @@ async fn evaluate_seat(
         eq: None,
         evidence: Mutex::new(Default::default()),
     };
-    let answer = match super::select::evaluate_with_inputs(
+    let evaluated = super::select::evaluate_with_inputs(
         &select,
         caller,
         deps,
@@ -486,8 +482,10 @@ async fn evaluate_seat(
         shared,
         true,
     )
-    .await
-    {
+    .await;
+    dry.accounts
+        .after_evaluation(deps.routing_config_path, true, slot as usize + 1);
+    let answer = match evaluated {
         Ok(answer) => answer,
         Err(refusal) => {
             return seat_rejection(&route, &refusal)

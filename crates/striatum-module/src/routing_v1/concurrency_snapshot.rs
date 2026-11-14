@@ -1,5 +1,5 @@
-//! A call-local view of the published ledger and cap policy. Counting never
-//! reloads admissions from the disposable SQL projection used for eligibility.
+//! A call-local view of the captured account ledger and cap policy. Counting
+//! never rereads admissions or takes another account-state snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

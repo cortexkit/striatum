@@ -19,7 +19,7 @@
         "cap_counts": [
           {
             "effective_cap": null,
-            "holds_in_flight": 0,
+            "holds_in_flight": 2,
             "model": null,
             "scope": "account"
           }

@@ -120,7 +120,7 @@ tests. Update filters and test paths when an approved replacement moves a pin.
 | S8a-3 | `FILTER="$PINS | test(account_writer::) | test(transaction_contention_tests::)"` | Full writer-handler coverage, source negative and per-table bypass counter. |
 | S8b-1 | `FILTER="$PINS | test(account_writer::) | test(account_state::)"` | Startup/load/reload, round trip and command-answer properties; replacement sign-offs already obtained. |
 | S8b-2 | `FILTER="$PINS | test(account_state::) | test(reads_off_writer::)"` | Reader-answer property, counted reader negatives, panel/key-pool mix, route-state differential. |
-| S8c | `FILTER="$PINS | test(account_state::)"` | Coherent sweep plus sweep-private quota/listing repair effects. |
+| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
 | S7b | `FILTER="$PINS | test(account_state::) | test(backup_exclusion::)"` | Block migration, frozen data, tombstones, stored-deadline provider status cases. |
 | S9a | `FILTER="$PINS | test(backup_exclusion::) | test(task_usage::) | test(observed_speed)"` | Split script Python check, open/refusal/history-chain, outbox freshness and idempotent mover. |
 | S9b-1 | `FILTER="$PINS"` | Derive windows/predicates/triggers/decision columns, no executable change. |
@@ -602,7 +602,9 @@ its connection wrapper, row-capture hook and DELETE authorizer now live in
 
 S8c filter: keep the invariant test filters above, use
 `connection_store::tests::` for the moved SQL-reference tests, and add
-`test(what_if_tests::sweep::) | test(panels_estimate_tests::) | test(media_samples_tests::)`.
+`test(what_if_tests::sweep::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference)`.
+`account_writer::tests::` and `block_state::tests::` also protect the moved
+capture/authorizer hooks and the private account-repair support.
 The new sweep tests compare whole responses (timings removed), including every
 pick/refusal/exclusion, bar, top-routable and adequate list, panels and head
 choices. The quota-replacement fixtures are recorded through the test-only SQL

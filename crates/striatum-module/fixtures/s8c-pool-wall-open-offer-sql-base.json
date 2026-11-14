@@ -1,0 +1,1156 @@
+{
+  "anchor_version": 5,
+  "concurrency": {
+    "accounts": [
+      {
+        "account_id": "apikey:catalog:main-workspace",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "catalog-provider"
+      },
+      {
+        "account_id": "apikey:pool-vendor:main",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 2,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "pool-provider"
+      }
+    ],
+    "enforcement_enabled": false
+  },
+  "consumer": "mason",
+  "results": [
+    {
+      "adequate": [
+        {
+          "adequacy": 1.0,
+          "cost_usd": null,
+          "fit": {},
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "catalog-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 0.0,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-vendor/model-pool"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-provider/model-pool"
+        }
+      ],
+      "iq": 0.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "catalog-provider/model-a",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 2000.0,
+        "eq": 2000.0
+      }
+    },
+    {
+      "adequate": [
+        {
+          "adequacy": 0.9906515365622404,
+          "cost_usd": null,
+          "fit": {
+            "elo": {
+              "fact": 1300.0,
+              "fit": 0.9906515365622404,
+              "requirement": 30.0,
+              "target": 1312.2676864876835
+            }
+          },
+          "normalized_cost": 0.06666666666666667,
+          "rates_per_mtok": {
+            "cache_write": null,
+            "cached_read": null,
+            "fresh_input": null,
+            "output": 2.0,
+            "reasoning": 2.0
+          },
+          "route": "catalog-provider/model-a",
+          "task_pricing": {
+            "finalCostUsd": 2.0,
+            "listCostUsd": 2.0,
+            "normalizedCost": 0.06666666666666667,
+            "omittedDimensions": [],
+            "pressure": 1.0,
+            "priceUnit": "million output tokens",
+            "profile": null,
+            "tokens": null,
+            "unpricedDimensions": [],
+            "valueMultiplier": 1.0,
+            "valueSource": "cold-start effective rate"
+          }
+        }
+      ],
+      "bar": {
+        "elo": 1312.2676864876835,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-vendor/model-pool"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-provider/model-pool"
+        }
+      ],
+      "iq": 30.0,
+      "pick": {
+        "cost_usd": null,
+        "route": "catalog-provider/model-a",
+        "variant": null
+      },
+      "top_routable": {
+        "elo": 2000.0,
+        "eq": 2000.0
+      }
+    },
+    {
+      "adequate": [],
+      "bar": {
+        "elo": 2000.0,
+        "eq": 0.0
+      },
+      "excluded": [
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-4-8"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-sonnet-4-6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-opus-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-claude-sonnet-4-6-thinking"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.1-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.5-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.4-mini"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-build-0.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-sol-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-terra-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "openai/gpt-5.6-luna-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.2"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-pro"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.7-code"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/glm-5.1"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.7"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/minimax-m2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k2.5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/qwen3.5:397b"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/mistral-large-3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-fable-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "kimi-for-coding/k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max-preview"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-plus"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.7-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.6-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "anthropic/claude-opus-5"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "alibaba-token-plan/qwen3.8-max"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/deepseek-v4-flash:0731"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "ollama-cloud/kimi-k3"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "xai/grok-4.6"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "google/antigravity-gemini-3.7-flash"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-vendor/model-pool"
+        },
+        {
+          "reason": "no_eligible_account",
+          "route": "pool-provider/model-pool"
+        },
+        {
+          "reason": "below_floor",
+          "route": "catalog-provider/model-a"
+        }
+      ],
+      "iq": 100.0,
+      "pick": null,
+      "refusal": {
+        "code": "no_route",
+        "detail": {
+          "adequacyFloor": 0.95,
+          "bestRejected": {
+            "adequacy": 0.65,
+            "route_key": "catalog-provider/model-a"
+          },
+          "blockingCauses": [
+            {
+              "adequateRoutes": [
+                {
+                  "routeKey": "anthropic/claude-fable-5"
+                },
+                {
+                  "routeKey": "anthropic/claude-opus-5"
+                },
+                {
+                  "routeKey": "pool-vendor/model-pool"
+                },
+                {
+                  "routeKey": "pool-provider/model-pool"
+                }
+              ],
+              "count": 48,
+              "reason": "no_eligible_account",
+              "routes": [
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-4-8"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-sonnet-4-6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.1-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.5-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.4-mini"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-build-0.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-sol-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-terra-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "openai/gpt-5.6-luna-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.2"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-pro"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.7-code"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/glm-5.1"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.7"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/minimax-m2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k2.5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/qwen3.5:397b"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/mistral-large-3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-fable-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "kimi-for-coding/k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-plus"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.7-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.6-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "anthropic/claude-opus-5"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "alibaba-token-plan/qwen3.8-max"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "ollama-cloud/kimi-k3"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "xai/grok-4.6"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "google/antigravity-gemini-3.7-flash"
+                },
+                {
+                  "reason": "no_eligible_account",
+                  "routeKey": "pool-vendor/model-pool"
+                },
+                {
+                  "credentialIds": [
+                    "apikey:pool-vendor:main"
+                  ],
+                  "reason": "no_eligible_account",
+                  "routeKey": "pool-provider/model-pool"
+                }
+              ]
+            }
+          ],
+          "reason": "all_inadequate",
+          "rejected": [
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-opus-4-5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-opus-4-6"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-opus-4-7"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-opus-4-8"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-sonnet-4-6"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-claude-opus-4-6-thinking"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-claude-sonnet-4-6-thinking"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-gemini-3.1-pro"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-gemini-3.5-flash"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.4"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.4-mini"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "xai/grok-4.3"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "xai/grok-build-0.1"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-sol"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-sol-pro"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-terra"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-terra-pro"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-luna"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "openai/gpt-5.6-luna-pro"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "xai/grok-4.5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/glm-5.2"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/minimax-m3"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/deepseek-v4-pro"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/kimi-k2.6"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/kimi-k2.7-code"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/deepseek-v4-flash"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/glm-5.1"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/minimax-m2.7"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/minimax-m2.5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/kimi-k2.5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/qwen3.5:397b"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/mistral-large-3"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-fable-5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "kimi-for-coding/k3"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "alibaba-token-plan/qwen3.8-max-preview"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "alibaba-token-plan/qwen3.6-flash"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "alibaba-token-plan/qwen3.7-plus"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "alibaba-token-plan/qwen3.7-max"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-gemini-3.6-flash"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "anthropic/claude-opus-5"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "alibaba-token-plan/qwen3.8-max"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/deepseek-v4-flash:0731"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "ollama-cloud/kimi-k3"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "xai/grok-4.6"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "google/antigravity-gemini-3.7-flash"
+            },
+            {
+              "reason": "no_eligible_account",
+              "routeKey": "pool-vendor/model-pool"
+            },
+            {
+              "credentialIds": [
+                "apikey:pool-vendor:main"
+              ],
+              "reason": "no_eligible_account",
+              "routeKey": "pool-provider/model-pool"
+            }
+          ]
+        }
+      },
+      "top_routable": {
+        "elo": 2000.0,
+        "eq": 2000.0
+      }
+    }
+  ]
+}

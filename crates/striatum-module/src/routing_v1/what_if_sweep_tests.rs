@@ -69,18 +69,6 @@ async fn fixture_with_repairs() -> (Arc<Harness>, Route) {
             })?;
             tx.record_continuation(
                 "fixture",
-                "open-offer",
-                &striatum_store::V1Recorded {
-                    body_json: "{}".into(),
-                    answer_json: "{}".into(),
-                },
-                "open-run",
-                "open-admission",
-                "open-previous",
-                Some(("open-decision", "open-reservation", NOW + 60_000)),
-            )?;
-            tx.record_continuation(
-                "fixture",
                 "expired-offer",
                 &striatum_store::V1Recorded {
                     body_json: "{}".into(),
@@ -93,6 +81,23 @@ async fn fixture_with_repairs() -> (Arc<Harness>, Route) {
             )
         })
         .unwrap();
+    let credential = harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .listed_credentials()
+        .iter()
+        .find(|row| row.account_id.as_deref() == Some("account-1"))
+        .unwrap()
+        .id
+        .clone();
+    seed_open_offer(
+        &harness,
+        "example-subscription",
+        "model-d",
+        "account-1",
+        &credential,
+    );
     harness.store().with_writer_for_test(|conn| conn.execute_batch(
         "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
          INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
@@ -193,10 +198,12 @@ async fn s8c_quota_replacement_after_classification_and_heal_is_sweep_local() {
         let before = rows(&harness);
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = calls.clone();
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checked = checks.clone();
         let _hook = crate::account_selection::Sweep::hook(
             &harness.config_path_for_test(),
             move |sweep, is_panel, point| {
-                if is_panel != panel || point != 1 {
+                if is_panel != panel {
                     return;
                 }
                 let blocks = sweep.published();
@@ -210,10 +217,14 @@ async fn s8c_quota_replacement_after_classification_and_heal_is_sweep_local() {
                     .unwrap()
                     .iter()
                     .any(|origin| origin.kind == "credential"
+                        && origin.provider == "example-subscription"
                         && origin.classified
                         && !origin.quota));
-                seen.fetch_add(1, Ordering::Relaxed);
-                quota(false);
+                checked.fetch_add(1, Ordering::Relaxed);
+                if point == 1 {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    quota(false);
+                }
             },
         );
         let mut params = request();
@@ -226,6 +237,7 @@ async fn s8c_quota_replacement_after_classification_and_heal_is_sweep_local() {
             evaluate(&operator, params).await
         });
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(checks.load(Ordering::Relaxed) >= 2);
         assert_eq!(before, rows(&harness));
         assert_eq!(
             *initial,
@@ -367,4 +379,85 @@ async fn s8c_committed_blocks_and_admissions_between_points_and_seats_do_not_lea
             .open_admission("p", "interleaved")
             .is_some());
     }
+}
+
+/// Seed a started source run and an unstarted replacement reservation joined
+/// by an unused continuation offer. Both admissions contribute to the reported
+/// in-flight count in this fixture.
+pub(super) fn seed_open_offer(
+    harness: &Harness,
+    provider: &str,
+    model: &str,
+    account: &str,
+    credential: &str,
+) {
+    harness
+        .store()
+        .account_transaction(|tx| {
+            for id in ["offer-source", "offer-reservation"] {
+                let row = striatum_store::AccountAdmissionRow {
+                    principal: "p".into(),
+                    admission_id: id.into(),
+                    request_fingerprint: "fp".into(),
+                    request_mode: "admit".into(),
+                    decision_id: format!("decision-{id}"),
+                    conversation_hash: format!("conversation-{id}"),
+                    provider: provider.into(),
+                    model: model.into(),
+                    account_id: account.into(),
+                    credential_id: credential.into(),
+                    pin_id: format!("pin-{id}"),
+                    pin_generation: 1,
+                    state: "reserved".into(),
+                    charged: true,
+                    request_bytes: 1,
+                    request_bytes_estimated: false,
+                    committed_at: NOW,
+                    admission_valid_until: NOW + 60_000,
+                    lease_valid_until: NOW + 120_000,
+                    reply_json: "{}".into(),
+                    run_id: None,
+                    started_at: None,
+                    started_late: false,
+                    released_at: None,
+                    finished_at: None,
+                    last_observed_at: None,
+                };
+                tx.insert_pin(&striatum_store::AccountPinRow {
+                    pin_id: row.pin_id.clone(),
+                    principal: row.principal.clone(),
+                    conversation_hash: row.conversation_hash.clone(),
+                    provider: provider.into(),
+                    pin_generation: 1,
+                    affinity_model: model.into(),
+                    account_id: account.into(),
+                    credential_id: credential.into(),
+                    pin_mode: "conversation_lease".into(),
+                    previous_pin_id: None,
+                    decision_id: row.decision_id.clone(),
+                    created_at: NOW,
+                })?;
+                tx.insert_admission(&row)?;
+                if id == "offer-source" {
+                    tx.mark_admission_started("p", id, "offer-run", NOW, false)?;
+                }
+            }
+            tx.record_continuation(
+                "p",
+                "open-offer",
+                &striatum_store::V1Recorded {
+                    body_json: "{}".into(),
+                    answer_json: "{}".into(),
+                },
+                "offer-run",
+                "offer-source",
+                "decision-offer-source",
+                Some((
+                    "decision-offer-reservation",
+                    "offer-reservation",
+                    NOW + 60_000,
+                )),
+            )
+        })
+        .unwrap();
 }

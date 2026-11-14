@@ -17,7 +17,7 @@ mod inflight;
 mod waiters;
 
 pub(crate) use admissions::AdmissionState;
-pub(crate) use blocks::{published, writer, BlockReads, Published};
+pub(crate) use blocks::{published, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
 pub(crate) use waiters::{matched as matched_waiters, CapCount, Waiter, Waiters};
 

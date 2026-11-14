@@ -1245,23 +1245,13 @@ async fn s8c_pool_wall_and_open_offer_match_the_sql_reference() {
     );
     let (ty, wall) = operator.call("route.pool_wall", &json!({"provider":POOL,"credentialId":"apikey:pool-vendor:main","kind":"rate_limited","untilMs":now+60_000})).await;
     assert_eq!(ty, FrameType::Response, "{wall}");
-    harness
-        .store()
-        .account_transaction(|tx| {
-            tx.record_continuation(
-                "pool-test",
-                "open-offer",
-                &striatum_store::V1Recorded {
-                    body_json: "{}".into(),
-                    answer_json: "{}".into(),
-                },
-                "run",
-                "admission",
-                "previous",
-                Some(("decision", "reservation", now as i64 + 60_000)),
-            )
-        })
-        .unwrap();
+    super::what_if_tests::seed_open_offer(
+        &harness,
+        POOL,
+        POOL_MODEL_SHORT,
+        "apikey:pool-vendor:main",
+        "apikey:pool-vendor:main",
+    );
     harness.store().reload_account_state_for_test().unwrap();
     let before = super::what_if_tests::rows(&harness);
     let trace = harness.store().trace_account_reads_for_test().unwrap();
@@ -1283,6 +1273,20 @@ async fn s8c_pool_wall_and_open_offer_match_the_sql_reference() {
         assert!(reads.reader.is_empty(), "{:?}", reads.reader);
         assert!(reads.writer.is_empty(), "{:?}", reads.writer);
     }
+    assert!(
+        answer["concurrency"]["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["provider"] == POOL
+                && row["account_id"] == "apikey:pool-vendor:main"
+                && row["cap_counts"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|count| count["scope"] == "account" && count["holds_in_flight"] == 2)),
+        "{answer}"
+    );
     assert_ne!(answer["results"], plain["result"]["results"]);
     assert_eq!(before, super::what_if_tests::rows(&harness));
     assert_eq!(

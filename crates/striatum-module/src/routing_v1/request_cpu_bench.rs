@@ -1140,3 +1140,54 @@ async fn what_if_sweep_cpu() {
             (fixture.store().writer_commit_count_for_test()-commits) as f64/n);
     }
 }
+
+/// One production-sized live-select sample for comparing the pre-change and
+/// post-change implementations. Setup and warmup are excluded from timings.
+#[tokio::test]
+#[ignore = "alternating live-select measurement: invoked by the comparison runner"]
+async fn live_select_cpu_round() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = production_fixture();
+    let route = fixture
+        .harness
+        .bind(reserved(fixture::CONSUMER), None)
+        .await;
+    let request = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"pin":"cpu-provider-0/model-0"});
+    let samples = std::env::var("STRIATUM_CPU_SELECT_SAMPLES")
+        .map(|v| v.parse::<usize>().unwrap())
+        .unwrap_or(300);
+    let warmup = std::env::var("STRIATUM_CPU_SELECT_WARMUP")
+        .map(|v| v.parse::<usize>().unwrap())
+        .unwrap_or(10);
+    assert!(samples >= 100);
+    for _ in 0..warmup {
+        call(
+            &fixture,
+            &route,
+            "route.select",
+            request.clone(),
+            &mut Samples::default(),
+        )
+        .await;
+    }
+    let snapshots = crate::account_state::SNAPSHOT_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    let mut measured = Samples::default();
+    for _ in 0..samples {
+        call(
+            &fixture,
+            &route,
+            "route.select",
+            request.clone(),
+            &mut measured,
+        )
+        .await;
+    }
+    assert_eq!(measured.refusals, 0);
+    measured.print("alternating_live_select");
+    println!(
+        "alternating_live_select snapshots/op={:.3}",
+        (crate::account_state::SNAPSHOT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+            - snapshots) as f64
+            / samples as f64
+    );
+}
