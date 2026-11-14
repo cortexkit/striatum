@@ -1,5 +1,46 @@
 {
   "anchor_version": 5,
+  "concurrency": {
+    "accounts": [
+      {
+        "account_id": "catalog-account-example-provider-apikey",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-provider"
+      },
+      {
+        "account_id": "account-1",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-subscription"
+      },
+      {
+        "account_id": "account-2",
+        "cap_counts": [
+          {
+            "effective_cap": null,
+            "holds_in_flight": 0,
+            "model": null,
+            "scope": "account"
+          }
+        ],
+        "provider": "example-subscription"
+      }
+    ],
+    "enforcement_enabled": false
+  },
   "consumer": "example_summary",
   "head_choices": {
     "catalog_version": "41",

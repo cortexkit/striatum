@@ -15,6 +15,8 @@ use super::{operator_config, provider_refusal, select, store_refusal, Caller, De
 
 #[path = "media_preview.rs"]
 mod media;
+#[path = "concurrency_snapshot.rs"]
+mod concurrency;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -185,6 +187,8 @@ pub(super) async fn what_if_with_profile_lookup(
             .account_evaluation_snapshot(super::now_ms() as i64)
             .map_err(store_refusal)?,
     );
+    let concurrency =
+        concurrency::Snapshot::capture(&deps, &live, &account_store, super::now_ms() as i64)?;
     let snapshot_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut results = Vec::with_capacity(iqs.as_ref().map_or(0, Vec::len));
     for iq in iqs.unwrap_or_default() {
@@ -228,7 +232,7 @@ pub(super) async fn what_if_with_profile_lookup(
     }
     let mut result =
         json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms,
-            "anchor_version": live.scoring_anchor_version()});
+            "anchor_version": live.scoring_anchor_version(), "concurrency":concurrency.report()});
     if !panels.is_empty() {
         let dry = super::panels::DryRun {
             live_config: live.clone(),
