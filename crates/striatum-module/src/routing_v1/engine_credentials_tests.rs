@@ -158,7 +158,7 @@ async fn engine_media_successful_probe_lifts_fence_and_next_admission_is_not_a_p
     observe(&route, "first", "run_finished", json!({})).await;
     age_fence(&harness);
     let decision = selected(&route, &request()).await;
-    admit(&route, &decision, "probe").await;
+    let probe = admit(&route, &decision, "probe").await;
     assert!(probe_note(&harness, "probe").is_string());
     observe(
         &route,
@@ -167,7 +167,16 @@ async fn engine_media_successful_probe_lifts_fence_and_next_admission_is_not_a_p
         json!({"run_id":"probe-run"}),
     )
     .await;
-    let finished = observe(&route, "probe", "run_finished", json!({})).await;
+    let finished = observe(
+        &route,
+        "probe",
+        "run_finished",
+        json!({
+            "served_account_id":probe["account"]["account_id"],
+            "credential_id":probe["account"]["credential_id"]
+        }),
+    )
+    .await;
     assert!(
         effects(&finished)
             .iter()
@@ -188,6 +197,75 @@ async fn engine_media_successful_probe_lifts_fence_and_next_admission_is_not_a_p
 }
 
 #[tokio::test]
+async fn engine_media_finish_requires_exact_serving_identity_before_healing() {
+    for shape in [
+        "other-account",
+        "other-credential",
+        "missing-account",
+        "missing-credential",
+    ] {
+        let harness = providers(false, false);
+        let route = harness.bind(reserved("colliculus"), None).await;
+        let first = selected(&route, &request()).await;
+        admit(&route, &first, "first").await;
+        refused(&route, "first").await;
+        observe(&route, "first", "run_finished", json!({})).await;
+        age_fence(&harness);
+        let decision = selected(&route, &request()).await;
+        let probe = admit(&route, &decision, "probe").await;
+        assert!(probe_note(&harness, "probe").is_string());
+        observe(
+            &route,
+            "probe",
+            "admission_started",
+            json!({"run_id":"probe-run"}),
+        )
+        .await;
+        let older = harness.store().credential_entitlement_fences().unwrap()[0].observed_at_ms;
+        let mut serving = json!({"run_id":"probe-run",
+            "served_account_id":probe["account"]["account_id"],
+            "credential_id":probe["account"]["credential_id"]});
+        match shape {
+            "other-account" => serving["served_account_id"] = json!("served-B"),
+            "other-credential" => serving["credential_id"] = json!("credential-B"),
+            "missing-account" => {
+                serving.as_object_mut().unwrap().remove("served_account_id");
+            }
+            _ => {
+                serving.as_object_mut().unwrap().remove("credential_id");
+            }
+        }
+        let finished = observe(&route, "probe", "run_finished", serving).await;
+        let fences = harness.store().credential_entitlement_fences().unwrap();
+        assert_eq!(
+            fences.len(),
+            1,
+            "{shape}: finishing another or unidentified login cannot heal A"
+        );
+        assert_eq!(fences[0].observed_at_ms, older);
+        assert!(!effects(&finished)
+            .iter()
+            .any(|effect| effect["effect"] == "credential_fence_lifted"));
+        harness
+            .store()
+            .account_read(|tx| {
+                let admission = tx.admission("reserved:colliculus", "probe")?.unwrap();
+                assert_eq!(
+                    admission.state, "finished",
+                    "{shape}: lifecycle still finishes"
+                );
+                assert!(admission.finished_at.is_some());
+                assert!(
+                    !tx.fence_rechecks()?.is_empty(),
+                    "{shape}: the probe evidence must remain"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn engine_media_failed_probe_keeps_fence_on_run_finished() {
     for failure in [
         "credential_refused",
@@ -203,7 +281,7 @@ async fn engine_media_failed_probe_keeps_fence_on_run_finished() {
         observe(&route, "first", "run_finished", json!({})).await;
         age_fence(&harness);
         let decision = selected(&route, &request()).await;
-        admit(&route, &decision, "probe").await;
+        let probe = admit(&route, &decision, "probe").await;
         assert!(probe_note(&harness, "probe").is_string());
         observe(
             &route,
@@ -222,7 +300,16 @@ async fn engine_media_failed_probe_keeps_fence_on_run_finished() {
             _ => json!({}),
         };
         observe(&route, "probe", failure, extra).await;
-        let finished = observe(&route, "probe", "run_finished", json!({})).await;
+        let finished = observe(
+            &route,
+            "probe",
+            "run_finished",
+            json!({
+                "served_account_id":probe["account"]["account_id"],
+                "credential_id":probe["account"]["credential_id"]
+            }),
+        )
+        .await;
         assert!(
             !effects(&finished)
                 .iter()

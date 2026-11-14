@@ -119,6 +119,56 @@ pub(super) async fn select(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
+    let capabilities = super::describe::capabilities();
+    if capabilities.contains(&"select_kind") && capabilities.contains(&"select_media") {
+        let config = super::operator_config(deps);
+        let consumers = super::consumers::effective(&config);
+        let declared = capabilities
+            .contains(&"consumer_declarations")
+            .then(|| {
+                params
+                    .get("consumer")
+                    .and_then(Value::as_str)
+                    .map(|consumer| consumers.defaults_for(consumer))
+            })
+            .flatten();
+        let sent = params
+            .get("kind")
+            .filter(|kind| !kind.is_null())
+            .map(|kind| {
+                kind.as_str()
+                    .ok_or_else(|| Refusal::invalid_request("kind", "expected a string"))
+            })
+            .transpose()?;
+        // Declaration aliases are catalog spellings, not additional wire kinds.
+        if sent.is_some_and(|kind| kind != "llm" && !super::engines::MEDIA_KINDS.contains(&kind)) {
+            return Err(Refusal::invalid_request(
+                "kind",
+                "kind is not served by select_media",
+            ));
+        }
+        let kind = super::consumers::kind::resolve(
+            declared
+                .as_ref()
+                .and_then(|defaults| defaults.kind.as_ref())
+                .map(|kind| kind.as_str()),
+            sent,
+        )?;
+        if kind != "llm" {
+            let mut resolved = params.clone();
+            resolved
+                .as_object_mut()
+                .ok_or_else(|| Refusal::invalid_request("params", "expected an object"))?
+                .insert("kind".into(), kind.into());
+            // Media never enters the LLM billing wait or merges LLM-only defaults.
+            return super::engines::select_media(&resolved, caller, deps);
+        }
+        if params.get("kind").is_some() {
+            let mut resolved = params.clone();
+            resolved.as_object_mut().unwrap().remove("kind");
+            return select_kind(&resolved, caller, deps, false).await;
+        }
+    }
     select_kind(params, caller, deps, false).await
 }
 

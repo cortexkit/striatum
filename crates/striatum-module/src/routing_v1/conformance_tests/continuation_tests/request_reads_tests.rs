@@ -127,9 +127,9 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
         1,
     );
 
-    // A completed report lifts the fences (temporary bans on routing to a
-    // credential after it failed) that its success disproves, scoped by the
-    // size class its admission recorded; that admission has finished by now.
+    // A completed report heals the fences (temporary bans on routing to a
+    // credential after it failed) that its success disproves. It finds the
+    // admission its run used, which has finished by now, by decision and run.
     let (reply, ordinary, keyed) = traced(
         reads,
         consumer.call(
@@ -142,8 +142,8 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
     result(reply);
     assert_reads("completed report", &ordinary, &keyed, 2);
     assert!(
-        keyed.iter().any(|sql| sql.contains("model_decision_id=?1")),
-        "the report did not reach its admission size lookup: {keyed:#?}"
+        keyed.iter().any(|sql| sql.contains("model_decision_id = ?1 AND run_id = ?2")),
+        "the report did not reach its run's admission lookup: {keyed:#?}"
     );
 }
 

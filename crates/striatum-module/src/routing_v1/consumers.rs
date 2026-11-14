@@ -1,7 +1,7 @@
 //! Verified consumer claims and route-bound ownership admission.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use cortexkit_role_routing::declarations::DemandDefaults;
 use cortexkit_role_routing::errors::Refusal;
@@ -23,12 +23,34 @@ pub(crate) struct Catalog {
     engines: BTreeMap<String, cortexkit_role_routing::EngineDeclarations>,
     agent_hosts: BTreeSet<String>,
     issues: Vec<String>,
+    media: Arc<Mutex<Option<MediaJoin>>>,
+}
+
+pub(super) struct MediaRoute {
+    pub module: String,
+    pub engine: cortexkit_role_routing::select_engine::Engine,
+}
+
+#[derive(Default)]
+pub(super) struct MediaKind {
+    pub routes: Vec<MediaRoute>,
+    pub grades: BTreeMap<String, f64>,
+}
+
+#[derive(Default)]
+pub(super) struct MediaRoutes {
+    pub by_kind: BTreeMap<String, MediaKind>,
+}
+
+struct MediaJoin {
+    source: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
+    routes: Arc<MediaRoutes>,
 }
 
 static CATALOG: OnceLock<RwLock<Catalog>> = OnceLock::new();
 
 pub(crate) fn replace_catalog(modules: &Value) {
-    let snapshot = Catalog::from_catalog(modules);
+    let mut snapshot = Catalog::from_catalog(modules);
     static REPORTED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
     if let Ok(mut reported) = REPORTED.lock() {
         for issue in &snapshot.issues {
@@ -37,7 +59,53 @@ pub(crate) fn replace_catalog(modules: &Value) {
             }
         }
     }
-    *CATALOG.get_or_init(Default::default).write().unwrap() = snapshot;
+    let mut current = CATALOG.get_or_init(Default::default).write().unwrap();
+    // Catalog refreshes also carry unrelated module metadata. Keep the join
+    // when the engine declarations have not changed.
+    if current.engines == snapshot.engines {
+        snapshot.media = current.media.clone();
+    }
+    *current = snapshot;
+}
+
+pub(super) fn media_routes(
+    source: Option<&Arc<crate::fusiform_catalog::CatalogSnapshot>>,
+) -> Arc<MediaRoutes> {
+    let catalog = CATALOG.get_or_init(Default::default).read().unwrap();
+    let mut cached = catalog.media.lock().unwrap();
+    if let Some(join) = cached.as_ref() {
+        let unchanged = match (join.source.as_ref(), source) {
+            (Some(old), Some(new)) => Arc::ptr_eq(old, new),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged {
+            return join.routes.clone();
+        }
+    }
+    // Only module declarations have catalog identities. Caller-local offers
+    // arrive with each request and must never acquire a catalog grade.
+    let mut routes = MediaRoutes::default();
+    for (module, slot) in &catalog.engines {
+        for engine in &slot.engines {
+            let kind = engine.kind.as_str();
+            let route = format!("{}/{}", engine.provider, engine.model);
+            let joined = routes.by_kind.entry(kind.into()).or_default();
+            if let Some(grade) = source.and_then(|snapshot| snapshot.media_grade(kind, &route)) {
+                joined.grades.insert(route, grade);
+            }
+            joined.routes.push(MediaRoute {
+                module: module.clone(),
+                engine: engine.clone(),
+            });
+        }
+    }
+    let routes = Arc::new(routes);
+    *cached = Some(MediaJoin {
+        source: source.cloned(),
+        routes: routes.clone(),
+    });
+    routes
 }
 
 pub(crate) fn engine_declarations() -> BTreeMap<String, cortexkit_role_routing::EngineDeclarations>

@@ -487,6 +487,35 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// The admissions (at most two, enough to tell an ambiguous run) that a
+    /// completed report's decision and run name, each with its probe size
+    /// class. Keyed exception: the module's state holds only open admissions
+    /// and a report usually arrives after its admission finished; the model
+    /// decision id is indexed, so this never scans.
+    pub fn admissions_for_run(
+        &self,
+        decision: &str,
+        run: Option<&str>,
+    ) -> RouteStateResult<Vec<(AccountAdmissionRow, Option<u32>)>> {
+        note_keyed_exception();
+        collect(
+            self.conn,
+            &format!(
+                "SELECT {ADMISSION_COLUMNS}, input_size_class FROM account_admission \
+                 {KEYED_EXCEPTION} WHERE model_decision_id = ?1 AND run_id = ?2 LIMIT 2"
+            ),
+            params![decision, run],
+            |row| {
+                Ok((
+                    admission_from_row(row)?,
+                    row.get::<_, Option<i64>>(25)?
+                        .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
+                ))
+            },
+        )
+        .map_err(err)
+    }
+
     /// Whether an admission is in one of `states`, without reading it: a
     /// primary-key UPDATE that leaves the row as it is and counts the match.
     /// The state uses it to confirm a transition it found not applicable, so

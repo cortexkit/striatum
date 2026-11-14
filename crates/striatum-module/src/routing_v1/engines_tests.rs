@@ -12,6 +12,9 @@ mod measurements;
 #[path = "engine_credentials_tests.rs"]
 mod credentials;
 
+#[path = "select_media_tests.rs"]
+mod media;
+
 fn engine(model: &str, local: bool) -> Value {
     json!({"kind":"transcribe","provider":"media-vendor","model":model,"local":local,
         "formats":["audio/wav"],"languages":["en"],"latency_class":"interactive"})

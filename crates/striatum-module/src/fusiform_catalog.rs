@@ -318,6 +318,8 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) wire_api_models: BTreeSet<String>,
     pub(crate) model_kinds: BTreeMap<String, String>,
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
+    media_grades: BTreeMap<String, MediaGrade>,
+    media_rates: BTreeMap<String, BTreeMap<String, MediaRate>>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, striatum_store::OperatorQuality>,
     decommissioned: BTreeMap<String, String>,
@@ -329,6 +331,32 @@ pub(crate) struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// A grade compares models of one media type, never unrelated catalog rows.
+    #[allow(
+        dead_code,
+        reason = "Media facts must not alter legacy engine selection."
+    )]
+    pub(crate) fn media_grade(&self, kind: &str, route: &str) -> Option<f64> {
+        let expected_type = match kind {
+            "transcribe" | "stream_transcribe" => "transcription",
+            "synthesize" => "speech",
+            "image" | "video" | "realtime" => kind,
+            _ => return None,
+        };
+        let grade = self.media_grades.get(route)?;
+        (grade.model_type == expected_type).then_some(grade.value)
+    }
+
+    /// Keys retain the catalog's `rate.` prefix so no rate can disappear when
+    /// deciding whether every incurred charge can be measured.
+    #[allow(
+        dead_code,
+        reason = "Media facts must not alter legacy engine selection."
+    )]
+    pub(crate) fn media_rates(&self, route: &str) -> Option<&BTreeMap<String, MediaRate>> {
+        self.media_rates.get(route)
+    }
+
     pub(crate) fn is_decommissioned(&self, route: &str) -> bool {
         self.decommissioned.contains_key(route)
     }
@@ -381,6 +409,72 @@ impl CatalogSnapshot {
     #[cfg(test)]
     pub(crate) fn parts(&self) -> (&[FusiformFactUpdate], FusiformCatalogCursor) {
         (&self.facts, self.cursor)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct MediaGrade {
+    model_type: String,
+    value: f64,
+}
+
+/// Only absent or explicitly unknown quantity rules permit billing the measured
+/// quantity unchanged. Preserve other kinds so callers can leave the route
+/// unpriced rather than silently ignore a possible quantum or floor.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RateQuantityKind {
+    Unspecified,
+    Unrecognised(Value),
+}
+
+impl RateQuantityKind {
+    fn decode(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Unspecified,
+            Some(value) if value.get("kind").and_then(Value::as_str) == Some("unknown") => {
+                Self::Unspecified
+            }
+            Some(value) => Self::Unrecognised(value.get("kind").unwrap_or(value).clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MediaRate {
+    pub(crate) state: Option<String>,
+    /// USD for one unit, not the served amount for `per` units. Token rates have
+    /// no request-unit conversion and deliberately carry no unit price here.
+    pub(crate) unit_price: Option<f64>,
+    pub(crate) per: Option<u64>,
+    pub(crate) increment: RateQuantityKind,
+    pub(crate) minimum_quantity: RateQuantityKind,
+}
+
+impl MediaRate {
+    fn decode(model: &str, key: &str, value: &Value) -> Self {
+        let per = value
+            .get("per")
+            .and_then(Value::as_u64)
+            .filter(|per| *per > 0);
+        let unit_price = key
+            .strip_prefix("rate.")
+            .and_then(|key| key.split_once('.'))
+            .filter(|(role, unit)| !role.is_empty() && unit.starts_with("per_"))
+            .and_then(|_| per)
+            .and_then(|per| {
+                let rate = serde_json::from_value::<CatalogRate>(value.clone()).ok()?;
+                decoded_rate(model, key, Some(&rate)).map(|amount| amount / per as f64)
+            });
+        Self {
+            state: value
+                .get("state")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            unit_price,
+            per,
+            increment: RateQuantityKind::decode(value.get("increment")),
+            minimum_quantity: RateQuantityKind::decode(value.get("minimum_quantity")),
+        }
     }
 }
 
@@ -995,6 +1089,8 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut wire_api_models = BTreeSet::new();
     let mut model_kinds = BTreeMap::new();
     let mut audio_input_prices = BTreeMap::new();
+    let mut media_grades = BTreeMap::new();
+    let mut media_rates = BTreeMap::new();
     let mut grades = BTreeMap::new();
     let mut decommissioned = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
@@ -1016,6 +1112,21 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
             .as_ref()
             .is_some_and(|scores| scores.graded_by == "operator")
         {
+            if let (Some(model_type), Some(value)) = (
+                entry.get("model.type").and_then(Value::as_str),
+                entry
+                    .get("quality.grade")
+                    .and_then(Value::as_f64)
+                    .filter(|grade| grade.is_finite() && *grade > 0.0),
+            ) {
+                media_grades.insert(
+                    served_key.clone(),
+                    MediaGrade {
+                        model_type: model_type.to_owned(),
+                        value,
+                    },
+                );
+            }
             if let (Some(elo), Some(eq)) = (
                 entry.get("quality.elo").and_then(Value::as_f64),
                 entry.get("quality.eq").and_then(Value::as_f64),
@@ -1051,6 +1162,18 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         ) {
             Ok((mut fact, model_rates)) => {
                 fact.login_methods_documented = documented.contains(&served_key);
+                media_rates.insert(
+                    served_key.clone(),
+                    entry
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, _)| key.starts_with("rate."))
+                        .map(|(key, value)| {
+                            (key.clone(), MediaRate::decode(&served_key, key, value))
+                        })
+                        .collect(),
+                );
                 audio_input_prices.insert(
                     served_key.clone(),
                     AudioInputPrice::decode(&served_key, &entry),
@@ -1086,6 +1209,8 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         wire_api_models,
         model_kinds,
         audio_input_prices,
+        media_grades,
+        media_rates,
         quality_scores: reply.quality_scores,
         grades,
         decommissioned,
@@ -2054,6 +2179,327 @@ mod tests {
 
     fn get_reply(name: &str) -> Vec<u8> {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
+    }
+
+    fn media_snapshot(models: Value, graded_by: Option<&str>) -> CatalogSnapshot {
+        let mut reply = json!({"catalog_version": 1, "resolved_at_ms": 1, "models": models});
+        if let Some(graded_by) = graded_by {
+            reply["quality_scores"] = json!({"graded_by": graded_by, "graded_at_ms": 1});
+        }
+        decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap()
+    }
+
+    fn speech_reply() -> Value {
+        fixture()["catalog.get — Eleven Flash TTS"]["response"].clone()
+    }
+
+    #[test]
+    fn media_grades_require_operator_positive_numbers_and_matching_types() {
+        let kinds = [
+            ("transcription", "transcribe"),
+            ("transcription", "stream_transcribe"),
+            ("speech", "synthesize"),
+            ("image", "image"),
+            ("video", "video"),
+            ("realtime", "realtime"),
+        ];
+        for (model_type, kind) in kinds {
+            let row =
+                json!({"existence": "present", "model.type": model_type, "quality.grade": 80});
+            let snapshot = media_snapshot(json!({"p/m": row}), Some("operator"));
+            assert_eq!(snapshot.media_grade(kind, "p/m"), Some(80.0), "{kind}");
+            assert_eq!(snapshot.media_grade(kind, "p/missing"), None);
+            for (_, other_kind) in kinds {
+                if !matches!(
+                    (kind, other_kind),
+                    ("transcribe", "stream_transcribe") | ("stream_transcribe", "transcribe")
+                ) && kind != other_kind
+                {
+                    assert_eq!(snapshot.media_grade(other_kind, "p/m"), None);
+                }
+            }
+            for marker in [None, Some("creator"), Some("Operator")] {
+                let snapshot = media_snapshot(json!({"p/m": row}), marker);
+                assert_eq!(snapshot.media_grade(kind, "p/m"), None);
+            }
+            for grade in [
+                Value::Null,
+                json!(0),
+                json!(-1),
+                json!("NaN"),
+                json!("Infinity"),
+            ] {
+                let mut invalid = row.clone();
+                invalid["quality.grade"] = grade;
+                let snapshot = media_snapshot(json!({"p/m": invalid}), Some("operator"));
+                assert_eq!(snapshot.media_grade(kind, "p/m"), None);
+            }
+            for model_type in [Value::Null, json!("chat"), json!("stream_transcribe")] {
+                let mut wrong_type = row.clone();
+                wrong_type["model.type"] = model_type;
+                let snapshot = media_snapshot(json!({"p/m": wrong_type}), Some("operator"));
+                assert_eq!(snapshot.media_grade(kind, "p/m"), None);
+            }
+            let mut missing = row.clone();
+            missing.as_object_mut().unwrap().remove("quality.grade");
+            assert_eq!(
+                media_snapshot(json!({"p/m": missing}), Some("operator")).media_grade(kind, "p/m"),
+                None
+            );
+            let mut missing_type = row;
+            missing_type.as_object_mut().unwrap().remove("model.type");
+            assert_eq!(
+                media_snapshot(json!({"p/m": missing_type}), Some("operator"))
+                    .media_grade(kind, "p/m"),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn media_facts_decode_absent_and_deprecated_rows_without_filtering() {
+        for existence in ["present", "absent"] {
+            for status in ["deprecated", "beta", "alpha"] {
+                let mut reply = speech_reply();
+                let row = &mut reply["models"]["elevenlabs/eleven_flash_v2_5"];
+                row["existence"] = json!(existence);
+                row["model.status"] = json!(status);
+                row["quality.grade"] = json!(75);
+                reply["quality_scores"] = json!({"graded_by": "operator", "graded_at_ms": 1});
+                let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+                let route = "elevenlabs/eleven_flash_v2_5";
+                assert_eq!(snapshot.media_grade("synthesize", route), Some(75.0));
+                assert_eq!(
+                    snapshot.media_rates(route).unwrap()["rate.input.per_character"].unit_price,
+                    Some(0.00004)
+                );
+                let fact = snapshot.model(route).unwrap();
+                assert_eq!(fact.present, existence == "present");
+                assert_eq!(fact.upstream_status.as_deref(), Some(status));
+            }
+        }
+    }
+
+    #[test]
+    fn media_rates_normalize_pinned_units_and_retain_every_rate_key_and_state() {
+        let payloads = fixture();
+        let mut media_rows = 0;
+        for payload in payloads.as_object().unwrap().values() {
+            let reply = &payload["response"];
+            let Some(models) = reply["models"].as_object() else {
+                continue;
+            };
+            let snapshot = decode_catalog_get(&serde_json::to_vec(reply).unwrap()).unwrap();
+            for (route, row) in models {
+                if !matches!(
+                    row["model.type"].as_str(),
+                    Some("transcription" | "speech" | "image" | "video" | "realtime")
+                ) {
+                    continue;
+                }
+                media_rows += 1;
+                let expected: BTreeMap<_, _> = row
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| key.starts_with("rate."))
+                    .map(|(key, value)| (key.clone(), value["state"].as_str().map(str::to_owned)))
+                    .collect();
+                if row.get("existence").is_none() {
+                    // The grade-only reply has no complete fact row or rates;
+                    // it must not invent a readable row in the rate table.
+                    assert!(expected.is_empty());
+                    assert!(snapshot.media_rates(route).is_none());
+                    continue;
+                }
+                let rates = snapshot.media_rates(route).expect("readable media row");
+                assert_eq!(
+                    rates
+                        .iter()
+                        .map(|(key, rate)| (key.clone(), rate.state.clone()))
+                        .collect::<BTreeMap<_, _>>(),
+                    expected
+                );
+                for (key, rate) in rates {
+                    let expected_price = match (route.as_str(), key.as_str()) {
+                        ("elevenlabs/eleven_flash_v2_5", "rate.input.per_character") => {
+                            Some(0.00004)
+                        }
+                        ("openai/gpt-transcribe", "rate.input_audio.per_second") => Some(0.000075),
+                        ("openai/gpt-live-transcribe", "rate.input_audio.per_second") => {
+                            Some(0.017 / 60.0)
+                        }
+                        _ => None,
+                    };
+                    match (rate.unit_price, expected_price) {
+                        (Some(actual), Some(expected)) => {
+                            assert!((actual - expected).abs() < 1e-12, "{route} {key}: {actual}")
+                        }
+                        (actual, expected) => assert_eq!(actual, expected, "{route} {key}"),
+                    }
+                    assert_eq!(rate.per, row[key]["per"].as_u64());
+                    assert_eq!(rate.increment, RateQuantityKind::Unspecified);
+                    assert_eq!(rate.minimum_quantity, RateQuantityKind::Unspecified);
+                }
+            }
+        }
+        assert_eq!(media_rows, 9);
+    }
+
+    #[test]
+    fn media_rates_keep_known_zero_incurred_and_refused_states_distinct() {
+        for state in [
+            "priced",
+            "stated_zero",
+            "not_billed",
+            "unpriced",
+            "billed_as",
+            "future_state",
+        ] {
+            let mut reply = speech_reply();
+            let rate =
+                &mut reply["models"]["elevenlabs/eleven_flash_v2_5"]["rate.input.per_character"];
+            rate["state"] = json!(state);
+            rate["key"] = json!("rate.output");
+            let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+            let decoded = &snapshot
+                .media_rates("elevenlabs/eleven_flash_v2_5")
+                .unwrap()["rate.input.per_character"];
+            assert_eq!(decoded.state.as_deref(), Some(state));
+            assert_eq!(
+                decoded.unit_price,
+                match state {
+                    "priced" => Some(0.00004),
+                    "stated_zero" | "not_billed" => Some(0.0),
+                    _ => None,
+                }
+            );
+        }
+        for (field, invalid) in [
+            ("per", json!(0)),
+            ("per", Value::Null),
+            ("per", json!(-1)),
+            ("currency", json!("EUR")),
+            ("units", json!(-1)),
+            ("exponent", json!(19)),
+        ] {
+            let mut reply = speech_reply();
+            reply["models"]["elevenlabs/eleven_flash_v2_5"]["rate.input.per_character"][field] =
+                invalid;
+            let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+            let decoded = &snapshot
+                .media_rates("elevenlabs/eleven_flash_v2_5")
+                .unwrap()["rate.input.per_character"];
+            assert_eq!(decoded.state.as_deref(), Some("priced"));
+            assert_eq!(decoded.unit_price, None, "{field}");
+        }
+    }
+
+    #[test]
+    fn media_rate_quantity_kinds_keep_unknown_absent_and_unrecognised_distinct() {
+        for field in ["increment", "minimum_quantity"] {
+            for shape in [
+                None,
+                Some(json!({"kind": "unknown"})),
+                Some(json!({"kind": "stated", "quantity": 10})),
+                Some(json!({"kind": "none"})),
+                Some(json!({"kind": 7})),
+            ] {
+                let mut reply = speech_reply();
+                let rate = &mut reply["models"]["elevenlabs/eleven_flash_v2_5"]
+                    ["rate.input.per_character"];
+                match &shape {
+                    Some(shape) => {
+                        rate[field] = shape.clone();
+                    }
+                    None => {
+                        rate.as_object_mut().unwrap().remove(field);
+                    }
+                }
+                let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+                let rate = &snapshot
+                    .media_rates("elevenlabs/eleven_flash_v2_5")
+                    .unwrap()["rate.input.per_character"];
+                let decoded = if field == "increment" {
+                    &rate.increment
+                } else {
+                    &rate.minimum_quantity
+                };
+                let expected = match shape {
+                    None => RateQuantityKind::Unspecified,
+                    Some(shape) if shape["kind"] == "unknown" => RateQuantityKind::Unspecified,
+                    Some(shape) => RateQuantityKind::Unrecognised(shape["kind"].clone()),
+                };
+                assert_eq!(*decoded, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn media_decoding_preserves_legacy_engine_cost() {
+        use cortexkit_role_routing::select_engine::SelectEngineRequest;
+        let mut reply = speech_reply();
+        let mut audio = fixture()["catalog.get — curated unit-billed transcription rate"]
+            ["response"]["models"]["openai/gpt-transcribe"]
+            .clone();
+        assert!(audio.is_object());
+        audio["model.type"] = json!("chat");
+        audio["rate.output"] =
+            json!({"state": "priced", "currency": "USD", "exponent": 0, "units": 999});
+        audio["rate.input_audio.per_second"]["increment"] = json!({"kind": "stated"});
+        audio["rate.input_audio.per_second"]["minimum_quantity"] = json!({"kind": "stated"});
+        reply["models"]["openai/gpt-transcribe"] = audio;
+        reply["models"]["google/gemini-3.5-transcribe-live"] = fixture()
+            ["catalog.get — Gemini Transcribe Live token rates"]["response"]["models"]
+            ["google/gemini-3.5-transcribe-live"]
+            .clone();
+        let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
+        for kind in ["transcribe", "stream_transcribe", "synthesize"] {
+            let request: SelectEngineRequest = serde_json::from_value(json!({"consumer": "c", "kind": kind, "privacy": "remote_allowed", "requirements": {"duration_ms": 60_000, "input_bytes": 1000}})).unwrap();
+            assert_eq!(
+                snapshot.engine_cost(&request, "openai", "gpt-transcribe"),
+                if kind == "synthesize" {
+                    None
+                } else {
+                    Some(0.0045)
+                }
+            );
+            assert_eq!(
+                snapshot.engine_cost(&request, "elevenlabs", "eleven_flash_v2_5"),
+                None
+            );
+            assert_eq!(
+                snapshot.engine_cost(&request, "google", "gemini-3.5-transcribe-live"),
+                if kind == "synthesize" {
+                    None
+                } else {
+                    Some(0.00525)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn media_decoding_preserves_chat_quality_without_media_grade_type_or_value_gates() {
+        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.elo": 1200, "quality.eq": 90, "quality.grade": 0, "quality.decommissioned": true});
+        for marker in [None, Some("creator"), Some("operator")] {
+            let snapshot = media_snapshot(json!({"p/m": row}), marker);
+            if marker == Some("operator") {
+                let quality = &snapshot.grades["p/m"];
+                assert_eq!((quality.elo, quality.eq), (1200.0, 90.0));
+            } else {
+                assert!(snapshot.grades.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn media_decoding_preserves_decommissioning_without_operator_or_grade_gates() {
+        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.grade": 0, "quality.decommissioned": true});
+        for marker in [None, Some("creator"), Some("operator")] {
+            let snapshot = media_snapshot(json!({"p/m": row}), marker);
+            assert!(snapshot.is_decommissioned("p/m"));
+        }
     }
 
     #[test]

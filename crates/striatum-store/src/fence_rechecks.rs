@@ -1317,6 +1317,79 @@ impl AccountTx<'_> {
             .map_err(err)?;
         Ok(())
     }
+
+    /// A report settles only its launch's exact evidence. Admission owners can
+    /// retire their matching decision copy, but never another run's generation.
+    /// Without an admission, the decision must still own the current claim.
+    pub(crate) fn heal_report_probe(
+        &self,
+        owner: &str,
+        decision_copy: Option<&str>,
+        model: &str,
+        admitted_at: i64,
+        origins: &[FenceRecheck],
+        now: i64,
+    ) -> RouteStateResult<()> {
+        for origin in origins.iter().filter(|origin| {
+            origin.evidence_at < admitted_at
+                && origin.model.as_deref().is_none_or(|value| value == model)
+        }) {
+            let proof: Option<(i64, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a
+                 JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
+                 AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at
+                 WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3
+                 AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6
+                 AND (?7 OR ((r.claim_owner IS NULL OR r.claim_owner=a.owner)
+                     AND r.claim_generation=a.claim_generation))
+                 AND r.cleared_at IS NULL",
+                    params![
+                        owner,
+                        origin.kind,
+                        origin.origin_key,
+                        origin.evidence,
+                        origin.evidence_at,
+                        admitted_at,
+                        decision_copy.is_some()
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(err)?;
+            let Some((claimed_at, generation)) = proof.filter(|(at, _)| origin.evidence_at < *at)
+            else {
+                continue;
+            };
+            self.heal_origins(
+                std::slice::from_ref(origin),
+                model,
+                admitted_at,
+                now,
+                None,
+                true,
+            )?;
+            self.conn
+                .execute(
+                    "DELETE FROM fence_probe_authorization WHERE (owner=?1 OR owner=?2)
+                 AND kind=?3 AND origin_key=?4 AND evidence=?5 AND evidence_at=?6
+                 AND claimed_at=?7 AND claim_generation=?8",
+                    params![
+                        owner,
+                        decision_copy,
+                        origin.kind,
+                        origin.origin_key,
+                        origin.evidence,
+                        origin.evidence_at,
+                        claimed_at,
+                        generation
+                    ],
+                )
+                .map_err(err)?;
+        }
+        Ok(())
+    }
     pub(crate) fn successful_quota_pools(
         &self,
         id: &str,
