@@ -1468,15 +1468,15 @@ impl AccountTx<'_> {
         for row in &held {
             let shown = blocks.clock(&row.kind, &row.origin_key).map(|(clock, cleared)| {
                 (clock.evidence.clone(), clock.evidence_at, clock.claim_generation, clock.scope.credential_id.clone(),
-                    clock.scope.model.clone(), cleared)
+                    clock.scope.model.clone(), cleared, clock.claim_owner.clone())
             });
             let stored = self
                 .conn
-                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at
+                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
                     FROM fence_recheck WHERE kind=?1 AND origin_key=?2"))
                 .map_err(err)?
                 .query_row([&row.kind, &row.origin_key], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
                 })
                 .optional()
                 .map_err(err)?;

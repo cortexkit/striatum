@@ -457,21 +457,53 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
             || text.contains("_tests/")
             || test_only.iter().any(|prefix| path.starts_with(prefix))
     };
+    // SQL comments end a word as whitespace does: `OR/**/REPLACE` and
+    // `OR -- note` followed by `REPLACE` on the next line are both REPLACE.
+    let uncomment = |text: &str| -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix("/*") {
+                rest = after.find("*/").map_or("", |end| &after[end + 2..]);
+                out.push(' ');
+            } else if let Some(after) = rest.strip_prefix("--") {
+                // A comment ends at a newline, or at a `\n` escape inside
+                // a Rust string literal.
+                let end = [after.find('\n'), after.find("\\n")].into_iter().flatten().min();
+                rest = end.map_or("", |end| &after[end..]);
+                out.push(' ');
+            } else {
+                let next = rest.chars().next().unwrap();
+                out.push(next);
+                rest = &rest[next.len_utf8()..];
+            }
+        }
+        out
+    };
+    // Both the text as written and the text without comments are searched,
+    // so removing comments (which may pair a `/*` and `*/` from unrelated
+    // strings) can only find more, never hide what the plain text shows.
     let scan = |text: &str| -> Vec<&'static str> {
-        let normal = text
-            .to_ascii_lowercase()
-            .replace(['"', '`', '\\', '\''], " ")
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normals: Vec<String> = [text.to_owned(), uncomment(text)]
+            .iter()
+            .map(|text| {
+                text.to_ascii_lowercase()
+                    .replace(['"', '`', '\\', '\''], " ")
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
         ["or replace", "replace into", "on conflict replace"]
             .into_iter()
             .filter(|form| {
-                normal.match_indices(form).any(|(at, _)| {
-                    let before = normal[..at].chars().next_back();
-                    let after = normal[at + form.len()..].chars().next();
-                    !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-                        && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                normals.iter().any(|normal| {
+                    normal.match_indices(form).any(|(at, _)| {
+                        let before = normal[..at].chars().next_back();
+                        let after = normal[at + form.len()..].chars().next();
+                        !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && !after.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
                 })
             })
             .collect()
@@ -482,6 +514,11 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
     assert_eq!(scan("UPDATE OR REPLACE pool_key_state SET a=1"), ["or replace"]);
     assert_eq!(scan("CREATE TABLE t (a TEXT UNIQUE ON CONFLICT REPLACE);"), ["on conflict replace"]);
     assert!(scan("let s = text.replace('a', \"b\"); color_replace").is_empty());
+    assert_eq!(scan("INSERT OR/**/REPLACE t VALUES (1)"), ["or replace"]);
+    assert_eq!(scan("INSERT OR -- keep the newest\n  REPLACE t VALUES (1)"), ["or replace"]);
+    assert_eq!(scan("x(\"INSERT OR \\\n         REPLACE t VALUES (1)\")"), ["or replace"]);
+    assert_eq!(scan("x(\"-- the newest\\nINSERT OR REPLACE t VALUES (1)\"); // --"), ["or replace"]);
+    assert_eq!(scan("-- INSERT OR REPLACE, even commented out\nSELECT 1"), ["or replace"]);
     let mut violations = Vec::new();
     let mut scanned = 0;
     for path in all.iter().filter(|path| !is_test(path)) {
@@ -935,6 +972,34 @@ fn probe_answers_read_from_a_stale_state_run_again_on_a_fresh_load() {
         })
         .unwrap();
     assert!(names, "the decision's probe names the refused credential");
+    assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
+}
+
+/// The probe-answer check compares the clock's claim owner too: a clock
+/// whose owner changed without the state seeing it makes the answer run
+/// again on a fresh load.
+#[test]
+fn a_probe_answer_on_a_clock_whose_owner_changed_unseen_runs_again() {
+    let rig = rig("block-state-checked-claim-owner");
+    due_credential_refusal(&rig, "c0");
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.grant_fence_rechecks(&origins, NOW, Some("decision"))
+        })
+        .unwrap());
+    UNSEEN.with(|unseen| unseen.set(true));
+    rig.store
+        .bypass_account_writer_for_test("UPDATE fence_recheck SET claim_owner='another';")
+        .unwrap();
+    UNSEEN.with(|unseen| unseen.set(false));
+    let loads = rig.decide_next_on(rig.published());
+    rig.store
+        .account_command(AccountCommandKind::Report, |tx| {
+            tx.probe_authorization_names_credential("decision", "c0", "m0")
+        })
+        .unwrap();
     assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
 }
 

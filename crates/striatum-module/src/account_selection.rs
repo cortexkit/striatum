@@ -5281,10 +5281,25 @@ fn prepare_and_admit(
         Err(reply) => return Err(reply),
     };
     checking("service_tier");
-    parsed.service_tier_chosen = match prepare_service_tier(&mut parsed, ctx, &mut roster, class) {
-        Ok(tier) => tier,
-        Err(reply) => return Err(reply),
-    };
+    // Accounts a route fence or another selection's reserved probe keeps out
+    // for now, and when the first of them returns: a bound tier those
+    // accounts serve waits for them instead of being refused for good.
+    let held_until = route_fenced
+        .values()
+        .copied()
+        .chain(ctx.classes.iter().flat_map(|classes| {
+            classes
+                .reserved_probe_accounts(&provider, &normalize(&parsed.model), &parsed)
+                .into_iter()
+                .map(|(_, until)| until)
+        }))
+        .filter(|until| *until > ctx.now_ms)
+        .min();
+    parsed.service_tier_chosen =
+        match prepare_service_tier(&mut parsed, ctx, &mut roster, class, held_until) {
+            Ok(tier) => tier,
+            Err(reply) => return Err(reply),
+        };
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return Err(because("route_fence", reply));
     }
@@ -5632,6 +5647,7 @@ fn prepare_service_tier(
     ctx: &Ctx<'_>,
     roster: &mut RosterBuild,
     class: striatum_core::accounts::AllowedAccountClass,
+    held_until: Option<i64>,
 ) -> Result<Option<cortexkit_role_routing::service_tier::ServiceTier>, OpReply> {
     use cortexkit_role_routing::service_tier::{fallback, ServiceTier};
     let bound = parsed
@@ -5661,6 +5677,11 @@ fn prepare_service_tier(
                 })
             })
         {
+            // No account left can serve the tier, but some are only held
+            // out for a while: wait for them, as a lost probe does.
+            if let Some(until) = held_until {
+                return Err(lost_probe_refusal(until, ctx.now_ms, Value::Null, json!([])));
+            }
             return Err(bound_service_tier_refusal(parsed));
         }
         return Ok((!tier.is_standard() || parsed.service_tier.is_some()).then_some(tier));
@@ -5804,10 +5825,11 @@ fn route_fence_refusal(
     ))
 }
 
-/// The answer to a request that lost a probe race and was admitted nowhere:
-/// the timed `account_pool_exhausted`, at `until` (the earlier of the lost
-/// probe's retry time and any reset the refusal knew). Never an untimed code,
-/// which a runner would read as a missing login.
+/// The answer to a request that lost a probe race, or whose accounts are
+/// held out for a while, and was admitted nowhere: the timed
+/// `account_pool_exhausted`, at `until` (the earliest time one of them may
+/// return). Never an untimed code, which a runner would read as a missing
+/// login or a decision to replace.
 fn lost_probe_refusal(until: i64, now: i64, decision_id: Value, exclusions: Value) -> OpReply {
     let retry_after_s = u64::try_from(until.saturating_sub(now))
         .unwrap_or(0)
@@ -5815,7 +5837,7 @@ fn lost_probe_refusal(until: i64, now: i64, decision_id: Value, exclusions: Valu
     OpReply::typed(
         "account_pool_exhausted",
         format!(
-            "no account admitted: a probe this request needed is in use until {}",
+            "no account admitted: the accounts this request needs are held until {}",
             rfc3339(until)
         ),
         json!({
