@@ -39,7 +39,7 @@ pub struct QuotaSuccessScope {
 }
 
 impl QuotaSuccessScope {
-    fn used(&self, key: &striatum_core::accounts::PoolKey, model: &str) -> bool {
+    pub(crate) fn used(&self, key: &striatum_core::accounts::PoolKey, model: &str) -> bool {
         key.scope.applies_to(model, self.family)
             && match (&key.name, &self.pool) {
                 (Some(expected), Some(actual)) => expected == actual,
@@ -1009,6 +1009,22 @@ pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
       AND a.admission_valid_until<=?1";
 
 impl AccountTx<'_> {
+    /// Arm real fixture blocks without changing their evidence or admissions.
+    /// Read-only previews synthesize clocks, so materialize them before setting
+    /// their due time; otherwise a quota origin may have no durable clock yet.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn arm_observe_retest_for_test(&self, provider: &str) -> RouteStateResult<()> {
+        sync(self.conn).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE fence_recheck SET next_recheck_at=0,reset_check_at=NULL,claim_owner=NULL
+            WHERE provider=?1",
+                [provider],
+            )
+            .map(|_| ())
+            .map_err(err)
+    }
+
     /// A selected probe may be sent without account admission. Persist its
     /// interval and intended credential together so its report can settle only
     /// that probe, even after the selection's in-memory hold expires.
@@ -1261,6 +1277,7 @@ impl AccountTx<'_> {
         &self,
         owner: &str,
         decision_copy: Option<&str>,
+        admission_owned: bool,
         model: &str,
         admitted_at: i64,
         origins: &[FenceRecheck],
@@ -1288,7 +1305,7 @@ impl AccountTx<'_> {
                         origin.evidence,
                         origin.evidence_at,
                         admitted_at,
-                        decision_copy.is_some()
+                        admission_owned
                     ],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
@@ -1423,7 +1440,7 @@ impl AccountTx<'_> {
         self.heal_origins(&origins, model, admitted_at, now, scope, false)
     }
 
-    fn heal_origins(
+    pub(crate) fn heal_origins(
         &self,
         origins: &[FenceRecheck],
         model: &str,

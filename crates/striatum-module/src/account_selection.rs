@@ -7152,6 +7152,8 @@ struct ObserveParams {
     retry_at_ms: Option<u64>,
     #[serde(default)]
     provider_code: Option<String>,
+    #[serde(default)]
+    attempt_outcome: Option<cortexkit_role_routing::attempt::AttemptOutcome>,
 }
 
 /// What `route.account_observe` reads from each tracked provider's roster
@@ -7196,6 +7198,18 @@ pub(crate) fn observe_authorized(
         );
     }
     checking("account_observe_parse");
+    // Legacy callers keep their open envelope, but the success member has the
+    // same capability gate and validation as the closed routing/v1 shape.
+    if params.get("attempt_outcome").is_some() {
+        if let Err(refusal) = cortexkit_role_routing::observe::parse_account_observe_request_serving(
+            params,
+            &crate::routing_v1::describe::capabilities(),
+        ) {
+            let mut detail = refusal.detail;
+            detail.insert("code".into(), json!(refusal.code.as_str()));
+            return OpReply::typed(refusal.code.as_str(), refusal.message, Value::Object(detail));
+        }
+    }
     let parsed: ObserveParams = match serde_json::from_value(params.clone()) {
         Ok(parsed) => parsed,
         Err(error) => return invalid(format!("invalid route.account_observe params: {error}")),
@@ -7283,7 +7297,7 @@ fn record_observation(
                 "id": existing.observation_id,
                 "duplicate": true,
                 "bound": existing.bound,
-                "effects": serde_json::from_str::<Value>(&existing.effects_json).unwrap_or(Value::Null),
+                "effects": [],
             }
         })));
     }
@@ -7614,15 +7628,43 @@ fn apply_bound_observation(
                 )?;
             }
         }
-        "attempt" => header_fences(
-            tx,
-            ctx,
-            principal,
-            parsed,
-            admission,
-            observation_id,
-            effects,
-        )?,
+        "attempt" => {
+            if principal == admission.principal
+                && parsed.served_account_id.as_deref() == Some(admission.account_id.as_str())
+                && parsed.credential_id.as_deref() == Some(admission.credential_id.as_str())
+                && parsed.attempt_outcome.as_ref().is_some_and(|outcome| {
+                    matches!(
+                        outcome.status,
+                        cortexkit_role_routing::attempt::AttemptStatus::Served
+                            | cortexkit_role_routing::attempt::AttemptStatus::ServedEmpty
+                    )
+                })
+            {
+                let scope = striatum_store::QuotaSuccessScope {
+                    family: ctx
+                        .provider_policy(&admission.provider)
+                        .family_for_model(&admission.model),
+                    pool: request_pool(
+                        parsed.pool.as_deref(),
+                        &admission.provider,
+                        &admission.model,
+                    ),
+                };
+                for origin in tx.heal_admission_success(admission, Some(&scope), now)? {
+                    effects.push(json!({"effect":"block_cleared", "kind":origin.kind,
+                        "origin_key":origin.origin_key}));
+                }
+            }
+            header_fences(
+                tx,
+                ctx,
+                principal,
+                parsed,
+                admission,
+                observation_id,
+                effects,
+            )?;
+        }
         "scoped_not_found" => {
             let (Some(credential_id), Some(view_digest)) = (
                 parsed.credential_id.as_deref(),

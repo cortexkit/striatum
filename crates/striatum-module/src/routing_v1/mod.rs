@@ -32,7 +32,7 @@ pub(crate) mod classifier;
 #[cfg(test)]
 mod classifier_tests;
 pub(crate) mod consumers;
-mod describe;
+pub(crate) mod describe;
 #[cfg(test)]
 pub(crate) use describe::inherit_capabilities;
 mod engines;

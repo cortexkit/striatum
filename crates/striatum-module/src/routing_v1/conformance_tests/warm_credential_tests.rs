@@ -7,6 +7,7 @@ fn result(reply: (FrameType, Value)) -> Value {
 
 async fn setup(label: &str) -> (KitSubject, Route) {
     let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
         harness: Mutex::new(Harness::new(label)),
     };
     subject

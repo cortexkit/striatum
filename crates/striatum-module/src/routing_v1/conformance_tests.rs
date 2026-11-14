@@ -822,6 +822,7 @@ pub(super) fn install_head_snapshot(harness: &Harness) {
 /// The kit's subject: a fresh [`Harness`] per check.
 struct KitSubject {
     harness: Mutex<Arc<Harness>>,
+    observe_blocks: Mutex<bool>,
 }
 
 struct KitRoute {
@@ -977,6 +978,60 @@ impl KitSubject {
     }
 }
 
+#[tokio::test]
+async fn observe_success_fixture_arms_real_quota_retest() {
+    let subject = KitSubject {
+        harness: Mutex::new(Harness::new("observe-fixture")),
+        observe_blocks: Mutex::new(false),
+    };
+    let mut catalog = fixture::catalog();
+    let account = catalog
+        .accounts
+        .iter()
+        .find(|a| a.provider == fixture::SUBSCRIPTION_PROVIDER)
+        .unwrap().clone();
+    let mut sibling = account.clone();
+    sibling.credential_id = "success-sibling".into();
+    let mut other = account.clone();
+    other.account_id = "success-other-account".into();
+    other.credential_id = "success-other-credential".into();
+    catalog.accounts = vec![account.clone(), sibling.clone(), other];
+    subject.configure_catalog(&catalog).await.unwrap();
+    let h = subject.harness();
+    let route = h.bind(reserved(fixture::RUNNER_ONE), None).await;
+    for (index, account) in [account, sibling].iter().enumerate() {
+        subject
+        .configure_observe_retest_block(
+            &account.account_id,
+            &account.credential_id,
+            "quota",
+            crate::now_ms() - if index == 0 { 1000 } else { 0 },
+        )
+        .await
+        .unwrap();
+    let before = h.store().fence_rechecks().unwrap();
+    let reply = route
+        .call(
+            "route.account_for",
+            &json!({
+                "provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
+                "conversation_key":format!("retest-{index}"),"admission_id":format!("retest-{index}"),
+                "candidates":{"view_digest":"fixture","accounts":[{
+                    "account_id":account.account_id,"credential_id":account.credential_id}]}
+            }),
+        )
+        .await;
+    let after = h.store().fence_rechecks().unwrap();
+    assert_eq!(
+        reply.0,
+        FrameType::Response,
+        "reply={} before={before:?} after={after:?}",
+        reply.1
+    );
+    assert!(after.iter().any(|o| o.last_claimed_at.is_some()));
+    }
+}
+
 #[async_trait]
 impl RoutingSubject for KitSubject {
     type Route = KitRoute;
@@ -1021,6 +1076,25 @@ impl RoutingSubject for KitSubject {
 
     async fn configure_catalog(&self, catalog: &Catalog) -> Result<(), String> {
         let harness = self.harness();
+        let reset_blocks = std::mem::take(&mut *self.observe_blocks.lock().unwrap());
+        if reset_blocks {
+            // Replacing the fixture catalog resets its blocks, not its admissions:
+            // the success checks deliberately replay admissions across replacements.
+            let h = harness.clone();
+            tokio::task::spawn_blocking(move || {
+                h.store().with_writer_for_test(|conn| {
+                    conn.execute_batch(
+                        "DELETE FROM account_fence;
+                    DELETE FROM credential_entitlement_fences;
+                    DELETE FROM account_non_quota_route_fence; DELETE FROM account_route_fence;
+                    DELETE FROM fence_recheck; DELETE FROM fence_probe_authorization;",
+                    )
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+        }
         install_catalog(&harness, catalog);
         install_panel_families(&harness, catalog);
         install_head_snapshot(&harness);
@@ -1519,6 +1593,96 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_observe_retest_block(
+        &self,
+        account_id: &str,
+        credential_id: &str,
+        kind: &str,
+        recorded_at_ms: u64,
+    ) -> Result<(), String> {
+        let h = self.harness();
+        let account = account_id.to_owned();
+        let credential = credential_id.to_owned();
+        let kind = kind.to_owned();
+        let at = i64::try_from(recorded_at_ms).map_err(|e| e.to_string())?;
+        if kind == "quota" {
+            // Keep healthy quota available after recovery, but do not let a
+            // reading newer than the seeded refusal settle the fixture early.
+            if let Some(reading) = crate::ACCOUNT_QUOTA
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .get_mut(&(QUOTA_SOURCE.to_owned(), account.clone()))
+            {
+                reading.entry["fetchedAt"] = json!(account_selection::rfc3339(at - 60_000));
+            }
+        }
+        let (provider, fingerprint) = {
+            let credentials = h.credentials();
+            let listing = credentials.lock().unwrap();
+            let row = listing
+                .listed_credentials()
+                .iter()
+                .find(|r| r.id == credential)
+                .ok_or("fixture credential missing")?;
+            let provider = row
+                .provider_ids
+                .first()
+                .ok_or("fixture provider missing")?
+                .clone();
+            let fingerprint = match listing.listing_fingerprint(&credential) {
+                crate::broca_credentials::ListingLookup::Listed(value) => Some(value),
+                _ => None,
+            };
+            (provider, fingerprint)
+        };
+        *self.observe_blocks.lock().unwrap() = true;
+        tokio::task::spawn_blocking(move || {
+            h.store().account_transaction(|tx| {
+                if kind == "quota" {
+                    let fence = striatum_store::AccountRouteFence {
+                        provider: provider.clone(),
+                        credential_id: credential.clone(),
+                        model: "model-c".into(),
+                        until_ms: at + 3_600_000,
+                        decision_id: "kit-success".into(),
+                        recorded_at: at,
+                    };
+                    tx.record_account_route_fence(&fence)?;
+                } else {
+                    tx.record_credential_refusal(
+                        &striatum_core::route_state_store::CredentialRefusal {
+                            provider_id: provider.clone(),
+                            credential_id: credential.clone(),
+                            code: match kind.as_str() {
+                                "credential_refused" => "credential_refused",
+                                "transient_backoff" => "credential_refused",
+                                "credit" => "billing_exhausted",
+                                _ => {
+                                    return Err(
+                                        striatum_core::route_state_store::RouteStateStoreError(
+                                            "unknown fixture block".into(),
+                                        ),
+                                    )
+                                }
+                            }
+                            .into(),
+                        },
+                        fingerprint.as_deref(),
+                        at,
+                    )?;
+                }
+                tx.arm_observe_retest_for_test(&provider)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+    }
+
     async fn route(&self, stamp: &RouteStamp) -> Result<KitRoute, String> {
         if let Some(scope) = &stamp.scope {
             let harness = self.harness();
@@ -1549,6 +1713,7 @@ impl RoutingSubject for KitSubject {
 /// model-input hook is absent here; classifier handler tests cover question
 /// limits and input-spend caps against the catalog and provider description.
 const NOT_APPLICABLE: &[&str] = &[
+    "account_observe_success_undeclared",
     "undeclared_pin_slot_refused",
     "undeclared_available_routes_refused",
     "undeclared_prefer_prompt_cache_refused",
@@ -1581,6 +1746,7 @@ const PENDING_READERS: &[(&str, &[&str])] = &[
     (
         "select_media",
         &[
+            "select_media_input_characters",
             "select_media_privacy",
             "select_media_requirements",
             "select_media_video",
@@ -1656,12 +1822,19 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         );
     }
     let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
         harness: Mutex::new(Harness::new("kit")),
     };
     for reason in PENDING_REFUSAL_REASONS {
         assert!(cortexkit_role_routing::errors::NoRouteReason::parse(reason).is_known());
-        assert!(!known.contains(reason), "refusal {reason} became a capability");
-        assert!(!advertised.contains(reason), "pending refusal advertised as a group");
+        assert!(
+            !known.contains(reason),
+            "refusal {reason} became a capability"
+        );
+        assert!(
+            !advertised.contains(reason),
+            "pending refusal advertised as a group"
+        );
     }
     let report = run_suite(&subject).await;
     eprintln!("{}", report.render());

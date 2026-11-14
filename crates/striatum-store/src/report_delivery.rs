@@ -136,6 +136,136 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    /// Settle success using the admission's identity, `committed_at` cutoff and
+    /// exact probe proof. Return the origins actually cleared for observation effects.
+    pub fn heal_admission_success(
+        &self,
+        admission: &AccountAdmissionRow,
+        scope: Option<&crate::QuotaSuccessScope>,
+        now: i64,
+    ) -> RouteStateResult<Vec<crate::FenceRecheck>> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(Vec::new());
+        }
+        let size = self.admission_size_class(&admission.principal, &admission.admission_id)?;
+        let owner = serde_json::json!([
+            "account_admission",
+            admission.principal,
+            admission.admission_id
+        ])
+        .to_string();
+        let decision: Option<String> = self.conn.query_row(
+            "SELECT model_decision_id FROM account_admission WHERE principal=?1 AND admission_id=?2",
+            params![admission.principal, admission.admission_id], |row| row.get(0),
+        ).map_err(err)?;
+        let mut origins: Vec<_> = self
+            .fence_rechecks()?
+            .into_iter()
+            .filter(|origin| {
+                origin.applies(
+                    &admission.provider,
+                    &admission.account_id,
+                    &admission.credential_id,
+                    &admission.model,
+                ) && origin
+                    .principal
+                    .as_deref()
+                    .is_none_or(|p| p == admission.principal)
+                    && origin
+                        .admission_id
+                        .as_deref()
+                        .is_none_or(|id| id == admission.admission_id)
+                    && origin
+                        .size_class
+                        .is_none_or(|class| Some(class as u32) == size)
+            })
+            .collect();
+        // Credential-quota holds are materialized as account fences, whose
+        // origin view has no credential column. The fence id retains the provider
+        // and credential id, so a sibling credential's hold must be excluded here.
+        let credential_prefix = format!(
+            "credential-quota:{}:",
+            serde_json::json!([admission.provider, admission.credential_id])
+        );
+        origins.retain(|origin| {
+            if origin.kind != "account" {
+                return true;
+            }
+            serde_json::from_str::<Vec<serde_json::Value>>(&origin.origin_key)
+                .ok()
+                .and_then(|key| key.first().and_then(|id| id.as_str()).map(str::to_owned))
+                .is_some_and(|id| {
+                    !id.starts_with("credential-quota:") || id.starts_with(&credential_prefix)
+                })
+        });
+        // An admission authorized to test a whole-account fence can clear that
+        // fence without a quota reading. Pool-scoped fences additionally require
+        // the success scope to cover their pool and model.
+        let mut captured = Vec::new();
+        for origin in &origins {
+            if origin.kind == "account" {
+                let key: Vec<serde_json::Value> =
+                    serde_json::from_str(&origin.origin_key).map_err(err)?;
+                let pool: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT pool_key_json FROM account_fence WHERE fence_id=?1",
+                        [key[0].as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(err)?;
+                if let Some(pool) = pool {
+                    let pool = serde_json::from_str(&pool).map_err(err)?;
+                    if !scope.is_some_and(|scope| scope.used(&pool, &admission.model)) {
+                        continue;
+                    }
+                }
+            }
+            captured.push(origin.clone());
+        }
+        self.heal_report_probe(
+            &owner,
+            decision.as_deref(),
+            true,
+            &admission.model,
+            admission.committed_at,
+            &captured,
+            now,
+        )?;
+        let serving: Vec<_> = self
+            .fence_rechecks()?
+            .into_iter()
+            .filter(|origin| {
+                origin.principal.is_none()
+                    && origin.evidence_at < admission.committed_at
+                    && origins.iter().any(|scoped| {
+                        scoped.kind == origin.kind
+                            && scoped.origin_key == origin.origin_key
+                            && scoped.evidence == origin.evidence
+                    })
+            })
+            .collect();
+        self.heal_origins(
+            &serving,
+            &admission.model,
+            admission.committed_at,
+            now,
+            scope,
+            false,
+        )?;
+        let remaining = self.fence_rechecks()?;
+        Ok(origins
+            .into_iter()
+            .filter(|origin| {
+                !remaining.iter().any(|other| {
+                    other.kind == origin.kind
+                        && other.origin_key == origin.origin_key
+                        && other.evidence == origin.evidence
+                })
+            })
+            .collect())
+    }
+
     fn heal_report_run(
         &self,
         decision: &str,
@@ -188,40 +318,7 @@ impl AccountTx<'_> {
                 );
                 return Ok(());
             }
-            let size = self.admission_size_class(principal, id)?;
-            let owner = serde_json::json!(["account_admission", principal, id]).to_string();
-            let origins: Vec<_> = self
-                .fence_rechecks()?
-                .into_iter()
-                .filter(|origin| {
-                    origin.applies(
-                        &admission.provider,
-                        &admission.account_id,
-                        &admission.credential_id,
-                        &admission.model,
-                    ) && origin
-                        .size_class
-                        .is_none_or(|class| Some(class as u32) == size)
-                })
-                .collect();
-            self.heal_report_probe(
-                &owner,
-                Some(decision),
-                &admission.model,
-                admission.committed_at,
-                &origins,
-                now,
-            )?;
-            self.heal_serving_fences_in_scope(
-                &admission.provider,
-                &admission.account_id,
-                &admission.credential_id,
-                &admission.model,
-                size,
-                admission.committed_at,
-                now,
-                effects.quota_scope.as_ref(),
-            )?;
+            self.heal_admission_success(&admission, effects.quota_scope.as_ref(), now)?;
         } else {
             // A decision without an account admission still owns its selection
             // probe. The decision clock is the conservative launch bound when
@@ -240,7 +337,15 @@ impl AccountTx<'_> {
                         |row| row.get(0),
                     )
                     .map_err(err)?;
-                self.heal_report_probe(decision, None, &model, at, &self.fence_rechecks()?, now)?;
+                self.heal_report_probe(
+                    decision,
+                    None,
+                    false,
+                    &model,
+                    at,
+                    &self.fence_rechecks()?,
+                    now,
+                )?;
                 // Only the first report may heal older matching serving evidence
                 // without a probe authorization. If this decision held one (a
                 // `fence_probe_authorization` row it owns), only
@@ -364,8 +469,7 @@ impl AccountTx<'_> {
 
     pub fn report_credential_refusals(
         &self,
-    ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>>
-    {
+    ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
         let mut statement=self.conn.prepare("SELECT provider_id,credential_id,code,listing_fingerprint,observed_at_ms FROM credential_entitlement_fences ORDER BY provider_id,credential_id").map_err(err)?;
         let rows = statement
             .query_map([], |r| {
