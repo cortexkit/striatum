@@ -10,6 +10,163 @@ fn descriptor() -> StorageDescriptor {
     dev_descriptor("report-delivery", path.to_string_lossy().into_owned())
 }
 
+fn report_outcome_for_run(
+    store: &SqliteRouteStateStore,
+    run: &str,
+    outcome: RouteOutcome,
+    now: i64,
+) {
+    store
+        .v1_commit_report(
+            "d",
+            &format!("run:{run}"),
+            &format!("report:d:{run}"),
+            &V1Recorded {
+                body_json: "{}".into(),
+                answer_json: "{}".into(),
+            },
+            outcome,
+            None,
+            false,
+            &V1ReportEffects {
+                lift_credential: Some(("example".into(), "key".into())),
+                ..Default::default()
+            },
+            None,
+            |_| Ok(()),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+}
+
+fn claim_decision_probe(store: &SqliteRouteStateStore, at: i64) {
+    store
+        .record_billing_account_route_fence(&AccountRouteFence {
+            provider: "example".into(),
+            credential_id: "key".into(),
+            model: "model".into(),
+            until_ms: at,
+            recorded_at: at - 3_600_000,
+            decision_id: "old".into(),
+        })
+        .unwrap();
+    let origins = store.fence_rechecks().unwrap();
+    assert!(store
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, at, Some("d")))
+        .unwrap());
+}
+
+#[test]
+fn completed_report_without_admission_heals_current_selection_time_claim() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    seed(&store, "d", "p");
+    claim_decision_probe(&store, 1);
+    report_outcome_for_run(&store, "selected", RouteOutcome::Completed, 2);
+    assert!(store.fence_rechecks().unwrap().is_empty());
+}
+
+#[test]
+fn completed_reused_decision_without_admission_cannot_resurrect_interrupted_claim() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    seed(&store, "d", "p");
+    claim_decision_probe(&store, 1);
+    report_outcome_for_run(&store, "interrupted", RouteOutcome::Interrupted, 2);
+    store
+        .store
+        .with_conn(|c| {
+            assert_eq!(
+                c.query_row(
+                    "SELECT count(*) FROM fence_probe_authorization",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )?,
+                0
+            );
+            Ok(())
+        })
+        .unwrap();
+    report_outcome_for_run(&store, "later-no-claim", RouteOutcome::Completed, 3);
+    assert_eq!(store.fence_rechecks().unwrap().len(), 1);
+    let origins = store.fence_rechecks().unwrap();
+    assert!(store
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 4, Some("d")))
+        .unwrap());
+    report_outcome_for_run(&store, "later-claim", RouteOutcome::Completed, 5);
+    assert_eq!(store.fence_rechecks().unwrap().len(), 1,
+        "without a run-specific launch clock, a claim after selection cannot be attributed to success");
+}
+
+#[test]
+fn completed_decision_report_does_not_consume_a_replaced_claim_generation() {
+    let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+    seed(&store, "d", "p");
+    claim_decision_probe(&store, 1);
+    let origins = store.fence_rechecks().unwrap();
+    assert!(store
+        .account_transaction(|tx| tx.grant_fence_rechecks(&origins, 3_600_002, Some("other")))
+        .unwrap());
+    report_outcome_for_run(&store, "stale", RouteOutcome::Completed, 3_600_003);
+    let remaining = store.fence_rechecks().unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].claim_owner.as_deref(), Some("other"));
+}
+
+#[test]
+fn report_admission_probe_settlement_retires_only_its_matching_decision_copy() {
+    for changed in ["matching", "other-generation", "newer-evidence"] {
+        let store = SqliteRouteStateStore::open(&descriptor()).unwrap();
+        seed(&store, "d", "p");
+        claim_decision_probe(&store, 1);
+        let owner = serde_json::json!(["account_admission", "runner", "admission"]).to_string();
+        let origins = store.fence_rechecks().unwrap();
+        assert!(store
+            .account_transaction(|tx| {
+                tx.claim_fence_rechecks_for_authorized_admission(&origins, 2, Some("d"), &owner)
+            })
+            .unwrap());
+        if changed == "other-generation" {
+            store.store.with_conn(|c| {
+                c.execute("UPDATE fence_probe_authorization SET claim_generation=claim_generation+1 WHERE owner='d'", [])?;
+                Ok(())
+            }).unwrap();
+        } else if changed == "newer-evidence" {
+            store
+                .record_billing_account_route_fence(&AccountRouteFence {
+                    provider: "example".into(),
+                    credential_id: "key".into(),
+                    model: "model".into(),
+                    until_ms: 100,
+                    recorded_at: 3,
+                    decision_id: "new".into(),
+                })
+                .unwrap();
+        }
+        let origins = store.fence_rechecks().unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.heal_report_probe(&owner, Some("d"), "model", 2, &origins, 4)
+            })
+            .unwrap();
+        assert_eq!(
+            store.fence_rechecks().unwrap().is_empty(),
+            changed != "newer-evidence"
+        );
+        store
+            .store
+            .with_conn(|c| {
+                let copies: i64 = c.query_row(
+                    "SELECT count(*) FROM fence_probe_authorization WHERE owner='d'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(copies, i64::from(changed != "matching"), "{changed}");
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
 #[test]
 fn inconclusive_v1_reports_release_only_their_non_quota_probe_claim() {
     for (outcome, error, neutral) in [

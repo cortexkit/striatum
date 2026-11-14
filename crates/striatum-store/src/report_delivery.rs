@@ -92,30 +92,9 @@ impl SqliteRouteStateStore {
             if first {
                 let account = AccountTx { conn: &tx };
                 account.use_continuation(decision_id, now).map_err(sql_error)?;
-                let admitted_at:i64=tx.query_row("SELECT COALESCE((SELECT created_at_ms FROM routing_v1_decision WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",[decision_id],|row|row.get(0))?;
                 let settle = account.probe_report_matches(
                     decision_id, effects.reported_credential.as_deref(), effects.preserve_probe).map_err(sql_error)?;
                 if settle { apply_account_effects(&account, effects, now)?; }
-                if settle && outcome==RouteOutcome::Completed {
-                    if let Some((provider,credential))=&effects.lift_credential {
-                        let (model,identity):(String,Option<String>)=tx.query_row("SELECT selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",[decision_id],|row|Ok((row.get(0)?,row.get(1)?)))?;
-                        let identity=identity.and_then(|raw|serde_json::from_str::<striatum_core::route_state_store::ProviderOutcome>(&raw).ok());
-                        if identity.as_ref().and_then(|identity|identity.credential_id.as_deref()).is_none_or(|id|id==credential) {
-                            account.heal_authorized_probe(decision_id,provider,&model,now).map_err(sql_error)?;
-                            let account_id=identity.as_ref().map_or(credential.as_str(),|identity|identity.account_ref.as_str());
-                            let size=account.size_admission_for_model_decision(decision_id,provider,credential,&model).map_err(sql_error)?;
-                            account.heal_serving_fences_in_scope(provider,account_id,credential,&model,size.map(|(class,_)|class),size.map_or(admitted_at,|(_,at)|at),now,effects.quota_scope.as_ref()).map_err(sql_error)?;
-                        }
-                    } else {
-                        let (provider,model,identity):(Option<String>,Option<String>,Option<String>)=tx.query_row(
-                            "SELECT selected_provider_id,selected_model_id,provider_identity_json FROM model_route_decisions WHERE id=?1",
-                            [decision_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
-                        let pinned=identity.and_then(|raw|serde_json::from_str::<striatum_core::route_state_store::ProviderOutcome>(&raw).ok()).and_then(|identity|identity.credential_id);
-                        if let (None,Some(provider),Some(model))=(pinned,provider,model) {
-                            account.heal_authorized_probe(decision_id,&provider,&model,now).map_err(sql_error)?;
-                        }
-                    }
-                }
                 if settle && failed {
                     account.fail_authorized_probe(decision_id, now,
                         striatum_core::fence_lifetimes::probe_is_inconclusive(outcome,error)).map_err(sql_error)?;
@@ -134,6 +113,12 @@ impl SqliteRouteStateStore {
                 }
                 report_outcome(&tx, decision_id, outcome, error, now)?;
             }
+            // Decisions can seat several runs. Delivery deduplication, not the
+            // first decision outcome, owns each run's successful probe settlement.
+            if outcome == RouteOutcome::Completed && !effects.preserve_probe {
+                account.heal_report_run(decision_id, delivery_key.strip_prefix("run:"), effects, first, now)
+                    .map_err(sql_error)?;
+            }
             if let Some(usage) = usage { insert_usage(&tx, decision_id, usage)?; }
             #[cfg(test)]
             report_crash("before_commit");
@@ -151,6 +136,145 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
+    fn heal_report_run(
+        &self,
+        decision: &str,
+        run: Option<&str>,
+        effects: &V1ReportEffects,
+        first: bool,
+        now: i64,
+    ) -> RouteStateResult<()> {
+        if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT principal,admission_id FROM account_admission
+             WHERE model_decision_id=?1 AND run_id=?2 LIMIT 2",
+            )
+            .map_err(err)?;
+        let admissions = statement
+            .query_map(params![decision, run], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        if admissions.len() > 1 {
+            tracing::warn!(
+                decision,
+                run,
+                "completed report has ambiguous admissions; no fences healed"
+            );
+            return Ok(());
+        }
+        if let Some((principal, id)) = admissions.first() {
+            let admission = self
+                .admission(principal, id)?
+                .expect("selected admission exists");
+            if effects
+                .reported_credential
+                .as_deref()
+                .is_some_and(|id| id != admission.credential_id)
+            {
+                tracing::warn!(
+                    decision,
+                    run,
+                    "completed report credential differs from admission; no fences healed"
+                );
+                return Ok(());
+            }
+            let size = self.admission_size_class(principal, id)?;
+            let owner = serde_json::json!(["account_admission", principal, id]).to_string();
+            let origins: Vec<_> = self
+                .fence_rechecks()?
+                .into_iter()
+                .filter(|origin| {
+                    origin.applies(
+                        &admission.provider,
+                        &admission.account_id,
+                        &admission.credential_id,
+                        &admission.model,
+                    ) && origin
+                        .size_class
+                        .is_none_or(|class| Some(class as u32) == size)
+                })
+                .collect();
+            self.heal_report_probe(
+                &owner,
+                Some(decision),
+                &admission.model,
+                admission.committed_at,
+                &origins,
+                now,
+            )?;
+            self.heal_serving_fences_in_scope(
+                &admission.provider,
+                &admission.account_id,
+                &admission.credential_id,
+                &admission.model,
+                size,
+                admission.committed_at,
+                now,
+                effects.quota_scope.as_ref(),
+            )?;
+        } else {
+            // A decision without an account admission still owns its selection
+            // probe. The decision clock is the conservative launch bound when
+            // no admission supplies a run-specific clock.
+            let (model, identity, at): (String, Option<String>, i64) = self.conn.query_row(
+                "SELECT selected_model_id,provider_identity_json,COALESCE((SELECT created_at_ms FROM routing_v1_decision
+                 WHERE decision_id=?1),created_at) FROM model_route_decisions WHERE id=?1",
+                [decision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            ).map_err(err)?;
+            if self.probe_report_matches(decision, effects.reported_credential.as_deref(), false)? {
+                let authorized: bool = self
+                    .conn
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
+                        [decision],
+                        |row| row.get(0),
+                    )
+                    .map_err(err)?;
+                self.heal_report_probe(decision, None, &model, at, &self.fence_rechecks()?, now)?;
+                // Only the first report may heal older matching serving evidence
+                // without authorization. If this decision held a probe proof,
+                // only the exact generation and launch-time checks above may
+                // settle it; ordinary recovery must not bypass those checks.
+                if authorized || !first {
+                    return Ok(());
+                }
+                let identity = identity.and_then(|raw| {
+                    serde_json::from_str::<striatum_core::route_state_store::ProviderOutcome>(&raw)
+                        .ok()
+                });
+                if let Some((provider, credential)) = &effects.lift_credential {
+                    if identity
+                        .as_ref()
+                        .and_then(|identity| identity.credential_id.as_deref())
+                        .is_none_or(|id| id == credential)
+                    {
+                        let account = identity.as_ref().map_or(credential.as_str(), |identity| {
+                            identity.account_ref.as_str()
+                        });
+                        self.heal_serving_fences_in_scope(
+                            provider,
+                            account,
+                            credential,
+                            &model,
+                            None,
+                            at,
+                            now,
+                            effects.quota_scope.as_ref(),
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn record_non_quota_size_refusal(
         &self,
         fact: &AccountSizeRefusal,
