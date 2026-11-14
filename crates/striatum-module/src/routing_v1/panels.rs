@@ -283,7 +283,9 @@ async fn seat_panel(
     }
     // Keep successful original seats before filling holes: a spare must not
     // displace a later seat's family or canonical model. The scorer already
-    // applied the class floor and package fit to these phase-ordered spares.
+    // dropped spares below the panel class's minimum quality grade and spares
+    // whose context window can't hold the evidence package, so only family
+    // and canonical-model uniqueness are checked here.
     for slot in vacancies {
         for spare in &panel.runner_up {
             if spare.phase
