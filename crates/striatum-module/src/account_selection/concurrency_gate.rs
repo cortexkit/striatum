@@ -115,7 +115,8 @@ impl Gate {
             return Check::Room;
         }
         let count = tx.inflight_count_for_model(caps, provider, account, &params.model, ctx.now_ms);
-        // No waiter holds a slot against a head call.
+        // A head call (a head's own turn: head-scoped route, or `head_turn`
+        // from an enrolled runner) is never held back for a waiter.
         if (count as u64) < cap
             && (self.head_call
                 || !self.held_for_waiters(
@@ -222,7 +223,7 @@ impl Gate {
                 })
                 .fold(ceiling, i64::min),
         };
-        // A head call is never refused, so this is never one. The waiter
+        // Head calls never reach this refusal (see `check`). The waiter
         // waits on every count it was refused on: the kept account alone, or
         // each eligible account of the route.
         let mut counts: Vec<_> = self

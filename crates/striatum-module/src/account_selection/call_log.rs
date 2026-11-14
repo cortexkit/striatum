@@ -32,8 +32,9 @@ impl AccountCall {
         .then_some("head_turn")
     }
 
-    /// `head_turn` on the caller-bearing shape is a legacy-only extension,
-    /// removed with that surface. Its trust rule is shared with routing/v1.
+    /// Reading `head_turn` on the older caller-bearing `account_for` shape is
+    /// routing's own extension (the contract defines it only on routing/v1);
+    /// it goes when that shape is retired. It uses the same trust rule as v1.
     pub(crate) fn legacy(
         params: &Value,
         principal: &str,
