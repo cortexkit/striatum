@@ -678,3 +678,48 @@ fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
     assert_eq!(state.blocks, fresh.blocks);
     assert_eq!(state.blocks.table_sizes()[10], ("account_transient_backoff", 1));
 }
+
+/// A command that writes a block row and then reads the block tables sees
+/// its own write, though the writer copies the row into the working state
+/// only when the command ends. Its batch sibling sees it too, and both match
+/// SQL.
+#[test]
+fn a_command_reads_its_own_block_writes_from_the_working_state() {
+    let (_scratch, store) = fixture("state-own-block-writes");
+    install(&store);
+    let fence = striatum_store::AccountPoolFenceRow {
+        evidence: striatum_store::AccountFenceRow {
+            fence_id: "own-write".into(),
+            provider: "p".into(),
+            account_id: "a".into(),
+            scope_json: "{}".into(),
+            fence_json: "{}".into(),
+            source: "broca_account_limit".into(),
+            observed_at: 1_000,
+            principal: "x".into(),
+            admission_id: None,
+            observation_id: None,
+            created_at: 1_000,
+            cleared_at: None,
+            cleared_reason: None,
+        },
+        pool_key: None,
+        recovery_set: Vec::new(),
+    };
+    let (own, sql) = crate::account_writer::repair(&store, move |tx| {
+        assert!(tx.active_fences("p")?.is_empty());
+        tx.insert_pool_fence(&fence)?;
+        let own = tx.active_fences("p")?;
+        Ok((own, tx.sql.active_fences("p")?))
+    })
+    .unwrap();
+    assert_eq!(own.len(), 1, "the command must see its own fence");
+    assert_eq!(own, sql);
+    let (later, sql) = crate::account_writer::repair(&store, |tx| {
+        tx.clear_fence("own-write", 2_000, "test")?;
+        Ok((tx.active_fences("p")?, tx.sql.active_fences("p")?))
+    })
+    .unwrap();
+    assert!(later.is_empty(), "a cleared fence must leave the command's view");
+    assert_eq!(later, sql);
+}
