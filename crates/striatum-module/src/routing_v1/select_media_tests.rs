@@ -27,6 +27,9 @@ mod preview;
 #[path = "media_contract_tests.rs"]
 mod contract;
 
+#[path = "media_samples_tests.rs"]
+mod samples;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");
