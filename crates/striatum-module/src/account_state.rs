@@ -1242,6 +1242,40 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
         loaded.blocks, published.blocks,
         "the request mix left the block state unequal to a fresh load"
     );
+    assert_eq!(
+        store.block_writes_outside_command(),
+        0,
+        "the request mix wrote block tables outside an account command: {:?}",
+        store.block_tables_written_outside_command()
+    );
+    // The route-state snapshot and the provider rows `route.cooldown_status`
+    // reads answer from the state as from SQL, for requests an hour either
+    // side of now against clocks evaluated at each of those times.
+    let wall = crate::now_ms() as i64;
+    let times = [wall - 3_600_000, wall, wall + 3_600_000];
+    for now in times {
+        for recheck in times {
+            let sql = store.build_snapshot_at_for_test(now as f64, recheck).unwrap();
+            assert_eq!(
+                published.blocks.route_state_snapshot(now as f64, recheck).unwrap(),
+                sql,
+                "route-state snapshot at {now} with clocks at {recheck}"
+            );
+        }
+    }
+    let routes = store.build_snapshot_at_for_test(wall as f64, wall).unwrap();
+    let providers: std::collections::BTreeSet<&str> = routes
+        .by_route
+        .keys()
+        .filter_map(|route| striatum_core::derive_provider_key(route))
+        .collect();
+    for provider in providers {
+        assert_eq!(
+            published.blocks.provider_cooldown(provider).unwrap(),
+            striatum_core::RouteStateStore::get_provider_cooldown(store, provider).unwrap(),
+            "provider cooldown of {provider}"
+        );
+    }
     let state = &published.admissions;
     let demand_entries: usize = state.demand.iter().map(|(_, rows)| rows.len()).sum();
     let start = std::time::Instant::now();

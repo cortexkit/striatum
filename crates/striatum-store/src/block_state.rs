@@ -21,7 +21,10 @@
 //! the SQL adapter does, through `fence_rechecks::derive_blocks`.
 //!
 //! Cleared account fences and retirement records are never held: the view
-//! ignores both, and nothing derived from them is needed.
+//! ignores both, and nothing derived from them is needed. Every
+//! `provider_cooldown_state` and `model_route_state` row is held, walled or
+//! not, because the route-state snapshot and `route.cooldown_status` read
+//! them whole (see `route_snapshot.rs`).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -205,15 +208,19 @@ const SELECTS: [&str; 16] = [
         json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at)),COALESCE(cooldown_observed_at,updated_at),0,cooldown_until,NULL
      FROM pool_key_state",
     // provider_cooldown_state: every row is held, because a route origin
-    // is compared with its provider's row whether or not that row walls.
-    "SELECT rowid,json_array(provider_key),
+    // is compared with its provider's row whether or not that row walls, and
+    // `route.cooldown_status` reads the row itself.
+    concat!("SELECT rowid,json_array(provider_key),
         cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL,'provider',json_array(provider_key),provider_key,NULL,NULL,NULL,NULL,NULL,NULL,
         json_array(cooldown_until,quota_exhausted_until,wall_observed_at),COALESCE(wall_observed_at,last_error_at,updated_at),
         0,MAX(COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0)),NULL,
         provider_key,last_error,COALESCE(wall_observed_at,last_error_at,updated_at),
-        COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0),wall_class,wall_unscoped
-     FROM provider_cooldown_state",
-    "SELECT rowid,json_array(route_key),
+        COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0),wall_class,wall_unscoped,",
+        crate::route_snapshot::provider_cooldown_columns!(),
+     " FROM provider_cooldown_state"),
+    // model_route_state: every row is held, walled or not: the route-state
+    // snapshot reads each route's latency, success and pressure too.
+    concat!("SELECT rowid,json_array(route_key),
         cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL,'route',json_array(route_key),provider_id,NULL,NULL,model_id,NULL,NULL,NULL,
         json_array(cooldown_until,quota_exhausted_until,wall_observed_at),COALESCE(wall_observed_at,last_error_at,updated_at),
         0,MAX(COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0)),NULL,
@@ -221,8 +228,9 @@ const SELECTS: [&str; 16] = [
         json_array(failure_backoff_until,failure_backoff_reason,failure_observed_at),COALESCE(failure_observed_at,last_error_at,updated_at),
         0,failure_backoff_until,NULL,
         provider_id,last_error,COALESCE(wall_observed_at,last_error_at,updated_at),
-        COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0),wall_class,wall_unscoped,route_key
-     FROM model_route_state",
+        COALESCE(cooldown_until,0),COALESCE(quota_exhausted_until,0),wall_class,wall_unscoped,route_key,",
+        crate::route_snapshot::route_state_columns!(),
+     ",wall_unscoped FROM model_route_state"),
     "SELECT rowid,json_array(provider,credential_id,model,size_class),
         1,'size',json_array(provider,credential_id,model,size_class),provider,NULL,credential_id,model,size_class,NULL,NULL,
         json_array(observed_at,expires_at),observed_at,1,expires_at,expires_at,
@@ -275,7 +283,7 @@ const HELD_ROWS: [&str; 16] = [
     "1",
     "walled_until IS NOT NULL OR cooldown_until IS NOT NULL",
     "1",
-    "cooldown_until IS NOT NULL OR quota_exhausted_until IS NOT NULL OR failure_backoff_until IS NOT NULL",
+    "1",
     "1",
     "1",
     "1",
@@ -407,6 +415,10 @@ enum Raw {
     },
     Size(crate::AccountSizeRefusal),
     Exclusion(crate::AccountExclusionRow),
+    /// A `provider_cooldown_state` row as `get_provider_cooldown` reads it.
+    Provider(crate::route_snapshot::ProviderCooldownRow),
+    /// A `model_route_state` row as the route-state snapshot reads it.
+    Route(crate::route_snapshot::RouteStateRow),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -518,7 +530,7 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
                 quarantined: quarantined(18)?,
                 wall: wall(18)?,
             },
-            Raw::None,
+            Raw::Provider(crate::route_snapshot::provider_row_at(r, 24)?),
             true,
         ),
         ROUTE_TABLE => source(
@@ -529,8 +541,8 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
                 quarantined: quarantined(33)?,
                 wall: wall(33)?,
             },
-            Raw::None,
-            false,
+            Raw::Route(crate::route_snapshot::route_row_at(r, 40)?),
+            true,
         ),
         CLOCK_TABLE => {
             let (block, cleared) = fence_rechecks::clock_row(r, 2)?;
@@ -1035,6 +1047,46 @@ impl BlockState {
         )
         .map_err(crate::err)?;
         Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
+    }
+
+    /// The route-state snapshot at `now`, as `SqliteRouteStateStore::build_snapshot`
+    /// builds it from SQL: every route row in table order, its deadlines
+    /// scheduled by the effective probe clocks evaluated at `recheck_now`
+    /// (the wall clock when the SQL reader runs, which a request's `now`
+    /// need not equal).
+    pub fn route_state_snapshot(
+        &self,
+        now: f64,
+        recheck_now: i64,
+    ) -> striatum_core::RouteStateResult<striatum_core::model_router::ModelRouteStateSnapshot>
+    {
+        let rechecks = self.fence_rechecks(recheck_now)?;
+        let mut rows: Vec<(i64, &crate::route_snapshot::RouteStateRow)> = self
+            .raws(ROUTE_TABLE)
+            .filter_map(|(rowid, raw)| match raw {
+                Raw::Route(row) => Some((rowid, row)),
+                _ => None,
+            })
+            .collect();
+        // The capacity entry takes the first live wall it meets, so the rows
+        // go in the order SQL returns them.
+        rows.sort_by_key(|(rowid, _)| *rowid);
+        let rows: Vec<_> = rows.into_iter().map(|(_, row)| row).collect();
+        crate::route_snapshot::overlay(&rows, &rechecks, self.enabled, now)
+    }
+
+    /// One provider's cooldown row, as `SqliteRouteStateStore::get_provider_cooldown`
+    /// reads it from SQL.
+    pub fn provider_cooldown(
+        &self,
+        provider_key: &str,
+    ) -> striatum_core::RouteStateResult<Option<striatum_core::ProviderCooldownState>> {
+        let key = crate::route_snapshot::provider_lookup_key(provider_key)?;
+        let row = self.raws(PROVIDER_TABLE).find_map(|(_, raw)| match raw {
+            Raw::Provider(row) if row.provider_key() == key => Some(row),
+            _ => None,
+        });
+        crate::route_snapshot::provider_cooldown(row)
     }
 
     /// Whether the store has the block schema. Without it the state holds
