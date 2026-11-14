@@ -1787,9 +1787,12 @@ pub(crate) fn refresh_serving_methods(
         // The join resolves providers missing their own catalog rows from the
         // cached vault listing and catalog facts, then uses the listed login's
         // authentication method to choose the billing plane.
-        let model_pools =
-            crate::config_overrides::live_config(routing_config_path).quota_model_pools();
+        let config = crate::config_overrides::live_config(routing_config_path);
+        let model_pools = config.quota_model_pools();
         if let Ok(mut credentials) = broca_credentials.lock() {
+            credentials
+                .concurrency_caps
+                .publish_settings(config.concurrency_caps());
             credentials.refresh_serving_methods(&accounts, &facts, now_ms(), &model_pools);
         }
     }

@@ -173,6 +173,53 @@ Continue mode answers which other account can take the paused run, so the same-a
 - **Report usage.** `usage` carries `input_tokens` (no cache reads or writes), `cached_input_tokens`, `cache_write_tokens`, `output_tokens` (including `reasoning_tokens`), `reasoning_tokens`, `duration_ms`, `first_token_ms` and `cost_usd`; it is part of the report body for idempotency. The token counts join the route's usage history (`model_route_usage`, row id `routing-v1-report:<decision_id>`, workload class from the consumer) the same way `route.record_usage` rows do; a count the report leaves out is stored as unknown (NULL), never zero. The history cannot hold an unknown output count, so a report without `output_tokens` adds no history row. `duration_ms` is the run's wall clock, mostly tool time on an agentic run, so the row is written with the usage facts' `untimed` flag: it records no duration and is never a speed sample. Both timing members are kept only in the stored report body. (`routing_v1/report.rs`, `record_usage`; `striatum-core/src/model_resolution.rs`, `NativeUsageFacts::untimed`)
 - **Run end.** `route.account_observe {kind: run_finished}` naming the admission marks it finished and ends the account pin's lease at once (`lease_valid_until` = now); `lease_valid_until_ms` is only the backstop. The admission's demand keeps counting until a quota reading reflects it. (`account_selection.rs`, `apply_bound_observation`)
 
+## Account concurrency cap settings
+
+The root `concurrency` object contains four optional maps. Keys match the
+provider and model stored on an admission, not a catalog alias or a runner:
+
+```json
+{
+  "concurrency": {
+    "providers": {"google": {"limit": 6, "scope": "account"}},
+    "plans": {"google/ultra_5x": {"limit": 4}},
+    "models": {"anthropic-platform/claude-opus-5": {"limit": 2}},
+    "accounts": {"google/vault-account-id": {"limit": "none"}}
+  }
+}
+```
+
+- `providers` keys are provider ids; `plans` keys are `provider/tier`;
+  `models` keys are `provider/model`; `accounts` keys are `provider/account_id`.
+  Account ids are vault account ids (or the allocator's credential account id
+  for an API key). Model ids are trimmed and lowercased as admissions store
+  them, with no variant or pool-prefix rewriting. A paid pool admission uses
+  its pool provider, e.g. `anthropic-platform`, not `anthropic`.
+- Each value requires `limit`: a positive integer or `"none"` to lift a cap.
+  Zero is rejected; use `exclude` rules for route exclusions instead.
+- One setting wins whole: account, then model, then plan, then provider, then
+  catalog. Lower settings contribute neither limit nor scope. Provider, plan
+  and account settings may specify `scope`: `account` or `account_model`.
+  When omitted, only the catalog scope is retained, defaulting to `account`
+  if there is no valid catalog cap. Model settings must not specify scope.
+- A winning model setting always assigns that model to its own account/model
+  count, including with `"none"`. Its holds do not also consume the shared
+  account count. An account setting wins over a model setting and may put
+  that model back into the shared count.
+
+Catalog caps come from `plan.prices` concurrency `limit`, `scope` and
+`review_by_ms`, joined by the roster's `plan_tier` through the same provider
+join as subscription pricing (Antigravity joins Google). Missing tiers, absent
+rows or absent concurrency mean no catalog cap. Duplicate plan rows, invalid
+limits and unknown scopes mean no catalog cap and one load warning per plan.
+A cap past its review date still applies, with one review warning. Settings
+remain usable without a catalog cap. The reader currently ignores
+`concurrency.per_model`; `account_model` therefore applies `limit` to every
+model unless a setting wins. Cap policy is rebuilt when plan prices, the roster
+or settings are updated, and requests look it up from an immutable snapshot;
+429 responses never teach it a limit.
+These settings define cap policy only; admission enforcement is separate.
+
 ## Open items
 - The historical fixed free-bucket and missing window-slack findings are addressed for live quota-priced subscriptions by the economics above. Legacy pure-core snapshots without account economics retain their old free-bucket behavior. (`crates/striatum-core/src/model_router.rs`, `route_order_keys`)
 - Fusiform's `quota_value` records measured list-price token value relative to subscription quota cost; routing uses its measured `low` as the conservative tier multiplier. When `quota_value` is missing, refused, or expired, routing uses the conservative `1×` multiplier and labels it unmeasured.

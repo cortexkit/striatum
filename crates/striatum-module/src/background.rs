@@ -235,7 +235,7 @@ pub(super) async fn start(
         "config refresh",
         config_overrides::config_refresh_loop(
             override_path.clone(),
-            Arc::clone(&broca_credentials.lock().unwrap().catalog_wake),
+            Arc::clone(&broca_credentials),
         ),
     );
 

@@ -186,6 +186,7 @@ pub struct CredentialData {
     pub(crate) runner_describe_logs: crate::account_refusal_log::LogLimiter,
     pub(crate) classifier_models: BTreeMap<String, Vec<crate::routing_v1::classifier::ServedModel>>,
     pub(crate) plan_prices: serde_json::Value,
+    pub(crate) concurrency_caps: crate::concurrency_caps::CapInputs,
     pub(crate) wire_apis: BTreeMap<String, String>,
     /// Endpoint presence from served `wire.api`; `wire_apis` stores `wire.family`.
     pub(crate) wire_api_models: BTreeSet<String>,
@@ -623,6 +624,8 @@ impl CredentialData {
     /// Every published plan counts, including unpriced or refused plan rows.
     /// Unknown membership must not be confused with a successfully empty list.
     pub(crate) fn publish_plan_prices(&mut self, prices: &serde_json::Value) {
+        self.concurrency_caps
+            .publish_catalog(prices, crate::now_ms() as i64);
         self.plan_prices = prices.clone();
         self.subscription_plan_providers = prices
             .get("prices")
@@ -925,6 +928,7 @@ impl CredentialData {
         at_ms: i64,
         model_pools: &[striatum_core::quota_extract::ModelPool],
     ) {
+        self.concurrency_caps.publish_roster(state);
         self.catalog_providers = facts.iter().collect();
         self.providers.clear();
         self.unmapped_ids.clear();
