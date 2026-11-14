@@ -152,7 +152,7 @@ async fn account_shadow_counts_ten_calls_but_not_head_replay_renew_or_allocator_
     for (n, event) in pressure.iter().enumerate() {
         assert_eq!(
             event,
-            &json!({"surface":"routing/v1","consumer":"class-runner","model":"model",
+            &json!({"surface":"routing/v1","consumer":"class-runner","class":"worker","model":"model",
             "accounts":[{"account_id":"oauth-account","count":n+1,"cap":1}]})
         );
     }
@@ -225,4 +225,129 @@ async fn account_shadow_kept_affinity_is_full_even_with_a_free_eligible_sibling(
             {"account_id":"oauth-account","count":3,"cap":1}
         ])
     );
+}
+
+#[tokio::test]
+async fn priority_select_calls_log_one_class_and_head_mark_on_both_surfaces() {
+    async fn capture(consumer: &str, declared: Option<&str>) -> Vec<(FrameType, Vec<u8>)> {
+        let _clock = crate::InjectedClock::set(NOW);
+        // Restart generated identifiers as well as the clock so the comparison
+        // covers real handler bytes, not a normalized reply with fields removed.
+        let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
+        let (harness, _) = setup("synthetic", false);
+        harness.edit_config(|config| config["head_agents"] = json!(["codemode"]));
+        let mut declaration = json!({"name":consumer});
+        if let Some(class) = declared {
+            declaration["priority"] = json!(class);
+        }
+        crate::routing_v1::consumers::replace_catalog(&json!([{
+            "module_id":"class-owner","nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[declaration]}}
+        }]));
+        let owner = harness.bind(reserved("class-owner"), None).await;
+        let runner = harness.bind(reserved("class-runner"), None).await;
+        let class = declared.unwrap_or("worker");
+        let mut answers = Vec::new();
+        for legacy in [false, true] {
+            crate::take_operator_infos();
+            let params = if legacy {
+                json!({"targetAgent":consumer,"substrate":"broca","executor":"broca",
+                    "requirements":{"iq":30,"eq":0}})
+            } else {
+                json!({"consumer":consumer,"requirements":{"iq":30,"eq":0}})
+            };
+            let selected = owner.call_raw("route.select", &params).await;
+            assert_eq!(selected.0, FrameType::Response);
+            let body: Value = serde_json::from_slice(&selected.1).unwrap();
+            let decision =
+                body["result"][if legacy { "decisionID" } else { "decision_id" }].clone();
+            answers.push(selected);
+            let lines = crate::take_operator_infos();
+            let calls: Vec<Value> = lines
+                .iter()
+                .filter_map(|line| {
+                    line.strip_prefix("routing select call ")
+                        .map(|body| serde_json::from_str(body).unwrap())
+                })
+                .collect();
+            assert_eq!(
+                calls,
+                vec![json!({
+                    "surface":if legacy {"route.select"} else {"routing/v1"},
+                    "consumer":consumer,"class":class,"head_request":class == "interactive"
+                })]
+            );
+            let mut admission = request(&format!("unchanged-{legacy}"));
+            admission["conversation_key"] = admission["admission_id"].clone();
+            admission["decision_id"] = decision;
+            if legacy {
+                admission["caller"] = json!({"runner":"class-runner"});
+            }
+            let admitted = runner.call_raw("route.account_for", &admission).await;
+            assert_eq!(admitted.0, FrameType::Response, "{:?}", admitted.1);
+            answers.push(admitted);
+        }
+        answers
+    }
+    for (consumer, class) in [
+        ("mason", "interactive"),
+        ("mason", "blocking"),
+        ("mason", "background"),
+        ("codemode", "worker"),
+    ] {
+        assert_eq!(
+            capture(consumer, None).await,
+            capture(consumer, Some(class)).await
+        );
+    }
+}
+
+#[tokio::test]
+async fn priority_account_pressure_uses_bound_consumer_and_unbound_worker() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    caps(&harness);
+    crate::routing_v1::consumers::replace_catalog(&json!([{
+        "module_id":"class-owner","nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":[
+            {"name":"mason","priority":"interactive"},
+            {"name":"class-runner","priority":"interactive"}
+        ]}}
+    }]));
+    let owner = harness.bind(reserved("class-owner"), None).await;
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    response(&runner.call("route.account_for", &request("seed")).await);
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30,"eq":0}}),
+        )
+        .await;
+    let decision = response(&selected)["decision_id"].clone();
+    for legacy in [false, true] {
+        for bound in [false, true] {
+            let mut body = request(&format!("priority-{legacy}-{bound}"));
+            body["conversation_key"] = body["admission_id"].clone();
+            if legacy {
+                body["caller"] = json!({"runner":"class-runner"});
+            }
+            if bound {
+                body["decision_id"] = decision.clone();
+            }
+            events();
+            response(&runner.call("route.account_for", &body).await);
+            let (calls, pressure) = events();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["head_call"], false);
+            assert_eq!(pressure.len(), 1, "{pressure:?}");
+            assert_eq!(
+                pressure[0]["class"],
+                if bound { "interactive" } else { "worker" }
+            );
+            assert_eq!(
+                pressure[0]["consumer"],
+                if bound { "mason" } else { "class-runner" }
+            );
+        }
+    }
 }

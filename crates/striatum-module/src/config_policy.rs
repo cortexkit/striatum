@@ -5,6 +5,27 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
+/// Operator spelling of the contract's consumer scheduling classes.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PriorityClass {
+    Interactive,
+    Blocking,
+    Worker,
+    Background,
+}
+
+impl From<PriorityClass> for cortexkit_role_routing::declarations::ConsumerPriority {
+    fn from(value: PriorityClass) -> Self {
+        match value {
+            PriorityClass::Interactive => Self::Interactive,
+            PriorityClass::Blocking => Self::Blocking,
+            PriorityClass::Worker => Self::Worker,
+            PriorityClass::Background => Self::Background,
+        }
+    }
+}
+
 fn present_value<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
