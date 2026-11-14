@@ -115,8 +115,10 @@ Routing decision: the durable selected route, request, candidate explanations, p
   call on routing/v1, independently of the optional boolean `head_turn` member
   from routing contract 0.7.29 (`account_head_turn`, conformance kit 0.10.33).
   The member is valid in every mode, including `continue`, and defaults to false.
-  It marks a head call only for an attested `reserved:<module>` principal whose
-  module is enrolled in routing's `runners` settings. Other callers' flags are
+  It marks a head call only when the daemon-stamped route principal is
+  `reserved:<module>` (a reserved module id the daemon attests, which no
+  request body can claim) and that module is enrolled in routing's `runners`
+  settings. Other callers' flags are
   ignored, not refused; other authorization rules still apply. Scope wins when
   both sources mark the call. A head call still occupies a concurrency slot;
   it is exempt only from the concurrency refusal, without changing priority,

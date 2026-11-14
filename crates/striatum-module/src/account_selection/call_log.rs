@@ -13,8 +13,10 @@ pub(crate) struct AccountCall {
 }
 
 impl AccountCall {
-    /// A body declaration is trusted only from an enrolled, attested runner,
-    /// not from caller.runner or another module authorized to allocate accounts.
+    /// A body declaration is trusted only when the daemon-stamped principal is
+    /// `reserved:<module>` and that module is enrolled in routing's `runners`
+    /// settings; never from caller.runner or another module authorized to
+    /// allocate accounts.
     pub(crate) fn head_turn_source(
         params: &Value,
         principal: &str,
