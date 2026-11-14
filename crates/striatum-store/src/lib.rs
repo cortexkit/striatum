@@ -753,6 +753,13 @@ impl SqliteRouteStateStore {
     }
 }
 
+/// The time the store's SQL readers evaluate expiry at: the wall clock, or a
+/// replayed request's recorded time in test builds. Readers of the account
+/// state that stand in for those SQL readers use it too, so both answer alike.
+pub fn store_now_ms() -> i64 {
+    now_ms()
+}
+
 fn now_ms() -> i64 {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(now) = replay::current().map(|inputs| inputs.now_ms) {

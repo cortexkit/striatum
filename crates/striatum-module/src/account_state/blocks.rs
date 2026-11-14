@@ -32,12 +32,10 @@ use striatum_store::{
 use super::{snapshot, AccountCommand, AccountState};
 
 /// The time `SqliteRouteStateStore::fence_rechecks` evaluates expiry at: the
-/// wall clock when the read runs, not the request's clock.
+/// store's clock when the read runs (the wall clock, or a replayed request's
+/// recorded time in test builds), not the request's clock.
 fn wall_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
+    striatum_store::store_now_ms()
 }
 
 /// The block reads a helper may make, answered by whoever holds the rows.
