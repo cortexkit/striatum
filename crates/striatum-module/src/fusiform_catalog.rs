@@ -320,6 +320,7 @@ pub(crate) struct CatalogSnapshot {
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
     media_grades: BTreeMap<String, MediaGrade>,
     media_rates: BTreeMap<String, BTreeMap<String, MediaRate>>,
+    video_facts: BTreeMap<String, VideoFacts>,
     quality_scores: Option<QualityScores>,
     grades: BTreeMap<String, striatum_store::OperatorQuality>,
     decommissioned: BTreeMap<String, String>,
@@ -330,7 +331,51 @@ pub(crate) struct CatalogSnapshot {
     retained: BTreeSet<(String, String)>,
 }
 
+/// Video output limits are independent of an engine's input-duration limit.
+/// Keep missing or malformed fields unknown rather than inventing support.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct VideoFacts {
+    pub max_output_duration_ms: Option<u64>,
+    pub aspect_ratios: Option<Vec<String>>,
+    pub audio: Option<bool>,
+}
+
+impl VideoFacts {
+    fn decode(route: &str, entry: &Value) -> Self {
+        fn field<T: serde::de::DeserializeOwned>(
+            route: &str,
+            entry: &Value,
+            key: &str,
+        ) -> Option<T> {
+            let value = entry.get(key)?;
+            match serde_json::from_value(value.clone()) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    // Catalog refreshes can repeat the same malformed field.
+                    // Name each route and field once, not on every selection.
+                    static REPORTED: std::sync::OnceLock<Mutex<BTreeSet<String>>> =
+                        std::sync::OnceLock::new();
+                    if let Ok(mut reported) = REPORTED.get_or_init(Default::default).lock() {
+                        if reported.insert(format!("{route}:{key}")) {
+                            eprintln!("[striatum] warning: video catalog {route} has invalid {key}; the fact remains unknown");
+                        }
+                    }
+                    None
+                }
+            }
+        }
+        Self {
+            max_output_duration_ms: field(route, entry, "limit.output_duration_ms"),
+            aspect_ratios: field(route, entry, "capability.aspect_ratios"),
+            audio: field(route, entry, "capability.output_audio"),
+        }
+    }
+}
+
 impl CatalogSnapshot {
+    pub(crate) fn video_facts(&self, route: &str) -> Option<&VideoFacts> {
+        self.video_facts.get(route)
+    }
     /// A grade compares models of one media type, never unrelated catalog rows.
     #[allow(
         dead_code,
@@ -448,6 +493,7 @@ pub(crate) struct MediaRate {
     pub(crate) per: Option<u64>,
     pub(crate) increment: RateQuantityKind,
     pub(crate) minimum_quantity: RateQuantityKind,
+    pub(crate) minimum: Option<u64>,
 }
 
 impl MediaRate {
@@ -474,6 +520,11 @@ impl MediaRate {
             per,
             increment: RateQuantityKind::decode(value.get("increment")),
             minimum_quantity: RateQuantityKind::decode(value.get("minimum_quantity")),
+            minimum: match value["minimum_quantity"]["kind"].as_str() {
+                Some("none") => Some(0),
+                Some("minimum") => value["minimum_quantity"]["quantity"].as_u64(),
+                _ => None,
+            },
         }
     }
 }
@@ -1091,6 +1142,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let mut audio_input_prices = BTreeMap::new();
     let mut media_grades = BTreeMap::new();
     let mut media_rates = BTreeMap::new();
+    let mut video_facts = BTreeMap::new();
     let mut grades = BTreeMap::new();
     let mut decommissioned = BTreeMap::new();
     // (served key, reason) for every entry left out of this snapshot.
@@ -1162,6 +1214,9 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         ) {
             Ok((mut fact, model_rates)) => {
                 fact.login_methods_documented = documented.contains(&served_key);
+                if entry.get("model.type").and_then(Value::as_str) == Some("video") {
+                    video_facts.insert(served_key.clone(), VideoFacts::decode(&served_key, &entry));
+                }
                 media_rates.insert(
                     served_key.clone(),
                     entry
@@ -1211,6 +1266,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
         audio_input_prices,
         media_grades,
         media_rates,
+        video_facts,
         quality_scores: reply.quality_scores,
         grades,
         decommissioned,

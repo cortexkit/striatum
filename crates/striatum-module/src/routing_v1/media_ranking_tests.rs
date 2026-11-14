@@ -433,7 +433,7 @@ fn media_ranking_join_is_reused_and_invalidated_by_either_catalog() {
 }
 
 #[tokio::test]
-async fn media_ranking_caller_offer_never_inherits_shared_identity_grade() {
+async fn media_ranking_caller_offer_inherits_its_kind_specific_catalog_grade() {
     super::super::super::describe::with_candidate_capabilities(
         &["select_kind", "select_media"],
         async {
@@ -451,7 +451,7 @@ async fn media_ranking_caller_offer_never_inherits_shared_identity_grade() {
                     ("z-local", "transcription", Some(60.0), None),
                 ],
             );
-            assert_eq!(select(&route, &params).await["engine"]["model"], "z-local");
+            assert_eq!(select(&route, &params).await["engine"]["model"], "a-shared");
         },
     )
     .await;

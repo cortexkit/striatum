@@ -79,6 +79,10 @@ pub(super) const MEDIA_KINDS: &[&str] = &[
     "video",
 ];
 
+fn caller_local_cost() -> Option<FactNumber> {
+    Some(FactNumber(0.0))
+}
+
 pub(super) fn select_media(
     params: &Value,
     caller: &Caller,
@@ -126,22 +130,41 @@ pub(super) fn preview_media(
     )
 }
 
-fn missing_media_catalog_requirement(request: &SelectMediaRequest) -> Option<&'static str> {
-    // No served catalog row carries these facts yet. An absent fact cannot
-    // prove a stated requirement, including for caller-local offers with no row.
-    // Keep the catalog keys together so future decoding has one matching site;
-    // the input-duration limit must never substitute for an output-duration cap.
+fn failed_video_requirement(
+    request: &SelectMediaRequest,
+    facts: Option<&crate::fusiform_catalog::VideoFacts>,
+) -> Option<&'static str> {
+    // Stated output requirements need catalog evidence. Input duration and a
+    // same-named caller_local request entry cannot supply a module's output facts.
     [
         (
-            request.requirements.output_duration_ms.is_some(),
+            request
+                .requirements
+                .output_duration_ms
+                .is_some_and(|duration| {
+                    facts
+                        .and_then(|facts| facts.max_output_duration_ms)
+                        .is_none_or(|limit| duration > limit)
+                }),
             "limit.output_duration_ms",
         ),
         (
-            request.requirements.aspect_ratio.is_some(),
+            request
+                .requirements
+                .aspect_ratio
+                .as_ref()
+                .is_some_and(|ratio| {
+                    facts
+                        .and_then(|facts| facts.aspect_ratios.as_ref())
+                        .is_none_or(|ratios| !ratios.contains(ratio))
+                }),
             "capability.aspect_ratios",
         ),
         (
-            request.requirements.audio.is_some(),
+            request
+                .requirements
+                .audio
+                .is_some_and(|audio| facts.and_then(|facts| facts.audio) != Some(audio)),
             "capability.output_audio",
         ),
     ]
@@ -378,11 +401,10 @@ fn select_request(
     let mut media_prices = std::collections::BTreeMap::new();
     for candidate in &mut candidates {
         candidate.cost = if media.is_some() {
-            // Offers are caller-owned, even when their names collide with a
-            // catalog route. The media contract's `Engine` declaration carries
-            // no cost, so a caller-local offer stays unpriced.
+            // Caller-owned execution has zero routing cost, but never a quoted
+            // dollar price: no module account is charged for the offer.
             if candidate.selected.caller_local {
-                None
+                caller_local_cost()
             } else {
                 media_prices
                     .entry(format!(
@@ -394,6 +416,7 @@ fn select_request(
                             pricing::estimate(
                                 catalog,
                                 &request,
+                                media.and_then(|media| media.requirements.input_characters),
                                 &candidate.engine.provider,
                                 &candidate.engine.model,
                             )
@@ -568,14 +591,37 @@ fn select_request(
         })
         .collect();
     if let Some(media) = media {
-        if let Some(fact) = missing_media_catalog_requirement(media) {
-            if let Some(view) = evaluation.as_mut() {
-                for candidate in &candidates {
+        let mut failed_fact = None;
+        candidates.retain(|candidate| {
+            if candidate.engine.kind != request.kind {
+                return true;
+            }
+            let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+            let facts = (!candidate.selected.caller_local)
+                .then(|| {
+                    catalog
+                        .as_ref()
+                        .and_then(|catalog| catalog.video_facts(&key))
+                })
+                .flatten();
+            if let Some(fact) = failed_video_requirement(media, facts) {
+                failed_fact.get_or_insert(fact);
+                if evaluation.is_some() {
                     excluded.insert(
-                        format!("{}/{}", candidate.engine.provider, candidate.engine.model),
-                        format!("catalog rows have no {fact} fact"),
+                        key,
+                        format!("catalog fact {fact} does not satisfy the request"),
                     );
                 }
+                return false;
+            }
+            true
+        });
+        if let Some(fact) = failed_fact.filter(|_| {
+            !candidates
+                .iter()
+                .any(|candidate| candidate.engine.kind == request.kind)
+        }) {
+            if let Some(view) = evaluation.as_mut() {
                 view.evidence["excluded"] = json!(excluded
                     .into_iter()
                     .map(|(route, reason)| json!({"route":route,"reason":reason}))
@@ -589,7 +635,7 @@ fn select_request(
                 ));
             }
             let mut refusal = Refusal::no_route(NoRouteReason::MissingCapability, None);
-            refusal.message = format!("catalog rows have no {fact} fact");
+            refusal.message = format!("catalog fact {fact} does not satisfy the request");
             return Err(refusal);
         }
         candidates.retain(|candidate| {
@@ -639,14 +685,44 @@ fn select_request(
         }
     }
     measurements::apply_evaluations(&request, &mut candidates, &evaluations);
+    let mut media_grades = joined
+        .as_ref()
+        .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
+        .map(|kind| kind.grades.clone())
+        .unwrap_or_default();
+    if media.is_some() {
+        for candidate in candidates
+            .iter()
+            .filter(|candidate| candidate.selected.caller_local)
+        {
+            let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
+            if let Some(grade) = catalog
+                .as_ref()
+                .and_then(|catalog| catalog.media_grade(request.kind.as_str(), &key))
+            {
+                media_grades.insert(key, grade);
+            }
+        }
+    }
     let winner = if let Some(policy) = &policy {
-        let empty = Default::default();
-        let grades = joined
-            .as_ref()
-            .and_then(|joined| joined.by_kind.get(request.kind.as_str()))
-            .map(|kind| &kind.grades)
-            .unwrap_or(&empty);
-        let ranked = ranking::rank(&request, &candidates, grades, &top_routes, policy);
+        let grades = &media_grades;
+        let minimums = media_prices
+            .iter()
+            .filter_map(|(key, price)| {
+                price
+                    .as_ref()?
+                    .minimum
+                    .map(|minimum| (key.clone(), minimum))
+            })
+            .collect();
+        let ranked = ranking::rank(
+            &request,
+            &candidates,
+            grades,
+            &top_routes,
+            &minimums,
+            policy,
+        );
         if let Some(view) = evaluation.as_mut() {
             for candidate in &candidates {
                 if let Err(refusal) = wire::select_engine(&request, std::slice::from_ref(candidate))

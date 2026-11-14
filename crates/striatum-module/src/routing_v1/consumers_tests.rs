@@ -126,30 +126,37 @@ async fn production_consumer_declarations_serve_defaults_admission_placement_and
         "unknown_consumer",
         "foreign.task",
     );
-    let media = owner
-        .call(
-            "route.select",
-            &json!({
-                "consumer":"basal.media", "requirements":{}
-            }),
-        )
-        .await;
-    no_route(&media, "no_available_model");
-    assert!(media.1["message"]
-        .as_str()
-        .unwrap()
-        .contains("route.select_engine"));
-    let describe = owner.call("role.describe", &json!({})).await;
-    assert_eq!(describe.0, FrameType::Response, "{describe:?}");
-    let groups = describe.1["result"]["capabilities"].as_array().unwrap();
-    assert_eq!(
-        groups
-            .iter()
-            .filter(|group| **group == json!("consumer_declarations"))
-            .count(),
-        1
-    );
-    assert!(!groups.contains(&json!("select_kind")));
+    // A router withholding media support must retain its compatibility refusal.
+    super::describe::without_capability(
+        "select_media",
+        super::describe::without_capability("select_kind", async {
+            let media = owner
+                .call(
+                    "route.select",
+                    &json!({
+                        "consumer":"basal.media", "requirements":{}
+                    }),
+                )
+                .await;
+            no_route(&media, "no_available_model");
+            assert!(media.1["message"]
+                .as_str()
+                .unwrap()
+                .contains("route.select_engine"));
+            let describe = owner.call("role.describe", &json!({})).await;
+            assert_eq!(describe.0, FrameType::Response, "{describe:?}");
+            let groups = describe.1["result"]["capabilities"].as_array().unwrap();
+            assert_eq!(
+                groups
+                    .iter()
+                    .filter(|group| **group == json!("consumer_declarations"))
+                    .count(),
+                1
+            );
+            assert!(!groups.contains(&json!("select_kind")));
+        }),
+    )
+    .await;
     super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         assert_eq!(
             super::describe::capabilities().as_ref(),
@@ -213,6 +220,9 @@ async fn declared_placement_module_narrows_settings_and_caller_filters() {
 
 #[tokio::test]
 async fn declared_placement_inherits_only_same_owner_and_nearest_member() {
+    // Placement inheritance is independent of the media kind dispatcher. Keep
+    // the older kind refusal here and exercise advertised search separately.
+    super::describe::without_capability("select_media", super::describe::without_capability("select_kind", async {
     super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         let h = harness();
         placement_catalog(&h, json!([
@@ -243,6 +253,29 @@ async fn declared_placement_inherits_only_same_owner_and_nearest_member() {
             on_runner(&other.call("route.select", &select(name)).await, fixture::RUNNER_ONE);
         }
     }).await;
+    })).await;
+}
+
+#[tokio::test]
+async fn production_declared_search_kind_is_invalid_even_when_inherited() {
+    super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
+        let h = harness();
+        placement_catalog(
+            &h,
+            json!([
+                {"name":"basal.task", "kind":"llm"},
+                {"name":"basal.task.child", "kind":"search"}
+            ]),
+        );
+        let route = h.bind(reserved("basal"), None).await;
+        let (frame, reply) = route
+            .call("route.select", &select("basal.task.child.unlisted"))
+            .await;
+        assert_eq!(frame, FrameType::Error, "{reply}");
+        assert_eq!(reply["code"], "invalid_request", "{reply}");
+        assert_eq!(reply["detail"]["field"], "kind", "{reply}");
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -338,29 +371,36 @@ async fn declared_kind_select_retains_media_and_unknown_kinds_and_production_hol
         {"name":"basal.media.child"},
         {"name":"basal.future", "kind":"future-engine"}
     ]);
-    super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
-        placement_catalog(&h, declarations.clone());
-        for (name, kind) in [
-            ("basal.media", "transcribe"),
-            ("basal.media.child.unlisted", "transcribe"),
-            ("basal.future", "future-engine"),
-        ] {
-            let reply = owner.call("route.select", &select(name)).await;
-            no_route(&reply, "no_available_model");
-            let message = reply.1["message"].as_str().unwrap();
-            assert!(
-                message.contains("route.select_engine") && message.contains(kind),
-                "{}",
-                reply.1
-            );
-        }
-        let mut request = select("basal.media");
-        request["kind"] = json!("transcribe");
-        let invalid = owner.call("route.select", &request).await;
-        assert_eq!(invalid.1["code"], "invalid_request", "{}", invalid.1);
-        assert_eq!(invalid.1["detail"]["field"], "kind", "{}", invalid.1);
-        assert!(!super::describe::capabilities().contains(&"select_kind"));
-    })
+    // Consumer declarations alone do not enable the media select protocol.
+    super::describe::without_capability(
+        "select_media",
+        super::describe::without_capability(
+            "select_kind",
+            super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+                placement_catalog(&h, declarations.clone());
+                for (name, kind) in [
+                    ("basal.media", "transcribe"),
+                    ("basal.media.child.unlisted", "transcribe"),
+                    ("basal.future", "future-engine"),
+                ] {
+                    let reply = owner.call("route.select", &select(name)).await;
+                    no_route(&reply, "no_available_model");
+                    let message = reply.1["message"].as_str().unwrap();
+                    assert!(
+                        message.contains("route.select_engine") && message.contains(kind),
+                        "{}",
+                        reply.1
+                    );
+                }
+                let mut request = select("basal.media");
+                request["kind"] = json!("transcribe");
+                let invalid = owner.call("route.select", &request).await;
+                assert_eq!(invalid.1["code"], "invalid_request", "{}", invalid.1);
+                assert_eq!(invalid.1["detail"]["field"], "kind", "{}", invalid.1);
+                assert!(!super::describe::capabilities().contains(&"select_kind"));
+            }),
+        ),
+    )
     .await;
     // Withholding the group must still disable cached and newly read declarations.
     super::describe::without_capability("consumer_declarations", async {

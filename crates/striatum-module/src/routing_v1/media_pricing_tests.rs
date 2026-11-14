@@ -131,7 +131,7 @@ async fn media_cost_speech_utf8_ceiling_ranks_before_tokens_and_round_trips_pric
 }
 
 #[tokio::test]
-async fn media_cost_function_all_incurred_rates_and_quantities_are_required() {
+async fn media_cost_all_incurred_rates_are_required_and_missing_quantity_quotes_units() {
     super::super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         let h = setup(vec![offer("speech", "synthesize", false)]);
         let route = h.bind(reserved("colliculus"), None).await;
@@ -161,8 +161,9 @@ async fn media_cost_function_all_incurred_rates_and_quantities_are_required() {
         let mut missing = params.clone();
         missing["requirements"].as_object_mut().unwrap().remove("input_bytes");
         let answer = select(&route, &missing).await;
-        assert!(answer.get("price").is_none());
-        assert_eq!(score(&h, &answer)["cost"], Value::Null);
+        assert!(answer["price"]["rates"].get("input.per_character").is_some());
+        assert!(answer["price"].get("estimated_task_usd").is_none());
+        near(&score(&h, &answer)["cost"], 0.00004);
         for synthetic in [json!({"existence":"present","model.type":"speech"}), json!({"existence":"present","model.type":"speech","rate.output":{"state":"stated_zero"}})] {
             install(&h, &[("speech", synthetic)]);
             let answer = select(&route, &params).await;
@@ -297,7 +298,7 @@ async fn media_cost_local_and_caller_offers_never_emit_catalog_price() {
             let answer = select(&route, &params).await;
             assert_eq!(answer["engine"]["caller_local"], true);
             assert!(answer.get("price").is_none());
-            assert_eq!(score(&h, &answer)["cost"], Value::Null);
+            assert_eq!(score(&h, &answer)["cost"], 0.0);
         },
     )
     .await;
