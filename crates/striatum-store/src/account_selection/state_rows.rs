@@ -248,10 +248,10 @@ impl AccountTx<'_> {
                     Ok(AdmissionStateRow {
                         row: admission_from_row(row)?,
                         input_size_class: row
-                            .get::<_, Option<i64>>(25)?
+                            .get::<_, Option<i64>>(26)?
                             .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
-                        model_decision_id: row.get(26)?,
-                        rowid: row.get(27)?,
+                        model_decision_id: row.get(27)?,
+                        rowid: row.get(28)?,
                     })
                 },
             )?;
@@ -440,7 +440,7 @@ impl AccountTx<'_> {
         self.conn
             .execute(
                 "UPDATE account_admission SET state = ?3, run_id = ?4, started_at = ?5, \
-                   started_late = ?6, released_at = ?7, finished_at = ?8 \
+                   started_late = ?6, released_at = ?7, finished_at = ?8, last_observed_at = ?10 \
                  WHERE principal = ?1 AND admission_id = ?2 AND state = ?9",
                 params![
                     row.principal,
@@ -452,9 +452,45 @@ impl AccountTx<'_> {
                     row.released_at,
                     row.finished_at,
                     from_state,
+                    row.last_observed_at,
                 ],
             )
             .map(|changed| changed == 1)
+            .map_err(err)
+    }
+
+    /// Persist a state-decided observation without reading the admission group.
+    pub fn set_admission_last_observed(
+        &self,
+        principal: &str,
+        admission: &str,
+        previous: Option<i64>,
+        at: i64,
+    ) -> RouteStateResult<bool> {
+        self.conn
+            .execute(
+                "UPDATE account_admission SET last_observed_at = ?3 \
+             WHERE principal = ?1 AND admission_id = ?2 AND last_observed_at IS ?4",
+                params![principal, admission, at, previous],
+            )
+            .map(|changed| changed == 1)
+            .map_err(err)
+    }
+
+    /// Advance the named admission and its started continuation reservations
+    /// for commands without module state. Live commands compute those rows on
+    /// their in-memory continuation chain and write by key.
+    pub fn observe_admission(&self, row: &AccountAdmissionRow, at: i64) -> RouteStateResult<()> {
+        self.conn
+            .execute(
+                "UPDATE account_admission SET last_observed_at = \
+               MAX(COALESCE(last_observed_at, ?3), COALESCE(started_at, ?3), ?3) \
+             WHERE principal = ?1 AND (admission_id = ?2 OR \
+               (state = 'started' AND admission_id IN (SELECT reservation_id \
+                FROM account_continue WHERE principal = ?1 AND admission_id = ?2)))",
+                params![row.principal, row.admission_id, at],
+            )
+            .map(|_| ())
             .map_err(err)
     }
 
@@ -508,7 +544,7 @@ impl AccountTx<'_> {
             |row| {
                 Ok((
                     admission_from_row(row)?,
-                    row.get::<_, Option<i64>>(25)?
+                    row.get::<_, Option<i64>>(26)?
                         .map(|size| u32::try_from(size).unwrap_or(u32::MAX)),
                 ))
             },

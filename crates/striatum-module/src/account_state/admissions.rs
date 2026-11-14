@@ -292,6 +292,12 @@ pub(crate) struct ChainReservation {
 pub(crate) enum Effect {
     /// Write the admission's lifecycle columns; it was in state `from`.
     Admission { row: AccountAdmissionRow, from: String },
+    /// Advance only observation time, including for a closed original row.
+    Observed {
+        admission: RowKey,
+        previous: Option<i64>,
+        at: i64,
+    },
     /// End one conversation's lease. The write requires the pin, generation
     /// and lease end the state saw, as `end_lease`'s SQL requires its pin.
     LeaseEnded {
@@ -838,6 +844,7 @@ impl AdmissionState {
             row.state = "started".into();
             row.run_id = Some(run_id.to_owned());
             row.started_at = Some(at);
+            row.last_observed_at = Some(row.last_observed_at.unwrap_or(at).max(at));
             row.started_late = late;
         })
     }
@@ -847,6 +854,47 @@ impl AdmissionState {
             row.state = "released".into();
             row.released_at = Some(at);
         })
+    }
+
+    pub(crate) fn observe_admission(&mut self, original: &AccountAdmissionRow, at: i64) {
+        let original_key = key(&original.principal, &original.admission_id);
+        let mut rows = vec![self
+            .open
+            .get(&original_key)
+            .map(|open| open.row.clone())
+            .unwrap_or_else(|| original.clone())];
+        if let Some(chain) = self.chains.get(&original_key) {
+            rows.extend(
+                chain
+                    .runs
+                    .values()
+                    .flat_map(|offers| offers.values())
+                    .filter_map(|offer| {
+                        self.open
+                            .get(&key(&original.principal, &offer.reservation_id))
+                    })
+                    .filter(|open| open.row.state == "started")
+                    .map(|open| open.row.clone()),
+            );
+        }
+        for row in rows {
+            let admission = key(&row.principal, &row.admission_id);
+            let latest = row
+                .last_observed_at
+                .into_iter()
+                .chain(row.started_at)
+                .chain([at])
+                .max()
+                .unwrap();
+            self.pending.push(Effect::Observed {
+                admission: admission.clone(),
+                previous: row.last_observed_at,
+                at: latest,
+            });
+            if let Some(open) = self.open.get_mut(&admission) {
+                Arc::make_mut(open).row.last_observed_at = Some(latest);
+            }
+        }
     }
 
     pub(crate) fn finish(&mut self, principal: &str, admission_id: &str, at: i64) -> bool {
@@ -1087,6 +1135,7 @@ impl AdmissionState {
                 self.transition(&selection.0, &offer.reservation_id, &["reserved"], |row| {
                     row.state = "started".into();
                     row.started_at = Some(now);
+                    row.last_observed_at = Some(row.last_observed_at.unwrap_or(now).max(now));
                     row.run_id = Some(offer.run_id.clone());
                 });
                 self.mark_chain_used(&selection.0, &offer);
