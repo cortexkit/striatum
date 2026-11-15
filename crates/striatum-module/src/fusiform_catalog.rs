@@ -476,7 +476,7 @@ impl CatalogSnapshot {
         let expected_type = match kind {
             "transcribe" | "stream_transcribe" => "transcription",
             "synthesize" => "speech",
-            "image" | "video" | "realtime" => kind,
+            "image" | "video" | "realtime" | "search" => kind,
             _ => return None,
         };
         let grade = self.media_grades.get(route)?;

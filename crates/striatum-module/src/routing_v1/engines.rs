@@ -5,6 +5,7 @@ use cortexkit_role_routing::{
     errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode},
     select_engine::{self as wire, EngineCandidate, SelectEngineAnswer},
     select_media::{self as media, SelectMediaAnswer, SelectMediaRequest},
+    select_search::{self as search, SelectSearchRequest},
 };
 use serde_json::{json, Value};
 use striatum_core::{accounts::AllowedAccountClass, route_state_store::DecisionInput};
@@ -97,6 +98,38 @@ pub(super) fn select_media(
         request.engine_request(),
         Some(&request),
         None,
+        None,
+    )
+}
+
+pub(super) fn select_search(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<Value, Refusal> {
+    let request =
+        search::parse_select_search_request(params, &super::describe::capabilities(), &["search"])?;
+    // Share engine policy, ranking and decision recording only after the search
+    // parser has enforced its narrower wire contract.
+    let mut common = SelectMediaRequest::new(
+        &request.consumer,
+        wire::Kind::new("search"),
+        media::MediaRequirements::default(),
+        request.privacy.clone(),
+    );
+    common.requirements.iq = request.requirements.iq;
+    common.pin = request.pin.clone();
+    common.exclude = request.exclude.clone();
+    common.exclude_providers = request.exclude_providers.clone();
+    common.eligible_routes = request.eligible_routes.clone();
+    select_request(
+        params,
+        caller,
+        deps,
+        common.engine_request(),
+        Some(&common),
+        Some(&request),
+        None,
     )
 }
 
@@ -127,6 +160,7 @@ pub(super) fn preview_media(
         deps,
         request.engine_request(),
         Some(request),
+        None,
         Some(view),
     )
 }
@@ -175,7 +209,7 @@ fn failed_video_requirement(
 
 fn select_inner(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
     let request = wire::parse_select_engine_request(params)?;
-    select_request(params, caller, deps, request, None, None)
+    select_request(params, caller, deps, request, None, None, None)
 }
 
 fn select_request(
@@ -184,6 +218,7 @@ fn select_request(
     deps: &Deps<'_>,
     request: wire::SelectEngineRequest,
     media: Option<&SelectMediaRequest>,
+    search: Option<&SelectSearchRequest>,
     mut evaluation: Option<&mut MediaEvaluation>,
 ) -> Result<Value, Refusal> {
     let config = evaluation
@@ -451,7 +486,8 @@ fn select_request(
             config.route_allowed(&request.consumer, &key, true)
         };
         if policy_allowed
-            && (candidate.engine.local
+            && (search.is_some()
+                || candidate.engine.local
                 || active_media_providers.contains(&candidate.engine.provider))
         {
             top_routes.insert(key.clone());
@@ -476,9 +512,15 @@ fn select_request(
             // enforces model pin-only rules but not chat provider spending rules.
             // Both operations still refuse only_for and not_for exclusions.
             candidate.fenced |= !policy_allowed;
-            let reachable = accounts
-                .engine_has_eligible_credential(&candidate.engine.provider, &candidate.engine.model)
-                .map_err(store_refusal)?;
+            // Search credentials belong to the declaring module. Its eligible
+            // subset, not Broca's media credential inventory, admits the route.
+            let reachable = search.is_some()
+                || accounts
+                    .engine_has_eligible_credential(
+                        &candidate.engine.provider,
+                        &candidate.engine.model,
+                    )
+                    .map_err(store_refusal)?;
             candidate.fenced |= !reachable;
             if !reachable && evaluation.is_some() {
                 excluded
@@ -491,6 +533,16 @@ fn select_request(
         #[cfg(test)]
         if let Some((_, cost)) = facts.filter(|_| media.is_none()) {
             candidate.cost = cost.filter(|value| value.is_finite()).map(FactNumber);
+        }
+        if search.is_some_and(|request| {
+            request.allowance_left.as_ref().is_some_and(|routes| {
+                routes.iter().any(|route| {
+                    route.provider == candidate.engine.provider
+                        && route.model == candidate.engine.model
+                })
+            })
+        }) {
+            candidate.cost = caller_local_cost();
         }
     }
     let identities: std::collections::BTreeSet<_> = candidates
@@ -838,7 +890,11 @@ fn select_request(
         if !winner.engine.local {
             answer.price = pricing.and_then(|pricing| pricing.price.clone());
         }
-        media::check_answer(request, &answer)?;
+        if let Some(search) = search {
+            search::check_answer(search, &answer)?;
+        } else {
+            media::check_answer(request, &answer)?;
+        }
         serde_json::to_value(answer)
     } else {
         serde_json::to_value(&answer)

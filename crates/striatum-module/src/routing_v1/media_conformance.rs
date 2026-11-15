@@ -26,6 +26,14 @@ impl Inputs {
                 cost.kind.as_str().to_owned(),
             );
         }
+        for slot in super::super::consumers::search_declarations().values() {
+            for route in &slot.routes {
+                kinds.insert(
+                    format!("{}/{}", route.provider, route.model),
+                    "search".into(),
+                );
+            }
+        }
         let mut models: serde_json::Map<String, Value> = h
             .store()
             .get_facts()
@@ -111,6 +119,20 @@ impl Inputs {
                 row[rate] = catalog_rate(&cost.into())?;
             }
         }
+        for (key, fact) in &self.facts.search {
+            let row = models
+                .entry(key.clone())
+                .or_insert_with(|| json!({"existence":"present"}));
+            row["model.type"] = json!("search");
+            if let Some(grade) = fact.grade {
+                row["quality.grade"] = json!(grade);
+            }
+            if let Some(price) = &fact.price {
+                for (key, rate) in &price.rates {
+                    row[&format!("rate.{key}")] = catalog_rate(&rate.rate)?;
+                }
+            }
+        }
         let snapshot = crate::fusiform_catalog::decode_catalog_get(
             &serde_json::to_vec(&json!({
                 "catalog_version":1,"resolved_at_ms":1,
@@ -131,6 +153,11 @@ impl Inputs {
                     config["models"][key]["not_for"] = json!(fact.not_for);
                 }
             }
+            for (key, fact) in &self.facts.search {
+                if !fact.not_for.is_empty() {
+                    config["models"][key]["not_for"] = json!(fact.not_for);
+                }
+            }
         });
         self.policies = self
             .facts
@@ -138,6 +165,13 @@ impl Inputs {
             .iter()
             .filter(|(_, fact)| !fact.not_for.is_empty())
             .map(|(key, _)| key.clone())
+            .chain(
+                self.facts
+                    .search
+                    .iter()
+                    .filter(|(_, fact)| !fact.not_for.is_empty())
+                    .map(|(key, _)| key.clone()),
+            )
             .collect();
         Ok(())
     }

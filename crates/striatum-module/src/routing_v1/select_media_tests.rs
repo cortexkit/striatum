@@ -70,10 +70,11 @@ async fn production_describe_advertises_fixed_media_kinds_without_engines() {
                 "synthesize",
                 "realtime",
                 "image",
-                "video"
+                "video",
+                "search"
             ])
         );
-        assert!(!describe["kinds"]
+        assert!(describe["kinds"]
             .as_array()
             .unwrap()
             .contains(&json!("search")));
@@ -91,7 +92,7 @@ async fn production_describe_advertises_fixed_media_kinds_without_engines() {
         }
         let mut params = request();
         params["kind"] = json!("search");
-        refuse(&route, &params, "invalid_request", Some("kind")).await;
+        refuse(&route, &params, "no_route", None).await;
     })
     .await;
 }
@@ -293,25 +294,31 @@ async fn synthesize_accepts_input_characters_and_describes_it_without_pricing() 
 
 #[tokio::test]
 async fn media_entry_refuses_unserved_kinds_and_cross_kind_requests() {
-    super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
-        let h = setup(vec![engine("remote", false)]);
-        let route = h.bind(reserved("colliculus"), None).await;
-        for kind in ["transcription", "speech", "search", "future-engine"] {
-            let mut params = request();
-            params["kind"] = json!(kind);
-            refuse(&route, &params, "invalid_request", Some("kind")).await;
-        }
-        declare("search", &[]);
-        let mut params = request();
-        params.as_object_mut().unwrap().remove("kind");
-        refuse(&route, &params, "invalid_request", Some("kind")).await;
-        declare("transcription", &[engine("remote", false)]);
-        assert_eq!(select(&route, &params).await["engine"]["model"], "remote");
-        params["kind"] = json!("image");
-        refuse(&route, &params, "invalid_request", Some("kind")).await;
-        declare("image", &[engine("wrong-kind", false)]);
-        let refusal = refuse(&route, &params, "no_route", None).await;
-        assert_eq!(refusal["detail"], json!({"reason":"no_available_model"}));
+    super::super::describe::without_capability("select_search", async {
+        super::super::describe::with_candidate_capabilities(
+            &["select_kind", "select_media"],
+            async {
+                let h = setup(vec![engine("remote", false)]);
+                let route = h.bind(reserved("colliculus"), None).await;
+                for kind in ["transcription", "speech", "search", "future-engine"] {
+                    let mut params = request();
+                    params["kind"] = json!(kind);
+                    refuse(&route, &params, "invalid_request", Some("kind")).await;
+                }
+                declare("search", &[]);
+                let mut params = request();
+                params.as_object_mut().unwrap().remove("kind");
+                refuse(&route, &params, "invalid_request", Some("kind")).await;
+                declare("transcription", &[engine("remote", false)]);
+                assert_eq!(select(&route, &params).await["engine"]["model"], "remote");
+                params["kind"] = json!("image");
+                refuse(&route, &params, "invalid_request", Some("kind")).await;
+                declare("image", &[engine("wrong-kind", false)]);
+                let refusal = refuse(&route, &params, "no_route", None).await;
+                assert_eq!(refusal["detail"], json!({"reason":"no_available_model"}));
+            },
+        )
+        .await;
     })
     .await;
 }

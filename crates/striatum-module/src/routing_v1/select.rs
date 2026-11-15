@@ -146,7 +146,9 @@ pub(super) async fn select(
             })
             .transpose()?;
         // Declaration aliases are catalog spellings, not additional wire kinds.
-        if sent.is_some_and(|kind| kind != "llm" && !super::engines::MEDIA_KINDS.contains(&kind)) {
+        if sent.is_some_and(|kind| {
+            kind != "llm" && kind != "search" && !super::engines::MEDIA_KINDS.contains(&kind)
+        }) {
             return Err(Refusal::invalid_request(
                 "kind",
                 "kind is not served by select_media",
@@ -166,6 +168,9 @@ pub(super) async fn select(
                 .ok_or_else(|| Refusal::invalid_request("params", "expected an object"))?
                 .insert("kind".into(), kind.into());
             // Media never enters the LLM billing wait or merges LLM-only defaults.
+            if kind == "search" {
+                return super::engines::select_search(&resolved, caller, deps);
+            }
             return super::engines::select_media(&resolved, caller, deps);
         }
         if params.get("kind").is_some() {

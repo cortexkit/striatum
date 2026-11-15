@@ -21,6 +21,7 @@ pub(super) mod kind;
 pub(crate) struct Catalog {
     modules: BTreeMap<String, BTreeMap<String, DemandDefaults>>,
     engines: BTreeMap<String, cortexkit_role_routing::EngineDeclarations>,
+    search: BTreeMap<String, cortexkit_role_routing::SearchDeclarations>,
     agent_hosts: BTreeSet<String>,
     issues: Vec<String>,
     media: Arc<Mutex<Option<MediaJoin>>>,
@@ -40,6 +41,7 @@ pub(super) struct MediaKind {
 #[derive(Default)]
 pub(super) struct MediaRoutes {
     pub by_kind: BTreeMap<String, MediaKind>,
+    pub issues: Vec<String>,
 }
 
 struct MediaJoin {
@@ -62,7 +64,7 @@ pub(crate) fn replace_catalog(modules: &Value) {
     let mut current = CATALOG.get_or_init(Default::default).write().unwrap();
     // Catalog refreshes also carry unrelated module metadata. Keep the join
     // when the engine declarations have not changed.
-    if current.engines == snapshot.engines {
+    if current.engines == snapshot.engines && current.search == snapshot.search {
         snapshot.media = current.media.clone();
     }
     *current = snapshot;
@@ -100,6 +102,36 @@ pub(super) fn media_routes(
             });
         }
     }
+    for (module, slot) in &catalog.search {
+        for route in &slot.routes {
+            let key = format!("{}/{}", route.provider, route.model);
+            if !source.is_some_and(|snapshot| {
+                snapshot
+                    .model(&key)
+                    .is_some_and(|row| row.present && row.model_type.as_deref() == Some("search"))
+            }) {
+                routes.issues.push(format!(
+                    "Module {module} search route {key} excluded: missing catalog search row"
+                ));
+                continue;
+            }
+            let joined = routes.by_kind.entry("search".into()).or_default();
+            if let Some(grade) = source.and_then(|snapshot| snapshot.media_grade("search", &key)) {
+                joined.grades.insert(key, grade);
+            }
+            joined.routes.push(MediaRoute {
+                module: module.clone(),
+                engine: cortexkit_role_routing::select_engine::Engine::new(
+                    cortexkit_role_routing::select_engine::Kind::new("search"),
+                    route.provider.clone(),
+                    route.model.clone(),
+                    false,
+                    vec![],
+                    cortexkit_role_routing::select_engine::LatencyClass::Interactive,
+                ),
+            });
+        }
+    }
     let routes = Arc::new(routes);
     *cached = Some(MediaJoin {
         source: source.cloned(),
@@ -115,6 +147,17 @@ pub(crate) fn engine_declarations() -> BTreeMap<String, cortexkit_role_routing::
         .read()
         .unwrap()
         .engines
+        .clone()
+}
+
+#[cfg(test)]
+pub(super) fn search_declarations() -> BTreeMap<String, cortexkit_role_routing::SearchDeclarations>
+{
+    CATALOG
+        .get_or_init(Default::default)
+        .read()
+        .unwrap()
+        .search
         .clone()
 }
 
@@ -153,6 +196,7 @@ impl Catalog {
                         roles
                             .get(cortexkit_role_routing::ROLE_DECLARATIONS_KEY)
                             .or_else(|| roles.get("media-provider/v1"))
+                            .or_else(|| roles.get("search-provider/v1"))
                     })
                     .is_some()
                 {
@@ -176,6 +220,21 @@ impl Catalog {
                     }
                     Err(error) => catalog.issues.push(format!(
                         "Module {module} declares media engines routing can't read, so routing ignores them: {error}"
+                    )),
+                }
+            }
+            if entry
+                .get("role_declarations")
+                .and_then(|roles| roles.get("search-provider/v1"))
+                .is_some()
+            {
+                let slot = &entry["role_declarations"]["search-provider/v1"];
+                match cortexkit_role_routing::parse_search_declarations(slot) {
+                    Ok(declarations) => {
+                        catalog.search.insert(module.to_owned(), declarations);
+                    }
+                    Err(error) => catalog.issues.push(format!(
+                        "Module {module} declares search routes routing can't read, so routing ignores them: {error}"
                     )),
                 }
             }
@@ -583,5 +642,9 @@ pub(crate) fn health() -> Value {
             claims.entry(name).or_default().push(module);
         }
     }
-    serde_json::json!({"issues": catalog.issues, "conflicts": claims.into_iter().filter(|(_, owners)| owners.len() > 1).collect::<BTreeMap<_, _>>()})
+    let mut issues = catalog.issues.clone();
+    if let Some(join) = catalog.media.lock().unwrap().as_ref() {
+        issues.extend(join.routes.issues.iter().cloned());
+    }
+    serde_json::json!({"issues": issues, "conflicts": claims.into_iter().filter(|(_, owners)| owners.len() > 1).collect::<BTreeMap<_, _>>()})
 }

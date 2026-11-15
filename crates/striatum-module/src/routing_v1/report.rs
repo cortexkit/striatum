@@ -82,17 +82,30 @@ pub(super) fn report_at(
         .and_then(|q| q.lock().ok().map(|q| q.clone()))
         .unwrap_or_default();
     let account_ids = credentials.quota_account_ids(&quota);
-    let mut effects = attempt::account_effects(&effect_request, &credentials, |params| {
-        prepare_account_facts(
-            params,
-            &decision,
-            deps,
-            now as i64,
-            &credentials,
-            &quota,
-            &account_ids,
-        )
-    })?;
+    let search = deps
+        .store
+        .get_decision_by_id(&request.decision_id)
+        .map_err(store_refusal)?
+        .is_some_and(|decision| {
+            serde_json::from_str::<Value>(&decision.requirements_json)
+                .ok()
+                .is_some_and(|params| params["kind"] == "search")
+        });
+    let mut effects = if search {
+        attempt::search_effects(&effect_request, &decision, now)
+    } else {
+        attempt::account_effects(&effect_request, &credentials, |params| {
+            prepare_account_facts(
+                params,
+                &decision,
+                deps,
+                now as i64,
+                &credentials,
+                &quota,
+                &account_ids,
+            )
+        })?
+    };
     let usage = request
         .usage
         .as_ref()
@@ -109,7 +122,7 @@ pub(super) fn report_at(
         .transpose()?
         .flatten();
     // Only success lifts the credential fence, never a neutral cancellation.
-    if effect_request.outcome == Outcome::Completed {
+    if !search && effect_request.outcome == Outcome::Completed {
         let credential = deps
             .store
             .decision_provider_identity(&request.decision_id)

@@ -5,6 +5,12 @@ use striatum_core::{route_state_store::CredentialRefusal, RouteOutcome};
 
 #[derive(Clone, Default)]
 pub struct V1ReportEffects {
+    /// Identity-free route telemetry for a module that owns its credentials.
+    pub route_state: Option<(
+        String,
+        String,
+        striatum_core::route_state_store::RouteStateUpdate,
+    )>,
     /// Explicit serving credential from the report, before identity fallback.
     pub reported_credential: Option<String>,
     /// Rejected and unknown outcomes do not settle a decision's probe.
@@ -581,6 +587,10 @@ fn apply_account_effects(
     effects: &V1ReportEffects,
     now: i64,
 ) -> rusqlite::Result<()> {
+    if let Some((route, capacity, update)) = &effects.route_state {
+        tx.update_route_state(route, capacity, update)
+            .map_err(sql_error)?;
+    }
     let conn = tx.conn;
     if let Some(fence) = &effects.non_quota_route_fence {
         tx.record_non_quota_route_fence(fence).map_err(sql_error)?;
