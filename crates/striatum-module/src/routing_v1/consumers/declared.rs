@@ -61,21 +61,10 @@ pub(super) fn honor(
     {
         return true;
     }
-    if extended(&declaration.defaults) {
-        issues.push(format!(
-            "ignored consumer {name:?} from module {module:?}: a consumer using declared defaults must equal its module id or start with {module}."
-        ));
-        false
-    } else {
-        // Legacy names remain owned and keep their demand defaults until the
-        // modules and settings move to module-qualified consumer names together.
-        // Remove this exception in the same release that removes the legacy
-        // `substrates` settings and the legacy `route.select` adapter.
-        issues.push(format!(
-            "transitional consumer {name:?} from module {module:?}: outside the module namespace; legacy demand defaults and admission retained"
-        ));
-        true
-    }
+    issues.push(format!(
+        "ignored consumer {name:?} from module {module:?}: a consumer must equal its module id or start with {module}."
+    ));
+    false
 }
 
 pub(super) fn extended(defaults: &DemandDefaults) -> bool {

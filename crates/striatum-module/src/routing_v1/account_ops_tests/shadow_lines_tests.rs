@@ -113,21 +113,6 @@ async fn account_shadow_consumers_and_declared_harness_do_not_change_admission_i
             assert!(call["scope_kind"].is_null());
         }
     }
-    let selected = owner
-        .call(
-            "route.select",
-            &json!({"targetAgent":"mason",
-        "substrate":"broca","executor":"broca","requirements":{"iq":30,"eq":0}}),
-        )
-        .await;
-    let mut body = request("legacy-selection");
-    body["model_decision_id"] = response(&selected)["decisionID"].clone();
-    body["caller"] = json!({"runner":"class-runner"});
-    events();
-    response(&runner.call("route.account_for", &body).await);
-    let (calls, _) = events();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0]["consumer"], "mason");
 }
 
 #[tokio::test]
@@ -228,14 +213,14 @@ async fn account_shadow_kept_affinity_is_full_even_with_a_free_eligible_sibling(
 }
 
 #[tokio::test]
-async fn priority_select_calls_log_one_class_and_head_mark_on_both_surfaces() {
+async fn priority_select_calls_log_one_class_and_head_mark_on_the_select_surface() {
     async fn capture(consumer: &str, declared: Option<&str>) -> Vec<(FrameType, Vec<u8>)> {
         let _clock = crate::InjectedClock::set(NOW);
         // Restart generated identifiers as well as the clock so the comparison
         // covers real handler bytes, not a normalized reply with fields removed.
         let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
         let (harness, _) = setup("synthetic", false);
-        harness.edit_config(|config| config["head_agents"] = json!(["codemode"]));
+        harness.edit_config(|config| config["head_agents"] = json!(["class-owner.codemode"]));
         let mut declaration = json!({"name":consumer});
         if let Some(class) = declared {
             declaration["priority"] = json!(class);
@@ -248,7 +233,7 @@ async fn priority_select_calls_log_one_class_and_head_mark_on_both_surfaces() {
         let runner = harness.bind(reserved("class-runner"), None).await;
         let class = declared.unwrap_or("worker");
         let mut answers = Vec::new();
-        for legacy in [false, true] {
+        for legacy in [false] {
             crate::take_operator_infos();
             let params = if legacy {
                 json!({"targetAgent":consumer,"substrate":"broca","executor":"broca",
@@ -290,10 +275,10 @@ async fn priority_select_calls_log_one_class_and_head_mark_on_both_surfaces() {
         answers
     }
     for (consumer, class) in [
-        ("mason", "interactive"),
-        ("mason", "blocking"),
-        ("mason", "background"),
-        ("codemode", "worker"),
+        ("class-owner.mason", "interactive"),
+        ("class-owner.mason", "blocking"),
+        ("class-owner.mason", "background"),
+        ("class-owner.codemode", "worker"),
     ] {
         assert_eq!(
             capture(consumer, None).await,
@@ -310,17 +295,16 @@ async fn priority_account_pressure_uses_bound_consumer_and_unbound_worker() {
     crate::routing_v1::consumers::replace_catalog(&json!([{
         "module_id":"class-owner","nonce_verified":true,
         "role_declarations":{"routing/v1":{"consumers":[
-            {"name":"mason","priority":"interactive"},
-            {"name":"class-runner","priority":"interactive"}
+            {"name":"class-owner.mason","priority":"interactive"}
         ]}}
-    }]));
+    }, {"module_id":"class-runner","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[{"name":"class-runner","priority":"interactive"}]}}}]));
     let owner = harness.bind(reserved("class-owner"), None).await;
     let runner = harness.bind(reserved("class-runner"), None).await;
     response(&runner.call("route.account_for", &request("seed")).await);
     let selected = owner
         .call(
             "route.select",
-            &json!({"consumer":"mason","requirements":{"iq":30,"eq":0}}),
+            &json!({"consumer":"class-owner.mason","requirements":{"iq":30,"eq":0}}),
         )
         .await;
     let decision = response(&selected)["decision_id"].clone();
@@ -346,7 +330,11 @@ async fn priority_account_pressure_uses_bound_consumer_and_unbound_worker() {
             );
             assert_eq!(
                 pressure[0]["consumer"],
-                if bound { "mason" } else { "class-runner" }
+                if bound {
+                    "class-owner.mason"
+                } else {
+                    "class-runner"
+                }
             );
         }
     }

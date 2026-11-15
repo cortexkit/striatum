@@ -375,7 +375,7 @@ async fn media_entry_applies_caller_local_admission_privacy_requirements_and_fen
         let owner = h.bind(reserved("callosum"), None).await;
         let foreign = h.bind(reserved("stranger"), None).await;
         let mut params = request();
-        params["consumer"] = json!("phone.media");
+        params["consumer"] = json!("colliculus.voice_message");
         params["privacy"] = json!("local_only");
         params["caller_local"] = json!([engine("phone", true)]);
         params["requirements"]["language"] = json!("en-US");

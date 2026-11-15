@@ -244,7 +244,9 @@ async fn media_ranking_below_bar_refuses_mason_and_best_effort_prefers_graded() 
         &["select_kind", "select_media"],
         async {
             let h = setup(vec![engine("a-top", false), engine("z-low", false)]);
-            h.edit_config(|config| config["consumers"]["mason"] = json!({"owner":"colliculus"}));
+            h.edit_config(|config| {
+                config["consumers"]["prefrontal-core.mason"] = json!({"owner":"colliculus"})
+            });
             catalog(
                 &h,
                 &[
@@ -258,10 +260,10 @@ async fn media_ranking_below_bar_refuses_mason_and_best_effort_prefers_graded() 
             params["requirements"]["iq"] = json!(80);
             params["caller_local"] = json!([engine("phone", true)]);
             assert_eq!(select(&route, &params).await["engine"]["model"], "z-low");
-            params["consumer"] = json!("mason.worker");
+            params["consumer"] = json!("prefrontal-core.mason.worker");
             refuse(&route, &params, "no_route", None).await;
             h.edit_config(|config| {
-                config["consumers"]["mason"]["below_bar"] = json!("best_effort")
+                config["consumers"]["prefrontal-core.mason"]["below_bar"] = json!("best_effort")
             });
             assert_eq!(select(&route, &params).await["engine"]["model"], "z-low");
             params["privacy"] = json!("local_only");

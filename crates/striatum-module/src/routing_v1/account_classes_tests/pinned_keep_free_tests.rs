@@ -196,13 +196,13 @@ async fn pinned_origins_cannot_spend_a_walled_account() {
 async fn non_mason_request_pins_and_demand_keep_the_reserve() {
     let _clock = crate::InjectedClock::set(NOW);
     for (consumer, pin) in [
-        ("mason", true),
+        ("other.worker", true),
         ("prefrontal-core.masonish", true),
         (CONSUMER, false),
     ] {
         let (harness, _pools) = fixture(Origin::Request, 85.0);
         harness.edit_config(|config| {
-            if consumer == "prefrontal-core.masonish" {
+            if consumer != CONSUMER {
                 config["consumers"][consumer] = json!({"owner":OWNER,"mode":"demand"});
             }
         });

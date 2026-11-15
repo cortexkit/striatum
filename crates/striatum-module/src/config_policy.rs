@@ -5,6 +5,8 @@ use schemars::{JsonSchema, Schema};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
 
+pub(crate) const ATHENA_SYNTHESIZER_CONSUMER: &str = "prefrontal-core.athena.synthesizer";
+
 /// Operator spelling of the contract's consumer scheduling classes.
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -397,25 +399,6 @@ impl ExcludeGroups {
     }
 }
 
-/// The `routing/v1` consumers routing serves beyond the request classes
-/// [`crate::select_policy::Consumer`] already names (mason, sidekick, athena,
-/// lab, core, codemode, flow). Magic Context owns these summary and dream
-/// consumers; they take the default policy: no exclusions beyond
-/// `exclude.all`, and any route, priced per token or not.
-pub const MAGIC_CONTEXT_CONSUMERS: &[&str] = &[
-    "mc_summary",
-    "mc_dream",
-    "mc_dream_verify",
-    "mc_dream_map",
-    "mc_dream_curate",
-    "mc_dream_classify",
-    "mc_dream_review_user",
-    "mc_dream_retrospective",
-    "mc_dream_primers",
-    "mc_dream_compress_cues",
-    "mc_dream_docs",
-];
-
 /// A runner module `routing/v1` answers with (`runners[]`).
 /// Listed in preference order: the first listed runner that can serve the
 /// answered route is named.
@@ -444,47 +427,6 @@ pub struct RunnerPolicy {
     pub via_vault: bool,
 }
 
-/// Settings and callers deploy independently, so both spellings remain live
-/// until every caller has moved to its module-owned name. Verify had one old
-/// policy for two tasks; an old rule therefore applies to both new siblings.
-pub const CONSUMER_ALIAS_PAIRS: &[(&str, &str)] = &[
-    ("mason", "prefrontal-core.mason"),
-    ("sidekick", "prefrontal-core.sidekick"),
-    ("athena", "prefrontal-core.athena"),
-    ("athena.gather", "prefrontal-core.athena.gather"),
-    ("synthesizer", "prefrontal-core.athena.synthesizer"),
-    ("lab", "prefrontal-core.lab"),
-    ("core", "prefrontal-core.wake"),
-    ("codemode", "basal.codemode"),
-    ("flow", "basal.flow"),
-    ("mc_summary", "magic-context.summary"),
-    ("mc_dream", "magic-context.dream"),
-    ("mc_dream_classify", "magic-context.dream.classify-memories"),
-    ("mc_dream_curate", "magic-context.dream.curate"),
-    (
-        "mc_dream_compress_cues",
-        "magic-context.dream.compress-cues",
-    ),
-    (
-        "mc_dream_review_user",
-        "magic-context.dream.review-user-memories",
-    ),
-    ("mc_dream_map", "magic-context.dream.map-memories"),
-    ("mc_dream_primers", "magic-context.dream.refresh-primers"),
-    (
-        "mc_dream_retrospective",
-        "magic-context.dream.reflect-events",
-    ),
-    ("mc_dream_verify", "magic-context.dream.verify"),
-    ("mc_dream_verify", "magic-context.dream.verify-broad"),
-];
-
-/// Head choices belong to routing itself, not a module declaration. Classifier
-/// requests are also a routing protocol consumer rather than a module workload.
-pub fn routing_builtin_consumer(name: &str) -> bool {
-    matches!(name, "head" | "classifier")
-}
-
 fn dotted_prefix(prefix: &str, consumer: &str) -> bool {
     consumer == prefix
         || consumer
@@ -492,46 +434,17 @@ fn dotted_prefix(prefix: &str, consumer: &str) -> bool {
             .is_some_and(|tail| tail.starts_with('.'))
 }
 
-pub fn consumer_spellings(name: &str) -> Vec<String> {
-    let longest = CONSUMER_ALIAS_PAIRS
-        .iter()
-        .filter(|(old, _)| dotted_prefix(old, name))
-        .map(|(old, _)| old.len())
-        .max();
-    match longest {
-        Some(length) => CONSUMER_ALIAS_PAIRS
-            .iter()
-            .filter(|(old, _)| old.len() == length && dotted_prefix(old, name))
-            .map(|(old, new)| format!("{new}{}", &name[old.len()..]))
-            .collect(),
-        None => vec![name.to_owned()],
-    }
-}
-
 pub fn consumer_specificity(name: &str) -> usize {
-    consumer_spellings(name)
-        .iter()
-        .map(String::len)
-        .max()
-        .unwrap_or(0)
+    name.len()
 }
 
 pub fn consumer_entry<'a, T>(entries: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
-    entries.get(name).or_else(|| {
-        entries.iter().find_map(|(key, value)| {
-            (consumer_matches(key, name) && consumer_matches(name, key)).then_some(value)
-        })
-    })
+    entries.get(name)
 }
 
-/// Match whole dotted segments after translating legacy names. Translating
-/// both operands lets either deployment order retain the operator's policy.
+/// Match whole dotted segments, so children inherit their namespace's policy.
 pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
-    consumer_spellings(prefix).iter().any(|prefix| {
-        consumer_spellings(consumer)
-            .iter()
-            .any(|consumer| dotted_prefix(prefix, consumer))
-    })
+    dotted_prefix(prefix, consumer)
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -697,11 +610,12 @@ pub fn is_slot(name: &str) -> bool {
 /// The `route.select` consumer a pin slot is requested under, so the slot's
 /// pin is judged by that consumer's `only_for` / `not_for` rules. Core asks for
 /// the synthesizer pin and the Spec Campaigns designer's `spec_designer` slot as
-/// consumer `athena`, and for the `lab_planner` slot as consumer `lab`.
+/// consumer `prefrontal-core.athena`, and for the `lab_planner` slot as consumer
+/// `prefrontal-core.lab`.
 pub fn slot_consumer(slot: &str) -> Option<&'static str> {
     match slot {
-        "synthesizer" | "spec_designer" => Some("athena"),
-        "lab_planner" => Some("lab"),
+        "synthesizer" | "spec_designer" => Some("prefrontal-core.athena"),
+        "lab_planner" => Some("prefrontal-core.lab"),
         _ => None,
     }
 }
@@ -730,7 +644,7 @@ pub fn resolve_consumer_policy(
     declared: &BTreeMap<String, ConsumerPolicy>,
 ) -> ConsumerPolicy {
     let mut result = serde_json::Map::new();
-    if consumer_matches("mason", consumer) {
+    if consumer_matches("prefrontal-core.mason", consumer) {
         result.insert("below_bar".into(), serde_json::json!("refuse"));
     }
     let mut ladder_source = None;

@@ -15,7 +15,7 @@ fn harness() -> Arc<Harness> {
     harness.edit_config(|config| {
         config["consumers"] = json!({
             "codemode": { "owner": "prefrontal-core", "pay_per_token": true },
-            "mc_dream_curate": { "owner": "magic-context" }
+            "magic-context.dream.curate": { "owner": "magic-context" }
         });
     });
     install_catalog(&harness, &fixture::catalog());
@@ -557,7 +557,7 @@ async fn declared_defaults_inherit_by_member_only_for_the_same_owner() {
                 json!({"owner":"magic-context"});
             config["consumers"]["magic-context.summary.ownerless"] = json!({});
             config["consumers"]["magic-context.summary.foreign"] = json!({"owner":"other"});
-            config["consumers"]["legacy.settings"] = json!({});
+            config["consumers"]["magic-context.legacy.settings"] = json!({});
         });
         consumers::replace_catalog(&json!([{
             "module_id":"magic-context", "nonce_verified":true,
@@ -567,7 +567,7 @@ async fn declared_defaults_inherit_by_member_only_for_the_same_owner() {
                 {"name":"magic-context.summary.child"},
                 {"name":"magic-context.summary.child.own", "iq":20, "eq":0,
                  "ladder":["example-provider/model-b"]},
-                {"name":"legacy", "eq":17}
+                {"name":"magic-context.legacy", "eq":17}
             ]}}
         }]));
         let owner = h.bind(reserved("magic-context"), None).await;
@@ -601,7 +601,7 @@ async fn declared_defaults_inherit_by_member_only_for_the_same_owner() {
         let other = h.bind(reserved("other"), None).await;
         for (name, route) in [
             ("magic-context.summary.foreign", &other),
-            ("legacy.settings", &other),
+            ("magic-context.legacy.settings", &other),
         ] {
             let missing = route
                 .call("route.select", &json!({"consumer":name,"requirements":{}}))
@@ -622,7 +622,9 @@ async fn declared_defaults_inherit_by_member_only_for_the_same_owner() {
                 "{input}"
             );
         }
-        let legacy = owner.call("route.select", &select("legacy.unlisted")).await;
+        let legacy = owner
+            .call("route.select", &select("magic-context.legacy.unlisted"))
+            .await;
         assert_eq!(selected_input(&h, &legacy)["eq"].as_f64(), Some(17.0));
         let underscore = owner
             .call("route.select", &select("magic-context.summary_child"))
@@ -1024,41 +1026,6 @@ async fn settings_ladder_what_if_admits_operator_pin_only_choices() {
     );
 }
 
-#[tokio::test]
-async fn settings_ladder_legacy_selection_admits_pin_only_but_not_consumer_restrictions() {
-    let _clock = crate::InjectedClock::set(LADDER_NOW);
-    let h = settings_ladder_harness();
-    h.edit_config(|config| {
-        config["consumers"]["codemode"]["mode"] = json!("ladder");
-        config["consumers"]["codemode"]["ladder"] = json!(SETTINGS_LADDER);
-        config["consumers"]["codemode"]["pay_per_token"] = json!(false);
-        config["models"][SETTINGS_LADDER[1]]["pin_only_for"] = json!(["codemode"]);
-    });
-    let route = h.bind(reserved("magic-context"), None).await;
-    let request = json!({"consumer":"codemode", "targetAgent":"codemode",
-        "executor":"broca", "substrate":"broca", "requirements":{"iq":30,"eq":0}});
-    let reply = route.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[0],
-        "{}",
-        reply.1
-    );
-    h.edit_config(|config| config["models"][SETTINGS_LADDER[0]]["not_for"] = json!(["codemode"]));
-    let reply = route.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[1],
-        "{}",
-        reply.1
-    );
-    for key in &SETTINGS_LADDER[1..] {
-        settings_ladder_wall(&h, key, LADDER_NOW + 30_000);
-    }
-    let reply = route.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-}
-
 const LADDER_VARIANTS: [&str; 3] = ["high", "high", "medium"];
 
 fn variant_ladder_harness(first_variant: &str, legacy: bool) -> Arc<Harness> {
@@ -1244,32 +1211,6 @@ async fn settings_ladder_explicit_variant_walls_keep_the_earliest_reset() {
     );
 }
 
-#[tokio::test]
-async fn settings_ladder_legacy_selection_preserves_explicit_variant() {
-    let _clock = crate::InjectedClock::set(LADDER_NOW);
-    let h = variant_ladder_harness("high", true);
-    let route = h.bind(reserved("magic-context"), None).await;
-    let reply = route
-        .call(
-            "route.select",
-            &json!({"consumer":"codemode", "targetAgent":"codemode",
-        "executor":"broca", "substrate":"broca", "requirements":{"iq":30,"eq":0}}),
-        )
-        .await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["selected"]["promptParams"]["variant"], "high",
-        "{}",
-        reply.1
-    );
-    assert_eq!(
-        reply.1["result"]["selected"]["routeKey"],
-        format!("{}/high", SETTINGS_LADDER[0]),
-        "{}",
-        reply.1
-    );
-}
-
 fn admission_refused(reply: (FrameType, Value), code: &str, consumer: &str) {
     refused(reply.clone(), code, consumer);
     assert_eq!(reply.1["detail"], json!({"consumer": consumer}));
@@ -1332,7 +1273,7 @@ async fn declared_admission_selectors_use_attested_identity_not_their_scope() {
 }
 
 #[tokio::test]
-async fn declared_admission_unlisted_dotted_children_inherit_legacy_and_settings_admission() {
+async fn declared_admission_unlisted_dotted_children_inherit_declared_and_settings_admission() {
     let h = harness();
     h.edit_config(|config| {
         config["consumers"]["settings-parent"] = json!({
@@ -1345,7 +1286,7 @@ async fn declared_admission_unlisted_dotted_children_inherit_legacy_and_settings
         "role_declarations": {"routing/v1": {"consumers": [
             {"name": "legacy-owner.task", "eq": 17},
             {"name": "legacy-owner.task.nested", "eq": 19},
-            {"name": "transitional-task", "eq": 23}
+            {"name": "legacy-owner.another-task", "eq": 23}
         ]}}
     }]));
     let owner = h.bind(reserved("legacy-owner"), None).await;
@@ -1355,7 +1296,7 @@ async fn declared_admission_unlisted_dotted_children_inherit_legacy_and_settings
     for (consumer, eq) in [
         ("legacy-owner.task.child", 17),
         ("legacy-owner.task.nested.child", 19),
-        ("transitional-task.child", 23),
+        ("legacy-owner.another-task.child", 23),
     ] {
         assert!(registry.knows(consumer));
         assert_eq!(
@@ -1398,7 +1339,7 @@ async fn declared_admission_unlisted_dotted_children_inherit_legacy_and_settings
     );
     for consumer in [
         "legacy-owner.task_child",
-        "transitional-task_child",
+        "legacy-owner.another-task_child",
         "no-ancestor.child",
     ] {
         assert!(!registry.knows(consumer));
@@ -1589,7 +1530,7 @@ async fn declared_admission_inherits_selectors_and_locks_only_extended_settings_
 }
 
 #[tokio::test]
-async fn declared_admission_ignored_claims_do_not_conflict_but_legacy_and_settings_claims_do() {
+async fn declared_admission_ignored_claims_do_not_conflict_but_rooted_and_settings_claims_do() {
     super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         let h = harness();
         let owner_entry = json!({"module_id": "conflict-owner", "nonce_verified": true,
@@ -1626,7 +1567,7 @@ async fn declared_admission_ignored_claims_do_not_conflict_but_legacy_and_settin
                 );
             }
         }
-        let legacy_claim = entry("other-owner", true, &["conflict-owner.task"]);
+        let legacy_claim = entry("conflict-owner.task", true, &["conflict-owner.task"]);
         for modules in [
             json!([owner_entry, legacy_claim]),
             json!([legacy_claim, owner_entry]),
@@ -1680,7 +1621,7 @@ async fn consumer_health_report(harness: &Harness) -> Value {
 }
 
 #[tokio::test]
-async fn declared_names_ignore_foreign_extensions_keep_legacy_admission_and_refresh() {
+async fn declared_names_reject_foreign_names_and_refresh() {
     super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         let h = harness();
         let before = consumer_health_report(&h).await;
@@ -1738,6 +1679,17 @@ async fn declared_names_ignore_foreign_extensions_keep_legacy_admission_and_refr
             ("outside-null", 24),
             ("name-owner.task", 0),
         ] {
+            if name.starts_with("outside-") {
+                assert!(!registry.knows(name));
+                for route in [&owner, &stranger] {
+                    refused(
+                        route.call("route.select", &select(name)).await,
+                        "unknown_consumer",
+                        name,
+                    );
+                }
+                continue;
+            }
             assert_eq!(
                 owner.call("route.select", &select(name)).await.0,
                 FrameType::Response
@@ -1792,53 +1744,6 @@ async fn declared_names_ignore_foreign_extensions_keep_legacy_admission_and_refr
         assert_eq!(consumers::health()["issues"], json!([]));
     })
     .await;
-}
-
-#[tokio::test]
-async fn settings_only_names_log_info_at_load_without_health_warnings_or_request_logs() {
-    let h = harness();
-    consumers::replace_catalog(&json!([entry(
-        "declared-owner",
-        true,
-        &["declared-owner.task"]
-    )]));
-    crate::take_operator_warnings();
-    crate::take_operator_infos();
-    h.edit_config(|config| {
-        config["consumers"] =
-            json!({"settings-only": {}, "declared-owner.task": {}, "head": {}, "classifier": {}});
-    });
-    assert_eq!(
-        crate::take_operator_infos(),
-        vec!["[striatum] settings consumer \"settings-only\" has no module declaration"]
-    );
-    assert!(crate::take_operator_warnings().is_empty());
-    assert_eq!(consumers::health()["issues"], json!([]));
-    let caller = h.bind(reserved("any-bound-module"), None).await;
-    for _ in 0..3 {
-        h.operator_config();
-        assert_eq!(
-            caller
-                .call("route.select", &select("settings-only"))
-                .await
-                .0,
-            FrameType::Response
-        );
-    }
-    // Per-call telemetry is expected; declaration diagnostics still belong
-    // only to settings load, not to each request using a settings-only name.
-    assert_eq!(
-        crate::take_operator_infos(),
-        vec![
-            format!(
-                "routing select call {}",
-                json!({"surface":"routing/v1","consumer":"settings-only", "class":"worker","head_request":false})
-            );
-            3
-        ]
-    );
-    assert!(crate::take_operator_warnings().is_empty());
-    assert_eq!(consumers::health()["issues"], json!([]));
 }
 
 #[tokio::test]
@@ -2069,11 +1974,11 @@ async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owner
     consumers::replace_catalog(&json!([entry(
         "declaring-module",
         true,
-        &["example.worker"]
+        &["declaring-module.worker"]
     )]));
     for (module, consumer) in [
-        ("declaring-module", "example.worker"),
-        ("magic-context", "mc_dream_curate"),
+        ("declaring-module", "declaring-module.worker"),
+        ("magic-context", "magic-context.dream.curate"),
     ] {
         let route = harness.bind(reserved(module), None).await;
         let reply = route
@@ -2099,7 +2004,7 @@ async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owner
         delegate
             .call(
                 "route.consumer_models",
-                &json!({"consumer":"example.worker"})
+                &json!({"consumer":"declaring-module.worker"})
             )
             .await
             .0,
@@ -2110,11 +2015,11 @@ async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owner
         stranger
             .call(
                 "route.consumer_models",
-                &json!({"consumer":"example.worker"}),
+                &json!({"consumer":"declaring-module.worker"}),
             )
             .await,
         "consumer_not_owned",
-        "example.worker",
+        "declaring-module.worker",
     );
     refused(
         stranger
@@ -2126,7 +2031,7 @@ async fn consumer_models_checks_declaring_delegated_configured_and_foreign_owner
     let extra = delegate
         .call(
             "route.consumer_models",
-            &json!({"consumer":"example.worker","extra":1}),
+            &json!({"consumer":"declaring-module.worker","extra":1}),
         )
         .await;
     assert_eq!(extra.1["code"], "invalid_request");
@@ -2251,11 +2156,11 @@ async fn verified_declarer_and_configured_owner_are_admitted_without_a_project()
     consumers::replace_catalog(&json!([entry(
         "declaring-module",
         true,
-        &["example.worker"]
+        &["declaring-module.worker"]
     )]));
     for (module, consumer) in [
-        ("declaring-module", "example.worker"),
-        ("magic-context", "mc_dream_curate"),
+        ("declaring-module", "declaring-module.worker"),
+        ("magic-context", "magic-context.dream.curate"),
     ] {
         let route = harness.bind(reserved(module), None).await;
         let reply = route.call("route.select", &select(consumer)).await;
@@ -2264,10 +2169,10 @@ async fn verified_declarer_and_configured_owner_are_admitted_without_a_project()
     let stranger = harness.bind(reserved("unrelated"), Some("project-1")).await;
     refused(
         stranger
-            .call("route.select", &select("mc_dream_curate"))
+            .call("route.select", &select("magic-context.dream.curate"))
             .await,
         "consumer_not_owned",
-        "mc_dream_curate",
+        "magic-context.dream.curate",
     );
 }
 
@@ -2278,11 +2183,11 @@ async fn only_verified_catalog_declarations_create_ownership() {
     consumers::replace_catalog(&json!([entry(
         "declaring-module",
         true,
-        &["example.worker"]
+        &["declaring-module.worker"]
     )]));
     assert_eq!(
         route
-            .call("route.select", &select("example.worker"))
+            .call("route.select", &select("declaring-module.worker"))
             .await
             .0,
         FrameType::Response
@@ -2290,35 +2195,39 @@ async fn only_verified_catalog_declarations_create_ownership() {
     consumers::replace_catalog(&json!([entry(
         "declaring-module",
         false,
-        &["example.worker"]
+        &["declaring-module.worker"]
     )]));
     refused(
-        route.call("route.select", &select("example.worker")).await,
+        route
+            .call("route.select", &select("declaring-module.worker"))
+            .await,
         "unknown_consumer",
-        "example.worker",
+        "declaring-module.worker",
     );
     let description = route.call("role.describe", &json!({})).await;
     assert!(!description.1["result"]["consumers"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|item| item["id"] == "example.worker"));
+        .any(|item| item["id"] == "declaring-module.worker"));
     consumers::replace_catalog(&json!([]));
     refused(
-        route.call("route.select", &select("example.worker")).await,
+        route
+            .call("route.select", &select("declaring-module.worker"))
+            .await,
         "unknown_consumer",
-        "example.worker",
+        "declaring-module.worker",
     );
 }
 
 #[tokio::test]
 async fn different_verified_owners_lock_the_name_in_both_catalog_orders() {
     let harness = harness();
-    let first = entry("first-module", true, &["example.worker"]);
-    let second = entry("second-module", true, &["example.worker"]);
+    let first = entry("example", true, &["example.worker"]);
+    let second = entry("example.worker", true, &["example.worker"]);
     for catalog in [json!([first, second]), json!([second, first])] {
         consumers::replace_catalog(&catalog);
-        for module in ["first-module", "second-module"] {
+        for module in ["example", "example.worker"] {
             let route = harness.bind(reserved(module), None).await;
             refused(
                 route.call("route.select", &select("example.worker")).await,
@@ -2339,25 +2248,39 @@ async fn different_verified_owners_lock_the_name_in_both_catalog_orders() {
 async fn configured_owners_join_the_declaration_lock_without_overriding_it() {
     let harness = harness();
     let owner = harness.bind(reserved("magic-context"), None).await;
-    consumers::replace_catalog(&json!([entry("magic-context", true, &["mc_dream_curate"])]));
+    consumers::replace_catalog(&json!([entry(
+        "magic-context",
+        true,
+        &["magic-context.dream.curate"]
+    )]));
     assert_eq!(
         owner
-            .call("route.select", &select("mc_dream_curate"))
+            .call("route.select", &select("magic-context.dream.curate"))
             .await
             .0,
         FrameType::Response
     );
-    consumers::replace_catalog(&json!([entry("other-module", true, &["mc_dream_curate"])]));
+    consumers::replace_catalog(&json!([entry(
+        "magic-context.dream.curate",
+        true,
+        &["magic-context.dream.curate"]
+    )]));
     refused(
-        owner.call("route.select", &select("mc_dream_curate")).await,
+        owner
+            .call("route.select", &select("magic-context.dream.curate"))
+            .await,
         "consumer_not_owned",
-        "mc_dream_curate",
+        "magic-context.dream.curate",
     );
-    let other = harness.bind(reserved("other-module"), None).await;
+    let other = harness
+        .bind(reserved("magic-context.dream.curate"), None)
+        .await;
     refused(
-        other.call("route.select", &select("mc_dream_curate")).await,
+        other
+            .call("route.select", &select("magic-context.dream.curate"))
+            .await,
         "consumer_not_owned",
-        "mc_dream_curate",
+        "magic-context.dream.curate",
     );
 }
 
@@ -2409,73 +2332,6 @@ async fn delegated_select_requires_current_owner_authorized_scope_not_project_eq
     assert!(Caller::for_route(channel, 3).scope_authority.is_some());
     crate::clear_route_scope(channel, 3);
     assert!(Caller::for_route(channel, 3).scope_authority.is_none());
-}
-
-#[tokio::test]
-async fn legacy_core_selection_stays_open_but_non_core_cannot_borrow_target_agent_authority() {
-    let harness = harness();
-    let route = harness.bind(reserved("unrelated"), None).await;
-    let core = route
-        .call(
-            "route.select",
-            &json!({"targetAgent": "codemode", "executor":"broca", "substrate":"broca", "requirements": {"iq": 30, "eq": 0}, "availableModels": ["example-provider/model-a"]}),
-        )
-        .await;
-    assert_eq!(core.0, FrameType::Response, "{}", core.1);
-    for params in [
-        json!({"targetAgent": "mc_dream_curate", "requirements": {"iq": 30, "eq": 0}}),
-        json!({"targetAgent": "mason", "consumer": "mc_dream_curate", "requirements": {"iq": 30, "eq": 0}, "owner": "magic-context", "project_id": "project-1"}),
-    ] {
-        refused(
-            route.call("route.select", &params).await,
-            "consumer_not_owned",
-            "mc_dream_curate",
-        );
-    }
-}
-
-#[tokio::test]
-async fn legacy_explore_admission_preserves_the_selected_route_without_a_consumer_group() {
-    let harness = harness();
-    let caller = harness.bind(reserved("unrelated"), None).await;
-    let request = json!({"targetAgent": "explore", "requirements": {"iq": 30, "eq": 0}, "availableModels": ["example-provider/model-a"]});
-    let reply = caller.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["selected"]["routeKey"],
-        "example-provider/model-a"
-    );
-    let mut canonical = request;
-    canonical["targetAgent"] = json!("mason");
-    let baseline = caller.call("route.select", &canonical).await;
-    assert_eq!(baseline.0, FrameType::Response, "{}", baseline.1);
-    assert_eq!(
-        baseline.1["result"]["selected"]["routeKey"],
-        reply.1["result"]["selected"]["routeKey"]
-    );
-}
-
-#[tokio::test]
-async fn an_unregistered_legacy_target_label_has_no_core_admission_exception() {
-    let harness = harness();
-    let caller = harness.bind(reserved("unrelated"), None).await;
-    let request = json!({"targetAgent": "unregistered-label", "requirements": {"iq": 30, "eq": 0}, "availableModels": ["example-provider/model-a"]});
-    refused(
-        caller.call("route.select", &request).await,
-        "unknown_consumer",
-        "unregistered-label",
-    );
-    harness.edit_config(|config| {
-        config["consumers"]["unregistered-label"] = json!({"owner": "consumer-owner"})
-    });
-    refused(
-        caller.call("route.select", &request).await,
-        "consumer_not_owned",
-        "unregistered-label",
-    );
-    let owner = harness.bind(reserved("consumer-owner"), None).await;
-    let reply = owner.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
 }
 
 #[tokio::test]
@@ -2546,7 +2402,7 @@ fn body_claims_and_unattested_principals_never_grant_configured_ownership() {
         };
         assert_eq!(
             registry
-                .admit("mc_dream_curate", &caller)
+                .admit("magic-context.dream.curate", &caller)
                 .unwrap_err()
                 .code
                 .as_str(),
@@ -2570,11 +2426,11 @@ async fn fractional_operator_score_targets_do_not_cross_the_integer_wire_validat
 #[test]
 fn declaration_defaults_inherit_within_the_declaring_module_and_requests_override_them() {
     let catalog = consumers::Catalog::from_catalog(&json!([
-        {"module_id": "module-a", "nonce_verified": true, "role_declarations": {"routing/v1": {"consumers": [
+        {"module_id": "example", "nonce_verified": true, "role_declarations": {"routing/v1": {"consumers": [
              {"name": "example", "eq": 40, "context_window": 32000, "max_output_tokens":4096},
              {"name": "example.worker", "eq": 50, "tools": "required", "max_output_tokens":8192}
         ]}}},
-        entry("module-b", true, &["example.foreign"])
+        entry("example.foreign", true, &["example.foreign"])
     ]));
     let harness = harness();
     let config = harness.operator_config();
@@ -2642,75 +2498,6 @@ fn catalog_wire_decodes_routing_declarations_with_the_pinned_protocol() {
 }
 
 #[tokio::test]
-async fn consumer_alias_admission_does_not_bypass_module_ownership() {
-    let h = harness();
-    consumers::replace_catalog(&json!([entry(
-        "prefrontal-core",
-        true,
-        &["prefrontal-core.sidekick"]
-    )]));
-    h.edit_config(|config| {
-        config["consumers"] = json!({"sidekick": {}});
-    });
-    let owner = h.bind(reserved("prefrontal-core"), None).await;
-    let stranger = h.bind(reserved("another-module"), None).await;
-    for consumer in [
-        "sidekick",
-        "prefrontal-core.sidekick",
-        "sidekick.explore",
-        "prefrontal-core.sidekick.explore",
-    ] {
-        assert_eq!(
-            owner.call("route.select", &select(consumer)).await.0,
-            FrameType::Response
-        );
-        let (ty, reply) = stranger.call("route.select", &select(consumer)).await;
-        assert_eq!(ty, FrameType::Error, "{reply}");
-        assert_eq!(reply["code"], "consumer_not_owned", "{reply}");
-    }
-}
-
-#[test]
-fn consumer_alias_ownership_conflict_warns_once_at_catalog_load() {
-    let _h = harness();
-    let catalog = json!([
-        entry("legacy-alias-warning-owner", true, &["flow"]),
-        entry("basal", true, &["basal.flow"]),
-    ]);
-    let expected = "consumer alias ownership conflict: \"flow\" declared by \"legacy-alias-warning-owner\" and \"basal.flow\" declared by \"basal\"";
-    crate::take_operator_warnings();
-    consumers::replace_catalog(&catalog);
-    let issues = consumers::health()["issues"].as_array().unwrap().clone();
-    assert_eq!(
-        issues
-            .iter()
-            .filter(|issue| issue.as_str() == Some(expected))
-            .count(),
-        1
-    );
-    let warnings = crate::take_operator_warnings();
-    assert_eq!(
-        warnings
-            .iter()
-            .filter(|warning| warning.contains(expected))
-            .count(),
-        1
-    );
-    consumers::replace_catalog(&catalog);
-    assert!(crate::take_operator_warnings().is_empty());
-
-    let same_owner = json!([entry("basal", true, &["flow", "basal.flow"])]);
-    consumers::replace_catalog(&same_owner);
-    assert!(!consumers::health()["issues"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|issue| issue
-            .as_str()
-            .is_some_and(|issue| issue.contains("consumer alias ownership conflict"))));
-}
-
-#[tokio::test]
 async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segment() {
     use cortexkit_role_routing::declarations::ConsumerPriority::*;
     let _clock = crate::InjectedClock::set(1_800_000_000_000);
@@ -2721,13 +2508,13 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
             {"name":"basal.block","priority":"blocking"},
             {"name":"basal.block.deep","priority":"background"},
             {"name":"basal.worker","priority":"worker"},
-            {"name":"legacy-task","priority":"blocking","eq":23},
-            {"name":"shared","priority":"interactive"}
+            {"name":"basal.task","priority":"blocking","eq":23},
+            {"name":"basal.shared","priority":"interactive"}
         ]}}},
-        {"module_id":"other","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[
-            {"name":"shared","priority":"background"},
-            {"name":"basal.foreign"}
-        ]}}}
+        {"module_id":"basal.shared","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[
+            {"name":"basal.shared","priority":"background"}
+        ]}}},
+        {"module_id":"basal.foreign","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[{"name":"basal.foreign"}]}}}
     ]);
     let catalog = consumers::Catalog::from_catalog(&modules);
     let registry = catalog.effective(&h.operator_config());
@@ -2738,11 +2525,11 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
         ("basal.block.deep.child", Background),
         ("basal.worker", Worker),
         ("basal.foreign.child", Worker),
-        ("shared", Worker),
-        ("shared.child", Worker),
+        ("basal.shared", Worker),
+        ("basal.shared.child", Worker),
         ("unknown", Worker),
         ("basal_block", Worker),
-        ("legacy-task.child", Blocking),
+        ("basal.task.child", Blocking),
     ] {
         assert_eq!(
             registry.defaults_for(name).priority,
@@ -2750,25 +2537,24 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
             "{name}"
         );
     }
-    // Scheduling metadata must not discard a transitional name's demand or
-    // ownership: those names remain usable until their callers are renamed.
-    assert_eq!(registry.defaults_for("legacy-task").eq, Some(23));
+    // Scheduling metadata must preserve a rooted consumer's demand and ownership.
+    assert_eq!(registry.defaults_for("basal.task").eq, Some(23));
     consumers::replace_catalog(&modules);
     let owner = h.bind(reserved("basal"), None).await;
     let stranger = h.bind(reserved("other"), None).await;
     assert_eq!(
-        owner.call("route.select", &select("legacy-task")).await.0,
+        owner.call("route.select", &select("basal.task")).await.0,
         FrameType::Response
     );
     admission_refused(
-        stranger.call("route.select", &select("legacy-task")).await,
+        stranger.call("route.select", &select("basal.task")).await,
         "consumer_not_owned",
-        "legacy-task",
+        "basal.task",
     );
     h.edit_config(|config| {
         config["consumer_priorities"] = json!({
             "basal":"background", "basal.block":"interactive",
-            "shared":"blocking", "unknown":"interactive"
+            "basal.shared":"blocking", "unknown":"interactive"
         });
     });
     let registry = catalog.effective(&h.operator_config());
@@ -2778,7 +2564,7 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
         ("basal.block.deep.child", Interactive),
         ("basal.blocked", Background),
         ("basal_block", Worker),
-        ("shared.child", Blocking),
+        ("basal.shared.child", Blocking),
         ("unknown.child", Interactive),
         ("unknownish", Worker),
     ] {
@@ -2787,5 +2573,47 @@ async fn consumer_priority_inherits_single_owner_and_operator_overrides_by_segme
             Some(expected),
             "{name}"
         );
+    }
+}
+
+#[tokio::test]
+async fn consumer_cut_old_name_in_a_fresh_select_is_unknown() {
+    let harness = harness();
+    harness.edit_config(|config| {
+        config["consumers"] = json!({"prefrontal-core.mason":{"owner":"prefrontal-core"}});
+    });
+    consumers::replace_catalog(&json!([entry(
+        "prefrontal-core",
+        true,
+        &["prefrontal-core.mason"]
+    )]));
+    let caller = harness.bind(reserved("prefrontal-core"), None).await;
+    admission_refused(
+        caller.call("route.select", &select("mason")).await,
+        "unknown_consumer",
+        "mason",
+    );
+    let canonical = caller
+        .call("route.select", &select("prefrontal-core.mason"))
+        .await;
+    assert_eq!(canonical.0, FrameType::Response, "{}", canonical.1);
+}
+
+#[tokio::test]
+async fn consumer_cut_target_agent_select_is_refused_like_an_unknown_member() {
+    let harness = harness();
+    let caller = harness.bind(reserved("unrelated"), None).await;
+    for member in ["targetAgent", "obsolete_selector"] {
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({
+                    member:"codemode", "requirements":{"iq":30,"eq":0}
+                }),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert_eq!(reply.1["code"], "invalid_request", "{reply:?}");
+        assert_eq!(reply.1["detail"]["field"], member, "{reply:?}");
     }
 }

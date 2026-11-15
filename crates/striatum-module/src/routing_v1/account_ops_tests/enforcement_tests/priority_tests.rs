@@ -12,10 +12,11 @@ use super::*;
 fn classes(harness: &Harness) {
     crate::routing_v1::consumers::replace_catalog(&json!([
         {"module_id":"class-owner","nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"urgent"},{"name":"bulk"}]}}}
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"class-owner.urgent"},{"name":"class-owner.bulk"}]}}}
     ]));
     harness.edit_config(|config| {
-        config["consumer_priorities"] = json!({"urgent":"blocking","bulk":"background"})
+        config["consumer_priorities"] =
+            json!({"class-owner.urgent":"blocking","class-owner.bulk":"background"})
     });
 }
 
@@ -108,13 +109,13 @@ async fn a_blocking_waiter_takes_the_freed_slot_before_a_later_background_reques
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, runner, owner) = enforced().await;
     running(&runner, A, "h").await;
-    let x = bound(&owner, "urgent", on(A, "x")).await;
+    let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
     assert_eq!(waiters(&harness, NOW), [(Blocking, 0, vec![A.to_owned()])]);
     finish(&runner, "h").await;
     assert_eq!(count(&harness, A, NOW), 0);
     lines();
-    let y = bound(&owner, "bulk", on(A, "y")).await;
+    let y = bound(&owner, "class-owner.bulk", on(A, "y")).await;
     assert_concurrency_full(&runner.call("route.account_for", &y).await, NOW + 30_000);
     assert_eq!(count(&harness, A, NOW), 0);
     // Refused though a slot is free, Y logs its refusal line like any other.
@@ -122,11 +123,16 @@ async fn a_blocking_waiter_takes_the_freed_slot_before_a_later_background_reques
     assert_eq!(
         pressure,
         [
-            json!({"surface":"routing/v1","consumer":"bulk","class":"background",
+            json!({"surface":"routing/v1","consumer":"class-owner.bulk","class":"background",
             "model":"model","refused":true,"accounts":[{"account_id":A,"count":0,"cap":1}]})
         ]
     );
-    let retried = bound(&owner, "urgent", again("x", "x-again", on(A, "x"))).await;
+    let retried = bound(
+        &owner,
+        "class-owner.urgent",
+        again("x", "x-again", on(A, "x")),
+    )
+    .await;
     assert_eq!(
         admitted_on(&runner, &retried).await["account"]["account_id"],
         A
@@ -139,9 +145,9 @@ async fn a_blocking_waiter_takes_the_freed_slot_before_a_later_background_reques
     let (harness, runner, owner) = enforced().await;
     running(&runner, A, "h").await;
     finish(&runner, "h").await;
-    let y = bound(&owner, "bulk", on(A, "y")).await;
+    let y = bound(&owner, "class-owner.bulk", on(A, "y")).await;
     assert_eq!(admitted_on(&runner, &y).await["account"]["account_id"], A);
-    let x = bound(&owner, "urgent", on(A, "x")).await;
+    let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
     assert_eq!(classes_waiting(&harness, NOW), [Blocking]);
 }
@@ -151,7 +157,7 @@ async fn a_waiter_that_does_not_come_back_frees_the_slot_30_s_after_its_retry_ti
     let clock = crate::InjectedClock::set(NOW);
     let (harness, runner, owner) = enforced().await;
     running(&runner, A, "h").await;
-    let x = bound(&owner, "urgent", on(A, "x")).await;
+    let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
     finish(&runner, "h").await;
     drop(clock);
@@ -159,11 +165,16 @@ async fn a_waiter_that_does_not_come_back_frees_the_slot_30_s_after_its_retry_ti
     // take the slot.
     let ends = NOW + 60_000;
     let before = at(ends - 1);
-    let y = bound(&owner, "bulk", on(A, "y")).await;
+    let y = bound(&owner, "class-owner.bulk", on(A, "y")).await;
     assert_concurrency_full(&runner.call("route.account_for", &y).await, ends);
     drop(before);
     let _after = at(ends);
-    let y = bound(&owner, "bulk", again("y", "y-again", on(A, "y"))).await;
+    let y = bound(
+        &owner,
+        "class-owner.bulk",
+        again("y", "y-again", on(A, "y")),
+    )
+    .await;
     assert_eq!(admitted_on(&runner, &y).await["account"]["account_id"], A);
     assert!(waiters(&harness, ends).is_empty());
 }
@@ -178,7 +189,7 @@ async fn reset_at_ms_counts_only_the_waiters_still_live_at_the_instant() {
         let clock = crate::InjectedClock::set(refused_at);
         let (_harness, runner, owner) = enforced().await;
         running(&runner, A, "h").await;
-        let x = bound(&owner, "urgent", on(A, "x")).await;
+        let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
         assert_concurrency_full(
             &runner.call("route.account_for", &x).await,
             refused_at + 30_000,
@@ -186,7 +197,7 @@ async fn reset_at_ms_counts_only_the_waiters_still_live_at_the_instant() {
         finish(&runner, "h").await;
         drop(clock);
         let _t = at(t);
-        let y = bound(&owner, "bulk", on(A, "y")).await;
+        let y = bound(&owner, "class-owner.bulk", on(A, "y")).await;
         assert_concurrency_full(&runner.call("route.account_for", &y).await, reset);
     }
 }
@@ -228,10 +239,15 @@ async fn worker_waiters_go_in_order_of_first_refusal_and_a_waiter_never_holds_a_
     // consumer's decision: its own wait is never ahead of it.
     let (harness, runner, owner) = enforced().await;
     running(&runner, A, "h").await;
-    let x = bound(&owner, "urgent", on(A, "x")).await;
+    let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
     finish(&runner, "h").await;
-    let x = bound(&owner, "bulk", again("x", "x-again", on(A, "x"))).await;
+    let x = bound(
+        &owner,
+        "class-owner.bulk",
+        again("x", "x-again", on(A, "x")),
+    )
+    .await;
     assert_eq!(admitted_on(&runner, &x).await["account"]["account_id"], A);
     assert!(waiters(&harness, NOW).is_empty());
 }
@@ -252,11 +268,16 @@ async fn a_waiter_kept_on_its_affinity_account_waits_on_that_count_alone() {
     assert_eq!(waiters(&harness, NOW), [(Worker, 0, vec![A.to_owned()])]);
     // A free slot on B is not one X could take, so a background request
     // with no affinity gets it.
-    let y = bound(&owner, "bulk", fresh("y")).await;
+    let y = bound(&owner, "class-owner.bulk", fresh("y")).await;
     assert_eq!(admitted_on(&runner, &y).await["account"]["account_id"], B);
     // A later refusal keeps X's order and takes its class and retry time.
     let later = at(NOW + 5_000);
-    let x = bound(&owner, "urgent", again("x-first", "x-later", fresh("x"))).await;
+    let x = bound(
+        &owner,
+        "class-owner.urgent",
+        again("x-first", "x-later", fresh("x")),
+    )
+    .await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 35_000);
     assert_eq!(
         waiters(&harness, NOW + 5_000),
@@ -299,7 +320,7 @@ async fn a_waiter_holds_back_one_slot_in_total_whatever_it_waits_on() {
     let t = NOW + 40_000;
     let clock = crate::InjectedClock::set(NOW);
     let (harness, runner, owner) = enforced().await;
-    let x = bound(&owner, "urgent", fresh("x")).await;
+    let x = bound(&owner, "class-owner.urgent", fresh("x")).await;
     running(&runner, A, "ha").await;
     running(&runner, B, "hb").await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, t - 10_000);
@@ -328,8 +349,8 @@ async fn the_waiters_ahead_are_counted_together_not_first_fit() {
     for x_first in [true, false] {
         let clock = crate::InjectedClock::set(NOW);
         let (harness, runner, owner) = enforced().await;
-        let x = bound(&owner, "urgent", fresh("x")).await;
-        let w = bound(&owner, "urgent", on(A, "w")).await;
+        let x = bound(&owner, "class-owner.urgent", fresh("x")).await;
+        let w = bound(&owner, "class-owner.urgent", on(A, "w")).await;
         running(&runner, A, "ha").await;
         running(&runner, B, "hb").await;
         let bodies = if x_first { [x, w] } else { [w, x] };
@@ -356,9 +377,9 @@ async fn the_waiters_ahead_are_counted_together_not_first_fit() {
     for w_waits in [true, false] {
         let clock = crate::InjectedClock::set(NOW);
         let (_harness, runner, owner) = enforced().await;
-        let x = bound(&owner, "urgent", fresh("x")).await;
+        let x = bound(&owner, "class-owner.urgent", fresh("x")).await;
         let w = if w_waits {
-            Some(bound(&owner, "urgent", on(B, "w")).await)
+            Some(bound(&owner, "class-owner.urgent", on(B, "w")).await)
         } else {
             None
         };
@@ -477,7 +498,7 @@ async fn under_account_model_scope_a_waiter_holds_no_slot_against_another_model(
     let runner = harness.bind(reserved("class-runner"), None).await;
     let owner = harness.bind(reserved("class-owner"), None).await;
     running(&runner, A, "h").await;
-    let x = bound(&owner, "urgent", on(A, "x")).await;
+    let x = bound(&owner, "class-owner.urgent", on(A, "x")).await;
     assert_concurrency_full(&runner.call("route.account_for", &x).await, NOW + 30_000);
     assert_eq!(
         waited_models(&harness, NOW),
@@ -505,4 +526,98 @@ async fn under_account_model_scope_a_waiter_holds_no_slot_against_another_model(
     );
     let next = admitted_on(&runner, &again("same", "same-again", on(A, "same"))).await;
     assert_eq!(next["account"]["account_id"], A);
+}
+
+#[tokio::test]
+async fn consumer_cut_migrated_old_decision_admissions_use_canonical_priority_on_both_surfaces() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        migrated_priority_case(legacy, false).await;
+    }
+}
+
+#[tokio::test]
+async fn consumer_cut_legacy_admission_keeps_priority_after_binding_retention() {
+    let _clock = crate::InjectedClock::set(NOW);
+    migrated_priority_case(true, true).await;
+}
+
+async fn migrated_priority_case(legacy: bool, prune_binding: bool) {
+    let (harness, credentials) =
+        crate::routing_v1::account_classes_tests::setup_at_version("synthetic", false, Some(93));
+    let decision = striatum_store::V1Decision {
+        decision_id: "old-mason".into(),
+        principal: "reserved:prefrontal-core".into(),
+        consumer: "mason".into(),
+        allowed_account_class: Default::default(),
+        project_id: None,
+        provider: "synthetic".into(),
+        model: "model".into(),
+        variant: None,
+        runner_module: "class-runner".into(),
+        affinity: None,
+        created_at_ms: NOW as i64 - (if prune_binding { 10 } else { 3 }) * 86_400_000,
+        expires_at_ms: NOW as i64 - (if prune_binding { 9 } else { 2 }) * 86_400_000,
+    };
+    harness
+        .store()
+        .seed_preupgrade_decision_for_test(&decision, true)
+        .unwrap();
+    let harness = crate::routing_v1::conformance_tests::upgrade_harness(harness);
+    let fact = crate::routing_v1::account_classes_tests::account_fact("synthetic");
+    harness.install_facts(&[fact.clone()]);
+    crate::routing_v1::account_classes_tests::catalog_fact(&harness, &fact);
+    harness.set_credentials(credentials);
+    harness.edit_config(|config| {
+        config["consumers"] = json!({"prefrontal-core.mason":{"owner":"prefrontal-core"}});
+        config["consumer_priorities"] = json!({"prefrontal-core.mason":"blocking"});
+    });
+    if prune_binding {
+        let pruned = harness
+            .store()
+            .prune_v1_decisions(NOW as i64 - 7 * 86_400_000, 10)
+            .unwrap();
+        assert_eq!(pruned.decisions, 1);
+        assert!(harness.store().v1_decision("old-mason").unwrap().is_none());
+    }
+    caps(&harness, 1, true);
+    let runner = harness.bind(reserved("class-runner"), None).await;
+    running(&runner, A, "occupying").await;
+    let mut body = on(A, "migrated-waiter");
+    body[if legacy {
+        "model_decision_id"
+    } else {
+        "decision_id"
+    }] = json!("old-mason");
+    if legacy {
+        body["caller"] = json!({"runner":"class-runner"});
+    }
+    let reply = runner.call("route.account_for", &body).await;
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    assert_eq!(
+        classes_waiting(&harness, NOW),
+        [Blocking],
+        "legacy={legacy}, binding_pruned={prune_binding}: {reply:?}"
+    );
+    if prune_binding {
+        assert_eq!(
+            harness
+                .store()
+                .get_decision_by_id("old-mason")
+                .unwrap()
+                .unwrap()
+                .target_agent,
+            "prefrontal-core.mason"
+        );
+    } else {
+        assert_eq!(
+            harness
+                .store()
+                .v1_decision("old-mason")
+                .unwrap()
+                .unwrap()
+                .consumer,
+            "prefrontal-core.mason"
+        );
+    }
 }

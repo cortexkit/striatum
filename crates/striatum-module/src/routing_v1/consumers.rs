@@ -277,32 +277,6 @@ impl Catalog {
                 }
             }
         }
-        // Different owners of the two spellings are an admission conflict, not
-        // independent workloads. Report it at catalog load, before a caller
-        // discovers the conflict through a refused selection.
-        for (old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
-            let old_owners: Vec<_> = catalog
-                .modules
-                .iter()
-                .filter(|(_, names)| names.contains_key(*old))
-                .map(|(module, _)| module.as_str())
-                .collect();
-            let new_owners: Vec<_> = catalog
-                .modules
-                .iter()
-                .filter(|(_, names)| names.contains_key(*new))
-                .map(|(module, _)| module.as_str())
-                .collect();
-            for old_owner in &old_owners {
-                for new_owner in &new_owners {
-                    if old_owner != new_owner {
-                        catalog.issues.push(format!(
-                            "consumer alias ownership conflict: {old:?} declared by {old_owner:?} and {new:?} declared by {new_owner:?}"
-                        ));
-                    }
-                }
-            }
-        }
         catalog.issues.sort();
         catalog.issues.dedup();
         catalog
@@ -341,25 +315,6 @@ impl Catalog {
         for (name, owner) in config.consumer_owners() {
             registry.owners.entry(name).or_default().insert(owner);
         }
-        // An alias must not turn a declared consumer into an ownerless settings
-        // entry: admission is the same whichever spelling a caller supplies.
-        let alias_owners: Vec<_> = registry
-            .owners
-            .keys()
-            .map(|name| {
-                let owners = registry
-                    .owners
-                    .iter()
-                    .filter(|(other, _)| {
-                        crate::config_policy::consumer_matches(name, other)
-                            && crate::config_policy::consumer_matches(other, name)
-                    })
-                    .flat_map(|(_, owners)| owners.iter().cloned())
-                    .collect::<BTreeSet<_>>();
-                (name.clone(), owners)
-            })
-            .collect();
-        registry.owners.extend(alias_owners);
         // An ownerless settings child cannot open admission beneath a declared
         // namespace whose declaration uses the 0.7.18 members (a default iq,
         // a ladder of pins, a runner placement, caller selectors or a kind),
@@ -395,26 +350,6 @@ impl Catalog {
             .defaults
             .retain(|name, _| registry.owners[name].len() == 1);
         registry
-    }
-}
-
-/// Until modules and settings use module-qualified consumer names together,
-/// undeclared settings names produce info logs rather than health warnings.
-pub(crate) fn settings_loaded(config: &LiveConfig) {
-    let catalog = CATALOG.get_or_init(Default::default).read().unwrap();
-    for name in config.v1_consumers() {
-        if crate::config_policy::routing_builtin_consumer(&name) {
-            continue;
-        }
-        if !catalog
-            .modules
-            .values()
-            .any(|names| names.contains_key(&name))
-        {
-            crate::info_operator(format!(
-                "[striatum] settings consumer {name:?} has no module declaration"
-            ));
-        }
     }
 }
 
@@ -594,16 +529,6 @@ impl Registry {
     }
 }
 
-/// Core's legacy request classes remain a documented compatibility exception.
-/// An explicit consumer wins over targetAgent for admission, never vice versa.
-pub(crate) fn legacy_consumer(params: &Value) -> &str {
-    params
-        .get("consumer")
-        .and_then(Value::as_str)
-        .or_else(|| params.get("targetAgent").and_then(Value::as_str))
-        .unwrap_or("mason")
-}
-
 /// Count requests at the API boundary, not selection attempts: internal
 /// retries must not turn one API call into several log lines.
 pub(crate) fn record_select(surface: &str, consumer: Option<&str>, config: &LiveConfig) {
@@ -617,21 +542,6 @@ pub(crate) fn record_select(surface: &str, consumer: Option<&str>, config: &Live
             "head_request":class == cortexkit_role_routing::declarations::ConsumerPriority::Interactive
         })
     ));
-}
-
-pub(crate) fn legacy_core_consumer(name: &str) -> bool {
-    // These core-owned targetAgent labels exist only in the old route.select
-    // shape. Delete the data file when the old route.select adapter is removed;
-    // the labels are not consumer groups.
-    let target_labels: Vec<&str> =
-        serde_json::from_str(include_str!("legacy_consumer_aliases.json"))
-            .expect("legacy core target labels are a JSON array");
-    matches!(
-        name,
-        "mason" | "sidekick" | "athena" | "lab" | "core" | "codemode" | "flow"
-    ) || target_labels.contains(&name)
-        || crate::config_policy::consumer_matches("sidekick", name)
-        || crate::config_policy::consumer_matches("athena", name)
 }
 
 pub(crate) fn health() -> Value {

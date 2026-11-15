@@ -158,6 +158,10 @@ impl Harness {
         &self.store
     }
 
+    pub(super) fn set_quota_cache_for_test(&self, cache: crate::QuotaCache) {
+        *self.quota_cache.lock().unwrap() = cache;
+    }
+
     /// The store's database file, for tests that read a table directly.
     pub(super) fn store_path(&self) -> PathBuf {
         self.dir.join("store.db")

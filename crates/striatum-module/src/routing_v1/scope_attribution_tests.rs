@@ -115,34 +115,6 @@ async fn a_scoped_v1_select_records_the_stamped_project_and_workdir() {
 }
 
 #[tokio::test]
-async fn a_scoped_legacy_select_records_the_stamped_project() {
-    let harness = harness();
-    let route = scoped(
-        &harness,
-        reserved(fixture::CONSUMER),
-        Some(PROJECT),
-        Some(WORKDIR),
-    )
-    .await;
-
-    let reply = route
-        .call(
-            "route.select",
-            &json!({
-                "targetAgent": "mason",
-                "requirements": {"iq": 50, "eq": 50},
-                "availableModels": ["example-provider/model-a"],
-            }),
-        )
-        .await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    let id = reply.1["result"]["decisionID"].as_str().unwrap();
-    let row = harness.store().get_decision_by_id(id).unwrap().unwrap();
-    assert_eq!(row.project_id.as_deref(), Some(PROJECT));
-    assert_eq!(row.workdir.as_deref(), Some(WORKDIR));
-}
-
-#[tokio::test]
 async fn an_unscoped_select_records_no_project() {
     let harness = harness();
     let route = harness.bind(reserved(fixture::CONSUMER), None).await;

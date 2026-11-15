@@ -1,6 +1,11 @@
 -- Consumer names read back for policy must use the module-owned namespaces.
--- The ledger's consumer and v1 target_agent are history only and stay unchanged.
--- Legacy-only target_agent still supplies admission scheduling priority.
+-- The ledger's consumer stays historical. Its target_agent also supplies legacy
+-- admission priority after the shorter-lived v1 binding has been pruned, so
+-- rewrite the ledger's target_agent value even while its v1 binding still exists.
+-- Live-copy rehearsal renamed 39,413 ledger targets (22,518 bound, 16,895
+-- unbound), 22,518 v1 decision consumers and 1,453 panel consumers, with no
+-- affinity renames/collisions. Measured about 2.6 s total: 2.24 s for the
+-- ledger update and 0.31 s to commit. Routing is offline during startup migration.
 CREATE TEMP TABLE routing_consumer_rename (old TEXT PRIMARY KEY, new TEXT NOT NULL);
 INSERT INTO routing_consumer_rename VALUES
     ('mason', 'prefrontal-core.mason'),
@@ -39,9 +44,7 @@ FROM (
     UNION SELECT consumer FROM routing_v1_affinity
     UNION SELECT json_extract(state_json, '$.request.consumer') FROM routing_v1_panel
         WHERE json_valid(state_json)
-    UNION SELECT target_agent FROM model_route_decisions AS ledger
-        WHERE NOT EXISTS (SELECT 1 FROM routing_v1_decision AS binding
-                          WHERE binding.decision_id = ledger.id)
+    UNION SELECT target_agent FROM model_route_decisions
 )
 WHERE EXISTS (
     SELECT 1 FROM routing_consumer_rename
@@ -74,9 +77,7 @@ UPDATE routing_v1_panel SET state_json = json_set(state_json, '$.request.consume
 
 UPDATE model_route_decisions AS ledger SET target_agent = (
     SELECT new FROM routing_consumer_names WHERE old = ledger.target_agent
-) WHERE target_agent IN (SELECT old FROM routing_consumer_names)
-    AND NOT EXISTS (SELECT 1 FROM routing_v1_decision AS binding
-                    WHERE binding.decision_id = ledger.id);
+) WHERE target_agent IN (SELECT old FROM routing_consumer_names);
 
 DROP TABLE routing_consumer_names;
 DROP TABLE routing_consumer_rename;

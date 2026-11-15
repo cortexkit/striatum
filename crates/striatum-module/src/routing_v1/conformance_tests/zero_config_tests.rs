@@ -37,13 +37,14 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     let modules = json!([
         {"module_id":"prefrontal-core", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"consumers":[
-                {"name":"mason"}, {"name":"sidekick"}, {"name":"head"},
-                {"name":"codemode"}, {"name":"flow"}
+                {"name":"prefrontal-core.mason"}, {"name":"prefrontal-core.sidekick"}
             ]}}},
-        {"module_id":"callosum", "nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}},
+        {"module_id":"basal", "nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"basal.codemode"},{"name":"basal.flow"}]}}},
+        {"module_id":"colliculus", "nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"colliculus.voice_message","selectors":["callosum"]}]}}},
         {"module_id":"magic-context", "nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"mc_summary"}]}}},
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"magic-context.summary"}]}}},
         {"module_id":"broca", "nonce_verified":true,
             "role_declarations":{"routing/v1":{"runner":{
                 "follows_account_choice":true,
@@ -115,10 +116,11 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     for (owner, names) in [
         (
             "prefrontal-core",
-            &["mason", "sidekick", "head", "codemode", "flow"][..],
+            &["prefrontal-core.mason", "prefrontal-core.sidekick"][..],
         ),
-        ("callosum", &["phone.media"][..]),
-        ("magic-context", &["mc_summary"][..]),
+        ("basal", &["basal.codemode", "basal.flow"][..]),
+        ("callosum", &["colliculus.voice_message"][..]),
+        ("magic-context", &["magic-context.summary"][..]),
     ] {
         let caller = harness.bind(reserved(owner), None).await;
         for consumer in names {
@@ -193,17 +195,17 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     );
 
     for consumer in [
-        "mason",
-        "sidekick",
+        "prefrontal-core.mason",
+        "prefrontal-core.sidekick",
         "head",
-        "mc_summary",
-        "codemode",
-        "flow",
+        "magic-context.summary",
+        "basal.codemode",
+        "basal.flow",
     ] {
         let policy = config.consumer_policy(consumer, &Default::default(), &consumers.policies);
         assert_eq!(
             policy.below_bar.unwrap_or_default(),
-            if consumer == "mason" {
+            if consumer == "prefrontal-core.mason" {
                 crate::config_policy::BelowBarPolicy::Refuse
             } else {
                 crate::config_policy::BelowBarPolicy::BestEffort
@@ -373,8 +375,8 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
     // Media engines have no subscription alternative or pin operation. The
     // LLM-only spend fence must not disable an installed phone transcription path.
     crate::routing_v1::consumers::replace_catalog(&json!([
-        {"module_id":"callosum","nonce_verified":true,"role_declarations":{
-            "routing/v1":{"consumers":[{"name":"phone.media"}]},
+        {"module_id":"colliculus","nonce_verified":true,"role_declarations":{
+            "routing/v1":{"consumers":[{"name":"colliculus.voice_message","selectors":["callosum"]}]},
             "media-provider/v1":{"engines":[{"kind":"transcribe","provider":"openai",
                 "model":"gpt-transcribe","local":false,"formats":["audio/wav"],
                 "languages":["en"],"latency_class":"interactive"}]}
@@ -405,7 +407,7 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
     harness.set_credentials(credentials);
     let caller = harness.bind(reserved("callosum"), None).await;
     let selected = caller.call("route.select_engine", &json!({
-        "consumer":"phone.media", "kind":"transcribe", "requirements":{}, "privacy":"remote_allowed"
+        "consumer":"colliculus.voice_message", "kind":"transcribe", "requirements":{}, "privacy":"remote_allowed"
     })).await;
     assert_eq!(selected.0, FrameType::Response, "{selected:?}");
     assert_eq!(selected.1["result"]["engine"]["provider"], "openai");

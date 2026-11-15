@@ -620,10 +620,21 @@ impl Consumer {
 
     /// The request class named by a consumer's root, if it names one.
     pub(crate) fn from_id(id: &str) -> Option<Consumer> {
-        Self::ALL.into_iter().find(|consumer| {
-            crate::variant_policy::consumer_group(Some(*consumer))
-                .is_some_and(|root| crate::config_policy::consumer_matches(root, id))
-        })
+        Self::ALL
+            .into_iter()
+            .find(|consumer| crate::config_policy::consumer_matches(consumer.id(), id))
+    }
+
+    pub(crate) const fn id(self) -> &'static str {
+        match self {
+            Consumer::Mason => "prefrontal-core.mason",
+            Consumer::Sidekick => "prefrontal-core.sidekick",
+            Consumer::Athena => "prefrontal-core.athena",
+            Consumer::Lab => "prefrontal-core.lab",
+            Consumer::Core => "prefrontal-core.wake",
+            Consumer::Codemode => "basal.codemode",
+            Consumer::Flow => "basal.flow",
+        }
     }
 }
 

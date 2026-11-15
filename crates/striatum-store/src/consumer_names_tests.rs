@@ -119,7 +119,7 @@ fn consumer_names_migration_preserves_policy_rows_and_history() {
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
-            assert_eq!(history, ("mason".into(), "mason".into()));
+            assert_eq!(history, ("prefrontal-core.mason".into(), "mason".into()));
             assert_eq!(
                 conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r
                     .get::<_, i64>(

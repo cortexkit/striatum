@@ -44,10 +44,7 @@ enum Version {
 
 impl Version {
     fn consumer(self) -> &'static str {
-        match self {
-            Self::V1 => "phone.media",
-            Self::V2 => "colliculus.voice_message",
-        }
+        "colliculus.voice_message"
     }
 
     fn module(self) -> &'static str {
@@ -67,8 +64,9 @@ impl Version {
     fn catalog(self, with_engines: bool) -> Value {
         let mut modules = match self {
             Self::V1 => json!([
-                {"module_id":"callosum","nonce_verified":true,
-                    "role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
+                {"module_id":"colliculus","nonce_verified":true,
+                    "role_declarations":{"routing/v1":{"consumers":[{
+                        "name":"colliculus.voice_message","selectors":["callosum"]}]}}}
             ]),
             Self::V2 => json!([
                 {"module_id":"colliculus","nonce_verified":true,
@@ -150,7 +148,7 @@ fn fixture(version: Version) -> Arc<Harness> {
 }
 
 #[derive(Default)]
-struct Samples(BTreeMap<String, Vec<u8>>);
+struct Samples(BTreeMap<String, Vec<u8>>, bool);
 
 impl Samples {
     async fn capture(
@@ -198,6 +196,14 @@ impl Samples {
         } else {
             assert_eq!(reply.header.ty, FrameType::Response, "{name}: {value}");
             assert_eq!(value["result"]["expires_at_ms"], NOW + 600_000);
+            if self.1 && method == "route.select_engine" {
+                let mut old = params.clone();
+                old["consumer"] = json!("phone.media");
+                let refused = route.call(method, &old).await;
+                assert_eq!(refused.0, FrameType::Error, "{name}: {refused:?}");
+                assert_eq!(refused.1["code"], "unknown_consumer", "{name}: {refused:?}");
+                assert_eq!(refused.1["detail"], json!({"consumer":"phone.media"}));
+            }
         }
         // Keep both bodies verbatim, including the handler's object-member order.
         let mut pair = b"{\"request\":".to_vec();
@@ -221,6 +227,45 @@ impl Samples {
         let mut sums = String::new();
         for (name, bytes) in &self.0 {
             let path = directory.join(name);
+            if matches!(version, Version::V1) {
+                assert!(!update, "archived V1 samples must not be rewritten");
+                let archived = std::fs::read(&path).unwrap();
+                let mut expected: Value = serde_json::from_slice(&archived).unwrap();
+                let actual: Value = serde_json::from_slice(bytes).unwrap();
+                if expected["request"]["params"]["consumer"] == "phone.media" {
+                    expected["request"]["params"]["consumer"] = json!(version.consumer());
+                }
+                assert_eq!(actual["request"], expected["request"], "{name}");
+                if matches!(
+                    name.as_str(),
+                    "caller-direct.json" | "caller-not-owner.json"
+                ) {
+                    assert_eq!(
+                        actual["reply"],
+                        json!({
+                            "code":"consumer_not_owned",
+                            "message":"the caller and its scope do not own consumer \"colliculus.voice_message\"",
+                            "detail":{"consumer":"colliculus.voice_message"}
+                        }),
+                        "{name}"
+                    );
+                } else {
+                    // Requests use the current consumer; all other answer bytes
+                    // remain the exact archived protocol answer, including order.
+                    let answer = |pair: &[u8]| {
+                        let marker = b",\"reply\":";
+                        let start = pair
+                            .windows(marker.len())
+                            .position(|w| w == marker)
+                            .unwrap()
+                            + marker.len();
+                        pair[start..pair.len() - 1].to_vec()
+                    };
+                    assert_eq!(answer(bytes), answer(&archived), "{name}");
+                }
+                sums.push_str(&format!("{:x}  {name}\n", Sha256::digest(&archived)));
+                continue;
+            }
             if update {
                 std::fs::create_dir_all(&directory).unwrap();
                 std::fs::write(&path, bytes).unwrap();
@@ -261,6 +306,7 @@ async fn capture_vectors(version: Version) {
     let _clock = crate::InjectedClock::set(NOW as u64);
     let _ids = striatum_store::replay::Inputs::new(NOW).install();
     let mut samples = Samples::default();
+    samples.1 = matches!(version, Version::V1);
     let harness = fixture(version);
     let route = harness.bind(reserved("callosum"), None).await;
     let mut first = Value::Null;

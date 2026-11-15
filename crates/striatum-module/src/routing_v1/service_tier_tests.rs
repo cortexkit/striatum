@@ -476,26 +476,33 @@ async fn account_service_tier_legacy_admission_continues_at_bound_fast_tier() {
     assert_eq!(conflict.1["code"], "admission_conflict", "{}", conflict.1);
 }
 
-/// Core's mason launches select through the older select, which records a
-/// tier but writes no v1 row naming the runner. Broca's admission for such a
-/// standard decision must still get an account; on 5 Nov every Anthropic run
-/// from Broca was refused `account_not_authorized` this way.
+/// Historical standard-tier decisions without a v1 binding still authorize legacy account admissions.
 #[tokio::test]
 async fn account_service_tier_legacy_standard_decision_without_v1_row_admits() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = legacy_broca_setup();
-    let owner = harness.bind(reserved("prefrontal-core"), None).await;
-    let selected = owner
-        .call(
-            "route.select",
-            &json!({
-                "targetAgent": "mason", "consumer": "mason", "substrate": "broca",
-                "requirements": {"iq": 10, "eq": 0}
-            }),
+    let request = legacy_broca_request("legacy-standard");
+    let decision_id = "historical-standard";
+    harness
+        .store()
+        .seed_preupgrade_decision_for_test(
+            &striatum_store::V1Decision {
+                decision_id: decision_id.into(),
+                principal: "reserved:prefrontal-core".into(),
+                consumer: "prefrontal-core.mason".into(),
+                allowed_account_class: Default::default(),
+                project_id: None,
+                provider: request["provider"].as_str().unwrap().into(),
+                model: request["model"].as_str().unwrap().into(),
+                variant: None,
+                runner_module: "broca".into(),
+                affinity: None,
+                created_at_ms: NOW as i64,
+                expires_at_ms: NOW as i64 + 60_000,
+            },
+            false,
         )
-        .await;
-    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
-    let decision_id = selected.1["result"]["decisionID"].as_str().unwrap();
+        .unwrap();
     // The live refused decision dec_c1e8aa40025f carries exactly this: tier
     // `standard` (a fast project's tier stepped down for a model without fast)
     // and every account allowed. This harness has no project tier setting, so
@@ -1082,49 +1089,6 @@ async fn service_tier_project_settings_change_the_next_routing_decision() {
 }
 
 #[tokio::test]
-async fn service_tier_project_settings_reach_legacy_pinned_selections() {
-    let _clock = crate::InjectedClock::set(NOW);
-    let (harness, _) = setup(&["pro_200"], true, true);
-    let project = harness
-        .store_path()
-        .parent()
-        .unwrap()
-        .join("legacy-tier-project");
-    let path = project.join(".cortexkit/striatum.jsonc");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(
-        &path,
-        r#"{"consumers":{"sidekick":{"service_tier":"ultrafast"}}}"#,
-    )
-    .unwrap();
-    let route = harness.bind(reserved("tier-owner"), None).await;
-    let request = json!({"targetAgent":"explore", "consumer":"sidekick", "executor":"broca", "workload":"sidekick.gather", "substrate":"broca", "requirements":{"iq":30,"eq":0}, "projectRoot":project, "pin":{"model":format!("openai/{MODEL}")}, "pin_fallback":"none"});
-    let reply = route.call("route.select", &request).await;
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(
-        reply.1["result"]["selected"]["promptParams"]["service_tier_chosen"],
-        "fast"
-    );
-    let id = reply.1["result"]["decisionID"].as_str().unwrap();
-    assert_eq!(
-        harness.store().decision_service_tier(id).unwrap(),
-        Some(("fast".into(), vec!["oauth:0".into()]))
-    );
-    let raw: String = rusqlite::Connection::open(harness.store_path())
-        .unwrap()
-        .query_row(
-            "SELECT requirements_json FROM model_route_decisions WHERE id=?1",
-            [id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&raw).unwrap()["service_tier_requested"],
-        "ultrafast"
-    );
-}
-
-#[tokio::test]
 async fn service_tier_refused_pin_records_its_real_reason_once() {
     use striatum_store::DecisionListFilter;
 
@@ -1183,7 +1147,11 @@ async fn service_tier_project_settings_reach_legacy_panel_members() {
         .join("panel-tier-project");
     let path = project.join(".cortexkit/striatum.jsonc");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(&path, r#"{"consumers":{"athena":{"service_tier":"fast"}}}"#).unwrap();
+    std::fs::write(
+        &path,
+        r#"{"consumers":{"prefrontal-core.athena":{"service_tier":"fast"}}}"#,
+    )
+    .unwrap();
     let excluded: Vec<_> = harness
         .store()
         .get_facts()
