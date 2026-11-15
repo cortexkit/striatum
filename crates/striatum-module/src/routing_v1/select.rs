@@ -2968,11 +2968,9 @@ impl<'a> Selection<'a> {
                 &mut snapshot,
                 &format!("{}/{}", parsed.provider, parsed.model),
             );
-        let refused = |code: &str, message: String| {
-            // The shared pin scorer wraps a reserve rejection in a generic
-            // summary code, but retains the specific cause in its message.
-            let reserve_limited = code == "subscription_reserve"
-                || message.starts_with(&format!("{pin}: subscription_reserve ("));
+        let refused = |code: &str, cause: Option<String>, message: String| {
+            let reserve_limited =
+                code == "subscription_reserve" || cause.as_deref() == Some("subscription_reserve");
             let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)
                 && self
                     .rejections
@@ -3030,7 +3028,7 @@ impl<'a> Selection<'a> {
             self.sources.catalog_targets,
             self.rejections,
         )
-        .map_err(|refusal| refused(&refusal.code, refusal.message))?;
+        .map_err(|refusal| refused(&refusal.code, refusal.cause, refusal.message))?;
         self.check_eligible_pin(pin, &selected, parsed.variant.as_deref())?;
         // Hard pin admission remains shared with legacy selection. Reprice only
         // the admitted route, retaining its real demand's profile bucket.
@@ -3072,7 +3070,14 @@ impl<'a> Selection<'a> {
                 if error.reason == RouteFailureReason::ConcurrencyFull {
                     no_route_refusal(&error, self.now)
                 } else {
-                    refused(error.reason.as_str(), error.refusal_message())
+                    refused(
+                        error.reason.as_str(),
+                        error
+                            .rejected
+                            .first()
+                            .map(|rejected| rejected.reason.clone()),
+                        error.refusal_message(),
+                    )
                 }
             })?;
         priced.score.adequacy = selected.score.adequacy;

@@ -2354,6 +2354,7 @@ async fn handle_select_request_attempt(
                     .map_err(|code| work_model_pin::Refusal {
                         message: code.clone(),
                         code,
+                        cause: None,
                         retry_at: None,
                     })
                 } else {
@@ -2438,6 +2439,7 @@ async fn handle_select_request_attempt(
                 .map_err(|(code, message)| work_model_pin::Refusal {
                     code,
                     message,
+                    cause: None,
                     retry_at: None,
                 })?;
             }
@@ -2471,6 +2473,7 @@ async fn handle_select_request_attempt(
                                 code: "no_route".into(),
                                 message: "the selected recovery probe is held by another request"
                                     .into(),
+                                cause: None,
                                 retry_at: Some(retry_at),
                             }
                         }
@@ -2478,6 +2481,7 @@ async fn handle_select_request_attempt(
                             work_model_pin::Refusal {
                                 code,
                                 message,
+                                cause: None,
                                 retry_at: None,
                             }
                         }
