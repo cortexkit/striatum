@@ -57,9 +57,12 @@ pub(crate) struct RouteStateRow {
     failure_backoff_until: Option<f64>,
     failure_backoff_reason: Option<String>,
     pub(crate) last_error: Option<String>,
-    /// A dry run keeps the error used to determine its captured block's scope
-    /// separately from refreshed diagnostic text. None means no override;
-    /// Some(None) preserves a captured row with no error.
+    /// The `last_error` a what-if dry run used at capture to classify this
+    /// route's wall: which block it is, and whether it covers the provider or
+    /// one route. A dry run freezes its blocks at capture, so diagnostic text
+    /// refreshed later must not reclassify them. None means no override
+    /// (classify from `last_error`); Some(None) means the captured row had no
+    /// error.
     pub(crate) scope_error: Option<Option<String>>,
     wall_class: Option<String>,
     wall_unscoped: bool,

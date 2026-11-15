@@ -449,8 +449,9 @@ fn resolve_select_request_with_catalog_targets(
     // `model=`) keeps operator-excluded routes in the available set: `exclude`
     // keeps a route out of automatic choice only. An admission pin's automatic
     // fallback still applies the operator's exclusions during admission. An
-    // operator ladder also names its choices, but scoring still enforces provider,
-    // model and consumer restrictions other than pin-only rules.
+    // operator ladder also names its choices, so scoring skips the settings
+    // rules that only forbid automatic choice (`pin_only`, `pin_only_for`) but
+    // still enforces `not_for` and `only_for` on providers, models and consumers.
     let availability_policy = operator_policy.compiled_policy();
     let policy = striatum_core::launch_policy::resolve_compiled_routing_policy(
         params.available_models.iter().cloned(),
