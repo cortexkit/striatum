@@ -255,6 +255,14 @@ pub(crate) enum ProbeBinding {
     Lost { retry_at: i64 },
 }
 
+/// The account recovery named by selection, including the stored block class.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountBlock {
+    pub reset_at_ms: Option<i64>,
+    pub lifetime: striatum_core::blocks::LifetimeClass,
+    pub credential_code: Option<String>,
+}
+
 /// Why a legacy launch could not claim the probes its route needs.
 #[derive(Debug)]
 pub(crate) enum LaunchRefusal {
@@ -2655,7 +2663,17 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
-        self.blocked_reset_with_policy(
+        self.blocked_account(provider, model, priced)
+            .map(|block| block.reset_at_ms)
+    }
+
+    pub(crate) fn blocked_account(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Option<AccountBlock> {
+        self.blocked_account_with_policy(
             provider,
             model,
             priced,
@@ -2663,13 +2681,13 @@ impl ClassContext {
         )
     }
 
-    fn blocked_reset_with_policy(
+    fn blocked_account_with_policy(
         &self,
         provider: &str,
         model: &str,
         priced: bool,
         policy: AllocatorPolicy,
-    ) -> Option<Option<i64>> {
+    ) -> Option<AccountBlock> {
         // An empty roster may have lost accounts to route or credential
         // fences. Reuse admission's classification so only a dated account
         // limit, not missing credentials or policy exclusions, supplies a reset.
@@ -2683,7 +2701,14 @@ impl ClassContext {
                 empty_roster_refusal(self, provider, model, priced, &fenced, self.now_ms, None)
             {
                 if code == "account_pool_exhausted" {
-                    return Some(detail.and_then(|detail| detail["reset_at_ms"].as_i64()));
+                    let reset = detail.and_then(|detail| detail["reset_at_ms"].as_i64());
+                    return Some(self.account_block_at(
+                        provider,
+                        model,
+                        priced,
+                        reset,
+                        striatum_core::blocks::LifetimeClass::NonQuota,
+                    ));
                 }
             }
         }
@@ -2713,7 +2738,74 @@ impl ClassContext {
             model,
             self.now_ms,
         );
-        Some(reset.into_iter().chain(fenced.values().copied()).min())
+        let reset = reset.into_iter().chain(fenced.values().copied()).min();
+        // The allocator recovery above comes only from typed quota exclusions.
+        // A route or credential origin at that recovery may instead be non-quota.
+        Some(self.account_block_at(
+            provider,
+            model,
+            priced,
+            reset,
+            striatum_core::blocks::LifetimeClass::Quota,
+        ))
+    }
+
+    fn account_block_at(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        reset_at_ms: Option<i64>,
+        fallback: striatum_core::blocks::LifetimeClass,
+    ) -> AccountBlock {
+        use striatum_core::blocks::LifetimeClass;
+        let mut block = AccountBlock {
+            reset_at_ms,
+            lifetime: fallback,
+            credential_code: None,
+        };
+        let Some(fact) = self
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model)
+        else {
+            return block;
+        };
+        let mut non_quota = false;
+        for row in self.class(fact, priced).rows {
+            let account = self.account_id(row);
+            for origin in self.indexed_origins(provider, account, &row.id, model) {
+                if !self.origin_applies(origin, provider, account, &row.id, model)
+                    || self.origin_due(origin, account, model)
+                    || reset_at_ms.is_some_and(|reset| {
+                        self.recheck_hint(origin, account, model) != reset
+                            && self.probe_reserved_until(provider, &row.id) != Some(reset)
+                    })
+                {
+                    continue;
+                }
+                // Only origins participating in the named recovery determine
+                // its class; a later non-quota wall on another account is unrelated.
+                if origin.quota {
+                    if !non_quota {
+                        block.lifetime = LifetimeClass::Quota;
+                    }
+                    continue;
+                }
+                non_quota = true;
+                block.lifetime = LifetimeClass::NonQuota;
+                if origin.kind == "credential" {
+                    block.credential_code = self
+                        .refusals
+                        .iter()
+                        .find(|refusal| {
+                            refusal.provider_id == provider && refusal.credential_id == row.id
+                        })
+                        .map(|refusal| refusal.code.clone());
+                }
+            }
+        }
+        block
     }
 
     /// Read dated account recovery even when a quota recheck has temporarily
@@ -2730,6 +2822,17 @@ impl ClassContext {
         priced: bool,
         keep_free: f64,
     ) -> Option<i64> {
+        self.account_recovery_with_keep_free(provider, model, priced, keep_free)
+            .and_then(|block| block.reset_at_ms)
+    }
+
+    pub(crate) fn account_recovery_with_keep_free(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        keep_free: f64,
+    ) -> Option<AccountBlock> {
         let mut recovered = self.clone();
         recovered.replace_refusals(
             self.refusals
@@ -2759,9 +2862,7 @@ impl ClassContext {
         // that margin is diagnosed without changing account admission policy.
         let mut policy = self.config.allocator_policy_ref(provider).clone();
         policy.reserve_seven_day = policy.reserve_seven_day.max(keep_free);
-        recovered
-            .blocked_reset_with_policy(provider, model, priced, policy)
-            .flatten()
+        recovered.blocked_account_with_policy(provider, model, priced, policy)
     }
 
     #[allow(clippy::too_many_arguments)]

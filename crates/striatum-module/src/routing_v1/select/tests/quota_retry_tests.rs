@@ -2,6 +2,98 @@ use super::*;
 
 const RECHECK: u64 = RECOVERY_NOW + 900_000;
 
+fn refuse_credentials(harness: &Harness, code: &str) {
+    for account in fixture::catalog().accounts {
+        crate::credential_fences::record(
+            harness.store(),
+            &harness.credentials(),
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
+                credential_id: account.credential_id,
+                code: code.into(),
+            },
+            RECOVERY_NOW as i64,
+        )
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn non_quota_billing_block_keeps_reason_and_probe_deadline() {
+    for (code, reason) in [
+        ("billing_exhausted", "credential_billing_exhausted"),
+        ("credit_insufficient", "credential_billing_exhausted"),
+        ("ENTITLEMENT_ERROR", "credential_unentitled"),
+    ] {
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let (harness, route) = configured().await;
+        refuse_credentials(&harness, code);
+        for contradictory_quota in [false, true] {
+            if contradictory_quota {
+                exhaust_recovery_accounts(Some(DISTANT_WALL));
+            }
+            let reply = route
+                .call(
+                    "route.select",
+                    &json!({
+                        "consumer":fixture::SUMMARY, "pin":ACCOUNT_ROUTE,
+                        "requirements":{"iq":50}, "hold_wait_max_s":0
+                    }),
+                )
+                .await;
+            assert_eq!(reply.1["code"], "pin_unavailable", "{reply:?}");
+            assert_eq!(reply.1["detail"]["reason"], reason, "{reply:?}");
+            assert_eq!(
+                reply.1["detail"]["reset_at_ms"],
+                RECOVERY_NOW + 3_600_000,
+                "{reply:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn non_quota_account_preflight_keeps_its_deadline() {
+    let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+    let (harness, route) = configured().await;
+    refuse_credentials(&harness, "billing_exhausted");
+    let reply = route
+        .call(
+            "route.select",
+            &json!({
+                "consumer":fixture::SUMMARY, "available_routes":[ACCOUNT_ROUTE],
+                "requirements":{"iq":50}, "hold_wait_max_s":0
+            }),
+        )
+        .await;
+    assert_eq!(reply.1["code"], "no_route", "{reply:?}");
+    assert_eq!(reply.1["detail"]["reason"], "accounts_blocked", "{reply:?}");
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        RECOVERY_NOW + 3_600_000,
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn quota_classified_billing_block_keeps_quota_reason_and_recheck() {
+    let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+    let (harness, route) = configured().await;
+    exhaust_recovery_accounts(Some(DISTANT_WALL));
+    refuse_credentials(&harness, "billing_exhausted");
+    let reply = route
+        .call(
+            "route.select",
+            &json!({
+                "consumer":fixture::SUMMARY, "pin":ACCOUNT_ROUTE,
+                "requirements":{"iq":50}, "hold_wait_max_s":0
+            }),
+        )
+        .await;
+    assert_eq!(reply.1["detail"]["reason"], "quota_exhausted", "{reply:?}");
+    assert_eq!(reply.1["detail"]["reset_at_ms"], RECHECK, "{reply:?}");
+}
+
 #[tokio::test]
 async fn pin_quota_accounts_retry_by_recheck_and_keep_near_reset() {
     for (reset, expected) in [(ACCOUNT_RESET, ACCOUNT_RESET), (DISTANT_WALL, RECHECK)] {
