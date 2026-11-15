@@ -148,6 +148,113 @@ pub(crate) fn production_fixture() -> RequestFixture {
     build_fixture(800, 40)
 }
 
+/// Give the synthetic facts six model families and enough context for the
+/// evidence package; otherwise the fixture only exercises a panel shortfall.
+#[tokio::test]
+#[ignore = "release panel CPU report: cargo test --release panel_select_request_cpu -- --ignored --nocapture"]
+async fn panel_select_request_cpu() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = production_fixture();
+    let families = ["claude", "gpt", "gemini", "grok", "qwen", "deepseek"];
+    for (i, mut fact) in fixture.store().get_facts().unwrap().into_iter().enumerate() {
+        fact.family = Some(families[i % families.len()].into());
+        fact.context_window = Some(1_000_000.0);
+        fact.max_output_tokens = Some(32_000);
+        fixture
+            .store()
+            .upsert_fact(&fact, striatum_core::FactSource::Override)
+            .unwrap();
+    }
+    fixture.edit_config(|config| {
+        config["panels"]["audit"] =
+            json!({"topK":3,"by":"iq","extra":3,"extraBy":"random","floor":0});
+    });
+    let route = fixture
+        .harness
+        .bind(reserved(fixture::CONSUMER), None)
+        .await;
+    let samples = std::env::var("STRIATUM_CPU_PANEL_SAMPLES")
+        .map(|n| n.parse::<usize>().unwrap())
+        .unwrap_or(30);
+    assert!(samples >= 10);
+    println!("panel fixture: 800 facts, 40 credentials, six families, 1M context, audit 3+3, package_tokens=184507 samples={samples}");
+    // Freeze the baseline picks independently of the warmup so an optimization
+    // cannot silently change both estimate and live selection in the same way.
+    let expected: Vec<_> = [
+        ("cpu-provider-0", "model-79", "gpt"),
+        ("cpu-provider-1", "model-79", "grok"),
+        ("cpu-provider-2", "model-79", "deepseek"),
+        ("cpu-provider-8", "model-22", "gemini"),
+        ("cpu-provider-4", "model-50", "qwen"),
+        ("cpu-provider-4", "model-52", "claude"),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(slot, (provider, model, family))| {
+        let route = json!({"provider":provider,"model":model});
+        json!({"slot":slot,"phase":if slot < 3 { "top" } else { "extra" },
+            "route":route,"family":family,
+            "runner":{"module":"runner-one","harness":"alpha","model":route},
+            "temperature":null,"service_tier_chosen":null,
+            "context_window":1_000_000,"max_output_tokens":32_000,"price":null})
+    })
+    .collect();
+    for estimate in [true, false] {
+        let request = json!({"consumer":fixture::SUMMARY,"class":"audit",
+            "package_tokens":184_507,"seed":"panel-cpu-fixed","estimate":estimate});
+        let warm = call(
+            &fixture,
+            &route,
+            "route.select_panel",
+            request.clone(),
+            &mut Samples::default(),
+        )
+        .await;
+        let picks = |answer: &Value| -> Vec<Value> {
+            answer["seats"]
+                .as_array()
+                .expect("panel seats")
+                .iter()
+                .map(|seat| {
+                    json!({"slot":seat["slot"],"phase":seat["phase"],
+                    "route":seat["answer"]["route"],"family":seat["family"],
+                    "runner":seat["answer"]["runner"],"temperature":seat["temperature"],
+                    "service_tier_chosen":seat["answer"]["service_tier_chosen"],
+                    "context_window":seat["answer"]["context_window"],
+                    "max_output_tokens":seat["answer"]["max_output_tokens"],
+                    "price":seat["answer"]["price"]})
+                })
+                .collect()
+        };
+        assert_eq!(picks(&warm), expected, "{warm}");
+        // The remote profiling helper resets its counters after this warmup.
+        let mut measured = Samples::default();
+        for _ in 0..samples {
+            let answer = call(
+                &fixture,
+                &route,
+                "route.select_panel",
+                request.clone(),
+                &mut measured,
+            )
+            .await;
+            assert_eq!(picks(&answer), expected);
+        }
+        assert_eq!(measured.refusals, 0);
+        let label = if estimate {
+            "panel_estimate"
+        } else {
+            "panel_real"
+        };
+        measured.print(label);
+        println!(
+            "{label} picks={}",
+            serde_json::to_string(&expected).unwrap()
+        );
+        // The remote profiling helper prints inclusive CPU per call here.
+    }
+}
+
 #[tokio::test]
 #[ignore = "paired release select CPU/p99 measurement on the live-count fixture"]
 async fn select_concurrency_request_cpu() {
