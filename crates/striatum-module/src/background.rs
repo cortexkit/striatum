@@ -567,7 +567,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_timer_truncates_an_over_cap_wal() {
+    async fn checkpoint_timer_allows_next_write_to_cap_an_over_limit_wal() {
         let dir = cortexkit_test_support::ScratchDir::new("wal-checkpoint-timer");
         let store = Arc::new(
             striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
@@ -585,8 +585,15 @@ mod tests {
             std::time::Duration::from_millis(10),
         ));
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut sequence = 0;
             while bytes() > striatum_store::WAL_SIZE_CAP_BYTES {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                // Change a value each time: an identical UPSERT may write no
+                // pages and therefore need no WAL restart.
+                sequence += 1;
+                store
+                    .put_quota_snapshot("next writer commit", sequence)
+                    .unwrap();
             }
         })
         .await;

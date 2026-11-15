@@ -85,7 +85,13 @@ const DECISION_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
      AND NOT EXISTS (SELECT 1 FROM account_admission a \
        WHERE a.decision_id = account_decision.decision_id) \
      AND NOT EXISTS (SELECT 1 FROM account_hold h \
-       WHERE h.decision_id = account_decision.decision_id)";
+        WHERE h.decision_id = account_decision.decision_id)";
+
+const PIN_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_affinity f \
+    WHERE f.principal=p.principal AND f.conversation_hash=p.conversation_hash \
+      AND f.provider=p.provider) \
+  AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.pin_id=p.pin_id) \
+  AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.pin_id=p.pin_id)";
 
 fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
@@ -161,17 +167,35 @@ impl SqliteRouteStateStore {
         created_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
-        self.retention_write(|tx| {
-                tx.execute(
-                    &format!(
-                        "DELETE FROM account_decision WHERE rowid IN ( \
-                           SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time \
-                           WHERE mode = ?1 AND created_at < ?2 AND {DECISION_UNREFERENCED} \
-                           ORDER BY created_at LIMIT ?3)"
-                    ),
-                    params![mode, created_before, limit_param(limit)],
-                )
+        let keys = self
+            .store
+            .with_read(|conn| {
+                let mut statement = conn.prepare(&format!(
+                "SELECT decision_id FROM account_decision INDEXED BY account_decision_by_mode_time \
+                 WHERE mode=?1 AND created_at<?2 AND {DECISION_UNREFERENCED} \
+                 ORDER BY created_at LIMIT ?3"
+            ))?;
+                let rows = statement
+                    .query_map(params![mode, created_before, limit_param(limit)], |row| {
+                        row.get::<_, String>(0)
+                    })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
             })
+            .map_err(err)?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let keys = serde_json::to_string(&keys).map_err(err)?;
+        self.retention_write(|tx| {
+            tx.execute(
+                &format!(
+                    "DELETE FROM account_decision \
+                         WHERE decision_id IN (SELECT value FROM json_each(?3)) \
+                           AND mode = ?1 AND created_at < ?2 AND {DECISION_UNREFERENCED}"
+                ),
+                params![mode, created_before, keys],
+            )
+        })
     }
 
     fn retention_write<T>(
@@ -247,9 +271,29 @@ impl SqliteRouteStateStore {
     /// Every retained admission protects its pin (including a continuation's
     /// reservation), as do holds. Pin bodies are not cached in account state.
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        let keys = self.plan_account_pins(before, limit)?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
-            tx.prune_account_pins(before, limit)
+            tx.delete_account_pins(before, &keys)
         })
+    }
+
+    /// Find unreferenced history on a pooled reader. The writer checks the
+    /// references again by pin identity, since planning does not reserve rows.
+    pub fn plan_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<Vec<String>> {
+        self.store
+            .with_read(|conn| {
+                let mut statement = conn.prepare(&format!(
+                    "SELECT p.pin_id FROM account_pin p INDEXED BY account_pin_by_created \
+                 WHERE p.created_at<?1 AND {PIN_UNREFERENCED} ORDER BY p.created_at LIMIT ?2"
+                ))?;
+                let rows =
+                    statement.query_map(params![before, limit_param(limit)], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
     }
 
     /// Delete at most `limit` conversation affinity rows whose idle expiry and
@@ -599,6 +643,21 @@ fn admission_due_by_values(a: &str) -> String {
 }
 
 impl crate::AccountTx<'_> {
+    /// Delete only planned identities that are still old and unreferenced.
+    pub fn delete_account_pins(&self, before: i64, keys: &[String]) -> RouteStateResult<usize> {
+        let keys = serde_json::to_string(keys).map_err(err)?;
+        self.command_sql(|tx| {
+            tx.execute(
+                &format!(
+                "DELETE FROM account_pin AS p WHERE pin_id IN (SELECT value FROM json_each(?2)) \
+                 AND created_at<?1 AND {PIN_UNREFERENCED}"
+            ),
+                params![before, keys],
+            )
+        })
+        .map_err(err)
+    }
+
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
         self.retention_write(|tx| {
             tx.execute(

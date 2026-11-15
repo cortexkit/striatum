@@ -14,6 +14,8 @@ enum Backend {
 
 #[derive(Default)]
 struct WriterMetrics {
+    #[cfg(any(test, feature = "test-support"))]
+    writer_hold_ns: AtomicU64,
     commits: AtomicU64,
     acquisitions: AtomicU64,
     queue_ns: AtomicU64,
@@ -332,6 +334,10 @@ impl ConnectionStore {
             let commit = COMMIT_NS.with(|n| n.get()) - commit_before;
             let elapsed = start.elapsed();
             held.set(elapsed);
+            #[cfg(any(test, feature = "test-support"))]
+            self.metrics
+                .writer_hold_ns
+                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
             let sql = (elapsed.as_nanos() as u64).saturating_sub(commit);
             self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
             self.metrics.commit_ns.fetch_add(commit, Ordering::Relaxed);
@@ -390,6 +396,12 @@ impl ConnectionStore {
 }
 
 impl SqliteRouteStateStore {
+    /// Exclusive writer-callback time, excluding pooled-reader SQL time.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writer_hold_ns_for_test(&self) -> u64 {
+        self.store.metrics.writer_hold_ns.load(Ordering::Relaxed)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn projection_command<T>(
         &self,
