@@ -353,7 +353,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 92] {
+fn route_state_migrations() -> [Migration; 93] {
     [
         Migration {
             version: 1,
@@ -723,7 +723,62 @@ fn route_state_migrations() -> [Migration; 92] {
             version: 93,
             statements: include_str!("../migrations/093_pin_retention.sql"),
         },
+        Migration {
+            version: 94,
+            statements: block_storage::MIGRATION,
+        },
     ]
+}
+
+fn migrate_route_state(store: &SqliteStore, migrations: &[Migration]) -> RouteStateResult<()> {
+    let block_storage = migrations.iter().any(|migration| migration.version == 94);
+    if block_storage {
+        store
+            .with_conn(block_storage::install_migration_function)
+            .map_err(err)?;
+    }
+    // Migration 58 rebuilds account_pin while admissions reference it. SQLite
+    // ignores foreign_keys changes inside a transaction, so suspend enforcement
+    // around the shared runner and restore it before this store can serve.
+    let migration = (|| {
+        store
+            .with_conn(|conn| conn.pragma_update(None, "foreign_keys", "OFF"))
+            .map_err(err)?;
+        store
+            .migrate(ROUTE_STATE_NAMESPACE, migrations)
+            .map_err(err)
+    })();
+    // Attempt both cleanups even if migration or the other cleanup failed.
+    store
+        .with_conn(|conn| {
+            let foreign_keys = conn.pragma_update(None, "foreign_keys", "ON");
+            let function = if block_storage {
+                conn.remove_function("block_migration_quarantined", 3)
+            } else {
+                Ok(())
+            };
+            foreign_keys?;
+            function?;
+            let enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+            if enabled == 1 {
+                Ok(())
+            } else {
+                Err(rusqlite::Error::InvalidQuery)
+            }
+        })
+        .map_err(|error| err(format!("cleaning up route-state migration: {error}")))?;
+    let outcome = migration?;
+    // A previous binary must refuse a newer schema, not silently serve tables
+    // that its shorter migration chain cannot query.
+    if outcome.store_ahead() {
+        return Err(err(format!(
+            "store_ahead: namespace {ROUTE_STATE_NAMESPACE} is at version {} but this binary's chain ends at {}; \
+             this binary would serve a schema it cannot query (binary rollback or reset numbering); \
+             deploy a binary carrying version {} or newer",
+             outcome.recorded,outcome.chain_max,outcome.recorded
+        )));
+    }
+    Ok(())
 }
 
 /// Trigger truncation when the allocated WAL exceeds 16 MiB.
@@ -1753,41 +1808,7 @@ impl SqliteRouteStateStore {
         migrations: &[Migration],
     ) -> RouteStateResult<Self> {
         let store = open_sqlite(descriptor).map_err(err)?;
-        // Migration 58 rebuilds `account_pin` while `account_admission` holds a
-        // foreign key to it; with enforcement on, dropping the old table would
-        // first delete every pin and fail on the admissions that name them.
-        // SQLite ignores `PRAGMA foreign_keys` inside a transaction and the
-        // shared runner opens one per migration, so enforcement is suspended
-        // around the whole run here and switched back on before serving. The
-        // migration checks its own result with `foreign_key_check`.
-        store
-            .with_conn(|conn| conn.pragma_update(None, "foreign_keys", "OFF"))
-            .map_err(err)?;
-        // A store written by a longer chain than this binary carries used to
-        // migrate as a silent no-op and then serve a schema the binary cannot
-        // query. The route-state chain rebuilds tables and re-keys facts, so an
-        // ahead store is refused here, naming both versions.
-        let migration = store.migrate(ROUTE_STATE_NAMESPACE, migrations);
-        store
-            .with_conn(|conn| {
-                conn.pragma_update(None, "foreign_keys", "ON")?;
-                let enabled: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
-                if enabled == 1 {
-                    Ok(())
-                } else {
-                    Err(rusqlite::Error::InvalidQuery)
-                }
-            })
-            .map_err(|error| err(format!("re-enabling foreign keys after migration: {error}")))?;
-        let outcome = migration.map_err(err)?;
-        if outcome.store_ahead() {
-            return Err(err(format!(
-                "store_ahead: namespace {ROUTE_STATE_NAMESPACE} is at version {} but this binary's chain ends at {}; \
-                 this binary would serve a schema it cannot query (binary rollback or reset numbering); \
-                 deploy a binary carrying version {} or newer",
-                outcome.recorded, outcome.chain_max, outcome.recorded
-            )));
-        }
+        migrate_route_state(&store, migrations)?;
         validate_family_spellings(&store)?;
         // Changing temp_store discards existing TEMP objects, so configure it
         // before installing the catalog write counter and its TEMP triggers.

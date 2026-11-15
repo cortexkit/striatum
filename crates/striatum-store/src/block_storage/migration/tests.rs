@@ -1,4 +1,107 @@
 use super::*;
+
+fn migration_function_is_absent(conn: &Connection) {
+    let error = conn
+        .query_row(
+            "SELECT block_migration_quarantined(0,NULL,NULL)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("no such function"), "{error}");
+    assert_eq!(
+        conn.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
+    assert_eq!(
+        crate::SqliteRouteStateStore::latest_migration_version_for_test(),
+        94
+    );
+    let versions = std::iter::once(0).chain(
+        crate::route_state_migrations()
+            .into_iter()
+            .filter(|migration| migration.version < 94)
+            .map(|migration| migration.version),
+    );
+    for version in versions {
+        let scratch = cortexkit_test_support::ScratchDir::new("block-registered-upgrade");
+        let descriptor = crate::dev_descriptor(
+            "block-registered-upgrade",
+            scratch.path().join("state.db").to_string_lossy(),
+        );
+        if version > 0 {
+            let store = crate::open_sqlite(&descriptor).unwrap();
+            let older = crate::route_state_migrations()
+                .into_iter()
+                .filter(|migration| migration.version <= version)
+                .collect::<Vec<_>>();
+            crate::migrate_route_state(&store, &older).unwrap();
+        }
+        let store = crate::SqliteRouteStateStore::open(&descriptor).unwrap();
+        store.with_writer_for_test(|conn| {
+            migration_function_is_absent(conn);
+            assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('block','probe_authorization','success_proof','retirement_tombstone')",[],|row|row.get::<_,i64>(0))?,4);
+            Ok(())
+        }).unwrap();
+        store.frozen_block_data_for_test().unwrap();
+        drop(store);
+        let error = crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 93)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("store_ahead"), "{error}");
+        assert!(error.to_string().contains("94"), "{error}");
+        assert!(error.to_string().contains("93"), "{error}");
+    }
+}
+
+#[test]
+fn failed_registered_migration_is_atomic_and_removes_the_function_on_its_writer() {
+    let scratch = cortexkit_test_support::ScratchDir::new("block-failed-upgrade");
+    let descriptor = crate::dev_descriptor(
+        "block-failed-upgrade",
+        scratch.path().join("state.db").to_string_lossy(),
+    );
+    let store = crate::open_sqlite(&descriptor).unwrap();
+    let chain = crate::route_state_migrations();
+    crate::migrate_route_state(&store, &chain[..chain.len() - 1]).unwrap();
+    store.with_conn(|conn| {
+        conn.execute("INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_observed_at,updated_at) VALUES ('bad-real','key',1.5,1,1)",[])?;
+        Ok(())
+    }).unwrap();
+    let before = store
+        .with_conn(|conn| {
+            let mut query = conn.prepare("SELECT * FROM cortexkit_schema_version ORDER BY 1")?;
+            let width = query.column_count();
+            let rows = query.query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, rusqlite::types::Value>(index))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .unwrap();
+    let error = crate::migrate_route_state(&store, &chain).unwrap_err();
+    assert!(
+        error.to_string().contains("CHECK constraint failed"),
+        "{error}"
+    );
+    store.with_conn(|conn| {
+        migration_function_is_absent(conn);
+        assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('block','probe_authorization','success_proof','retirement_tombstone')",[],|row|row.get::<_,i64>(0))?,0);
+        assert_eq!(conn.query_row("SELECT walled_until FROM pool_key_state WHERE provider='bad-real'",[],|row|row.get::<_,f64>(0))?,1.5);
+        assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE name='fence_origin'",[],|row|row.get::<_,i64>(0))?,1);
+        let mut query=conn.prepare("SELECT * FROM cortexkit_schema_version ORDER BY 1")?;
+        let width=query.column_count();
+        let after=query.query_map([],|row|(0..width).map(|index|row.get::<_,rusqlite::types::Value>(index)).collect::<rusqlite::Result<Vec<_>>>())?.collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(after,before);
+        Ok(())
+    }).unwrap();
+}
 use crate::SqliteRouteStateStore;
 use std::collections::BTreeSet;
 
