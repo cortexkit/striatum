@@ -2701,6 +2701,22 @@ impl AccountTx<'_> {
                 )
                 .map_err(err)?;
             }
+            if origin.kind == "observation" {
+                // Retirement spends every authorization for this evidence,
+                // including superseded tests that can no longer heal it.
+                self.conn
+                    .execute(
+                        "DELETE FROM fence_probe_authorization WHERE kind=?1 AND origin_key=?2
+                     AND evidence=?3 AND evidence_at=?4",
+                        params![
+                            origin.kind,
+                            origin.origin_key,
+                            origin.evidence,
+                            origin.evidence_at
+                        ],
+                    )
+                    .map_err(err)?;
+            }
         }
         Ok(())
     }
@@ -2850,6 +2866,15 @@ impl AccountTx<'_> {
         let what = format!("heal of {} {}", origin.kind, origin.origin_key);
         let blocks = self.working()?;
         match origin.kind.as_str() {
+            "observation" => {
+                if !authorized || origin.evidence_at >= admitted_at {
+                    return Ok(());
+                }
+                blocks
+                    .check_source(self.conn, &origin.kind, &origin.origin_key, provider)
+                    .map_err(err)?;
+                self.retire_observation_origin(origin, now)?;
+            }
             "account" => {
                 // Only active fences are held: a fence already cleared is
                 // not cleared again.
@@ -3056,6 +3081,27 @@ impl AccountTx<'_> {
         self.clear_held_clock(origin, now)
     }
 
+    fn retire_observation_origin(&self, origin: &FenceRecheck, now: i64) -> RouteStateResult<()> {
+        // Retain the receipt time so replayed observation effects cannot restore
+        // this backoff or an older one. The retirement trigger removes the active
+        // backoff without deleting observation history.
+        self.conn
+            .execute(
+                "INSERT INTO fence_retired_origin(kind,origin_key,evidence,evidence_at,retired_at)
+             SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS
+             (SELECT 1 FROM fence_retired_origin WHERE kind=?1 AND origin_key=?2 AND evidence=?3)",
+                params![
+                    origin.kind,
+                    origin.origin_key,
+                    origin.evidence,
+                    origin.evidence_at,
+                    now
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
+    }
+
     /// Record that `pool` succeeded for one account fence's evidence, keyed
     /// and naming the success the working state holds for it, if any.
     fn put_success_pool(
@@ -3197,6 +3243,12 @@ impl AccountTx<'_> {
             let key: Vec<serde_json::Value> =
                 serde_json::from_str(&origin.origin_key).map_err(err)?;
             match origin.kind.as_str() {
+                "observation" => {
+                    if !authorized || origin.evidence_at >= admitted_at {
+                        continue;
+                    }
+                    self.retire_observation_origin(origin, now)?;
+                }
                 "account" => {
                     let id = key[0].as_str().unwrap_or("");
                     let (pool,needed):(Option<String>,Option<String>)=self.conn.query_row("SELECT pool_key_json,recovery_set_json FROM account_fence WHERE fence_id=?1",[id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(err)?;
