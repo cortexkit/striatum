@@ -247,7 +247,7 @@ pub(crate) async fn serve(
             #[cfg(test)]
             if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
+                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
             ) {
                 crate::stage_timing::ACCOUNT_DELAY
                     .with(|delay| std::thread::sleep(delay.replace(std::time::Duration::ZERO)));
@@ -280,11 +280,11 @@ pub(crate) async fn serve(
                 }
                 reply
             };
-            // The dispatcher already runs inside the route handler's blocking
-            // wrapper; neither account handler spawns additional store work.
+            // The scope restores thread-local timing after each poll, so an
+            // awaiting panel cannot pick up another request's store work.
             let (reply, stages) = if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE
+                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
             ) {
                 striatum_store::scope_stage_timing(call).await
             } else {
@@ -299,6 +299,17 @@ pub(crate) async fn serve(
             "params",
             format!("the request body is not JSON: {error}"),
         )),
+    };
+    let panel_counts = if operation == ops::ROUTE_SELECT_PANEL {
+        let answer = reply.as_ref().ok();
+        (
+            answer
+                .and_then(|value| value["seats"].as_array())
+                .map(|seats| seats.len() as u64),
+            answer.and_then(|value| value["policy"]["size"].as_u64()),
+        )
+    } else {
+        (None, None)
     };
     let serialization = std::time::Instant::now();
     let (ty, body) = match reply {
@@ -330,6 +341,14 @@ pub(crate) async fn serve(
             call_params["mode"].as_str().unwrap_or("admit"),
             &provider,
             &caller.principal,
+            serialization,
+            call_stages,
+        );
+    } else if operation == ops::ROUTE_SELECT_PANEL {
+        timing.emit_panel(
+            total,
+            &call_params,
+            panel_counts,
             serialization,
             call_stages,
         );

@@ -55,6 +55,102 @@ fn request(tokens: u64) -> Value {
         "package_tokens":tokens, "temperatures":[0.2,0.4,0.6], "estimate":true})
 }
 
+async fn logged_panel(estimate: bool, slow: bool) -> (Value, Vec<String>) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, route) = configured().await;
+    let mut params = request(60_000);
+    params["estimate"] = json!(estimate);
+    crate::stage_timing::LOG_LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+    if slow {
+        crate::stage_timing::ACCOUNT_DELAY.with(|delay| {
+            delay.set(crate::stage_timing::SLOW_ACCOUNT_CALL + std::time::Duration::from_millis(50))
+        });
+    }
+    let (ty, reply) = harness
+        .finish_dispatched(route.request_frame("route.select_panel", &params))
+        .await;
+    assert_eq!(ty, FrameType::Response, "{reply}");
+    let lines = crate::stage_timing::LOG_LINES.with(|lines| lines.borrow_mut().take().unwrap());
+    (reply, lines)
+}
+
+fn assert_panel_log(reply: &Value, lines: &[String], estimate: bool) {
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(reply["result"]["policy"]["size"], 3);
+    let line = &lines[0];
+    assert!(
+        line.starts_with("[routing] slow route.select_panel total_ms="),
+        "{line}"
+    );
+    for field in [
+        "operation=route.select_panel".to_owned(),
+        format!("consumer=\"{}\"", fixture::SUMMARY),
+        "class=\"audit\"".to_owned(),
+        format!("estimate={estimate}"),
+        "package_tokens=60000".to_owned(),
+        format!(
+            "seated={}",
+            reply["result"]["seats"].as_array().unwrap().len()
+        ),
+        format!(
+            "requested={}",
+            reply["result"]["policy"]["size"].as_u64().unwrap()
+        ),
+    ] {
+        assert!(
+            line.split_whitespace().any(|part| part == field),
+            "{field}: {line}"
+        );
+    }
+    for field in [
+        "total_ms",
+        "writer_queue_wait_ms",
+        "sql_ms",
+        "commit_ms",
+        "serialization_ms",
+    ] {
+        let value = line
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(&format!("{field}=")))
+            .unwrap();
+        let value = value.parse::<f64>().unwrap();
+        assert!(
+            value >= if field == "total_ms" { 250.0 } else { 0.0 },
+            "{line}"
+        );
+        if field == "sql_ms" {
+            assert!(value > 0.0, "{line}");
+        }
+    }
+    assert_eq!(line.lines().count(), 1);
+    assert!(
+        !line.contains("account_id") && !line.contains("credential"),
+        "{line}"
+    );
+}
+
+#[tokio::test]
+async fn slow_panel_estimate_logs_once() {
+    let (reply, lines) = logged_panel(true, true).await;
+    assert_eq!(reply["result"]["seats"].as_array().unwrap().len(), 2);
+    assert_panel_log(&reply, &lines, true);
+}
+
+#[tokio::test]
+async fn slow_live_panel_logs_once() {
+    let (reply, lines) = logged_panel(false, true).await;
+    assert_eq!(reply["result"]["seats"].as_array().unwrap().len(), 2);
+    assert_panel_log(&reply, &lines, false);
+}
+
+#[tokio::test]
+async fn fast_panel_logs_nothing() {
+    let (reply, lines) = logged_panel(true, true).await;
+    assert_panel_log(&reply, &lines, true);
+    let (_, lines) = logged_panel(false, false).await;
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
 // Compare every table, including SQLite sequences: checking only decision rows
 // would miss account reconciliation, reservations and probe clock writes.
 fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {

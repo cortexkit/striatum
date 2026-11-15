@@ -67,6 +67,35 @@ impl AccountCallTiming {
         });
         eprintln!("{line}");
     }
+
+    pub(crate) fn emit_panel(
+        &self,
+        total: Duration,
+        params: &serde_json::Value,
+        counts: (Option<u64>, Option<u64>),
+        serialization: Duration,
+        stages: StoreStageTiming,
+    ) {
+        if total < SLOW_ACCOUNT_CALL {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let label = |key: &str| serde_json::to_string(&params[key].as_str()).unwrap();
+        let number =
+            |value: Option<u64>| value.map_or_else(|| "null".to_owned(), |n| n.to_string());
+        let line = format!("[routing] slow route.select_panel total_ms={} writer_queue_wait_ms={:.3} sql_ms={:.3} commit_ms={:.3} serialization_ms={:.3} operation=route.select_panel consumer={} class={} estimate={} package_tokens={} seated={} requested={}",
+            total.as_millis(), ms(stages.writer_queue_ns), ms(stages.sql_ns), ms(stages.commit_ns),
+            serialization.as_secs_f64() * 1_000.0, label("consumer"), label("class"),
+            params["estimate"].as_bool().unwrap_or(false), number(params["package_tokens"].as_u64()),
+            number(counts.0), number(counts.1));
+        #[cfg(test)]
+        LOG_LINES.with(|lines| {
+            if let Some(lines) = lines.borrow_mut().as_mut() {
+                lines.push(line.clone());
+            }
+        });
+        eprintln!("{line}");
+    }
 }
 
 #[cfg(test)]
