@@ -840,8 +840,8 @@ async fn measure(fixture: RequestFixture, batches: usize) {
         );
         // Maintenance follows the unchanged request mix and is timed separately,
         // so opting in cannot attribute a checkpoint to a request's commit.
-        for kind in ["passive", "over_cap_truncate"] {
-            if kind == "over_cap_truncate" {
+        for kind in ["passive", "over_cap_passive"] {
+            if kind == "over_cap_passive" {
                 let payload = "x".repeat(striatum_store::WAL_SIZE_CAP_BYTES as usize + 4096);
                 harness
                     .store()

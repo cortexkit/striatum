@@ -440,4 +440,40 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    #[ignore = "release ledger deletion writer-hold measurement"]
+    fn measure_ledger_retention_writer_hold() {
+        use striatum_core::RouteStateStore;
+        for compact in [false, true] {
+            let scratch = cortexkit_test_support::ScratchDir::new("ledger-retention-hold");
+            let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+                "ledger-retention-hold",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap();
+            for index in 0..512 {
+                store
+                    .record_decision(&live_sized_decision(&format!("dec-{index:05}")))
+                    .unwrap();
+            }
+            if compact {
+                for _ in 0..32 {
+                    store.strip_decision_detail(i64::MAX, 0, 16, 1).unwrap();
+                }
+            }
+            for round in 0..2 {
+                let held = store.writer_hold_ns_for_test();
+                let started = std::time::Instant::now();
+                assert_eq!(
+                    store.delete_decisions_older_than(i64::MAX, 256).unwrap(),
+                    256
+                );
+                println!("ledger retention compact={compact} round={round} rows=256 wall_ms={:.3} writer_hold_ms={:.3}",
+                    started.elapsed().as_secs_f64() * 1000.0,
+                    (store.writer_hold_ns_for_test() - held) as f64 / 1_000_000.0,
+                );
+            }
+        }
+    }
 }
