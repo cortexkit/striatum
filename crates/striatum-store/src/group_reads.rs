@@ -79,41 +79,6 @@ pub fn reads_tables(sql: &str, tables: &[&str]) -> bool {
     })
 }
 
-/// Whether `sql` selects rows from `table` other than a write's own target
-/// row: a `FROM` or `JOIN` of it, or it as a later item of a comma join,
-/// whatever its quoting or its `main.`/`temp.` schema prefix.
-fn selects_from(sql: &str, table: &str) -> bool {
-    let mut text = sql.to_ascii_lowercase();
-    for quote in ['"', '`', '[', ']'] {
-        text = text.replace(quote, "");
-    }
-    let text = text
-        .replace("main.", "")
-        .replace("temp.", "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .replace(" ,", ",")
-        .replace(", ", ",");
-    if !text.contains("select") {
-        return false;
-    }
-    // A `DELETE FROM` names its own target; that is not a read of it.
-    let own = format!("delete from {table}");
-    let text = text.strip_prefix(own.as_str()).unwrap_or(&text);
-    ["from ", "join ", ","].iter().any(|before| {
-        let needle = format!("{before}{table}");
-        text.match_indices(&needle).any(|(at, _)| {
-            // `pool_key_state_x` is another table, and `, pool_key_state.col`
-            // names a column of the target, not a join.
-            !text[at + needle.len()..]
-                .chars()
-                .next()
-                .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_' || next == '.')
-        })
-    })
-}
-
 /// Whether a statement trace event is a trigger's: SQLite then passes a
 /// "-- <trigger>" comment rather than the statement's own text, so the text
 /// differs from the prepared statement's. A statement whose own text starts
@@ -330,6 +295,19 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 3] = [
     ),
 ];
 
+/// Writes that run a `SELECT` of their own over other tables (a bound
+/// `json_each` list, a bound observation) yet read their own target only
+/// for the rows they write: the row predicate, an upsert's guard,
+/// `RETURNING`. Any other write running a `SELECT` has every read of its
+/// target counted, because the authorizer does not say which select a read
+/// belongs to. Matched by exact text, so an edited statement is counted
+/// until it is reviewed again.
+pub const REVIEWED_OWN_ROW_WRITES: [&str; 3] = [
+    crate::UPDATE_INHERITED_ROUTE_WALLS,
+    crate::UPDATE_INHERITED_ROUTE_WALL_SCOPE,
+    crate::account_selection::INSERT_TRANSIENT_BACKOFFS,
+];
+
 /// Block-table reads seen since the last [`BlockReadTrace::take`].
 #[derive(Default)]
 pub struct BlockReadTrace {
@@ -403,9 +381,12 @@ impl BlockReadTrace {
     /// a view, a sub-query, a comma join or a trigger the statement fires,
     /// whatever the spelling of the name. A write's reads of its own target
     /// table (its row predicate, an upsert's guard, `RETURNING`) are part of
-    /// the write, unless it also selects from that table. A text that
-    /// cannot be prepared here is reported as read when it names a watched
-    /// table.
+    /// the write only in the reviewed plain forms, which run no `SELECT` of
+    /// their own: SQLite's authorizer reports a `SELECT` for every select,
+    /// sub-query or view the statement codes, and then every read of the
+    /// target counts, since the authorizer does not say which of them come
+    /// from the sub-query ([`REVIEWED_OWN_ROW_WRITES`] excepted). A text that cannot be prepared here is reported as
+    /// read when it names a watched table.
     fn tables_read(&self, sql: &str) -> Classified {
         let mut guard = self.classifier.lock().unwrap();
         let Some((conn, cache)) = guard.as_mut() else {
@@ -424,6 +405,7 @@ impl BlockReadTrace {
                 AuthAction::Insert { table_name } => Some((1, table_name, inner)),
                 AuthAction::Update { table_name, .. } => Some((1, table_name, inner)),
                 AuthAction::Delete { table_name } => Some((1, table_name, inner)),
+                AuthAction::Select => Some((2, "", inner)),
                 _ => None,
             };
             if let Some((kind, table, inner)) = event {
@@ -455,12 +437,17 @@ impl BlockReadTrace {
                     .map(|(_, table, _)| table.clone());
                 // A write reads its own target's columns for its row
                 // predicate, an upsert's guard or `RETURNING`; that is part
-                // of the write. Selecting from the target (an `INSERT …
-                // SELECT` or a sub-query over it) reads other rows, so it
-                // counts.
-                let own_row = |table: &str| {
-                    target.as_deref() == Some(table) && !selects_from(sql, table)
-                };
+                // of the write. A write that runs any `SELECT` of its own (an
+                // `INSERT … SELECT`, a sub-query, a view) may read other rows
+                // of its target however the text spells it, so every read
+                // of the target then counts, unless the write is on the
+                // reviewed list.
+                let selects = events
+                    .iter()
+                    .any(|(kind, _, accessor)| *kind == 2 && trigger(accessor).is_none());
+                let reviewed = REVIEWED_OWN_ROW_WRITES.contains(&sql);
+                let own_row =
+                    |table: &str| target.as_deref() == Some(table) && (!selects || reviewed);
                 let watched = |kind: &u8, table: &String| *kind == 0 && self.watches(table);
                 let mut read: Vec<String> = events
                     .iter()
@@ -600,8 +587,9 @@ mod tests {
 
     /// The block read trace finds reads by what SQLite's authorizer reports,
     /// so a comma join, a quoted or schema-qualified name, a sub-query inside
-    /// a write, a write selecting from its own target and a trigger fired by
-    /// a write are all reads; a keyed write of a block row is not.
+    /// a write, a write selecting from its own target (however spelled, or
+    /// through a view) and a trigger fired by a write are all reads; a keyed
+    /// write of a block row is not.
     #[test]
     fn the_block_trace_sees_reads_however_they_are_spelled() {
         let scratch = cortexkit_test_support::ScratchDir::new("block-trace-spellings");
@@ -615,7 +603,8 @@ mod tests {
                 conn.execute_batch(
                     "CREATE TABLE trace_scratch(x); CREATE TABLE trace_log(n);
                      CREATE TRIGGER trace_scratch_reads AFTER INSERT ON trace_scratch
-                     BEGIN INSERT INTO trace_log SELECT count(*) FROM fence_recheck; END;",
+                     BEGIN INSERT INTO trace_log SELECT count(*) FROM fence_recheck; END;
+                     CREATE VIEW trace_keys AS SELECT credential_id FROM pool_key_state;",
                 )
             })
             .unwrap();
@@ -631,6 +620,12 @@ mod tests {
             "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM \"pool_key_state\")",
             "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM main.pool_key_state)",
             "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT n FROM trace_log , pool_key_state)",
+            // A write reading other rows of its own target, spelled so no
+            // text match finds the target after `FROM`: a comment between,
+            // a parenthesised table, and a view over the target.
+            "UPDATE pool_key_state SET walled_until=(SELECT max(walled_until) FROM/*x*/pool_key_state)",
+            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM (pool_key_state))",
+            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM trace_keys)",
         ];
         for sql in reads {
             store.with_writer_for_test(|conn| conn.execute_batch(sql)).unwrap();

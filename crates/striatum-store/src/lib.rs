@@ -773,6 +773,24 @@ pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(route_write_read
                                 failure_backoff_reason
                          FROM model_route_state WHERE route_key = ?1");
 
+// Writes that run a `SELECT` of their own, over a bound `json_each` list,
+// and read their target table only for the rows they write. The block read
+// trace counts every read of a write's target once the write runs a
+// `SELECT`, except for these reviewed statements
+// (`group_reads::REVIEWED_OWN_ROW_WRITES`).
+pub(crate) const UPDATE_INHERITED_ROUTE_WALLS: &str = "UPDATE model_route_state SET
+                       cooldown_until = ?1,
+                       quota_exhausted_until = ?2,
+                       quota_pressure = COALESCE(?3, quota_pressure),
+                       wall_class = COALESCE(?4, wall_class),
+                       failure_count = failure_count + ?5,
+                       quota_error_count = quota_error_count + ?6,
+                       last_error = COALESCE(?7, last_error),
+                       last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
+                       updated_at = ?8
+                      WHERE provider_id = ?9 AND route_key IN (SELECT value FROM json_each(?10))";
+pub(crate) const UPDATE_INHERITED_ROUTE_WALL_SCOPE: &str = "UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))";
+
 impl SqliteRouteStateStore {
     /// Stored providers only; score aliases added to a request are not catalog
     /// identities and must not be used to resolve credential ownership.
@@ -7688,17 +7706,7 @@ impl crate::AccountTx<'_> {
                 // A repeat refusal replaces the old provider generation's raw
                 // horizons, including migrated deadlines longer than one hour.
                 tx.execute(
-                    "UPDATE model_route_state SET
-                       cooldown_until = ?1,
-                       quota_exhausted_until = ?2,
-                       quota_pressure = COALESCE(?3, quota_pressure),
-                       wall_class = COALESCE(?4, wall_class),
-                       failure_count = failure_count + ?5,
-                       quota_error_count = quota_error_count + ?6,
-                       last_error = COALESCE(?7, last_error),
-                       last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
-                       updated_at = ?8
-                      WHERE provider_id = ?9 AND route_key IN (SELECT value FROM json_each(?10))",
+                    UPDATE_INHERITED_ROUTE_WALLS,
                     params![
                         cooldown_until,
                         quota_exhausted_until,
@@ -7714,7 +7722,7 @@ impl crate::AccountTx<'_> {
                 )?;
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
                     tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
-                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))",params![provider_key,updated_at,update.unscoped_wall,inherited])?;
+                    tx.execute(UPDATE_INHERITED_ROUTE_WALL_SCOPE,params![provider_key,updated_at,update.unscoped_wall,inherited])?;
                     fence_rechecks::register_on(self,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
                 Ok(())

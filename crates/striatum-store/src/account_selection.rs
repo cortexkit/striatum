@@ -2333,17 +2333,7 @@ impl AccountTx<'_> {
         }
         // The rows this observation inserted or moved, returned by the
         // write itself rather than read back from the block table.
-        let keys = self.conn.prepare("INSERT INTO account_transient_backoff
-            SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
-                o.received_at,json_array(o.observation_id,e.key),e.value
-            FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
-            WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
-                AND json_extract(e.value,'$.effect')='transient_backoff'
-                AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
-                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
-            ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
-                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at
-            RETURNING json_array(provider,account_id)").map_err(err)?
+        let keys = self.conn.prepare(INSERT_TRANSIENT_BACKOFFS).map_err(err)?
             .query_map(params![id,effects], |row| row.get::<_, String>(0))
             .map_err(err)?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -2921,3 +2911,19 @@ impl crate::AccountTx<'_> {
         .map_err(err)
     }
 }
+
+/// A bound transient-backoff observation's effects, written as backoff rows.
+/// It runs a `SELECT` over the observation and its `json_each` list, and
+/// reads its target only for its upsert guard and `RETURNING`: a reviewed
+/// own-row write for the block read trace (`group_reads::REVIEWED_OWN_ROW_WRITES`).
+pub(crate) const INSERT_TRANSIENT_BACKOFFS: &str = "INSERT INTO account_transient_backoff
+            SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
+                o.received_at,json_array(o.observation_id,e.key),e.value
+            FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
+            WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
+                AND json_extract(e.value,'$.effect')='transient_backoff'
+                AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
+                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
+            ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
+                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at
+            RETURNING json_array(provider,account_id)";
