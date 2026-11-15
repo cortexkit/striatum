@@ -1449,6 +1449,46 @@ async fn service_tier_never_upgrades_and_unknown_plan_or_runner_falls_to_standar
 }
 
 #[test]
+fn service_tier_kimi_apikey_plane_prices_fast_without_changing_subscription_draw() {
+    // Captured Kimi responses: the ordinary row states zero, while the API-key
+    // quota-proxy plane quotes Highspeed at $4 input and $20 output per million tokens.
+    let payload: Value = serde_json::from_str(include_str!(
+        "../../fixtures/service-tier-v1/kimi-served-payloads.json"
+    ))
+    .unwrap();
+    let catalog = crate::fusiform_catalog::PlaneCatalog::default()
+        .with_test_catalog(
+            &serde_json::to_vec(&payload["catalog.get — speed twin k3.1-pro plain"]["response"])
+                .unwrap(),
+        )
+        .with_test_plane(
+            &serde_json::to_vec(&payload["catalog.get — speed twin k3.1-pro apikey"]["response"])
+                .unwrap(),
+        );
+    let mut credentials = BrocaCredentials::default();
+    credentials.publish_billing_catalog(catalog);
+    let mut fact = crate::tests::fact("kimi-code-plan-global", "k3.1-pro");
+    credentials.price_for_method(&mut fact, "apikey", &Default::default());
+    assert!(crate::service_tiers::model_offers(
+        &credentials,
+        &fact,
+        "fast"
+    ));
+    let mut subscription = fact.clone();
+    crate::service_tiers::price_fact(&credentials, &mut fact, "fast", false, 1.0);
+    let rates = &fact.billing_plane.as_ref().unwrap().rates;
+    assert_eq!(rates["rate.input"], BillingRate::Priced { rate: 4.0 });
+    assert_eq!(rates["rate.output"], BillingRate::Priced { rate: 20.0 });
+    assert_eq!(rates["rate.cache_read"], BillingRate::Priced { rate: 0.2 });
+    assert_eq!(rates["rate.cache_write"], BillingRate::Priced { rate: 4.0 });
+    assert!(!rates.contains_key("rate.reasoning"));
+    crate::service_tiers::price_fact(&credentials, &mut subscription, "fast", true, 3.0);
+    let rates = &subscription.billing_plane.as_ref().unwrap().rates;
+    assert_eq!(rates["rate.input"], BillingRate::Priced { rate: 6.0 });
+    assert_eq!(rates["rate.output"], BillingRate::Priced { rate: 30.0 });
+}
+
+#[test]
 fn service_tier_prices_subscription_draw_and_api_mode_without_inheriting_base_dimensions() {
     let _clock = crate::InjectedClock::set(NOW);
     let (_, credentials) = setup(&["pro_500"], true, true);

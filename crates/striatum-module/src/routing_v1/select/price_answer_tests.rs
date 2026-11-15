@@ -391,6 +391,114 @@ async fn no_price_for_unmeasured_subscription_or_unpriced_antigravity() {
 }
 
 #[tokio::test]
+async fn kimi_fast_price_answer_uses_plane_rates_with_existing_subscription_scaling() {
+    use cortexkit_claustrum_client::ScopedCredentialListing;
+
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let provider = "kimi-code-plan-global";
+    let key = "kimi-code-plan-global/k3.1-pro";
+    let wire = "openai.chat_completions";
+    let payload: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/service-tier-v1/kimi-served-payloads.json"
+    ))
+    .unwrap();
+    for method in ["apikey", "oauth"] {
+        let (h, mut credentials) = super::super::service_tier_tests::setup_for_method(
+            &["pro_500"],
+            true,
+            true,
+            method,
+            wire,
+        );
+        let mut fact = crate::tests::fact(provider, "k3.1-pro");
+        fact.auth_methods = Some(vec![method.into()]);
+        h.install_facts(&[fact]);
+        let rows = credentials
+            .listed_credentials()
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.provider_ids = vec![provider.into()];
+                row.serves = vec![provider.into()];
+                row
+            })
+            .collect();
+        credentials.apply_listing(
+            &ScopedCredentialListing {
+                view: format!("kimi-{method}"),
+                credentials: rows,
+                ..Default::default()
+            },
+            1_800_000_000_000,
+        );
+        let mut plans = credentials.plan_prices.clone();
+        for plan in plans["prices"].as_array_mut().unwrap() {
+            if plan["provider_id"] == "openai" {
+                plan["provider_id"] = json!(provider);
+            }
+        }
+        credentials.publish_plan_prices(&plans);
+        let mut page = payload["catalog.get — speed twin k3.1-pro apikey"]["response"].clone();
+        // The API-key case uses the captured page unchanged. An OAuth copy
+        // exercises subscription-equivalent scaling of the same quoted rates.
+        page["plane"]["auth_method"] = json!(method);
+        credentials.wire_apis = [(key.into(), wire.into())].into();
+        let catalog = crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[])
+            .with_test_catalog(
+                &serde_json::to_vec(
+                    &payload["catalog.get — speed twin k3.1-pro plain"]["response"],
+                )
+                .unwrap(),
+            )
+            .with_test_plane(&serde_json::to_vec(&page).unwrap());
+        credentials.publish_billing_catalog(catalog.clone());
+        declare_price_harness(&mut credentials, "tier-runner", wire, &[method]);
+        h.set_credentials(credentials);
+        h.edit_config(|config| {
+            config["providers"][provider]["subscription_multiplier"] = json!(22);
+            config["providers"][provider]["subscription"] = json!(method == "oauth");
+        });
+        let route = h.bind(reserved("tier-owner"), None).await;
+        let params =
+            json!({"consumer":"mason","requirements":{"iq":50},"pin":key,"service_tier":"fast"});
+        let answer = answered(&route, &params).await;
+        assert_eq!(answer["service_tier_chosen"], "fast", "{answer}");
+        let divisor = if method == "oauth" { 22.0 } else { 1.0 };
+        assert_eq!(
+            answer["price"]["rates_per_mtok"]["input"].as_f64(),
+            Some(4.0 / divisor),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["price"]["rates_per_mtok"]["output"].as_f64(),
+            Some(20.0 / divisor),
+            "{answer}"
+        );
+        assert_eq!(
+            answer["price"]["basis"],
+            if method == "oauth" {
+                "subscription_equivalent"
+            } else {
+                "metered"
+            }
+        );
+
+        page["models"][key]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !key.ends_with(".mode.fast"));
+        page["models"][key]["rate.input.mode.fast"] = json!({"state":"unpriced"});
+        h.credentials()
+            .lock()
+            .unwrap()
+            .publish_billing_catalog(catalog.with_test_plane(&serde_json::to_vec(&page).unwrap()));
+        let unpriced = answered(&route, &params).await;
+        assert_eq!(unpriced["service_tier_chosen"], "fast", "{unpriced}");
+        assert!(unpriced.get("price").is_none(), "{unpriced}");
+    }
+}
+
+#[tokio::test]
 async fn nonstandard_tier_uses_catalog_modes_not_quota_draw_and_omits_unknown_modes() {
     let _clock = crate::InjectedClock::set(1_800_000_000_000);
     for method in ["apikey", "oauth"] {

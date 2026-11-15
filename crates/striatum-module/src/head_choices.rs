@@ -285,23 +285,27 @@ pub(crate) fn choices_for_harness(
         };
         let mut service_tiers = vec!["standard".into()];
         for tier in ["fast", "ultrafast"] {
-            if service_tiers::model_offers(credentials, fact, tier)
-                && credentials.listed_credentials().iter().any(|row| {
-                    broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
-                        && fact.billing_plane.as_ref().is_none_or(|plane| {
-                            row.auth_method.as_deref() == Some(&plane.auth_method)
-                        })
-                        && service_tiers::runner_supports(credentials, runner, fact, row, tier)
-                        && service_tiers::plan_rate(
-                            &credentials.plan_prices,
-                            row,
-                            provider,
-                            tier,
-                            false,
-                        )
-                        .is_some()
-                })
-            {
+            if credentials.listed_credentials().iter().any(|row| {
+                service_tiers::model_offers_for_method(
+                    credentials,
+                    fact,
+                    row.auth_method.as_deref(),
+                    tier,
+                ) && broca_credentials::credential_serves_fact(row, fact, &providers, credentials)
+                    && fact
+                        .billing_plane
+                        .as_ref()
+                        .is_none_or(|plane| row.auth_method.as_deref() == Some(&plane.auth_method))
+                    && service_tiers::runner_supports(credentials, runner, fact, row, tier)
+                    && service_tiers::plan_rate(
+                        &credentials.plan_prices,
+                        row,
+                        provider,
+                        tier,
+                        false,
+                    )
+                    .is_some()
+            }) {
                 service_tiers.push(tier.into());
             }
         }

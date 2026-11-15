@@ -75,15 +75,17 @@ pub(super) fn for_selection(
             has_metered_plane = true;
         }
         if let Some(tier) = tier.filter(|tier| !tier.is_standard()) {
-            // Billing pages can carry only standard rates. Non-standard prices
-            // are model-catalog facts, not a plan's extra quota consumption.
+            // Resolve each route's tier on its own billing plane, falling back
+            // to catalog modes only when the page carries none. These prices
+            // are separate from a plan's extra quota consumption.
             let key = format!("{}/{}", model.provider_id, model.model_id);
-            let modes = classes
-                .credentials
-                .billing_catalog
-                .mode_rates(&key, tier.as_str());
             for fact in [&mut model, &mut metered] {
                 if let Some(plane) = &mut fact.billing_plane {
+                    let modes = classes.credentials.billing_catalog.mode_rates(
+                        &key,
+                        Some(&plane.auth_method),
+                        tier.as_str(),
+                    );
                     let suffix = format!(".mode.{}", tier.as_str());
                     plane.rates.retain(|key, _| !key.ends_with(&suffix));
                     for (key, rate) in &modes {

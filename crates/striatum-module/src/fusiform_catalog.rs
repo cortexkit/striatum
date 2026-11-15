@@ -836,24 +836,36 @@ pub(crate) struct PlaneCatalog {
 }
 
 impl PlaneCatalog {
-    pub(crate) fn offers_tier(&self, model: &str, tier: &str) -> bool {
-        self.base.get(model).is_some_and(|rates| {
-            rates
-                .rates
-                .keys()
-                .any(|key| key.ends_with(&format!(".mode.{tier}")))
-        })
+    pub(crate) fn offers_tier(&self, model: &str, auth_method: Option<&str>, tier: &str) -> bool {
+        !self.mode_rates(model, auth_method, tier).is_empty()
     }
 
-    pub(crate) fn mode_rates(&self, model: &str, tier: &str) -> BTreeMap<String, BillingRate> {
-        self.base
-            .get(model)
+    /// A served plane is authoritative for a tier when its model row carries
+    /// any rate for that mode, even an unpriced one, just as for wire facts.
+    /// Pages that strip mode rates fall back to the ordinary catalog. Never
+    /// fill a partially quoted mode with dimensions from a different source.
+    pub(crate) fn mode_rates(
+        &self,
+        model: &str,
+        auth_method: Option<&str>,
+        tier: &str,
+    ) -> BTreeMap<String, BillingRate> {
+        let suffix = format!(".mode.{tier}");
+        let served = model.split_once('/').and_then(|(provider, _)| {
+            match self.pages.get(&(provider.into(), auth_method?.into())) {
+                Some(PlaneReply::Served(page)) => page.rates.get(model),
+                _ => None,
+            }
+        });
+        served
+            .filter(|rates| rates.rates.keys().any(|key| key.ends_with(&suffix)))
+            .or_else(|| self.base.get(model))
             .map(|rates| {
                 rates
                     .rates
                     .iter()
                     .filter_map(|(key, rate)| {
-                        key.strip_suffix(&format!(".mode.{tier}"))
+                        key.strip_suffix(&suffix)
                             .map(|base| (base.to_owned(), rate.clone()))
                     })
                     .collect()
@@ -2671,6 +2683,62 @@ mod tests {
     }
 
     #[test]
+    fn mode_rates_use_served_plane_keys_without_mixing_base_dimensions() {
+        let payload: Value = serde_json::from_str(include_str!(
+            "../fixtures/service-tier-v1/kimi-served-payloads.json"
+        ))
+        .unwrap();
+        let model = "kimi-code-plan-global/k3.1-pro";
+        let base = &payload["catalog.get — speed twin k3.1-pro plain"]["response"];
+        let page = &payload["catalog.get — speed twin k3.1-pro apikey"]["response"];
+        let catalog = PlaneCatalog::default()
+            .with_test_catalog(&serde_json::to_vec(base).unwrap())
+            .with_test_plane(&serde_json::to_vec(page).unwrap());
+        let mode = catalog.mode_rates(model, Some("apikey"), "fast");
+        assert_eq!(mode["rate.input"], BillingRate::Priced { rate: 4.0 });
+        assert_eq!(mode["rate.output"], BillingRate::Priced { rate: 20.0 });
+        for method in [None, Some("oauth")] {
+            assert!(catalog.offers_tier(model, method, "fast"));
+            assert_eq!(
+                catalog.mode_rates(model, method, "fast")["rate.input"],
+                BillingRate::Priced { rate: 0.0 }
+            );
+        }
+
+        let mut stripped = page.clone();
+        stripped["models"][model]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !key.ends_with(".mode.fast"));
+        let fallback = catalog
+            .clone()
+            .with_test_plane(&serde_json::to_vec(&stripped).unwrap());
+        assert_eq!(
+            fallback.mode_rates(model, Some("apikey"), "fast"),
+            catalog.mode_rates(model, None, "fast")
+        );
+
+        // Even a single unpriced mode key is an authoritative quote. The
+        // missing output and cache rates must not become the base row's zeroes.
+        stripped["models"][model]["rate.input.mode.fast"] = json!({"state":"unpriced"});
+        let partial = catalog.with_test_plane(&serde_json::to_vec(&stripped).unwrap());
+        assert!(partial.offers_tier(model, Some("apikey"), "fast"));
+        assert_eq!(
+            partial.mode_rates(model, Some("apikey"), "fast"),
+            BTreeMap::from([("rate.input".into(), BillingRate::Unpriced)])
+        );
+
+        let mut no_base_modes = base.clone();
+        no_base_modes["models"][model]
+            .as_object_mut()
+            .unwrap()
+            .retain(|key, _| !key.ends_with(".mode.fast"));
+        let plane_only = partial.with_test_catalog(&serde_json::to_vec(&no_base_modes).unwrap());
+        assert!(plane_only.offers_tier(model, Some("apikey"), "fast"));
+        assert!(!plane_only.offers_tier(model, None, "fast"));
+    }
+
+    #[test]
     fn price_rate_lifetimes_survive_catalog_and_plane_ingestion_verbatim() {
         for (model, lifetimes) in [
             ("anthropic/claude", [("5m", 3.75), ("1h", 6.0)]),
@@ -2689,7 +2757,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(catalog.base, plane_page);
-            let mode = catalog.mode_rates(model, "fast");
+            let mode = catalog.mode_rates(model, None, "fast");
             for (lifetime, rate) in lifetimes {
                 let key = format!("rate.cache_write.ttl.{lifetime}");
                 assert_eq!(

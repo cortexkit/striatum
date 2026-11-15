@@ -100,10 +100,28 @@ pub(crate) fn runner_supports(
 }
 
 pub(crate) fn model_offers(credentials: &BrocaCredentials, fact: &ModelFact, tier: &str) -> bool {
+    model_offers_for_method(
+        credentials,
+        fact,
+        fact.billing_plane
+            .as_ref()
+            .map(|plane| plane.auth_method.as_str()),
+        tier,
+    )
+}
+
+pub(crate) fn model_offers_for_method(
+    credentials: &BrocaCredentials,
+    fact: &ModelFact,
+    auth_method: Option<&str>,
+    tier: &str,
+) -> bool {
     tier == "standard"
-        || credentials
-            .billing_catalog
-            .offers_tier(&format!("{}/{}", fact.provider_id, fact.model_id), tier)
+        || credentials.billing_catalog.offers_tier(
+            &format!("{}/{}", fact.provider_id, fact.model_id),
+            auth_method,
+            tier,
+        )
 }
 
 /// Credits pay only after included quota is exhausted. A balance alone is not
@@ -147,9 +165,11 @@ pub(crate) fn price_fact(
             }
         } else {
             // A mode does not inherit missing dimensions from standard.
-            plane.rates = credentials
-                .billing_catalog
-                .mode_rates(&format!("{}/{}", fact.provider_id, fact.model_id), tier);
+            plane.rates = credentials.billing_catalog.mode_rates(
+                &format!("{}/{}", fact.provider_id, fact.model_id),
+                Some(&plane.auth_method),
+                tier,
+            );
         }
     }
 }
