@@ -2843,7 +2843,12 @@ impl<'a> Selection<'a> {
                     let route = fact_to_route(fact);
                     if account_recoveries
                         .get(&route.route_key)
-                        .is_some_and(|block| block.credential_code.is_some())
+                        .is_some_and(|block| {
+                            block
+                                .credential_code
+                                .as_deref()
+                                .is_some_and(crate::credential_fences::is_billing_code)
+                        })
                     {
                         for state in [
                             recovery_snapshot.by_route.get_mut(&route.route_key),
@@ -2871,7 +2876,10 @@ impl<'a> Selection<'a> {
                     self.eligible_rejections(&recovery_input.facts, explicit_variant);
                 recovery_rejections.to_mut().retain(|key, reason| {
                     !account_recoveries.get(key).is_some_and(|block| {
-                        block.credential_code.is_some()
+                        block
+                            .credential_code
+                            .as_deref()
+                            .is_some_and(crate::credential_fences::is_billing_code)
                             && matches!(
                                 reason.as_str(),
                                 "credential_billing_exhausted" | "credential_unentitled"
