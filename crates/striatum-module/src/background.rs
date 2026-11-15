@@ -306,8 +306,8 @@ async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
             match outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "account maintenance failed"),
-                // A panic still stops this loop, so the serving loop reports it
-                // and the module restarts, as when Tick ran on this task.
+                // A panic in the maintenance pass still stops this loop, so the
+                // serving loop reports it and the module restarts.
                 Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
                 Err(error) => tracing::warn!(%error, "account maintenance worker failed"),
             }
