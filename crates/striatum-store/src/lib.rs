@@ -57,6 +57,7 @@ mod speed_sample_tests;
 #[cfg(feature = "test-support")]
 pub mod backup;
 mod diagnostics;
+pub mod job_timing;
 mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};

@@ -1131,17 +1131,19 @@ pub async fn config_refresh_loop(
     }
     loop {
         tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
-        let next = live_config(&path);
-        if !Arc::ptr_eq(&active, &next) {
-            eprintln!("[striatum] routing-config-reloaded: {}", path.display());
-            active = next;
-            if let Ok(mut credentials) = credentials.lock() {
-                credentials
-                    .concurrency_caps
-                    .publish_settings(active.concurrency_caps());
-                credentials.catalog_wake.notify_one();
+        striatum_store::job_timing::sync("config_refresh", || {
+            let next = live_config(&path);
+            if !Arc::ptr_eq(&active, &next) {
+                eprintln!("[striatum] routing-config-reloaded: {}", path.display());
+                active = next;
+                if let Ok(mut credentials) = credentials.lock() {
+                    credentials
+                        .concurrency_caps
+                        .publish_settings(active.concurrency_caps());
+                    credentials.catalog_wake.notify_one();
+                }
             }
-        }
+        });
     }
 }
 

@@ -444,7 +444,7 @@ impl Default for PassBudget {
 /// `batch` returns (rows deleted, rows examined). Adds the batches it ran to
 /// `batches_so_far` and returns (rows deleted, drained).
 fn drain(
-    table: &str,
+    table: &'static str,
     budget: &PassBudget,
     max_batches: usize,
     batches_so_far: &mut usize,
@@ -463,33 +463,41 @@ fn drain(
 /// [`drain`] for a table whose batches hold `batch_rows` rows rather than the
 /// budget's delete batch size.
 fn drain_batches(
-    table: &str,
+    table: &'static str,
     batch_rows: usize,
     budget: &PassBudget,
     max_batches: usize,
     batches_so_far: &mut usize,
     mut batch: impl FnMut() -> Result<(usize, usize), String>,
 ) -> (usize, bool) {
-    let mut deleted = 0;
-    for round in 0..max_batches {
-        if round > 0 && !budget.pause.is_zero() {
-            std::thread::sleep(budget.pause);
-        }
-        *batches_so_far += 1;
-        match batch() {
-            Ok((removed, examined)) => {
-                deleted += removed;
-                if examined < batch_rows {
+    let name = match table {
+        "account_decision (shadow)" => "retention.shadow_decisions",
+        "model_route_decisions (detail)" => "retention.decision_detail",
+        name => name,
+    };
+    striatum_store::job_timing::sync(name, || {
+        let mut deleted = 0;
+        for round in 0..max_batches {
+            if round > 0 && !budget.pause.is_zero() {
+                std::thread::sleep(budget.pause);
+            }
+            *batches_so_far += 1;
+            match batch() {
+                Ok((removed, examined)) => {
+                    striatum_store::job_timing::rows(removed as u64);
+                    deleted += removed;
+                    if examined < batch_rows {
+                        return (deleted, true);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(table, error = %error, "retention batch failed");
                     return (deleted, true);
                 }
             }
-            Err(error) => {
-                tracing::warn!(table, error = %error, "retention batch failed");
-                return (deleted, true);
-            }
         }
-    }
-    (deleted, false)
+        (deleted, false)
+    })
 }
 
 fn before(now_ms: i64, window_ms: i64) -> i64 {
@@ -564,39 +572,44 @@ fn run_retention_pass_with_affinity_sweep(
     let scan_limit = rows.saturating_mul(per_table);
     let checkpoint = affinity_sweep.clone();
     let (mut affinities, mut affinities_drained) = (0, true);
-    match affinity_sweep.plan(store, affinity_before, now_ms, scan_limit) {
-        Ok(Some(plan)) => {
-            affinities_drained = plan.examined < scan_limit;
-            for (round, keys) in plan
-                .keys
-                .chunks(rows.min(AFFINITY_DELETE_BATCH_ROWS).max(1))
-                .enumerate()
-            {
-                if round > 0 && !budget.pause.is_zero() {
-                    std::thread::sleep(budget.pause);
-                }
-                *batches += 1;
-                match crate::account_writer::prune_account_affinities(
-                    store,
-                    keys.to_vec(),
-                    affinity_before,
-                    now_ms,
-                ) {
-                    Ok(batch) => {
-                        affinities += batch.affinities;
-                        pins += batch.pins;
+    striatum_store::job_timing::sync("retention.affinity_and_pins", || {
+        match affinity_sweep.plan(store, affinity_before, now_ms, scan_limit) {
+            Ok(Some(plan)) => {
+                affinities_drained = plan.examined < scan_limit;
+                for (round, keys) in plan
+                    .keys
+                    .chunks(rows.min(AFFINITY_DELETE_BATCH_ROWS).max(1))
+                    .enumerate()
+                {
+                    if round > 0 && !budget.pause.is_zero() {
+                        std::thread::sleep(budget.pause);
                     }
-                    Err(error) => {
-                        *affinity_sweep = checkpoint;
-                        tracing::warn!(error=%error, "affinity retention command failed");
-                        break;
+                    *batches += 1;
+                    match crate::account_writer::prune_account_affinities(
+                        store,
+                        keys.to_vec(),
+                        affinity_before,
+                        now_ms,
+                    ) {
+                        Ok(batch) => {
+                            striatum_store::job_timing::rows(
+                                (batch.affinities + batch.pins) as u64,
+                            );
+                            affinities += batch.affinities;
+                            pins += batch.pins;
+                        }
+                        Err(error) => {
+                            *affinity_sweep = checkpoint;
+                            tracing::warn!(error=%error, "affinity retention command failed");
+                            break;
+                        }
                     }
                 }
             }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(error=%error, "affinity retention planning failed"),
         }
-        Ok(None) => {}
-        Err(error) => tracing::warn!(error=%error, "affinity retention planning failed"),
-    }
+    });
     let (unneeded_pins, pins_drained) = drain("account_pin", budget, per_table, batches, || {
         counted(crate::account_writer::prune_account_pins(
             store,
@@ -840,16 +853,19 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
         }
         let pass_store = Arc::clone(&store);
         let mut pass_sweep = std::mem::take(&mut affinity_sweep);
-        let outcome = tokio::task::spawn_blocking(move || {
-            let report = run_retention_pass_with_affinity_sweep(
-                &pass_store,
-                &windows,
-                crate::account_selection::now_ms(),
-                &PassBudget::default(),
-                &mut pass_sweep,
-            );
-            (report, pass_sweep)
-        })
+        let outcome = striatum_store::job_timing::run(
+            "retention",
+            crate::stage_timing::spawn_job_blocking(move || {
+                let report = run_retention_pass_with_affinity_sweep(
+                    &pass_store,
+                    &windows,
+                    crate::account_selection::now_ms(),
+                    &PassBudget::default(),
+                    &mut pass_sweep,
+                );
+                (report, pass_sweep)
+            }),
+        )
         .await;
         match outcome {
             Ok((report, next_sweep)) => {

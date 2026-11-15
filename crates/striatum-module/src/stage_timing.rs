@@ -8,6 +8,19 @@ use striatum_store::StoreStageTiming;
 pub(crate) const SLOW_ACCOUNT_CALL: Duration = Duration::from_millis(250);
 static SERIALIZATION_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Carry the current background pass into the blocking pool and merge only its
+/// completed work. The scope is restored before the pool reuses the thread.
+pub(crate) async fn spawn_job_blocking<F, T>(f: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (result, work) =
+        tokio::task::spawn_blocking(striatum_store::job_timing::blocking(f)).await?;
+    striatum_store::job_timing::record(work);
+    Ok(result)
+}
+
 #[cfg(test)]
 pub(crate) fn serialization_ns() -> u64 {
     SERIALIZATION_NS.load(Ordering::Relaxed)

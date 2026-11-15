@@ -1902,6 +1902,7 @@ fn apply_catalog_snapshot(
 ) -> Result<(), FusiformCatalogError> {
     apply_mapped_catalog(store, snapshot, credentials, None)
         .map_err(|reason| error(format!("apply {context}: {reason}")))?;
+    striatum_store::job_timing::rows(snapshot.facts.len() as u64);
     if let Some(path) = config_path {
         let shadowed = crate::config_overrides::live_config(path).shadowed_operator_grades(
             &store
@@ -1947,8 +1948,10 @@ pub(crate) fn report_unserved_routes(
     store: &SqliteRouteStateStore,
     health: &SharedCatalogHealth,
 ) -> Result<(), FusiformCatalogError> {
-    let routes = crate::account_writer::prune_unserved_unpicked_facts(store)
-        .map_err(|reason| error(format!("list and prune absent routes: {reason}")))?;
+    let routes = striatum_store::job_timing::sync("catalog_prune", || {
+        crate::account_writer::prune_unserved_unpicked_facts(store)
+    })
+    .map_err(|reason| error(format!("list and prune absent routes: {reason}")))?;
     if let Ok(mut health) = health.lock() {
         let newly_reported = health.note_unserved_routes(routes);
         if !newly_reported.is_empty() {
@@ -2085,7 +2088,7 @@ pub(crate) async fn ingest_before_upsert(
 async fn on_blocking_thread<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, FusiformCatalogError> + Send + 'static,
 ) -> Result<T, FusiformCatalogError> {
-    match tokio::task::spawn_blocking(work).await {
+    match crate::stage_timing::spawn_job_blocking(work).await {
         Ok(result) => result,
         Err(failure) if failure.is_panic() => std::panic::resume_unwind(failure.into_panic()),
         // The blocking pool cancels only while the runtime shuts down.
@@ -2109,17 +2112,20 @@ async fn apply_and_report(
     let (store, health) = (Arc::clone(store), Arc::clone(health));
     let config_path = config_path.map(Path::to_path_buf);
     let ladder = ladder.cloned();
-    on_blocking_thread(move || {
-        apply_catalog_snapshot(
-            &store,
-            &snapshot,
-            config_path.as_deref(),
-            ladder.as_ref(),
-            credentials.as_ref(),
-            context,
-        )?;
-        report_unserved_routes(&store, &health)
-    })
+    striatum_store::job_timing::run(
+        "catalog_apply",
+        on_blocking_thread(move || {
+            apply_catalog_snapshot(
+                &store,
+                &snapshot,
+                config_path.as_deref(),
+                ladder.as_ref(),
+                credentials.as_ref(),
+                context,
+            )?;
+            report_unserved_routes(&store, &health)
+        }),
+    )
     .await
 }
 
@@ -2131,7 +2137,11 @@ async fn bootstrap_cycle<C: CatalogWire>(
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
     let snapshot = client.catalog_get().await?;
-    client.refresh_planes(Some(&snapshot)).await?;
+    striatum_store::job_timing::run(
+        "billing_plane_refresh",
+        client.refresh_planes(Some(&snapshot)),
+    )
+    .await?;
     apply_and_report(
         store,
         health,
@@ -2172,7 +2182,11 @@ async fn poll_cycle<C: CatalogWire>(
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
-        client.refresh_planes(Some(&snapshot)).await?;
+        striatum_store::job_timing::run(
+            "billing_plane_refresh",
+            client.refresh_planes(Some(&snapshot)),
+        )
+        .await?;
         apply_and_report(
             store,
             health,
@@ -2185,7 +2199,8 @@ async fn poll_cycle<C: CatalogWire>(
         .await?;
         1
     } else {
-        client.refresh_planes(None).await?;
+        striatum_store::job_timing::run("billing_plane_refresh", client.refresh_planes(None))
+            .await?;
         if let (Some(path), Some(cursor)) = (config_path, cursor) {
             let path = path.to_path_buf();
             let store = Arc::clone(store);
@@ -2226,7 +2241,7 @@ pub async fn catalog_refresh_loop(
         Arc::clone(&guard.catalog_wake)
     };
     loop {
-        let result =
+        let result = striatum_store::job_timing::run("catalog_poll", async {
             match FusiformCatalogConsumer::connect(&connection_file_path, &project_root).await {
                 Ok(mut consumer) if bootstrapped => {
                     consumer.credentials = Some(Arc::clone(&credentials));
@@ -2251,7 +2266,9 @@ pub async fn catalog_refresh_loop(
                     .await
                 }
                 Err(reason) => Err(reason),
-            };
+            }
+        })
+        .await;
         match result {
             Ok(_) => {
                 bootstrapped = true;
