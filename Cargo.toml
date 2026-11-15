@@ -36,7 +36,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 tracing = "0.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 async-nats = { version = "0.50", default-features = false }
 async-trait = "0.1"

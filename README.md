@@ -21,7 +21,7 @@ cargo build --locked --release -p striatum-module
 bash scripts/rust-test-gate.sh
 ```
 
-The gate needs Rust 1.99.0, Python 3.10 or newer, and cargo-nextest. It runs the source checks and the whole test suite, with no sibling checkout.
+The `rust-test-gate.sh` script needs Rust 1.100.0, Python 3.10 or newer, and cargo-nextest. It runs the source checks and the whole test suite, with no sibling checkout.
 
 Six real-daemon tests are ignored by default because they build `../subconscious` and `../insula`, with `../commons` beside them. Run them on a machine that has those checkouts:
 
