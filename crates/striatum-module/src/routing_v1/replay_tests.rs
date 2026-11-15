@@ -585,6 +585,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "report_outcomes",
                                 "report_usage_run_id",
                                 "select_pin_slot",
+                                "select_pin_origin",
                                 "select_available_routes",
                                 "select_eligible_routes",
                                 "consumer_declarations",

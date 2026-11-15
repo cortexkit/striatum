@@ -20,8 +20,8 @@ use std::time::Duration;
 use cortexkit_role_routing::errors::{NoRouteReason, PinUnavailableReason, Refusal, RefusalCode};
 use cortexkit_role_routing::select::{
     parse_select_request_serving, parse_select_request_with_defaults, Modality, PinFallback,
-    PinOutcome, RouteRef, RunnerAuth, RunnerRef, SelectAnswer, SelectRequest, ToolsRequirement,
-    EXPLANATION_MAX_CHARS,
+    PinOrigin, PinOutcome, RouteRef, RunnerAuth, RunnerRef, SelectAnswer, SelectRequest,
+    ToolsRequirement, EXPLANATION_MAX_CHARS,
 };
 use serde_json::{json, Value};
 use striatum_core::model_router::{
@@ -60,6 +60,7 @@ const MEMBERS: &[&str] = &[
     "consumer",
     "requirements",
     "pin",
+    "pin_origin",
     "exclude",
     "exclude_providers",
     "runners",
@@ -874,6 +875,11 @@ async fn prepare_selection(
     let effective_params = consumers.with_defaults(&consumer, params, &operator_config);
     let mut request =
         parse_admitted_request(&effective_params, caller, &consumers, evaluation.is_some())?;
+    // Validate the marker for every caller, but only enrolled principals may
+    // use it to spend the pinned model's subscription reserve.
+    if !operator_config.honours_pin_origin(&caller.principal) {
+        request.pin_origin = None;
+    }
     if request.eligible_routes.as_ref().is_some_and(Vec::is_empty) {
         return Err(Refusal::no_route(NoRouteReason::NoAvailableModel, None));
     }
@@ -1761,6 +1767,7 @@ async fn select_at_tier_attempt(
     let choose = || {
         let request_pin_exempt = inputs.consumer_pinned
             || (request.pin.is_none() && request.pin_slot.is_some())
+            || request.pin_origin == Some(PinOrigin::User)
             || request_pin_is_keep_free_exempt(&consumer, request.pin.as_deref(), &consumer_policy);
         let mut request_pin = request.pin.clone().or_else(|| {
             request
@@ -2962,6 +2969,10 @@ impl<'a> Selection<'a> {
                 &format!("{}/{}", parsed.provider, parsed.model),
             );
         let refused = |code: &str, message: String| {
+            // The shared pin scorer wraps a reserve rejection in a generic
+            // summary code, but retains the specific cause in its message.
+            let reserve_limited = code == "subscription_reserve"
+                || message.starts_with(&format!("{pin}: subscription_reserve ("));
             let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)
                 && self
                     .rejections
@@ -2980,7 +2991,8 @@ impl<'a> Selection<'a> {
                         code,
                         "not_available" | "no_eligible_account" | "no_available_model"
                     ))
-                    || code == "credential_billing_exhausted")
+                    || code == "credential_billing_exhausted"
+                    || reserve_limited)
             {
                 reset = self.pin_account_recovery(
                     &pin_key,
@@ -2989,7 +3001,7 @@ impl<'a> Selection<'a> {
                     available,
                     &snapshot,
                 );
-                if reset.is_some() {
+                if reset.is_some() || reserve_limited {
                     reason = PinUnavailableReason::QuotaExhausted;
                 }
             }
@@ -3317,9 +3329,9 @@ fn request_pin_is_keep_free_exempt(
     pin: Option<&str>,
     policy: &crate::config_policy::ConsumerPolicy,
 ) -> bool {
-    // Temporary until core adds a marker distinguishing a user's model choice
-    // from core-generated requests that repeat a prior model. Only mason and its
-    // dotted launch/retry children identify raw user pins.
+    // Keep raw mason pins exempt until core sends pin_origin for user choices.
+    // Remove this compatibility rule once core's marker is live; other raw
+    // request pins still need the marker or an operator-settings match.
     if consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.") {
         return true;
     }

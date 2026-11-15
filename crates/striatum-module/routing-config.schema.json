@@ -119,6 +119,16 @@
       "$ref": "#/$defs/PanelPolicies",
       "default": {}
     },
+    "pin_origin_callers": {
+      "description": "Full caller principals allowed to mark user pins with `pin_origin`.\nAbsent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.",
+      "type": "array",
+      "default": [
+        "reserved:prefrontal-core"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
     "providers": {
       "type": "object",
       "additionalProperties": {

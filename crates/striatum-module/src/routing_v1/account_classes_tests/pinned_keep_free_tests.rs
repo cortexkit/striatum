@@ -327,6 +327,181 @@ async fn failed_pins_do_not_exempt_automatic_fallback() {
 const SYNTHESIZER: &str = "prefrontal-core.athena.synthesizer";
 const SYNTHESIZER_PIN: &str = "synthetic/model:medium";
 
+const USER_PIN_CONSUMER: &str = "pin-origin-test";
+const USER_PIN_CALLER: &str = "prefrontal-core";
+
+fn user_pin_fixture(used: f64, module: &str) -> (Arc<Harness>, impl Drop) {
+    let (harness, pools) = fixture(Origin::Request, used);
+    harness.edit_config(|config| {
+        config["consumers"][USER_PIN_CONSUMER] = json!({"owner":module,"mode":"demand"});
+    });
+    (harness, pools)
+}
+
+fn user_pin_request() -> Value {
+    let mut request = selection_request(Origin::Request, USER_PIN_CONSUMER);
+    request["pin_origin"] = json!("user");
+    request
+}
+
+fn assert_reserve_limited(reply: &(FrameType, Value)) {
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    assert_eq!(reply.1["code"], "pin_unavailable", "{reply:?}");
+    assert_eq!(reply.1["detail"]["reason"], "quota_exhausted", "{reply:?}");
+    assert_eq!(reply.1["detail"]["pin"], MODEL, "{reply:?}");
+}
+
+#[tokio::test]
+async fn enrolled_user_pin_spends_below_keep_free() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = user_pin_fixture(85.0, USER_PIN_CALLER);
+    let caller = harness.bind(reserved(USER_PIN_CALLER), None).await;
+    let mut request = user_pin_request();
+    request.as_object_mut().unwrap().remove("pin_origin");
+    assert_reserve_limited(&caller.call("route.select", &request).await);
+    let reply = caller.call("route.select", &user_pin_request()).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(reply.1["result"]["route"]["provider"], "synthetic");
+    assert_eq!(reply.1["result"]["route"]["model"], "model");
+    assert!(reply.1.to_string().contains(EXEMPT), "{reply:?}");
+    assert_eq!(
+        reply.1["result"]["detail"]["score"]["objective"]["subscriptionPricing"]["availablePoints"],
+        15.0,
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn unenrolled_user_pin_keeps_the_reserve() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for module in [
+        "prefrontal-core-other",
+        "other-prefrontal-core",
+        "prefrontal-core.child",
+    ] {
+        let (harness, _pools) = user_pin_fixture(85.0, module);
+        // A core-owned scope must not enroll its caller.
+        let caller = harness
+            .bind(reserved(module), Some("pin-origin-project"))
+            .await;
+        assert_reserve_limited(&caller.call("route.select", &user_pin_request()).await);
+    }
+}
+
+#[tokio::test]
+async fn empty_pin_origin_callers_disables_default_enrollment() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = user_pin_fixture(85.0, USER_PIN_CALLER);
+    harness.edit_config(|config| config["pin_origin_callers"] = json!([]));
+    let caller = harness.bind(reserved(USER_PIN_CALLER), None).await;
+    assert_reserve_limited(&caller.call("route.select", &user_pin_request()).await);
+}
+
+#[tokio::test]
+async fn configured_pin_origin_caller_is_honoured() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let module = "custom-router-client";
+    let (harness, _pools) = user_pin_fixture(85.0, module);
+    harness
+        .edit_config(|config| config["pin_origin_callers"] = json!([format!("reserved:{module}")]));
+    let caller = harness.bind(reserved(module), None).await;
+    let reply = caller.call("route.select", &user_pin_request()).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert!(reply.1.to_string().contains(EXEMPT), "{reply:?}");
+}
+
+#[tokio::test]
+async fn reserve_limited_pin_without_known_reset_is_quota_exhausted() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = user_pin_fixture(85.0, USER_PIN_CALLER);
+    let mut state = crate::account_quota::AccountQuotaState::default();
+    crate::account_quota::apply_provider_reply(
+        &mut state,
+        "test-source",
+        &serde_json::to_vec(&json!({"result":[{
+            "provider":"test-source","apiProvider":"synthetic","account":"oauth-account",
+            "source":"vault","fetchedAt":crate::account_selection::rfc3339(NOW as i64),
+            "usage":{"primary":{"usedPercent":85.0,"windowMinutes":10080}}
+        }]}))
+        .unwrap(),
+        NOW as i64,
+    )
+    .unwrap();
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = state;
+    let caller = harness.bind(reserved(USER_PIN_CALLER), None).await;
+    let mut request = user_pin_request();
+    request.as_object_mut().unwrap().remove("pin_origin");
+    let reply = caller.call("route.select", &request).await;
+    assert_reserve_limited(&reply);
+    assert!(reply.1["detail"].get("reset_at_ms").is_none(), "{reply:?}");
+}
+
+#[tokio::test]
+async fn user_pin_cannot_spend_a_walled_account() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = user_pin_fixture(100.0, USER_PIN_CALLER);
+    let caller = harness.bind(reserved(USER_PIN_CALLER), None).await;
+    assert_reserve_limited(&caller.call("route.select", &user_pin_request()).await);
+}
+
+#[tokio::test]
+async fn pin_origin_invalid_value_is_refused() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for module in [USER_PIN_CALLER, "unenrolled-client"] {
+        let (harness, _pools) = user_pin_fixture(10.0, module);
+        let caller = harness.bind(reserved(module), None).await;
+        for invalid in [
+            json!("agent"),
+            json!(""),
+            json!(true),
+            json!({}),
+            json!([]),
+            json!(7),
+        ] {
+            let mut request = user_pin_request();
+            request["pin_origin"] = invalid;
+            let reply = caller.call("route.select", &request).await;
+            assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+            assert_eq!(reply.1["code"], "invalid_request", "{reply:?}");
+            assert_eq!(reply.1["detail"]["field"], "pin_origin", "{reply:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pin_origin_without_pin_is_refused() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for module in [USER_PIN_CALLER, "unenrolled-client"] {
+        let (harness, _pools) = user_pin_fixture(10.0, module);
+        let caller = harness.bind(reserved(module), None).await;
+        let mut request = user_pin_request();
+        request.as_object_mut().unwrap().remove("pin");
+        let reply = caller.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert_eq!(reply.1["code"], "invalid_request", "{reply:?}");
+        assert_eq!(reply.1["detail"]["field"], "pin_origin", "{reply:?}");
+    }
+}
+
+#[tokio::test]
+async fn null_pin_origin_is_absent_and_failed_user_pin_does_not_exempt_fallback() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = user_pin_fixture(85.0, USER_PIN_CALLER);
+    let caller = harness.bind(reserved(USER_PIN_CALLER), None).await;
+    let mut request = user_pin_request();
+    request["pin_origin"] = Value::Null;
+    assert_reserve_limited(&caller.call("route.select", &request).await);
+    let mut request = user_pin_request();
+    request["pin"] = json!("absent/model");
+    request["pin_fallback"] = json!("route");
+    let reply = caller.call("route.select", &request).await;
+    assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+    assert!(
+        reply.1.to_string().contains("subscription_reserve"),
+        "{reply:?}"
+    );
+}
+
 fn synthesizer_fixture(policy: Value) -> (Arc<Harness>, impl Drop) {
     let (harness, pools) = fixture(Origin::Request, 85.0);
     harness.edit_config(|config| {

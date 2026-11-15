@@ -33,6 +33,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::REPORT_ATTEMPT_OUTCOMES,
     "report_usage_run_id",
     "select_pin_slot",
+    cortexkit_role_routing::capabilities::SELECT_PIN_ORIGIN,
     "select_available_routes",
     cortexkit_role_routing::capabilities::SELECT_ELIGIBLE_ROUTES,
     "select_prefer_prompt_cache",

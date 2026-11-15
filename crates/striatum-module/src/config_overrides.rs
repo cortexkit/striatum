@@ -955,6 +955,14 @@ impl LiveConfig {
             .collect()
     }
 
+    /// Match the daemon-stamped full principal, never the scope owner or a suffix.
+    pub fn honours_pin_origin(&self, principal: &str) -> bool {
+        self.config
+            .pin_origin_callers
+            .iter()
+            .any(|caller| caller == principal)
+    }
+
     /// Operator owners add exact-name claims too, so conflicting owners lock
     /// the name instead of letting either source override the other.
     pub(crate) fn consumer_owners(&self) -> BTreeMap<String, String> {
@@ -1259,7 +1267,7 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
     /// Whole dotted consumer names; the longest matching override wins.
@@ -1277,6 +1285,10 @@ struct RoutingConfigFile {
     consumers: BTreeMap<String, ConsumerPolicy>,
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
+    /// Full caller principals allowed to mark user pins with `pin_origin`.
+    /// Absent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.
+    #[serde(default = "default_pin_origin_callers")]
+    pin_origin_callers: Vec<String>,
     /// How providers spell model ids and which model families the capability
     /// heuristic recognizes; see `ModelNamingConfig`.
     #[serde(default)]
@@ -1296,6 +1308,31 @@ struct RoutingConfigFile {
     retention: RetentionSection,
     #[serde(default)]
     accounts: crate::config_policy::ProviderAccountsPolicy,
+}
+
+fn default_pin_origin_callers() -> Vec<String> {
+    vec!["reserved:prefrontal-core".into()]
+}
+
+impl Default for RoutingConfigFile {
+    fn default() -> Self {
+        Self {
+            consumer_priorities: Default::default(),
+            concurrency: Default::default(),
+            model_routing: Default::default(),
+            providers: Default::default(),
+            default_variants: Default::default(),
+            consumers: Default::default(),
+            runners: Default::default(),
+            pin_origin_callers: default_pin_origin_callers(),
+            model_naming: Default::default(),
+            head_agents: Default::default(),
+            quota_model_pools: Default::default(),
+            catalog: Default::default(),
+            retention: Default::default(),
+            accounts: Default::default(),
+        }
+    }
 }
 
 /// Regenerate with `cargo run -p striatum-module --bin ck-striatum -- --print-config-schema`.

@@ -867,6 +867,23 @@ fn retired_account_model_families_load_with_named_warnings() {
 }
 
 #[test]
+fn pin_origin_enrollment_defaults_to_the_full_core_principal() {
+    let defaults = LiveConfig::default();
+    assert!(defaults.honours_pin_origin("reserved:prefrontal-core"));
+    for principal in [
+        "prefrontal-core",
+        "reserved:prefrontal-core-other",
+        "reserved:prefrontal-core.child",
+    ] {
+        assert!(!defaults.honours_pin_origin(principal));
+    }
+    let parsed = LiveConfig::new(parse_config("{}").unwrap(), None);
+    assert!(parsed.honours_pin_origin("reserved:prefrontal-core"));
+    let disabled = LiveConfig::new(parse_config(r#"{"pin_origin_callers":[]}"#).unwrap(), None);
+    assert!(!disabled.honours_pin_origin("reserved:prefrontal-core"));
+}
+
+#[test]
 fn generated_schema_is_current_and_closed() {
     let generated = routing_config_schema();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing-config.schema.json");
@@ -900,6 +917,12 @@ fn generated_schema_is_current_and_closed() {
     assert!(schema["$defs"].get("ModelFamilyRules").is_none());
     assert!(schema["properties"].get("model_families").is_none());
     let properties = &schema["properties"];
+    assert_eq!(properties["pin_origin_callers"]["type"], "array");
+    assert_eq!(properties["pin_origin_callers"]["items"]["type"], "string");
+    assert_eq!(
+        properties["pin_origin_callers"]["default"],
+        serde_json::json!(["reserved:prefrontal-core"])
+    );
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     assert!(schema["$defs"].get("AccountModelFamily").is_none());
     assert!(schema["$defs"]["ProviderAccountsPolicy"]["properties"]
