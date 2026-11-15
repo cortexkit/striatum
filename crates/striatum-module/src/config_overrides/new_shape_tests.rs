@@ -814,3 +814,19 @@ fn removed_substrates_setting_is_a_clear_config_error() {
         );
     }
 }
+
+#[test]
+fn converter_dropped_scoped_policy_entry_changes_v1_document_and_policy() {
+    let consumer = "prefrontal-core.mason";
+    let source = json!({"model_routing":{"exclude":{consumer:["p/m"]}}});
+    let converted = crate::config_convert::convert_value(source.clone()).unwrap();
+    assert_eq!(converted["models"]["p/m"]["not_for"], json!([consumer]));
+    assert!(!config(converted.clone()).route_allowed(consumer, "p/m", true));
+
+    let mut without_entry = source;
+    without_entry["model_routing"]["exclude"][consumer] = json!([]);
+    let converted_without = crate::config_convert::convert_value(without_entry).unwrap();
+    assert_ne!(converted["models"], converted_without["models"]);
+    assert!(converted_without["models"].get("p/m").is_none());
+    assert!(config(converted_without).route_allowed(consumer, "p/m", true));
+}
