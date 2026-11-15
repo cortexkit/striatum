@@ -234,9 +234,9 @@ impl AccountTx<'_> {
                         .is_none_or(|class| Some(class as u32) == size)
             })
             .collect();
-        // An admission authorized to test a whole-account fence can clear that
-        // fence without a quota reading. Pool-scoped fences additionally require
-        // the success scope to cover their pool and model.
+        // Pool-scoped fences require the success scope to cover their pool
+        // and model. Whole-account fences pass the scope to the probe healer,
+        // which proves only the recovery-set pools the request used.
         let mut captured = Vec::new();
         for origin in &origins {
             if origin.kind == "account" {
@@ -276,6 +276,7 @@ impl AccountTx<'_> {
             &admission.model,
             admission.committed_at,
             &captured,
+            scope,
             now,
         )?;
         let serving: Vec<_> = self
@@ -380,6 +381,7 @@ impl AccountTx<'_> {
                     &model,
                     at,
                     &self.fence_rechecks()?,
+                    effects.quota_scope.as_ref(),
                     now,
                 )?;
                 // Only the first report may heal older matching serving evidence
