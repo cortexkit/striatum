@@ -3372,8 +3372,9 @@ pub(crate) fn runner_for_route(
     if !needs_runner_pin(catalog_targets, provider) {
         if let Some(classes) = classes {
             // The claim answers whether the launch must pin its credential,
-            // decided on the state it claimed on; a required pin is never
-            // dropped for an unpinned target.
+            // decided on the state it claimed on, not on the selection's
+            // older read. A credential id that does not parse as a pin
+            // (`method:provider[:account]`) keeps the plain target, as before.
             let pin = classes.claim_launch_credential(
                 store,
                 provider,
@@ -3382,15 +3383,10 @@ pub(crate) fn runner_for_route(
                 true,
                 owner,
             )?;
-            if let Some(id) = pin {
-                return striatum_core::runner::RunnerModel::pinned(&id, model, variant)
-                    .map(|runner| (runner, None))
-                    .ok_or_else(|| account_selection::LaunchRefusal::Refused {
-                        code: "no_eligible_account".into(),
-                        message: format!(
-                            "{provider}/{model}: the launch must pin credential {id}, which names no pin"
-                        ),
-                    });
+            if let Some(runner) = pin
+                .and_then(|id| striatum_core::runner::RunnerModel::pinned(&id, model, variant))
+            {
+                return Ok((runner, None));
             }
         }
         return Ok((
