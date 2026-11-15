@@ -35,6 +35,32 @@ pub(super) fn estimate(
     model: &str,
 ) -> Option<Estimate> {
     let route = format!("{provider}/{model}");
+    if request.kind.as_str() == "search" {
+        let rates = catalog.media_rates(&route)?;
+        let mut unit_rates = BTreeMap::new();
+        let mut cost = 0.0;
+        for (key, rate) in rates {
+            if !matches!(
+                key.as_str(),
+                "rate.request.per_request" | "rate.output.per_result"
+            ) {
+                return None;
+            }
+            let amount = rate.unit_price?;
+            cost += amount;
+            unit_rates.insert(key.strip_prefix("rate.")?.to_owned(), amount);
+        }
+        if unit_rates.is_empty() || !cost.is_finite() {
+            return None;
+        }
+        return Some(Estimate {
+            cost,
+            price: unit_price(unit_rates, None),
+            basis: "metered",
+            minimum: None,
+            quantity_known: false,
+        });
+    }
     if matches!(
         request.kind,
         wire::Kind::Transcribe | wire::Kind::StreamTranscribe

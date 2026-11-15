@@ -42,6 +42,51 @@ pub(super) fn for_effects(request: &ReportRequest, now: u64) -> ReportRequest {
     effects
 }
 
+pub(super) fn search_effects(
+    request: &ReportRequest,
+    decision: &striatum_store::V1Decision,
+    now: u64,
+) -> V1ReportEffects {
+    use striatum_core::route_state_store::{RouteStateUpdate, RouteWallClass};
+    let Some(attempt) = &request.attempt_outcome else {
+        return V1ReportEffects::default();
+    };
+    let mut update = RouteStateUpdate {
+        observed_at_ms: Some(now.min(i64::MAX as u64) as i64),
+        unscoped_wall: true,
+        ..Default::default()
+    };
+    match attempt.status {
+        AttemptStatus::Served | AttemptStatus::ServedEmpty => {
+            update.success_ema = Some(1.0);
+        }
+        AttemptStatus::Throttled | AttemptStatus::Unavailable => {
+            let wait = attempt
+                .retry_after_ms
+                .unwrap_or(striatum_core::account_wall::TRANSIENT_BACKOFF_MS as u64);
+            update.cooldown_until = Some(now.saturating_add(wait) as f64);
+        }
+        AttemptStatus::Quota | AttemptStatus::Credential => {
+            // The module owns the account. Without an account identity, the
+            // refusal can only block this route, for the non-quota maximum.
+            update.cooldown_until = Some(
+                now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS as u64)
+                    as f64,
+            );
+            update.wall_class = Some(RouteWallClass::Billing);
+        }
+        _ => return V1ReportEffects::default(),
+    }
+    V1ReportEffects {
+        route_state: Some((
+            striatum_core::make_route_key(&decision.provider, &decision.model, None),
+            striatum_core::make_capacity_key(&decision.provider, &decision.model),
+            update,
+        )),
+        ..Default::default()
+    }
+}
+
 pub(super) fn account_effects(
     request: &ReportRequest,
     credentials: &crate::broca_credentials::BrocaCredentials,

@@ -48,6 +48,8 @@ mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
+#[cfg(test)]
+mod search_tests;
 mod select;
 #[cfg(test)]
 mod service_tier_tests;

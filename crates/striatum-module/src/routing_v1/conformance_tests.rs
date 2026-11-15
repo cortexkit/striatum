@@ -1928,6 +1928,14 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
     for check in [
+        "select_search_advertisement",
+        "select_search_declarations",
+        "select_search_nonce",
+        "select_search_requirements",
+        "select_search_privacy",
+        "select_search_allowance",
+        "select_search_ranking",
+        "select_search_reports",
         "observe_credential_refused_requires_backoff",
         "credential_refused_blocks_credential",
         "credential_refused_retry_at_ms_refused",
