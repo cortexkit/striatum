@@ -3791,3 +3791,71 @@ fn a_recovery_from_older_evidence_does_not_lift_a_renewed_pool_block() {
         "a recovery from the current evidence lifts it"
     );
 }
+
+/// A decision checks the clocks of the empty provider, and their clears,
+/// against SQL, and nothing else of it (`check_provider_rows`). That leaves
+/// nothing out: the `fence_origin` view projects the empty provider for the
+/// principal branch alone, so on a fixture with a row in every block table
+/// SQL's only empty-provider rows are the principal clocks, and the state's
+/// empty-provider scope holds those clocks and nothing in any other table.
+/// A principal clock the state holds stale is still caught.
+#[test]
+fn only_principal_rows_have_the_empty_provider() {
+    let rig = rig("block-state-empty-provider");
+    rig.run(|conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW));
+    rig.sql(format!(
+        "INSERT INTO account_principal_exclusion(principal,admission_id,credential_id,runner_view_digest,roster_view_digest,observation_id,recorded_at)
+         VALUES ('principal','admission','credential','runner','roster',NULL,{NOW});"
+    ));
+    rig.run(fence_rechecks::sync);
+    let (view, empty_sources) = rig
+        .store
+        .with_reader_for_test(|conn| {
+            let view = conn
+                .prepare("SELECT DISTINCT kind FROM fence_origin WHERE provider=''")?
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut empty_sources = Vec::new();
+            for (table, column) in PROVIDER_COLUMNS {
+                let count: i64 = conn.query_row(
+                    &format!("SELECT count(*) FROM {} WHERE {column}=''", BLOCK_TABLES[table]),
+                    [],
+                    |r| r.get(0),
+                )?;
+                empty_sources.push((BLOCK_TABLES[table], count));
+            }
+            Ok((view, empty_sources))
+        })
+        .unwrap();
+    assert_eq!(view, vec!["principal".to_owned()], "only the principal branch projects ''");
+    for (table, count) in empty_sources {
+        if table == BLOCK_TABLES[CLOCK_TABLE] {
+            assert!(count > 0, "the principal clocks have the empty provider");
+        } else {
+            assert_eq!(count, 0, "{table} holds no row of the empty provider");
+        }
+    }
+    let state = rig.published();
+    for (table, _) in PROVIDER_COLUMNS {
+        let rows: Vec<_> = state.tables[table].scope_rows("").collect();
+        if table == CLOCK_TABLE {
+            assert!(!rows.is_empty());
+            for (_, held) in rows {
+                assert!(
+                    matches!(held, Held::Clock(block, _) if block.kind == "principal"),
+                    "only principal clocks"
+                );
+            }
+        } else {
+            assert!(rows.is_empty(), "{} holds no empty-provider row", BLOCK_TABLES[table]);
+        }
+    }
+    let stale = rig.published();
+    rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='principal';".into());
+    let loads = rig.decide_next_on(stale);
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, |tx| tx.check_decision_inputs(&[""]))
+        .unwrap();
+    assert_eq!(rig.loads_since(loads), 2, "a stale principal clock is caught");
+    rig.check(&[NOW], "after the empty-provider check");
+}

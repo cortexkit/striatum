@@ -398,7 +398,16 @@ fn success_pools_check_sql() -> String {
     )
 }
 
-/// The keyed check of a clock, or of its route clears, by origin.
+/// The check of the route clears of a provider's clocks, by the clear
+/// table's primary key under the clocks' provider index.
+fn route_clears_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} {} WHERE (kind,origin_key) IN (SELECT kind,origin_key FROM fence_recheck WHERE provider=?1)",
+        SELECTS[ROUTE_CLEAR_TABLE]
+    )
+}
+
+/// The keyed check of a clock by origin.
 fn by_origin_check_sql(table: usize) -> String {
     format!("{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2", SELECTS[table])
 }
@@ -417,7 +426,7 @@ pub fn reviewed_exempt_reads() -> Vec<String> {
             .iter()
             .map(|(table, column)| provider_rows_check_sql(*table, column)),
     );
-    reads.push(by_origin_check_sql(ROUTE_CLEAR_TABLE));
+    reads.push(route_clears_check_sql());
     reads.push(exclusions_check_sql());
     reads.push(success_pools_check_sql());
     reads.push(by_origin_check_sql(CLOCK_TABLE));
@@ -836,18 +845,78 @@ impl<K: Eq + Hash + Clone, V: Clone + PartialEq> PartialEq for Shards<K, V> {
     }
 }
 
-/// One table's held rows by rowid, and the rowid of each primary key.
+/// One table's held rows by rowid, the rowid of each primary key, and the
+/// rowids of each scope ([`scope_of`]) so a decision check can find the
+/// rows it compares without visiting the rest.
 #[derive(Clone, Default, PartialEq)]
 struct Table {
+    /// This table's position in [`BLOCK_TABLES`], which decides its scopes.
+    table: usize,
     rows: Shards<i64, (String, Arc<Held>)>,
     keys: Shards<String, i64>,
+    scopes: Shards<String, Shards<i64, ()>>,
+}
+
+/// The scope a decision check looks a held row up by, if its table has one:
+/// the provider of a table in [`PROVIDER_COLUMNS`] (as [`row_provider`]
+/// names it), an exclusion's principal and admission ([`exclusion_scope`]),
+/// a route clear's clock ([`clear_scope`]), and a success pool's fence.
+fn scope_of(table: usize, key: &str, held: &Held) -> Option<String> {
+    if PROVIDER_COLUMNS.iter().any(|(provider_table, _)| *provider_table == table) {
+        return row_provider(table, key, held);
+    }
+    match (table, held) {
+        (EXCLUSION_TABLE, _) => {
+            let parts: Vec<serde_json::Value> = serde_json::from_str(key).ok()?;
+            Some(exclusion_scope(parts.first()?.as_str()?, parts.get(1)?.as_str()?))
+        }
+        (ROUTE_CLEAR_TABLE, Held::RouteClear(clear)) => Some(clear_scope(&clear.kind, &clear.origin_key)),
+        (SUCCESS_POOL_TABLE, Held::SuccessPool(pool)) => Some(pool.fence_id.clone()),
+        _ => None,
+    }
+}
+
+/// The scope of one admission's principal exclusions.
+fn exclusion_scope(principal: &str, admission_id: &str) -> String {
+    serde_json::json!([principal, admission_id]).to_string()
+}
+
+/// The scope of one clock's route clears.
+fn clear_scope(kind: &str, origin_key: &str) -> String {
+    serde_json::json!([kind, origin_key]).to_string()
 }
 
 impl Table {
+    fn new(table: usize) -> Self {
+        Self {
+            table,
+            ..Self::default()
+        }
+    }
+
+    /// The held rows of one scope, with their rowids, in no particular order.
+    fn scope_rows(&self, scope: &str) -> impl Iterator<Item = (i64, &Held)> {
+        self.scopes
+            .get(&scope.to_owned())
+            .into_iter()
+            .flat_map(|rowids| rowids.iter())
+            .filter_map(|(rowid, ())| self.rows.get(rowid).map(|(_, held)| (*rowid, &**held)))
+    }
+
     fn remove_rowid(&mut self, rowid: i64) {
-        if let Some((key, _)) = self.rows.remove(&rowid) {
+        if let Some((key, held)) = self.rows.remove(&rowid) {
             if self.keys.get(&key) == Some(&rowid) {
                 self.keys.remove(&key);
+            }
+            if let Some(scope) = scope_of(self.table, &key, &held) {
+                if let Some(mut rowids) = self.scopes.get(&scope).cloned() {
+                    rowids.remove(&rowid);
+                    if rowids.len == 0 {
+                        self.scopes.remove(&scope);
+                    } else {
+                        self.scopes.insert(scope, rowids);
+                    }
+                }
             }
         }
     }
@@ -865,6 +934,11 @@ impl Table {
         if let Some(held) = held {
             self.rows.insert(rowid, (key.to_owned(), Arc::clone(held)));
             self.keys.insert(key.to_owned(), rowid);
+            if let Some(scope) = scope_of(self.table, key, held) {
+                let mut rowids = self.scopes.get(&scope).cloned().unwrap_or_default();
+                rowids.insert(rowid, ());
+                self.scopes.insert(scope, rowids);
+            }
         }
     }
 }
@@ -999,7 +1073,7 @@ impl BlockState {
         }
         let mut state = Self {
             enabled: true,
-            tables: vec![Table::default(); BLOCK_TABLES.len()],
+            tables: (0..BLOCK_TABLES.len()).map(Table::new).collect(),
         };
         for (index, select) in SELECTS.iter().enumerate() {
             let mut statement = conn.prepare(&format!("{MAINTENANCE_READ} {select}"))?;
@@ -1058,6 +1132,7 @@ impl BlockState {
             && self.tables.iter().zip(&other.tables).all(|(a, b)| {
                 Arc::ptr_eq(&a.rows.shards, &b.rows.shards)
                     && Arc::ptr_eq(&a.keys.shards, &b.keys.shards)
+                    && Arc::ptr_eq(&a.scopes.shards, &b.scopes.shards)
             })
     }
 
@@ -1364,96 +1439,91 @@ impl BlockState {
     ///
     /// Every statement is keyed by `provider`: each table's primary key or
     /// an index leads with its provider column (`account_fence_by_account`,
-    /// `model_route_state(provider_id)`, `fence_recheck_scope`), and a
-    /// clock's clears by the clear table's primary key.
+    /// `model_route_state(provider_id)`, `fence_recheck_scope`), and the
+    /// clocks' clears by the clear table's primary key. The state side finds
+    /// its rows through the table's scope index, so the check visits only
+    /// `provider`'s rows.
+    ///
+    /// The empty provider names the principal clocks: the view projects a
+    /// principal exclusion's provider as `''`, and every other source row
+    /// carries the provider it was recorded for. So for it only the clocks
+    /// and their clears are compared; the other tables and the success pools
+    /// hold no row of the empty provider
+    /// (`only_principal_rows_have_the_empty_provider`).
     pub(crate) fn check_provider_rows(
         &self,
         conn: &Connection,
         provider: &str,
     ) -> rusqlite::Result<()> {
-        for (table, column) in PROVIDER_COLUMNS {
-            let mut in_sql: Vec<(i64, Held)> = Vec::new();
-            let mut statement = conn.prepare_cached(&provider_rows_check_sql(table, column))?;
-            let mut rows = statement.query([provider])?;
-            while let Some(row) = rows.next()? {
-                if let (rowid, _, Some(held)) = decode(table, row)? {
-                    in_sql.push((rowid, held));
-                }
-            }
-            in_sql.sort_by_key(|(rowid, _)| *rowid);
-            let mut in_state: Vec<(i64, Held)> = self.tables[table]
-                .rows
-                .iter()
-                .filter(|(_, (key, held))| row_provider(table, key, held).as_deref() == Some(provider))
-                .map(|(rowid, (_, held))| (*rowid, (**held).clone()))
-                .collect();
-            in_state.sort_by_key(|(rowid, _)| *rowid);
-            if in_sql != in_state {
-                return Err(diverged(format_args!(
-                    "the {} rows of provider {provider} differ from the state's",
-                    BLOCK_TABLES[table]
-                )));
-            }
+        let tables: &[(usize, &str)] = if provider.is_empty() {
+            &[(CLOCK_TABLE, "provider")]
+        } else {
+            &PROVIDER_COLUMNS
+        };
+        for (table, column) in tables {
+            self.compare_rows(
+                conn,
+                *table,
+                &provider_rows_check_sql(*table, column),
+                [provider],
+                self.tables[*table].scope_rows(provider),
+                format_args!("the {} rows of provider {provider}", BLOCK_TABLES[*table]),
+            )?;
         }
-        for (_, held) in self.rows_of(CLOCK_TABLE) {
-            let Held::Clock(block, _) = held else { continue };
-            if block.scope.provider != provider {
-                continue;
-            }
-            let mut in_sql: Vec<(i64, Held)> = Vec::new();
-            let mut statement = conn.prepare_cached(&by_origin_check_sql(ROUTE_CLEAR_TABLE))?;
-            let mut rows = statement.query([&block.kind, &block.origin_key])?;
-            while let Some(row) = rows.next()? {
-                if let (rowid, _, Some(held)) = decode(ROUTE_CLEAR_TABLE, row)? {
-                    in_sql.push((rowid, held));
-                }
-            }
-            in_sql.sort_by_key(|(rowid, _)| *rowid);
-            let mut in_state: Vec<(i64, Held)> = self
-                .rows_of(ROUTE_CLEAR_TABLE)
-                .filter(|(_, held)| {
-                    matches!(held, Held::RouteClear(clear)
-                        if clear.kind == block.kind && clear.origin_key == block.origin_key)
-                })
-                .map(|(rowid, held)| (rowid, held.clone()))
-                .collect();
-            in_state.sort_by_key(|(rowid, _)| *rowid);
-            if in_sql != in_state {
-                return Err(diverged(format_args!(
-                    "the route clears of {} origin {} differ from the state's",
-                    block.kind, block.origin_key
-                )));
-            }
+        // The clocks agree by now, so their clears are those of the
+        // provider's clocks in SQL too.
+        let clears = self.tables[CLOCK_TABLE]
+            .scope_rows(provider)
+            .filter_map(|(_, held)| match held {
+                Held::Clock(block, _) => Some(clear_scope(&block.kind, &block.origin_key)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.compare_rows(
+            conn,
+            ROUTE_CLEAR_TABLE,
+            &route_clears_check_sql(),
+            [provider],
+            clears
+                .iter()
+                .flat_map(|scope| self.tables[ROUTE_CLEAR_TABLE].scope_rows(scope)),
+            format_args!("the route clears of provider {provider}'s clocks"),
+        )?;
+        if provider.is_empty() {
+            return Ok(());
         }
         // The pools a success healed of the provider's active account
         // fences, which decide which of a fence's pools still block. The
         // fences themselves agree by now.
-        let fences: std::collections::HashSet<String> = self
-            .raws(ACCOUNT_FENCE_TABLE)
-            .filter_map(|(_, raw)| match raw {
-                Raw::AccountFence { row, .. } if row.provider == provider => Some(row.fence_id.clone()),
+        let fences = self.tables[ACCOUNT_FENCE_TABLE]
+            .scope_rows(provider)
+            .filter_map(|(_, held)| match held {
+                Held::Source {
+                    raw: Raw::AccountFence { row, .. },
+                    ..
+                } => Some(row.fence_id.as_str()),
                 _ => None,
-            })
-            .collect();
-        self.check_rows(
+            });
+        self.compare_rows(
             conn,
             SUCCESS_POOL_TABLE,
             &success_pools_check_sql(),
             [provider],
-            |_, held| matches!(held, Held::SuccessPool(pool) if fences.contains(&pool.fence_id)),
+            fences.flat_map(|fence| self.tables[SUCCESS_POOL_TABLE].scope_rows(fence)),
             format_args!("the success pools of provider {provider}"),
         )
     }
 
     /// Compare the rows `statement` (bound to `params`) returns from SQL with
-    /// the rows of `table` this state holds that `keep` selects, by rowid.
-    fn check_rows(
+    /// `held`, the rows of `table` this state holds for it, by rowid. Neither
+    /// side's rows are cloned.
+    fn compare_rows<'a>(
         &self,
         conn: &Connection,
         table: usize,
         statement: &str,
         params: impl rusqlite::Params,
-        keep: impl Fn(&str, &Held) -> bool,
+        held: impl Iterator<Item = (i64, &'a Held)>,
         what: std::fmt::Arguments<'_>,
     ) -> rusqlite::Result<()> {
         let mut in_sql: Vec<(i64, Held)> = Vec::new();
@@ -1465,14 +1535,14 @@ impl BlockState {
             }
         }
         in_sql.sort_by_key(|(rowid, _)| *rowid);
-        let mut in_state: Vec<(i64, Held)> = self.tables[table]
-            .rows
-            .iter()
-            .filter(|(_, (key, held))| keep(key, held))
-            .map(|(rowid, (_, held))| (*rowid, (**held).clone()))
-            .collect();
+        let mut in_state: Vec<(i64, &Held)> = held.collect();
         in_state.sort_by_key(|(rowid, _)| *rowid);
-        if in_sql != in_state {
+        let same = in_sql.len() == in_state.len()
+            && in_sql
+                .iter()
+                .zip(&in_state)
+                .all(|((sql_rowid, sql), (rowid, held))| sql_rowid == rowid && sql == *held);
+        if !same {
             return Err(diverged(format_args!("{what} differ from the state's")));
         }
         Ok(())
@@ -1487,17 +1557,12 @@ impl BlockState {
         principal: &str,
         admission_id: &str,
     ) -> rusqlite::Result<()> {
-        self.check_rows(
+        self.compare_rows(
             conn,
             EXCLUSION_TABLE,
             &exclusions_check_sql(),
             [principal, admission_id],
-            |key, _| {
-                serde_json::from_str::<Vec<serde_json::Value>>(key).is_ok_and(|parts| {
-                    parts.first().and_then(|v| v.as_str()) == Some(principal)
-                        && parts.get(1).and_then(|v| v.as_str()) == Some(admission_id)
-                })
-            },
+            self.tables[EXCLUSION_TABLE].scope_rows(&exclusion_scope(principal, admission_id)),
             format_args!("the exclusions of admission {principal} {admission_id}"),
         )
     }
