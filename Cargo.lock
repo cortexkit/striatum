@@ -339,15 +339,15 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing-conformance"
-version = "0.10.36"
+version = "0.10.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7394baae7bd793e783c3f702b3f7a01451f0d1b699b73f9bff13213db2d9cd56"
+checksum = "e2d14ad82926092a6335aef20dca159a51da47673f1c892545607e7f6e9f1a35"
 dependencies = [
  "async-trait",
  "cortexkit-role-routing",
  "serde",
  "serde_json",
- "subc-protocol 0.34.1",
+ "subc-protocol 0.37.0",
 ]
 
 [[package]]

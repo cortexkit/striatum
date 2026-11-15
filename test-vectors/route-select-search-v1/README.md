@@ -1,7 +1,10 @@
 # `route.select` search v1 wire pairs
 
 These synthetic Plexus fixtures are captured from striatum's real frame handler,
-using routing 0.7.32 and conformance 0.10.36. No daemon or provider is contacted.
+using `cortexkit-role-routing` 0.7.32 and `cortexkit-role-routing-conformance`
+0.10.36. Final verification uses `cortexkit-role-routing-conformance` 0.10.37,
+whose declared-search placement case follows the search selection contract.
+No daemon or provider is contacted.
 The nonce-verified `plexus` module declares consumer `plexus.web_search` with
 selector `plexus`, plus three `search-provider/v1` routes. Search credentials
 remain owned by that module; routing has no credential fixture for them.
