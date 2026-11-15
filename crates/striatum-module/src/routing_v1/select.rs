@@ -643,7 +643,7 @@ fn record_pinned_refusal(
 pub(super) struct RequestInputs {
     pub(super) live_config: std::sync::Arc<config_overrides::LiveConfig>,
     pub(super) operator_config: std::sync::Arc<config_overrides::LiveConfig>,
-    pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
+    pub(super) catalog_snapshot: std::sync::Arc<striatum_store::CatalogFactsSnapshot>,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
     policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
