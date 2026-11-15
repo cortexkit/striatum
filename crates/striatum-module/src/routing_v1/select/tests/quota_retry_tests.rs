@@ -186,6 +186,31 @@ fn key_pool_quota_retry_by_recheck_and_keep_near_reset() {
                 RECOVERY_NOW,
             );
             assert_eq!(refusal.wait_until_ms(), expected, "{refusal:?}");
+            if reset.is_none() {
+                assert!(!refusal.detail.contains_key("reset_at_ms"), "{refusal:?}");
+            }
         }
+    }
+}
+
+#[test]
+fn capped_account_limit_message_names_a_recheck_not_a_reset() {
+    for pin in [Some("pool/model"), None] {
+        let capped = quota_account_limit_refusal(pin, Some(DISTANT_WALL as i64), RECOVERY_NOW);
+        assert_eq!(capped.wait_until_ms(), Some(RECHECK));
+        assert!(capped
+            .message
+            .contains("next time to check for account headroom"));
+        assert!(!capped.message.contains("reset"));
+        assert!(!capped.message.contains("frees up"));
+        for reset in [Some(ACCOUNT_RESET as i64), None] {
+            assert_eq!(
+                quota_account_limit_refusal(pin, reset, RECOVERY_NOW).message,
+                account_limit_refusal(pin, reset).message,
+            );
+        }
+        assert!(account_limit_refusal(pin, Some(DISTANT_WALL as i64))
+            .message
+            .contains("time an account frees up"));
     }
 }

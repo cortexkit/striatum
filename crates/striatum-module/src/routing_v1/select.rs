@@ -3248,16 +3248,7 @@ impl<'a> Selection<'a> {
                     | "account_pool_exhausted"
                     | "account_pool_reserve_limited"
             ) {
-                account_limit_refusal(
-                    None,
-                    super::quota_retry_hint(
-                        refusal
-                            .reset_at_ms
-                            .and_then(|reset| u64::try_from(reset).ok()),
-                        self.now as u64,
-                    )
-                    .map(|reset| reset as i64),
-                )
+                quota_account_limit_refusal(None, refusal.reset_at_ms, self.now as u64)
             } else {
                 provider_refusal(&refusal.code, refusal.message)
             }
@@ -3299,23 +3290,32 @@ fn account_limit_refusal(pin: Option<&str>, reset: Option<i64>) -> Refusal {
         None => Refusal::no_route(NoRouteReason::parse("accounts_blocked"), reset),
     };
     refusal.message = "Every account that can serve this route has reached its limit. \
-        The detail gives the next time to check for account headroom, when routing knows it."
+        The detail gives the time an account frees up, when routing knows it."
         .into();
+    refusal
+}
+
+fn quota_account_limit_refusal(pin: Option<&str>, reset: Option<i64>, now: u64) -> Refusal {
+    let real_reset = reset.and_then(|reset| u64::try_from(reset).ok());
+    let retry = super::quota_retry_hint(real_reset, now);
+    let mut refusal = account_limit_refusal(pin, retry.map(|retry| retry as i64));
+    if retry != real_reset {
+        refusal.message = "Every account that can serve this route has reached its limit. \
+            The detail gives the next time to check for account headroom, when routing knows it."
+            .into();
+    }
     refusal
 }
 
 fn pool_select_refusal(refusal: key_pool::PoolRefusal, pin: Option<&str>, now: u64) -> Refusal {
     if refusal.code == striatum_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED {
-        account_limit_refusal(
+        quota_account_limit_refusal(
             pin,
-            super::quota_retry_hint(
-                refusal
-                    .detail
-                    .as_ref()
-                    .and_then(|detail| detail["earliestResetAtMs"].as_u64()),
-                now,
-            )
-            .map(|reset| reset as i64),
+            refusal
+                .detail
+                .as_ref()
+                .and_then(|detail| detail["earliestResetAtMs"].as_i64()),
+            now,
         )
     } else {
         provider_refusal(&refusal.code, refusal.message)

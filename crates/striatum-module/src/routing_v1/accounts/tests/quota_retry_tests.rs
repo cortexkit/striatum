@@ -90,3 +90,15 @@ fn mixed_account_pool_retry_follows_the_named_recovery_cause() {
         assert_eq!(refusal.wait_until_ms(), Some(expected), "{refusal:?}");
     }
 }
+
+#[test]
+fn quota_refusals_without_known_resets_stay_untimed() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for code in ["account_pool_exhausted", "account_pool_reserve_limited"] {
+        let detail = json!({"exclusions":[{"account_id":"quota-account", "reason":"below_reserve", "window":"seven_day"}]});
+        let refusal = account_refusal(code, "no known reset".into(), Some(&detail));
+        assert_eq!(refusal.wait_until_ms(), None);
+        assert!(!refusal.detail.contains_key("reset_at_ms"), "{refusal:?}");
+        assert_eq!(refusal.message, "no known reset");
+    }
+}
