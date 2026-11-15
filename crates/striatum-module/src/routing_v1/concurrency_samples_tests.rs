@@ -7,7 +7,7 @@ use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::account_classes_tests::setup;
-use super::conformance_tests::reserved;
+use super::conformance_tests::{install_catalog, install_panel_families, reserved, Harness};
 
 const START: u64 = 1_800_000_000_000;
 const REFUSED_AT: u64 = START + 48_000;
@@ -130,6 +130,127 @@ async fn capture(stem: &str) -> Sample {
     }
 }
 
+async fn capture_panel(all_full: bool) -> Sample {
+    let _clock = crate::InjectedClock::set(START);
+    let _ids = striatum_store::replay::Inputs::new(START as i64).install();
+    let harness = Harness::new("concurrency-panel-samples");
+    // Remove seeded routes before installing a minimal catalog so even nested
+    // admission diagnostics contain only the synthetic panel candidates.
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute("DELETE FROM model_facts", [])
+        .unwrap();
+    let mut catalog = cortexkit_role_routing_conformance::fixture::catalog();
+    let original = catalog.models[0].clone();
+    catalog.models = ["claude", "gpt", "gemini"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, family)| {
+            let mut model = original.clone();
+            model.provider = format!("synthetic-{index}");
+            model.model = "panel-model".into();
+            model.family = Some(family.into());
+            model.iq = 90;
+            model.context_window = 200_000;
+            model.max_output_tokens = 32_000;
+            model
+        })
+        .collect();
+    catalog.accounts.clear();
+    catalog.runners.truncate(1);
+    catalog.runners[0].module = "broca".into();
+    let routes: Vec<_> = catalog
+        .models
+        .iter()
+        .map(|model| model.route_key())
+        .collect();
+    catalog.runners[0].route_keys = routes.clone();
+    install_catalog(&harness, &catalog);
+    install_panel_families(&harness, &catalog);
+    assert_eq!(harness.store().get_facts().unwrap().len(), 3);
+    harness.edit_config(|config| {
+        config["consumers"] = json!({"prefrontal-core.athena":{
+            "owner":"prefrontal-core","pay_per_token":true}});
+        config["panels"]["audit"] = json!({"topK":3,"by":"iq","extra":0,"floor":0});
+        config["runners"] = json!([{"module":"broca","via_vault":true}]);
+        config["concurrency"] = json!({"enforcement_enabled":true,"providers":{
+            "synthetic-0":{"limit":1},"synthetic-1":{"limit":1},
+            "synthetic-2":{"limit":1}}});
+    });
+    let runner = harness.bind(reserved("broca"), None).await;
+    let consumer = harness.bind(reserved("prefrontal-core"), None).await;
+    // Each provider has one eligible API-key account. Leave only the final
+    // provider free for the partial panel, without fabricating reservations.
+    for model in catalog.models.iter().take(if all_full { 3 } else { 2 }) {
+        let account = format!("catalog-account-{}-apikey", model.provider);
+        let reply = runner
+            .call(
+                "route.account_for",
+                &json!({"provider":model.provider,"model":model.model,
+                    "conversation_key":account,"admission_id":format!("fill-{account}")}),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
+        assert_eq!(reply.1["result"]["account"]["account_id"], account);
+    }
+    let _refusal_clock = crate::InjectedClock::set(REFUSED_AT);
+    let frame = consumer.request_frame(
+        "route.select_panel",
+        &json!({"class":"audit","consumer":"prefrontal-core.athena",
+            "available_routes":routes,"runners":["broca"],"seed":"fixed"}),
+    );
+    let request = frame.body.clone();
+    let reply = harness.handle(frame).await;
+    Sample {
+        request,
+        reply: reply.body,
+        frame_type: reply.header.ty,
+        legacy_reply: None,
+    }
+}
+
+fn panel_shortfall(sample: &Sample, seats: usize) {
+    assert_eq!(
+        sample.frame_type,
+        FrameType::Response,
+        "{}",
+        String::from_utf8_lossy(&sample.reply)
+    );
+    let body: Value = serde_json::from_slice(&sample.reply).unwrap();
+    let request: Value = serde_json::from_slice(&sample.request).unwrap();
+    let request = cortexkit_role_routing::panel::parse_select_panel_request_serving(
+        &request["params"],
+        super::describe::CAPABILITIES,
+    )
+    .unwrap();
+    let answer = serde_json::from_value(body["result"].clone()).unwrap();
+    cortexkit_role_routing::panel::check_panel_answer(&request, &answer).unwrap();
+    let result = &body["result"];
+    assert_eq!(result["seats"].as_array().unwrap().len(), seats, "{body}");
+    assert_eq!(result["shortfall"]["code"], "size_reduced", "{body}");
+    let causes = result["shortfall"]["detail"]["causes"].as_array().unwrap();
+    assert_eq!(causes.len(), 3 - seats, "{body}");
+    for cause in causes {
+        assert_eq!(cause["reason"], "no_route", "{body}");
+        assert_eq!(cause["reset_at_ms"], RESET, "{body}");
+        assert_eq!(
+            cause["detail"]["detail"]["reason"], "concurrency_full",
+            "{body}"
+        );
+        assert_eq!(cause["detail"]["detail"]["reset_at_ms"], RESET, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn panel_all_full_answers_with_zero_seats_and_concurrency_shortfall() {
+    panel_shortfall(&capture_panel(true).await, 0);
+}
+
+#[tokio::test]
+async fn panel_partial_answers_with_one_seat_and_concurrency_shortfall() {
+    panel_shortfall(&capture_panel(false).await, 1);
+}
+
 #[tokio::test]
 async fn basal_flow_select_refuses_only_the_synthetic_route() {
     let sample = capture("basal-flow-select").await;
@@ -236,6 +357,16 @@ async fn handler_samples_regenerate_byte_for_byte() {
         let sample = capture(stem).await;
         refusal(&sample);
         // Keep the handler's bytes, not a parsed and reserialized equivalent.
+        assert!(samples
+            .insert(format!("{stem}.request.json"), sample.request)
+            .is_none());
+        assert!(samples
+            .insert(format!("{stem}.reply.json"), sample.reply)
+            .is_none());
+    }
+    for (stem, all_full, seats) in [("panel-all-full", true, 0), ("panel-partial", false, 1)] {
+        let sample = capture_panel(all_full).await;
+        panel_shortfall(&sample, seats);
         assert!(samples
             .insert(format!("{stem}.request.json"), sample.request)
             .is_none());
