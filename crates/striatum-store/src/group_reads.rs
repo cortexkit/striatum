@@ -29,28 +29,10 @@ pub fn reads_admission_group(sql: &str) -> bool {
     reads_tables(sql, &GROUP_TABLES)
 }
 
-/// The tables the block state holds, plus the view over them.
-pub const BLOCK_READ_TABLES: [&str; 17] = [
-    "account_fence",
-    "credential_entitlement_fences",
-    "account_route_fence",
-    "account_non_quota_route_fence",
-    "pool_key_state",
-    "provider_cooldown_state",
-    "model_route_state",
-    "account_size_refusal",
-    "account_non_quota_size_refusal",
-    "account_principal_exclusion",
-    "account_transient_backoff",
-    "fence_recheck",
-    "fence_recheck_route_clear",
-    "fence_probe_authorization",
-    "fence_success_pool",
-    "account_eligibility",
-    "fence_origin",
-];
+/// The physical tables whose rows feed the published block state.
+pub const BLOCK_READ_TABLES: [&str; 8] = crate::block_state::BLOCK_TABLES;
 
-/// Whether `sql` reads one of the block tables or the `fence_origin` view.
+/// Whether `sql` reads one of the block-state tables.
 pub fn reads_block_tables(sql: &str) -> bool {
     reads_tables(sql, &BLOCK_READ_TABLES)
 }
@@ -253,47 +235,39 @@ impl SqliteRouteStateStore {
     }
 }
 
-/// The block tables, the `fence_origin` view's tables and the sync's TEMP
-/// snapshot of it: what [`BlockReadTrace`] watches.
-pub const BLOCK_TRACE_TABLES: [&str; 18] = [
-    "account_fence",
-    "credential_entitlement_fences",
-    "account_route_fence",
-    "account_non_quota_route_fence",
-    "pool_key_state",
-    "provider_cooldown_state",
-    "model_route_state",
-    "account_size_refusal",
-    "account_non_quota_size_refusal",
-    "account_principal_exclusion",
-    "account_transient_backoff",
-    "fence_recheck",
-    "fence_recheck_route_clear",
-    "fence_probe_authorization",
-    "fence_success_pool",
-    "account_eligibility",
-    "fence_origin",
-    "current_fence_origin",
-];
+/// The physical tables watched by [`BlockReadTrace`].
+pub const BLOCK_TRACE_TABLES: [&str; 8] = crate::block_state::BLOCK_TABLES;
 
 /// The schema triggers that read block tables when a write fires them, each
 /// with the key it reads by. A statement whose only block reads come from
 /// these is counted apart ([`BlockReads::triggers`]); a read from any other
 /// trigger is an ordinary read, so a new reading trigger fails the trace.
-pub const REVIEWED_TRIGGERS: [(&str, &str); 3] = [
-    (
-        "model_route_state_inherit_fence_scope",
-        "provider_cooldown_state by its primary key provider_key = NEW.provider_id",
-    ),
+pub const REVIEWED_TRIGGERS: [(&str, &str); 4] = [
     (
         "model_facts_inherit_provider_cooldown",
         "provider_cooldown_state by its primary key provider_key = NEW.provider_id",
     ),
     (
-        "fence_retire_enforcement",
-        "each source table by its primary key taken from NEW.origin_key; model_route_state by provider_id (indexed) with provider_cooldown_state by provider_key",
+        "retirement_tombstone_enforce",
+        "block by its primary key kind and origin_key, with the exact evidence signature",
+    ),
+    (
+        "block_retirement_insert",
+        "retirement_tombstone by kind, origin_key and evidence; block by kind and origin_key",
+    ),
+    (
+        "block_retirement_update",
+        "retirement_tombstone by kind, origin_key and evidence; block by kind and origin_key",
     ),
 ];
+
+/// The allocator reads only insertion-order bookkeeping, never refusal policy.
+/// The exact statement is exempt only while a writer command is executing;
+/// placing its comment on another read or using it from a request exempts nothing.
+pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 1] = [(
+    crate::block_storage::NEXT_SOURCE_ORDER,
+    "writer bookkeeping: next source order per kind",
+)];
 
 /// Writes that run a `SELECT` of their own over other tables (a bound
 /// `json_each` list, or the fields of an `account_observe` report bound as
@@ -303,10 +277,11 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 3] = [
 /// target counted, because the authorizer does not say which select a read
 /// belongs to. Matched by exact text, so an edited statement is counted
 /// until it is reviewed again.
-pub const REVIEWED_OWN_ROW_WRITES: [&str; 3] = [
+pub const REVIEWED_OWN_ROW_WRITES: [&str; 4] = [
     crate::UPDATE_INHERITED_ROUTE_WALLS,
     crate::UPDATE_INHERITED_ROUTE_WALL_SCOPE,
-    crate::account_selection::INSERT_TRANSIENT_BACKOFFS,
+    crate::OPERATOR_CLEAR_ROUTE_BLOCKS,
+    crate::OPERATOR_CLEAR_PROVIDER_MODEL,
 ];
 
 /// Block-table reads seen since the last [`BlockReadTrace::take`].
@@ -319,6 +294,7 @@ pub struct BlockReadTrace {
     checks: Mutex<Vec<String>>,
     route_writes: Mutex<Vec<String>>,
     route_write_rows: Mutex<Vec<String>>,
+    writer_bookkeeping: Mutex<Vec<String>>,
     triggers: Mutex<Vec<String>>,
     /// A connection to the traced database, used only to prepare each new
     /// statement text once under an authorizer, and what that found.
@@ -352,6 +328,8 @@ pub struct BlockReads {
     pub route_writes: Vec<String>,
     /// The same reads with their bound values, naming the rows they read.
     pub route_write_rows: Vec<String>,
+    /// Exact catalogued insertion-order reads made inside a writer command.
+    pub writer_bookkeeping: Vec<String>,
     /// Writes whose only block reads are those of [`REVIEWED_TRIGGERS`] they
     /// fire, by text.
     pub triggers: Vec<String>,
@@ -366,6 +344,7 @@ impl BlockReadTrace {
             checks: std::mem::take(&mut self.checks.lock().unwrap()),
             route_writes: std::mem::take(&mut self.route_writes.lock().unwrap()),
             route_write_rows: std::mem::take(&mut self.route_write_rows.lock().unwrap()),
+            writer_bookkeeping: std::mem::take(&mut self.writer_bookkeeping.lock().unwrap()),
             triggers: std::mem::take(&mut self.triggers.lock().unwrap()),
         }
     }
@@ -529,7 +508,18 @@ unsafe extern "C" fn on_block_statement(
             return 0;
         }
     }
-    if text.contains(crate::block_state::MAINTENANCE_READ) {
+    if tap.writer
+        && crate::block_state::in_writer_command()
+        && REVIEWED_WRITER_BOOKKEEPING
+            .iter()
+            .any(|(sql, _)| *sql == text)
+    {
+        tap.trace
+            .writer_bookkeeping
+            .lock()
+            .unwrap()
+            .push(text.into_owned());
+    } else if text.contains(crate::block_state::MAINTENANCE_READ) {
         *tap.trace.maintenance.lock().unwrap() += 1;
     } else if text.contains(crate::block_state::STATE_CHECK) {
         tap.trace.checks.lock().unwrap().push(text.into_owned());
@@ -680,3 +670,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "group_reads/native/tests.rs"]
+mod native_tests;

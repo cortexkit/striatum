@@ -16,7 +16,7 @@ fn decision_checks_match_legacy_for_clock_source_clear_success_and_scope_changes
     store.with_writer_for_test(|conn| {
         fence_rechecks::sync_at(conn,now)?;
         conn.execute("INSERT INTO provider_cooldown_state(provider_key,updated_at) VALUES ('unrelated',?1)",[now])?;
-        let legacy = super::super::BlockState::load(conn)?;
+        let legacy = crate::block_state::legacy::BlockState::load(conn)?;
         let credential = legacy.view_origins().into_iter().find(|origin| origin.kind == "credential").unwrap();
         let principal = legacy.view_origins().into_iter().find(|origin| origin.kind == "principal").unwrap();
         let principal_id = principal.principal.as_deref().unwrap();

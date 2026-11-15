@@ -113,7 +113,7 @@ fn key_states(
     now_ms: i64,
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-    crate::fence_rechecks::sync(conn)?;
+    crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), crate::now_ms())?;
     read_key_states(conn, provider, now_ms, excluded_lease)
 }
 
@@ -126,22 +126,10 @@ pub(crate) fn read_key_states(
     now_ms: i64,
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-    let mut statement = conn.prepare(
-        "SELECT credential_id, last_used_at, walled_until, cooldown_until
-         FROM pool_key_state WHERE provider = ?1",
-    )?;
-    let rows = statement
-        .query_map(params![provider], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<KeyRow>>>()?;
-    let rechecks = crate::fence_rechecks::read(conn)?;
-    let clock_schema = crate::fence_rechecks::enabled(conn)?;
+    let state = crate::BlockState::read(conn)?;
+    let rows = state.pool_key_rows(provider)?;
+    let rechecks = state.clock_rechecks();
+    let clock_schema = state.enabled();
     let leases = lease_counts(conn, provider, now_ms, excluded_lease)?;
     Ok(key_states_from(
         provider,
@@ -419,7 +407,13 @@ impl SqliteRouteStateStore {
         provider: &str,
         now_ms: i64,
     ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
-        self.account_transaction(|tx| key_states(tx.conn, provider, now_ms, None).map_err(err))
+        self.account_transaction(|tx| {
+            crate::fence_rechecks::legacy::sync(tx.conn).map_err(err)?;
+            let mut statement=tx.conn.prepare("SELECT credential_id,last_used_at,walled_until,cooldown_until FROM pool_key_state WHERE provider=?1").map_err(err)?;
+            let rows=statement.query_map([provider],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(err)?
+                .collect::<rusqlite::Result<Vec<KeyRow>>>().map_err(err)?;
+            Ok(key_states_from(provider,rows,&crate::fence_rechecks::legacy::read(tx.conn).map_err(err)?,crate::fence_rechecks::legacy::enabled(tx.conn).map_err(err)?,lease_counts(tx.conn,provider,now_ms,None).map_err(err)?))
+        })
     }
 
     /// Key states for a request outside the writer, from `published`, the
@@ -485,7 +479,8 @@ impl SqliteRouteStateStore {
             // or claimed a newer refusal since the read.
             let changed = crate::fence_rechecks::needs_sync(conn).map_err(err)?;
             if changed {
-                crate::fence_rechecks::sync(conn).map_err(err)?;
+                crate::fence_rechecks::sync_on(&crate::AccountTx::sql(conn), crate::now_ms())
+                    .map_err(err)?;
             }
             let states = read_key_states(conn, &provider, now_ms, None).map_err(err)?;
             Ok(states)
@@ -543,7 +538,7 @@ impl crate::AccountTx<'_> {
         }
     }
 
-    /// Wall a key atomically with the observation that reported the refusal.
+    /// Wall a key atomically with its ordering timestamp and retry clock.
     pub fn pool_wall(
         &self,
         provider: &str,
@@ -555,58 +550,43 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         let until_ms = until_ms
             .min(now_ms.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS));
-        if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
-            let (deadline, why, observed) = match kind {
-                PoolWallKind::Billing => ("walled_until", "wall_reason", "wall_observed_at"),
-                PoolWallKind::RateLimited => {
-                    ("cooldown_until", "cooldown_reason", "cooldown_observed_at")
-                }
-            };
-            // A new refusal supersedes its earlier horizon, including uncapped
-            // raw deadlines retained during migration. Delayed older reports
-            // must not extend or supersede the newer evidence.
-            self.conn.execute(&format!("INSERT INTO pool_key_state(provider,credential_id,{deadline},{why},updated_at,{observed})
-                VALUES (?1,?2,?3,?4,?5,?5) ON CONFLICT(provider,credential_id) DO UPDATE SET
-                {deadline}=excluded.{deadline},{why}=excluded.{why},{observed}=excluded.{observed},
-                updated_at=MAX(pool_key_state.updated_at,excluded.updated_at)
-                WHERE pool_key_state.{observed} IS NULL OR excluded.{observed}>=pool_key_state.{observed}"),
-                params![provider,credential_id,until_ms,reason,now_ms]).map_err(err)?;
-            let origin = if kind == PoolWallKind::Billing {
-                "pool_billing"
-            } else {
-                "pool_rate"
-            };
-            crate::fence_rechecks::register_on(
-                self,
-                origin,
-                &serde_json::json!([provider, credential_id]).to_string(),
-            )
-            .map_err(err)?;
-            return Ok(());
-        }
-        let statement = match kind {
-            PoolWallKind::Billing => {
-                "INSERT INTO pool_key_state (provider, credential_id, walled_until, wall_reason, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(provider, credential_id) DO UPDATE SET
-                   walled_until = MAX(COALESCE(pool_key_state.walled_until, 0), excluded.walled_until),
-                   wall_reason = excluded.wall_reason, updated_at = excluded.updated_at"
-            }
-            PoolWallKind::RateLimited => {
-                "INSERT INTO pool_key_state (provider, credential_id, cooldown_until, cooldown_reason, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT(provider, credential_id) DO UPDATE SET
-                   cooldown_until = MAX(COALESCE(pool_key_state.cooldown_until, 0), excluded.cooldown_until),
-                   cooldown_reason = excluded.cooldown_reason, updated_at = excluded.updated_at"
-            }
+        let (origin, observed) = match kind {
+            PoolWallKind::Billing => ("pool_billing", "wall_observed_at"),
+            PoolWallKind::RateLimited => ("pool_rate", "cooldown_observed_at"),
         };
-        self.conn
-            .execute(
-                statement,
-                params![provider, credential_id, until_ms, reason, now_ms],
-            )
-            .map_err(err)?;
-        Ok(())
+        // Leasing can move updated_at but cannot replace refusal ordering.
+        // Only a report at least as new as this refusal may replace its wall.
+        let changed=self.conn.execute(&format!("INSERT INTO pool_key_state(provider,credential_id,updated_at,{observed})
+            VALUES (?1,?2,?3,?3) ON CONFLICT(provider,credential_id) DO UPDATE SET
+                {observed}=excluded.{observed},updated_at=MAX(pool_key_state.updated_at,excluded.updated_at)
+            WHERE pool_key_state.{observed} IS NULL OR excluded.{observed}>=pool_key_state.{observed}"),
+            params![provider,credential_id,now_ms]).map_err(err)?;
+        let key = serde_json::json!([provider, credential_id]).to_string();
+        if changed != 0 {
+            let mut row =
+                crate::block_storage::StoredBlock::from_origin(crate::fence_rechecks::ViewOrigin {
+                    kind: origin.into(),
+                    origin_key: key.clone(),
+                    provider: provider.into(),
+                    account_id: None,
+                    credential_id: Some(credential_id.into()),
+                    model: None,
+                    size_class: None,
+                    principal: None,
+                    admission_id: None,
+                    evidence: serde_json::json!([until_ms, reason, now_ms]).to_string(),
+                    evidence_at: now_ms,
+                    quota: Some(false),
+                    deadline: Some(until_ms as f64),
+                    reset_at: None,
+                })
+                .map_err(err)?;
+            row.deadline = Some(crate::block_storage::Deadline::Integer(until_ms));
+            row.reason = Some(reason.into());
+            row.observed_at = Some(now_ms);
+            crate::block_storage::write_source(self.conn, &row).map_err(err)?;
+        }
+        crate::fence_rechecks::register_on(self, origin, &key).map_err(err)
     }
 }
 

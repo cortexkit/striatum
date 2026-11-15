@@ -21,6 +21,10 @@ tracing = { workspace = true }
 [features]
 test-support = []
 
+[[example]]
+name = "block_parity_rehearsal"
+required-features = ["test-support"]
+
 [dev-dependencies]
 cortexkit-test-support = "=0.1.13"
 # Integration tests and examples compile the library as a dependency, without

@@ -3,9 +3,11 @@
 //! request reader's answer from memory must equal its SQL answer.
 
 use super::*;
+use crate::fence_rechecks::{self, FenceRecheck};
 use crate::{
     err, AccountCommandKind, AccountStateBridge, AccountWorkingState, SqliteRouteStateStore,
 };
+use rusqlite::{types::Value, OptionalExtension};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use striatum_core::route_state_store::{FactSource, RouteStateStore, RouteStateUpdate};
@@ -72,19 +74,29 @@ impl AccountStateBridge for TestOwner {
     }
 }
 
-struct Rig {
-    store: SqliteRouteStateStore,
+pub(crate) struct Rig {
+    pub(crate) store: SqliteRouteStateStore,
     owner: Arc<TestOwner>,
     // Dropped last, after the store has closed its files.
     _scratch: cortexkit_test_support::ScratchDir,
 }
 
 fn rig(name: &str) -> Rig {
+    make_rig(name, false)
+}
+
+pub(crate) fn rig_before_block_migration(name: &str) -> Rig {
+    make_rig(name, true)
+}
+
+fn make_rig(name: &str, before_block_migration: bool) -> Rig {
     let scratch = cortexkit_test_support::ScratchDir::new(name);
-    let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-        name,
-        scratch.path().join("state.db").to_string_lossy(),
-    ))
+    let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
+    let store = if before_block_migration {
+        SqliteRouteStateStore::open_at_version_for_test(&descriptor, 93)
+    } else {
+        SqliteRouteStateStore::open(&descriptor)
+    }
     .unwrap();
     let owner = Arc::new(TestOwner::default());
     store.install_account_state_bridge(owner.clone()).unwrap();
@@ -96,7 +108,14 @@ fn rig(name: &str) -> Rig {
 }
 
 impl Rig {
-    fn published(&self) -> BlockState {
+    pub(crate) fn reload(&self) {
+        self.owner.request_reload();
+        self.store
+            .account_command(AccountCommandKind::Maintenance, |_| Ok(()))
+            .unwrap();
+    }
+
+    pub(crate) fn published(&self) -> BlockState {
         self.owner
             .published
             .lock()
@@ -107,7 +126,7 @@ impl Rig {
             .clone()
     }
 
-    fn fresh(&self) -> BlockState {
+    pub(crate) fn fresh(&self) -> BlockState {
         self.store.with_reader_for_test(BlockState::load).unwrap()
     }
 
@@ -4467,89 +4486,4 @@ fn a_recovery_from_older_evidence_does_not_lift_a_renewed_pool_block() {
         matches!(acquire(&current), crate::PoolAcquireOutcome::Leased(_)),
         "a recovery from the current evidence lifts it"
     );
-}
-
-/// A decision checks the clocks of the empty provider, and their clears,
-/// against SQL, and nothing else of it (`check_provider_rows`). That leaves
-/// nothing out: the `fence_origin` view projects the empty provider for the
-/// principal branch alone, so on a fixture with a row in every block table
-/// SQL's only empty-provider rows are the principal clocks, and the state's
-/// empty-provider scope holds those clocks and nothing in any other table.
-/// A principal clock the state holds stale is still caught.
-#[test]
-fn only_principal_rows_have_the_empty_provider() {
-    let rig = rig("block-state-empty-provider");
-    rig.run(|conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW));
-    rig.sql(format!(
-        "INSERT INTO account_principal_exclusion(principal,admission_id,credential_id,runner_view_digest,roster_view_digest,observation_id,recorded_at)
-         VALUES ('principal','admission','credential','runner','roster',NULL,{NOW});"
-    ));
-    rig.run(fence_rechecks::sync);
-    let (view, empty_sources) = rig
-        .store
-        .with_reader_for_test(|conn| {
-            let view = conn
-                .prepare("SELECT DISTINCT kind FROM fence_origin WHERE provider=''")?
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            let mut empty_sources = Vec::new();
-            for (table, column) in PROVIDER_COLUMNS {
-                let count: i64 = conn.query_row(
-                    &format!(
-                        "SELECT count(*) FROM {} WHERE {column}=''",
-                        BLOCK_TABLES[table]
-                    ),
-                    [],
-                    |r| r.get(0),
-                )?;
-                empty_sources.push((BLOCK_TABLES[table], count));
-            }
-            Ok((view, empty_sources))
-        })
-        .unwrap();
-    assert_eq!(
-        view,
-        vec!["principal".to_owned()],
-        "only the principal branch projects ''"
-    );
-    for (table, count) in empty_sources {
-        if table == BLOCK_TABLES[CLOCK_TABLE] {
-            assert!(count > 0, "the principal clocks have the empty provider");
-        } else {
-            assert_eq!(count, 0, "{table} holds no row of the empty provider");
-        }
-    }
-    let state = rig.published();
-    for (table, _) in PROVIDER_COLUMNS {
-        let rows: Vec<_> = state.tables[table].scope_rows("").collect();
-        if table == CLOCK_TABLE {
-            assert!(!rows.is_empty());
-            for (_, held) in rows {
-                assert!(
-                    matches!(held, Held::Clock(block, _) if block.kind == "principal"),
-                    "only principal clocks"
-                );
-            }
-        } else {
-            assert!(
-                rows.is_empty(),
-                "{} holds no empty-provider row",
-                BLOCK_TABLES[table]
-            );
-        }
-    }
-    let stale = rig.published();
-    rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='principal';".into());
-    let loads = rig.decide_next_on(stale);
-    rig.store
-        .account_command(AccountCommandKind::Maintenance, |tx| {
-            tx.check_decision_inputs(&[""])
-        })
-        .unwrap();
-    assert_eq!(
-        rig.loads_since(loads),
-        2,
-        "a stale principal clock is caught"
-    );
-    rig.check(&[NOW], "after the empty-provider check");
 }

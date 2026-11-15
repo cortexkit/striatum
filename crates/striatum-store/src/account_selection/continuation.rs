@@ -35,9 +35,9 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<()> {
         self.conn
             .execute(
-                "UPDATE credential_entitlement_fences SET listing_fingerprint=?1
-             WHERE provider_id=?2 AND credential_id=?3 AND code='signed_out'
-             AND observed_at_ms=?4 AND listing_fingerprint IS ?5",
+                "UPDATE block SET listing_fingerprint=?1
+              WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?2 AND credential_id=?3 AND code='signed_out'
+              AND observed_at=?4 AND listing_fingerprint IS ?5",
                 params![
                     fingerprint,
                     fence.provider_id,

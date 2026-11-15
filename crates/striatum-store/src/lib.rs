@@ -61,12 +61,11 @@ mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod block_state;
-#[cfg(test)]
-#[path = "block_storage/tests.rs"]
 mod block_storage;
 mod engine_measurements;
 mod fence_rechecks;
 mod route_snapshot;
+mod sql_real;
 #[cfg(any(test, feature = "test-support"))]
 pub use block_state::reviewed_exempt_reads;
 pub use block_state::{
@@ -752,18 +751,19 @@ pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(
     route_write_read!(),
     "SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1"
 );
-pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_write_read!(), "SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
-                    ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
-                     (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
-                      AND COALESCE(m.wall_observed_at,m.last_error_at,m.updated_at)=COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
-                      AND m.last_error IS p.last_error
-                      AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
-                      AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))");
+pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_write_read!(), "SELECT m.route_key,m.model_id,m.wall_observed_at,m.last_error,m.last_error_at,a.wall_class,COALESCE(a.wall_unscoped,0) FROM model_route_state m
+    LEFT JOIN block a ON a.kind='route' AND a.origin_key=json_array(m.route_key) AND a.is_origin=1
+    LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+    LEFT JOIN block p ON p.kind='provider' AND p.origin_key=json_array(m.provider_id) AND p.is_origin=1 AND p.source_present=1
+    WHERE m.provider_id=?1 AND ((b.cooldown_until IS NULL AND b.quota_exhausted_until IS NULL)
+        OR (b.observed_at=p.observed_at AND b.scope_error IS p.scope_error
+          AND COALESCE(b.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
+          AND COALESCE(b.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))");
 pub(crate) const ROUTE_READ_PROVIDER_EXISTING: &str = concat!(
     route_write_read!(),
-    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1"
+    "SELECT b.cooldown_until,b.quota_exhausted_until,p.quota_pressure,p.last_error,p.last_error_at,b.wall_class,COALESCE(b.wall_unscoped,0),p.wall_observed_at
+        FROM provider_cooldown_state p LEFT JOIN block b ON b.kind='provider' AND b.origin_key=json_array(p.provider_key)
+            AND b.is_origin=1 AND b.source_present=1 WHERE p.provider_key=?1"
 );
 pub(crate) const ROUTE_READ_ROUTE_PRIOR_OBSERVED: &str = concat!(
     route_write_read!(),
@@ -771,25 +771,24 @@ pub(crate) const ROUTE_READ_ROUTE_PRIOR_OBSERVED: &str = concat!(
 );
 pub(crate) const ROUTE_READ_ROUTE_EXISTING: &str = concat!(
     route_write_read!(),
-    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                latency_ema_ms, success_ema, failure_count, quota_error_count,
-                                last_error, last_error_at, wall_class
-                         FROM model_route_state WHERE route_key = ?1"
+    "SELECT b.cooldown_until,b.quota_exhausted_until,m.quota_pressure,m.latency_ema_ms,m.success_ema,m.failure_count,m.quota_error_count,
+        m.last_error,m.last_error_at,b.wall_class,COALESCE(b.wall_unscoped,0)
+        FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key)
+            AND b.is_origin=1 AND b.source_present=1 WHERE m.route_key=?1"
 );
 pub(crate) const ROUTE_READ_ROUTE_PROVIDER_ROW: &str = concat!(
     route_write_read!(),
-    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
-                                last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1"
+    "SELECT b.cooldown_until,b.quota_exhausted_until,p.quota_pressure,p.last_error,p.last_error_at,b.wall_class,COALESCE(b.wall_unscoped,0),p.wall_observed_at
+        FROM provider_cooldown_state p LEFT JOIN block b ON b.kind='provider' AND b.origin_key=json_array(p.provider_key)
+            AND b.is_origin=1 AND b.source_present=1 WHERE p.provider_key=?1"
 );
-pub(crate) const ROUTE_READ_OUTCOME_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
-                         FROM model_route_state WHERE route_key=?1");
+pub(crate) const ROUTE_READ_OUTCOME_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT m.consecutive_terminal_failures,b.deadline,b.reason,
+        COALESCE(m.failure_observed_at,m.last_error_at,m.updated_at),m.wall_observed_at FROM model_route_state m
+        LEFT JOIN block b ON b.kind='failure' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1 WHERE m.route_key=?1");
 pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(
     route_write_read!(),
-    "SELECT consecutive_terminal_failures, failure_backoff_until,
-                                failure_backoff_reason
-                         FROM model_route_state WHERE route_key = ?1"
+    "SELECT m.consecutive_terminal_failures,b.deadline,b.reason FROM model_route_state m
+        LEFT JOIN block b ON b.kind='failure' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1 WHERE m.route_key=?1"
 );
 
 // Writes that run a `SELECT` of their own, over a bound `json_each` list,
@@ -798,17 +797,20 @@ pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(
 // `SELECT`, except for these reviewed statements
 // (`group_reads::REVIEWED_OWN_ROW_WRITES`).
 pub(crate) const UPDATE_INHERITED_ROUTE_WALLS: &str = "UPDATE model_route_state SET
-                       cooldown_until = ?1,
-                       quota_exhausted_until = ?2,
                        quota_pressure = COALESCE(?3, quota_pressure),
-                       wall_class = COALESCE(?4, wall_class),
                        failure_count = failure_count + ?5,
                        quota_error_count = quota_error_count + ?6,
                        last_error = COALESCE(?7, last_error),
                        last_error_at = CASE WHEN ?7 IS NULL THEN last_error_at ELSE ?8 END,
                        updated_at = ?8
                       WHERE provider_id = ?9 AND route_key IN (SELECT value FROM json_each(?10))";
-pub(crate) const UPDATE_INHERITED_ROUTE_WALL_SCOPE: &str = "UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))";
+pub(crate) const UPDATE_INHERITED_ROUTE_WALL_SCOPE: &str = "UPDATE model_route_state SET wall_observed_at=?2 WHERE provider_id=?1 AND route_key IN (SELECT value FROM json_each(?4))";
+
+pub(crate) const OPERATOR_CLEAR_ROUTE_BLOCKS:&str="UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',wall_class=NULL,claim_owner=NULL
+                WHERE kind='route' AND is_origin=1 AND source_present=1 AND origin_key IN (SELECT json_array(value) FROM json_each(?1))";
+pub(crate) const OPERATOR_CLEAR_PROVIDER_MODEL:&str="UPDATE block SET cleared_models=CASE WHEN EXISTS(SELECT 1 FROM json_each(cleared_models) WHERE value=?2)
+                    THEN cleared_models ELSE json_insert(cleared_models,'$[#]',?2) END
+                WHERE kind='provider' AND is_origin=1 AND source_present=1 AND provider=?1";
 
 impl SqliteRouteStateStore {
     /// Stored providers only; score aliases added to a request are not catalog
@@ -2719,22 +2721,10 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Every stored credential entitlement fence.
     pub fn credential_entitlement_fences(
         &self,
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
-        self.store
-            .with_read(|c: &Connection| {
-                let mut stmt = c.prepare(
-                    "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
-                     FROM credential_entitlement_fences ORDER BY provider_id, credential_id",
-                )?;
-                let rows = stmt.query_map([], |row| {
-                    crate::account_selection::rows::entitlement_at(row, 0)
-                })?;
-                rows.collect::<Result<Vec<_>, _>>()
-            })
-            .map_err(err)
+        self.account_read(|tx| Ok(tx.current_blocks()?.entitlement_fences()))
     }
 
     /// Replace the refusal timestamp while preserving its code and listing
@@ -3913,8 +3903,8 @@ impl RouteStateStore for SqliteRouteStateStore {
         &self,
         provider_key: &str,
     ) -> RouteStateResult<Option<ProviderCooldownState>> {
-        // The SQL oracle: request paths read the account state's copy of the
-        // row (`BlockState::provider_cooldown`).
+        // Cold/raw reads join durable block deadlines to telemetry. Live
+        // requests use the published BlockState's copy of the same fields.
         let provider_key = route_snapshot::provider_lookup_key(provider_key)?.to_owned();
         self.store
             .with_conn(|c: &Connection| {
@@ -4167,8 +4157,8 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot> {
-        // The SQL oracle: request paths build the same snapshot from the
-        // account state's block rows (`BlockState::route_state_snapshot`).
+        // Private stores have no publisher; their snapshot reads the typed
+        // sources. Live requests use BlockState::route_state_snapshot.
         self.store
             .with_conn(|c: &Connection| Ok(route_snapshot::read_snapshot(c, now, now_ms())))
             .map_err(err)?
@@ -4183,6 +4173,8 @@ struct ExistingProviderState {
     wall_class: Option<RouteWallClass>,
     last_error: Option<String>,
     last_error_at: Option<i64>,
+    wall_unscoped: bool,
+    wall_observed_at: Option<i64>,
 }
 
 #[derive(Default)]
@@ -4197,6 +4189,17 @@ struct ExistingState {
     quota_error_count: i64,
     last_error: Option<String>,
     last_error_at: Option<i64>,
+    wall_unscoped: bool,
+}
+
+struct InheritedRouteState {
+    route_key: String,
+    model_id: String,
+    wall_observed_at: Option<i64>,
+    last_error: Option<String>,
+    last_error_at: Option<i64>,
+    wall_class: Option<String>,
+    wall_unscoped: bool,
 }
 
 /// Whether a stored wall was written from a permanent refusal of one named
@@ -7045,27 +7048,22 @@ impl crate::AccountTx<'_> {
             let Some((provider, model, _variant)) = identity else { return Ok(None); };
             let capacity = striatum_core::make_capacity_key(&provider, &model);
             let base = route_key == capacity;
-            let routes = {
-                let mut statement = tx.prepare("SELECT route_key,cooldown_until,quota_exhausted_until FROM model_route_state WHERE route_key=?1 OR (?2 AND capacity_key=?3) ORDER BY route_key")?;
-                let rows = statement.query_map(params![route_key,base,capacity], |row| Ok((row.get(0)?, CooldownState { cooldown_until: row.get(1)?, quota_exhausted_until: row.get(2)? })))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            tx.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL,wall_class=NULL,updated_at=?4 WHERE route_key=?1 OR (?2 AND capacity_key=?3)", params![route_key,base,capacity,now_ms()])?;
-            tx.execute("INSERT INTO fence_recheck_route_clear(kind,origin_key,provider,model,evidence)
-                SELECT kind,origin_key,provider,?2,evidence FROM fence_origin WHERE kind='provider' AND provider=?1
-                ON CONFLICT(kind,origin_key,provider,model) DO UPDATE SET evidence=excluded.evidence",params![provider,model])?;
-            let account_fences = {
-                let mut statement = tx.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE provider=?1 AND model=?2 AND wall_class='quota'
-                    UNION ALL SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_non_quota_route_fence WHERE provider=?1 AND model=?2 ORDER BY credential_id")?;
-                let rows = statement.query_map(params![provider,model], |row| Ok(AccountRouteFence { provider:row.get(0)?,credential_id:row.get(1)?,model:row.get(2)?,until_ms:row.get(3)?,decision_id:row.get(4)?,recorded_at:row.get(5)? }))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            tx.execute("DELETE FROM account_route_fence WHERE provider=?1 AND model=?2", params![provider,model])?;
-            tx.execute("DELETE FROM account_non_quota_route_fence WHERE provider=?1 AND model=?2",params![provider,model])?;
-            // Credential walls cover every model served by the provider. An
-            // operator clearing one of its routes also permits an early retry.
-            tx.execute("UPDATE pool_key_state SET walled_until=NULL,wall_reason=NULL WHERE provider=?1", [&provider])?;
-            tx.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND code='credential_refused'", [&provider])?;
+            let state=self.current_blocks().map_err(fence_rechecks::command_error)?;
+            let routes=state.route_cooldowns_for_clear(&route_key,base,&capacity);
+            let account_fences=state.route_fences_for_clear(&provider,&model);
+            let at=now_ms();
+            let keys=serde_json::to_string(&routes.iter().map(|(key,_)|key).collect::<Vec<_>>()).map_err(|error|rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            tx.execute(OPERATOR_CLEAR_ROUTE_BLOCKS,params![keys,at])?;
+            tx.execute("UPDATE model_route_state SET updated_at=?4 WHERE route_key=?1 OR (?2 AND capacity_key=?3)",params![route_key,base,capacity,at])?;
+            tx.execute(OPERATOR_CLEAR_PROVIDER_MODEL,params![provider,model])?;
+            tx.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                WHERE kind IN ('account_route','non_quota_route','transient_route') AND source_present=1 AND provider=?1 AND model=?2",params![provider,model,at])?;
+            // Clearing one route also lifts the provider's credential-wide
+            // billing wall, allowing an early retry as the operator requested.
+            tx.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
+                WHERE kind='pool_billing' AND is_origin=1 AND source_present=1 AND provider=?1",params![provider,at])?;
+            tx.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
+                WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND code='credential_refused'",params![provider,at])?;
 
             Ok(Some(ClearedRouteCooldowns {route_key, routes, account_fences}))
         }).map_err(err)
@@ -7393,11 +7391,16 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         self.command_sql(|c: &Connection| {
             let tx = c;
-            let changed = tx.execute(
-                "UPDATE credential_entitlement_fences SET observed_at_ms = ?3
-                      WHERE provider_id = ?1 AND credential_id = ?2",
-                params![provider_id, credential_id, observed_at_ms],
-            )?;
+            let state = self
+                .current_blocks()
+                .map_err(fence_rechecks::command_error)?;
+            let changed =
+                if let Some(mut fence) = state.entitlement_fence(provider_id, credential_id) {
+                    fence.observed_at_ms = observed_at_ms;
+                    block_storage::write_source(tx, &block_storage::credential_source(&fence)?)?
+                } else {
+                    0
+                };
             fence_rechecks::register_on(
                 self,
                 "credential",
@@ -7416,9 +7419,9 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         self.command_sql(|c: &Connection| {
             c.execute(
-                "DELETE FROM credential_entitlement_fences
-                      WHERE provider_id = ?1 AND credential_id = ?2",
-                params![provider_id, credential_id],
+                "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                      WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2",
+                params![provider_id, credential_id,now_ms()],
             )
         })
         .map_err(err)
@@ -7429,28 +7432,9 @@ impl crate::AccountTx<'_> {
         credential_id: &str,
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
         self.command_sql(|c: &Connection| {
-            let mut stmt = c.prepare(
-                "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
-                      FROM credential_entitlement_fences WHERE credential_id = ?1
-                      ORDER BY provider_id",
-            )?;
-            let lifted: Vec<striatum_core::route_state_store::CredentialEntitlementFence> = stmt
-                .query_map([credential_id], |row| {
-                    Ok(
-                        striatum_core::route_state_store::CredentialEntitlementFence {
-                            provider_id: row.get(0)?,
-                            credential_id: row.get(1)?,
-                            code: row.get(2)?,
-                            listing_fingerprint: row.get(3)?,
-                            observed_at_ms: row.get(4)?,
-                        },
-                    )
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            c.execute(
-                "DELETE FROM credential_entitlement_fences WHERE credential_id = ?1",
-                [credential_id],
-            )?;
+            let lifted=self.current_blocks().map_err(fence_rechecks::command_error)?.entitlement_fences().into_iter().filter(|row|row.credential_id==credential_id).collect();
+            c.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
+                WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1",params![credential_id,now_ms()])?;
             Ok(lifted)
         })
         .map_err(err)
@@ -7463,9 +7447,9 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         self.command_sql(|c: &Connection| {
             c.execute(
-                "DELETE FROM credential_entitlement_fences
-                     WHERE credential_id = ?1 AND listing_fingerprint IS ?2",
-                params![credential_id, fingerprint],
+                "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                     WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS ?2",
+                params![credential_id, fingerprint,now_ms()],
             )
         })
         .map_err(err)
@@ -7478,8 +7462,8 @@ impl crate::AccountTx<'_> {
     ) -> RouteStateResult<()> {
         self.command_sql(|c: &Connection| {
             c.execute(
-                "UPDATE credential_entitlement_fences SET listing_fingerprint = ?2
-                     WHERE credential_id = ?1 AND listing_fingerprint IS NULL",
+                "UPDATE block SET listing_fingerprint=?2
+                     WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS NULL",
                 params![credential_id, fingerprint],
             )
             .map(|_| ())
@@ -7682,7 +7666,7 @@ impl crate::AccountTx<'_> {
                 // model refusal keeps its own deadline and evidence generation.
                 // Read only to decide this writer's own write of the row (see `route_write_read`).
                 let mut inherited=tx.prepare(ROUTE_READ_PROVIDER_INHERITED_ROUTES)?
-                    .query_map([&provider_key],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    .query_map([&provider_key],|row|Ok(InheritedRouteState {route_key:row.get(0)?,model_id:row.get(1)?,wall_observed_at:row.get(2)?,last_error:row.get(3)?,last_error_at:row.get(4)?,wall_class:row.get(5)?,wall_unscoped:row.get(6)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
                 let existing = tx
                     .query_row(
                         // Read only to decide this writer's own write of the row (see `route_write_read`).
@@ -7696,6 +7680,8 @@ impl crate::AccountTx<'_> {
                                 last_error: row.get(3)?,
                                 last_error_at: row.get(4)?,
                                 wall_class: row_wall_class(row, 5)?,
+                                wall_unscoped: row.get(6)?,
+                                wall_observed_at: row.get(7)?,
                             })
                         },
                     )
@@ -7725,28 +7711,11 @@ impl crate::AccountTx<'_> {
                 let updated_at = observed_at;
 
                 tx.execute(
-                    "INSERT INTO provider_cooldown_state (
-                       provider_key, cooldown_until, quota_exhausted_until, quota_pressure,
-                       last_error, last_error_at, updated_at, wall_class
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-                     ON CONFLICT(provider_key) DO UPDATE SET
-                       cooldown_until=excluded.cooldown_until,
-                       quota_exhausted_until=excluded.quota_exhausted_until,
-                       quota_pressure=excluded.quota_pressure,
-                       last_error=excluded.last_error,
-                       last_error_at=excluded.last_error_at,
-                       updated_at=excluded.updated_at,
-                       wall_class=excluded.wall_class",
-                    params![
-                        provider_key,
-                        cooldown_until,
-                        quota_exhausted_until,
-                        quota_pressure,
-                        last_error,
-                        last_error_at,
-                        updated_at,
-                        wall_class.map(RouteWallClass::as_str),
-                    ],
+                    "INSERT INTO provider_cooldown_state(provider_key,quota_pressure,last_error,last_error_at,updated_at)
+                     VALUES (?1,?2,?3,?4,?5) ON CONFLICT(provider_key) DO UPDATE SET
+                       quota_pressure=excluded.quota_pressure,last_error=excluded.last_error,
+                       last_error_at=excluded.last_error_at,updated_at=excluded.updated_at",
+                    params![provider_key,quota_pressure,last_error,last_error_at,updated_at],
                 )?;
 
                 // A direct cooldown signal can name a route that is not in the
@@ -7755,29 +7724,35 @@ impl crate::AccountTx<'_> {
                 let (_, model_id, variant) = route_identity(&tx, route_key, None)?;
                 let inserted=tx.execute(
                     "INSERT OR IGNORE INTO model_route_state (
-                       route_key, capacity_key, provider_id, model_id, variant,
-                       cooldown_until, quota_exhausted_until, quota_pressure,
-                       latency_ema_ms, success_ema, failure_count, quota_error_count,
-                       last_error, last_error_at, updated_at, wall_class
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,0,0,?9,?10,?11,?12)",
-                    params![
-                        route_key,
-                        capacity_key,
-                        route_provider,
-                        model_id,
-                        variant,
-                        cooldown_until,
-                        quota_exhausted_until,
-                        quota_pressure,
-                        last_error,
-                        last_error_at,
-                        updated_at,
-                        wall_class.map(RouteWallClass::as_str),
-                    ],
+                       route_key,capacity_key,provider_id,model_id,variant,quota_pressure,
+                       latency_ema_ms,success_ema,failure_count,quota_error_count,last_error,last_error_at,updated_at,wall_observed_at
+                     ) VALUES (?1,?2,?3,?4,?5,?6,NULL,NULL,0,0,?7,?8,?9,?10)",
+                    params![route_key,capacity_key,route_provider,model_id,variant,quota_pressure,last_error,last_error_at,updated_at,prior_at],
                 )?;
 
-                if inserted>0 {inherited.push(route_key.to_owned());}
-                let inherited=serde_json::to_string(&inherited).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                if inserted>0 {inherited.push(InheritedRouteState {route_key:route_key.into(),model_id,wall_observed_at:prior_at,
+                    last_error:last_error.clone(),last_error_at,wall_class:wall_class.map(|class|class.as_str().to_owned()),wall_unscoped:existing.wall_unscoped});}
+                let unscoped=if new_wall {update.unscoped_wall} else {existing.wall_unscoped};
+                let wall_observed=if new_wall {Some(updated_at)} else {prior_at};
+                let source_at=wall_observed.or(last_error_at).unwrap_or(updated_at);
+                for inherited in &inherited {
+                    let wall_observed=if new_wall {Some(updated_at)} else {inherited.wall_observed_at};
+                    let error=last_error.as_deref().or(inherited.last_error.as_deref());
+                    let error_at=if last_error.is_some() {Some(updated_at)} else {inherited.last_error_at};
+                    let class=update.wall_class.map(RouteWallClass::as_str).or(inherited.wall_class.as_deref());
+                    let unscoped=if new_wall {update.unscoped_wall} else {inherited.wall_unscoped};
+                    if fence_rechecks::quarantined_row(unscoped,error,class) {
+                        tx.execute("DELETE FROM block WHERE kind='route' AND is_origin=1 AND origin_key=json_array(?1)",[&inherited.route_key])?;
+                    } else if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                        kind:"route",key:&inherited.route_key,provider:&provider_key,model:Some(&inherited.model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
+                        wall_observed,observed_at:wall_observed.or(error_at).unwrap_or(updated_at),error,class,unscoped,
+                    })? {block_storage::write_source(tx,&row)?;}
+                }
+                if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                    kind:"provider",key:&provider_key,provider:&provider_key,model:None,cooldown:cooldown_until,exhausted:quota_exhausted_until,
+                    wall_observed,observed_at:source_at,error:last_error.as_deref(),class:wall_class.map(RouteWallClass::as_str),unscoped,
+                })? {block_storage::write_source(tx,&row)?;}
+                let inherited=serde_json::to_string(&inherited.iter().map(|row|&row.route_key).collect::<Vec<_>>()).map_err(|e|rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 // A repeat refusal replaces the old provider generation's raw
                 // horizons, including migrated deadlines longer than one hour.
                 tx.execute(
@@ -7796,7 +7771,7 @@ impl crate::AccountTx<'_> {
                     ],
                 )?;
                 if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
-                    tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE provider_key=?1",params![provider_key,updated_at,update.unscoped_wall])?;
+                    tx.execute("UPDATE provider_cooldown_state SET wall_observed_at=?2 WHERE provider_key=?1",params![provider_key,updated_at])?;
                     tx.execute(UPDATE_INHERITED_ROUTE_WALL_SCOPE,params![provider_key,updated_at,update.unscoped_wall,inherited])?;
                     fence_rechecks::register_on(self,"provider",&serde_json::json!([provider_key]).to_string())?;
                 }
@@ -7857,6 +7832,7 @@ impl crate::AccountTx<'_> {
                                 cooldown_until: r.get(0)?,
                                 quota_exhausted_until: r.get(1)?,
                                 wall_class: row_wall_class(r, 9)?,
+                                wall_unscoped:r.get(10)?,
                                 quota_pressure: r.get(2)?,
                                 latency_ema_ms: r.get(3)?,
                                 success_ema: r.get(4)?,
@@ -7890,6 +7866,7 @@ impl crate::AccountTx<'_> {
                                 last_error: r.get(3)?,
                                 last_error_at: r.get(4)?,
                                 wall_class: row_wall_class(r, 5)?,
+                                wall_unscoped:r.get(6)?,wall_observed_at:r.get(7)?,
                             })
                         },
                     )
@@ -7936,42 +7913,26 @@ impl crate::AccountTx<'_> {
 
                 tx.execute(
                     "INSERT INTO model_route_state (
-                       route_key, capacity_key, provider_id, model_id, variant,
-                       cooldown_until, quota_exhausted_until, quota_pressure,
-                       latency_ema_ms, success_ema, failure_count, quota_error_count,
-                       last_error, last_error_at, updated_at, wall_class
-                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                       route_key,capacity_key,provider_id,model_id,variant,quota_pressure,
+                       latency_ema_ms,success_ema,failure_count,quota_error_count,last_error,last_error_at,updated_at,wall_observed_at
+                     ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
                      ON CONFLICT(route_key) DO UPDATE SET
-                       capacity_key=excluded.capacity_key, provider_id=excluded.provider_id,
-                       model_id=excluded.model_id, variant=excluded.variant,
-                       cooldown_until=excluded.cooldown_until,
-                       quota_exhausted_until=excluded.quota_exhausted_until,
-                       quota_pressure=excluded.quota_pressure,
-                       latency_ema_ms=excluded.latency_ema_ms, success_ema=excluded.success_ema,
-                       failure_count=excluded.failure_count, quota_error_count=excluded.quota_error_count,
-                       last_error=excluded.last_error, last_error_at=excluded.last_error_at,
-                       updated_at=excluded.updated_at, wall_class=excluded.wall_class",
-                    params![
-                        route_key,
-                        capacity_key,
-                        provider_id,
-                        model_id,
-                        variant,
-                        cooldown_until,
-                        quota_exhausted_until,
-                        quota_pressure,
-                        latency_ema_ms,
-                        success_ema,
-                        failure_count,
-                        quota_error_count,
-                        last_error,
-                        last_error_at,
-                        observed_at,
-                        wall_class.map(RouteWallClass::as_str),
-                    ],
+                       capacity_key=excluded.capacity_key,provider_id=excluded.provider_id,model_id=excluded.model_id,variant=excluded.variant,
+                       quota_pressure=excluded.quota_pressure,latency_ema_ms=excluded.latency_ema_ms,success_ema=excluded.success_ema,
+                       failure_count=excluded.failure_count,quota_error_count=excluded.quota_error_count,
+                       last_error=excluded.last_error,last_error_at=excluded.last_error_at,updated_at=excluded.updated_at",
+                    params![route_key,capacity_key,provider_id,model_id,variant,quota_pressure,latency_ema_ms,success_ema,
+                        failure_count,quota_error_count,last_error,last_error_at,observed_at,if new_route {provider.wall_observed_at} else {prior_at}],
                 )?;
-                if update.cooldown_until.is_some() || update.quota_exhausted_until.is_some() {
-                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2,wall_unscoped=?3 WHERE route_key=?1",params![route_key,observed_at,update.unscoped_wall])?;
+                let wall_observed=if new_wall {Some(observed_at)} else if new_route {provider.wall_observed_at} else {prior_at};
+                let unscoped=if new_wall {update.unscoped_wall} else if new_route {provider.wall_unscoped} else {ex.wall_unscoped};
+                if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                    kind:"route",key:route_key,provider:&provider_id,model:Some(&model_id),cooldown:cooldown_until,exhausted:quota_exhausted_until,
+                    wall_observed,observed_at:wall_observed.or(last_error_at).unwrap_or(observed_at),error:last_error.as_deref(),
+                    class:wall_class.map(RouteWallClass::as_str),unscoped,
+                })? {block_storage::write_source(tx,&row)?;}
+                if new_wall {
+                    tx.execute("UPDATE model_route_state SET wall_observed_at=?2 WHERE route_key=?1",params![route_key,observed_at])?;
                     fence_rechecks::register_on(self,"route",&serde_json::json!([route_key]).to_string())?;
                 }
                 Ok(())
@@ -8083,46 +8044,34 @@ impl crate::AccountTx<'_> {
                         .last_error
                         .clone()
                         .unwrap_or_else(|| update.outcome.as_str().to_string());
-                    tx.execute(
+                    let scope=self.current_blocks().map_err(fence_rechecks::command_error)?;
+                    let prior_class=scope.block("route",&serde_json::json!([route_key]).to_string()).filter(|row|row.source_present).and_then(|row|row.wall_class.clone());
+                    let changed=tx.execute(
                         "INSERT INTO model_route_state (
-                           route_key, capacity_key, provider_id, model_id, variant,
-                           quota_exhausted_until, failure_count, quota_error_count,
-                            last_error, last_error_at, updated_at, wall_observed_at, wall_unscoped
-                          ) VALUES (?1,?2,?3,?4,?5,?6,1,1,?7,?8,?8,?8,1)
+                           route_key,capacity_key,provider_id,model_id,variant,failure_count,quota_error_count,
+                           last_error,last_error_at,updated_at,wall_observed_at
+                         ) VALUES (?1,?2,?3,?4,?5,1,1,?6,?7,?7,?7)
                          ON CONFLICT(route_key) DO UPDATE SET
-                           capacity_key=excluded.capacity_key,
-                           provider_id=excluded.provider_id,
-                           model_id=excluded.model_id,
-                           variant=excluded.variant,
-                            cooldown_until=NULL,
-                            quota_exhausted_until=excluded.quota_exhausted_until,
-                            wall_observed_at=excluded.wall_observed_at,
-                            wall_unscoped=excluded.wall_unscoped,
-                           failure_count=model_route_state.failure_count + 1,
-                           quota_error_count=model_route_state.quota_error_count + 1,
-                           last_error=excluded.last_error,
-                           last_error_at=excluded.last_error_at,
-                            updated_at=excluded.updated_at
-                          WHERE model_route_state.wall_observed_at IS NULL
-                            OR excluded.wall_observed_at>=model_route_state.wall_observed_at",
-                        params![
-                            route_key,
-                            capacity_key,
-                            provider_id,
-                            model_id,
-                            variant,
-                            quota_exhausted_until,
-                            surfaced_error,
-                            update.observed_at_ms,
-                        ],
+                           capacity_key=excluded.capacity_key,provider_id=excluded.provider_id,model_id=excluded.model_id,variant=excluded.variant,
+                           wall_observed_at=excluded.wall_observed_at,failure_count=model_route_state.failure_count+1,
+                           quota_error_count=model_route_state.quota_error_count+1,last_error=excluded.last_error,
+                           last_error_at=excluded.last_error_at,updated_at=excluded.updated_at
+                         WHERE model_route_state.wall_observed_at IS NULL OR excluded.wall_observed_at>=model_route_state.wall_observed_at",
+                        params![route_key,capacity_key,provider_id,model_id,variant,surfaced_error,update.observed_at_ms],
                     )?;
+                    if changed>0 {
+                        if let Some(row)=block_storage::wall_source(tx,block_storage::WallSource {
+                            kind:"route",key:&route_key,provider:&provider_id,model:Some(&model_id),cooldown:None,exhausted:Some(quota_exhausted_until),
+                            wall_observed:Some(update.observed_at_ms),observed_at:update.observed_at_ms,error:Some(&surfaced_error),class:prior_class.as_deref(),unscoped:true,
+                        })? {block_storage::write_source(tx,&row)?;}
+                    }
                 }
-                let existing: Option<(i64, Option<f64>, Option<String>,i64)> = tx
+                let existing: Option<(i64, Option<f64>, Option<String>,i64,Option<i64>)> = tx
                     .query_row(
                         // Read only to decide this writer's own write of the row (see `route_write_read`).
                         ROUTE_READ_OUTCOME_FAILURE_STATE,
                         [&route_key],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?,row.get(3)?,row.get(4)?)),
                     )
                     .optional()?;
                 let previous_failures = existing
@@ -8152,15 +8101,12 @@ impl crate::AccountTx<'_> {
                             FROM model_route_decisions d WHERE d.id=?1",params![decision_id,provider_id,model_id],|row|row.get(0))?;
                         // A late completion from an already-running request
                         // cannot clear failure evidence recorded after it launched.
-                        tx.execute(
-                            "UPDATE model_route_state
-                             SET consecutive_terminal_failures=0,
-                                 failure_backoff_until=NULL,
-                                 failure_backoff_reason=NULL,
-                                 updated_at=?1
+                        let cleared=tx.execute(
+                            "UPDATE model_route_state SET consecutive_terminal_failures=0,updated_at=?1
                              WHERE route_key=?2 AND COALESCE(failure_observed_at,last_error_at,updated_at)<?3",
                             params![update.observed_at_ms, route_key,admitted_at],
                         )?;
+                        if cleared>0 {block_storage::remove_source(tx,"failure",&serde_json::json!([route_key]).to_string(),update.observed_at_ms,"completed")?;}
                     }
                     FailureBackoffTransition::Failure {
                         consecutive_failures,
@@ -8175,38 +8121,29 @@ impl crate::AccountTx<'_> {
                             .last_error
                             .clone()
                             .unwrap_or_else(|| update.outcome.as_str().to_string());
+                        let inherited_scope:Option<(Option<i64>,bool)>=if existing.is_none() {
+                            tx.query_row(ROUTE_READ_ROUTE_PROVIDER_ROW,[&provider_id],|row|Ok((row.get(7)?,row.get(6)?))).optional()?
+                        } else {None};
                         tx.execute(
                             "INSERT INTO model_route_state (
-                               route_key, capacity_key, provider_id, model_id, variant,
-                               failure_count, last_error, last_error_at, updated_at,
-                               consecutive_terminal_failures, failure_backoff_until,
-                               failure_backoff_reason
-                             ) VALUES (?1,?2,?3,?4,?5,1,?6,?7,?7,?8,?9,?10)
+                               route_key,capacity_key,provider_id,model_id,variant,failure_count,last_error,last_error_at,updated_at,consecutive_terminal_failures,wall_observed_at
+                             ) VALUES (?1,?2,?3,?4,?5,1,?6,?7,?7,?8,?9)
                              ON CONFLICT(route_key) DO UPDATE SET
-                               capacity_key=excluded.capacity_key,
-                               provider_id=excluded.provider_id,
-                               model_id=excluded.model_id,
-                               variant=excluded.variant,
-                               failure_count=model_route_state.failure_count + 1,
-                               last_error=excluded.last_error,
-                               last_error_at=excluded.last_error_at,
-                               updated_at=excluded.updated_at,
-                               consecutive_terminal_failures=excluded.consecutive_terminal_failures,
-                               failure_backoff_until=excluded.failure_backoff_until,
-                               failure_backoff_reason=excluded.failure_backoff_reason",
-                            params![
-                                route_key,
-                                capacity_key,
-                                provider_id,
-                                model_id,
-                                variant,
-                                surfaced_error,
-                                update.observed_at_ms,
-                                consecutive_failures,
-                                failure_backoff_until,
-                                failure_backoff_reason,
-                            ],
+                               capacity_key=excluded.capacity_key,provider_id=excluded.provider_id,model_id=excluded.model_id,variant=excluded.variant,
+                               failure_count=model_route_state.failure_count+1,last_error=excluded.last_error,last_error_at=excluded.last_error_at,
+                               updated_at=excluded.updated_at,consecutive_terminal_failures=excluded.consecutive_terminal_failures",
+                            params![route_key,capacity_key,provider_id,model_id,variant,surfaced_error,update.observed_at_ms,consecutive_failures,inherited_scope.and_then(|scope|scope.0)],
                         )?;
+                        tx.execute("UPDATE block SET scope_error=?2,observed_at=CASE WHEN ?3 THEN ?4 ELSE observed_at END
+                            WHERE kind='route' AND is_origin=1 AND source_present=1 AND origin_key=json_array(?1)",
+                            params![route_key,surfaced_error,existing.as_ref().is_some_and(|state|state.4.is_none()),update.observed_at_ms])?;
+                        let scope=self.current_blocks().map_err(fence_rechecks::command_error)?;
+                        let key=serde_json::json!([route_key]).to_string();
+                        let held=scope.block("route",&key).filter(|row|row.source_present).or_else(||scope.block("failure",&key).filter(|row|row.source_present));
+                        if let Some(row)=block_storage::failure_source(tx,block_storage::FailureSource {
+                            key:&route_key,provider:&provider_id,model:&model_id,deadline:failure_backoff_until,reason:failure_backoff_reason.as_deref(),
+                            observed_at:update.observed_at_ms,error:Some(&surfaced_error),class:held.and_then(|row|row.wall_class.as_deref()),unscoped:held.map_or_else(||inherited_scope.is_some_and(|scope|scope.1),|row|row.wall_unscoped),
+                        })? {block_storage::write_source(tx,&row)?;}
                         tx.execute("UPDATE model_route_state SET failure_observed_at=?2 WHERE route_key=?1",params![route_key,update.observed_at_ms])?;
                         if failure_backoff_until.is_some() {
                             fence_rechecks::register_on(self,"failure",&serde_json::json!([route_key]).to_string())?;
@@ -8242,14 +8179,10 @@ impl crate::AccountTx<'_> {
                 .optional()?;
             if prior.is_some() {
                 tx.execute(
-                    "UPDATE model_route_state
-                         SET consecutive_terminal_failures = 0,
-                             failure_backoff_until = NULL,
-                             failure_backoff_reason = NULL,
-                             updated_at = ?1
-                         WHERE route_key = ?2",
+                    "UPDATE model_route_state SET consecutive_terminal_failures=0,updated_at=?1 WHERE route_key=?2",
                     params![now_ms(), route_key],
                 )?;
+                block_storage::remove_source(tx,"failure",&serde_json::json!([route_key]).to_string(),now_ms(),"operator clear")?;
             }
 
             Ok(prior)

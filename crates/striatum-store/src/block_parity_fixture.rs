@@ -7,7 +7,9 @@ impl SqliteRouteStateStore {
     pub fn assert_block_parity_fixture_coverage_for_test(&self, now: i64) {
         use std::collections::BTreeSet;
         use striatum_core::blocks::{Cause, LifetimeClass, SOURCE_KINDS};
-        let loaded = self.load_blocks(now).unwrap();
+        let loaded = self
+            .with_reader_for_test(|conn| fence_rechecks::legacy::load_blocks(conn, now))
+            .unwrap();
         assert_eq!(
             loaded
                 .blocks

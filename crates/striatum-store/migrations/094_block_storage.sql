@@ -14,6 +14,8 @@ CREATE TABLE block (
   admission_id TEXT,
   observation_id TEXT,
   pool_key_json TEXT CHECK (pool_key_json IS NULL OR json_valid(pool_key_json)),
+  listing_fingerprint TEXT,
+  recovery_set_json TEXT CHECK (recovery_set_json IS NULL OR json_valid(recovery_set_json)),
   evidence TEXT NOT NULL,
   evidence_at INTEGER NOT NULL,
   quota INTEGER NOT NULL CHECK (quota IN (0,1)),
@@ -42,13 +44,17 @@ CREATE TABLE block (
   reason TEXT,
   code TEXT,
   wall_class TEXT,
+  -- Account-route records of other classes keep ordering/transient data but
+  -- are not origins. Claims and counts share this stored generated flag.
+  is_origin INTEGER GENERATED ALWAYS AS (kind!='account_route' OR wall_class IS 'quota') STORED,
   wall_unscoped INTEGER NOT NULL DEFAULT 0 CHECK (wall_unscoped IN (0,1)),
   scope_error TEXT,
-  inherited_from_provider INTEGER NOT NULL DEFAULT 0 CHECK (inherited_from_provider IN (0,1)),
   meta TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(meta)),
   PRIMARY KEY (kind, origin_key)
 );
 CREATE INDEX block_scope ON block(provider,credential_id,account_id,model);
+CREATE INDEX block_source_order ON block(kind,source_order);
+CREATE INDEX block_retired_time ON block(cleared_at) WHERE cleared_by='retired' AND is_origin=1;
 CREATE INDEX block_exclusions ON block(principal,admission_id,credential_id)
   WHERE kind='principal';
 CREATE INDEX block_observation ON block(observation_id) WHERE observation_id IS NOT NULL;
@@ -104,21 +110,21 @@ WHERE NOT EXISTS (SELECT 1 FROM block_migration_quarantine q
 -- Provider-wide refusal evidence can hide a route's shorter cooldown deadline.
 -- Store both deadlines; routing suppresses the duplicate route origin at read.
 INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,deadline,
-  next_recheck_at,inherited_from_provider)
+  next_recheck_at)
 SELECT 'route',json_array(r.route_key),r.provider_id,r.model_id,
   json_array(r.cooldown_until,r.quota_exhausted_until,r.wall_observed_at),
   COALESCE(r.wall_observed_at,r.last_error_at,r.updated_at),0,
   MAX(COALESCE(r.cooldown_until,0),COALESCE(r.quota_exhausted_until,0)),
   CAST(MIN(MAX(COALESCE(r.cooldown_until,0),COALESCE(r.quota_exhausted_until,0)),
-    COALESCE(r.wall_observed_at,r.last_error_at,r.updated_at)+3600000) AS INTEGER),1
+    COALESCE(r.wall_observed_at,r.last_error_at,r.updated_at)+3600000) AS INTEGER)
 FROM model_route_state r
 WHERE (r.cooldown_until IS NOT NULL OR r.quota_exhausted_until IS NOT NULL)
   AND NOT EXISTS (SELECT 1 FROM block b WHERE b.kind='route' AND b.origin_key=json_array(r.route_key))
   AND NOT EXISTS (SELECT 1 FROM block_migration_quarantine q
     WHERE q.kind='route' AND q.origin_key=json_array(r.route_key));
 
--- Older route-fence rows of a non-quota class still participate in report
--- ordering and transient_account_route_fences, although fence_origin excludes them.
+-- Older route-fence rows of a non-quota class still supply report ordering
+-- and keyed source metadata, although fence_origin excludes them.
 INSERT INTO block(kind,origin_key,provider,credential_id,model,evidence,evidence_at,
   quota,deadline,next_recheck_at)
 SELECT 'account_route',json_array(provider,credential_id,model),provider,credential_id,model,
@@ -136,17 +142,17 @@ SELECT 'account',json_array(fence_id),provider,account_id,fence_json,
   cleared_at,'removed',cleared_reason,0
 FROM account_fence WHERE cleared_at IS NOT NULL;
 
--- Metadata contains only details decoded by Rust. Fields used by indexes,
--- ordering, retention or compare-and-set guards have their own columns.
+-- Metadata contains only details decoded by Rust. Fields named by SQL indexes,
+-- ordering, retention or compare-and-set predicates have their own columns.
 UPDATE block SET
-  (source_order,observed_at,created_at,observation_id,pool_key_json,cleared_reason,meta) =
-  (SELECT f.rowid,f.observed_at,f.created_at,f.observation_id,f.pool_key_json,f.cleared_reason,
+  (source_order,observed_at,created_at,observation_id,pool_key_json,cleared_reason,recovery_set_json,meta) =
+  (SELECT f.rowid,f.observed_at,f.created_at,f.observation_id,f.pool_key_json,f.cleared_reason,f.recovery_set_json,
     json_object('scope_json',f.scope_json,'fence_json',f.fence_json,'source',f.source,
-      'principal',f.principal,'admission_id',f.admission_id,'recovery_set_json',f.recovery_set_json)
+      'principal',f.principal,'admission_id',f.admission_id)
    FROM account_fence f WHERE block.origin_key=json_array(f.fence_id))
 WHERE kind='account';
-UPDATE block SET (source_order,code,observed_at,meta) =
-  (SELECT c.rowid,c.code,c.observed_at_ms,json_object('listing_fingerprint',c.listing_fingerprint)
+UPDATE block SET (source_order,code,observed_at,listing_fingerprint,meta) =
+  (SELECT c.rowid,c.code,c.observed_at_ms,c.listing_fingerprint,'{}'
    FROM credential_entitlement_fences c
    WHERE block.origin_key=json_array(c.provider_id,c.credential_id))
 WHERE kind='credential';
@@ -181,19 +187,19 @@ UPDATE block SET (source_order,observation_id) =
 WHERE kind='observation';
 UPDATE block SET (source_order,reason,observed_at) =
   (SELECT p.rowid,CASE block.kind WHEN 'pool_billing' THEN p.wall_reason ELSE p.cooldown_reason END,
-    CASE block.kind WHEN 'pool_billing' THEN p.wall_observed_at ELSE p.cooldown_observed_at END
+    CASE block.kind WHEN 'pool_billing' THEN COALESCE(p.wall_observed_at,p.updated_at) ELSE COALESCE(p.cooldown_observed_at,p.updated_at) END
    FROM pool_key_state p WHERE block.origin_key=json_array(p.provider,p.credential_id))
 WHERE kind IN ('pool_billing','pool_rate');
 UPDATE block SET (source_order,cooldown_until,quota_exhausted_until,wall_class,wall_unscoped,scope_error,observed_at) =
-  (SELECT p.rowid,p.cooldown_until,p.quota_exhausted_until,p.wall_class,p.wall_unscoped,p.last_error,p.wall_observed_at
+  (SELECT p.rowid,p.cooldown_until,p.quota_exhausted_until,p.wall_class,p.wall_unscoped,p.last_error,COALESCE(p.wall_observed_at,p.last_error_at,p.updated_at)
    FROM provider_cooldown_state p WHERE block.origin_key=json_array(p.provider_key))
 WHERE kind='provider';
 UPDATE block SET (source_order,cooldown_until,quota_exhausted_until,wall_class,wall_unscoped,scope_error,observed_at) =
-  (SELECT r.rowid,r.cooldown_until,r.quota_exhausted_until,r.wall_class,r.wall_unscoped,r.last_error,r.wall_observed_at
+  (SELECT r.rowid,r.cooldown_until,r.quota_exhausted_until,r.wall_class,r.wall_unscoped,r.last_error,COALESCE(r.wall_observed_at,r.last_error_at,r.updated_at)
    FROM model_route_state r WHERE block.origin_key=json_array(r.route_key))
 WHERE kind='route';
 UPDATE block SET (source_order,reason,wall_class,wall_unscoped,scope_error,observed_at) =
-  (SELECT r.rowid,r.failure_backoff_reason,r.wall_class,r.wall_unscoped,r.last_error,r.failure_observed_at
+  (SELECT r.rowid,r.failure_backoff_reason,r.wall_class,r.wall_unscoped,r.last_error,COALESCE(r.failure_observed_at,r.last_error_at,r.updated_at)
    FROM model_route_state r WHERE block.origin_key=json_array(r.route_key))
 WHERE kind='failure';
 
@@ -243,11 +249,13 @@ WHERE NOT EXISTS (SELECT 1 FROM block b WHERE b.kind=r.kind AND b.origin_key=r.o
 INSERT INTO retirement_tombstone
 SELECT kind,origin_key,evidence,evidence_at,(SELECT at FROM block_migration_now)
 FROM block WHERE managed=0 AND quota=0 AND deadline<(SELECT at FROM block_migration_now)
-  AND inherited_from_provider=0 AND NOT (kind='account_route' AND wall_class IS NOT 'quota')
+  AND is_origin=1 AND EXISTS (SELECT 1 FROM fence_origin o
+    WHERE o.kind=block.kind AND o.origin_key=block.origin_key AND o.evidence=block.evidence)
 ON CONFLICT(kind,origin_key,evidence) DO NOTHING;
 UPDATE block SET cleared_at=(SELECT at FROM block_migration_now),cleared_by='retired',source_present=0
 WHERE managed=0 AND quota=0 AND deadline<(SELECT at FROM block_migration_now)
-  AND inherited_from_provider=0 AND NOT (kind='account_route' AND wall_class IS NOT 'quota');
+  AND is_origin=1 AND EXISTS (SELECT 1 FROM fence_origin o
+    WHERE o.kind=block.kind AND o.origin_key=block.origin_key AND o.evidence=block.evidence);
 
 CREATE TRIGGER retirement_tombstone_enforce AFTER INSERT ON retirement_tombstone
 BEGIN

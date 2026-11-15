@@ -746,10 +746,9 @@ impl crate::AccountTx<'_> {
                        SELECT rowid FROM account_observation \
                          INDEXED BY account_observation_by_received \
                        WHERE received_at < ?1 \
-                         AND NOT EXISTS (SELECT 1 FROM account_fence f \
-                           WHERE f.observation_id = account_observation.observation_id) \
-                          AND NOT EXISTS (SELECT 1 FROM account_principal_exclusion x \
-                            WHERE x.observation_id = account_observation.observation_id) \
+                         AND NOT EXISTS (SELECT 1 FROM block b \
+                           WHERE b.is_origin=1 AND b.kind IN ('account','principal') \
+                             AND b.observation_id=account_observation.observation_id) \
                           AND NOT (kind='signed_out' AND bound=1 AND EXISTS ( \
                             SELECT 1 FROM account_admission a \
                             WHERE a.principal=account_observation.principal \
@@ -939,9 +938,12 @@ impl crate::AccountTx<'_> {
         limit: usize,
     ) -> RouteStateResult<usize> {
         self.retention_write(|tx| {
+            tx.execute("DELETE FROM block WHERE rowid IN (
+                SELECT rowid FROM block INDEXED BY block_retired_time
+                WHERE is_origin=1 AND cleared_by='retired' AND cleared_at<?1 ORDER BY cleared_at LIMIT ?2)",params![before,limit_param(limit)])?;
             tx.execute(
-                "DELETE FROM fence_retired_origin WHERE rowid IN ( \
-                   SELECT rowid FROM fence_retired_origin INDEXED BY fence_retired_origin_by_retired \
+                "DELETE FROM retirement_tombstone WHERE rowid IN ( \
+                   SELECT rowid FROM retirement_tombstone INDEXED BY retirement_tombstone_time \
                    WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)",
                 params![before, limit_param(limit)],
             )

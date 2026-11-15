@@ -627,22 +627,10 @@ impl SqliteRouteStateStore {
 }
 
 impl AccountTx<'_> {
-    /// Latest report times in this transaction's view, including reports on
-    /// sibling routes of the same credential.
     pub fn route_fence_latest_reports(
         &self,
     ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at))
-             FROM account_route_fence GROUP BY credential_id",
-            )
-            .map_err(err)?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(err)
+        Ok(self.current_blocks()?.route_fence_latest_reports())
     }
 
     /// Clear older route evidence in the same transaction that checked its
@@ -655,9 +643,9 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<usize> {
         self.conn
             .execute(
-                "DELETE FROM account_route_fence
-            WHERE provider=?1 AND credential_id=?2 AND COALESCE(last_reported_at,recorded_at)<?3",
-                params![provider, credential, reading_at],
+                "UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?4),cleared_by='removed',claim_owner=NULL
+                    WHERE kind='account_route' AND source_present=1 AND provider=?1 AND credential_id=?2 AND COALESCE(last_reported_at,recorded_at)<?3",
+                params![provider, credential, reading_at,crate::now_ms()],
             )
             .map_err(err)
     }
@@ -737,15 +725,9 @@ impl AccountTx<'_> {
         credential: &str,
     ) -> RouteStateResult<Option<striatum_core::route_state_store::CredentialEntitlementFence>>
     {
-        self.conn
-            .query_row(
-                "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
-             FROM credential_entitlement_fences WHERE provider_id = ?1 AND credential_id = ?2",
-                params![provider, credential],
-                |row| rows::entitlement_at(row, 0),
-            )
-            .optional()
-            .map_err(err)
+        Ok(self
+            .current_blocks()?
+            .entitlement_fence(provider, credential))
     }
 
     /// Account-wide backoffs are derived from committed, bound observation
@@ -794,7 +776,7 @@ impl AccountTx<'_> {
         if changed > 0 {
             return Ok(CredentialProbeClaim::Claimed);
         }
-        let exists: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2)",params![provider,credential],|row|row.get(0)).map_err(err)?;
+        let exists: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM block WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2)",params![provider,credential],|row|row.get(0)).map_err(err)?;
         Ok(if exists {
             CredentialProbeClaim::Blocked
         } else {
@@ -888,18 +870,11 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Size-specific quota evidence remains until fresh headroom or success;
-    /// its reported reset is a recheck hint, not an expiry.
+    /// Reported reset times remain recheck hints, not expiry of quota evidence.
     pub fn account_size_refusals(&self, _now: i64) -> RouteStateResult<Vec<AccountSizeRefusal>> {
-        self.store.with_read(|conn: &Connection| {
-            if !account_fact_table_exists(conn, "account_size_refusal")? { return Ok(Vec::new()); }
-            let extra=if account_fact_table_exists(conn,"account_non_quota_size_refusal")? {
-                " UNION ALL SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_non_quota_size_refusal"
-            }else{""};
-            let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,size_class,expires_at,observed_at FROM account_size_refusal{extra}"))?;
-            let rows = statement.query_map([], |row| rows::size_refusal_at(row, 0))?;
-            rows.collect()
-        }).map_err(err)
+        self.store
+            .with_read(|conn| Ok(crate::BlockState::read(conn)?.size_refusals()))
+            .map_err(err)
     }
 
     pub fn clear_account_size_refusal(
@@ -968,16 +943,13 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Latest evidence per credential, separate from the fence's first receipt.
+    /// Latest report time per credential, separate from the first receipt.
     pub fn account_route_fence_latest_reports(
         &self,
     ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
-        self.store.with_read(|conn: &Connection| {
-            if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(std::collections::BTreeMap::new()); }
-            let mut statement = conn.prepare("SELECT credential_id,MAX(COALESCE(last_reported_at,recorded_at)) FROM account_route_fence GROUP BY credential_id")?;
-            let rows = statement.query_map([], |row| Ok((row.get(0)?,row.get(1)?)))?;
-            rows.collect()
-        }).map_err(err)
+        self.store
+            .with_read(|conn| Ok(crate::BlockState::read(conn)?.route_fence_latest_reports()))
+            .map_err(err)
     }
 
     /// Retained quota route evidence. Provider dates schedule checks rather
@@ -998,14 +970,9 @@ impl SqliteRouteStateStore {
         _now: i64,
         class: &str,
     ) -> RouteStateResult<Vec<AccountRouteFence>> {
-        self.store.with_read(|conn: &Connection| {
-            if !account_fact_table_exists(conn, "account_route_fence")? { return Ok(Vec::new()); }
-            let table=if class!="quota" {"account_non_quota_route_fence"} else {"account_route_fence"};
-            let filter=if class=="transient" {"WHERE wall_kind='transient'"} else if class=="billing" {"WHERE wall_kind='billing'"} else {"WHERE wall_class='quota'"};
-            let mut statement = conn.prepare(&format!("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM {table} {filter} ORDER BY provider,credential_id,model"))?;
-            let rows = statement.query_map([], |row| rows::route_fence_at(row, 0))?;
-            rows.collect()
-        }).map_err(err)
+        self.store
+            .with_read(|conn| Ok(crate::BlockState::read(conn)?.route_fences(class)))
+            .map_err(err)
     }
 
     /// Revalidate evidence ordering under the writer lock. The reading may
@@ -1926,19 +1893,9 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// Every fence on `provider` not yet cleared.
+    /// Every standing quota hold on this provider, from the current block rows.
     pub fn active_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountFenceRow>> {
-        let mut statement = self
-            .conn
-            .prepare(&format!(
-                "SELECT {FENCE_COLUMNS} FROM account_fence \
-                 WHERE provider = ?1 AND cleared_at IS NULL ORDER BY created_at, fence_id"
-            ))
-            .map_err(err)?;
-        let rows = statement
-            .query_map(params![provider], fence_from_row)
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(err)
+        Ok(self.current_blocks()?.active_fences(provider))
     }
 
     pub fn insert_fence(&self, row: &AccountFenceRow) -> RouteStateResult<()> {
@@ -1952,79 +1909,21 @@ impl AccountTx<'_> {
         })
     }
 
-    /// Store the recovery set in the same transaction as the confirming evidence.
-    pub fn insert_pool_fence(&self, block: &AccountPoolFenceRow) -> RouteStateResult<()> {
-        let row = &block.evidence;
-        let pool_key = block
-            .pool_key
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(err)?;
-        let recovery_set = serde_json::to_string(&block.recovery_set).map_err(err)?;
-        self.conn
-            .execute(
-                &format!(
-                    "INSERT INTO account_fence ({FENCE_COLUMNS}, pool_key_json, recovery_set_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)"
-                ),
-                params![
-                    row.fence_id,
-                    row.provider,
-                    row.account_id,
-                    row.scope_json,
-                    row.fence_json,
-                    row.source,
-                    row.observed_at,
-                    row.principal,
-                    row.admission_id,
-                    row.observation_id,
-                    row.created_at,
-                    row.cleared_at,
-                    row.cleared_reason,
-                    pool_key,
-                    recovery_set,
-                ],
-            )
-            .map(|_| ())
-            .map_err(err)
+    /// Store the recovery set with the same stable fence id as its evidence.
+    pub fn insert_pool_fence(&self, fence: &AccountPoolFenceRow) -> RouteStateResult<()> {
+        let row = crate::block_storage::account_source(self.conn, fence).map_err(err)?;
+        let changed = crate::block_storage::write_source(self.conn, &row).map_err(err)?;
+        if changed == 0 {
+            return Err(err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY),
+                Some("UNIQUE constraint failed: block.kind, block.origin_key".into()),
+            )));
+        }
+        Ok(())
     }
 
     pub fn active_pool_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountPoolFenceRow>> {
-        let mut statement = self
-            .conn
-            .prepare(&format!(
-                "SELECT {FENCE_COLUMNS}, pool_key_json, recovery_set_json FROM account_fence
-             WHERE provider=?1 AND cleared_at IS NULL ORDER BY created_at, fence_id"
-            ))
-            .map_err(err)?;
-        let rows = statement
-            .query_map([provider], |row| {
-                Ok((
-                    fence_from_row(row)?,
-                    row.get::<_, Option<String>>(13)?,
-                    row.get::<_, String>(14)?,
-                ))
-            })
-            .map_err(err)?;
-        rows.map(|row| {
-            let (evidence, key, recovery) = row.map_err(err)?;
-            let healed = self.successful_quota_pools(
-                &evidence.fence_id,
-                evidence.observed_at.min(evidence.created_at),
-            )?;
-            let mut recovery_set: Vec<PoolKey> = serde_json::from_str(&recovery).map_err(err)?;
-            recovery_set.retain(|pool| !healed.contains(pool));
-            Ok(AccountPoolFenceRow {
-                evidence,
-                pool_key: key
-                    .map(|key| serde_json::from_str(&key))
-                    .transpose()
-                    .map_err(err)?,
-                recovery_set,
-            })
-        })
-        .collect()
+        self.current_blocks()?.active_pool_fences(provider)
     }
 
     /// Mark a standing block ended, recording when and why. Returns whether
@@ -2032,8 +1931,8 @@ impl AccountTx<'_> {
     pub fn clear_fence(&self, fence_id: &str, at: i64, reason: &str) -> RouteStateResult<bool> {
         self.conn
             .execute(
-                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
-                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='kept',cleared_reason=?3,claim_owner=NULL
+                 WHERE kind='account' AND origin_key=json_array(?1) AND source_present=1",
                 params![fence_id, at, reason],
             )
             .map(|changed| changed > 0)
@@ -2052,9 +1951,9 @@ impl AccountTx<'_> {
         let changed = self
             .conn
             .execute(
-                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
-                 WHERE fence_id = ?1 AND cleared_at IS NULL AND observed_at = ?4 \
-                   AND created_at = ?5 AND fence_json = ?6",
+                "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='kept',cleared_reason=?3,claim_owner=NULL
+                 WHERE kind='account' AND origin_key=json_array(?1) AND source_present=1 AND observed_at=?4
+                   AND created_at=?5 AND evidence=?6",
                 params![
                     row.fence_id,
                     at,
@@ -2089,11 +1988,10 @@ impl AccountTx<'_> {
         let changed = self
             .conn
             .execute(
-                "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
-                 WHERE fence_id = ?1 AND cleared_at IS NULL AND observed_at = ?4 \
-                   AND created_at = ?5 AND fence_json = ?6 AND pool_key_json IS ?7 \
-                   AND recovery_set_json = ?8 AND (SELECT count(*) FROM fence_success_pool \
-                   WHERE fence_id = ?1 AND evidence_at = ?9) = ?10",
+                "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='kept',cleared_reason=?3,claim_owner=NULL
+                 WHERE kind='account' AND is_origin=1 AND origin_key=json_array(?1) AND source_present=1 AND observed_at=?4
+                   AND created_at=?5 AND evidence=?6 AND pool_key_json IS ?7
+                    AND (SELECT count(*) FROM success_proof WHERE fence_id=?1 AND evidence_at=?8)=?9 AND recovery_set_json=?10",
                 params![
                     row.fence_id,
                     at,
@@ -2102,9 +2000,9 @@ impl AccountTx<'_> {
                     row.created_at,
                     row.fence_json,
                     pool_key_json,
-                    recovery_set_json,
                     successes.0,
-                    successes.1 as i64
+                    successes.1 as i64,
+                    recovery_set_json
                 ],
             )
             .map_err(err)?;
@@ -2126,27 +2024,17 @@ impl AccountTx<'_> {
         let recovery_set = serde_json::to_string(recovery_set).map_err(err)?;
         self.conn
             .execute(
-                "UPDATE account_fence SET recovery_set_json = ?2 \
-                 WHERE fence_id = ?1 AND cleared_at IS NULL",
+                "UPDATE block SET recovery_set_json=?2
+                 WHERE kind='account' AND origin_key=json_array(?1) AND source_present=1",
                 params![fence_id, recovery_set],
             )
             .map(|_| ())
             .map_err(err)
     }
 
-    /// Every provider with at least one standing block.
+    /// Every provider with at least one standing quota hold.
     pub fn active_fence_providers(&self) -> RouteStateResult<Vec<String>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT DISTINCT provider FROM account_fence WHERE cleared_at IS NULL \
-                 ORDER BY provider",
-            )
-            .map_err(err)?;
-        let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(err)
+        Ok(self.current_blocks()?.active_fence_providers())
     }
 
     /// The scoped not-found exclusions reported against this one admission.
@@ -2155,52 +2043,18 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Vec<AccountExclusionRow>> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "SELECT principal, admission_id, credential_id, runner_view_digest, \
-                   roster_view_digest, observation_id, recorded_at \
-                 FROM account_principal_exclusion WHERE principal = ?1 AND admission_id = ?2 \
-                 ORDER BY credential_id",
-            )
-            .map_err(err)?;
-        let rows = statement
-            .query_map(params![principal, admission_id], |row| {
-                rows::exclusion_at(row, 0)
-            })
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<_>>().map_err(err)
+        Ok(self
+            .current_blocks()?
+            .admission_exclusions(principal, admission_id))
     }
 
-    /// Record a scoped not-found. Returns false when this admission already
-    /// excluded the credential.
-    pub fn insert_exclusion(&self, row: &AccountExclusionRow) -> RouteStateResult<bool> {
-        let changed = self
-            .conn
-            .execute(
-                "INSERT INTO account_principal_exclusion (principal, admission_id, credential_id, \
-                   runner_view_digest, roster_view_digest, observation_id, recorded_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT (principal, admission_id, credential_id) DO NOTHING",
-                params![
-                    row.principal,
-                    row.admission_id,
-                    row.credential_id,
-                    row.runner_view_digest,
-                    row.roster_view_digest,
-                    row.observation_id,
-                    row.recorded_at,
-                ],
-            )
-            .map_err(err)?;
+    /// Record a scoped not-found only once for this admission and credential.
+    pub fn insert_exclusion(&self, exclusion: &AccountExclusionRow) -> RouteStateResult<bool> {
+        let row = crate::block_storage::principal_source(self.conn, exclusion).map_err(err)?;
+        let changed = crate::block_storage::write_source(self.conn, &row).map_err(err)?;
         if changed == 1 {
-            crate::fence_rechecks::register_on(
-                self,
-                "principal",
-                &serde_json::json!([row.principal, row.admission_id, row.credential_id])
-                    .to_string(),
-            )
-            .map_err(err)?;
+            crate::fence_rechecks::register_on(self, "principal", &row.block.origin_key)
+                .map_err(err)?;
         }
         Ok(changed == 1)
     }
@@ -2214,7 +2068,7 @@ impl AccountTx<'_> {
         if inserted && crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             self.conn
                 .execute(
-                    "UPDATE fence_recheck SET next_recheck_at=MIN(next_recheck_at,?2)
+                    "UPDATE block SET next_recheck_at=MIN(next_recheck_at,?2)
                 WHERE kind='principal' AND origin_key=?1",
                     params![
                         serde_json::json!([row.principal, row.admission_id, row.credential_id])
@@ -2230,18 +2084,11 @@ impl AccountTx<'_> {
         Ok(inserted)
     }
 
-    /// How many admissions of `principal` reported a scoped not-found for
-    /// `credential_id`: more than one for a credential the vault still lists
-    /// is the repeated-refusal alarm.
+    /// Count admissions with a standing scoped refusal for this principal and credential.
     pub fn exclusion_count(&self, principal: &str, credential_id: &str) -> RouteStateResult<i64> {
-        self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM account_principal_exclusion \
-                 WHERE principal = ?1 AND credential_id = ?2",
-                params![principal, credential_id],
-                |row| row.get(0),
-            )
-            .map_err(err)
+        Ok(self
+            .current_blocks()?
+            .exclusion_count(principal, credential_id))
     }
 
     /// The first report of a runner event, if routing already applied it.
@@ -2344,16 +2191,71 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        // The rows this observation inserted or moved, returned by the
-        // write itself rather than read back from the block table.
-        let keys = self
+        // One observation may name an account more than once. Its last
+        // effect wins, while first occurrence fixes insertion order. Reduce
+        // before writing so a replay cannot temporarily replace a healed
+        // evidence signature and accidentally re-arm its clock.
+        let effects = self
             .conn
-            .prepare(INSERT_TRANSIENT_BACKOFFS)
+            .prepare(TRANSIENT_BACKOFF_EFFECTS_SQL)
             .map_err(err)?
-            .query_map(params![id, effects], |row| row.get::<_, String>(0))
+            .query_map(params![id, effects], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, crate::block_storage::Deadline>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
             .map_err(err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
+        let mut positions = std::collections::HashMap::new();
+        let mut reduced = Vec::new();
+        for effect in effects {
+            let identity = (effect.0.clone(), effect.1.clone());
+            if let Some(index) = positions.get(&identity) {
+                reduced[*index] = effect;
+            } else {
+                positions.insert(identity, reduced.len());
+                reduced.push(effect);
+            }
+        }
+        let mut keys = Vec::new();
+        for (provider, account, deadline, at, evidence) in reduced {
+            let key = serde_json::json!([provider, account]).to_string();
+            let state = self.current_blocks()?;
+            state
+                .check_source(self.conn, "observation", &key, &provider)
+                .map_err(err)?;
+            if state
+                .block("observation", &key)
+                .filter(|row| row.source_present)
+                .and_then(|row| row.observed_at)
+                .is_some_and(|prior| prior > at)
+            {
+                continue;
+            }
+            let mut row =
+                crate::block_storage::StoredBlock::from_origin(crate::fence_rechecks::ViewOrigin {
+                    kind: "observation".into(),
+                    origin_key: key.clone(),
+                    provider,
+                    account_id: Some(account),
+                    evidence,
+                    evidence_at: at,
+                    quota: Some(false),
+                    deadline: Some(deadline.as_f64()),
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            row.deadline = Some(deadline);
+            row.observed_at = Some(at);
+            row.observation_id = Some(id.into());
+            crate::block_storage::write_source(self.conn, &row).map_err(err)?;
+            keys.push(key);
+        }
         for key in keys {
             crate::fence_rechecks::register_on(self, "observation", &key).map_err(err)?;
         }
@@ -2801,24 +2703,21 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
-        self.command_sql(|conn: &Connection| {
-            conn.execute(
-                "INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6) \
-                ON CONFLICT (provider,credential_id,model,size_class) DO UPDATE SET \
-                expires_at=excluded.expires_at,observed_at=excluded.observed_at \
-                WHERE excluded.observed_at >= account_size_refusal.observed_at",
-                params![
-                    fact.provider,
-                    fact.credential_id,
-                    fact.model,
-                    fact.size_class,
-                    fact.expires_at,
-                    fact.observed_at
-                ],
-            )
+        let row = crate::block_storage::size_source(fact, true).map_err(err)?;
+        let blocks = self.current_blocks()?;
+        blocks
+            .check_source(self.conn, "size", &row.block.origin_key, &fact.provider)
+            .map_err(err)?;
+        if blocks
+            .source_record("size", &row.block.origin_key)
+            .is_some_and(|prior| prior.origin().evidence_at > fact.observed_at)
+        {
+            return Ok(());
+        }
+        drop(blocks);
+        crate::block_storage::write_source(self.conn, &row)
             .map(|_| ())
-        })
-        .map_err(err)
+            .map_err(err)
     }
 
     pub fn clear_account_size_refusal(
@@ -2830,8 +2729,9 @@ impl crate::AccountTx<'_> {
         observed_at: i64,
     ) -> RouteStateResult<()> {
         self.command_sql(|conn: &Connection| {
-            conn.execute("DELETE FROM account_size_refusal WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5",
-                params![provider,credential,model,size_class,observed_at]).map(|_| ())
+            conn.execute("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?6),cleared_by='removed',claim_owner=NULL
+                WHERE kind='size' AND source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND COALESCE(observed_at,evidence_at)<?5",
+                params![provider,credential,model,size_class,observed_at,crate::now_ms()]).map(|_| ())
         }).map_err(err)
     }
 
@@ -2858,32 +2758,51 @@ impl crate::AccountTx<'_> {
         fence: &AccountRouteFence,
         class: &str,
     ) -> RouteStateResult<()> {
-        self.command_sql(|conn: &Connection| {
-                conn.execute(
-                    "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES (?1,?2,?3,?4,?5,?6,?6,?7) \
-                ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
-                until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at) THEN excluded.until_ms ELSE account_route_fence.until_ms END, \
-                wall_class=CASE WHEN account_route_fence.until_ms<=excluded.recorded_at THEN excluded.wall_class \
-                  WHEN account_route_fence.wall_class='quota' THEN 'quota' ELSE excluded.wall_class END, \
-                recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at), \
-                last_reported_at=CASE \
-                  WHEN account_route_fence.wall_class='quota' AND excluded.wall_class='transient' AND account_route_fence.until_ms>excluded.recorded_at \
-                    THEN account_route_fence.last_reported_at \
-                  ELSE MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at) END",
-                    params![
-                        fence.provider,
-                        fence.credential_id,
-                        fence.model,
-                        fence.until_ms,
-                        fence.decision_id,
-                        fence.recorded_at,
-                        class
-                    ],
-                )?;
-                if crate::fence_rechecks::enabled(&conn)? {conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;}
-                Ok(())
-            })
-            .map_err(err)
+        let key = serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string();
+        let blocks = self.current_blocks()?;
+        blocks
+            .check_source(self.conn, "account_route", &key, &fence.provider)
+            .map_err(err)?;
+        let mut merged = fence.clone();
+        let mut merged_class = class;
+        let mut reported = Some(fence.recorded_at);
+        if let Some((prior, prior_class, last)) =
+            blocks.account_route_fence(&fence.provider, &fence.credential_id, &fence.model)
+        {
+            let latest = last.unwrap_or(prior.recorded_at);
+            if fence.recorded_at < latest {
+                merged.until_ms = prior.until_ms;
+            }
+            if prior.until_ms > fence.recorded_at && prior_class.as_deref() == Some("quota") {
+                merged_class = "quota";
+            }
+            reported = if prior_class.as_deref() == Some("quota")
+                && class == "transient"
+                && prior.until_ms > fence.recorded_at
+            {
+                last
+            } else {
+                Some(latest.max(fence.recorded_at))
+            };
+            merged.recorded_at = prior.recorded_at.min(fence.recorded_at);
+            merged.decision_id = prior.decision_id;
+        }
+        let row = crate::block_storage::account_route_source(
+            &merged,
+            "account_route",
+            merged_class,
+            reported,
+        )
+        .map_err(err)?;
+        drop(blocks);
+        crate::block_storage::write_source(self.conn, &row).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE block SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",
+                [&key],
+            )
+            .map_err(err)?;
+        Ok(())
     }
 
     pub fn reconcile_account_route_fence(
@@ -2892,53 +2811,54 @@ impl crate::AccountTx<'_> {
         until_ms: i64,
         last_reported_at: i64,
     ) -> RouteStateResult<()> {
-        self.command_sql(|conn: &Connection| {
-            conn.execute("UPDATE account_route_fence SET until_ms=?1 WHERE provider=?2 AND credential_id=?3 AND model=?4 AND wall_class='quota' AND until_ms=?5 AND COALESCE(last_reported_at,recorded_at)=?6",
-                params![until_ms, fence.provider, fence.credential_id, fence.model, fence.until_ms, last_reported_at]).map(|_| ())
-        }).map_err(err)
+        let key = serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string();
+        let blocks = self.current_blocks()?;
+        blocks
+            .check_source(self.conn, "account_route", &key, &fence.provider)
+            .map_err(err)?;
+        let Some((mut current, class, reported)) =
+            blocks.account_route_fence(&fence.provider, &fence.credential_id, &fence.model)
+        else {
+            return Ok(());
+        };
+        if class.as_deref() != Some("quota")
+            || current.until_ms != fence.until_ms
+            || reported.unwrap_or(current.recorded_at) != last_reported_at
+        {
+            return Ok(());
+        }
+        current.until_ms = until_ms;
+        let row = crate::block_storage::account_route_source(
+            &current,
+            "account_route",
+            "quota",
+            reported,
+        )
+        .map_err(err)?;
+        drop(blocks);
+        crate::block_storage::write_source(self.conn, &row)
+            .map(|_| ())
+            .map_err(err)
     }
 
     pub fn clear_all_account_route_fences_for_credential(
         &self,
         credential_id: &str,
     ) -> RouteStateResult<usize> {
-        self.command_sql(|conn: &Connection| {
-            let tx = conn;
-            let mut cleared = 0;
-            for table in ["account_route_fence", "account_non_quota_route_fence"] {
-                if account_fact_table_exists(&tx, table)? {
-                    cleared += tx.execute(
-                        &format!("DELETE FROM {table} WHERE credential_id=?1"),
-                        [credential_id],
-                    )?;
-                }
-            }
-            if crate::fence_rechecks::enabled(&tx)? {
-                tx.execute(
-                    "DELETE FROM fence_recheck WHERE credential_id=?1
-                    AND kind IN ('account_route','non_quota_route','transient_route')",
-                    [credential_id],
-                )?;
-            }
-
-            Ok(cleared)
-        })
-        .map_err(err)
+        let cleared=self.conn.execute("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
+            WHERE credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')",params![credential_id,crate::now_ms()]).map_err(err)?;
+        self.conn.execute("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+            WHERE credential_id=?1 AND kind IN ('account_route','non_quota_route','transient_route')",[credential_id]).map_err(err)?;
+        Ok(cleared)
     }
 }
 
-/// A bound transient-backoff observation's effects, written as backoff rows.
-/// It runs a `SELECT` over the observation and its `json_each` list, and
-/// reads its target only for its upsert guard and `RETURNING`: a reviewed
-/// own-row write for the block read trace (`group_reads::REVIEWED_OWN_ROW_WRITES`).
-pub(crate) const INSERT_TRANSIENT_BACKOFFS: &str = "INSERT INTO account_transient_backoff
-            SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
-                o.received_at,json_array(o.observation_id,e.key),e.value
+/// Read the effects of one bound observation by its replay key. Evidence
+/// signatures keep SQLite's effect index and JSON string representation.
+pub(crate) const TRANSIENT_BACKOFF_EFFECTS_SQL: &str = "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
+                o.received_at,json_array(o.observation_id,e.key)
             FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
             WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
                 AND json_extract(e.value,'$.effect')='transient_backoff'
                 AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
-                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
-            ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
-                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at
-            RETURNING json_array(provider,account_id)";
+                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')";

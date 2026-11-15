@@ -21,12 +21,17 @@ fn migration_preserves_each_kind_metadata_and_claimed_generation() {
             rusqlite::params![now+700,now-500])?;
         Ok(())
     }).unwrap();
-    let before = store.load_blocks(now).unwrap();
+    let before = store
+        .with_reader_for_test(|conn| crate::fence_rechecks::legacy::load_blocks(conn, now))
+        .unwrap();
     let times = store.block_parity_times(now).unwrap();
     let expected = times
         .iter()
         .map(|at| {
-            let mut blocks = store.load_blocks(*at).unwrap().blocks;
+            let mut blocks = store
+                .with_reader_for_test(|conn| crate::fence_rechecks::legacy::load_blocks(conn, *at))
+                .unwrap()
+                .blocks;
             blocks.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
             blocks
         })
@@ -158,7 +163,7 @@ fn migration_keeps_hidden_route_deadlines_and_removes_quarantined_providers() {
         conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,wall_unscoped,last_error,updated_at) VALUES ('inherit/old','inherit/old','inherit','old',?1,?2,1,'capacity',?2)",rusqlite::params![now+1000,now-1])?;
         conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_class,last_error,updated_at) VALUES ('quarantined',?1,?2,'quota','{\"provider_code\":\"quota_exhausted\",\"account_ref\":\"account\"}',?2)",rusqlite::params![now+9000,now-1])?;
         crate::fence_rechecks::sync_at(conn,now)?;
-        let old=crate::fence_rechecks::read_effective_at(conn,now)?;
+        let old=crate::fence_rechecks::legacy::read_effective_at(conn,now)?;
         assert!(!old.iter().any(|b|b.kind=="route" && b.provider=="inherit"));
         let mixed_before=conn.query_row("SELECT cooldown_until,wall_observed_at,wall_unscoped,last_error FROM model_route_state WHERE route_key='inherit/old'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,bool>(2)?,r.get::<_,String>(3)?)))?;
         install_migration_function(conn)?;
@@ -166,8 +171,8 @@ fn migration_keeps_hidden_route_deadlines_and_removes_quarantined_providers() {
         let rows=read(conn)?;
         assert!(!rows.iter().any(|r|r.block.scope.provider=="quarantined"));
         let route=rows.iter().find(|r|r.block.kind=="route").unwrap();
-        assert_eq!(route.cooldown_until,Some((now+1000) as f64));
-        assert!(route.inherited_from_provider);
+        assert_eq!(route.cooldown_until.map(SqlReal::as_f64),Some((now+1000) as f64));
+        assert!(route.source_present && route.is_origin(),"a covered route wall remains a real stored origin");
         assert_eq!(effective(&rows,now)?.blocks.iter().filter(|b|b.scope.provider=="inherit").map(|b|b.kind.as_str()).collect::<Vec<_>>(),vec!["provider"]);
         let mixed_after=conn.query_row("SELECT cooldown_until,wall_observed_at,wall_unscoped,last_error FROM model_route_state WHERE route_key='inherit/old'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,bool>(2)?,r.get::<_,String>(3)?)))?;
         assert_eq!(mixed_after,mixed_before,"the migration does not rewrite mixed-table evidence");
@@ -195,7 +200,7 @@ fn migration_new_evidence_keeps_the_prior_claim_time_without_its_authorization()
     store.with_writer_for_test(|conn| {
         conn.execute("UPDATE account_route_fence SET until_ms=?1,last_reported_at=?2 WHERE provider='cpu-provider-0'",rusqlite::params![now+50,now-10])?;
         conn.execute("UPDATE fence_recheck SET claim_owner='older-owner',claim_generation=41,last_claimed_at=?1,next_recheck_at=?2 WHERE kind='account_route'",rusqlite::params![now,now+990000])?;
-        let before=crate::fence_rechecks::read_effective_at(conn,now)?.into_iter().find(|b|b.kind=="account_route").unwrap();
+        let before=crate::fence_rechecks::legacy::read_effective_at(conn,now)?.into_iter().find(|b|b.kind=="account_route").unwrap();
         install_migration_function(conn)?;
         conn.execute_batch(MIGRATION)?;
         let rows=read(conn)?;
@@ -302,10 +307,12 @@ fn retirement_prevents_reinserted_evidence_from_reblocking() {
     store.with_writer_for_test(|conn| {
         install_migration_function(conn)?;
         conn.execute_batch(MIGRATION)?;
-        conn.execute_batch("CREATE TEMP TABLE delayed_block AS SELECT * FROM block WHERE kind='credential' AND source_present=1;
+        let persisted=conn.prepare("SELECT name FROM pragma_table_xinfo('block') WHERE hidden=0 ORDER BY cid")?
+            .query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?.join(",");
+        conn.execute_batch(&format!("CREATE TEMP TABLE delayed_block AS SELECT {persisted} FROM block WHERE kind='credential' AND source_present=1;
             INSERT INTO retirement_tombstone SELECT kind,origin_key,evidence,evidence_at,evidence_at+1 FROM delayed_block;
             DELETE FROM block WHERE kind='credential';
-            INSERT INTO block SELECT * FROM delayed_block;")?;
+            INSERT INTO block({persisted}) SELECT {persisted} FROM delayed_block;"))?;
         let rows = read(conn)?;
         assert!(!rows.iter().any(|row| row.block.kind == "credential" && row.held()));
         conn.execute("UPDATE block SET evidence='different generation',cleared_at=NULL,cleared_by=NULL,source_present=1 WHERE kind='credential'",[])?;

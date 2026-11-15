@@ -430,22 +430,27 @@ impl AccountTx<'_> {
         fact: &AccountSizeRefusal,
         now: i64,
     ) -> RouteStateResult<()> {
-        self.conn.execute("INSERT INTO account_non_quota_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
-            ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
-            WHERE excluded.observed_at>=account_non_quota_size_refusal.observed_at",
-            params![fact.provider,fact.credential_id,fact.model,fact.size_class,fact.expires_at.min(now.saturating_add(3_600_000)),fact.observed_at]).map_err(err)?;
-        crate::fence_rechecks::register_on(
-            self,
-            "non_quota_size",
-            &serde_json::json!([
-                fact.provider,
-                fact.credential_id,
-                fact.model,
-                fact.size_class
-            ])
-            .to_string(),
-        )
-        .map_err(err)
+        let mut capped = fact.clone();
+        capped.expires_at = capped.expires_at.min(now.saturating_add(3_600_000));
+        let row = crate::block_storage::size_source(&capped, false).map_err(err)?;
+        let blocks = self.current_blocks()?;
+        blocks
+            .check_source(
+                self.conn,
+                "non_quota_size",
+                &row.block.origin_key,
+                &fact.provider,
+            )
+            .map_err(err)?;
+        let newer = blocks
+            .source_record("non_quota_size", &row.block.origin_key)
+            .is_none_or(|prior| prior.origin().evidence_at <= fact.observed_at);
+        drop(blocks);
+        if newer {
+            crate::block_storage::write_source(self.conn, &row).map_err(err)?;
+        }
+        crate::fence_rechecks::register_on(self, "non_quota_size", &row.block.origin_key)
+            .map_err(err)
     }
     pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
         self.record_account_route_backoff(fence, "billing")
@@ -455,34 +460,38 @@ impl AccountTx<'_> {
         fence: &AccountRouteFence,
         kind: &str,
     ) -> RouteStateResult<()> {
-        self.conn.execute("INSERT INTO account_non_quota_route_fence VALUES (?1,?2,?3,?4,?5,?6,?6,?7)
-            ON CONFLICT(provider,credential_id,model,wall_kind) DO UPDATE SET until_ms=excluded.until_ms,
-            last_reported_at=MAX(account_non_quota_route_fence.last_reported_at,excluded.last_reported_at),decision_id=excluded.decision_id",
-            params![fence.provider,fence.credential_id,fence.model,fence.until_ms.min(fence.recorded_at.saturating_add(3_600_000)),fence.decision_id,fence.recorded_at,kind]).map_err(err)?;
+        let origin = if kind == "transient" {
+            "transient_route"
+        } else {
+            "non_quota_route"
+        };
+        let key = serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string();
+        let blocks = self.current_blocks()?;
+        blocks
+            .check_source(self.conn, origin, &key, &fence.provider)
+            .map_err(err)?;
+        let mut merged = fence.clone();
+        merged.until_ms = merged
+            .until_ms
+            .min(fence.recorded_at.saturating_add(3_600_000));
+        let mut reported = fence.recorded_at;
+        if let Some((prior, last)) =
+            blocks.non_quota_route_fence(&fence.provider, &fence.credential_id, &fence.model, kind)
+        {
+            merged.recorded_at = prior.recorded_at;
+            reported = last.max(fence.recorded_at);
+        }
+        let row = crate::block_storage::account_route_source(&merged, origin, kind, Some(reported))
+            .map_err(err)?;
+        drop(blocks);
+        crate::block_storage::write_source(self.conn, &row).map_err(err)?;
         self.conn
             .execute(
-                "UPDATE fence_recheck SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
-                params![
-                    if kind == "transient" {
-                        "transient_route"
-                    } else {
-                        "non_quota_route"
-                    },
-                    serde_json::json!([fence.provider, fence.credential_id, fence.model])
-                        .to_string()
-                ],
+                "UPDATE block SET claim_owner=NULL WHERE kind=?1 AND origin_key=?2",
+                params![origin, key],
             )
             .map_err(err)?;
-        crate::fence_rechecks::register_on(
-            self,
-            if kind == "transient" {
-                "transient_route"
-            } else {
-                "non_quota_route"
-            },
-            &serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string(),
-        )
-        .map_err(err)
+        crate::fence_rechecks::register_on(self, origin, &row.block.origin_key).map_err(err)
     }
     /// Record a credential refusal in the same transaction as its observation.
     pub fn record_credential_refusal(
@@ -503,7 +512,15 @@ impl AccountTx<'_> {
         provider: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
-        self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2",params![provider,credential]).map(|_|()).map_err(err)
+        crate::block_storage::remove_source(
+            self.conn,
+            "credential",
+            &serde_json::json!([provider, credential]).to_string(),
+            crate::now_ms(),
+            "credential cleared",
+        )
+        .map(|_| ())
+        .map_err(err)
     }
 
     /// Delete a credential refusal that a decision read as `fence`: keyed and
@@ -513,9 +530,10 @@ impl AccountTx<'_> {
         &self,
         fence: &striatum_core::route_state_store::CredentialEntitlementFence,
     ) -> RouteStateResult<()> {
-        let changed = self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2
-            AND code=?3 AND listing_fingerprint IS ?4 AND observed_at_ms=?5",
-            params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms]).map_err(err)?;
+        let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?6,cleared_by='removed',claim_owner=NULL
+            WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2
+            AND code=?3 AND listing_fingerprint IS ?4 AND observed_at=?5",
+            params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms,crate::now_ms()]).map_err(err)?;
         crate::block_state::expect_changes(
             changed,
             1,
@@ -530,38 +548,11 @@ impl AccountTx<'_> {
     pub fn report_credential_refusals(
         &self,
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
-        let mut statement=self.conn.prepare("SELECT provider_id,credential_id,code,listing_fingerprint,observed_at_ms FROM credential_entitlement_fences ORDER BY provider_id,credential_id").map_err(err)?;
-        let rows = statement
-            .query_map([], |r| {
-                Ok(
-                    striatum_core::route_state_store::CredentialEntitlementFence {
-                        provider_id: r.get(0)?,
-                        credential_id: r.get(1)?,
-                        code: r.get(2)?,
-                        listing_fingerprint: r.get(3)?,
-                        observed_at_ms: r.get(4)?,
-                    },
-                )
-            })
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+        Ok(self.current_blocks()?.entitlement_fences())
     }
 
     pub fn report_route_fences(&self, _now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
-        let mut statement=self.conn.prepare("SELECT provider,credential_id,model,until_ms,decision_id,recorded_at FROM account_route_fence WHERE wall_class='quota' ORDER BY provider,credential_id,model").map_err(err)?;
-        let rows = statement
-            .query_map([], |r| {
-                Ok(AccountRouteFence {
-                    provider: r.get(0)?,
-                    credential_id: r.get(1)?,
-                    model: r.get(2)?,
-                    until_ms: r.get(3)?,
-                    decision_id: r.get(4)?,
-                    recorded_at: r.get(5)?,
-                })
-            })
-            .map_err(err)?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+        Ok(self.current_blocks()?.route_fences("quota"))
     }
 }
 
@@ -601,18 +592,42 @@ fn apply_account_effects(
         tx.record_eligibility(fact).map_err(sql_error)?;
     }
     if let Some((refusal, fingerprint)) = &effects.credential_refusal {
-        let changed = conn.execute(
-            "INSERT INTO credential_entitlement_fences (provider_id,credential_id,code,listing_fingerprint,observed_at_ms)
-             VALUES (?1,?2,?3,?4,?5) ON CONFLICT(provider_id,credential_id) DO UPDATE SET
-              code=excluded.code, observed_at_ms=MAX(credential_entitlement_fences.observed_at_ms,excluded.observed_at_ms),
-              listing_fingerprint=CASE WHEN credential_entitlement_fences.code='signed_out' AND excluded.code!='signed_out'
-                THEN excluded.listing_fingerprint ELSE COALESCE(credential_entitlement_fences.listing_fingerprint,excluded.listing_fingerprint) END
-              WHERE excluded.code!='signed_out' OR credential_entitlement_fences.code='signed_out'",
-            params![refusal.provider_id, refusal.credential_id, refusal.code, fingerprint, now],
-        )?;
+        let state = tx
+            .current_blocks()
+            .map_err(crate::fence_rechecks::command_error)?;
+        let prior = state.entitlement_fence(&refusal.provider_id, &refusal.credential_id);
+        let changed = if refusal.code == "signed_out"
+            && prior.as_ref().is_some_and(|row| row.code != "signed_out")
+        {
+            0
+        } else {
+            let listing_fingerprint = match &prior {
+                Some(row) if row.code == "signed_out" && refusal.code != "signed_out" => {
+                    fingerprint.clone()
+                }
+                Some(row) => row
+                    .listing_fingerprint
+                    .clone()
+                    .or_else(|| fingerprint.clone()),
+                None => fingerprint.clone(),
+            };
+            let fence = striatum_core::route_state_store::CredentialEntitlementFence {
+                provider_id: refusal.provider_id.clone(),
+                credential_id: refusal.credential_id.clone(),
+                code: refusal.code.clone(),
+                listing_fingerprint,
+                observed_at_ms: prior
+                    .as_ref()
+                    .map_or(now, |row| row.observed_at_ms.max(now)),
+            };
+            crate::block_storage::write_source(
+                conn,
+                &crate::block_storage::credential_source(&fence)?,
+            )?
+        };
         // A sign-in report must not replace or postpone an independent refusal.
         if changed != 0 && crate::fence_rechecks::enabled(conn)? {
-            conn.execute("UPDATE fence_recheck SET claim_owner=NULL,classified=0 WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+            conn.execute("UPDATE block SET claim_owner=NULL,classified=0 WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
             crate::fence_rechecks::register_on(
                 tx,
                 "credential",

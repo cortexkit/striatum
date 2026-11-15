@@ -753,7 +753,7 @@ fn run_retention_pass_with_affinity_sweep(
         });
     let retired_before = before(now_ms, RETIRED_FENCE_ORIGIN_WINDOW_MS);
     let (retired_origins, retired_origins_drained) =
-        drain("fence_retired_origin", budget, per_table, batches, || {
+        drain("retirement_tombstone", budget, per_table, batches, || {
             counted(crate::account_writer::prune_retired_fence_origins(
                 store,
                 retired_before,

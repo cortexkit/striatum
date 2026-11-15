@@ -3,12 +3,10 @@
 //! its cooldown, quota and failure deadlines replaced by the probe clocks'
 //! schedule, and the provider-wide cooldown row.
 //!
-//! One overlay serves two sources of rows. The store's `build_snapshot` and
-//! `get_provider_cooldown` read SQL; they stay the oracle, and the answer for
-//! a store without the block schema or an account-evaluation projection
-//! (a private copy of the store that holds no account state). The in-memory
-//! block state holds every `model_route_state` and `provider_cooldown_state`
-//! row, decoded by the same row decoders below, and answers request paths
+//! One overlay serves two sources of rows. Cold/private-store reads join the
+//! typed block sources to live telemetry. The in-memory block state holds
+//! the same typed sources and telemetry, decoded by the same row decoders,
+//! and answers live request paths
 //! through [`crate::BlockState::route_state_snapshot`] and
 //! [`crate::BlockState::provider_cooldown`].
 
@@ -23,20 +21,24 @@ use crate::fence_rechecks::{self, FenceRecheck};
 /// The `model_route_state` columns the snapshot reads, in [`route_row_at`]'s
 /// order, before the `wall_unscoped` flag. A macro so the block state's
 /// constant projection can name the same list.
+#[cfg(any(test, feature = "test-support"))]
 macro_rules! route_state_columns {
     () => {
         "route_key,capacity_key,cooldown_until,quota_exhausted_until,quota_pressure,latency_ema_ms,success_ema,failure_backoff_until,failure_backoff_reason,last_error,wall_class"
     };
 }
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use route_state_columns;
 
 /// The `provider_cooldown_state` columns `get_provider_cooldown` reads, in
 /// [`provider_row_at`]'s order.
+#[cfg(any(test, feature = "test-support"))]
 macro_rules! provider_cooldown_columns {
     () => {
         "provider_key,cooldown_until,quota_exhausted_until,quota_pressure,wall_class,last_error"
     };
 }
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use provider_cooldown_columns;
 
 /// One `model_route_state` row as the snapshot reads it. The wall class is
@@ -140,8 +142,9 @@ pub(crate) fn provider_cooldown(
     }))
 }
 
-/// Read one provider's cooldown row from SQL.
-pub(crate) fn read_provider_cooldown(
+/// The frozen schema-93 provider reader used only by differential tests.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn legacy_read_provider_cooldown(
     conn: &Connection,
     provider_key: &str,
 ) -> RouteStateResult<Option<ProviderCooldownState>> {
@@ -161,15 +164,16 @@ pub(crate) fn read_provider_cooldown(
     provider_cooldown(row.as_ref())
 }
 
-/// Build the snapshot from SQL: route rows in rowid order and, on a store
-/// with probe clocks, the effective clocks evaluated at `recheck_now`.
-pub(crate) fn read_snapshot(
+/// The frozen schema-93 snapshot reader used only by differential tests.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn legacy_read_snapshot(
     conn: &Connection,
     now: f64,
     recheck_now: i64,
 ) -> RouteStateResult<ModelRouteStateSnapshot> {
-    let clock_schema = fence_rechecks::enabled(conn).map_err(crate::err)?;
-    let rechecks = fence_rechecks::read_effective_at(conn, recheck_now).map_err(crate::err)?;
+    let clock_schema = fence_rechecks::legacy::enabled(conn).map_err(crate::err)?;
+    let rechecks =
+        fence_rechecks::legacy::read_effective_at(conn, recheck_now).map_err(crate::err)?;
     let mut statement = conn
         .prepare_cached(if clock_schema {
             concat!(
@@ -318,4 +322,35 @@ pub(crate) fn overlay(
         by_route,
         by_capacity,
     })
+}
+
+/// Read raw provider deadlines, not the provider's independently renewed probe
+/// horizon. A quarantined old provider row has telemetry but no block to join.
+pub(crate) fn read_provider_cooldown(
+    conn: &Connection,
+    provider_key: &str,
+) -> RouteStateResult<Option<ProviderCooldownState>> {
+    let key = provider_lookup_key(provider_key)?;
+    let row=conn.query_row("SELECT p.provider_key,b.cooldown_until,b.quota_exhausted_until,p.quota_pressure,b.wall_class,p.last_error
+        FROM provider_cooldown_state p LEFT JOIN block b ON b.kind='provider' AND b.origin_key=json_array(p.provider_key)
+            AND b.is_origin=1 AND b.source_present=1 WHERE p.provider_key=?1",[key],|row|provider_row_at(row,0)).optional().map_err(crate::err)?;
+    provider_cooldown(row.as_ref())
+}
+
+/// Cold/private-store snapshot path. The live request path uses the published
+/// BlockState; this SQL path reads the same durable sources independently.
+pub(crate) fn read_snapshot(
+    conn: &Connection,
+    now: f64,
+    recheck_now: i64,
+) -> RouteStateResult<ModelRouteStateSnapshot> {
+    let rechecks = fence_rechecks::read_effective_at(conn, recheck_now).map_err(crate::err)?;
+    let rows=conn.prepare_cached("SELECT m.route_key,m.capacity_key,b.cooldown_until,b.quota_exhausted_until,
+        m.quota_pressure,m.latency_ema_ms,m.success_ema,f.deadline,f.reason,m.last_error,
+        CASE WHEN b.kind IS NOT NULL THEN b.wall_class ELSE f.wall_class END,
+        CASE WHEN b.kind IS NOT NULL THEN b.wall_unscoped ELSE COALESCE(f.wall_unscoped,0) END
+        FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+        LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
+        ORDER BY m.rowid").map_err(crate::err)?.query_map([],|row|route_row_at(row,0)).map_err(crate::err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(crate::err)?;
+    overlay(&rows, &rechecks, true, now)
 }

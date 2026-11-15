@@ -10,13 +10,9 @@ use striatum_core::blocks::Block;
 use super::{ProbeAuthorization, Shards, SuccessPool};
 use crate::block_storage::{self, Meta, StoredBlock};
 use crate::fence_rechecks::{self, FenceRecheck, LoadedBlocks, ViewOrigin};
-
-#[path = "decisions/tests.rs"]
-mod decisions;
-#[path = "pool/tests.rs"]
-mod pool;
-#[path = "provider/tests.rs"]
-mod provider;
+use crate::sql_real::{SqlReal, SqlValue};
+mod dry_run;
+pub use dry_run::DryRunRepair;
 
 const TABLES: [&str; 8] = [
     "block",
@@ -29,28 +25,80 @@ const TABLES: [&str; 8] = [
     "account_eligibility",
 ];
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PoolTelemetry {
     provider: String,
     credential_id: String,
-    last_used_at: rusqlite::types::Value,
+    last_used_at: SqlValue,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderTelemetry {
+    provider_key: String,
+    quota_pressure: Option<SqlReal>,
+    last_error: Option<String>,
+}
+
+impl ProviderTelemetry {
+    fn provider_key(&self) -> &str {
+        &self.provider_key
+    }
+    fn snapshot_row(&self) -> crate::route_snapshot::ProviderCooldownRow {
+        crate::route_snapshot::ProviderCooldownRow {
+            provider_key: self.provider_key.clone(),
+            cooldown_until: None,
+            quota_exhausted_until: None,
+            quota_pressure: self.quota_pressure.map(SqlReal::as_f64),
+            wall_class: None,
+            last_error: self.last_error.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RouteTelemetry {
+    route_key: String,
+    capacity_key: String,
+    quota_pressure: Option<SqlReal>,
+    latency_ema_ms: Option<SqlReal>,
+    success_ema: Option<SqlReal>,
+    last_error: Option<String>,
+}
+
+impl RouteTelemetry {
+    fn snapshot_row(&self) -> crate::route_snapshot::RouteStateRow {
+        crate::route_snapshot::RouteStateRow {
+            route_key: self.route_key.clone(),
+            capacity_key: self.capacity_key.clone(),
+            cooldown_until: None,
+            quota_exhausted_until: None,
+            quota_pressure: self.quota_pressure.map(SqlReal::as_f64),
+            latency_ema_ms: self.latency_ema_ms.map(SqlReal::as_f64),
+            success_ema: self.success_ema.map(SqlReal::as_f64),
+            failure_backoff_until: None,
+            failure_backoff_reason: None,
+            last_error: self.last_error.clone(),
+            wall_class: None,
+            wall_unscoped: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Record {
     Block(StoredBlock),
     Authorization(ProbeAuthorization),
     Success(SuccessPool),
     Pool(PoolTelemetry),
-    Provider(crate::route_snapshot::ProviderCooldownRow),
+    Provider(ProviderTelemetry),
     Route {
         provider: String,
-        row: crate::route_snapshot::RouteStateRow,
+        row: RouteTelemetry,
     },
     Eligibility(crate::AccountEligibilityFact),
 }
 
-#[derive(Clone, Default, PartialEq)]
+#[derive(Clone, Default, PartialEq, Eq)]
 struct Table {
     rows: Shards<i64, (String, Arc<Record>)>,
     keys: Shards<String, i64>,
@@ -133,8 +181,8 @@ impl Table {
     }
 }
 
-#[derive(Clone, Default, PartialEq)]
-struct BlockState {
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct BlockState {
     enabled: bool,
     tables: Vec<Table>,
 }
@@ -151,7 +199,15 @@ impl std::fmt::Debug for BlockState {
 }
 
 impl BlockState {
-    fn load(conn: &Connection) -> rusqlite::Result<Self> {
+    pub fn load(conn: &Connection) -> rusqlite::Result<Self> {
+        Self::load_with_marker(conn, super::MAINTENANCE_READ)
+    }
+
+    pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Self> {
+        Self::load_with_marker(conn, "")
+    }
+
+    fn load_with_marker(conn: &Connection, marker: &str) -> rusqlite::Result<Self> {
         if !conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
             [],
@@ -167,8 +223,7 @@ impl BlockState {
             if table == 3 {
                 continue;
             }
-            let mut statement =
-                conn.prepare(&format!("{} {}", super::MAINTENANCE_READ, select(table)))?;
+            let mut statement = conn.prepare(&format!("{marker} {}", select(table)))?;
             let mut rows = statement.query([])?;
             while let Some(row) = rows.next()? {
                 let (rowid, key, record) = decode(table, row)?;
@@ -178,7 +233,7 @@ impl BlockState {
         Ok(state)
     }
 
-    fn apply(&mut self, rows: &BlockRows) {
+    pub fn apply(&mut self, rows: &BlockRows) {
         if self.enabled {
             for (table, rowid, key, record) in &rows.0 {
                 self.tables[*table].put(*rowid, key.clone(), record.clone());
@@ -186,7 +241,7 @@ impl BlockState {
         }
     }
 
-    fn fingerprints(&self) -> Vec<(usize, Option<i64>)> {
+    pub fn fingerprints(&self) -> Vec<(usize, Option<i64>)> {
         self.tables
             .iter()
             .map(|table| {
@@ -198,7 +253,7 @@ impl BlockState {
             .collect()
     }
 
-    fn shares_storage_with(&self, other: &Self) -> bool {
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
         self.tables.len() == other.tables.len()
             && self.tables.iter().zip(&other.tables).all(|(a, b)| {
                 Arc::ptr_eq(&a.rows.shards, &b.rows.shards)
@@ -207,7 +262,7 @@ impl BlockState {
             })
     }
 
-    fn table_sizes(&self) -> Vec<(&'static str, usize)> {
+    pub fn table_sizes(&self) -> Vec<(&'static str, usize)> {
         TABLES
             .iter()
             .zip(&self.tables)
@@ -230,7 +285,7 @@ impl BlockState {
         })
     }
 
-    fn block(&self, kind: &str, origin_key: &str) -> Option<&StoredBlock> {
+    pub(crate) fn block(&self, kind: &str, origin_key: &str) -> Option<&StoredBlock> {
         let table = self.tables.first()?;
         let key = serde_json::json!([kind, origin_key]).to_string();
         let rowid = table.keys.get(&key)?;
@@ -240,39 +295,45 @@ impl BlockState {
         }
     }
 
-    fn enabled(&self) -> bool {
+    pub fn enabled(&self) -> bool {
         self.enabled
     }
 
-    fn stored_clocks(&self) -> impl Iterator<Item = (&Block, Option<i64>)> {
+    pub fn stored_clocks(&self) -> impl Iterator<Item = (&Block, Option<i64>)> {
         self.block_rows()
-            .filter(|row| row.managed)
+            .filter(|row| row.managed && row.is_origin())
             .map(|row| (&row.block, row.cleared_at))
     }
 
-    fn clock(&self, kind: &str, origin_key: &str) -> Option<(&Block, Option<i64>)> {
+    pub(crate) fn pending_clock(&self, kind: &str, key: &str) -> Option<&Block> {
+        self.block(kind, key).map(|row| &row.block)
+    }
+
+    pub(crate) fn source_record(&self, kind: &str, key: &str) -> Option<&StoredBlock> {
+        self.block(kind, key).filter(|row| row.source_present)
+    }
+
+    pub fn clock(&self, kind: &str, origin_key: &str) -> Option<(&Block, Option<i64>)> {
         self.block(kind, origin_key)
-            .filter(|row| row.managed)
+            .filter(|row| row.managed && row.is_origin())
             .map(|row| (&row.block, row.cleared_at))
     }
 
-    fn live_clocks(&self) -> HashMap<(&str, &str), &Block> {
+    pub fn live_clocks(&self) -> HashMap<(&str, &str), &Block> {
         self.stored_clocks()
             .filter(|(_, cleared_at)| cleared_at.is_none())
             .map(|(block, _)| ((block.kind.as_str(), block.origin_key.as_str()), block))
             .collect()
     }
 
-    fn clocks_claimed_by(&self, owner: &str) -> Vec<(&Block, Option<i64>)> {
+    pub fn clocks_claimed_by(&self, owner: &str) -> Vec<(&Block, Option<i64>)> {
         self.stored_clocks()
             .filter(|(block, _)| block.claim_owner.as_deref() == Some(owner))
             .collect()
     }
 
     fn view_origin(&self, row: &StoredBlock) -> Option<ViewOrigin> {
-        if !row.source_present
-            || (row.block.kind == "account_route" && row.wall_class.as_deref() != Some("quota"))
-        {
+        if !row.source_present || !row.is_origin() {
             return None;
         }
         let mut origin = row.origin();
@@ -299,12 +360,19 @@ impl BlockState {
                         )
                         .is_some_and(|provider| {
                             provider.source_present
+                                && provider.cleared_at.is_none()
                                 && provider.scope_error == row.scope_error
                                 && provider.block.evidence_at == row.block.evidence_at
-                                && provider.cooldown_until.unwrap_or(0.0)
-                                    >= row.cooldown_until.unwrap_or(0.0)
-                                && provider.quota_exhausted_until.unwrap_or(0.0)
-                                    >= row.quota_exhausted_until.unwrap_or(0.0)
+                                && provider.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                                    >= row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                                && provider
+                                    .quota_exhausted_until
+                                    .map(SqlReal::as_f64)
+                                    .unwrap_or(0.0)
+                                    >= row
+                                        .quota_exhausted_until
+                                        .map(SqlReal::as_f64)
+                                        .unwrap_or(0.0)
                         })
                 {
                     return None;
@@ -317,13 +385,13 @@ impl BlockState {
             .collect()
     }
 
-    fn view_origins(&self) -> Vec<ViewOrigin> {
+    pub fn view_origins(&self) -> Vec<ViewOrigin> {
         let mut rows: Vec<_> = self.view_rows().into_iter().map(|(_, row)| row).collect();
         rows.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
         rows
     }
 
-    fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
+    pub fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
         let mut rows = self.view_rows();
         rows.sort_by_key(|(position, _)| *position);
         rows.into_iter().map(|(_, row)| row).collect()
@@ -331,7 +399,7 @@ impl BlockState {
 
     fn clocks(&self, rowid_order: bool) -> fence_rechecks::Clocks {
         self.block_rows()
-            .filter(|row| row.managed)
+            .filter(|row| row.managed && row.is_origin())
             .map(|row| {
                 let mut block = row.block.clone();
                 block.cleared_models = row.cleared_models.clone();
@@ -346,10 +414,13 @@ impl BlockState {
             .collect()
     }
 
-    fn blocks(&self, now: i64) -> striatum_core::RouteStateResult<LoadedBlocks> {
+    pub fn blocks(&self, now: i64) -> striatum_core::RouteStateResult<LoadedBlocks> {
         let mut loaded =
             fence_rechecks::derive_blocks(self.clocks(false), &[], self.view_origins(), now)
                 .map_err(crate::err)?;
+        for block in &mut loaded.blocks {
+            self.pending_claim_history(block);
+        }
         loaded
             .blocks
             .sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
@@ -359,18 +430,40 @@ impl BlockState {
         Ok(loaded)
     }
 
-    fn fence_rechecks(&self, now: i64) -> striatum_core::RouteStateResult<Vec<FenceRecheck>> {
-        let loaded = fence_rechecks::derive_blocks(
+    pub fn fence_rechecks(&self, now: i64) -> striatum_core::RouteStateResult<Vec<FenceRecheck>> {
+        let mut loaded = fence_rechecks::derive_blocks(
             self.clocks(true),
             &[],
             self.view_origins_in_scan_order(),
             now,
         )
         .map_err(crate::err)?;
+        for block in &mut loaded.blocks {
+            self.pending_claim_history(block);
+        }
         Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
     }
 
-    fn source_origin(&self, kind: &str, origin_key: &str) -> Option<ViewOrigin> {
+    // A replacement source can be read before its keyed registration. Its
+    // prior claim still bounds the effective schedule during that interval.
+    fn pending_claim_history(&self, block: &mut Block) {
+        let Some(row) = self
+            .block(&block.kind, &block.origin_key)
+            .filter(|row| !row.managed)
+        else {
+            return;
+        };
+        let Some(claimed) = row.block.last_claimed_at else {
+            return;
+        };
+        block.last_claimed_at = Some(claimed);
+        if block.evidence_at < claimed {
+            block.next_recheck_at = block.next_recheck_at.max(row.block.next_recheck_at);
+        }
+        block.reset_check_at = block.reset_check_at.filter(|reset| *reset > claimed);
+    }
+
+    pub fn source_origin(&self, kind: &str, origin_key: &str) -> Option<ViewOrigin> {
         let mut origin = self
             .block(kind, origin_key)
             .and_then(|row| self.view_origin(row))?;
@@ -380,7 +473,7 @@ impl BlockState {
         Some(origin)
     }
 
-    fn eligibility(&self) -> Vec<crate::AccountEligibilityFact> {
+    pub fn eligibility(&self) -> Vec<crate::AccountEligibilityFact> {
         let mut rows: Vec<_> = self
             .rows(7)
             .filter_map(|(_, record)| match record {
@@ -398,7 +491,7 @@ impl BlockState {
         rows
     }
 
-    fn size_refusals(&self) -> Vec<crate::AccountSizeRefusal> {
+    pub fn size_refusals(&self) -> Vec<crate::AccountSizeRefusal> {
         let mut rows: Vec<_> = self
             .block_rows()
             .filter(|row| {
@@ -414,7 +507,7 @@ impl BlockState {
         rows.into_iter().filter_map(StoredBlock::size).collect()
     }
 
-    fn size_refusal(
+    pub fn size_refusal(
         &self,
         quota: bool,
         provider: &str,
@@ -430,7 +523,7 @@ impl BlockState {
         .and_then(StoredBlock::size)
     }
 
-    fn route_fences(&self, class: &str) -> Vec<crate::AccountRouteFence> {
+    pub fn route_fences(&self, class: &str) -> Vec<crate::AccountRouteFence> {
         let mut rows: Vec<_> = self
             .block_rows()
             .filter(|row| {
@@ -457,7 +550,77 @@ impl BlockState {
         rows
     }
 
-    fn account_route_fence(
+    pub(crate) fn route_cooldowns_for_clear(
+        &self,
+        requested: &str,
+        base: bool,
+        capacity: &str,
+    ) -> Vec<(String, crate::CooldownState)> {
+        let mut rows = self
+            .rows(6)
+            .filter_map(|(_, record)| {
+                let Record::Route { row, .. } = record else {
+                    return None;
+                };
+                if row.route_key != requested && !(base && row.capacity_key == capacity) {
+                    return None;
+                }
+                let block = self
+                    .block("route", &serde_json::json!([row.route_key]).to_string())
+                    .filter(|row| row.source_present);
+                Some((
+                    row.route_key.clone(),
+                    crate::CooldownState {
+                        cooldown_until: block
+                            .and_then(|row| row.cooldown_until)
+                            .map(SqlReal::as_f64),
+                        quota_exhausted_until: block
+                            .and_then(|row| row.quota_exhausted_until)
+                            .map(SqlReal::as_f64),
+                    },
+                ))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
+    }
+
+    pub(crate) fn route_fences_for_clear(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Vec<crate::AccountRouteFence> {
+        let mut rows = self
+            .block_rows()
+            .filter(|row| {
+                row.source_present
+                    && row.block.scope.provider == provider
+                    && row.block.scope.model.as_deref() == Some(model)
+                    && ((row.block.kind == "account_route" && row.is_origin())
+                        || matches!(
+                            row.block.kind.as_str(),
+                            "non_quota_route" | "transient_route"
+                        ))
+            })
+            .filter_map(|row| {
+                row.route_fence().map(|fence| {
+                    (
+                        fence,
+                        if row.block.kind == "account_route" {
+                            0
+                        } else {
+                            1
+                        },
+                        row.source_order,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|a, b| (&a.0.credential_id, a.1, a.2).cmp(&(&b.0.credential_id, b.1, b.2)));
+        rows.into_iter().map(|(fence, _, _)| fence).collect()
+    }
+
+    pub fn account_route_fence(
         &self,
         provider: &str,
         credential: &str,
@@ -476,7 +639,7 @@ impl BlockState {
         ))
     }
 
-    fn non_quota_route_fence(
+    pub fn non_quota_route_fence(
         &self,
         provider: &str,
         credential: &str,
@@ -496,7 +659,7 @@ impl BlockState {
         Some((row.route_fence()?, row.block.evidence_at))
     }
 
-    fn route_fence_latest_reports(&self) -> BTreeMap<String, i64> {
+    pub fn route_fence_latest_reports(&self) -> BTreeMap<String, i64> {
         let mut reports = BTreeMap::new();
         for row in self
             .block_rows()
@@ -516,7 +679,7 @@ impl BlockState {
         reports
     }
 
-    fn entitlement_fences(
+    pub fn entitlement_fences(
         &self,
     ) -> Vec<striatum_core::route_state_store::CredentialEntitlementFence> {
         let mut rows: Vec<_> = self
@@ -529,7 +692,7 @@ impl BlockState {
         rows
     }
 
-    fn entitlement_fence(
+    pub fn entitlement_fence(
         &self,
         provider: &str,
         credential: &str,
@@ -541,24 +704,21 @@ impl BlockState {
         .and_then(StoredBlock::entitlement)
     }
 
-    fn account_fence(
+    pub fn account_fence(
         &self,
         fence_id: &str,
     ) -> Option<(crate::AccountFenceRow, Option<&str>, &str)> {
         let row = self
             .block("account", &serde_json::json!([fence_id]).to_string())
             .filter(|row| row.source_present)?;
-        let Meta::Account(meta) = &row.meta else {
-            return None;
-        };
         Some((
             row.account_fence()?,
             row.pool_key_json.as_deref(),
-            &meta.recovery_set_json,
+            row.recovery_set_json.as_deref()?,
         ))
     }
 
-    fn active_fences(&self, provider: &str) -> Vec<crate::AccountFenceRow> {
+    pub fn active_fences(&self, provider: &str) -> Vec<crate::AccountFenceRow> {
         let mut rows: Vec<_> = self
             .block_rows()
             .filter(|row| row.block.scope.provider == provider)
@@ -568,7 +728,7 @@ impl BlockState {
         rows
     }
 
-    fn active_fence_providers(&self) -> Vec<String> {
+    pub fn active_fence_providers(&self) -> Vec<String> {
         self.block_rows()
             .filter(|row| row.source_present && row.block.kind == "account")
             .map(|row| row.block.scope.provider.clone())
@@ -577,7 +737,7 @@ impl BlockState {
             .collect()
     }
 
-    fn active_pool_fences(
+    pub fn active_pool_fences(
         &self,
         provider: &str,
     ) -> striatum_core::RouteStateResult<Vec<crate::AccountPoolFenceRow>> {
@@ -591,11 +751,12 @@ impl BlockState {
                         &serde_json::json!([evidence.fence_id]).to_string(),
                     )
                     .expect("active fence has its block");
-                let Meta::Account(meta) = &row.meta else {
-                    unreachable!("account metadata was decoded by kind")
-                };
-                let mut recovery_set: Vec<PoolKey> =
-                    serde_json::from_str(&meta.recovery_set_json).map_err(crate::err)?;
+                let mut recovery_set: Vec<PoolKey> = serde_json::from_str(
+                    row.recovery_set_json
+                        .as_deref()
+                        .expect("account recovery set was decoded by kind"),
+                )
+                .map_err(crate::err)?;
                 let healed = self
                     .success_pools()
                     .filter(|pool| {
@@ -620,7 +781,7 @@ impl BlockState {
             .collect()
     }
 
-    fn credential_quota_classification(
+    pub fn credential_quota_classification(
         &self,
         provider: &str,
         credential: &str,
@@ -643,7 +804,7 @@ impl BlockState {
         )
     }
 
-    fn admission_exclusions(
+    pub fn admission_exclusions(
         &self,
         principal: &str,
         admission_id: &str,
@@ -662,7 +823,7 @@ impl BlockState {
         rows
     }
 
-    fn exclusion_count(&self, principal: &str, credential_id: &str) -> i64 {
+    pub fn exclusion_count(&self, principal: &str, credential_id: &str) -> i64 {
         self.block_rows()
             .filter(|row| {
                 row.source_present
@@ -673,14 +834,14 @@ impl BlockState {
             .count() as i64
     }
 
-    fn authorizations(&self) -> impl Iterator<Item = &ProbeAuthorization> {
+    pub fn authorizations(&self) -> impl Iterator<Item = &ProbeAuthorization> {
         self.rows(1).filter_map(|(_, record)| match record {
             Record::Authorization(row) => Some(row),
             _ => None,
         })
     }
 
-    fn authorization_owners(&self) -> Vec<String> {
+    pub fn authorization_owners(&self) -> Vec<String> {
         self.authorizations()
             .map(|row| row.owner.clone())
             .collect::<std::collections::BTreeSet<_>>()
@@ -688,7 +849,7 @@ impl BlockState {
             .collect()
     }
 
-    fn authorizations_of(&self, owner: &str) -> Vec<ProbeAuthorization> {
+    pub fn authorizations_of(&self, owner: &str) -> Vec<ProbeAuthorization> {
         let mut rows: Vec<_> = self
             .authorizations()
             .filter(|row| row.owner == owner)
@@ -698,14 +859,14 @@ impl BlockState {
         rows
     }
 
-    fn success_pools(&self) -> impl Iterator<Item = &SuccessPool> {
+    pub fn success_pools(&self) -> impl Iterator<Item = &SuccessPool> {
         self.rows(2).filter_map(|(_, record)| match record {
             Record::Success(row) => Some(row),
             _ => None,
         })
     }
 
-    fn probe_release(&self, owner: &str) -> Vec<(ProbeAuthorization, bool)> {
+    pub fn probe_release(&self, owner: &str) -> Vec<(ProbeAuthorization, bool)> {
         self.authorizations_of(owner)
             .into_iter()
             .map(|row| {
@@ -722,7 +883,7 @@ impl BlockState {
             .collect()
     }
 
-    fn apply_probe_release(&mut self, owner: &str, now: i64) {
+    pub fn apply_probe_release(&mut self, owner: &str, now: i64) {
         for (authorization, current) in self.probe_release(owner) {
             if !current {
                 continue;
@@ -750,7 +911,7 @@ impl BlockState {
         }
     }
 
-    fn clock_rechecks(&self) -> Vec<FenceRecheck> {
+    pub fn clock_rechecks(&self) -> Vec<FenceRecheck> {
         let mut rows: Vec<_> = self
             .clocks(true)
             .into_values()
@@ -761,7 +922,7 @@ impl BlockState {
         rows
     }
 
-    fn needs_sync(&self) -> bool {
+    pub fn needs_sync(&self) -> bool {
         let mut clocks: HashMap<_, _> = self
             .stored_clocks()
             .map(|(block, _)| {
@@ -781,7 +942,7 @@ impl BlockState {
         clocks.keys().any(|(kind, _)| kind != "observation")
     }
 
-    fn pool_key_rows(
+    pub fn pool_key_rows(
         &self,
         provider: &str,
     ) -> rusqlite::Result<Vec<(String, Option<i64>, Option<i64>, Option<i64>)>> {
@@ -794,8 +955,8 @@ impl BlockState {
                 continue;
             }
             let last = match &row.last_used_at {
-                rusqlite::types::Value::Null => None,
-                rusqlite::types::Value::Integer(at) => Some(*at),
+                SqlValue::Null => None,
+                SqlValue::Integer(at) => Some(*at),
                 other => {
                     return Err(rusqlite::Error::InvalidColumnType(
                         1,
@@ -821,7 +982,7 @@ impl BlockState {
         Ok(rows)
     }
 
-    fn provider_cooldown(
+    pub fn provider_cooldown(
         &self,
         provider: &str,
     ) -> striatum_core::RouteStateResult<Option<striatum_core::ProviderCooldownState>> {
@@ -833,19 +994,19 @@ impl BlockState {
         let Some(telemetry) = telemetry else {
             return Ok(None);
         };
-        let mut row = telemetry.clone();
+        let mut row = telemetry.snapshot_row();
         if let Some(block) = self
             .block("provider", &serde_json::json!([key]).to_string())
             .filter(|row| row.source_present)
         {
-            row.cooldown_until = block.cooldown_until;
-            row.quota_exhausted_until = block.quota_exhausted_until;
+            row.cooldown_until = block.cooldown_until.map(SqlReal::as_f64);
+            row.quota_exhausted_until = block.quota_exhausted_until.map(SqlReal::as_f64);
             row.wall_class = block.wall_class.clone();
         }
         crate::route_snapshot::provider_cooldown(Some(&row))
     }
 
-    fn route_state_snapshot(
+    pub fn route_state_snapshot(
         &self,
         now: f64,
         recheck_now: i64,
@@ -858,10 +1019,10 @@ impl BlockState {
             let key = serde_json::json!([telemetry.route_key]).to_string();
             let wall = self.block("route", &key).filter(|row| row.source_present);
             let failure = self.block("failure", &key).filter(|row| row.source_present);
-            let mut row = telemetry.clone();
+            let mut row = telemetry.snapshot_row();
             if let Some(block) = wall {
-                row.cooldown_until = block.cooldown_until;
-                row.quota_exhausted_until = block.quota_exhausted_until;
+                row.cooldown_until = block.cooldown_until.map(SqlReal::as_f64);
+                row.quota_exhausted_until = block.quota_exhausted_until.map(SqlReal::as_f64);
                 row.wall_class = block.wall_class.clone();
                 row.wall_unscoped = block.wall_unscoped;
             } else if let Some(block) = failure {
@@ -879,7 +1040,7 @@ impl BlockState {
         crate::route_snapshot::overlay(&rows, &self.fence_rechecks(recheck_now)?, self.enabled, now)
     }
 
-    fn routes_stamped_by_provider(
+    pub fn routes_stamped_by_provider(
         &self,
         provider: &str,
         evidence_at: i64,
@@ -902,9 +1063,16 @@ impl BlockState {
                     && row.scope_error == covering.scope_error
                     && row.block.evidence_at == evidence_at
                     && evidence_at < admitted_at
-                    && row.cooldown_until.unwrap_or(0.0) <= covering.cooldown_until.unwrap_or(0.0)
-                    && row.quota_exhausted_until.unwrap_or(0.0)
-                        <= covering.quota_exhausted_until.unwrap_or(0.0)
+                    && row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                        <= covering.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
+                    && row
+                        .quota_exhausted_until
+                        .map(SqlReal::as_f64)
+                        .unwrap_or(0.0)
+                        <= covering
+                            .quota_exhausted_until
+                            .map(SqlReal::as_f64)
+                            .unwrap_or(0.0)
             })
             .filter_map(|row| {
                 let key: Vec<String> = serde_json::from_str(&row.block.origin_key).ok()?;
@@ -970,8 +1138,13 @@ impl BlockState {
         self.compare_rows(conn, 0, &statement, [kind, origin_key], held.into_iter())
     }
 
-    fn check_clock(&self, conn: &Connection, kind: &str, origin_key: &str) -> rusqlite::Result<()> {
-        let sql = conn.query_row(&format!("{} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS),[kind,origin_key],|row| fence_rechecks::clock_row(row,0)).optional()?;
+    pub fn check_clock(
+        &self,
+        conn: &Connection,
+        kind: &str,
+        origin_key: &str,
+    ) -> rusqlite::Result<()> {
+        let sql = conn.query_row(&format!("{} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS),[kind,origin_key],|row| fence_rechecks::clock_row(row,0)).optional()?;
         let state = self
             .clock(kind, origin_key)
             .map(|(block, cleared)| (block.clone(), cleared));
@@ -1012,7 +1185,7 @@ impl BlockState {
         Ok(())
     }
 
-    fn check_source(
+    pub fn check_source(
         &self,
         conn: &Connection,
         kind: &str,
@@ -1066,9 +1239,9 @@ impl BlockState {
         Ok(())
     }
 
-    fn check_provider_rows(&self, conn: &Connection, provider: &str) -> rusqlite::Result<()> {
+    pub fn check_provider_rows(&self, conn: &Connection, provider: &str) -> rusqlite::Result<()> {
         if provider.is_empty() {
-            let mut sql = conn.prepare_cached(&format!("{} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS))?.query_map([provider],|row| {
+            let mut sql = conn.prepare_cached(&format!("{} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",super::STATE_CHECK,block_storage::CLOCK_COLUMNS))?.query_map([provider],|row| {
                 let (block,cleared) = fence_rechecks::clock_row(row,1)?;
                 let json: String = row.get(20)?;
                 let models: Vec<String> = serde_json::from_str(&json).map_err(|e| rusqlite::Error::FromSqlConversionFailure(20,rusqlite::types::Type::Text,Box::new(e)))?;
@@ -1129,7 +1302,7 @@ impl BlockState {
         self.compare_rows(conn,2,&format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2)),[provider],scopes.iter().flat_map(|scope| self.tables[2].scoped(scope)))
     }
 
-    fn check_exclusions(
+    pub fn check_exclusions(
         &self,
         conn: &Connection,
         principal: &str,
@@ -1245,7 +1418,7 @@ impl StoredBlock {
         if !self.source_present || self.block.kind != "credential" {
             return None;
         }
-        let Meta::Credential(meta) = &self.meta else {
+        let Meta::Credential(_) = &self.meta else {
             return None;
         };
         Some(
@@ -1253,7 +1426,7 @@ impl StoredBlock {
                 provider_id: self.block.scope.provider.clone(),
                 credential_id: self.block.scope.credential_id.clone()?,
                 code: self.code.clone()?,
-                listing_fingerprint: meta.listing_fingerprint.clone(),
+                listing_fingerprint: self.listing_fingerprint.clone(),
                 observed_at_ms: self.observed_at?,
             },
         )
@@ -1326,10 +1499,21 @@ fn decode(table: usize, row: &Row<'_>) -> rusqlite::Result<(i64, String, Option<
             credential_id: row.get(3)?,
             last_used_at: row.get(4)?,
         }),
-        5 => Record::Provider(crate::route_snapshot::provider_row_at(row, 2)?),
+        5 => Record::Provider(ProviderTelemetry {
+            provider_key: row.get(2)?,
+            quota_pressure: row.get(5)?,
+            last_error: row.get(7)?,
+        }),
         6 => Record::Route {
             provider: row.get(2)?,
-            row: crate::route_snapshot::route_row_at(row, 3)?,
+            row: RouteTelemetry {
+                route_key: row.get(3)?,
+                capacity_key: row.get(4)?,
+                quota_pressure: row.get(7)?,
+                latency_ema_ms: row.get(8)?,
+                success_ema: row.get(9)?,
+                last_error: row.get(12)?,
+            },
         },
         7 => Record::Eligibility(crate::AccountEligibilityFact {
             provider: row.get(2)?,
@@ -1345,15 +1529,17 @@ fn decode(table: usize, row: &Row<'_>) -> rusqlite::Result<(i64, String, Option<
 }
 
 #[derive(Clone, Debug, Default)]
-struct BlockRows(Vec<(usize, i64, String, Option<Arc<Record>>)>);
+pub struct BlockRows(Vec<(usize, i64, String, Option<Arc<Record>>)>);
 
-fn read_back(conn: &Connection, captured: &[(usize, i64)]) -> rusqlite::Result<BlockRows> {
+pub(crate) fn read_back(conn: &Connection, captured: &[(u8, i64)]) -> rusqlite::Result<BlockRows> {
     let mut rows = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for &(table, rowid) in captured {
+        let table = usize::from(table);
         if !seen.insert((table, rowid)) {
             continue;
         }
+        super::READ_BACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let found = conn
             .query_row(
                 &format!(
@@ -1373,277 +1559,33 @@ fn read_back(conn: &Connection, captured: &[(usize, i64)]) -> rusqlite::Result<B
     Ok(BlockRows(rows))
 }
 
-#[test]
-fn migrated_state_readers_match_legacy_state_without_virtual_source_rows() {
-    let scratch = cortexkit_test_support::ScratchDir::new("consolidated-state-parity");
-    let store = crate::SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "consolidated-state-parity",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
-    )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store.assert_block_parity_fixture_coverage_for_test(now);
-    store.with_writer_for_test(|conn| {
-        conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_unscoped,last_error,updated_at) VALUES ('inherit',?1,?2,1,'capacity',?2)",rusqlite::params![now+2000,now-1])?;
-        conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,wall_unscoped,last_error,updated_at) VALUES ('inherit/old','inherit/old','inherit','old',?1,?2,1,'capacity',?2)",rusqlite::params![now+1000,now-1])?;
-        conn.execute("INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'zzz',evidence FROM fence_recheck WHERE kind='provider'",[])?;
-        conn.execute("INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'aaa',evidence FROM fence_recheck WHERE kind='provider'",[])?;
-        Ok(())
-    }).unwrap();
-    let times = store.block_parity_times(now).unwrap();
-    store
-        .with_writer_for_test(|conn| {
-            let orphaned_cleared: i64 = conn.query_row("SELECT count(*) FROM fence_recheck r WHERE r.kind!='observation' AND r.cleared_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM fence_origin o WHERE o.kind=r.kind AND o.origin_key=r.origin_key)",[],|row| row.get(0))?;
-            assert_eq!(orphaned_cleared,1,"the fixture exercises a cleared orphan before normalization");
-            fence_rechecks::sync_at(conn,now)?;
-            conn.execute("INSERT INTO fence_probe_authorization SELECT claim_owner,kind,origin_key,evidence,evidence_at,COALESCE(last_claimed_at,evidence_at),claim_generation FROM fence_recheck WHERE claim_owner IS NOT NULL",[])?;
-            let legacy = super::BlockState::load(conn)?;
-            block_storage::install_migration_function(conn)?;
-            conn.execute_batch(block_storage::MIGRATION)?;
-            let state = BlockState::load(conn)?;
-            assert!(state.enabled());
-            assert!(state.shares_storage_with(&state.clone()));
-            assert_eq!(state.eligibility(), legacy.eligibility());
-            assert_eq!(state.size_refusals(), legacy.size_refusals());
-            assert_eq!(
-                state.route_fence_latest_reports(),
-                legacy.route_fence_latest_reports()
-            );
-            assert_eq!(state.entitlement_fences(), legacy.entitlement_fences());
-            assert_eq!(
-                state.active_fence_providers(),
-                legacy.active_fence_providers()
-            );
-            assert_eq!(state.authorization_owners(), legacy.authorization_owners());
-            assert_eq!(state.clock_rechecks(), legacy.clock_rechecks());
-            assert_eq!(state.live_clocks(),legacy.live_clocks());
-            assert!(!state.needs_sync(), "migration leaves no orphaned clocks to reconcile");
-            for class in ["quota", "transient", "billing", "unknown"] {
-                assert_eq!(
-                    state.route_fences(class),
-                    legacy.route_fences(class),
-                    "{class}"
-                );
-            }
-            let quarantined: std::collections::HashSet<_> = legacy.quarantined().into_iter().collect();
-            let kept = |origin: &ViewOrigin| !quarantined.contains(&(origin.kind.clone(),origin.origin_key.clone()));
-            let origins: Vec<_> = legacy.view_origins().into_iter().filter(kept).collect();
-            assert_eq!(state.view_origins(), origins);
-            assert_eq!(
-                state.view_origins_in_scan_order(),
-                legacy.view_origins_in_scan_order().into_iter().filter(kept).collect::<Vec<_>>()
-            );
-            for at in times {
-                let before = legacy.blocks(at).unwrap();
-                let after = state.blocks(at).unwrap();
-                assert_eq!(after.blocks, before.blocks, "blocks at {at}");
-                assert_eq!(
-                    after.cleared_evidence, before.cleared_evidence,
-                    "cleared at {at}"
-                );
-                assert_eq!(
-                    state.fence_rechecks(at).unwrap(),
-                    legacy.fence_rechecks(at).unwrap(),
-                    "scan order at {at}"
-                );
-                let before = legacy.route_state_snapshot(at as f64, at).unwrap();
-                let after = state.route_state_snapshot(at as f64, at).unwrap();
-                assert_eq!(after.now,before.now);
-                for (before,after) in [(&before.by_route,&after.by_route),(&before.by_capacity,&after.by_capacity)] {
-                    assert_eq!(after.keys().collect::<std::collections::BTreeSet<_>>(),before.keys().collect::<std::collections::BTreeSet<_>>());
-                    for (key,row) in before { assert_eq!(after.get(key),Some(row),"route/capacity {key} at {at}"); }
-                }
-            }
-            for origin in origins {
-                let provider = origin.provider.as_str();
-                let credential = origin.credential_id.as_deref().unwrap_or("missing");
-                let model = origin.model.as_deref().unwrap_or("missing");
-                assert_eq!(
-                    state.entitlement_fence(provider, credential),
-                    legacy.entitlement_fence(provider, credential)
-                );
-                assert_eq!(
-                    state.active_fences(provider),
-                    legacy.active_fences(provider)
-                );
-                assert_eq!(
-                    state.active_pool_fences(provider).unwrap(),
-                    legacy.active_pool_fences(provider).unwrap()
-                );
-                for proposed in [false, true] {
-                    assert_eq!(
-                        state.credential_quota_classification(provider, credential, proposed),
-                        legacy.credential_quota_classification(provider, credential, proposed)
-                    );
-                }
-                let principal = origin.principal.as_deref().unwrap_or("missing");
-                let admission = origin.admission_id.as_deref().unwrap_or("missing");
-                assert_eq!(
-                    state.admission_exclusions(principal, admission),
-                    legacy.admission_exclusions(principal, admission)
-                );
-                assert_eq!(
-                    state.exclusion_count(principal, credential),
-                    legacy.exclusion_count(principal, credential)
-                );
-                assert_eq!(
-                    state.source_origin(&origin.kind, &origin.origin_key),
-                    legacy
-                        .source_origin(&origin.kind, &origin.origin_key)
-                        .cloned()
-                );
-                assert_eq!(
-                    state.account_route_fence(provider, credential, model),
-                    legacy
-                        .account_route_fence(provider, credential, model)
-                        .map(|(row, class, at)| (row.clone(), class, at))
-                );
-                for class in ["billing", "transient"] {
-                    assert_eq!(
-                        state.non_quota_route_fence(provider, credential, model, class),
-                        legacy
-                            .non_quota_route_fence(provider, credential, model, class)
-                            .map(|(row, at)| (row.clone(), at))
-                    );
-                }
-                if let Some(size) = origin.size_class {
-                    for quota in [false, true] {
-                        assert_eq!(
-                            state.size_refusal(quota, provider, credential, model, size),
-                            legacy
-                                .size_refusal(quota, provider, credential, model, size)
-                                .cloned()
-                        );
-                    }
-                }
-                if !provider.is_empty() {
-                    assert_eq!(
-                        state.provider_cooldown(provider).unwrap(),
-                        legacy.provider_cooldown(provider).unwrap()
-                    );
-                    let mut before = legacy.pool_key_rows(provider)?;
-                    let mut after = state.pool_key_rows(provider)?;
-                    before.sort();
-                    after.sort();
-                    assert_eq!(after, before);
-                }
-                state.check_source(conn, &origin.kind, &origin.origin_key, provider)?;
-                state.check_clock(conn, &origin.kind, &origin.origin_key)?;
-                state.check_provider_rows(conn, provider)?;
-                state.check_exclusions(conn, principal, admission)?;
-                let mut before = legacy.routes_stamped_by_provider(provider,origin.evidence_at,now+1);
-                let mut after = state.routes_stamped_by_provider(provider,origin.evidence_at,now+1);
-                before.sort_by(|a,b| a.0.cmp(&b.0)); after.sort_by(|a,b| a.0.cmp(&b.0)); assert_eq!(after,before);
-            }
-            for fence in legacy.active_fences("cpu-provider-0") {
-                assert_eq!(
-                    state.account_fence(&fence.fence_id),
-                    legacy
-                        .account_fence(&fence.fence_id)
-                        .map(|(row, pool, recovery)| (row.clone(), pool, recovery))
-                );
-            }
-            for owner in legacy.authorization_owners() {
-                let mut before = legacy.clocks_claimed_by(&owner);
-                let mut after = state.clocks_claimed_by(&owner);
-                before.sort_by(|a,b| (&a.0.kind,&a.0.origin_key).cmp(&(&b.0.kind,&b.0.origin_key)));
-                after.sort_by(|a,b| (&a.0.kind,&a.0.origin_key).cmp(&(&b.0.kind,&b.0.origin_key)));
-                assert_eq!(after,before);
-                assert_eq!(state.probe_release(&owner), legacy.probe_release(&owner));
-                let mut before = legacy.clone();
-                let mut after = state.clone();
-                before.apply_probe_release(&owner, now);
-                after.apply_probe_release(&owner, now);
-                assert_eq!(
-                    after.blocks(now).unwrap().blocks,
-                    before.blocks(now).unwrap().blocks
-                );
-                assert_eq!(after.authorization_owners(), before.authorization_owners());
-            }
-            assert_eq!(
-                state
-                    .table_sizes()
-                    .iter()
-                    .find(|(name, _)| *name == "retirement_tombstone")
-                    .unwrap()
-                    .1,
-                0
-            );
-            assert_eq!(state.block_rows().count(), state.tables[0].rows.len);
-            Ok(())
-        })
-        .unwrap();
+#[cfg(any(test, feature = "test-support"))]
+pub(super) fn reviewed_exempt_reads() -> Vec<String> {
+    let mark = super::STATE_CHECK;
+    let mut reads=vec![
+        format!("{mark} {} WHERE kind=?1 AND origin_key=?2",select(0)),
+        format!("{mark} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
+        format!("{mark} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key"),
+        format!("{mark} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
+        format!("{mark} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",select(2)),
+        format!("{mark} {} WHERE kind='principal' AND principal=?1 AND admission_id=?2",select(0)),
+    ];
+    reads.extend(
+        [
+            (0, "provider"),
+            (4, "provider"),
+            (5, "provider_key"),
+            (6, "provider_id"),
+        ]
+        .map(|(table, column)| format!("{mark} {} WHERE {column}=?1", select(table))),
+    );
+    reads
 }
 
-#[test]
-fn captured_physical_rows_equal_reload_after_replace_move_rollback_and_retirement() {
-    let scratch = cortexkit_test_support::ScratchDir::new("consolidated-state-capture");
-    let store = crate::SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "consolidated-state-capture",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
-    )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store.with_writer_for_test(|conn| {
-        block_storage::install_migration_function(conn)?;
-        conn.execute_batch(block_storage::MIGRATION)?;
-        conn.execute("INSERT INTO probe_authorization SELECT 'capture-owner',kind,origin_key,evidence,evidence_at,evidence_at,claim_generation FROM block WHERE kind='credential' AND source_present=1",[])?;
-        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let changed = Arc::clone(&captured);
-        conn.update_hook(Some(move |_, database: &str, table: &str, rowid: i64| {
-            if database == "main" {
-                if let Some(index) = TABLES.iter().position(|name| *name == table) {
-                    changed.lock().unwrap().push((index,rowid));
-                }
-            }
-        }));
-        conn.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
-            if matches!(context.action,rusqlite::hooks::AuthAction::Delete { table_name } if TABLES.contains(&table_name)) {
-                rusqlite::hooks::Authorization::Ignore
-            } else { rusqlite::hooks::Authorization::Allow }
-        }));
-        let mut state = BlockState::load(conn)?;
-        let original = state.clone();
-        assert!(state.shares_storage_with(&original));
-        let commands = [
-            "UPDATE block SET claim_generation=claim_generation+1,claim_owner='claimed',cleared_models='[\"partial/model\"]' WHERE kind='credential'",
-            "INSERT OR REPLACE INTO block SELECT * FROM block WHERE kind='credential'",
-            "UPDATE block SET origin_key='[\"moved/route\"]' WHERE kind='failure'",
-            "SAVEPOINT rejected; UPDATE block SET claim_owner='rolled-back' WHERE kind='account'; ROLLBACK TO rejected; RELEASE rejected",
-            "DELETE FROM block WHERE kind='non_quota_size'",
-            "DELETE FROM probe_authorization",
-            "UPDATE pool_key_state SET last_used_at=last_used_at+1",
-            "UPDATE provider_cooldown_state SET quota_pressure=0.75",
-            "UPDATE model_route_state SET latency_ema_ms=123",
-            "INSERT OR REPLACE INTO success_proof VALUES ('parity-fence','{}',17,19)",
-            "INSERT OR REPLACE INTO account_eligibility(provider,credential_id,model,listing_fingerprint,code,observed_at) VALUES ('new-provider','new-credential','new-model','fingerprint','known',21)",
-            "INSERT INTO retirement_tombstone SELECT kind,origin_key,evidence,evidence_at,evidence_at+1 FROM block WHERE kind='size'",
-        ];
-        for (step,command) in commands.into_iter().enumerate() {
-            captured.lock().unwrap().clear();
-            conn.execute_batch(command)?;
-            let changes = captured.lock().unwrap().clone();
-            assert!(!changes.is_empty(),"command {step} exercises the update hook");
-            let changes = read_back(conn,&changes)?;
-            state.apply(&changes);
-            let loaded = BlockState::load(conn)?;
-            assert_eq!(state,loaded,"memory equals load after command {step}: {command}");
-            assert_eq!(state.fingerprints(),loaded.fingerprints());
-            for table in &state.tables { assert_eq!(table.rows.len,table.keys.len); }
-            assert!(!state.shares_storage_with(&original));
-        }
-        assert!(state.block_rows().any(|row| row.block.kind == "credential" && !row.cleared_models.is_empty()));
-        assert!(!state.block_rows().any(|row| row.block.kind == "size"));
-        assert!(state.tables[1].rows.len == 0,"whole-table deletion reports every authorization");
-        assert!(state.block("failure","[\"moved/route\"]").is_some());
-        Ok(())
-    }).unwrap();
+impl BlockRows {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
+#[cfg(test)]
+mod tests;

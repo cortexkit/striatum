@@ -130,143 +130,43 @@ impl FenceRecheck {
 
 pub(crate) fn enabled(conn: &Connection) -> rusqlite::Result<bool> {
     conn.prepare_cached(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='fence_recheck')",
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
     )?
     .query_row([], |row| row.get(0))
 }
 
-/// Whether the stored recheck evidence differs from the current fence origins,
-/// checked without materializing the writer's TEMP snapshot. The writer must
-/// check again before synchronizing: evidence may change after this read
-/// snapshot is released.
 pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
     if !enabled(conn)? {
         return Ok(false);
     }
-    let quarantined = quarantined_origins(conn)?;
-    let mut statement = conn.prepare("SELECT kind,origin_key,evidence FROM fence_recheck")?;
-    let mut clocks = statement
-        .query_map([], |row| {
-            Ok((
-                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                row.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<std::collections::BTreeMap<_, _>>>()?;
-    if quarantined.iter().any(|key| clocks.contains_key(key)) {
-        return Ok(true);
-    }
-    // Scan the UNION view once rather than correlating it against every clock.
-    let mut statement = conn.prepare("SELECT kind,origin_key,evidence FROM fence_origin")?;
-    for row in statement.query_map([], |row| {
-        Ok((
-            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-            row.get::<_, String>(2)?,
-        ))
-    })? {
-        let (key, evidence) = row?;
-        if quarantined.contains(&key) {
-            continue;
-        }
-        if clocks.remove(&key).as_deref() != Some(evidence.as_str()) {
-            return Ok(true);
-        }
-    }
-    if clocks.keys().any(|(kind, _)| kind != "observation") {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(crate::BlockState::read(conn)?.needs_sync())
 }
 
-pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
-    sync_at(conn, crate::now_ms())
-}
+#[cfg(any(test, feature = "test-support"))]
+#[path = "fence_rechecks/legacy/tests.rs"]
+pub(crate) mod legacy;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use legacy::{quarantined_origins, retire_expired, snapshot_origins, sync, sync_at};
 
-/// The expired, unmanaged origins `sync` retires at `now`: their non-quota
-/// deadline passed and no clock holds their evidence.
-const RETIRING: &str =
-    "SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
-    WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
-        WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)";
-
-/// Archive the expired, unmanaged origins of the current snapshot at `now`,
-/// which makes `fence_retire_enforcement` end their source evidence.
-/// Returns how many it archived. An archive row for the same generation is
-/// replaced: deleted first, so the insert that fires the trigger resolves no
-/// conflict. (A conflict policy on that insert would also apply to every
-/// statement of the trigger, which writes the block tables.) The archive
-/// table has no delete trigger.
-pub(crate) fn retire_expired(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
-    conn.execute(
-        &format!(
-            "DELETE FROM fence_retired_origin WHERE (kind,origin_key,evidence) IN
-            (SELECT kind,origin_key,evidence FROM ({RETIRING}))"
-        ),
-        [now],
-    )?;
-    conn.execute(
-        &format!("INSERT INTO fence_retired_origin {RETIRING}"),
-        [now],
-    )
-}
-
-/// [`sync`] at a given time.
-pub(crate) fn sync_at(conn: &Connection, now: i64) -> rusqlite::Result<()> {
-    if !enabled(conn)? {
-        return Ok(());
-    }
-    snapshot_origins(conn)?;
-    let retired = retire_expired(conn, now)?;
-    if retired > 0 {
-        snapshot_origins(conn)?;
-    }
-    upsert_clocks(conn, None, None)?;
-    // Observation evidence is append-only and read through a bounded sparse
-    // index. Its clock survives that lookback until a successful probe heals it.
-    conn.execute("DELETE FROM fence_recheck WHERE kind!='observation' AND NOT EXISTS
-        (SELECT 1 FROM current_fence_origin o WHERE o.kind=fence_recheck.kind AND o.origin_key=fence_recheck.origin_key)", [])?;
-    // Older writers stored account-local errors on model/provider rows.
-    // Snapshot reads ignore those rows as model/provider walls. Exclude their
-    // retry clocks too, so one account's error cannot hide healthy siblings.
-    for (kind, key) in quarantined_origins(conn)? {
-        conn.execute(
-            "DELETE FROM fence_recheck WHERE kind=?1 AND origin_key=?2",
-            params![kind, key],
-        )?;
-    }
-    Ok(())
-}
-
-/// Install a new refusal's clock at receipt, even if its shorter deadline is
-/// already due. Only the named origin is registered; historical rows are not
-/// mistaken for a new refusal merely because another account reported one.
 pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Result<()> {
     if !enabled(conn)? {
         return Ok(());
     }
-    snapshot_origins(conn)?;
-    upsert_clocks(conn, Some(kind), Some(key))
+    let tx = crate::AccountTx::sql(conn);
+    register_on(&tx, kind, key)
 }
 
-/// [`sync_at`] for a command: decided on the command's working state when it
-/// has one, and on SQL otherwise (a projection, a test seam, a store without
-/// the block schema).
-///
-/// The state answers what `sync_at` would read from the `fence_origin` view
-/// and `fence_recheck`, so no request path copies the view. Each write the
-/// state decides is keyed on its row and checked: an archived origin and an
-/// installed or moved clock first check, by primary key, that SQL holds the
-/// origin's source rows as the state does (`BlockState::check_source`);
-/// clock updates and deletes name the clock values the state showed; an
-/// insert must not meet an existing clock. A miss raises `STATE_DIVERGED`.
+/// Reconcile the command's captured source rows with their durable clocks.
+/// Evidence retired here is archived before its enforcement trigger clears it.
 pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<()> {
-    let Some(state) = tx.working_blocks().map_err(command_error)? else {
-        return sync_at(tx.conn, now);
+    if !enabled(tx.conn)? {
+        return Ok(());
+    }
+    let state = match tx.working_blocks().map_err(command_error)? {
+        Some(state) => state.into_owned(),
+        None => crate::BlockState::read(tx.conn)?,
     };
-    let state = state.into_owned();
-    // Archive the expired, unmanaged origins: quota=0, deadline passed, and
-    // no clock holds their evidence (`RETIRING`).
-    let retiring: Vec<ViewOrigin> = state
+    let retiring: Vec<_> = state
         .view_origins_in_scan_order()
         .into_iter()
         .filter(|origin| {
@@ -282,16 +182,8 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
     for origin in &retiring {
         state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
         state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
-    }
-    for origin in &retiring {
         tx.conn.execute(
-            "DELETE FROM fence_retired_origin WHERE kind=?1 AND origin_key=?2 AND evidence=?3",
-            params![origin.kind, origin.origin_key, origin.evidence],
-        )?;
-    }
-    for origin in &retiring {
-        tx.conn.execute(
-            "INSERT INTO fence_retired_origin VALUES (?1,?2,?3,?4,?5)",
+            "INSERT OR REPLACE INTO retirement_tombstone VALUES (?1,?2,?3,?4,?5)",
             params![
                 origin.kind,
                 origin.origin_key,
@@ -301,85 +193,57 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
             ],
         )?;
     }
-    // The archive trigger ended the retired sources: read the state again.
-    let state = if retiring.is_empty() {
-        state
-    } else {
-        tx.working_blocks()
-            .map_err(command_error)?
-            .map(std::borrow::Cow::into_owned)
-            .unwrap_or(state)
+    let state = match tx.working_blocks().map_err(command_error)? {
+        Some(state) => state.into_owned(),
+        None => crate::BlockState::read(tx.conn)?,
     };
     let view = state.view_origins_in_scan_order();
     for origin in &view {
         upsert_clock_on(tx, &state, origin)?;
     }
-    // Observation evidence is append-only and read through a bounded sparse
-    // index. Its clock survives that lookback until a successful probe heals
-    // it. Every other clock goes with its origin.
-    let live: std::collections::HashSet<(&str, &str)> = view
+    let live: std::collections::HashSet<_> = view
         .iter()
         .map(|origin| (origin.kind.as_str(), origin.origin_key.as_str()))
         .collect();
-    let state = tx
-        .working_blocks()
-        .map_err(command_error)?
-        .map(std::borrow::Cow::into_owned)
-        .unwrap_or(state);
-    let stale: Vec<(String, String, String, String)> = state
-        .stored_clocks()
-        .filter(|(clock, _)| {
-            clock.kind != "observation"
-                && !live.contains(&(clock.kind.as_str(), clock.origin_key.as_str()))
-        })
-        .map(|(clock, _)| {
-            (
-                clock.kind.clone(),
-                clock.origin_key.clone(),
-                clock.evidence.clone(),
-                clock.scope.provider.clone(),
-            )
-        })
-        .collect();
-    for (kind, key, evidence, provider) in &stale {
-        state.check_source(tx.conn, kind, key, provider)?;
-        delete_clock_on(tx, kind, key, evidence)?;
-    }
-    // Older writers stored account-local errors on model/provider rows.
-    // Snapshot reads ignore those rows as model/provider walls. Exclude their
-    // retry clocks too, so one account's error cannot hide healthy siblings.
-    for (kind, key) in state.quarantined() {
-        let Some((clock, _)) = state.clock(&kind, &key) else {
-            continue;
-        };
-        if stale.iter().any(|(k, o, _, _)| *k == kind && *o == key) {
-            continue;
-        }
-        let evidence = clock.evidence.clone();
-        let provider = clock.scope.provider.clone();
-        state.check_source(tx.conn, &kind, &key, &provider)?;
-        delete_clock_on(tx, &kind, &key, &evidence)?;
+    let state = match tx.working_blocks().map_err(command_error)? {
+        Some(state) => state.into_owned(),
+        None => crate::BlockState::read(tx.conn)?,
+    };
+    for (clock, _) in state.stored_clocks().filter(|(clock, _)| {
+        clock.kind != "observation"
+            && !live.contains(&(clock.kind.as_str(), clock.origin_key.as_str()))
+    }) {
+        state.check_source(
+            tx.conn,
+            &clock.kind,
+            &clock.origin_key,
+            &clock.scope.provider,
+        )?;
+        delete_clock_on(tx, &clock.kind, &clock.origin_key, &clock.evidence)?;
     }
     Ok(())
 }
 
-/// [`register`] for a command, decided on its working state when it has one.
 pub(crate) fn register_on(
     tx: &crate::AccountTx<'_>,
     kind: &str,
     key: &str,
 ) -> rusqlite::Result<()> {
-    let Some(state) = tx.working_blocks().map_err(command_error)? else {
-        return register(tx.conn, kind, key);
+    if !enabled(tx.conn)? {
+        return Ok(());
+    }
+    let state = match tx.working_blocks().map_err(command_error)? {
+        Some(state) => state.into_owned(),
+        None => crate::BlockState::read(tx.conn)?,
     };
-    let Some(origin) = state
+    if let Some(origin) = state
         .view_origins_in_scan_order()
         .into_iter()
         .find(|origin| origin.kind == kind && origin.origin_key == key)
-    else {
-        return Ok(());
-    };
-    upsert_clock_on(tx, &state, &origin)
+    {
+        upsert_clock_on(tx, &state, &origin)?;
+    }
+    Ok(())
 }
 
 /// A number as SQLite computes it: an integer, or a real once integer
@@ -466,142 +330,76 @@ pub(crate) fn clock_schedule(
     (next.cast_integer(), reset)
 }
 
-/// The clock `upsert_clocks` writes for one origin: its evidence, class and
-/// schedule. A changed evidence value is new evidence, not a probe.
+/// Install the clock on the same row as the newly captured source. History
+/// kept while replacing evidence prevents a late report from shortening a
+/// clock that an already-claimed probe moved into the future.
 fn upsert_clock_on(
     tx: &crate::AccountTx<'_>,
     state: &crate::BlockState,
     origin: &ViewOrigin,
 ) -> rusqlite::Result<()> {
-    let quota = origin.quota.unwrap_or(false);
-    let (next, reset) = clock_schedule(quota, origin.evidence_at, origin.deadline, origin.reset_at);
-    match state.clock(&origin.kind, &origin.origin_key) {
-        None => {
-            state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
-            let inserted = tx.conn.execute(
-                "INSERT INTO fence_recheck (kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-                  evidence,evidence_at,quota,next_recheck_at,reset_check_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
-                 ON CONFLICT(kind,origin_key) DO NOTHING",
-                params![
-                    origin.kind,
-                    origin.origin_key,
-                    origin.provider,
-                    origin.account_id,
-                    origin.credential_id,
-                    origin.model,
-                    origin.size_class,
-                    origin.principal,
-                    origin.admission_id,
-                    origin.evidence,
-                    origin.evidence_at,
-                    quota,
-                    next,
-                    reset,
-                ],
-            )?;
-            crate::block_state::expect_changes(
-                inserted,
-                1,
-                format_args!(
-                    "installing the clock of {} {}",
-                    origin.kind, origin.origin_key
-                ),
-            )
-        }
-        Some((clock, _)) if clock.evidence != origin.evidence => {
-            state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
-            let claimed = clock.last_claimed_at.unwrap_or(i64::MIN);
-            let next = if origin.evidence_at >= claimed {
-                next
-            } else {
-                next.max(clock.next_recheck_at)
-            };
-            let reset = reset.filter(|reset| *reset > claimed as f64);
-            let moved = tx.conn.execute(
-                "UPDATE fence_recheck SET evidence=?3,evidence_at=?4,quota=?5,next_recheck_at=?6,reset_check_at=?7,
-                  classified=0,cleared_at=NULL,claim_owner=NULL
-                 WHERE kind=?1 AND origin_key=?2 AND evidence=?8 AND next_recheck_at=?9 AND last_claimed_at IS ?10",
-                params![
-                    origin.kind,
-                    origin.origin_key,
-                    origin.evidence,
-                    origin.evidence_at,
-                    quota,
-                    next,
-                    reset,
-                    clock.evidence,
-                    clock.next_recheck_at,
-                    clock.last_claimed_at,
-                ],
-            )?;
-            crate::block_state::expect_changes(
-                moved,
-                1,
-                format_args!(
-                    "renewing the clock of {} {}",
-                    origin.kind, origin.origin_key
-                ),
-            )
-        }
-        Some(_) => Ok(()),
+    if state.clock(&origin.kind, &origin.origin_key).is_some() {
+        return Ok(());
     }
+    state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
+    let Some(prior) = state.pending_clock(&origin.kind, &origin.origin_key) else {
+        return Err(crate::block_state::diverged(
+            "source missing while registering its clock",
+        ));
+    };
+    let quota = origin.quota.unwrap_or(false);
+    let (mut next, reset) =
+        clock_schedule(quota, origin.evidence_at, origin.deadline, origin.reset_at);
+    let claimed = prior.last_claimed_at.unwrap_or(i64::MIN);
+    if origin.evidence_at < claimed {
+        next = next.max(prior.next_recheck_at);
+    }
+    let reset = reset.filter(|reset| *reset > claimed as f64);
+    let changed = tx.conn.execute(
+        "UPDATE block SET quota=?3,classified=0,next_recheck_at=?4,reset_check_at=?5,
+        managed=1,cleared_at=NULL,cleared_by=NULL,claim_owner=NULL,cleared_models='[]'
+        WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND source_present=1 AND managed=0 AND evidence=?6
+            AND next_recheck_at=?7 AND last_claimed_at IS ?8 AND claim_generation=?9",
+        params![
+            origin.kind,
+            origin.origin_key,
+            quota,
+            next,
+            reset,
+            origin.evidence,
+            prior.next_recheck_at,
+            prior.last_claimed_at,
+            prior.claim_generation
+        ],
+    )?;
+    crate::block_state::expect_changes(
+        changed,
+        1,
+        format_args!(
+            "registering the clock of {} {}",
+            origin.kind, origin.origin_key
+        ),
+    )
 }
 
-/// Delete one clock, keyed on the evidence the state showed.
 fn delete_clock_on(
     tx: &crate::AccountTx<'_>,
     kind: &str,
     key: &str,
     evidence: &str,
 ) -> rusqlite::Result<()> {
-    let deleted = tx.conn.execute(
-        "DELETE FROM fence_recheck WHERE kind=?1 AND origin_key=?2 AND evidence=?3",
-        params![kind, key, evidence],
-    )?;
+    let changed=tx.conn.execute("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0 WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND evidence=?3 AND managed=1",params![kind,key,evidence])?;
     crate::block_state::expect_changes(
-        deleted,
+        changed,
         1,
-        format_args!("deleting the clock of {kind} {key}"),
+        format_args!("dropping the clock of {kind} {key}"),
     )
 }
 
 /// A command-level error carried through SQL code: its text, which keeps a
 /// `STATE_DIVERGED` marker, is what the writer looks for.
-fn command_error(error: striatum_core::RouteStateStoreError) -> rusqlite::Error {
+pub(crate) fn command_error(error: striatum_core::RouteStateStoreError) -> rusqlite::Error {
     rusqlite::Error::ToSqlConversionFailure(error.0.into())
-}
-
-pub(crate) fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
-    // Materialize once and index the compound origin key. A correlated lookup
-    // against the UNION view otherwise rebuilds its JSON keys for every clock.
-    conn.execute_batch("CREATE TEMP TABLE IF NOT EXISTS current_fence_origin AS SELECT * FROM fence_origin WHERE 0;
-        CREATE UNIQUE INDEX IF NOT EXISTS current_fence_origin_key ON current_fence_origin(kind,origin_key);
-        DELETE FROM current_fence_origin;
-        INSERT INTO current_fence_origin SELECT * FROM fence_origin;")
-}
-
-fn upsert_clocks(conn: &Connection, kind: Option<&str>, key: Option<&str>) -> rusqlite::Result<()> {
-    // A changed evidence value is new evidence, not a probe. Pool evidence
-    // omits the shared last-used timestamp so leasing a key cannot extend its
-    // retry deadline merely by changing that timestamp.
-    conn.execute(
-        "INSERT INTO fence_recheck (kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-          evidence,evidence_at,quota,next_recheck_at,reset_check_at)
-         SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-          evidence,evidence_at,COALESCE(quota,0),
-          CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER),
-          CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END
-         FROM current_fence_origin WHERE (?1 IS NULL OR (kind=?1 AND origin_key=?2))
-         ON CONFLICT(kind,origin_key) DO UPDATE SET evidence=excluded.evidence,evidence_at=excluded.evidence_at,
-          quota=excluded.quota,
-          next_recheck_at=CASE WHEN excluded.evidence_at>=COALESCE(fence_recheck.last_claimed_at,-9223372036854775808)
-            THEN excluded.next_recheck_at ELSE MAX(fence_recheck.next_recheck_at,excluded.next_recheck_at) END,
-          reset_check_at=CASE WHEN excluded.reset_check_at>COALESCE(fence_recheck.last_claimed_at,-9223372036854775808) THEN excluded.reset_check_at END,
-          classified=0,cleared_at=NULL,claim_owner=NULL WHERE fence_recheck.evidence!=excluded.evidence",
-        params![kind,key],
-    )?;
-    Ok(())
 }
 
 /// Whether a route or provider row holds one account's error rather than a
@@ -612,82 +410,13 @@ pub(crate) fn quarantined_row(unscoped: bool, error: Option<&str>, class: Option
     !unscoped && striatum_core::account_wall::account_scoped_wall(error, class)
 }
 
-pub(crate) fn quarantined_origins(conn: &Connection) -> rusqlite::Result<Vec<(String, String)>> {
-    let mut quarantined = Vec::new();
-    for (table, key, kind) in [
-        ("model_route_state", "route_key", "route"),
-        ("provider_cooldown_state", "provider_key", "provider"),
-    ] {
-        let mut statement = conn.prepare(&format!(
-            "SELECT {key},last_error,wall_class FROM {table} WHERE wall_unscoped=0"
-        ))?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        })?;
-        for row in rows {
-            let (key, error, class) = row?;
-            if quarantined_row(false, error.as_deref(), class.as_deref()) {
-                quarantined.push((kind.to_owned(), serde_json::json!([key]).to_string()));
-            }
-        }
-    }
-    Ok(quarantined)
-}
-
 pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
     if !enabled(conn)? {
         return Ok(Vec::new());
     }
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-        evidence_at,quota,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,evidence,classified FROM fence_recheck WHERE cleared_at IS NULL ORDER BY kind,origin_key")?;
-    let rows = statement.query_map([], |row| {
-        Ok(FenceRecheck {
-            evidence: row.get(15)?,
-            kind: row.get(0)?,
-            origin_key: row.get(1)?,
-            provider: row.get(2)?,
-            account_id: row.get(3)?,
-            credential_id: row.get(4)?,
-            model: row.get(5)?,
-            size_class: row.get(6)?,
-            principal: row.get(7)?,
-            admission_id: row.get(8)?,
-            evidence_at: row.get(9)?,
-            quota: row.get(10)?,
-            classified: row.get(16)?,
-            next_recheck_at: row.get(11)?,
-            reset_check_at: row.get(12)?,
-            last_claimed_at: row.get(13)?,
-            claim_owner: row.get(14)?,
-            cleared_models: Vec::new(),
-        })
-    })?;
-    let mut origins: Vec<FenceRecheck> = rows.collect::<rusqlite::Result<_>>()?;
-    let mut statement=conn.prepare("SELECT c.kind,c.origin_key,c.model FROM fence_recheck_route_clear c JOIN fence_recheck r USING(kind,origin_key) WHERE c.evidence=r.evidence")?;
-    for row in statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })? {
-        let (kind, key, model) = row?;
-        if let Some(origin) = origins
-            .iter_mut()
-            .find(|origin| origin.kind == kind && origin.origin_key == key)
-        {
-            origin.cleared_models.push(model);
-        }
-    }
-    Ok(origins)
+    Ok(crate::BlockState::read(conn)?.clock_rechecks())
 }
 
-/// Overlay newly written evidence for scoring without opening a writer.
-/// Admission materializes and claims their durable schedules atomically.
 pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRecheck>> {
     read_effective_at(conn, crate::now_ms())
 }
@@ -699,91 +428,9 @@ pub(crate) fn read_effective_at(
     if !enabled(conn)? {
         return Ok(Vec::new());
     }
-    let mut known: std::collections::BTreeMap<_, _> = read(conn)?
-        .into_iter()
-        .map(|origin| ((origin.kind.clone(), origin.origin_key.clone()), origin))
-        .collect();
-    let mut signatures = std::collections::BTreeMap::new();
-    let mut statement = conn.prepare(
-        "SELECT kind,origin_key,evidence,last_claimed_at,next_recheck_at FROM fence_recheck",
-    )?;
-    for row in statement.query_map([], |row| {
-        Ok((
-            (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-            (
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, i64>(4)?,
-            ),
-        ))
-    })? {
-        let (key, value) = row?;
-        signatures.insert(key, value);
-    }
-    let quarantined = quarantined_origins(conn)?;
-    let mut effective = Vec::new();
-    let mut statement=conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        let key = (row.get::<_, String>(0)?, row.get::<_, String>(1)?);
-        if quarantined.contains(&key) {
-            continue;
-        }
-        let evidence: String = row.get(9)?;
-        let prior = signatures.get(&key);
-        if prior.is_some_and(|(signature, _, _)| *signature == evidence) {
-            if let Some(origin) = known.remove(&key) {
-                effective.push(origin);
-            }
-            continue;
-        }
-        known.remove(&key);
-        let evidence_at: i64 = row.get(10)?;
-        let quota = row.get::<_, Option<bool>>(11)?.unwrap_or(false);
-        let deadline = row.get::<_, Option<f64>>(12)?.map(|at| at as i64);
-        let reset = row.get::<_, Option<f64>>(13)?.map(|at| at as i64);
-        if !quota && deadline.is_some_and(|at| at < now) {
-            continue;
-        }
-        let last_claimed_at = prior.and_then(|(_, claimed, _)| *claimed);
-        let mut next = if quota {
-            evidence_at.saturating_add(QUOTA_FENCE_RECHECK_MS)
-        } else {
-            let cap = evidence_at.saturating_add(NON_QUOTA_FENCE_MAX_MS);
-            deadline.unwrap_or(cap).min(cap)
-        };
-        if last_claimed_at.is_some_and(|claimed| evidence_at < claimed) {
-            next = next.max(prior.unwrap().2);
-        }
-        effective.push(FenceRecheck {
-            evidence,
-            kind: key.0,
-            origin_key: key.1,
-            provider: row.get(2)?,
-            account_id: row.get(3)?,
-            credential_id: row.get(4)?,
-            model: row.get(5)?,
-            size_class: row.get(6)?,
-            principal: row.get(7)?,
-            admission_id: row.get(8)?,
-            evidence_at,
-            quota,
-            classified: false,
-            next_recheck_at: next,
-            reset_check_at: reset.filter(|at| {
-                quota && *at > evidence_at && last_claimed_at.is_none_or(|claimed| *at > claimed)
-            }),
-            last_claimed_at,
-            claim_owner: None,
-            cleared_models: Vec::new(),
-        });
-    }
-    effective.extend(
-        known
-            .into_values()
-            .filter(|origin| origin.kind == "observation"),
-    );
-    Ok(effective)
+    crate::BlockState::read(conn)?
+        .fence_rechecks(now)
+        .map_err(command_error)
 }
 
 /// Source evidence and clocks loaded without modifying either. Cleared evidence
@@ -828,45 +475,19 @@ fn load_blocks(conn: &Connection, now: i64) -> rusqlite::Result<LoadedBlocks> {
     if !enabled(conn)? {
         return Ok(LoadedBlocks::default());
     }
-    let mut clocks = Clocks::new();
-    let mut statement = conn.prepare(&format!("SELECT {CLOCK_COLUMNS} FROM fence_recheck"))?;
-    for row in statement.query_map([], |r| clock_row(r, 0))? {
-        let (block, cleared) = row?;
-        clocks.insert(
-            (block.kind.clone(), block.origin_key.clone()),
-            (block, cleared),
-        );
-    }
-    let mut statement = conn.prepare(
-        "SELECT kind,origin_key,evidence,model FROM fence_recheck_route_clear ORDER BY model",
-    )?;
-    let clears = statement
-        .query_map([], |r| {
-            Ok(RouteClear {
-                kind: r.get(0)?,
-                origin_key: r.get(1)?,
-                evidence: r.get(2)?,
-                model: r.get(3)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    attach_route_clears(&mut clocks, &clears);
-    let quarantined = quarantined_origins(conn)?;
-    let mut statement = conn.prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?;
-    let origins = statement
-        .query_map([], |r| view_origin(r, 0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    derive_blocks(clocks, &quarantined, origins, now)
+    crate::BlockState::read(conn)?
+        .blocks(now)
+        .map_err(command_error)
 }
 
-/// The `fence_recheck` columns [`clock_row`] decodes, in its order.
+/// The `block` columns [`clock_row`] decodes, in its order.
 pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
 
 /// Stored clocks keyed by source kind and origin key, each with its
 /// `cleared_at`.
 pub(crate) type Clocks = std::collections::BTreeMap<(String, String), (Block, Option<i64>)>;
 
-/// One `fence_recheck` row, decoded from [`CLOCK_COLUMNS`] starting at `at`.
+/// One `block` row, decoded from [`CLOCK_COLUMNS`] starting at `at`.
 pub(crate) fn clock_row(
     r: &rusqlite::Row<'_>,
     at: usize,
@@ -924,7 +545,7 @@ pub(crate) fn attach_route_clears(clocks: &mut Clocks, clears: &[RouteClear]) {
 }
 
 /// One row of the `fence_origin` view: an origin's current source evidence.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewOrigin {
     pub kind: String,
     pub origin_key: String,
@@ -1075,7 +696,7 @@ fn test_is_current(
 /// the admission flag bound at `?{flag}`.
 fn current_test_join(flag: usize) -> String {
     format!(
-        "JOIN fence_recheck r ON r.kind=a.kind AND r.origin_key=a.origin_key
+        "JOIN block r ON r.is_origin=1 AND r.managed=1 AND r.kind=a.kind AND r.origin_key=a.origin_key
          AND r.evidence=a.evidence AND r.evidence_at=a.evidence_at AND r.cleared_at IS NULL
          AND (((r.claim_owner IS NULL OR r.claim_owner=a.owner) AND r.claim_generation=a.claim_generation)
              OR (?{flag} AND r.claim_owner=a.owner))"
@@ -1090,7 +711,7 @@ fn current_test_join(flag: usize) -> String {
 fn clock_held(first: usize) -> String {
     let at = |offset: usize| first + offset;
     format!(
-        "evidence=?{} AND evidence_at=?{} AND cleared_at IS NULL AND quota=?{} AND next_recheck_at=?{}
+        "is_origin=1 AND managed=1 AND evidence=?{} AND evidence_at=?{} AND cleared_at IS NULL AND quota=?{} AND next_recheck_at=?{}
          AND reset_check_at IS ?{} AND claim_owner IS ?{} AND claim_generation=?{}",
         at(0), at(1), at(2), at(3), at(4), at(5), at(6)
     )
@@ -1104,7 +725,7 @@ pub(crate) fn claim(
     origins: &[FenceRecheck],
     now: i64,
 ) -> rusqlite::Result<bool> {
-    sync(conn)?;
+    sync_on(&crate::AccountTx::sql(conn), now)?;
     claim_decided(conn, None, origins, now, None, None, None)
 }
 
@@ -1161,8 +782,8 @@ fn claim_states(
         .iter()
         .map(|origin| {
             conn.query_row(
-                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM fence_recheck
-             WHERE kind=?1 AND origin_key=?2 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
+                "SELECT quota,next_recheck_at,reset_check_at,claim_owner,claim_generation FROM block
+             WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND evidence_at=?3 AND evidence=?4 AND cleared_at IS NULL",
                 params![origin.kind, origin.origin_key, origin.evidence_at, origin.evidence],
                 |row| {
                     Ok(ClaimState {
@@ -1185,7 +806,7 @@ fn claim_states(
 /// `model`, as a non-quota clock of that model or of none).
 pub(crate) fn no_authorized_clock_check_sql(model: bool) -> String {
     format!(
-        "{} UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
+        "{} UPDATE block SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1
             AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5{}",
         crate::block_state::STATE_CHECK,
         if model {
@@ -1211,7 +832,7 @@ pub(crate) fn unstarted_admission_check_sql() -> String {
 pub(crate) fn authorization_check_sql() -> String {
     format!(
         "{} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
-                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key",
+                FROM probe_authorization WHERE owner=?1 ORDER BY kind,origin_key",
         crate::block_state::STATE_CHECK
     )
 }
@@ -1220,7 +841,7 @@ pub(crate) fn authorization_check_sql() -> String {
 pub(crate) fn probe_clock_check_sql() -> String {
     format!(
         "{} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
-                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2",
+                    FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1",
         crate::block_state::STATE_CHECK
     )
 }
@@ -1309,7 +930,7 @@ fn claim_decided(
         return Ok(false);
     }
     // The clock state each update was decided on, after the keyed columns.
-    const DECIDED: &str = "evidence=:evidence AND evidence_at=:evidence_at AND cleared_at IS NULL
+    const DECIDED: &str = "is_origin=1 AND managed=1 AND evidence=:evidence AND evidence_at=:evidence_at AND cleared_at IS NULL
         AND quota=:quota AND next_recheck_at=:next AND reset_check_at IS :reset
         AND claim_owner IS :owner AND claim_generation=:generation";
     for (origin, owned, due, state) in states {
@@ -1324,7 +945,7 @@ fn claim_decided(
             .into_iter()
             .flatten()
         {
-            conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+            conn.execute("INSERT INTO probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
                 VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET
                 evidence=excluded.evidence,evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,
                 claim_generation=excluded.claim_generation",
@@ -1339,7 +960,7 @@ fn claim_decided(
         let changed = if owned && !due {
             conn.execute(
                 &format!(
-                    "UPDATE fence_recheck SET claim_owner=:grant,
+                    "UPDATE block SET claim_owner=:grant,
                     reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
                     WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
                 ),
@@ -1357,7 +978,7 @@ fn claim_decided(
             with_next.push((":generation_new", &generation as &dyn rusqlite::ToSql));
             conn.execute(
                 &format!(
-                    "UPDATE fence_recheck SET next_recheck_at=:renewed,last_claimed_at=:now,claim_owner=:grant,
+                    "UPDATE block SET next_recheck_at=:renewed,last_claimed_at=:now,claim_owner=:grant,
                     claim_generation=:generation_new,reset_check_at=CASE WHEN reset_check_at>:now THEN reset_check_at END
                     WHERE kind=:kind AND origin_key=:key AND {DECIDED}"
                 ),
@@ -1382,12 +1003,14 @@ impl SqliteRouteStateStore {
 
     /// Boundary domain includes source deadlines even when a stored clock has
     /// capped them, and all persisted probe clocks, each with its neighbours.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn block_parity_times(&self, now: i64) -> RouteStateResult<Vec<i64>> {
         self.store
             .with_read(|conn| Ok(parity_times(conn, now)?.into_iter().collect()))
             .map_err(err)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn block_parity_identities(&self) -> RouteStateResult<Vec<[String; 4]>> {
         self.store.with_read(parity_identities).map_err(err)
     }
@@ -1398,19 +1021,20 @@ impl SqliteRouteStateStore {
         now: i64,
     ) -> RouteStateResult<Vec<FenceRecheck>> {
         self.store
-            .with_read(|conn| read_effective_at(conn, now))
+            .with_read(|conn| legacy::read_effective_at(conn, now))
             .map_err(err)
     }
 
     /// Compare in one read snapshot, so a concurrent report cannot produce a
     /// false difference between the adapter and the SQL oracle.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn block_parity(&self, now: i64) -> RouteStateResult<BlockParity> {
         self.store.with_read(|conn| {
             let tx = conn;
             let started = std::time::Instant::now();
-            let loaded = load_blocks(&tx, now)?;
+            let loaded = legacy::load_blocks(&tx, now)?;
             let load_time = started.elapsed();
-            let rows = read_effective_at(&tx, now)?;
+            let rows = legacy::read_effective_at(&tx, now)?;
             let mut report = BlockParity { load_time, active: loaded.blocks.len(), cleared_evidence: loaded.cleared_evidence.len(), identities: 0, combinations_per_identity: 0, function_comparisons: 0, differences: Vec::new() };
             let canonical = |rows: Vec<FenceRecheck>| -> std::collections::BTreeMap<_,_> {
                 rows.into_iter().map(|mut row| {
@@ -1463,6 +1087,7 @@ pub struct BlockParity {
     pub differences: Vec<String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn parity_times(conn: &Connection, now: i64) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
     let mut times = std::collections::BTreeSet::from([now]);
     let mut statement = conn.prepare("SELECT next_recheck_at FROM fence_recheck UNION SELECT reset_check_at FROM fence_recheck UNION SELECT last_claimed_at FROM fence_recheck UNION SELECT deadline FROM fence_origin UNION SELECT reset_at FROM fence_origin")?;
@@ -1475,6 +1100,7 @@ fn parity_times(conn: &Connection, now: i64) -> rusqlite::Result<std::collection
     Ok(times)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn parity_identities(conn: &Connection) -> rusqlite::Result<Vec<[String; 4]>> {
     use std::collections::BTreeSet;
     let mut statement = conn.prepare("SELECT provider,account_id,credential_id,model FROM fence_origin UNION SELECT provider,account_id,credential_id,model FROM fence_recheck UNION SELECT provider,NULL,NULL,model FROM fence_recheck_route_clear")?;
@@ -1518,6 +1144,7 @@ fn parity_identities(conn: &Connection) -> rusqlite::Result<Vec<[String; 4]>> {
     Ok(identities.into_iter().collect())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn compare_block_functions(
     conn: &Connection,
     now: i64,
@@ -1657,7 +1284,7 @@ pub struct ReleasedAdmissionProbes {
 
 pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
     "SELECT DISTINCT a.principal,a.admission_id,p.owner
-    FROM fence_probe_authorization p CROSS JOIN account_admission a
+    FROM probe_authorization p CROSS JOIN account_admission a
       ON a.principal=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[1]')
       AND a.admission_id=json_extract(CASE WHEN json_valid(p.owner) THEN p.owner END,'$[2]')
     WHERE p.owner=json_array('account_admission',a.principal,a.admission_id)
@@ -1666,7 +1293,7 @@ pub(crate) const EXPIRED_ADMISSION_PROBES: &str =
 
 impl AccountTx<'_> {
     /// Arm real fixture blocks without changing their evidence or admissions.
-    /// A block's retest clock is a `fence_recheck` row, and reads derive a
+    /// A block's retest clock is a `block` row, and reads derive a
     /// default clock for any block that has none stored. `sync` writes those
     /// missing rows first, so the update below has a row to make due even for
     /// a quota block that has only been read so far.
@@ -1680,7 +1307,7 @@ impl AccountTx<'_> {
         sync_on(self, crate::now_ms()).map_err(err)?;
         self.conn
             .execute(
-                "UPDATE fence_recheck SET next_recheck_at=0,reset_check_at=NULL,claim_owner=NULL
+                "UPDATE block SET next_recheck_at=0,reset_check_at=NULL,claim_owner=NULL
             WHERE provider=?1 AND (account_id=?2 OR credential_id=?3)",
                 params![provider, account, credential],
             )
@@ -1770,7 +1397,7 @@ impl AccountTx<'_> {
         let authorized: bool = self
             .conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
+                "SELECT EXISTS(SELECT 1 FROM probe_authorization WHERE owner=?1)",
                 [owner],
                 |row| row.get(0),
             )
@@ -1784,8 +1411,8 @@ impl AccountTx<'_> {
         let current: bool = self
             .conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a JOIN fence_recheck r
-             ON a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
+                "SELECT EXISTS(SELECT 1 FROM probe_authorization a JOIN block r
+             ON r.is_origin=1 AND r.managed=1 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
              AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation
              WHERE a.owner=?1 AND r.cleared_at IS NULL)",
                 [owner],
@@ -1859,7 +1486,7 @@ impl AccountTx<'_> {
         let Some(blocks) = self.working_blocks()? else {
             self.conn
                 .execute(
-                    "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                    "UPDATE block SET claim_owner=?2 WHERE claim_owner=?1 AND is_origin=1 AND managed=1",
                     params![from, to],
                 )
                 .map_err(err)?;
@@ -1869,7 +1496,7 @@ impl AccountTx<'_> {
             let changed = self
                 .conn
                 .execute(
-                    "UPDATE fence_recheck SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
+                    "UPDATE block SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
                 AND claim_owner=?4 AND evidence=?5 AND evidence_at=?6 AND claim_generation=?7",
                     params![
                         clock.kind,
@@ -1893,7 +1520,7 @@ impl AccountTx<'_> {
         let left = self
             .conn
             .execute(
-                "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                "UPDATE block SET claim_owner=?2 WHERE claim_owner=?1 AND is_origin=1 AND managed=1",
                 params![from, to],
             )
             .map_err(err)?;
@@ -2056,7 +1683,7 @@ impl AccountTx<'_> {
         let changed = self
             .conn
             .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
+                "DELETE FROM probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
             AND evidence=?4 AND evidence_at=?5 AND claimed_at=?6 AND claim_generation=?7",
                 params![
                     row.owner,
@@ -2095,10 +1722,7 @@ impl AccountTx<'_> {
         }
         let left = self
             .conn
-            .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1",
-                [owner],
-            )
+            .execute("DELETE FROM probe_authorization WHERE owner=?1", [owner])
             .map_err(err)?;
         if held.is_some() {
             crate::block_state::expect_changes(
@@ -2144,7 +1768,7 @@ impl AccountTx<'_> {
                     self.expect_no_authorized_clock(row, None)?;
                     continue;
                 };
-                let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3+CASE WHEN quota=1 THEN ?4 WHEN ?6 THEN 0 ELSE ?5 END,
+                let changed = self.conn.execute(&format!("UPDATE block SET next_recheck_at=?3+CASE WHEN quota=1 THEN ?4 WHEN ?6 THEN 0 ELSE ?5 END,
                     claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
                     WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(7)),
                     params![row.kind,row.origin_key,now,QUOTA_FENCE_RECHECK_MS,NON_QUOTA_FENCE_MAX_MS,inconclusive,
@@ -2180,21 +1804,18 @@ impl AccountTx<'_> {
             }
             return self.delete_authorizations(owner, Some(&held));
         }
-        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2+CASE WHEN quota=1 THEN ?3 WHEN ?5 THEN 0 ELSE ?4 END,
+        self.conn.execute("UPDATE block AS r SET next_recheck_at=?2+CASE WHEN quota=1 THEN ?3 WHEN ?5 THEN 0 ELSE ?4 END,
             claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?2 THEN reset_check_at END
-            WHERE r.cleared_at IS NULL AND EXISTS (SELECT 1 FROM fence_probe_authorization a
+            WHERE r.is_origin=1 AND r.managed=1 AND r.cleared_at IS NULL AND EXISTS (SELECT 1 FROM probe_authorization a
                 WHERE a.owner=?1 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",
             params![owner,now,QUOTA_FENCE_RECHECK_MS,NON_QUOTA_FENCE_MAX_MS,inconclusive]).map_err(err)?;
-        self.conn.execute("DELETE FROM fence_probe_authorization AS a WHERE owner!=?1 AND EXISTS (
-            SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1 AND p.kind=a.kind AND p.origin_key=a.origin_key
+        self.conn.execute("DELETE FROM probe_authorization AS a WHERE owner!=?1 AND EXISTS (
+            SELECT 1 FROM probe_authorization p WHERE p.owner=?1 AND p.kind=a.kind AND p.origin_key=a.origin_key
             AND p.evidence=a.evidence AND p.evidence_at=a.evidence_at AND p.claim_generation=a.claim_generation)",
             [owner]).map_err(err)?;
         self.conn
-            .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1",
-                [owner],
-            )
+            .execute("DELETE FROM probe_authorization WHERE owner=?1", [owner])
             .map_err(err)?;
         Ok(())
     }
@@ -2208,7 +1829,7 @@ impl AccountTx<'_> {
             return Ok(Vec::new());
         }
         self.conn
-            .prepare("SELECT DISTINCT owner FROM fence_probe_authorization ORDER BY owner")
+            .prepare("SELECT DISTINCT owner FROM probe_authorization ORDER BY owner")
             .map_err(err)?
             .query_map([], |row| row.get(0))
             .map_err(err)?
@@ -2309,8 +1930,8 @@ impl AccountTx<'_> {
                         let current = *current;
                         // Run for a clock the state calls superseded too: SQL
                         // must then change nothing, or it disagrees.
-                        let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
-                            claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND cleared_at IS NULL
+                        let changed = self.conn.execute("UPDATE block SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
+                            claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND cleared_at IS NULL
                             AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6",
                             params![row.kind,row.origin_key,now,row.evidence,row.evidence_at,row.claim_generation]).map_err(err)?;
                         crate::block_state::expect_changes(
@@ -2323,10 +1944,10 @@ impl AccountTx<'_> {
                     self.delete_authorizations(&owner, Some(&held))?;
                 }
                 None => {
-                    self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
+                    self.conn.execute("UPDATE block AS r SET next_recheck_at=?2,last_claimed_at=NULL,claim_owner=NULL,
                          claim_generation=claim_generation+1
-                        WHERE r.cleared_at IS NULL AND EXISTS (
-                            SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1
+                        WHERE r.is_origin=1 AND r.managed=1 AND r.cleared_at IS NULL AND EXISTS (
+                            SELECT 1 FROM probe_authorization p WHERE p.owner=?1
                               AND p.kind=r.kind AND p.origin_key=r.origin_key AND p.evidence=r.evidence
                               AND p.evidence_at=r.evidence_at AND p.claim_generation=r.claim_generation)",
                         params![owner,now]).map_err(err)?;
@@ -2371,8 +1992,8 @@ impl AccountTx<'_> {
         }
         self.conn
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a
-            JOIN fence_recheck r ON a.kind=r.kind AND a.origin_key=r.origin_key
+                "SELECT EXISTS(SELECT 1 FROM probe_authorization a
+            JOIN block r ON r.is_origin=1 AND r.managed=1 AND a.kind=r.kind AND a.origin_key=r.origin_key
                 AND a.evidence=r.evidence AND a.evidence_at=r.evidence_at
             WHERE a.owner=?1 AND r.credential_id=?2 AND (r.model IS NULL OR r.model=?3)
                 AND r.cleared_at IS NULL)",
@@ -2393,21 +2014,21 @@ impl AccountTx<'_> {
             }
             let held = blocks.authorizations_of(from);
             for row in &held {
-                self.conn.execute("INSERT INTO fence_probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
+                self.conn.execute("INSERT INTO probe_authorization(owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation)
                     VALUES (?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
                     evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,claim_generation=excluded.claim_generation",
                     params![to,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
             }
             return self.delete_authorizations(from, Some(&held));
         }
-        self.conn.execute("INSERT INTO fence_probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
-            FROM fence_probe_authorization WHERE owner=?1
+        self.conn.execute("INSERT INTO probe_authorization SELECT ?2,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+            FROM probe_authorization WHERE owner=?1
             ON CONFLICT(owner,kind,origin_key) DO UPDATE SET evidence=excluded.evidence,
             evidence_at=excluded.evidence_at,claimed_at=excluded.claimed_at,
             claim_generation=excluded.claim_generation",params![from,to]).map_err(err)?;
         self.conn
             .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1 AND owner!=?2",
+                "DELETE FROM probe_authorization WHERE owner=?1 AND owner!=?2",
                 params![from, to],
             )
             .map_err(err)?;
@@ -2456,7 +2077,7 @@ impl AccountTx<'_> {
                     .conn
                     .execute(
                         &format!(
-                            "UPDATE fence_recheck SET next_recheck_at=?3,claim_owner=NULL
+                            "UPDATE block SET next_recheck_at=?3,claim_owner=NULL
                     WHERE kind=?1 AND origin_key=?2 AND {}",
                             clock_held(4)
                         ),
@@ -2488,19 +2109,16 @@ impl AccountTx<'_> {
         }
         self.conn
             .execute(
-                "UPDATE fence_recheck AS r SET next_recheck_at=?3,claim_owner=NULL
-            WHERE r.quota=0 AND r.cleared_at IS NULL AND (r.model IS NULL OR r.model=?2)
-            AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
+                "UPDATE block AS r SET next_recheck_at=?3,claim_owner=NULL
+            WHERE r.is_origin=1 AND r.managed=1 AND r.quota=0 AND r.cleared_at IS NULL AND (r.model IS NULL OR r.model=?2)
+            AND EXISTS (SELECT 1 FROM probe_authorization a WHERE a.owner=?1
                 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
                  AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",
                 params![owner, model, now],
             )
             .map_err(err)?;
         self.conn
-            .execute(
-                "DELETE FROM fence_probe_authorization WHERE owner=?1",
-                [owner],
-            )
+            .execute("DELETE FROM probe_authorization WHERE owner=?1", [owner])
             .map_err(err)?;
         Ok(())
     }
@@ -2551,7 +2169,7 @@ impl AccountTx<'_> {
                 None => self
                     .conn
                     .query_row(
-                        &format!("SELECT a.claimed_at FROM fence_probe_authorization a {}
+                        &format!("SELECT a.claimed_at FROM probe_authorization a {}
                     WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3 AND a.evidence=?4 AND a.evidence_at=?5", current_test_join(6)),
                         params![
                             owner,
@@ -2625,9 +2243,12 @@ impl AccountTx<'_> {
                 None => self
                     .conn
                     .query_row(
-                        &format!("SELECT a.claimed_at,a.claim_generation FROM fence_probe_authorization a {}
+                        &format!(
+                            "SELECT a.claimed_at,a.claim_generation FROM probe_authorization a {}
                      WHERE a.owner=?1 AND a.kind=?2 AND a.origin_key=?3
-                     AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6", current_test_join(7)),
+                     AND a.evidence=?4 AND a.evidence_at=?5 AND a.claimed_at<=?6",
+                            current_test_join(7)
+                        ),
                         params![
                             owner,
                             origin.kind,
@@ -2675,7 +2296,7 @@ impl AccountTx<'_> {
             let changed = self
                 .conn
                 .execute(
-                    "DELETE FROM fence_probe_authorization WHERE (owner=?1 OR owner=?2)
+                    "DELETE FROM probe_authorization WHERE (owner=?1 OR owner=?2)
                  AND kind=?3 AND origin_key=?4 AND evidence=?5 AND evidence_at=?6
                  AND claimed_at=?7 AND claim_generation=?8",
                     params![
@@ -2714,9 +2335,7 @@ impl AccountTx<'_> {
         }
         let mut statement = self
             .conn
-            .prepare(
-                "SELECT pool_key_json FROM fence_success_pool WHERE fence_id=?1 AND evidence_at=?2",
-            )
+            .prepare("SELECT pool_key_json FROM success_proof WHERE fence_id=?1 AND evidence_at=?2")
             .map_err(err)?;
         let rows = statement
             .query_map(params![id, observed], |row| row.get::<_, String>(0))
@@ -2814,20 +2433,21 @@ impl AccountTx<'_> {
         scope: Option<&QuotaSuccessScope>,
         authorized: bool,
     ) -> RouteStateResult<()> {
-        if self.working_blocks()?.is_none() {
-            return self.heal_origins_on_sql(origins, model, admitted_at, now, scope, authorized);
-        }
         for origin in origins {
             self.heal_origin(origin, model, admitted_at, now, scope, authorized)?;
         }
         Ok(())
     }
 
-    /// The working state as this command's earlier writes left it. Only
-    /// called once a command is known to have one.
+    /// The current command's captured rows, or a SQL read for a cold store
+    /// without a publisher. Both paths use the same keyed healing checks.
     fn working(&self) -> RouteStateResult<std::borrow::Cow<'_, crate::BlockState>> {
-        self.working_blocks()?
-            .ok_or_else(|| err("a heal decided on the state lost its working state"))
+        match self.working_blocks()? {
+            Some(state) => Ok(state),
+            None => crate::BlockState::read(self.conn)
+                .map(std::borrow::Cow::Owned)
+                .map_err(err),
+        }
     }
 
     /// [`Self::heal_origins`] for one origin, deciding on the working state.
@@ -2872,8 +2492,8 @@ impl AccountTx<'_> {
                 // request did not use. An empty whole-account recovery set
                 // and pool-keyed fences retain their authorized clear.
                 if authorized && (pool.is_some() || needed.is_empty()) {
-                    if older(row) {
-                        self.clear_held_fence(row, now, "probe_succeeded")?;
+                    if older(&row) {
+                        self.clear_held_fence(&row, now, "probe_succeeded")?;
                     }
                     return self.clear_held_clock(origin, now);
                 }
@@ -2955,9 +2575,10 @@ impl AccountTx<'_> {
                     .account_route_fence(provider, credential, model)
                     .filter(|(row, _, last)| last.unwrap_or(row.recorded_at) < admitted_at)
                 {
-                    let changed = self.conn.execute("DELETE FROM account_route_fence WHERE provider=?1 AND credential_id=?2 AND model=?3
-                        AND until_ms=?4 AND recorded_at=?5 AND last_reported_at IS ?6 AND wall_class IS ?7",
-                        params![provider,credential,model,row.until_ms,row.recorded_at,last,class]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?8,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='account_route' AND source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3
+                        AND deadline=?4 AND recorded_at=?5 AND last_reported_at IS ?6 AND wall_class IS ?7",
+                        params![provider,credential,model,row.until_ms,row.recorded_at,last,class,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
@@ -2971,45 +2592,37 @@ impl AccountTx<'_> {
                     .non_quota_route_fence(provider, credential, model, kind)
                     .filter(|(_, last)| *last < admitted_at)
                 {
-                    let changed = self.conn.execute("DELETE FROM account_non_quota_route_fence WHERE provider=?1 AND credential_id=?2
-                        AND model=?3 AND wall_kind=?4 AND until_ms=?5 AND recorded_at=?6 AND last_reported_at=?7",
-                        params![provider,credential,model,kind,row.until_ms,row.recorded_at,last]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?8,cleared_by='removed',claim_owner=NULL
+                        WHERE source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3
+                        AND kind=CASE ?4 WHEN 'transient' THEN 'transient_route' ELSE 'non_quota_route' END
+                        AND deadline=?5 AND recorded_at=?6 AND last_reported_at=?7",
+                        params![provider,credential,model,kind,row.until_ms,row.recorded_at,last,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
             "size" | "non_quota_size" => {
                 let quota = origin.kind == "size";
-                let table = if quota {
-                    "account_size_refusal"
-                } else {
-                    "account_non_quota_size_refusal"
-                };
+                let kind = if quota { "size" } else { "non_quota_size" };
                 if let Some(row) = origin.size_class.and_then(|class| {
                     blocks
                         .size_refusal(quota, provider, credential, model, class)
                         .filter(|row| row.observed_at < admitted_at)
                 }) {
-                    let changed = self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3
-                        AND size_class=?4 AND expires_at=?5 AND observed_at=?6"),
-                        params![provider,credential,model,row.size_class,row.expires_at,row.observed_at]).map_err(err)?;
+                    let changed = self.conn.execute(&format!("UPDATE block SET source_present=0,cleared_at=?7,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='{kind}' AND source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3
+                        AND size_class=?4 AND deadline IS ?5 AND observed_at=?6"),
+                        params![provider,credential,model,row.size_class,row.expires_at,row.observed_at,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
             "pool_billing" | "pool_rate" => {
-                let (field, evidence) = if origin.kind == "pool_billing" {
-                    ("walled_until", "json_array(walled_until,wall_reason,COALESCE(wall_observed_at,updated_at))")
-                } else {
-                    ("cooldown_until", "json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at))")
-                };
                 if let Some(held) = blocks.source_origin(&origin.kind, &origin.origin_key) {
                     let changed = self
                         .conn
                         .execute(
-                            &format!(
-                                "UPDATE pool_key_state SET {field}=NULL
-                        WHERE provider=?1 AND credential_id=?2 AND {evidence}=?3"
-                            ),
-                            params![provider, credential, held.evidence],
+                            "UPDATE block SET source_present=0,cleared_at=?4,cleared_by='removed',claim_owner=NULL
+                                WHERE provider=?1 AND credential_id=?2 AND evidence=?3 AND kind=?5 AND source_present=1",
+                            params![provider, credential, held.evidence,now,origin.kind],
                         )
                         .map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
@@ -3017,9 +2630,9 @@ impl AccountTx<'_> {
             }
             "route" => {
                 if let Some(held) = blocks.source_origin("route", &origin.origin_key) {
-                    let changed = self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
-                        WHERE route_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2",
-                        params![key[0].as_str(),held.evidence]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='route' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2",
+                        params![key[0].as_str(),held.evidence,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
@@ -3029,25 +2642,25 @@ impl AccountTx<'_> {
                 for (route, evidence, last_error, observed) in
                     blocks.routes_stamped_by_provider(provider, origin.evidence_at, admitted_at)
                 {
-                    let changed = self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
-                        WHERE route_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2
-                        AND last_error IS ?3 AND COALESCE(wall_observed_at,last_error_at,updated_at)=?4",
-                        params![route,evidence,last_error,observed]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?5,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='route' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2
+                        AND scope_error IS ?3 AND observed_at=?4",
+                        params![route,evidence,last_error,observed,now]).map_err(err)?;
                     expect_changes(changed, 1, format_args!("{what}: route {route}"))
                         .map_err(err)?;
                 }
                 if let Some(held) = blocks.source_origin("provider", &origin.origin_key) {
-                    let changed = self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL
-                        WHERE provider_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2",
-                        params![provider,held.evidence]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='provider' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2",
+                        params![provider,held.evidence,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
             "failure" => {
                 if let Some(held) = blocks.source_origin("failure", &origin.origin_key) {
-                    let changed = self.conn.execute("UPDATE model_route_state SET failure_backoff_until=NULL
-                        WHERE route_key=?1 AND json_array(failure_backoff_until,failure_backoff_reason,failure_observed_at)=?2",
-                        params![key[0].as_str(),held.evidence]).map_err(err)?;
+                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+                        WHERE kind='failure' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2",
+                        params![key[0].as_str(),held.evidence,now]).map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
@@ -3072,7 +2685,7 @@ impl AccountTx<'_> {
             .cloned();
         let changed = match held {
             Some(held) => self.conn.execute(
-                "UPDATE fence_success_pool SET evidence_at=?3,healed_at=?4
+                "UPDATE success_proof SET evidence_at=?3,healed_at=?4
                 WHERE fence_id=?1 AND pool_key_json=?2 AND evidence_at=?5 AND healed_at=?6",
                 params![
                     fence_id,
@@ -3084,7 +2697,7 @@ impl AccountTx<'_> {
                 ],
             ),
             None => self.conn.execute(
-                "INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
+                "INSERT INTO success_proof VALUES (?1,?2,?3,?4)
                 ON CONFLICT(fence_id,pool_key_json) DO NOTHING",
                 params![fence_id, pool, evidence_at, now],
             ),
@@ -3108,7 +2721,7 @@ impl AccountTx<'_> {
         let changed = self
             .conn
             .execute(
-                "UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2
+                 "UPDATE block SET cleared_at=?3,cleared_by=CASE WHEN source_present=1 THEN 'kept' ELSE 'removed' END WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1
             AND evidence=?4 AND evidence_at=?5 AND cleared_at IS ?6 AND next_recheck_at=?7
             AND claim_owner IS ?8 AND claim_generation=?9",
                 params![
@@ -3144,7 +2757,7 @@ impl AccountTx<'_> {
                 .conn
                 .execute(
                     &format!(
-                        "UPDATE fence_recheck SET next_recheck_at=?3+?4,
+                        "UPDATE block SET next_recheck_at=?3+?4,
                 claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
                 WHERE kind=?1 AND origin_key=?2 AND {}",
                         clock_held(5)
@@ -3173,7 +2786,7 @@ impl AccountTx<'_> {
         }
         self.conn
             .execute(
-                "UPDATE fence_recheck SET next_recheck_at=?3+?4,
+                "UPDATE block SET next_recheck_at=?3+?4,
             claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
             WHERE kind=?1 AND origin_key=?2",
                 params![origin.kind, origin.origin_key, now, QUOTA_FENCE_RECHECK_MS],
@@ -3182,138 +2795,6 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    fn heal_origins_on_sql(
-        &self,
-        origins: &[FenceRecheck],
-        model: &str,
-        admitted_at: i64,
-        now: i64,
-        scope: Option<&QuotaSuccessScope>,
-        authorized: bool,
-    ) -> RouteStateResult<()> {
-        for origin in origins {
-            let provider = origin.provider.as_str();
-            let credential = origin.credential_id.as_deref().unwrap_or("");
-            let key: Vec<serde_json::Value> =
-                serde_json::from_str(&origin.origin_key).map_err(err)?;
-            match origin.kind.as_str() {
-                "account" => {
-                    let id = key[0].as_str().unwrap_or("");
-                    let (pool,needed):(Option<String>,Option<String>)=self.conn.query_row("SELECT pool_key_json,recovery_set_json FROM account_fence WHERE fence_id=?1",[id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(err)?;
-                    let pool_keyed = pool.is_some();
-                    let needed: Vec<striatum_core::accounts::PoolKey> = match pool {
-                        Some(pool) => vec![serde_json::from_str(&pool).map_err(err)?],
-                        None => needed
-                            .map(|raw| serde_json::from_str(&raw).map_err(err))
-                            .transpose()?
-                            .unwrap_or_default(),
-                    };
-                    if authorized && (pool_keyed || needed.is_empty()) {
-                        self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='probe_succeeded'
-                            WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
-                        self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",params![origin.kind,origin.origin_key,now]).map_err(err)?;
-                        continue;
-                    }
-                    if scope.is_none() && !authorized {
-                        continue;
-                    }
-                    if needed.is_empty() {
-                        continue;
-                    }
-                    for pool in needed
-                        .iter()
-                        .filter(|pool| scope.is_some_and(|scope| scope.used(pool, model)))
-                    {
-                        self.conn.execute("INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
-                            ON CONFLICT(fence_id,pool_key_json) DO UPDATE SET evidence_at=excluded.evidence_at,healed_at=excluded.healed_at",
-                            params![id,serde_json::to_string(pool).map_err(err)?,origin.evidence_at,now]).map_err(err)?;
-                    }
-                    let healed = self.successful_quota_pools(id, origin.evidence_at)?;
-                    if !needed.iter().all(|pool| healed.contains(pool)) {
-                        if authorized {
-                            self.defer_recovery_test(origin, now)?;
-                        }
-                        continue;
-                    }
-                    self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason=?4 WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at,if authorized { "probe_succeeded" } else { "run_succeeded" }]).map_err(err)?;
-                }
-                "credential" => {
-                    if origin.quota {
-                        let prefix = format!(
-                            "credential-quota:{}:",
-                            serde_json::json!([provider, credential])
-                        );
-                        if self
-                            .active_pool_fences(provider)?
-                            .iter()
-                            .any(|fence| fence.evidence.fence_id.starts_with(&prefix))
-                        {
-                            continue;
-                        }
-                    }
-                    self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2 AND observed_at_ms<?3",params![provider,credential,admitted_at]).map_err(err)?;
-                }
-                "account_route" | "non_quota_route" | "transient_route" => {
-                    let table = if origin.kind == "account_route" {
-                        "account_route_fence"
-                    } else {
-                        "account_non_quota_route_fence"
-                    };
-                    if origin.kind == "account_route" {
-                        self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND COALESCE(last_reported_at,recorded_at)<?4"),params![provider,credential,model,admitted_at]).map_err(err)?;
-                    } else {
-                        let kind = if origin.kind == "transient_route" {
-                            "transient"
-                        } else {
-                            "billing"
-                        };
-                        self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND last_reported_at<?4 AND wall_kind=?5"),params![provider,credential,model,admitted_at,kind]).map_err(err)?;
-                    }
-                }
-                "size" | "non_quota_size" => {
-                    let table = if origin.kind == "size" {
-                        "account_size_refusal"
-                    } else {
-                        "account_non_quota_size_refusal"
-                    };
-                    self.conn.execute(&format!("DELETE FROM {table} WHERE provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND observed_at<?5"),params![provider,credential,model,origin.size_class,admitted_at]).map_err(err)?;
-                }
-                "pool_billing" | "pool_rate" => {
-                    let field = if origin.kind == "pool_billing" {
-                        "walled_until"
-                    } else {
-                        "cooldown_until"
-                    };
-                    self.conn.execute(&format!("UPDATE pool_key_state SET {field}=NULL WHERE provider=?1 AND credential_id=?2"),params![provider,credential]).map_err(err)?;
-                }
-                "route" => {
-                    self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE route_key=?1",[key[0].as_str()]).map_err(err)?;
-                }
-                "provider" => {
-                    // Only the rows stamped by this provider evidence inherit
-                    // its recovery. A separate model refusal has its own clock.
-                    self.conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL
-                        WHERE provider_id=?1 AND COALESCE(wall_observed_at,last_error_at,updated_at)=?2
-                        AND COALESCE(wall_observed_at,last_error_at,updated_at)<?3
-                        AND last_error IS (SELECT last_error FROM provider_cooldown_state WHERE provider_key=?1)
-                        AND COALESCE(cooldown_until,0)<=(SELECT COALESCE(cooldown_until,0) FROM provider_cooldown_state WHERE provider_key=?1)
-                        AND COALESCE(quota_exhausted_until,0)<=(SELECT COALESCE(quota_exhausted_until,0) FROM provider_cooldown_state WHERE provider_key=?1)",params![provider,origin.evidence_at,admitted_at]).map_err(err)?;
-                    self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL WHERE provider_key=?1",[provider]).map_err(err)?;
-                }
-                "failure" => {
-                    self.conn.execute("UPDATE model_route_state SET failure_backoff_until=NULL WHERE route_key=?1",[key[0].as_str()]).map_err(err)?;
-                }
-                _ => {}
-            }
-            self.conn
-                .execute(
-                    "UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",
-                    params![origin.kind, origin.origin_key, now],
-                )
-                .map_err(err)?;
-        }
-        Ok(())
-    }
     /// Preview classification without materializing or renewing retry clocks.
     /// Only a classification of the same evidence can be reused; admission or
     /// reconciliation must classify new evidence under the writer lock.
@@ -3329,9 +2810,8 @@ impl AccountTx<'_> {
         let prior = self
             .conn
             .query_row(
-                "SELECT r.quota FROM fence_recheck r JOIN fence_origin o
-             ON o.kind=r.kind AND o.origin_key=r.origin_key AND o.evidence=r.evidence
-             WHERE r.kind='credential' AND r.provider=?1 AND r.credential_id=?2 AND r.classified=1",
+                "SELECT quota FROM block WHERE kind='credential' AND is_origin=1 AND provider=?1 AND credential_id=?2
+                    AND managed=1 AND source_present=1 AND classified=1",
                 params![provider, credential],
                 |row| row.get(0),
             )
@@ -3361,9 +2841,9 @@ impl AccountTx<'_> {
                 .map(|(clock, cleared)| (clock.clone(), cleared))
                 .collect();
             for (clock, cleared) in clocks.iter().filter(|(clock, _)| !clock.classified) {
-                let changed = self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,
+                let changed = self.conn.execute("UPDATE block SET quota=?3,classified=1,
                     next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
-                    WHERE kind='credential' AND origin_key=?1 AND classified=0 AND provider=?2 AND credential_id=?4
+                    WHERE kind='credential' AND origin_key=?1 AND is_origin=1 AND managed=1 AND source_present=1 AND classified=0 AND provider=?2 AND credential_id=?4
                     AND evidence=?5 AND evidence_at=?6 AND quota=?7 AND next_recheck_at=?8 AND cleared_at IS ?9",
                     params![clock.origin_key,provider,quota,credential,clock.evidence,clock.evidence_at,
                         clock.lifetime == LifetimeClass::Quota,clock.next_recheck_at,cleared]).map_err(err)?;
@@ -3384,9 +2864,9 @@ impl AccountTx<'_> {
                 }
             }));
         }
-        self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
-            WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND classified=0",params![provider,credential,quota]).map_err(err)?;
-        self.conn.query_row("SELECT quota FROM fence_recheck WHERE kind='credential' AND provider=?1 AND credential_id=?2",params![provider,credential],|row|row.get(0)).optional().map(|quota|quota.unwrap_or(false)).map_err(err)
+        self.conn.execute("UPDATE block SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
+            WHERE kind='credential' AND is_origin=1 AND provider=?1 AND credential_id=?2 AND managed=1 AND source_present=1 AND classified=0",params![provider,credential,quota]).map_err(err)?;
+        self.conn.query_row("SELECT quota FROM block WHERE kind='credential' AND is_origin=1 AND provider=?1 AND credential_id=?2 AND managed=1 AND source_present=1",params![provider,credential],|row|row.get(0)).optional().map(|quota|quota.unwrap_or(false)).map_err(err)
     }
 
     /// The effective rechecks, as `SqliteRouteStateStore::fence_rechecks`
@@ -5719,3 +5199,7 @@ impl crate::AccountTx<'_> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "fence_rechecks/origin/tests.rs"]
+mod origin_tests;
