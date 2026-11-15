@@ -2929,8 +2929,8 @@ impl crate::AccountTx<'_> {
 
 /// A bound transient-backoff observation's effects, written as backoff rows.
 /// It runs a `SELECT` over the observation and its `json_each` list, and
-/// reads its target only for its upsert guard and `RETURNING`: a reviewed
-/// own-row write for the block read trace (`group_reads::REVIEWED_OWN_ROW_WRITES`).
+/// reads its target only for its upsert guard and `RETURNING`. A keyed retirement
+/// lookup rejects replayed effects no newer than a retired backoff.
 pub(crate) const INSERT_TRANSIENT_BACKOFFS: &str = "INSERT INTO account_transient_backoff
             SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
                 o.received_at,json_array(o.observation_id,e.key),e.value
@@ -2939,6 +2939,10 @@ pub(crate) const INSERT_TRANSIENT_BACKOFFS: &str = "INSERT INTO account_transien
                 AND json_extract(e.value,'$.effect')='transient_backoff'
                 AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
                 AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
+                AND NOT EXISTS (SELECT 1 FROM fence_retired_origin r
+                    WHERE r.kind='observation'
+                    AND r.origin_key=json_array(json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'))
+                    AND r.evidence_at>=o.received_at)
             ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
                 evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at
             RETURNING json_array(provider,account_id)";
