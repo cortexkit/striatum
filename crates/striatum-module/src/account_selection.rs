@@ -1718,8 +1718,9 @@ impl ClassContext {
             self.note_probe_reserved(provider, &admission.credential_id, retry_at);
             return Ok(ProbeBinding::Lost { retry_at });
         }
-        // A runner may send without a later account admission. Its decision
-        // must own the durable interval before the route is returned.
+        // A runner may send without a later account admission, so its
+        // decision durably owns the probe's interval by now; the in-memory
+        // reservation, if the selection took one, is no longer needed.
         if let Some(hold) = &self.selection_probes {
             hold.release_selected(provider, &admission.credential_id, self.now_ms);
         }
