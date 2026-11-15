@@ -19,6 +19,7 @@ const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
 mod paid_anthropic_shape_tests;
+mod pinned_keep_free_tests;
 
 fn assert_configured_runner_caller_without_writer(harness: &Harness, frame: &subc_protocol::Frame) {
     let path = harness.store_path().with_extension("caller.jsonc");

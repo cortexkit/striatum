@@ -1759,6 +1759,9 @@ async fn select_at_tier_attempt(
     // The continuing model falls through once it is no longer allowed. Legacy
     // targetAgent bodies never reach this surface.
     let choose = || {
+        let request_pin_exempt = inputs.consumer_pinned
+            || (request.pin.is_none() && request.pin_slot.is_some())
+            || request_pin_is_keep_free_exempt(&consumer);
         let mut request_pin = request.pin.clone().or_else(|| {
             request
                 .pin_slot
@@ -1780,7 +1783,7 @@ async fn select_at_tier_attempt(
         if request.pin_fallback == Some(PinFallback::Route) {
             if let Some(Err(refusal)) = request_pin
                 .as_deref()
-                .map(|pin| selection.pin(pin, &available))
+                .map(|pin| selection.pin(pin, &available, request_pin_exempt))
             {
                 // Explicit fallback authorizes another route, including when
                 // the pin's eligible accounts have no concurrency capacity.
@@ -1878,7 +1881,7 @@ async fn select_at_tier_attempt(
                 request_pin.as_deref(),
                 project_pin.as_deref(),
                 continuing.as_deref(),
-                |pin| selection.pin(pin, &available),
+                |pin| selection.pin(pin, &available, request_pin.is_none() || request_pin_exempt),
                 |only| selection.score(only),
                 || {
                     if classifier {
@@ -2115,6 +2118,13 @@ async fn select_at_tier_attempt(
             "variant": selected.prompt_params.variant,
             "cost_usd": selected.score.objective.task_pricing.as_ref().filter(|price| price.price_unit == "task").and_then(|price| price.final_cost_usd),
         });
+        if selected
+            .explanation
+            .iter()
+            .any(|line| line == PINNED_KEEP_FREE_EXPLANATION)
+        {
+            preview["explanation"] = json!(PINNED_KEEP_FREE_EXPLANATION);
+        }
         if panel_seat {
             let route = RouteRef {
                 provider: selected.model.provider_id.clone(),
@@ -2706,7 +2716,9 @@ impl<'a> Selection<'a> {
             })
             .cloned()
             .collect();
-        let snapshot = self.scoring_snapshot(pinned);
+        let mut snapshot = self.scoring_snapshot(pinned);
+        let keep_free_exempt =
+            pinned && recovery_key.is_some_and(|key| exempt_pinned_keep_free(&mut snapshot, key));
         let mut input = self.pass().input_with_policy(&allowed, snapshot, pinned);
         select_policy::apply_explicit_variant(&mut input, explicit_variant);
         let result = self
@@ -2767,11 +2779,15 @@ impl<'a> Selection<'a> {
                     .cloned()
                     .collect();
                 recovery_available.extend(account_resets.keys().cloned());
-                let mut recovery_input = self.pass().input_with_policy(
-                    &recovery_available,
-                    self.scoring_snapshot(pinned),
-                    pinned,
-                );
+                let mut recovery_snapshot = self.scoring_snapshot(pinned);
+                if pinned {
+                    if let Some(key) = recovery_key {
+                        exempt_pinned_keep_free(&mut recovery_snapshot, key);
+                    }
+                }
+                let mut recovery_input =
+                    self.pass()
+                        .input_with_policy(&recovery_available, recovery_snapshot, pinned);
                 select_policy::apply_explicit_variant(&mut recovery_input, explicit_variant);
                 let recovery_rejections =
                     self.eligible_rejections(&recovery_input.facts, explicit_variant);
@@ -2785,11 +2801,19 @@ impl<'a> Selection<'a> {
                     );
                 error
             });
-        select_policy::explain_dotted_exclusions(
+        let mut result = select_policy::explain_dotted_exclusions(
             result,
             self.sources.operator_config,
             self.consumer,
-        )
+        );
+        if keep_free_exempt {
+            if let Ok(selected) = &mut result {
+                selected
+                    .explanation
+                    .push(PINNED_KEEP_FREE_EXPLANATION.into());
+            }
+        }
+        result
     }
 
     fn score_input(
@@ -2896,7 +2920,12 @@ impl<'a> Selection<'a> {
 
     /// A named model, through the same pin admission a work run's `model=`
     /// takes: hard admission only, never a quality ranking.
-    fn pin(&self, pin: &str, available: &HashSet<String>) -> Result<SelectedModelRoute, Refusal> {
+    fn pin(
+        &self,
+        pin: &str,
+        available: &HashSet<String>,
+        keep_free_exempt: bool,
+    ) -> Result<SelectedModelRoute, Refusal> {
         let parsed = RouteRef::parse_pin(pin)
             .ok_or_else(|| Refusal::pin_unavailable(pin, PinUnavailableReason::Invalid, None))?;
         if self.facts.iter().any(|fact| {
@@ -2926,7 +2955,12 @@ impl<'a> Selection<'a> {
         let variant = work_model_pin::named_variant(pin, self.facts);
         let (pin_key, pin_capacity) =
             work_model_pin::route_keys(pin, variant.as_deref(), self.facts);
-        let snapshot = self.snapshot.clone();
+        let mut snapshot = self.snapshot.clone();
+        let keep_free_exempt = keep_free_exempt
+            && exempt_pinned_keep_free(
+                &mut snapshot,
+                &format!("{}/{}", parsed.provider, parsed.model),
+            );
         let refused = |code: &str, message: String| {
             let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)
                 && self
@@ -2953,6 +2987,7 @@ impl<'a> Selection<'a> {
                     &pin_capacity,
                     variant.as_deref(),
                     available,
+                    &snapshot,
                 );
                 if reset.is_some() {
                     reason = PinUnavailableReason::QuotaExhausted;
@@ -3053,6 +3088,11 @@ impl<'a> Selection<'a> {
                 return Err(pin_refusal);
             }
         }
+        if keep_free_exempt {
+            selected
+                .explanation
+                .push(PINNED_KEEP_FREE_EXPLANATION.into());
+        }
         Ok(selected)
     }
 
@@ -3062,6 +3102,7 @@ impl<'a> Selection<'a> {
         pin_capacity: &str,
         variant: Option<&str>,
         available: &HashSet<String>,
+        snapshot: &ModelRouteStateSnapshot,
     ) -> Option<u64> {
         if ![pin_key, pin_capacity]
             .iter()
@@ -3082,10 +3123,10 @@ impl<'a> Selection<'a> {
         if let Some(variant) = variant {
             fact.variant = Some(variant.into());
         }
-        let mut input = self.pass().input(available, self.snapshot.clone());
+        let mut input = self.pass().input(available, snapshot.clone());
         let keep_free = [
-            self.snapshot.by_route.get(pin_key),
-            self.snapshot.by_capacity.get(pin_capacity),
+            snapshot.by_route.get(pin_key),
+            snapshot.by_capacity.get(pin_capacity),
         ]
         .into_iter()
         .flatten()
@@ -3267,6 +3308,33 @@ impl<'a> Selection<'a> {
         decision.consumer = Some(self.consumer.to_owned());
         crate::record_failed_selection_decision(self.deps.store.as_ref(), &decision);
     }
+}
+
+const PINNED_KEEP_FREE_EXPLANATION: &str = "pinned: keep-free margin not applied";
+
+fn request_pin_is_keep_free_exempt(consumer: &str) -> bool {
+    // Temporary until core adds a marker distinguishing a user's model choice
+    // from core-generated requests that repeat a prior model, such as replacement
+    // seats. Only mason and its dotted launch/retry children identify user pins.
+    consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.")
+}
+
+fn exempt_pinned_keep_free(snapshot: &mut ModelRouteStateSnapshot, capacity: &str) -> bool {
+    let Some(pool) = snapshot
+        .by_capacity
+        .get_mut(capacity)
+        .and_then(|state| state.subscription_pool.as_mut())
+    else {
+        return false;
+    };
+    if pool.keep_free_percent <= 0.0 {
+        return false;
+    }
+    // Copy only the chosen model's pool. Automatic fallbacks and other models
+    // retain their reserve. Quota usage, account blocks and the allocator's
+    // minimum spare quota are unchanged.
+    std::sync::Arc::make_mut(pool).keep_free_percent = 0.0;
+    true
 }
 
 fn clone_scoring_snapshot(snapshot: &ModelRouteStateSnapshot) -> ModelRouteStateSnapshot {
