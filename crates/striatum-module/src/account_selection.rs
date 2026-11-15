@@ -2785,7 +2785,7 @@ impl ClassContext {
                     continue;
                 }
                 // Only origins participating in the named recovery determine
-                // its class; a later non-quota wall on another account is unrelated.
+                // its class; a later non-quota block origin on another account is unrelated.
                 if origin.quota {
                     if !non_quota {
                         block.lifetime = LifetimeClass::Quota;

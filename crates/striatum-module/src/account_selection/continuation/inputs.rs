@@ -9,7 +9,8 @@ use striatum_core::accounts::AllowedAccountClass;
 /// `requested_account` preserves an explicit pin and `candidates` the runner's
 /// offered set. `model_decision_id` retains selection provenance. `harness` names
 /// the runner from that decision, or the daemon-authenticated route principal for
-/// a select-less run, never the request body's caller. `owner_scope` records who
+/// a run admitted without any `route.select` decision, never the request body's
+/// caller. `owner_scope` records who
 /// owns the run and its project, using the already-loaded selection. The selected
 /// harness and workdir remain on the model decision and are preserved by the
 /// continuation's decision link, rather than duplicated here. Daemon session and
@@ -18,8 +19,8 @@ use striatum_core::accounts::AllowedAccountClass;
 /// `parent_conversation_key` retains placement preference.
 /// `initial_input_bytes`, `initial_input_estimated` and `request_input_tokens`
 /// retain the demand/size estimate. No token, secret or raw conversation key is
-/// stored: routing hashes the supplied key with its private salt and the attested
-/// principal, then compares it with the conversation hash stored on the admission.
+/// stored: routing hashes the supplied key with its private salt and the
+/// daemon-authenticated principal, then compares it with the conversation hash stored on the admission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Inputs {
     version: u32,
