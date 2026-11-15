@@ -2074,6 +2074,11 @@ async fn select_at_tier_attempt(
                         })
                         .flatten();
                     let named_non_quota = no_route.earliest_reset_route.as_ref() == Some(key)
+                        && !matches!(
+                            no_route.reason,
+                            RouteFailureReason::NoAdequateRoute
+                                | RouteFailureReason::AllRoutesInadequate
+                        )
                         && account_blocks.get(key).is_some_and(|block| {
                             block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
                         });
