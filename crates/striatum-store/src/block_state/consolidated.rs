@@ -362,7 +362,7 @@ impl BlockState {
                             provider.source_present
                                 && provider.cleared_at.is_none()
                                 && provider.scope_error == row.scope_error
-                                && provider.block.evidence_at == row.block.evidence_at
+                                && provider.observed_at == row.observed_at
                                 && provider.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                                     >= row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                                 && provider

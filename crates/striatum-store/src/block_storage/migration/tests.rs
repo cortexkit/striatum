@@ -425,3 +425,42 @@ fn retirement_prevents_reinserted_evidence_from_reblocking() {
         Ok(())
     }).unwrap();
 }
+
+#[test]
+fn migration_keeps_null_wall_stamp_fallback_separate_from_an_older_clock() {
+    let scratch = cortexkit_test_support::ScratchDir::new("block-fallback-evidence");
+    let store = SqliteRouteStateStore::open_at_version_for_test(
+        &crate::dev_descriptor(
+            "block-fallback-evidence",
+            scratch.path().join("state.db").to_string_lossy(),
+        ),
+        93,
+    )
+    .unwrap();
+    let now = 1_800_000_000_000_i64;
+    let source_time = now - 100;
+    let clock_time = now - 200;
+    store.with_writer_for_test(|conn| {
+        conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,last_error,last_error_at,updated_at) VALUES ('fallback-provider',?1,'{\"code\":\"throttled\"}',?2,?2)",rusqlite::params![now+1_000,source_time])?;
+        conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,last_error,last_error_at,updated_at) VALUES ('fallback-provider/model','fallback-provider/model','fallback-provider','model',?1,'{\"code\":\"throttled\"}',?2,?2)",rusqlite::params![now+1_000,source_time])?;
+        conn.execute("UPDATE provider_cooldown_state SET wall_observed_at=NULL",[])?;
+        conn.execute("UPDATE model_route_state SET wall_observed_at=NULL,last_error_at=?1,updated_at=?1",[source_time])?;
+        crate::fence_rechecks::legacy::sync(conn)?;
+        assert_eq!(conn.execute("UPDATE fence_recheck SET evidence_at=?1 WHERE kind='provider'",[clock_time])?,1);
+        let expected = crate::fence_rechecks::legacy::load_blocks(conn,now)?;
+        let expected_origins=crate::block_state::legacy::BlockState::load(conn)?.view_origins();
+        assert_eq!(expected.blocks.iter().map(|b|b.kind.as_str()).collect::<Vec<_>>(),vec!["provider"]);
+        install_migration_function(conn)?;
+        conn.execute_batch(MIGRATION)?;
+        let source_times=conn.prepare("SELECT kind,observed_at FROM block WHERE kind IN ('provider','route') ORDER BY kind")?.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,f64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(source_times,vec![("provider".into(),source_time as f64),("route".into(),source_time as f64)]);
+        let state=crate::BlockState::load(conn)?;
+        // An old matching clock can carry an earlier probe timestamp. Coverage
+        // still compares the source rows' shared fallback evidence timestamp.
+        assert_eq!(effective(&read(conn)?,now)?.blocks,expected.blocks);
+        assert_eq!(state.blocks(now).unwrap().blocks,expected.blocks);
+        assert_eq!(state.blocks(now).unwrap().blocks[0].evidence_at,clock_time);
+        assert_eq!(state.view_origins(),expected_origins);
+        Ok(())
+    }).unwrap();
+}

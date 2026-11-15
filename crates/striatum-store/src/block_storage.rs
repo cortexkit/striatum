@@ -441,7 +441,7 @@ pub(crate) fn effective(
                     && p.held()
                     && p.block.scope.provider == row.block.scope.provider
                     && p.scope_error == row.scope_error
-                    && p.block.evidence_at == row.block.evidence_at
+                    && p.observed_at == row.observed_at
                     && p.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                         >= row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                     && p.quota_exhausted_until.map(SqlReal::as_f64).unwrap_or(0.0)

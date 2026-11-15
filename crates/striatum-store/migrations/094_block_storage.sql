@@ -205,9 +205,11 @@ WHERE kind='failure';
 
 -- Matching evidence keeps its class, classification and exact claimed
 -- generation. A hold created or cleared afterwards does not reclassify it.
-UPDATE block SET (quota,classified,next_recheck_at,reset_check_at,last_claimed_at,
+-- Its clock evidence time can predate the current source metadata. Probe
+-- history uses evidence_at; provider coverage uses the separate observed_at.
+UPDATE block SET (evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,
   claim_generation,claim_owner,cleared_at,cleared_by,managed) =
-  (SELECT r.quota,r.classified,r.next_recheck_at,r.reset_check_at,r.last_claimed_at,
+  (SELECT r.evidence_at,r.quota,r.classified,r.next_recheck_at,r.reset_check_at,r.last_claimed_at,
     r.claim_generation,r.claim_owner,r.cleared_at,
     CASE WHEN r.cleared_at IS NOT NULL THEN 'kept' END,1
    FROM fence_recheck r WHERE r.kind=block.kind AND r.origin_key=block.origin_key
