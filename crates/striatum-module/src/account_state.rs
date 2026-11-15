@@ -195,7 +195,8 @@ const FIRST_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// A shorter first-load bound a test sets, in milliseconds; 0 keeps
 /// [`FIRST_LOAD_WAIT`].
 #[cfg(test)]
-static FIRST_LOAD_WAIT_FOR_TEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FIRST_LOAD_WAIT_FOR_TEST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 fn first_load_wait() -> std::time::Duration {
     #[cfg(test)]
@@ -710,7 +711,9 @@ impl AccountCommand<'_> {
         decision: &str,
     ) -> RouteStateResult<Option<String>> {
         match self.admission_state() {
-            Some(state) => Ok(state.continued_reservation(principal, admission_id, run_id, decision)),
+            Some(state) => {
+                Ok(state.continued_reservation(principal, admission_id, run_id, decision))
+            }
             None => self
                 .sql
                 .continued_reservation(principal, admission_id, run_id, decision),
@@ -726,9 +729,10 @@ impl AccountCommand<'_> {
     ) -> RouteStateResult<bool> {
         match self.admission_state() {
             Some(state) => Ok(state.has_used_successor(principal, admission_id, run_id, previous)),
-            None => self
-                .sql
-                .continuation_has_used_successor(principal, admission_id, run_id, previous),
+            None => {
+                self.sql
+                    .continuation_has_used_successor(principal, admission_id, run_id, previous)
+            }
         }
     }
 
@@ -866,7 +870,12 @@ impl AccountCommand<'_> {
                     used_at,
                     released_at,
                 } => {
-                    if !sql.settle_continuation_offer(&selection.0, &selection.1, used_at, released_at)? {
+                    if !sql.settle_continuation_offer(
+                        &selection.0,
+                        &selection.1,
+                        used_at,
+                        released_at,
+                    )? {
                         return Err(diverged(format!("offer {selection:?} is not open in SQL")));
                     }
                 }
@@ -1021,9 +1030,7 @@ impl AccountCommand<'_> {
 
     pub(crate) fn end_lease(&mut self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
         let changed = self.sql.end_lease(pin_id, at)?;
-        self.mirror_checked(changed, "end_lease", |state| {
-            state.end_lease(pin_id, at)
-        })?;
+        self.mirror_checked(changed, "end_lease", |state| state.end_lease(pin_id, at))?;
         Ok(changed)
     }
 
@@ -1129,7 +1136,9 @@ impl AccountCommand<'_> {
         now: i64,
     ) -> RouteStateResult<()> {
         if self.state.is_none() {
-            return self.sql.finish_continuations(principal, admission, run, now);
+            return self
+                .sql
+                .finish_continuations(principal, admission, run, now);
         }
         self.decide(|state| state.finish_continuations(principal, admission, run, now))
     }
@@ -1186,7 +1195,10 @@ impl AccountCommand<'_> {
         } else {
             Vec::new()
         };
-        let probes = !state.admissions.expired_probe_admissions(owners, now).is_empty();
+        let probes = !state
+            .admissions
+            .expired_probe_admissions(owners, now)
+            .is_empty();
         let offers = state.admissions.has_expired_offers(now);
         if probes {
             self.release_expired_admission_probes(now)?;
@@ -1212,7 +1224,9 @@ impl AccountCommand<'_> {
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
-        let deleted = self.sql.prune_account_admissions_returning(before, limit, now_ms)?;
+        let deleted = self
+            .sql
+            .prune_account_admissions_returning(before, limit, now_ms)?;
         if let Some(state) = self.state.as_deref_mut() {
             for row in &deleted {
                 state.inflight.remove(
@@ -1357,9 +1371,14 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
     let times = [wall - 3_600_000, wall, wall + 3_600_000];
     for now in times {
         for recheck in times {
-            let sql = store.build_snapshot_at_for_test(now as f64, recheck).unwrap();
+            let sql = store
+                .build_snapshot_at_for_test(now as f64, recheck)
+                .unwrap();
             assert_eq!(
-                published.blocks.route_state_snapshot(now as f64, recheck).unwrap(),
+                published
+                    .blocks
+                    .route_state_snapshot(now as f64, recheck)
+                    .unwrap(),
                 sql,
                 "route-state snapshot at {now} with clocks at {recheck}"
             );

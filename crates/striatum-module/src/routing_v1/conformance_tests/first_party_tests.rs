@@ -59,7 +59,10 @@ async fn open_peer(target: Value, settings: bool, should_send: bool) {
         authenticate_server(&mut stream, &key, &daemon, "0.40.0", Duration::from_secs(2))
             .await
             .unwrap();
-        let request = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
+        let request = crate::test_daemon::read_application_frame(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
             "catalog.list"
@@ -71,7 +74,10 @@ async fn open_peer(target: Value, settings: bool, should_send: bool) {
             "modules":modules(Some(true)),"subc_ops":[]}),
         )
         .await;
-        let request = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
+        let request = crate::test_daemon::read_application_frame(&mut stream)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
             "route.open"

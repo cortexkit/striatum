@@ -104,12 +104,18 @@ pub(crate) fn allocator_refusal(detail: &Value) {
     }
     TRACE.with(|trace| {
         if let Some(trace) = trace.borrow_mut().as_mut() {
-            if let Ok(diagnostic) = serde_json::from_value::<cortexkit_role_routing::errors::AccountUnservableDetail>(detail.clone()) {
-                if diagnostic.reason == cortexkit_role_routing::errors::AccountUnservableReason::CandidatesDisjoint {
+            if let Ok(diagnostic) = serde_json::from_value::<
+                cortexkit_role_routing::errors::AccountUnservableDetail,
+            >(detail.clone())
+            {
+                if diagnostic.reason
+                    == cortexkit_role_routing::errors::AccountUnservableReason::CandidatesDisjoint
+                {
                     trace.unservable_candidates = Some(diagnostic);
                 }
             }
-            trace.eligible_accounts_not_offered = detail.get("eligible_accounts_not_offered").cloned();
+            trace.eligible_accounts_not_offered =
+                detail.get("eligible_accounts_not_offered").cloned();
             if !summary.is_empty() {
                 trace.exclusions = Some(summary);
             }
@@ -204,18 +210,27 @@ pub(crate) fn emit(
         "exclusions":exclusions, "suppressed":suppressed,
     });
     if let Some(accounts) = params["candidates"]["accounts"].as_array() {
-        fields["offered_candidate_credential_ids"] = json!(accounts.iter()
-            .filter_map(|account| account["credential_id"].as_str()).collect::<Vec<_>>());
+        fields["offered_candidate_credential_ids"] = json!(accounts
+            .iter()
+            .filter_map(|account| account["credential_id"].as_str())
+            .collect::<Vec<_>>());
     }
     TRACE.with(|trace| {
-        if let Some(diagnostic) = trace.borrow().as_ref().and_then(|trace| trace.unservable_candidates.as_ref()) {
+        if let Some(diagnostic) = trace
+            .borrow()
+            .as_ref()
+            .and_then(|trace| trace.unservable_candidates.as_ref())
+        {
             fields["offered_credential_ids"] = json!(diagnostic.offered_credential_ids);
             fields["eligible_credential_ids"] = json!(diagnostic.eligible_credential_ids);
             fields["offered_credential_count"] = json!(diagnostic.offered_credential_count);
             fields["eligible_credential_count"] = json!(diagnostic.eligible_credential_count);
         }
-        if let Some(detail) = trace.borrow().as_ref()
-            .and_then(|trace| trace.eligible_accounts_not_offered.as_ref()) {
+        if let Some(detail) = trace
+            .borrow()
+            .as_ref()
+            .and_then(|trace| trace.eligible_accounts_not_offered.as_ref())
+        {
             fields["eligible_accounts_not_offered"] = detail.clone();
         }
     });

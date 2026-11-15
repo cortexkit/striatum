@@ -1,8 +1,8 @@
 //! Rehearse the sparse observation-backoff index on an already cloned snapshot.
 
-use striatum_store::{dev_descriptor, SqliteRouteStateStore, OBSERVATION_BACKOFFS_SQL};
 use rusqlite::{params, Connection, OpenFlags, StatementStatus};
 use std::time::Instant;
+use striatum_store::{dev_descriptor, SqliteRouteStateStore, OBSERVATION_BACKOFFS_SQL};
 
 fn read_plan(conn: &Connection, now: i64, label: &str) -> Vec<String> {
     let cutoff = now.saturating_sub(24 * 60 * 60_000);

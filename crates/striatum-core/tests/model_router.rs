@@ -69,7 +69,8 @@ fn fact(b: FactBuilder) -> ModelFact {
     let has_vector = b.class_vector.is_some();
     ModelFact {
         billing_plane: None,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: b.provider_id,
@@ -98,7 +99,9 @@ fn fact(b: FactBuilder) -> ModelFact {
         eq_source: None,
         class_vector: b.class_vector,
         class_vector_is_overlay: has_vector,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
     }
 }
 
@@ -1069,12 +1072,10 @@ fn vision_requirement_admits_only_vision_capable() {
         ..Default::default()
     });
     let extra = Extra {
-        required_capabilities: Some(
-            striatum_core::model_router::RequiredCapabilities {
-                vision: Some(true),
-                min_context: None,
-            },
-        ),
+        required_capabilities: Some(striatum_core::model_router::RequiredCapabilities {
+            vision: Some(true),
+            min_context: None,
+        }),
         ..Default::default()
     };
     let r =
@@ -1099,12 +1100,10 @@ fn min_context_filters_small_context_models() {
         ..Default::default()
     });
     let extra = Extra {
-        required_capabilities: Some(
-            striatum_core::model_router::RequiredCapabilities {
-                vision: None,
-                min_context: Some(200_000.0),
-            },
-        ),
+        required_capabilities: Some(striatum_core::model_router::RequiredCapabilities {
+            vision: None,
+            min_context: Some(200_000.0),
+        }),
         ..Default::default()
     };
     let r = select_model_route(input(vec![small, big], req(60.0, 10.0), extra)).unwrap();
@@ -1126,12 +1125,10 @@ fn positive_min_context_rejects_unknown_context() {
         vec![unknown_context],
         req(0.0, 0.0),
         Extra {
-            required_capabilities: Some(
-                striatum_core::model_router::RequiredCapabilities {
-                    vision: None,
-                    min_context: Some(1.0),
-                },
-            ),
+            required_capabilities: Some(striatum_core::model_router::RequiredCapabilities {
+                vision: None,
+                min_context: Some(1.0),
+            }),
             ..Default::default()
         },
     ));
@@ -1642,8 +1639,7 @@ fn seed_loads_and_every_fact_has_valid_scores() {
         assert!(f.scores.speed.is_finite());
         assert!(matches!(
             f.confidence,
-            striatum_core::Confidence::Curated
-                | striatum_core::Confidence::Unknown
+            striatum_core::Confidence::Curated | striatum_core::Confidence::Unknown
         ));
     }
 }
@@ -2360,12 +2356,10 @@ fn unscored_zero_score_row_is_unroutable_at_zero_demand_with_typed_rejection() {
         vec![unscored],
         req(0.0, 0.0),
         Extra {
-            required_capabilities: Some(
-                striatum_core::model_router::RequiredCapabilities {
-                    vision: Some(true),
-                    min_context: None,
-                },
-            ),
+            required_capabilities: Some(striatum_core::model_router::RequiredCapabilities {
+                vision: Some(true),
+                min_context: None,
+            }),
             ..Extra::default()
         },
     ));
@@ -2643,9 +2637,7 @@ fn whole_selection_engagement_all_candidates_complete_prices_in_basket() {
 
 /// Prices `facts` the way selection does (producers on, term off) and returns
 /// the shortlist verdict.
-fn price_basket_selection(
-    facts: Vec<ModelFact>,
-) -> striatum_core::model_router::PricedShortlist {
+fn price_basket_selection(facts: Vec<ModelFact>) -> striatum_core::model_router::PricedShortlist {
     price_selection_shortlist(
         input(facts, req(50.0, 0.0), Extra::default()),
         &RoutingConfig {
@@ -4075,9 +4067,8 @@ fn muse_route_with_input_fallback_is_cheaper_than_luna_and_selected() {
         + vector.reasoning * 0.2
         + vector.cached_read * 0.002
         + vector.cache_write * 0.1;
-    let expected =
-        (expected_raw / 1_000_000.0 / striatum_core::BASKET_REFERENCE_COST_PER_MESSAGE)
-            .clamp(0.0, 1.0);
+    let expected = (expected_raw / 1_000_000.0 / striatum_core::BASKET_REFERENCE_COST_PER_MESSAGE)
+        .clamp(0.0, 1.0);
     assert!((muse.basket_cost().unwrap() - expected).abs() < 1e-12);
 
     let selected =
@@ -5181,9 +5172,8 @@ fn uncovered_plan_names_the_missing_multiplier_or_prices_at_list() {
     priced.class_vector = Some(vector.clone());
     priced.class_vector_is_overlay = true;
     let list_dollars = (10_000.0 * 2.0 + 2_000.0 * 6.0 + 5_000.0 * 0.5) / 1_000_000.0;
-    let expected = list_dollars
-        / striatum_core::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE
-        / 15.0;
+    let expected =
+        list_dollars / striatum_core::routing_config::BASKET_REFERENCE_COST_PER_MESSAGE / 15.0;
     let price = priced.basket_price(&vector);
     assert!(price.unpriced.is_empty(), "{:?}", price.unpriced);
     assert!((price.cost.expect("a priced route") - expected).abs() < 1e-12);

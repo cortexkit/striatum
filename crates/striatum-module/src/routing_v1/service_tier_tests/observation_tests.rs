@@ -54,7 +54,10 @@ impl DescribePeer {
             authenticate_server(&mut stream, &key, &daemon, "0.40.0", Duration::from_secs(5))
                 .await
                 .unwrap();
-            let open = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
+            let open = crate::test_daemon::read_application_frame(&mut stream)
+                .await
+                .unwrap()
+                .unwrap();
             let body: Value = serde_json::from_slice(&open.body).unwrap();
             assert_eq!(body["op"], "route.open");
             let target = match &reply {
@@ -193,7 +196,10 @@ async fn parallel_economics_peer(
             authenticate_server(&mut stream, &key, &daemon, "0.40.0", Duration::from_secs(5))
                 .await
                 .unwrap();
-            let open = crate::test_daemon::read_application_frame(&mut stream).await.unwrap().unwrap();
+            let open = crate::test_daemon::read_application_frame(&mut stream)
+                .await
+                .unwrap()
+                .unwrap();
             let body: Value = serde_json::from_slice(&open.body).unwrap();
             assert_eq!(body["op"], "route.open");
             respond(
@@ -521,7 +527,10 @@ async fn current_positive_withdrawal_refuses_bound_fast_without_a_retry_or_step_
         let refused = runner.call("route.account_for", &request).await;
         assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
         assert_eq!(refused.1["code"], "account_unservable");
-        assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
+        assert_eq!(
+            refused.1["detail"],
+            json!({"reason":"bound_tier_unavailable"})
+        );
         assert!(
             refused.1["detail"].get("retry_after_ms").is_none(),
             "{}",
@@ -560,9 +569,15 @@ async fn bound_fast_with_its_accounts_route_fenced_gets_a_timed_wait() {
     let runner = harness.bind(reserved("broca"), None).await;
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-    assert_ne!(refused.1["code"], "account_selection_unavailable", "{}", refused.1);
+    assert_ne!(
+        refused.1["code"], "account_selection_unavailable",
+        "{}",
+        refused.1
+    );
     assert!(
-        refused.1["detail"]["reset_at_ms"].as_i64().is_some_and(|at| at > NOW as i64),
+        refused.1["detail"]["reset_at_ms"]
+            .as_i64()
+            .is_some_and(|at| at > NOW as i64),
         "{}",
         refused.1
     );

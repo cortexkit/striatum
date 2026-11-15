@@ -130,10 +130,7 @@ pub(super) fn claim(
         return Ok(ProbeClaim::ReservedUntil(holder.expires_at));
     }
     let claimed = claim()?;
-    if matches!(
-        claimed,
-        striatum_store::CredentialProbeClaim::Claimed
-    ) {
+    if matches!(claimed, striatum_store::CredentialProbeClaim::Claimed) {
         reservations.retain(|entry| {
             !entry.scope.ptr_eq(scope)
                 || entry.provider != provider

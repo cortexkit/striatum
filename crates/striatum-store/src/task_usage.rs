@@ -1,8 +1,8 @@
 //! Closed-task samples for background profile refreshes. Do not run this query
 //! during store initialization or route selection.
 
-use striatum_core::RouteStateResult;
 use rusqlite::{params, Connection};
+use striatum_core::RouteStateResult;
 
 use super::{err, SqliteRouteStateStore};
 

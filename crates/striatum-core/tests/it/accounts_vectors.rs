@@ -7,6 +7,8 @@
 mod accounts_support;
 
 use accounts_support::*;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 use striatum_core::accounts::evidence::{
     confirm_exhaustion, header_window, hold_until, jitter_s, normalize_used_percent,
     retry_after_with_jitter, Carrier, ConfirmationOutcome, Derivation, EvidenceScope,
@@ -17,8 +19,6 @@ use striatum_core::accounts::{
     decide, eligibility::scope_check, ConfirmationSource, FenceScope, GeneralWindow, HoldBasis,
     ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime, ScopedList, ScopedWindow,
 };
-use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const VECTORS: &str = include_str!("../fixtures/antauth-routing-vectors-b504bc84-20260929.json");
 /// The digest `docs/designs/account-selection.md` records for the vectors (ref N).

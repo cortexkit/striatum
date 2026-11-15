@@ -1,12 +1,12 @@
 //! Apply consumer exclusions and select pinned models without quality ranking.
 
 use crate::config_policy::SynthesizerPin;
+use serde::Deserialize;
+use std::collections::HashMap;
 use striatum_core::model_facts::ModelRequirements;
 use striatum_core::model_router::{SelectModelRouteInput, SelectedModelRoute};
 use striatum_core::provider_model_spec::ExclusionPolicy;
 use striatum_core::{ConcurrencySlots, RoutingConfig};
-use serde::Deserialize;
-use std::collections::HashMap;
 
 use striatum_core::model_facts::{fact_to_route, ModelFact};
 
@@ -40,7 +40,11 @@ pub(crate) struct SelectionPass<'a> {
 impl<'a> SelectionPass<'a> {
     pub fn routing_config(&self) -> RoutingConfig {
         let policy = self.operator_config.consumer_policy(
-            if self.consumer.is_empty() { self.target_agent } else { self.consumer },
+            if self.consumer.is_empty() {
+                self.target_agent
+            } else {
+                self.consumer
+            },
             &crate::config_policy::ConsumerPolicy::default(),
             &std::collections::BTreeMap::new(),
         );
@@ -70,10 +74,17 @@ impl<'a> SelectionPass<'a> {
         // The grouped global view is materialized from pin_only rules. For an
         // operator ladder, read provider/model rules directly with pin admission
         // so exclusions other than pin_only and pin_only_for still apply.
-        let mut operator_exclude_keys = if pinned { Vec::new() } else { self.operator_exclude.to_vec() };
+        let mut operator_exclude_keys = if pinned {
+            Vec::new()
+        } else {
+            self.operator_exclude.to_vec()
+        };
         if !self.classifier {
             operator_exclude_keys.extend(self.policy_memo.exclusions(
-                self.operator_config, self.consumer, self.facts, pinned,
+                self.operator_config,
+                self.consumer,
+                self.facts,
+                pinned,
             ));
         }
         SelectModelRouteInput {
@@ -179,13 +190,15 @@ impl<'a> SelectionPass<'a> {
             continuing,
             admit_pin,
             |only| self.score(only),
-            || select_in_order(available, &policy, |only, variant, _| {
-                let result = self.score_with_variant(only, policy.operator_ladder(), variant);
-                if result.is_ok() {
-                    explicit_variant = variant.map(str::to_owned);
-                }
-                result
-            }),
+            || {
+                select_in_order(available, &policy, |only, variant, _| {
+                    let result = self.score_with_variant(only, policy.operator_ladder(), variant);
+                    if result.is_ok() {
+                        explicit_variant = variant.map(str::to_owned);
+                    }
+                    result
+                })
+            },
         )
         .map(|(selected, basis)| (selected, basis, explicit_variant))
     }
@@ -196,7 +209,9 @@ pub(crate) fn apply_explicit_variant(input: &mut SelectModelRouteInput<'_>, vari
     let Some(variant) = variant else { return };
     for fact in &mut input.facts {
         let route = fact_to_route(fact);
-        if input.available_models.contains(&route.route_key) || input.available_models.contains(&route.capacity_key) {
+        if input.available_models.contains(&route.route_key)
+            || input.available_models.contains(&route.capacity_key)
+        {
             fact.variant = Some(variant.into());
             let defaults = fact.prompt_defaults.get_or_insert_with(Default::default);
             defaults.variant = Some(variant.into());
@@ -297,9 +312,13 @@ pub(crate) fn select_in_order(
                 return Ok(selected);
             }
             Err(error) => {
-                if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull {
+                if error.reason == striatum_core::model_router::RouteFailureReason::ConcurrencyFull
+                {
                     if let Some(reset) = error.earliest_reset {
-                        if concurrency_reset.as_ref().is_none_or(|(previous, _)| reset < *previous) {
+                        if concurrency_reset
+                            .as_ref()
+                            .is_none_or(|(previous, _)| reset < *previous)
+                        {
                             concurrency_reset = Some((reset, error.earliest_reset_route.clone()));
                         }
                     }
@@ -428,8 +447,11 @@ pub(crate) fn prepare_candidates(
             let rows = guard
                 .as_ref()
                 .map_or(&[][..], |guard| guard.listed_credentials());
-            let mut catalog_providers: crate::broca_credentials::AuthCatalog = facts.iter().collect();
-            catalog_providers.providers.retain(|provider| !catalog_targets.contains_key(provider));
+            let mut catalog_providers: crate::broca_credentials::AuthCatalog =
+                facts.iter().collect();
+            catalog_providers
+                .providers
+                .retain(|provider| !catalog_targets.contains_key(provider));
             let mut metered_accounts = std::collections::HashSet::new();
             for fact in facts {
                 let route = fact_to_route(fact);
@@ -452,7 +474,10 @@ pub(crate) fn prepare_candidates(
                     .copied()
                     .filter(|row| {
                         crate::broca_credentials::credential_serves_fact(
-                            row, fact, &catalog_providers, credential_data,
+                            row,
+                            fact,
+                            &catalog_providers,
+                            credential_data,
                         )
                     })
                     .collect();
@@ -544,13 +569,20 @@ pub(crate) fn prepare_candidates(
         }
     }
     rejected.extend(filters.clone());
-    let structural: HashMap<_, _> = facts.iter().flat_map(|fact| {
-        striatum_core::model_facts::llm_classification_rejection(fact, classifier)
-            .into_iter().flat_map(|reason| {
-                let route = fact_to_route(fact);
-                [(route.route_key, reason.clone()), (route.capacity_key, reason)]
-            })
-    }).collect();
+    let structural: HashMap<_, _> = facts
+        .iter()
+        .flat_map(|fact| {
+            striatum_core::model_facts::llm_classification_rejection(fact, classifier)
+                .into_iter()
+                .flat_map(|reason| {
+                    let route = fact_to_route(fact);
+                    [
+                        (route.route_key, reason.clone()),
+                        (route.capacity_key, reason),
+                    ]
+                })
+        })
+        .collect();
     let mut filters = filters;
     filters.extend(structural.clone());
     rejected.extend(structural);
@@ -588,10 +620,10 @@ impl Consumer {
 
     /// The request class named by a consumer's root, if it names one.
     pub(crate) fn from_id(id: &str) -> Option<Consumer> {
-        Self::ALL
-            .into_iter()
-            .find(|consumer| crate::variant_policy::consumer_group(Some(*consumer))
-                .is_some_and(|root| crate::config_policy::consumer_matches(root, id)))
+        Self::ALL.into_iter().find(|consumer| {
+            crate::variant_policy::consumer_group(Some(*consumer))
+                .is_some_and(|root| crate::config_policy::consumer_matches(root, id))
+        })
     }
 }
 
@@ -1031,10 +1063,10 @@ fn pin_rejection(reason: &str) -> String {
 mod candidate_tests {
     use super::*;
     use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
-    use striatum_core::route_state_store::CredentialEntitlementFence;
-    use striatum_core::{ModelRouteStateSnapshot, ModelRoutingPolicyInput};
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
+    use striatum_core::route_state_store::CredentialEntitlementFence;
+    use striatum_core::{ModelRouteStateSnapshot, ModelRoutingPolicyInput};
 
     fn row(id: &str, kind: &str, method: &str) -> ListedCredential {
         ListedCredential {

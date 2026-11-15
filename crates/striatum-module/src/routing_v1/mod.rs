@@ -63,8 +63,6 @@ mod account_ops_tests;
 #[cfg(test)]
 mod account_refusal_codes_tests;
 #[cfg(test)]
-mod credential_startup_tests;
-#[cfg(test)]
 mod add_shapes_tests;
 #[cfg(test)]
 mod concurrency_samples_tests;
@@ -74,6 +72,8 @@ mod conformance_tests;
 mod consumers_tests;
 #[cfg(test)]
 mod core_wire_fixture_tests;
+#[cfg(test)]
+mod credential_startup_tests;
 #[cfg(test)]
 mod diagnostics_tests;
 #[cfg(test)]

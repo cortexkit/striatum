@@ -80,13 +80,25 @@ async fn finish_failure(fault: &str, expected_reason: &str) {
         "no admission, affinity, reservation, pin or probe leaks"
     );
     let after = crate::account_state::snapshot(harness.store()).unwrap();
-    assert_eq!(after.admissions, before.admissions, "no in-memory grant or reservation leaks");
+    assert_eq!(
+        after.admissions, before.admissions,
+        "no in-memory grant or reservation leaks"
+    );
     assert_eq!(after.inflight, before.inflight, "no in-memory slot leaks");
     assert_eq!(after.waiters, before.waiters, "no in-memory waiter leaks");
-    assert_eq!(after.blocks.authorizations().count(), before.blocks.authorizations().count());
+    assert_eq!(
+        after.blocks.authorizations().count(),
+        before.blocks.authorizations().count()
+    );
     // Preparation classifies the old fence before the admission command. Compare
     // blocks against SQL, not the earlier unclassified publication.
-    assert_eq!(after.blocks, harness.store().account_transaction(|tx| tx.load_block_state()).unwrap());
+    assert_eq!(
+        after.blocks,
+        harness
+            .store()
+            .account_transaction(|tx| tx.load_block_state())
+            .unwrap()
+    );
 
     // The same due probe can still be claimed after the failed command.
     if fault == "io" {

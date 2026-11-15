@@ -146,7 +146,10 @@ fn one_shot_output_modes_add_no_stderr_logging() {
         let output = home.run_with_args(true, &[mode]);
         assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
-        assert!(!output.stdout.is_empty(), "{mode} must still print its output");
+        assert!(
+            !output.stdout.is_empty(),
+            "{mode} must still print its output"
+        );
     }
 }
 

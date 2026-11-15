@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use striatum_core::{model_facts::fact_to_route, ModelFact};
 use serde::Deserialize;
+use striatum_core::{model_facts::fact_to_route, ModelFact};
 
 use crate::{
     select_policy::Consumer,

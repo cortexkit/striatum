@@ -36,9 +36,7 @@ fn old_prune_after_begin(
     let tx = write_transaction(connection)?;
     after_begin();
     let unserved = tx
-        .prepare(
-            "SELECT route_key FROM model_facts WHERE fusiform_present=0 ORDER BY route_key",
-        )?
+        .prepare("SELECT route_key FROM model_facts WHERE fusiform_present=0 ORDER BY route_key")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<Vec<String>>>()?;
     for sql in old_delete_statements() {
@@ -108,11 +106,9 @@ fn reader_planned_prune_deletes_exactly_the_old_rows() {
                 ]
             );
             assert_eq!(
-                connection.query_row(
-                    "SELECT COUNT(*) FROM model_route_decisions",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )?,
+                connection.query_row("SELECT COUNT(*) FROM model_route_decisions", [], |row| {
+                    row.get::<_, i64>(0)
+                })?,
                 3
             );
             Ok(())
@@ -262,9 +258,7 @@ fn no_op_prune_never_acquires_or_commits_on_writer() {
     let (_scratch, store) = rig("prune-no-op");
     store
         .store
-        .with_conn(|connection| {
-            connection.execute("UPDATE model_facts SET fusiform_present=1", [])
-        })
+        .with_conn(|connection| connection.execute("UPDATE model_facts SET fusiform_present=1", []))
         .unwrap();
     let before = Before::new(&store);
     assert!(store.prune_unserved_unpicked_facts().unwrap().is_empty());

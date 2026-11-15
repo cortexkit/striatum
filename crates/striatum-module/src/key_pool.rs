@@ -13,15 +13,13 @@
 //! A pool with no admissible key refuses `explicit_provider_pool_exhausted`
 //! naming every key's reason. There is no fallback to the subscription logins.
 
-use striatum_core::key_pool::{PoolBlockedKey, EXPLICIT_PROVIDER_POOL_EXHAUSTED};
 use std::collections::BTreeMap;
+use striatum_core::key_pool::{PoolBlockedKey, EXPLICIT_PROVIDER_POOL_EXHAUSTED};
 
-use striatum_core::runner::RunnerModel;
-use striatum_store::{
-    PoolAcquire, PoolAcquireOutcome, PoolWallKind, SqliteRouteStateStore,
-};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use striatum_core::runner::RunnerModel;
+use striatum_store::{PoolAcquire, PoolAcquireOutcome, PoolWallKind, SqliteRouteStateStore};
 
 use crate::broca_credentials::{SharedBrocaCredentials, EXPLICIT_PROVIDER_CREDENTIAL_UNRESOLVED};
 
@@ -155,8 +153,7 @@ pub fn acquire(
         .pool_keys(provider, ctx.now_ms.max(0) as u64)
         .map_err(|(code, message)| refusal(&code, message));
     let Some(target) =
-        striatum_core::score_alias::alias_target(ctx.catalog_targets, provider)
-            .map(str::to_string)
+        striatum_core::score_alias::alias_target(ctx.catalog_targets, provider).map(str::to_string)
     else {
         // Pool membership comes from the vault listing. When the listing is
         // unread, stale or maps no key to the provider, that is the refusal:

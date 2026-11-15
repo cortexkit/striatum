@@ -6,8 +6,8 @@
 //! The decision itself is the row `route.select` writes into the decision
 //! ledger; this module only keeps what v1 adds to it.
 
-use striatum_core::{accounts::AllowedAccountClass, RouteStateResult};
 use rusqlite::{params, Connection, OptionalExtension};
+use striatum_core::{accounts::AllowedAccountClass, RouteStateResult};
 
 use super::{err, SqliteRouteStateStore};
 

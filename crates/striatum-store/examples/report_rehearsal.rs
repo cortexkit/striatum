@@ -1,10 +1,10 @@
 //! Apply routing migrations to an already cloned live-store snapshot, never the live DB.
 
-use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 use std::{
     path::Path,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
+use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
 fn clock_ms() -> i64 {
     SystemTime::now()

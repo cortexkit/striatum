@@ -32,13 +32,13 @@ use std::time::Duration;
 use cortexkit_claustrum_client::{
     CredentialErrorClass, CredentialResolver, CredentialResolverError, ScopedCredentialListing,
 };
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use striatum_core::quota::{RateWindow, StaleDisclosure, Usage, LAST_GOOD_MAX_AGE_MS};
 use striatum_store::{
     PersistedAccountReading, PersistedProviderCompleteness, PersistedVaultRoster,
     SqliteRouteStateStore,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Length of Claude's five-hour general window, as Insula publishes it.
 pub const FIVE_HOUR_MINUTES: i64 = 300;
@@ -2272,11 +2272,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db").to_string_lossy().into_owned();
         let open = || {
-            SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
-                "striatum",
-                path.clone(),
-            ))
-            .unwrap()
+            SqliteRouteStateStore::open(&striatum_store::dev_descriptor("striatum", path.clone()))
+                .unwrap()
         };
         let mut state = AccountQuotaState::default();
         let store = open();
@@ -2494,11 +2491,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("store.db").to_string_lossy().into_owned();
         let open = || {
-            SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
-                "striatum",
-                path.clone(),
-            ))
-            .expect("open store")
+            SqliteRouteStateStore::open(&striatum_store::dev_descriptor("striatum", path.clone()))
+                .expect("open store")
         };
         let before = {
             let store = open();

@@ -88,18 +88,23 @@ fn both<T: Send + PartialEq + std::fmt::Debug + 'static>(
 fn group_rows(store: &SqliteRouteStateStore) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
     store
         .with_reader_for_test(|conn| {
-            ["account_admission", "account_affinity", "account_continue", "account_pin"]
-                .into_iter()
-                .map(|table| {
-                    let mut statement =
-                        conn.prepare(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))?;
-                    let width = statement.column_count();
-                    let rows = statement
-                        .query_map([], |row| (0..width).map(|i| row.get(i)).collect())?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    Ok((table.to_owned(), rows))
-                })
-                .collect()
+            [
+                "account_admission",
+                "account_affinity",
+                "account_continue",
+                "account_pin",
+            ]
+            .into_iter()
+            .map(|table| {
+                let mut statement =
+                    conn.prepare(&format!("SELECT rowid, * FROM {table} ORDER BY rowid"))?;
+                let width = statement.column_count();
+                let rows = statement
+                    .query_map([], |row| (0..width).map(|i| row.get(i)).collect())?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok((table.to_owned(), rows))
+            })
+            .collect()
         })
         .unwrap()
 }
@@ -162,7 +167,11 @@ fn assert_same_answers(
                     .admission(principal, id)?
                     .filter(|row| OPEN.contains(&row.state.as_str()));
                 let memory = state.open_admission(principal, id);
-                assert_eq!(memory.map(|open| &open.row), open.as_ref(), "{context}: admission {id}");
+                assert_eq!(
+                    memory.map(|open| &open.row),
+                    open.as_ref(),
+                    "{context}: admission {id}"
+                );
                 if open.is_some() {
                     assert_eq!(
                         memory.and_then(|open| open.input_size_class),
@@ -295,7 +304,11 @@ impl Admission {
 /// Insert a pinned admission and, when it is the conversation's first or a
 /// reassignment, install its pin as the affinity. Pins are always fresh, as
 /// serving issues them.
-fn admit(tx: &mut AccountCommand<'_>, admission: &Admission, install: bool) -> RouteStateResult<()> {
+fn admit(
+    tx: &mut AccountCommand<'_>,
+    admission: &Admission,
+    install: bool,
+) -> RouteStateResult<()> {
     let current = tx.affinity(&admission.principal, &admission.hash, PROVIDER)?;
     tx.insert_pin(&admission.pin_row())?;
     tx.insert_admission(&admission.row())?;
@@ -415,7 +428,9 @@ fn apply(
             both(store, oracle, move |tx| admit(tx, &admission, install))
         }
         1 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             let stale = rng.below(3) == 0;
             let mut fresh = world.new_admission(rng, now);
             fresh.principal = target.principal.clone();
@@ -430,13 +445,17 @@ fn apply(
                 };
                 tx.put_affinity(
                     &fresh.affinity(now),
-                    expected.as_ref().map(|(pin, generation)| (pin.as_str(), *generation)),
+                    expected
+                        .as_ref()
+                        .map(|(pin, generation)| (pin.as_str(), *generation)),
                 )?;
                 Ok(())
             })
         }
         2 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             let lease = (rng.below(2) == 0).then_some(now + rng.below(50) as i64);
             both(store, oracle, move |tx| {
                 tx.touch_affinity(
@@ -452,19 +471,27 @@ fn apply(
             })
         }
         3 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             let at = now - rng.below(20) as i64;
-            both(store, oracle, move |tx| tx.end_lease(&target.pin, at).map(|_| ()))
+            both(store, oracle, move |tx| {
+                tx.end_lease(&target.pin, at).map(|_| ())
+            })
         }
         4 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             both(store, oracle, move |tx| {
                 tx.mark_admission_expired(&target.principal, &target.id)
                     .map(|_| ())
             })
         }
         5 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             let run_id = world.fresh("run");
             let late = rng.below(2) == 0;
             let started = (target.principal.clone(), target.id.clone(), run_id.clone());
@@ -477,7 +504,9 @@ fn apply(
             result.map(|_| ())
         }
         6 => {
-            let Some(target) = any(rng, world) else { return };
+            let Some(target) = any(rng, world) else {
+                return;
+            };
             both(store, oracle, move |tx| {
                 tx.mark_admission_released(&target.principal, &target.id, now)
                     .map(|_| ())
@@ -500,10 +529,14 @@ fn apply(
             // Most offers continue a started run; some name an original that
             // never started, so retention can reach its chain.
             let (principal, original, run_id) = if rng.below(4) != 0 {
-                let Some(started) = rng.pick(&world.runs).cloned() else { return };
+                let Some(started) = rng.pick(&world.runs).cloned() else {
+                    return;
+                };
                 started
             } else {
-                let Some(target) = any(rng, world) else { return };
+                let Some(target) = any(rng, world) else {
+                    return;
+                };
                 (target.principal, target.id, world.fresh("run"))
             };
             let mut reservation = world.new_admission(rng, now);
@@ -514,7 +547,9 @@ fn apply(
             let install = rng.below(2) == 0;
             world.admissions.push(reservation.clone());
             let previous = if rng.below(2) == 0 {
-                rng.pick(&world.decisions).cloned().unwrap_or_else(|| "root".into())
+                rng.pick(&world.decisions)
+                    .cloned()
+                    .unwrap_or_else(|| "root".into())
             } else {
                 "root".into()
             };
@@ -539,7 +574,9 @@ fn apply(
             })
         }
         9 => {
-            let Some(decision) = rng.pick(&world.decisions).cloned() else { return };
+            let Some(decision) = rng.pick(&world.decisions).cloned() else {
+                return;
+            };
             both(store, oracle, move |tx| tx.use_continuation(&decision, now))
         }
         10 => {
@@ -560,14 +597,18 @@ fn apply(
                 .map(|_| ())
             })
         }
-        11 => both(store, oracle, move |tx| tx.release_expired_continuations(now)),
+        11 => both(store, oracle, move |tx| {
+            tx.release_expired_continuations(now)
+        }),
         12 => {
             run_oracle(oracle, |tx| tx.tick(now)).unwrap();
             crate::account_writer::tick(store, now)
         }
         13 => {
             let (before, limit) = (now - rng.below(60) as i64, 1 + rng.below(6) as usize);
-            let expected = run_oracle(oracle, |tx| tx.prune_account_admissions(before, limit, now + 30 * 60_000));
+            let expected = run_oracle(oracle, |tx| {
+                tx.prune_account_admissions(before, limit, now + 30 * 60_000)
+            });
             crate::account_writer::prune_account_admissions(store, before, limit, now + 30 * 60_000)
                 .map(|pruned| assert_eq!(pruned, expected.unwrap()))
         }
@@ -863,7 +904,11 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
             apply(&store, &oracle, &owner, &mut world, &mut rng, op, now);
             let context = format!("seed={seed} step={step} op={}", OPERATION_NAMES[op]);
             assert_equivalent(&store, &owner, &context);
-            assert_eq!(group_rows(&store), group_rows(&oracle), "{context}: rows differ from the oracle");
+            assert_eq!(
+                group_rows(&store),
+                group_rows(&oracle),
+                "{context}: rows differ from the oracle"
+            );
             assert_same_answers(&published(&owner), &oracle, &world, now, &context);
         }
         let state = published(&owner);
@@ -883,7 +928,10 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
     // Every index must have held entries at some sequence end, or the
     // comparison above proved nothing about it.
     for (name, total) in &reached {
-        assert!(*total > 0, "no sequence ended with a non-empty {name} index");
+        assert!(
+            *total > 0,
+            "no sequence ended with a non-empty {name} index"
+        );
     }
     assert!(
         pruned_affinities > 0,
@@ -891,7 +939,14 @@ fn generated_admission_sequences_with_pruning_match_a_fresh_load() {
     );
 }
 
-fn admission(principal: &str, id: &str, pin: &str, generation: u64, at: i64, lasts: i64) -> Admission {
+fn admission(
+    principal: &str,
+    id: &str,
+    pin: &str,
+    generation: u64,
+    at: i64,
+    lasts: i64,
+) -> Admission {
     Admission {
         principal: principal.into(),
         id: id.into(),
@@ -909,7 +964,8 @@ fn admission(principal: &str, id: &str, pin: &str, generation: u64, at: i64, las
 }
 
 fn prune_everything_before(store: &SqliteRouteStateStore, before: i64) {
-    crate::account_writer::prune_account_admissions(store, before, 100, before + 30 * 60_000).unwrap();
+    crate::account_writer::prune_account_admissions(store, before, 100, before + 30 * 60_000)
+        .unwrap();
 }
 
 #[test]
@@ -937,7 +993,10 @@ fn pruning_the_newest_finished_admission_reveals_the_older_open_one() {
     let reads = maintenance_reads();
     prune_everything_before(&store, 100);
     assert_eq!(latest(&owner).as_deref(), Some("older"));
-    assert!(maintenance_reads() > reads, "the recheck is a counted maintenance read");
+    assert!(
+        maintenance_reads() > reads,
+        "the recheck is a counted maintenance read"
+    );
     assert_equivalent(&store, &owner, "after pruning the newest admission");
 }
 
@@ -977,10 +1036,26 @@ fn pruning_the_newest_used_offer_reveals_the_older_used_one() {
         admit(tx, &original, true)?;
         tx.mark_admission_expired("p", "original")?;
         admit(tx, &first, false)?;
-        tx.record_continuation("p", "s1", &record, "run", "original", "root", Some(("d1", "first", 12)))?;
+        tx.record_continuation(
+            "p",
+            "s1",
+            &record,
+            "run",
+            "original",
+            "root",
+            Some(("d1", "first", 12)),
+        )?;
         tx.use_continuation("d1", 11)?;
         admit(tx, &second, false)?;
-        tx.record_continuation("p", "s2", &record, "run", "original", "d1", Some(("d2", "second", 14)))?;
+        tx.record_continuation(
+            "p",
+            "s2",
+            &record,
+            "run",
+            "original",
+            "d1",
+            Some(("d2", "second", 14)),
+        )?;
         tx.use_continuation("d2", 13)?;
         // Both reservations finish. The successor keeps its predecessor
         // offer until the successor is pruned, preserving chain resolution.
@@ -1002,7 +1077,10 @@ fn pruning_the_newest_used_offer_reveals_the_older_used_one() {
     let pruned = crate::account_writer::prune_account_continuations(&store, 100, 100).unwrap();
     assert_eq!(pruned, 1, "only the newest used offer is unprotected");
     assert_eq!(latest_used(&owner).as_deref(), Some("first"));
-    assert!(maintenance_reads() > reads, "the recheck is a counted maintenance read");
+    assert!(
+        maintenance_reads() > reads,
+        "the recheck is a counted maintenance read"
+    );
     assert_equivalent(&store, &owner, "after pruning the newest used offer");
 }
 
@@ -1012,7 +1090,14 @@ fn working_copy_fork_shares_admission_shards_and_reports_cost() {
     let owner = install(&store);
     let rows: Vec<_> = (0..2_000)
         .map(|i| {
-            let mut row = admission(&format!("p{}", i % 7), &format!("a{i}"), &format!("pin-{i}"), 1, 10 + i, 1_000);
+            let mut row = admission(
+                &format!("p{}", i % 7),
+                &format!("a{i}"),
+                &format!("pin-{i}"),
+                1,
+                10 + i,
+                1_000,
+            );
             row.hash = format!("h{i}");
             row
         })
@@ -1027,8 +1112,14 @@ fn working_copy_fork_shares_admission_shards_and_reports_cost() {
     let snapshot = owner.published_snapshot().unwrap();
     let fork = snapshot.fork();
     let fork = fork.as_any().downcast_ref::<AccountState>().unwrap();
-    assert!(fork.admissions.open.shares_storage_with(&snapshot.admissions.open));
-    assert!(fork.admissions.demand.shares_storage_with(&snapshot.admissions.demand));
+    assert!(fork
+        .admissions
+        .open
+        .shares_storage_with(&snapshot.admissions.open));
+    assert!(fork
+        .admissions
+        .demand
+        .shares_storage_with(&snapshot.admissions.demand));
     let start = std::time::Instant::now();
     for _ in 0..100_000 {
         std::hint::black_box(owner.published_snapshot().unwrap().fork());
@@ -1100,7 +1191,9 @@ fn live_sized_admission_state_costs() {
     for attempt in 1..=3 {
         let cpu = crate::routing_v1::request_cpu_bench::cpu_us();
         let start = std::time::Instant::now();
-        let rows = store.account_transaction(|tx| tx.load_admission_group()).unwrap();
+        let rows = store
+            .account_transaction(|tx| tx.load_admission_group())
+            .unwrap();
         let read = start.elapsed();
         let state = AdmissionState::from_rows(rows);
         let built = start.elapsed();
@@ -1127,7 +1220,14 @@ fn live_sized_admission_state_costs() {
     let now = BASE + ADMISSIONS * STEP;
     let mut admits = Vec::new();
     for i in 0..20 {
-        let mut fresh = admission("p0", &format!("fresh-{i}"), &format!("fresh-pin-{i}"), 1, now, 60_000);
+        let mut fresh = admission(
+            "p0",
+            &format!("fresh-{i}"),
+            &format!("fresh-pin-{i}"),
+            1,
+            now,
+            60_000,
+        );
         fresh.hash = format!("fresh-{i}");
         fresh.account = format!("a{}", i % 40);
         fresh.credential = format!("a{}-key", i % 40);
@@ -1140,11 +1240,7 @@ fn live_sized_admission_state_costs() {
         "live-size admission command: median {:?} max {:?} (20 commands, writer wall time)",
         admits[10], admits[19]
     );
-    for (name, prune) in [
-        ("admissions", 0),
-        ("affinities", 1),
-        ("continuations", 2),
-    ] {
+    for (name, prune) in [("admissions", 0), ("affinities", 1), ("continuations", 2)] {
         let before = BASE + 2_000 * STEP;
         let start = std::time::Instant::now();
         let pruned = match prune {
@@ -1219,7 +1315,10 @@ fn a_batch_with_a_diverged_command_runs_again_on_fresh_state() {
         store
             .enqueue_account_state_command(AccountCommandKind::Repair, move |tx, state| {
                 let tx = AccountCommand::new(tx, state);
-                Ok(tx.affinity("p", &hash, PROVIDER)?.unwrap().lease_valid_until)
+                Ok(tx
+                    .affinity("p", &hash, PROVIDER)?
+                    .unwrap()
+                    .lease_valid_until)
             })
             .unwrap()
     };
@@ -1232,8 +1331,15 @@ fn a_batch_with_a_diverged_command_runs_again_on_fresh_state() {
         .unwrap();
     release.send(()).unwrap();
     blocker.wait().unwrap();
-    assert_eq!(lease.wait().unwrap(), Some(66_000), "A replied from the stale state");
-    assert!(ended.wait().unwrap(), "B must succeed on the reloaded state");
+    assert_eq!(
+        lease.wait().unwrap(),
+        Some(66_000),
+        "A replied from the stale state"
+    );
+    assert!(
+        ended.wait().unwrap(),
+        "B must succeed on the reloaded state"
+    );
     assert_eq!(
         store.account_writer_batch_sizes_for_test().last(),
         Some(&2),
@@ -1267,7 +1373,11 @@ fn a_decided_lease_end_does_not_overwrite_a_lease_the_state_did_not_see() {
     assert!(error.contains(striatum_store::STATE_DIVERGED), "{error}");
     let lease: Option<i64> = store
         .with_writer_for_test(|conn| {
-            conn.query_row("SELECT lease_valid_until FROM account_affinity", [], |row| row.get(0))
+            conn.query_row(
+                "SELECT lease_valid_until FROM account_affinity",
+                [],
+                |row| row.get(0),
+            )
         })
         .unwrap();
     assert_eq!(lease, Some(70_000));
@@ -1319,7 +1429,10 @@ fn a_probe_release_leaves_a_started_admission_and_its_authorization_alone() {
         .unwrap();
     store
         .account_transaction(move |tx| {
-            let _ = tx.release_admission_probes(vec![("p".into(), "first".into(), owner.clone())], 100_000)?;
+            let _ = tx.release_admission_probes(
+                vec![("p".into(), "first".into(), owner.clone())],
+                100_000,
+            )?;
             Ok(())
         })
         .unwrap();

@@ -10,11 +10,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use striatum_core::key_pool::{
-    key_block, pick_pool_key, PoolBlockedKey, PoolKey, PoolKeyState,
-};
-use striatum_core::RouteStateResult;
 use rusqlite::{params, Connection, OptionalExtension};
+use striatum_core::key_pool::{key_block, pick_pool_key, PoolBlockedKey, PoolKey, PoolKeyState};
+use striatum_core::RouteStateResult;
 
 use super::{err, SqliteRouteStateStore};
 
@@ -145,7 +143,13 @@ pub(crate) fn read_key_states(
     let rechecks = crate::fence_rechecks::read(conn)?;
     let clock_schema = crate::fence_rechecks::enabled(conn)?;
     let leases = lease_counts(conn, provider, now_ms, excluded_lease)?;
-    Ok(key_states_from(provider, rows, &rechecks, clock_schema, leases))
+    Ok(key_states_from(
+        provider,
+        rows,
+        &rechecks,
+        clock_schema,
+        leases,
+    ))
 }
 
 /// Key states from the key rows, the stored clocks and the live lease
@@ -438,7 +442,13 @@ impl SqliteRouteStateStore {
                 .store
                 .with_read(|conn: &Connection| Ok(lease_counts(conn, provider, now_ms, None)?))
                 .map_err(err)?;
-            return Ok(key_states_from(provider, rows, &state.clock_rechecks(), true, leases));
+            return Ok(key_states_from(
+                provider,
+                rows,
+                &state.clock_rechecks(),
+                true,
+                leases,
+            ));
         }
         let provider = provider.to_owned();
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
@@ -543,9 +553,8 @@ impl crate::AccountTx<'_> {
         reason: &str,
         now_ms: i64,
     ) -> RouteStateResult<()> {
-        let until_ms = until_ms.min(
-            now_ms.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS),
-        );
+        let until_ms = until_ms
+            .min(now_ms.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS));
         if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             let (deadline, why, observed) = match kind {
                 PoolWallKind::Billing => ("walled_until", "wall_reason", "wall_observed_at"),

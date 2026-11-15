@@ -670,13 +670,23 @@ impl LiveConfig {
         )
     }
 
-    pub(crate) fn selection_exclusions(&self, consumer: &str, facts: &[ModelFact], pinned: bool) -> Vec<String> {
+    pub(crate) fn selection_exclusions(
+        &self,
+        consumer: &str,
+        facts: &[ModelFact],
+        pinned: bool,
+    ) -> Vec<String> {
         facts
             .iter()
             .filter_map(|fact| {
                 let route = striatum_core::fact_to_route(fact).route_key;
-                (!self.route_allowed_on_plane(consumer, &route, pinned, fact.billing_plane.as_ref()))
-                    .then_some(route)
+                (!self.route_allowed_on_plane(
+                    consumer,
+                    &route,
+                    pinned,
+                    fact.billing_plane.as_ref(),
+                ))
+                .then_some(route)
             })
             .collect()
     }

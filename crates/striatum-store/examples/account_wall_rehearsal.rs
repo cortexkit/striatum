@@ -1,9 +1,9 @@
 //! Rehearse read-side account-wall quarantine on a fresh VACUUM INTO copy.
 //! The source is opened read-only; normal store startup runs only on the copy.
-use striatum_core::{account_wall::account_scoped_wall, RouteStateStore, RouteWallClass};
-use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 use rusqlite::{Connection, OpenFlags};
 use std::path::PathBuf;
+use striatum_core::{account_wall::account_scoped_wall, RouteStateStore, RouteWallClass};
+use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
 type Wall = (
     String,
@@ -110,36 +110,33 @@ fn main() {
     let facts = store.get_facts().unwrap();
     let mut admitted_snapshot = snapshot;
     if let Some(quota) = store.quota_snapshot().unwrap() {
-        let windows = serde_json::from_str::<Vec<striatum_core::ProviderUsage>>(
-            &quota.windows_json,
-        )
-        .unwrap();
+        let windows =
+            serde_json::from_str::<Vec<striatum_core::ProviderUsage>>(&quota.windows_json).unwrap();
         striatum_core::merge_quota_overlay(&mut admitted_snapshot, &windows, &facts, &[]);
     }
     for (route, _, _, _, _) in eligible
         .into_iter()
         .filter(|wall| migrated.iter().any(|kept| kept.0 == wall.0))
     {
-        let panel =
-            striatum_core::select_panel(striatum_core::SelectPanelInput {
-                package_tokens: None,
-                panel_spec: serde_json::from_value(
-                    serde_json::json!({"size":1,"iqFloor":90,"class":"SPEC","diversity":"none"}),
-                )
-                .unwrap(),
-                selection: striatum_core::PanelSelection::Roster,
-                roster: serde_json::from_value(serde_json::json!([{"model":route}])).unwrap(),
-                facts: facts.clone(),
-                runtime_snapshot: Some(admitted_snapshot.clone()),
-                exclude_route_keys: vec![],
-                operator_exclude_keys: vec![],
-                required_capabilities: None,
-                available_models: [route.clone()].into_iter().collect(),
-                availability_substrate: striatum_core::AvailabilitySubstrate::Broca,
-                availability_label: "served".to_string(),
-                is_subscription_route: None,
-            })
-            .unwrap();
+        let panel = striatum_core::select_panel(striatum_core::SelectPanelInput {
+            package_tokens: None,
+            panel_spec: serde_json::from_value(
+                serde_json::json!({"size":1,"iqFloor":90,"class":"SPEC","diversity":"none"}),
+            )
+            .unwrap(),
+            selection: striatum_core::PanelSelection::Roster,
+            roster: serde_json::from_value(serde_json::json!([{"model":route}])).unwrap(),
+            facts: facts.clone(),
+            runtime_snapshot: Some(admitted_snapshot.clone()),
+            exclude_route_keys: vec![],
+            operator_exclude_keys: vec![],
+            required_capabilities: None,
+            available_models: [route.clone()].into_iter().collect(),
+            availability_substrate: striatum_core::AvailabilitySubstrate::Broca,
+            availability_label: "served".to_string(),
+            is_subscription_route: None,
+        })
+        .unwrap();
         println!(
             "rehearsed seating: {route} seats={} shortfall={:?}",
             panel.members.len(),

@@ -225,7 +225,10 @@ fn a_stalled_first_load_answers_a_request_within_the_bound() {
     // The installer waits within the same bound: it may have answered that
     // the load is still running before the load was resumed.
     if let Err(error) = loader.join().unwrap() {
-        assert!(error.to_string().contains(super::FIRST_LOAD_PENDING), "{error}");
+        assert!(
+            error.to_string().contains(super::FIRST_LOAD_PENDING),
+            "{error}"
+        );
     }
     request.join().unwrap();
     super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
@@ -268,23 +271,36 @@ fn a_stalled_load_answers_its_installer_and_its_retry_within_the_bound() {
         "the installer",
         Box::new(move || installing.install_account_state_bridge(driver)),
     );
-    assert!(installed.unwrap_err().to_string().contains("first load failed"));
+    assert!(installed
+        .unwrap_err()
+        .to_string()
+        .contains("first load failed"));
     let retrying = store.clone();
     let retried = bounded("the retry", Box::new(move || super::initialize(&retrying)));
     let error = retried.unwrap_err().to_string();
     assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
     let asking = store.clone();
-    let asked = bounded("a reader during the retry", Box::new(move || super::initialize(&asking)));
+    let asked = bounded(
+        "a reader during the retry",
+        Box::new(move || super::initialize(&asking)),
+    );
     let error = asked.unwrap_err().to_string();
     assert!(error.contains(super::FIRST_LOAD_PENDING), "{error}");
     resume.send(()).unwrap();
     let ready = store.clone();
-    bounded("the reader after the load", Box::new(move || {
-        super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
-        super::initialize(&ready)
-    }))
+    bounded(
+        "the reader after the load",
+        Box::new(move || {
+            super::FIRST_LOAD_WAIT_FOR_TEST.store(5_000, Ordering::Relaxed);
+            super::initialize(&ready)
+        }),
+    )
     .unwrap();
-    assert_eq!(owner.loads.load(Ordering::Relaxed), 2, "one failed load, one retry");
+    assert_eq!(
+        owner.loads.load(Ordering::Relaxed),
+        2,
+        "one failed load, one retry"
+    );
 }
 
 #[test]
@@ -737,7 +753,10 @@ fn state_blind_admission_writers_refuse_once_state_is_installed() {
             }
         }
     }
-    assert!(offenders.is_empty(), "state-blind writers called: {offenders:?}");
+    assert!(
+        offenders.is_empty(),
+        "state-blind writers called: {offenders:?}"
+    );
 }
 
 /// After a failed load, requests that arrive together retry it once and share
@@ -797,12 +816,19 @@ fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
         })
         .unwrap();
     assert!(store.block_seed_writes_for_test() > 0);
-    assert_eq!(store.block_writes_outside_command(), 0, "seeding is no violation");
+    assert_eq!(
+        store.block_writes_outside_command(),
+        0,
+        "seeding is no violation"
+    );
     let state = super::snapshot(&store).unwrap();
     assert_eq!(owner.loads.load(Ordering::Relaxed), loads + 1);
     let fresh = store.account_transaction(AccountState::load).unwrap();
     assert_eq!(state.blocks, fresh.blocks);
-    assert_eq!(state.blocks.table_sizes()[10], ("account_transient_backoff", 1));
+    assert_eq!(
+        state.blocks.table_sizes()[10],
+        ("account_transient_backoff", 1)
+    );
 }
 
 /// A command that writes a block row and then reads the block tables sees
@@ -846,6 +872,9 @@ fn a_command_reads_its_own_block_writes_from_the_working_state() {
         Ok((tx.active_fences("p")?, tx.sql.active_fences("p")?))
     })
     .unwrap();
-    assert!(later.is_empty(), "a cleared fence must leave the command's view");
+    assert!(
+        later.is_empty(),
+        "a cleared fence must leave the command's view"
+    );
     assert_eq!(later, sql);
 }

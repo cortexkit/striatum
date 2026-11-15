@@ -210,7 +210,10 @@ pub(crate) fn choices_for_harness(
                 && reachable_credentials.iter().any(|row| {
                     row.auth_method.as_deref() == Some("gateway")
                         && broca_credentials::credential_serves_fact(
-                            row, fact, &providers, credentials,
+                            row,
+                            fact,
+                            &providers,
+                            credentials,
                         )
                 });
             if !gateway_reachable {

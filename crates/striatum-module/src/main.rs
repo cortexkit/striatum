@@ -17,17 +17,16 @@
 mod account_quota;
 mod account_refusal_log;
 mod account_selection;
-mod account_writer;
 mod account_state;
-mod serving_index;
+mod account_writer;
 mod background;
 #[cfg(test)]
 mod baseline_tests;
 mod broca_credentials;
 mod catalog_targets;
+mod concurrency_caps;
 mod config_convert;
 mod config_overrides;
-mod concurrency_caps;
 mod config_policy;
 mod credential_fences;
 mod diagnostics_findings;
@@ -36,32 +35,33 @@ mod fusiform_catalog;
 mod head_choices;
 mod key_pool;
 mod legacy_wire;
-mod logging;
 #[cfg(test)]
 mod literal_census_tests;
+mod logging;
 mod model_resolution;
 mod panel_policy;
 mod project_settings;
 mod quota_bus;
-#[cfg(test)]
-#[path = "test_daemon_tests.rs"]
-mod test_daemon;
 mod quota_consumer;
 mod quota_events;
 mod retention;
 mod routing_v1;
-mod stage_timing;
 mod runtime_lag;
 mod select;
 mod select_concurrency;
 mod select_policy;
 mod selection_harness;
 mod service_tiers;
+mod serving_index;
+mod stage_timing;
 mod subscription_economics;
 mod substrate_policy;
 mod task_profile_refresh;
 #[cfg(test)]
 mod test_config;
+#[cfg(test)]
+#[path = "test_daemon_tests.rs"]
+mod test_daemon;
 #[cfg(test)]
 #[path = "test_exe/tests.rs"]
 mod test_exe;
@@ -84,6 +84,8 @@ use background::next_frame_or_loop_stop;
 #[cfg(test)]
 use background::BackgroundLoops;
 #[cfg(test)]
+use select::price_selection_inputs;
+#[cfg(test)]
 use select::{
     add_stage_ms, claim_ignored_caller_policy_warning, panel_availability, panel_decision_input,
     quota_signal_json, rate_limit_route_select_line, resolve_select_request, select_availability,
@@ -95,17 +97,16 @@ use select::{
     warn_ignored_caller_policy_once, DecisionProvenance, PreparedSelectionInputs, SelectParams,
     SelectionPolicySources,
 };
-#[cfg(test)]
-use select::price_selection_inputs;
 
 use broca_credentials::{BrocaCredentials, SharedBrocaCredentials};
 use cortexkit_store_types::StorageDescriptor;
 use fusiform_catalog::{CatalogReachHealth, SharedCatalogHealth};
+use quota_consumer::QuotaConsumer;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use striatum_core::launch_policy::resolve_routing_policy_with_catalog_targets;
 use striatum_core::model_facts::make_capacity_key;
-use striatum_core::model_facts::{
-    Confidence, ModelScores, RoutePricing, ScoreProvenance,
-};
+use striatum_core::model_facts::{Confidence, ModelScores, RoutePricing, ScoreProvenance};
 use striatum_core::model_router::{
     ModelRouteStateSnapshot, NoRouteError, RequiredCapabilities, RouteFailureReason,
     SelectModelRouteInput, SelectedModelRoute,
@@ -126,9 +127,6 @@ use striatum_core::{
 #[cfg(test)]
 use striatum_core::{routing_config::DEFAULT_ROUTING_CONFIG, FailureBackoffConfig};
 use striatum_store::{dev_descriptor, DecisionListFilter, SqliteRouteStateStore};
-use quota_consumer::QuotaConsumer;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use subc_protocol::manifest::Concurrency;
 use subc_protocol::{
     manifest::{
@@ -2049,7 +2047,8 @@ fn merge_model_upsert(
             };
             ModelFact {
                 billing_plane: None,
-                auth_methods: None, login_methods_documented: false,
+                auth_methods: None,
+                login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
                 provider_id: params.provider_id.clone(),
@@ -2082,7 +2081,9 @@ fn merge_model_upsert(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
-                upstream_status: None, model_type: None, model_kind: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
             }
         }
     };
@@ -2545,8 +2546,7 @@ fn panel_canonical_ids(
         .iter()
         .filter_map(|fact| {
             let route_key = fact_to_route(fact).route_key;
-            let catalog_key =
-                striatum_core::score_alias::catalog_key(catalog_targets, &route_key);
+            let catalog_key = striatum_core::score_alias::catalog_key(catalog_targets, &route_key);
             stored
                 .get(&catalog_key)
                 .map(|canonical_id| (route_key, canonical_id.clone()))
@@ -3171,8 +3171,8 @@ async fn handle_set_decision_outcome(
         .as_deref()
         .is_some_and(|error| error.starts_with("account_limit_exhausted:"));
     let credit_retry_at = (credit_window && account_exhausted).then(|| {
-        let cap = observed_at_ms
-            .saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
+        let cap =
+            observed_at_ms.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
         params
             .retry_after_secs
             .map(|seconds| {
@@ -3248,8 +3248,15 @@ async fn handle_set_decision_outcome(
                             identity.credential_id.as_deref() == Some(credential)
                         }) {
                             let model = decision.selected_model_id.as_deref().unwrap_or("");
-                            let scope=striatum_store::QuotaSuccessScope {family:fence_config.allocator_policy(provider).family_for_model(model),
-                                pool:striatum_core::quota_extract::antigravity_pool_for_capacity(&format!("{provider}/{model}")).map(str::to_string)};
+                            let scope = striatum_store::QuotaSuccessScope {
+                                family: fence_config
+                                    .allocator_policy(provider)
+                                    .family_for_model(model),
+                                pool: striatum_core::quota_extract::antigravity_pool_for_capacity(
+                                    &format!("{provider}/{model}"),
+                                )
+                                .map(str::to_string),
+                            };
                             let decision_id = params.decision_id.clone();
                             let provider = provider.to_owned();
                             let model = model.to_owned();
@@ -3292,8 +3299,9 @@ async fn handle_set_decision_outcome(
                                         decision.created_at as i64,
                                     )?;
                                     Ok(())
-                                })
-                                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                                },
+                            )
+                            .map_err(|e| ModuleError::Message(e.to_string()))?;
                         } else if frozen
                             .as_ref()
                             .and_then(|identity| identity.credential_id.as_deref())
@@ -3324,8 +3332,9 @@ async fn handle_set_decision_outcome(
                                         )?;
                                     }
                                     Ok(())
-                                })
-                                .map_err(|e| ModuleError::Message(e.to_string()))?;
+                                },
+                            )
+                            .map_err(|e| ModuleError::Message(e.to_string()))?;
                         }
                     }
                 }
@@ -3372,16 +3381,15 @@ async fn handle_set_decision_outcome(
                                 &model,
                                 observed_at_ms,
                             )
-                        })
-                        .map_err(|error| ModuleError::Message(error.to_string()))?;
+                        },
+                    )
+                    .map_err(|error| ModuleError::Message(error.to_string()))?;
                 }
             }
         }
     }
-    if striatum_core::fence_lifetimes::probe_is_inconclusive(
-        outcome,
-        params.last_error.as_deref(),
-    ) {
+    if striatum_core::fence_lifetimes::probe_is_inconclusive(outcome, params.last_error.as_deref())
+    {
         if let Some(decision) = store
             .get_decision_by_id(&params.decision_id)
             .map_err(|error| ModuleError::Message(error.to_string()))?
@@ -3403,8 +3411,9 @@ async fn handle_set_decision_outcome(
                             &model,
                             observed_at_ms,
                         )
-                    })
-                    .map_err(|error| ModuleError::Message(error.to_string()))?;
+                    },
+                )
+                .map_err(|error| ModuleError::Message(error.to_string()))?;
             }
         }
     }
@@ -3497,7 +3506,8 @@ fn record_provider_reset_fence(
         };
         let credentials = credentials.lock().map_err(|e| e.to_string())?;
         if !credentials.listed_credentials().iter().any(|row| {
-            row.id == reported && broca_credentials::credential_serves_fact(row, fact, &catalog, &credentials)
+            row.id == reported
+                && broca_credentials::credential_serves_fact(row, fact, &catalog, &credentials)
         }) {
             return Ok(());
         }
@@ -3527,8 +3537,7 @@ fn record_provider_reset_fence(
         credential_id: credential,
         model,
         until_ms: if non_quota {
-            let cap = now
-                .saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
+            let cap = now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
             if let Some(retry) = credit_retry_at {
                 retry.min(cap)
             } else if reset > now {
@@ -3583,9 +3592,7 @@ async fn handle_record_usage(
                 Some(sample) => store
                     .record_speed_sample_delivery(&sample)
                     .map_err(|e| e.to_string()),
-                None => {
-                    Ok(striatum_core::route_state_store::UsageRecordResult::default())
-                }
+                None => Ok(striatum_core::route_state_store::UsageRecordResult::default()),
             });
         return match result {
             Ok(result) => {
@@ -4391,9 +4398,8 @@ async fn handle_record_cooldown(
             credential_id: credential.into(),
             model: model.into(),
             until_ms: if contradicted {
-                let cap = now.saturating_add(
-                    striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
-                );
+                let cap =
+                    now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
                 params
                     .quota_exhausted_until
                     .or(params.cooldown_until)
@@ -5191,9 +5197,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use striatum_core::model_facts::{
-        Confidence, ModelFact, ModelPromptDefaults, ModelScores,
-    };
+    use striatum_core::model_facts::{Confidence, ModelFact, ModelPromptDefaults, ModelScores};
     use striatum_core::model_router::select_model_route_with_config;
     use striatum_core::{FactSource, NativeUsageFacts, UsageObservation};
 
@@ -6788,12 +6792,11 @@ mod tests {
     async fn the_operator_op_lifts_fences_and_refuses_non_operators() {
         let rig = Rig::new("credential-fence-operator-lift");
         let store: SharedStore = Arc::new(rig.open_store());
-        let refusal =
-            |provider: &str| striatum_core::route_state_store::CredentialRefusal {
-                provider_id: provider.into(),
-                credential_id: "apikey:inception".into(),
-                code: "billing_exhausted".into(),
-            };
+        let refusal = |provider: &str| striatum_core::route_state_store::CredentialRefusal {
+            provider_id: provider.into(),
+            credential_id: "apikey:inception".into(),
+            code: "billing_exhausted".into(),
+        };
         let credentials = empty_broca_credentials();
         for provider in ["inception", "other"] {
             credential_fences::record(&store, &credentials, &refusal(provider), now_ms() as i64)
@@ -7021,9 +7024,7 @@ mod tests {
                 "openai/gpt-5.6-sol".to_string(),
                 striatum_core::RouteRuntimeState {
                     quota_pressure: Some(0.7),
-                    quota_window_model: Some(
-                        striatum_core::PaceWindowModel::UtilizationFallback,
-                    ),
+                    quota_window_model: Some(striatum_core::PaceWindowModel::UtilizationFallback),
                     ..Default::default()
                 },
             )]),
@@ -7366,7 +7367,8 @@ mod tests {
     pub(super) fn fact(provider: &str, model: &str) -> ModelFact {
         ModelFact {
             billing_plane: None,
-            auth_methods: None, login_methods_documented: false,
+            auth_methods: None,
+            login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: provider.into(),
@@ -7399,7 +7401,9 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
         }
     }
 
@@ -11741,8 +11745,7 @@ mod tests {
                 rejected_json: serde_json::to_string(&rejections).unwrap(),
                 explanation_json: Some(r#"["cost-primary"]"#.into()),
                 quota_signal_json: Some(
-                    r#"{"state":"present","signals":[{"capacityKey":"p","pressure":0.1}]}"#
-                        .into(),
+                    r#"{"state":"present","signals":[{"capacityKey":"p","pressure":0.1}]}"#.into(),
                 ),
                 policy_revision: Some("policy-compacted".into()),
                 anchor_version: ANCHOR_VERSION,
@@ -11762,13 +11765,14 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&response.body).unwrap()["result"].clone()
         }
         let full = explain(&store).await;
-        assert_eq!(full["detailRetention"], json!({"detail": "full", "strippedAtMs": null}));
+        assert_eq!(
+            full["detailRetention"],
+            json!({"detail": "full", "strippedAtMs": null})
+        );
         assert_eq!(full["why"]["score"], score);
 
         // The full-detail window has passed and the decision is not sampled.
-        let batch = store
-            .strip_decision_detail(i64::MAX, 0, 16, 1_234)
-            .unwrap();
+        let batch = store.strip_decision_detail(i64::MAX, 0, 16, 1_234).unwrap();
         assert_eq!(batch.stripped, 1);
         let compact = explain(&store).await;
         assert_eq!(
@@ -12649,15 +12653,13 @@ mod tests {
                     last_error: None,
                     observed_at_ms: 1_000,
                     failure_backoff: Default::default(),
-                    provider_outcome: Some(
-                        striatum_core::route_state_store::ProviderOutcome {
-                            account_ref: "00000000-0000-4000-8000-0000000000a4".into(),
-                            credential_id: Some("chatgpt:openai:live".into()),
-                            resets_at_ms: Some(i64::MAX),
-                            credential_refusal: None,
-                            ..Default::default()
-                        },
-                    ),
+                    provider_outcome: Some(striatum_core::route_state_store::ProviderOutcome {
+                        account_ref: "00000000-0000-4000-8000-0000000000a4".into(),
+                        credential_id: Some("chatgpt:openai:live".into()),
+                        resets_at_ms: Some(i64::MAX),
+                        credential_refusal: None,
+                        ..Default::default()
+                    }),
                 },
             )
             .unwrap();
@@ -13342,7 +13344,8 @@ mod tests {
                 |(provider, model, efforts)| striatum_store::FusiformFactUpdate {
                     provider_id: (*provider).into(),
                     model_id: (*model).into(),
-                    auth_methods: None, login_methods_documented: false,
+                    auth_methods: None,
+                    login_methods_documented: false,
                     present: true,
                     context_window: Some(200_000.0),
                     max_output_tokens: None,
@@ -13356,7 +13359,9 @@ mod tests {
                     supports_tool_use: Some(true),
                     reasoning_efforts: Some(efforts.iter().map(|e| (*e).to_string()).collect()),
                     canonical_id: None,
-                    upstream_status: None, model_type: None, model_kind: None,
+                    upstream_status: None,
+                    model_type: None,
+                    model_kind: None,
                     lineage: None,
                 },
             )
@@ -15182,7 +15187,8 @@ mod tests {
             striatum_store::FusiformFactUpdate {
                 provider_id: provider.into(),
                 model_id: model.into(),
-                auth_methods: None, login_methods_documented: false,
+                auth_methods: None,
+                login_methods_documented: false,
                 present: true,
                 context_window: Some(200_000.0),
                 max_output_tokens: None,
@@ -15196,7 +15202,9 @@ mod tests {
                 supports_tool_use: None,
                 reasoning_efforts: None,
                 canonical_id: canonical.map(str::to_string),
-                upstream_status: None, model_type: None, model_kind: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
                 lineage: None,
             }
         };
@@ -15487,7 +15495,11 @@ mod tests {
         }
         let credentials = Arc::new(Mutex::new(BrocaCredentials::api_test_credentials(&[a, b])));
         let path = rig.dir.join("routing.jsonc");
-        crate::test_config::write(&path, r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#).unwrap();
+        crate::test_config::write(
+            &path,
+            r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#,
+        )
+        .unwrap();
         async fn select(
             store: &SharedStore,
             credentials: &SharedBrocaCredentials,
@@ -15561,7 +15573,11 @@ mod tests {
             let selected = select(&store, &credentials, &path).await;
             assert_eq!(selected["result"]["selected"], fenced["result"]["selected"]);
         }
-        crate::test_config::write(&path, r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#).unwrap();
+        crate::test_config::write(
+            &path,
+            r#"{"providers":{"a":{"pin_only":false},"b":{"pin_only":false}}}"#,
+        )
+        .unwrap();
         config_overrides::settle_live_config(&path);
         let removed = select(&store, &credentials, &path).await;
         assert_eq!(removed["result"]["selected"]["routeKey"], "a/reader");
@@ -15636,7 +15652,11 @@ mod tests {
         store.upsert_fact(&weak, FactSource::Override).unwrap();
         store.upsert_fact(&strong, FactSource::Override).unwrap();
         let config_path = rig.dir.join("striatum.jsonc");
-        crate::test_config::write(&config_path, r#"{"providers":{"p":{"pin_only":false}},"model_routing":{}}"#).unwrap();
+        crate::test_config::write(
+            &config_path,
+            r#"{"providers":{"p":{"pin_only":false}},"model_routing":{}}"#,
+        )
+        .unwrap();
         let quota_cache = Arc::new(Mutex::new(QuotaCache::default()));
 
         assert_eq!(select(&store, &quota_cache, &config_path).await, "p/strong");

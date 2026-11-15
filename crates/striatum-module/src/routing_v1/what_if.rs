@@ -193,7 +193,9 @@ pub(super) async fn what_if_with_profile_lookup(
     )?;
     let snapshot_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut results = Vec::with_capacity(iqs.as_ref().map_or(0, Vec::len));
-    let pinned_ladder = operator.consumer_policy(&params.consumer, &Default::default(), &Default::default()).operator_ladder();
+    let pinned_ladder = operator
+        .consumer_policy(&params.consumer, &Default::default(), &Default::default())
+        .operator_ladder();
     for iq in iqs.unwrap_or_default() {
         let mut request =
             json!({"consumer": params.consumer, "requirements": {"iq": iq.round() as u8}});
@@ -219,7 +221,11 @@ pub(super) async fn what_if_with_profile_lookup(
             .into_iter()
             .map(|rejected| {
                 let reason = operator
-                    .route_policy_refusal_with_pin(&params.consumer, &rejected.route_key, pinned_ladder)
+                    .route_policy_refusal_with_pin(
+                        &params.consumer,
+                        &rejected.route_key,
+                        pinned_ladder,
+                    )
                     .unwrap_or(rejected.reason);
                 json!({"route": rejected.route_key, "reason": reason})
             })

@@ -26,6 +26,8 @@ use cortexkit_claustrum_client::{
     ClaustrumCredentialResolver, CredentialGetTarget, CredentialResolver, CredentialResolverError,
     CredentialResolverFuture, ScopedCredentialListing,
 };
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use striatum_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use striatum_core::quota::ProviderUsage;
 use striatum_core::route_state_store::FactSource;
@@ -33,8 +35,6 @@ use striatum_core::{ModelFact, RouteStateStore};
 use striatum_store::{
     dev_descriptor, FusiformCatalogCursor, FusiformFactUpdate, SqliteRouteStateStore,
 };
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use tokio::sync::mpsc;
 
@@ -331,13 +331,16 @@ fn install_catalog(
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
         };
         store.upsert_fact(&fact, FactSource::Override).unwrap();
         updates.push(FusiformFactUpdate {
             provider_id: provider,
             model_id: model,
-            auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
+            auth_methods: fact.auth_methods.clone(),
+            login_methods_documented: fact.login_methods_documented,
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,
@@ -351,7 +354,9 @@ fn install_catalog(
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: list("reasoning_efforts"),
             canonical_id: text("canonical_id"),
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
             lineage: fact.family.clone(),
         });
     }

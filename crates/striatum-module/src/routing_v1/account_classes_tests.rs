@@ -3,14 +3,12 @@
 use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
-use striatum_core::accounts::{
-    ConfirmationSource, Fence, FenceScope, GeneralWindow, ResetTime,
-};
+use serde_json::{json, Value};
+use striatum_core::accounts::{ConfirmationSource, Fence, FenceScope, GeneralWindow, ResetTime};
 use striatum_core::billing::{BillingPlane, BillingRate};
 use striatum_core::route_state_store::CredentialRefusal;
 use striatum_core::RouteStateStore;
 use striatum_store::AccountFenceRow;
-use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{reserved, Harness};
@@ -126,7 +124,6 @@ async fn configured_runner_poisoned_credentials_reaches_its_account_operation() 
     assert_eq!(observe.0, FrameType::Error);
     assert_eq!(observe.1["code"], "store_error", "{}", observe.1);
 }
-
 
 #[tokio::test]
 async fn a_legacy_transient_wall_mislabeled_quota_never_refuses_a_model_pin() {
@@ -600,8 +597,8 @@ async fn a_credential_probe_is_a_fallback_and_an_entitlement_failure_renews_it()
 }
 
 pub(super) fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
-    use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
     static VERSION: AtomicU64 = AtomicU64::new(1);
     harness
         .store()
@@ -609,7 +606,8 @@ pub(super) fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
             &[FusiformFactUpdate {
                 provider_id: fact.provider_id.clone(),
                 model_id: fact.model_id.clone(),
-                auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
+                auth_methods: fact.auth_methods.clone(),
+                login_methods_documented: fact.login_methods_documented,
                 present: true,
                 context_window: fact.context_window,
                 max_output_tokens: fact.max_output_tokens,
@@ -623,7 +621,9 @@ pub(super) fn catalog_fact(harness: &Harness, fact: &striatum_core::ModelFact) {
                 supports_tool_use: fact.supports_tool_use,
                 reasoning_efforts: None,
                 canonical_id: None,
-                upstream_status: None, model_type: None, model_kind: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
                 lineage: None,
             }],
             FusiformCatalogCursor {
@@ -861,11 +861,13 @@ async fn paid_only_runner_candidates_require_a_routing_decision() {
         refused.1["detail"]["exclusions"],
         json!([{"account_id":"apikey-account", "credential_id":"apikey:test",
             "reason":"routing_decision_required"}]),
-        "{}", refused.1
+        "{}",
+        refused.1
     );
     assert_eq!(
         cortexkit_role_routing::refusals::retry_class(
-            refused.1["code"].as_str().unwrap(), &refused.1["detail"]
+            refused.1["code"].as_str().unwrap(),
+            &refused.1["detail"]
         ),
         cortexkit_role_routing::refusals::RetryClass::Permanent
     );
@@ -875,7 +877,10 @@ async fn paid_only_runner_candidates_require_a_routing_decision() {
     ] {
         let mut request = account_request("synthetic", id);
         request["candidates"] = json!({"view_digest":id, "accounts":accounts});
-        assert_credential(&runner.call("route.account_for", &request).await, "oauth:test");
+        assert_credential(
+            &runner.call("route.account_for", &request).await,
+            "oauth:test",
+        );
     }
 }
 
@@ -897,7 +902,10 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
         NOW,
     );
     credentials.refresh_serving_methods(
-        &Default::default(), &[account_fact("anthropic")], NOW as i64, &[],
+        &Default::default(),
+        &[account_fact("anthropic")],
+        NOW as i64,
+        &[],
     );
     credentials.runner_declarations.insert(
         RUNNER.into(),
@@ -905,10 +913,16 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
             "pairs":[{"wire_api":"anthropic.messages", "auth_method":"apikey"},
                 {"wire_api":"anthropic.messages", "auth_method":"oauth"}],
             "follows_account_choice":true
-        }})).unwrap().unwrap(),
+        }}))
+        .unwrap()
+        .unwrap(),
     );
-    credentials.runner_routed_accounts.insert(RUNNER.into(), vec!["apikey".into(), "oauth".into()]);
-    credentials.wire_apis.insert("anthropic/model".into(), "anthropic.messages".into());
+    credentials
+        .runner_routed_accounts
+        .insert(RUNNER.into(), vec!["apikey".into(), "oauth".into()]);
+    credentials
+        .wire_apis
+        .insert("anthropic/model".into(), "anthropic.messages".into());
     let planes = credentials.billing_catalog.clone();
     credentials.publish_billing_catalog(planes.with_wire_apis(&credentials.wire_apis));
     harness.set_credentials(credentials);
@@ -925,19 +939,42 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
     assert_eq!(refused.1["detail"]["field"], "decision_id", "{}", refused.1);
-    assert_eq!(refused.1["detail"]["exclusions"], json!([{
-        "account_id":"erin", "credential_id":"apikey:anthropic:erin", "reason":"routing_decision_required"
-    }]), "{}", refused.1);
-    let selected = caller.call("route.select", &json!({
-        "consumer":"mason", "pin":"anthropic-platform/model", "requirements":{"iq":0}
-    })).await;
+    assert_eq!(
+        refused.1["detail"]["exclusions"],
+        json!([{
+            "account_id":"erin", "credential_id":"apikey:anthropic:erin", "reason":"routing_decision_required"
+        }]),
+        "{}",
+        refused.1
+    );
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"mason", "pin":"anthropic-platform/model", "requirements":{"iq":0}
+            }),
+        )
+        .await;
     assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
-    assert_eq!(selected.1["result"]["route"]["provider"], "anthropic-platform", "{}", selected.1);
-    assert_eq!(selected.1["result"]["runner"]["model"]["provider"], "anthropic", "{}", selected.1);
-    assert_eq!(selected.1["result"]["runner"]["auth"]["pool"], "anthropic-platform", "{}", selected.1);
+    assert_eq!(
+        selected.1["result"]["route"]["provider"], "anthropic-platform",
+        "{}",
+        selected.1
+    );
+    assert_eq!(
+        selected.1["result"]["runner"]["model"]["provider"], "anthropic",
+        "{}",
+        selected.1
+    );
+    assert_eq!(
+        selected.1["result"]["runner"]["auth"]["pool"], "anthropic-platform",
+        "{}",
+        selected.1
+    );
     for offered in [false, true] {
         for pool_hint in [false, true] {
-            let mut request = account_request("anthropic", &format!("pool-decision-{offered}-{pool_hint}"));
+            let mut request =
+                account_request("anthropic", &format!("pool-decision-{offered}-{pool_hint}"));
             request["decision_id"] = selected.1["result"]["decision_id"].clone();
             if pool_hint {
                 request["pool"] = json!("anthropic-platform");
@@ -957,9 +994,15 @@ async fn pinned_paid_pool_decision_requires_the_selected_provider_not_the_runner
             request["provider"] = json!("anthropic-platform");
             let admitted = runner.call("route.account_for", &request).await;
             assert_credential(&admitted, "apikey:anthropic:erin");
-            assert_eq!(admitted.1["result"]["account"]["provider"], "anthropic-platform");
+            assert_eq!(
+                admitted.1["result"]["account"]["provider"],
+                "anthropic-platform"
+            );
             assert_eq!(admitted.1["result"]["account"]["method"], "apikey");
-            assert_eq!(admitted.1["result"]["reason"]["decision_id"], request["decision_id"]);
+            assert_eq!(
+                admitted.1["result"]["reason"]["decision_id"],
+                request["decision_id"]
+            );
         }
     }
 }
@@ -1056,9 +1099,9 @@ async fn ten_default_admissions_never_spend_after_subscription_exhaustion_or_ent
 
 #[test]
 fn demand_prices_only_the_class_that_account_for_may_serve() {
-    use striatum_core::RouteStateStore;
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::sync::Mutex;
+    use striatum_core::RouteStateStore;
     let _clock = crate::InjectedClock::set(NOW);
     for (blocked, fallback, expected_subscription, expected_method, expected_rate) in [
         (false, None, true, "oauth", 1.0),
@@ -2769,21 +2812,35 @@ async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset()
     ).unwrap();
     *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
-    let what_if = operator.call("route.what_if", &json!({"consumer":"mason","iqs":[0]})).await;
+    let what_if = operator
+        .call("route.what_if", &json!({"consumer":"mason","iqs":[0]}))
+        .await;
     assert_eq!(what_if.0, FrameType::Response, "{what_if:?}");
-    assert!(what_if.1.to_string().contains("subscription_reserve"), "{what_if:?}");
+    assert!(
+        what_if.1.to_string().contains("subscription_reserve"),
+        "{what_if:?}"
+    );
 
     let caller = harness.bind(reserved(OWNER), None).await;
     for variant in ["xhigh", "max"] {
         let pin = format!("synthetic/model:{variant}");
-        let reply = caller.call("route.select", &json!({"consumer":"mason","pin":pin,
-            "requirements":{"iq":100},"hold_wait_max_s":0})).await;
+        let reply = caller
+            .call(
+                "route.select",
+                &json!({"consumer":"mason","pin":pin,
+            "requirements":{"iq":100},"hold_wait_max_s":0}),
+            )
+            .await;
         assert_eq!(reply.0, FrameType::Error, "{reply:?}");
-        let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
+        let refusal: cortexkit_role_routing::errors::Refusal =
+            serde_json::from_value(reply.1).unwrap();
         assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
         assert_eq!(refusal.detail["reason"], "quota_exhausted", "{refusal:?}");
         assert_eq!(refusal.wait_until_ms(), Some(weekly_reset), "{refusal:?}");
-        assert!(refusal.message.contains("subscription_reserve"), "{refusal:?}");
+        assert!(
+            refusal.message.contains("subscription_reserve"),
+            "{refusal:?}"
+        );
     }
 }
 
@@ -2793,28 +2850,51 @@ async fn pin_availability_timed_account_block_names_its_recovery() {
     let (harness, mut credentials) = setup("synthetic", false);
     let mut listing = credentials.listed_credentials().to_vec();
     listing.retain(|row| row.id == "oauth:test");
-    credentials.apply_listing(&ScopedCredentialListing {
-        view:"only-subscription-account".into(), credentials:listing, ..Default::default()
-    }, NOW);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "only-subscription-account".into(),
+            credentials: listing,
+            ..Default::default()
+        },
+        NOW,
+    );
     harness.set_credentials(credentials);
     let reset = NOW + 600_000;
     oauth_weekly_reading_at(10.0, reset as i64, NOW as i64);
     let caller = harness.bind(reserved(OWNER), None).await;
-    let selected = caller.call("route.select", &json!({"consumer":"mason",
-        "requirements":{"iq":30}})).await;
+    let selected = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason",
+        "requirements":{"iq":30}}),
+        )
+        .await;
     assert_eq!(selected.0, FrameType::Response, "{selected:?}");
     oauth_weekly_reading_at(100.0, reset as i64, NOW as i64);
-    let reported = caller.call("route.report", &json!({
-        "decision_id":selected.1["result"]["decision_id"], "outcome":"refused",
-        "credential_id":"oauth:test", "runner_code":"billing_exhausted"
-    })).await;
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({
+                "decision_id":selected.1["result"]["decision_id"], "outcome":"refused",
+                "credential_id":"oauth:test", "runner_code":"billing_exhausted"
+            }),
+        )
+        .await;
     assert_eq!(reported.0, FrameType::Response, "{reported:?}");
-    let blocks = harness.store().account_transaction(|tx| tx.active_pool_fences("synthetic")).unwrap();
+    let blocks = harness
+        .store()
+        .account_transaction(|tx| tx.active_pool_fences("synthetic"))
+        .unwrap();
     assert_eq!(blocks.len(), 1);
     let block: Fence = serde_json::from_str(&blocks[0].evidence.fence_json).unwrap();
     assert_eq!(block.reset, ResetTime::At(reset as i64));
-    let reply = caller.call("route.select", &json!({"consumer":"mason","pin":"synthetic/model",
-        "requirements":{"iq":30},"hold_wait_max_s":0})).await;
+    let reply = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","pin":"synthetic/model",
+        "requirements":{"iq":30},"hold_wait_max_s":0}),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Error, "{reply:?}");
     let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
     assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
@@ -2860,10 +2940,7 @@ async fn subscription_billing_refusal_keeps_reset_evidence_but_stale_readings_al
     );
     let fence: striatum_core::accounts::Fence =
         serde_json::from_str(&blocks[0].evidence.fence_json).unwrap();
-    assert_eq!(
-        fence.reset,
-        striatum_core::accounts::ResetTime::At(reset)
-    );
+    assert_eq!(fence.reset, striatum_core::accounts::ResetTime::At(reset));
     let blocked = runner
         .call(
             "route.account_for",
@@ -4572,7 +4649,10 @@ async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
     harness.set_credentials(credentials.clone());
     let probe = owner.call("route.select", &select).await;
     assert_eq!(probe.0, FrameType::Response, "{}", probe.1);
-    let decision = probe.1["result"]["decision_id"].as_str().unwrap().to_owned();
+    let decision = probe.1["result"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
 
     let principal = format!("reserved:{RUNNER}");
     let mut winner = account_request("xai", "race-probe-winner");
@@ -4592,7 +4672,12 @@ async fn a_decision_owned_probe_answers_other_admissions_with_a_timed_wait() {
             let mut contender = loser.clone();
             contender["admission_id"] = json!("during-owner-admission");
             crate::account_selection::after_roster_prepared("race-probe-winner", move || {
-                *raced_hook.lock().unwrap() = Some(admit_directly(&harness_hook, &principal_hook, contender, deadline));
+                *raced_hook.lock().unwrap() = Some(admit_directly(
+                    &harness_hook,
+                    &principal_hook,
+                    contender,
+                    deadline,
+                ));
             });
             match admit_directly(&harness, &principal, winner.clone(), deadline) {
                 crate::account_selection::OpReply::Result(result) => {
@@ -4735,7 +4820,10 @@ async fn a_losing_racer_on_a_mixed_roster_gets_a_timed_wait() {
                 (deadline + 1..=deadline + 3_600_000).contains(&retry_at),
                 "{detail}"
             );
-            assert!(detail["retry_after_s"].as_u64().is_some_and(|s| s > 0), "{detail}");
+            assert!(
+                detail["retry_after_s"].as_u64().is_some_and(|s| s > 0),
+                "{detail}"
+            );
         }
         other => panic!("a second probe was admitted: {other:?}"),
     }
@@ -4809,7 +4897,12 @@ async fn a_racer_losing_a_reserved_probe_on_a_mixed_roster_gets_a_timed_wait() {
                 code, "account_pool_exhausted",
                 "losing a reserved probe is a wait, never an untimed refusal: {detail}"
             );
-            assert!(detail["reset_at_ms"].as_i64().is_some_and(|at| at > deadline as i64), "{detail}");
+            assert!(
+                detail["reset_at_ms"]
+                    .as_i64()
+                    .is_some_and(|at| at > deadline as i64),
+                "{detail}"
+            );
         }
         other => panic!("a second probe was admitted: {other:?}"),
     }
@@ -5902,18 +5995,40 @@ fn selection_step(
     step: &str,
 ) -> String {
     match step {
-        "bind" => match context.bind_selected_probe(harness.store(), "synthetic", "model", false, "decision") {
+        "bind" => match context.bind_selected_probe(
+            harness.store(),
+            "synthetic",
+            "model",
+            false,
+            "decision",
+        ) {
             Ok(crate::account_selection::ProbeBinding::Bound) => "Ok(Bound)".into(),
-            Ok(crate::account_selection::ProbeBinding::Lost { retry_at }) => format!("Ok(Lost {{ retry_at: {retry_at} }})"),
+            Ok(crate::account_selection::ProbeBinding::Lost { retry_at }) => {
+                format!("Ok(Lost {{ retry_at: {retry_at} }})")
+            }
             Err(error) => format!("Err({error})"),
         },
         "launch with a pinning runner" => format!(
             "{:?}",
-            context.claim_launch_credential(harness.store(), "synthetic", "model", false, true, None)
+            context.claim_launch_credential(
+                harness.store(),
+                "synthetic",
+                "model",
+                false,
+                true,
+                None
+            )
         ),
         _ => format!(
             "{:?}",
-            context.claim_launch_credential(harness.store(), "synthetic", "model", false, false, None)
+            context.claim_launch_credential(
+                harness.store(),
+                "synthetic",
+                "model",
+                false,
+                false,
+                None
+            )
         ),
     }
 }
@@ -5938,7 +6053,11 @@ fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
             .probe("synthetic", "model", false, false, None, "chosen")
             .admission()
             .map(|admission| admission.credential_id.clone());
-        assert_eq!(chosen.as_deref(), Some("oauth:test"), "{step}: the selection picks the login the block names");
+        assert_eq!(
+            chosen.as_deref(),
+            Some("oauth:test"),
+            "{step}: the selection picks the login the block names"
+        );
         exhaust_oauth(&harness, "synthetic");
         let answer = selection_step(&context, &harness, step);
         let claimed: Vec<_> = harness
@@ -5948,7 +6067,10 @@ fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
             .into_iter()
             .filter(|clock| clock.claim_owner.is_some())
             .collect();
-        assert!(claimed.is_empty(), "{step} claimed past the new block: {claimed:?} ({answer})");
+        assert!(
+            claimed.is_empty(),
+            "{step} claimed past the new block: {claimed:?} ({answer})"
+        );
         // Each step waits for the new block's probe: the time its clock
         // falls due. A launch claim answers `Result<Option<String>, _>`,
         // `Ok(Some(credential))` to pin and `Ok(None)` to go ahead unpinned,
@@ -5960,7 +6082,11 @@ fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
             panic!("{step}: one clock, the new block's: {clocks:?}");
         };
         let wait = format!("Lost {{ retry_at: {} }}", block.due_at());
-        let expected = if step == "bind" { format!("Ok({wait})") } else { format!("Err({wait})") };
+        let expected = if step == "bind" {
+            format!("Ok({wait})")
+        } else {
+            format!("Err({wait})")
+        };
         assert_eq!(answer, expected, "{step} must wait for the new block");
     }
 }
@@ -6013,7 +6139,10 @@ fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
             .into_iter()
             .filter(|clock| clock.claim_owner.is_some())
             .collect();
-        assert!(claimed.is_empty(), "{step} claimed a clock the clear lifted: {claimed:?} ({answer})");
+        assert!(
+            claimed.is_empty(),
+            "{step} claimed a clock the clear lifted: {claimed:?} ({answer})"
+        );
     }
 }
 
@@ -6145,7 +6274,9 @@ fn a_due_block_recorded_after_the_selection_read_is_claimed_by_its_bind() {
     due_provider_block(&harness);
     let clocks = harness.store().fence_rechecks().unwrap();
     assert!(
-        clocks.iter().any(|clock| clock.kind == "provider" && clock.due_at() <= NOW as i64),
+        clocks
+            .iter()
+            .any(|clock| clock.kind == "provider" && clock.due_at() <= NOW as i64),
         "the new block is due: {clocks:?}"
     );
     let answer = selection_step(&context, &harness, "bind");
@@ -6157,7 +6288,10 @@ fn a_due_block_recorded_after_the_selection_read_is_claimed_by_its_bind() {
         .map(|clock| (clock.kind, clock.claim_owner))
         .collect();
     assert_eq!(answer, "Ok(Bound)");
-    assert_eq!(owners, vec![("provider".to_owned(), Some("decision".to_owned()))]);
+    assert_eq!(
+        owners,
+        vec![("provider".to_owned(), Some("decision".to_owned()))]
+    );
 }
 
 /// A launch by a runner that cannot pin its credential, with an account
@@ -6219,7 +6353,10 @@ fn a_block_on_the_launch_login_gives_a_non_pinning_launch_one_timed_wait_either_
             .iter()
             .find(|clock| clock.account_id.as_deref() == Some("oauth-account"))
             .expect("the block has a clock");
-        assert!(block.quota && block.next_recheck_at > NOW as i64, "{block:?}");
+        assert!(
+            block.quota && block.next_recheck_at > NOW as i64,
+            "{block:?}"
+        );
         assert_eq!(
             answer,
             format!("Err(Lost {{ retry_at: {} }})", block.next_recheck_at),
@@ -6256,7 +6393,11 @@ fn a_transient_block_recorded_after_the_selection_read_is_a_timed_wait_not_a_poo
     );
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
     let walls: i64 = conn
-        .query_row("SELECT count(*) FROM account_fence WHERE cleared_at IS NULL", [], |row| row.get(0))
+        .query_row(
+            "SELECT count(*) FROM account_fence WHERE cleared_at IS NULL",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(walls, 0, "no account is walled");
     let claimed: Vec<_> = harness

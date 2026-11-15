@@ -4,12 +4,12 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::{params, Connection};
 use striatum_store::{
     dev_descriptor, AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord,
     AccountDemandRow, AccountFenceRow, AccountPinRow, SqliteRouteStateStore, ACCOUNT_DEMAND_SQL,
     DECISION_MODE_SERVE,
 };
-use rusqlite::{params, Connection};
 
 static NEXT_RIG: AtomicU64 = AtomicU64::new(0);
 

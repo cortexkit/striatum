@@ -591,12 +591,10 @@ mod tests {
             crate::now_ms()
         ));
         let store = Arc::new(
-            striatum_store::SqliteRouteStateStore::open(
-                &striatum_store::dev_descriptor(
-                    "call-flush-timer",
-                    path.to_string_lossy().into_owned(),
-                ),
-            )
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "call-flush-timer",
+                path.to_string_lossy().into_owned(),
+            ))
             .unwrap(),
         );
         let observer = rusqlite::Connection::open(&path).unwrap();

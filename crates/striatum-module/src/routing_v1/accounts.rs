@@ -11,13 +11,15 @@ use cortexkit_role_routing::account::{
     parse_account_for_request_serving, Account, AccountForAnswer, AccountForRequest, AccountPin,
     AccountReason, AccountReasonCode, Admission,
 };
-use cortexkit_role_routing::errors::{AccountUnservableDetail, AccountUnservableReason, NoRouteReason, Refusal, RefusalCode};
+use cortexkit_role_routing::errors::{
+    AccountUnservableDetail, AccountUnservableReason, NoRouteReason, Refusal, RefusalCode,
+};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request_serving, AccountObserveAnswer, Observation,
 };
 use cortexkit_role_routing::service_tier::{check_chosen, ServiceTier};
-use striatum_store::V1Recorded;
 use serde_json::{json, Value};
+use striatum_store::V1Recorded;
 
 use super::{account_ctx, now_ms, provider_refusal, Caller, Deps};
 use crate::account_refusal_log::{because, checking};
@@ -116,9 +118,16 @@ impl AccountCaller<'_> {
 /// child can look up its parent's reported use without sharing admission ids.
 fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCaller<'a>, Refusal> {
     checking("caller_check");
-    let runners = deps.broca_credentials.lock().map(|credentials| {
-        super::runners::enrollment::policies(&super::operator_config(deps).v1_runners(), &credentials)
-    }).unwrap_or_else(|_| super::operator_config(deps).v1_runners());
+    let runners = deps
+        .broca_credentials
+        .lock()
+        .map(|credentials| {
+            super::runners::enrollment::policies(
+                &super::operator_config(deps).v1_runners(),
+                &credentials,
+            )
+        })
+        .unwrap_or_else(|_| super::operator_config(deps).v1_runners());
     if caller.binding_is_current() {
         if let Some(module) = caller.attested_module().filter(|module| {
             runners.iter().any(|runner| runner.module == *module)
@@ -316,7 +325,10 @@ fn account_for_inner(
         return replay_admission(first, &body_json, &request, &authority, deps);
     }
     #[cfg(test)]
-    account_selection::run_after_roster_hook(&format!("v1-replay-checked:{}", request.admission_id));
+    account_selection::run_after_roster_hook(&format!(
+        "v1-replay-checked:{}",
+        request.admission_id
+    ));
     // Every refusal from here on was decided without the admission record: an
     // identical request may have committed this admission id since the check
     // above. Look again before refusing, and answer as that admission did.
@@ -341,7 +353,8 @@ fn account_for_inner(
                 caller.attested_module() == Some(decision.runner_module.as_str())
                     && same_name(&decision.provider, &request.provider)
                     && same_name(&decision.model, &request.model)
-                    && (!engine_decision || super::engines::now(deps) < decision.expires_at_ms as u64)
+                    && (!engine_decision
+                        || super::engines::now(deps) < decision.expires_at_ms as u64)
             }) {
                 return Err(because("unknown_decision", Refusal::unknown_decision()));
             }
@@ -361,7 +374,9 @@ fn account_for_inner(
                 // The stored tier, not the caller's request, is invalid.
                 if bound_tier.as_deref().and_then(ServiceTier::parse).is_none() {
                     return Err(Refusal::account_unservable(
-                        AccountUnservableReason::StoredStateInvalid, vec![], vec![],
+                        AccountUnservableReason::StoredStateInvalid,
+                        vec![],
+                        vec![],
                     ));
                 }
                 return Err(Refusal::with(
@@ -398,14 +413,18 @@ fn account_for_inner(
         .map_err(op_refusal)?;
         parsed.call = Some(call.clone());
         let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
-        let policy =
-            config_overrides::live_config(deps.routing_config_path).allocator_policy(&request.provider);
+        let policy = config_overrides::live_config(deps.routing_config_path)
+            .allocator_policy(&request.provider);
         // A store failure while building the shared context is reported by
         // `account_for` as transient unavailability, which callers retry,
         // rather than as a `store_error` refusal.
         checking("account_context");
-        if flags.enabled && !crate::broca_credentials::wait_for_first_listing(deps.broca_credentials) {
-            return Err(op_refusal(crate::broca_credentials::listing_not_ready(params)));
+        if flags.enabled
+            && !crate::broca_credentials::wait_for_first_listing(deps.broca_credentials)
+        {
+            return Err(op_refusal(crate::broca_credentials::listing_not_ready(
+                params,
+            )));
         }
         let mut ctx = account_ctx(deps, flags, &policy)
             .map_err(|refusal| account_unavailable(refusal.message))?;
@@ -417,11 +436,9 @@ fn account_for_inner(
                     "Routing can't read the media-provider credential list right now: its listing grant is missing or the last listing is stale or failed. Retry shortly; if it persists, the vault's media-provider list grant for routing needs checking.",
                 ));
             }
-            if !credentials
-                .listed_credentials()
-                .iter()
-                .any(|row| crate::account_selection::media_credential_serves(row, &request.provider))
-            {
+            if !credentials.listed_credentials().iter().any(|row| {
+                crate::account_selection::media_credential_serves(row, &request.provider)
+            }) {
                 return Err(super::provider_refusal(
                     "auth_required",
                     "No active API key in the vault's media-provider category serves this engine's provider. Add or enable one before using this engine.",
@@ -442,7 +459,12 @@ fn account_for_inner(
             body_json,
             bound_tier,
         };
-        match account_selection::account_for_parsed(parsed, &authority.principal, &ctx, Some(record)) {
+        match account_selection::account_for_parsed(
+            parsed,
+            &authority.principal,
+            &ctx,
+            Some(record),
+        ) {
             OpReply::Result(result) => Ok(result),
             error => Err(op_refusal(error)),
         }
@@ -484,12 +506,17 @@ pub(crate) struct AdmissionRecord {
 }
 
 #[cfg(test)]
-static FINISH_ANSWERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, fn(&mut Value)>>> =
-    std::sync::LazyLock::new(Default::default);
+static FINISH_ANSWERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, fn(&mut Value)>>,
+> = std::sync::LazyLock::new(Default::default);
 
 #[cfg(test)]
 pub(crate) fn inject_finish_answer(admission_id: &str, mutation: fn(&mut Value)) {
-    assert!(FINISH_ANSWERS.lock().unwrap().insert(admission_id.into(), mutation).is_none());
+    assert!(FINISH_ANSWERS
+        .lock()
+        .unwrap()
+        .insert(admission_id.into(), mutation)
+        .is_none());
 }
 
 #[derive(Debug)]
@@ -571,7 +598,9 @@ impl AdmissionRecord {
         {
             checking("chosen_service_tier");
             let mut refusal = Refusal::account_unservable(
-                AccountUnservableReason::BoundTierUnavailable, vec![], vec![],
+                AccountUnservableReason::BoundTierUnavailable,
+                vec![],
+                vec![],
             );
             refusal.message = "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.".into();
             return Err(refusal);
@@ -724,7 +753,9 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
     };
     let missing = |what: &str| {
         let mut refusal = Refusal::account_unservable(
-            AccountUnservableReason::AllocatorInvariant, vec![], vec![],
+            AccountUnservableReason::AllocatorInvariant,
+            vec![],
+            vec![],
         );
         refusal.message = format!("the allocator's answer has no {what}");
         refusal
@@ -850,7 +881,9 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 message.clone(),
             );
             if let Some(exclusions) = detail.and_then(|detail| detail.get("exclusions")) {
-                refusal.detail.insert("exclusions".into(), exclusions.clone());
+                refusal
+                    .detail
+                    .insert("exclusions".into(), exclusions.clone());
             }
             refusal
         }
@@ -877,13 +910,15 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             }
             refusal
         }
-        "no_eligible_account" => Refusal::account_unservable(
-            AccountUnservableReason::NoEligibleAccount, vec![], vec![],
-        ),
+        "no_eligible_account" => {
+            Refusal::account_unservable(AccountUnservableReason::NoEligibleAccount, vec![], vec![])
+        }
         "account_unservable" => {
             // The allocator already used the bounded constructor. Preserve its
             // full counts rather than counting the truncated lists again.
-            match detail.and_then(|detail| serde_json::from_value::<AccountUnservableDetail>(detail.clone()).ok()) {
+            match detail.and_then(|detail| {
+                serde_json::from_value::<AccountUnservableDetail>(detail.clone()).ok()
+            }) {
                 Some(detail) => {
                     let mut refusal = Refusal::account_unservable(
                         detail.reason,
@@ -892,7 +927,10 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                     );
                     for (key, count) in [
                         ("offered_credential_count", detail.offered_credential_count),
-                        ("eligible_credential_count", detail.eligible_credential_count),
+                        (
+                            "eligible_credential_count",
+                            detail.eligible_credential_count,
+                        ),
                     ] {
                         if refusal.detail.contains_key(key) {
                             if let Some(count) = count {
@@ -903,7 +941,9 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                     refusal
                 }
                 None => Refusal::account_unservable(
-                    AccountUnservableReason::Unknown("unspecified".into()), vec![], vec![],
+                    AccountUnservableReason::Unknown("unspecified".into()),
+                    vec![],
+                    vec![],
                 ),
             }
         }
@@ -1015,27 +1055,23 @@ fn account_observe_inner(
     // The allocator reads these two as closed sets of its own.
     if let Some(origin) = &request.upstream_origin {
         checking("observation_origin");
-        serde_json::from_value::<striatum_core::accounts::evidence::FrameOrigin>(json!(
-            origin
-        ))
-        .map_err(|_| {
-            Refusal::invalid_request(
-                "upstream_origin",
-                format!("{origin:?} is not a frame origin"),
-            )
-        })?;
+        serde_json::from_value::<striatum_core::accounts::evidence::FrameOrigin>(json!(origin))
+            .map_err(|_| {
+                Refusal::invalid_request(
+                    "upstream_origin",
+                    format!("{origin:?} is not a frame origin"),
+                )
+            })?;
     }
     if let Some(source) = &request.resets_at_source {
         checking("observation_reset_source");
-        serde_json::from_value::<striatum_core::accounts::evidence::ResetSource>(json!(
-            source
-        ))
-        .map_err(|_| {
-            Refusal::invalid_request(
-                "resets_at_source",
-                format!("{source:?} is not a reset source"),
-            )
-        })?;
+        serde_json::from_value::<striatum_core::accounts::evidence::ResetSource>(json!(source))
+            .map_err(|_| {
+                Refusal::invalid_request(
+                    "resets_at_source",
+                    format!("{source:?} is not a reset source"),
+                )
+            })?;
     }
     let mut legacy = serde_json::to_value(&request)
         .map_err(|error| provider_refusal("internal_error", error.to_string()))?;

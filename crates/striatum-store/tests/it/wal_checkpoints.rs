@@ -45,7 +45,10 @@ fn writer_uses_memory_temp_store() {
         })
         .unwrap();
     assert_eq!(temp_store, 2, "SQLite MEMORY is 2");
-    assert!(tracking, "configuring temp_store must preserve catalog tracking");
+    assert!(
+        tracking,
+        "configuring temp_store must preserve catalog tracking"
+    );
 }
 
 #[test]

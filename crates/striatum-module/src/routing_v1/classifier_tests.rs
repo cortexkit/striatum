@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use cortexkit_role_classifier::describe::{check_describe, RoleDescribe};
 use cortexkit_role_routing_conformance::CatalogModel;
-use striatum_core::ModelFact;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use striatum_core::ModelFact;
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{catalog_fact, reserved, Harness, Route};
@@ -347,11 +347,19 @@ async fn missing_question_limit_fails_closed_and_another_modules_listing_is_igno
     let route = harness.bind(reserved("another-module"), None).await;
     refused(&route, json!({"iq":0})).await;
     let route = harness.bind(reserved("example-consumer"), None).await;
-    let reply = route.call("route.select",
-        &json!({"consumer":"mason","requirements":{"iq":50}})).await;
+    let reply = route
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":50}}),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(reply.1["code"], "no_route");
-    assert!(reply.1.to_string().contains("not_chat_kind:decision"), "{}", reply.1);
+    assert!(
+        reply.1.to_string().contains("not_chat_kind:decision"),
+        "{}",
+        reply.1
+    );
 }
 
 #[tokio::test]

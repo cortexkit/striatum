@@ -2,7 +2,10 @@
 //! Billing planes, requested runner wire/auth pairs and provider limits, listing
 //! age and probe ownership stay dynamic.
 
-use crate::{broca_credentials::{AuthCatalog, BrocaCredentials}, config_overrides::LiveConfig};
+use crate::{
+    broca_credentials::{AuthCatalog, BrocaCredentials},
+    config_overrides::LiveConfig,
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{Arc, Mutex, OnceLock},

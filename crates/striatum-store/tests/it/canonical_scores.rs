@@ -53,7 +53,8 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
     FusiformFactUpdate {
         provider_id: provider.to_string(),
         model_id: model.to_string(),
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         present: true,
         context_window: Some(200_000.0),
         max_output_tokens: Some(32_000),
@@ -67,7 +68,9 @@ fn served(route: &str, canonical_id: Option<&str>) -> FusiformFactUpdate {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: canonical_id.map(str::to_string),
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     }
 }

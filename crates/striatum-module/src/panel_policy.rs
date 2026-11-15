@@ -1,11 +1,11 @@
 //! Translate the panel wire request and the live operator policy into routing inputs.
 
 use crate::config_policy::{ExtraRanking, PanelPolicies, Ranking};
+use serde::{Deserialize, Serialize};
 use striatum_core::panel::{
     ClassPanelPolicy, PanelClass, PanelDiversity, PanelExtraOrder, PanelOrder, PanelSpec,
 };
 use striatum_core::{fact_to_route, ExclusionPolicy, ExclusionSpecs, ModelFact};
-use serde::{Deserialize, Serialize};
 
 /// Decode retired size, IQ-floor and diversity hints without letting them
 /// override the width, quality bar or family rule in the operator's class policy.

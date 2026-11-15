@@ -2081,7 +2081,11 @@ async fn handle_select_request_attempt(
             && (!mapped_availability.models.contains(&route.route_key)
                 || mapped_availability.rejected.contains_key(&route.route_key))
             && !candidate_filters.contains_key(&route.route_key)
-            && operator_config.route_allowed(consumer_id, &route.route_key, consumer_policy.operator_ladder())
+            && operator_config.route_allowed(
+                consumer_id,
+                &route.route_key,
+                consumer_policy.operator_ladder(),
+            )
             && select_policy::choose_runner(
                 &configured_runners,
                 consumer_policy.runner.as_deref(),
@@ -2262,11 +2266,8 @@ async fn handle_select_request_attempt(
         let mut pin_availability = mapped_availability.rejected.clone();
         // Capture the timed route wall's expiry so a caller forbidden to fall
         // back can wait until the pinned route becomes admissible again.
-        let pin_wall_until = striatum_core::model_router::route_wall_until(
-            &pin_snapshot,
-            &pin_key,
-            &pin_capacity,
-        );
+        let pin_wall_until =
+            striatum_core::model_router::route_wall_until(&pin_snapshot, &pin_key, &pin_capacity);
         let mut pin_available = available.clone();
         let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
             && operator_config.route_allowed(consumer_id, &pin_capacity, true);
@@ -2434,45 +2435,57 @@ async fn handle_select_request_attempt(
                     &selected.model.model_id,
                     priced_per_token,
                 )
-                .map_err(|(code, message)| work_model_pin::Refusal { code, message, retry_at: None })?;
+                .map_err(|(code, message)| work_model_pin::Refusal {
+                    code,
+                    message,
+                    retry_at: None,
+                })?;
             }
             // Resolve the Broca launch target and its credential mapping
             // before recording a decision; an unusable mapping rejects the pin.
             // A deferred runner pin leases nothing until core completes it.
-            let runner =
-                if pin_harness == Some(substrate_policy::Harness::Broca) && !deferred_runner_pin {
-                    let session = pool_session(
-                        params.task_id.as_deref(),
-                        params.send_id.as_deref(),
-                        &format!("route.select:{}", now as i64),
-                    );
-                    Some(
-                        runner_for_route(
-                            &catalog_targets,
-                            broca_credentials,
-                            store.as_ref(),
-                            &session,
-                            &selected.model.provider_id,
-                            &selected.model.model_id,
-                            selected.prompt_params.variant.as_deref(),
-                            classes.as_ref(),
-                            priced_per_token,
-                            None,
-                        )
-                        .map_err(|refusal| match refusal {
-                            account_selection::LaunchRefusal::Lost { retry_at } => work_model_pin::Refusal {
-                                code: "no_route".into(),
-                                message: "the selected recovery probe is held by another request".into(),
-                                retry_at: Some(retry_at),
-                            },
-                            account_selection::LaunchRefusal::Refused { code, message } => {
-                                work_model_pin::Refusal { code, message, retry_at: None }
-                            }
-                        })?,
+            let runner = if pin_harness == Some(substrate_policy::Harness::Broca)
+                && !deferred_runner_pin
+            {
+                let session = pool_session(
+                    params.task_id.as_deref(),
+                    params.send_id.as_deref(),
+                    &format!("route.select:{}", now as i64),
+                );
+                Some(
+                    runner_for_route(
+                        &catalog_targets,
+                        broca_credentials,
+                        store.as_ref(),
+                        &session,
+                        &selected.model.provider_id,
+                        &selected.model.model_id,
+                        selected.prompt_params.variant.as_deref(),
+                        classes.as_ref(),
+                        priced_per_token,
+                        None,
                     )
-                } else {
-                    None
-                };
+                    .map_err(|refusal| match refusal {
+                        account_selection::LaunchRefusal::Lost { retry_at } => {
+                            work_model_pin::Refusal {
+                                code: "no_route".into(),
+                                message: "the selected recovery probe is held by another request"
+                                    .into(),
+                                retry_at: Some(retry_at),
+                            }
+                        }
+                        account_selection::LaunchRefusal::Refused { code, message } => {
+                            work_model_pin::Refusal {
+                                code,
+                                message,
+                                retry_at: None,
+                            }
+                        }
+                    })?,
+                )
+            } else {
+                None
+            };
             Ok((selected, runner, variant_choice))
         });
         timing.record_selection(selection_started.elapsed());
@@ -2550,7 +2563,8 @@ async fn handle_select_request_attempt(
                     if let account_selection::ProbeBinding::Lost { retry_at } = binding {
                         *probe_lost = true;
                         lost_probe_routes.insert(selected.route_key.clone());
-                        *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                        *lost_probe_until =
+                            Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
                         return Ok(());
                     }
                 }
@@ -2602,10 +2616,16 @@ async fn handle_select_request_attempt(
                                 Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
                                     *probe_lost = true;
                                     lost_probe_routes.insert(selected.route_key.clone());
-                                    *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                    *lost_probe_until = Some(
+                                        lost_probe_until
+                                            .map_or(retry_at, |prior| prior.min(retry_at)),
+                                    );
                                     return Ok(());
                                 }
-                                Err(account_selection::LaunchRefusal::Refused { code, message }) => {
+                                Err(account_selection::LaunchRefusal::Refused {
+                                    code,
+                                    message,
+                                }) => {
                                     return send_route_error(
                                         writer, ver, channel, epoch, corr, &code, &message,
                                     )
@@ -2645,21 +2665,41 @@ async fn handle_select_request_attempt(
                 if refusal.code == "decommissioned" {
                     let refusal = cortexkit_role_routing::errors::Refusal::pin_unavailable(
                         pin,
-                        cortexkit_role_routing::errors::PinUnavailableReason::parse("decommissioned"),
+                        cortexkit_role_routing::errors::PinUnavailableReason::parse(
+                            "decommissioned",
+                        ),
                         None,
                     );
-                    return send_route_error_body(writer, ver, channel, epoch, corr, ErrorBody {
-                        code: refusal.code.as_str().into(), message: refusal.message,
-                        detail: Some(serde_json::Value::Object(refusal.detail)),
-                    }).await;
+                    return send_route_error_body(
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        ErrorBody {
+                            code: refusal.code.as_str().into(),
+                            message: refusal.message,
+                            detail: Some(serde_json::Value::Object(refusal.detail)),
+                        },
+                    )
+                    .await;
                 }
                 // A store failure is answered as such, even after an earlier
                 // route lost its probe: the wait would hide it.
-                let lost = [*lost_probe_until, refusal.retry_at].into_iter().flatten().min();
+                let lost = [*lost_probe_until, refusal.retry_at]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 if let Some(until) = lost.filter(|_| refusal.code != "store_error") {
                     return send_route_error_body(
-                        writer, ver, channel, epoch, corr, lost_probe_wait(until),
-                    ).await;
+                        writer,
+                        ver,
+                        channel,
+                        epoch,
+                        corr,
+                        lost_probe_wait(until),
+                    )
+                    .await;
                 }
                 if let Some(detail) = pin_availability.get(&pin_key) {
                     if !refusal.message.contains(detail) {
@@ -2803,7 +2843,10 @@ async fn handle_select_request_attempt(
     let selection_started = Instant::now();
     let selection = match attempt(snapshot.clone()) {
         Ok(selected) => Ok(selected),
-        Err(no_route) if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted && !consumer_policy.operator_ladder() => {
+        Err(no_route)
+            if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted
+                && !consumer_policy.operator_ladder() =>
+        {
             // Break-glass: in a subscription environment "all routes exhausted" is a
             // common steady state and stalls the orchestrator. Retry ONCE against a
             // snapshot that clears the single earliest-reset route.
@@ -2894,7 +2937,16 @@ async fn handle_select_request_attempt(
                 config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
                 &catalog_targets,
             ) {
-                return send_route_error(writer, ver, channel, epoch, corr, &refusal.code, &refusal.message).await;
+                return send_route_error(
+                    writer,
+                    ver,
+                    channel,
+                    epoch,
+                    corr,
+                    &refusal.code,
+                    &refusal.message,
+                )
+                .await;
             }
             let variant_choice = apply_variant_policy(
                 &mut selected,
@@ -2906,7 +2958,8 @@ async fn handle_select_request_attempt(
                     .as_deref()
                     .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
                     .and_then(|pin| pin.variant)
-                    .as_deref().or(ladder_variant.as_deref()),
+                    .as_deref()
+                    .or(ladder_variant.as_deref()),
             );
             selected.explanation.push(policy_sources.clone());
             if let Some(line) = &executor_workload {
@@ -2937,9 +2990,7 @@ async fn handle_select_request_attempt(
                 Some(&policy_sources),
             );
             decision.allowed_account_class =
-                striatum_core::accounts::AllowedAccountClass::from_pay_per_token(
-                    priced_per_token,
-                );
+                striatum_core::accounts::AllowedAccountClass::from_pay_per_token(priced_per_token);
             if !host_run {
                 crate::tier_settings::record_requested(
                     &mut decision.requirements_json,
@@ -2977,7 +3028,9 @@ async fn handle_select_request_attempt(
                         if let account_selection::ProbeBinding::Lost { retry_at } = binding {
                             *probe_lost = true;
                             lost_probe_routes.insert(selected.route_key.clone());
-                            *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                            *lost_probe_until = Some(
+                                lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)),
+                            );
                             return Ok(());
                         }
                     }
@@ -3065,7 +3118,9 @@ async fn handle_select_request_attempt(
                             Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
                                 *probe_lost = true;
                                 lost_probe_routes.insert(selected.route_key.clone());
-                                *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                *lost_probe_until = Some(
+                                    lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)),
+                                );
                                 return Ok(());
                             }
                             Err(account_selection::LaunchRefusal::Refused { code, message }) => {
@@ -3093,10 +3148,16 @@ async fn handle_select_request_attempt(
                                 Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
                                     *probe_lost = true;
                                     lost_probe_routes.insert(selected.route_key.clone());
-                                    *lost_probe_until = Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
+                                    *lost_probe_until = Some(
+                                        lost_probe_until
+                                            .map_or(retry_at, |prior| prior.min(retry_at)),
+                                    );
                                     return Ok(());
                                 }
-                                Err(account_selection::LaunchRefusal::Refused { code, message }) => {
+                                Err(account_selection::LaunchRefusal::Refused {
+                                    code,
+                                    message,
+                                }) => {
                                     return send_route_error(
                                         writer, ver, channel, epoch, corr, &code, &message,
                                     )
@@ -3383,8 +3444,8 @@ pub(crate) fn runner_for_route(
                 true,
                 owner,
             )?;
-            if let Some(runner) = pin
-                .and_then(|id| striatum_core::runner::RunnerModel::pinned(&id, model, variant))
+            if let Some(runner) =
+                pin.and_then(|id| striatum_core::runner::RunnerModel::pinned(&id, model, variant))
             {
                 return Ok((runner, None));
             }
@@ -3628,12 +3689,11 @@ async fn handle_select_panel(
         credentials.price_facts(&mut prepared.facts, live_config.pricing());
     }
     live_config.apply(&mut prepared.facts);
-    let panel_consumer =
-        if params.panel_spec.class == striatum_core::panel::PanelClass::Lab {
-            select_policy::Consumer::Lab
-        } else {
-            select_policy::Consumer::Athena
-        };
+    let panel_consumer = if params.panel_spec.class == striatum_core::panel::PanelClass::Lab {
+        select_policy::Consumer::Lab
+    } else {
+        select_policy::Consumer::Athena
+    };
     let mut classes = account_selection::ClassContext::read_with_catalog(
         store,
         broca_credentials,

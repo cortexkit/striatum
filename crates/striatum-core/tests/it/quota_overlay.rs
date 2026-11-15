@@ -16,16 +16,15 @@ use striatum_core::quota::{
 use striatum_core::quota_pace::{
     project_quota_pressure, PaceError, PaceInput, DEFAULT_PACE_CONFIG,
 };
-use striatum_core::{
-    extract_windows, make_capacity_key, make_route_key, ModelRequirements,
-};
+use striatum_core::{extract_windows, make_capacity_key, make_route_key, ModelRequirements};
 
 const NOW: f64 = 1_000_000.0;
 
 fn fact(provider: &str, model: &str, cost: f64) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: provider.into(),
@@ -58,7 +57,9 @@ fn fact(provider: &str, model: &str, cost: f64) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
     }
 }
 

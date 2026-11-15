@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+use serde::Deserialize;
+use serde_json::{json, Value};
 use striatum_core::model_resolution::build_usage_observation;
 use striatum_core::{
     find_most_specific_fallback_entry, fuzzy_match_model, resolve_compatible_model_settings,
@@ -10,8 +12,6 @@ use striatum_core::{
     NativeUsageFacts, RouteStateStore, SnapshotLimit, SnapshotModalities, UserModelPinRequest,
     VariantFact,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use tokio::sync::mpsc;
 
@@ -455,12 +455,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store: SharedStore = std::sync::Arc::new(
-            striatum_store::SqliteRouteStateStore::open(
-                &striatum_store::dev_descriptor(
-                    "capabilities-lineage",
-                    dir.join("store.db").to_string_lossy().into_owned(),
-                ),
-            )
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "capabilities-lineage",
+                dir.join("store.db").to_string_lossy().into_owned(),
+            ))
             .unwrap(),
         );
         let request = || CapabilitiesParams {
@@ -497,12 +495,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let store: SharedStore = std::sync::Arc::new(
-            striatum_store::SqliteRouteStateStore::open(
-                &striatum_store::dev_descriptor(
-                    "capabilities-unknown",
-                    dir.join("store.db").to_string_lossy().into_owned(),
-                ),
-            )
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "capabilities-unknown",
+                dir.join("store.db").to_string_lossy().into_owned(),
+            ))
             .unwrap(),
         );
         let snapshot = snapshot_from_store(&store, "lineage-fixture", "claude-impostor-a").unwrap();
@@ -540,12 +536,10 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create capabilities test directory");
         let store: SharedStore = std::sync::Arc::new(
-            striatum_store::SqliteRouteStateStore::open(
-                &striatum_store::dev_descriptor(
-                    "striatum-capabilities-version",
-                    dir.join("store.db").to_string_lossy().into_owned(),
-                ),
-            )
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "striatum-capabilities-version",
+                dir.join("store.db").to_string_lossy().into_owned(),
+            ))
             .expect("open capabilities test store"),
         );
         let request = || CapabilitiesParams {

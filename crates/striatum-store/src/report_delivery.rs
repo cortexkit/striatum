@@ -98,16 +98,17 @@ impl SqliteRouteStateStore {
         let error = error.map(str::to_owned);
         let effects = effects.clone();
         let usage = usage.cloned();
-        let mut command = move |account: &AccountTx<'_>,
-                            state: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
-            let decision_id = decision_id.as_str();
-            let delivery_key = delivery_key.as_str();
-            let report_id = report_id.as_str();
-            let error = error.as_deref();
-            let effects = &effects;
-            let usage = usage.as_ref();
-            let tx = account.conn;
-            (|| -> rusqlite::Result<(Option<V1Recorded>, bool)> {
+        let mut command =
+            move |account: &AccountTx<'_>,
+                  state: Option<&mut (dyn crate::AccountWorkingState + 'static)>| {
+                let decision_id = decision_id.as_str();
+                let delivery_key = delivery_key.as_str();
+                let report_id = report_id.as_str();
+                let error = error.as_deref();
+                let effects = &effects;
+                let usage = usage.as_ref();
+                let tx = account.conn;
+                (|| -> rusqlite::Result<(Option<V1Recorded>, bool)> {
             let standing = tx.query_row(
                 "SELECT body_json, answer_json FROM routing_v1_report_delivery
                  WHERE decision_id=?1 AND delivery_key=?2",
@@ -173,7 +174,7 @@ impl SqliteRouteStateStore {
             report_crash("before_commit");
             Ok((Some(recorded.clone()), usage.is_some()))
             })().map_err(err)
-        };
+            };
         let result = if self.is_private_account_copy() {
             self.account_command(AccountCommandKind::Report, move |account| {
                 command(account, None)
@@ -245,12 +246,10 @@ impl AccountTx<'_> {
                 let pool: Option<String> = match self.working_blocks()? {
                     // Only active fences are held; one already cleared has
                     // nothing left to heal.
-                    Some(blocks) => {
-                        match key[0].as_str().and_then(|id| blocks.account_fence(id)) {
-                            Some((_, pool, _)) => pool.map(str::to_owned),
-                            None => continue,
-                        }
-                    }
+                    Some(blocks) => match key[0].as_str().and_then(|id| blocks.account_fence(id)) {
+                        Some((_, pool, _)) => pool.map(str::to_owned),
+                        None => continue,
+                    },
                     None => self
                         .conn
                         .query_row(
@@ -517,8 +516,15 @@ impl AccountTx<'_> {
         let changed = self.conn.execute("DELETE FROM credential_entitlement_fences WHERE provider_id=?1 AND credential_id=?2
             AND code=?3 AND listing_fingerprint IS ?4 AND observed_at_ms=?5",
             params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms]).map_err(err)?;
-        crate::block_state::expect_changes(changed, 1,
-            format_args!("clear of credential refusal {} {}", fence.provider_id, fence.credential_id)).map_err(err)
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!(
+                "clear of credential refusal {} {}",
+                fence.provider_id, fence.credential_id
+            ),
+        )
+        .map_err(err)
     }
 
     pub fn report_credential_refusals(

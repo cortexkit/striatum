@@ -13,12 +13,10 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use striatum_core::{
-    DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome, RouteStateStore,
-};
+use rusqlite::Connection;
+use striatum_core::{DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome, RouteStateStore};
 use striatum_store::backup::{BACKUP_EXCLUDABLE_TABLES, BACKUP_REQUIRED_TABLES};
 use striatum_store::{dev_descriptor, SqliteRouteStateStore};
-use rusqlite::Connection;
 
 fn open(path: &std::path::Path) -> SqliteRouteStateStore {
     SqliteRouteStateStore::open(&dev_descriptor(

@@ -122,9 +122,7 @@ mod tests {
 
     #[test]
     fn absent_manual_upserts_are_reported_but_keep_their_config_overlays() {
-        use striatum_store::{
-            dev_descriptor, FusiformCatalogCursor, SqliteRouteStateStore,
-        };
+        use striatum_store::{dev_descriptor, FusiformCatalogCursor, SqliteRouteStateStore};
         let scratch = cortexkit_test_support::ScratchDir::new("manual-upsert-config-presence");
         let descriptor = dev_descriptor(
             "manual-upsert-config-presence",

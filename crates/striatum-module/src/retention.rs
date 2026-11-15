@@ -63,9 +63,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::Value;
 use striatum_core::RouteStateStore;
 use striatum_store::SqliteRouteStateStore;
-use serde_json::Value;
 
 use crate::config_overrides::read_routing_config_value;
 
@@ -894,8 +894,8 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 #[cfg(test)]
 mod tests {
     use super::*;
-    use striatum_store::{dev_descriptor, AccountDecisionRecord, AccountObservationRow};
     use serde_json::json;
+    use striatum_store::{dev_descriptor, AccountDecisionRecord, AccountObservationRow};
 
     /// The test clock, 2026-10-12T00:00:00Z.
     const NOW: i64 = 1_791_763_200_000;
@@ -1137,7 +1137,13 @@ mod tests {
 
     /// A scratch store for one test. Returns the directory to delete, the
     /// database path for raw seeding, and the open store.
-    fn scratch_store(name: &str) -> (std::path::PathBuf, std::path::PathBuf, SqliteRouteStateStore) {
+    fn scratch_store(
+        name: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::path::PathBuf,
+        SqliteRouteStateStore,
+    ) {
         let dir = cortexkit_test_support::scratch_root()
             .join(format!("striatum-retention-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1155,7 +1161,9 @@ mod tests {
     /// test leaves out, so it does not enforce foreign keys.
     fn seeding_connection(path: &std::path::Path) -> rusqlite::Connection {
         let connection = rusqlite::Connection::open(path).unwrap();
-        connection.pragma_update(None, "foreign_keys", false).unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
         connection
     }
 
@@ -1345,8 +1353,10 @@ mod tests {
 
     fn full_score() -> serde_json::Value {
         // Not eligible, so recording it adds no unscored-model sightings.
-        let candidate = |route: &str| json!({"routeKey": route, "model": route, "elo": 1.0,
-            "eq": 1.0, "eloSource": "curated", "eqSource": "curated", "eligible": false});
+        let candidate = |route: &str| {
+            json!({"routeKey": route, "model": route, "elo": 1.0,
+            "eq": 1.0, "eloSource": "curated", "eqSource": "curated", "eligible": false})
+        };
         json!({
             "candidates": [candidate("p/pick"), candidate("q/also"), candidate("r/other"),
                 candidate("s/other")],
@@ -1415,7 +1425,9 @@ mod tests {
         assert_eq!(diagnostics_before.len(), 5);
         let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
         assert_eq!(
-            store.diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100).unwrap(),
+            store
+                .diagnostic_decisions(NOW - 30 * DAY_MS, NOW, 100)
+                .unwrap(),
             diagnostics_before
         );
         assert_eq!(report.decision_details_stripped, 2);
@@ -1434,7 +1446,10 @@ mod tests {
                 serde_json::from_str(row.quota_signal_json.as_deref().unwrap()).unwrap();
             assert_eq!(quota, json!({"state": "present", "signalsOmitted": 1}));
             // The compact record keeps everything else as recorded.
-            assert_eq!(row.rejected_json, r#"[{"routeKey":"t/walled","reason":"quota_exhausted"}]"#);
+            assert_eq!(
+                row.rejected_json,
+                r#"[{"routeKey":"t/walled","reason":"quota_exhausted"}]"#
+            );
             assert_eq!(row.explanation_json.as_deref(), Some(r#"["cost-primary"]"#));
             assert_eq!(row.policy_revision.as_deref(), Some("policy-1"));
             assert_eq!(row.requirements_json, r#"{"iq":70}"#);
@@ -1451,12 +1466,19 @@ mod tests {
         let later = NOW + 2 * DAY_MS;
         let report = run_retention_pass(&store, &RetentionWindows::default(), later, &no_pause());
         assert_eq!(report.decision_details_stripped, 1);
-        assert_eq!(report.route_decisions, 2, "the 29-day-old pair is past 30 days");
+        assert_eq!(
+            report.route_decisions, 2,
+            "the 29-day-old pair is past 30 days"
+        );
         assert!(store.get_decision_by_id(&sampled[1]).unwrap().is_none());
         let sample = store.get_decision_by_id(&sampled[0]).unwrap().unwrap();
         assert_eq!(sample.detail_stripped_at, None);
         assert_eq!(
-            store.get_decision_by_id(&plain[2]).unwrap().unwrap().detail_stripped_at,
+            store
+                .get_decision_by_id(&plain[2])
+                .unwrap()
+                .unwrap()
+                .detail_stripped_at,
             Some(later)
         );
         drop(store);
@@ -1510,7 +1532,10 @@ mod tests {
             [(1, 1, 2, false), (2, 0, 2, false), (1, 0, 1, true)]
         );
         assert_eq!(
-            count(&path, "SELECT COUNT(*) FROM model_route_decisions WHERE detail_stripped_at IS NULL"),
+            count(
+                &path,
+                "SELECT COUNT(*) FROM model_route_decisions WHERE detail_stripped_at IS NULL"
+            ),
             1
         );
         drop(store);
@@ -1596,8 +1621,20 @@ mod tests {
             .unwrap();
         // A run still in flight on one decision, and a live continuation
         // linking two others.
-        insert_admission(&connection, "live", "started", Some("old-live-admission"), (old, None, None));
-        insert_admission(&connection, "live-original", "started", None, (old, None, None));
+        insert_admission(
+            &connection,
+            "live",
+            "started",
+            Some("old-live-admission"),
+            (old, None, None),
+        );
+        insert_admission(
+            &connection,
+            "live-original",
+            "started",
+            None,
+            (old, None, None),
+        );
         connection
             .execute(
                 "INSERT INTO account_continue (principal, selection_id, request_json, \
@@ -1622,7 +1659,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        for (affinity, decision, updated_at) in [("stale", "old-plain", old), ("warm", "recent", recent)] {
+        for (affinity, decision, updated_at) in
+            [("stale", "old-plain", old), ("warm", "recent", recent)]
+        {
             connection
                 .execute(
                     "INSERT INTO routing_v1_affinity (principal, consumer, affinity, \
@@ -1648,11 +1687,19 @@ mod tests {
                 .unwrap();
             rows.collect::<rusqlite::Result<_>>().unwrap()
         };
-        let kept = ["old-continued", "old-live-admission", "old-previous", "recent"];
+        let kept = [
+            "old-continued",
+            "old-live-admission",
+            "old-previous",
+            "recent",
+        ];
         assert_eq!(left("routing_v1_decision", "decision_id"), kept);
         assert_eq!(left("routing_v1_report", "decision_id"), kept);
         assert_eq!(left("routing_v1_report_delivery", "decision_id"), kept);
-        assert_eq!(left("routing_v1_admission", "admission_id"), ["fresh", "live", "other"]);
+        assert_eq!(
+            left("routing_v1_admission", "admission_id"),
+            ["fresh", "live", "other"]
+        );
         assert_eq!(left("routing_v1_affinity", "affinity"), ["warm"]);
 
         // Once the runs finish and a week passes, the rest goes too.
@@ -1678,16 +1725,38 @@ mod tests {
         let connection = seeding_connection(&path);
         let old = NOW - 8 * DAY_MS;
         let recent = NOW - DAY_MS;
-        insert_admission(&connection, "finished-long-ago", "finished", None, (old, Some(old), None));
+        insert_admission(
+            &connection,
+            "finished-long-ago",
+            "finished",
+            None,
+            (old, Some(old), None),
+        );
         insert_admission(&connection, "running", "started", None, (old, None, None));
-        insert_admission(&connection, "finished-yesterday", "finished", None, (old, Some(recent), None));
+        insert_admission(
+            &connection,
+            "finished-yesterday",
+            "finished",
+            None,
+            (old, Some(recent), None),
+        );
         for (selection, admission, valid_until, released_at) in [
             ("released-offer", "finished-long-ago", Some(old), Some(old)),
             ("hold", "finished-long-ago", None, None),
             ("live-run", "running", Some(old), Some(old)),
-            ("run-just-finished", "finished-yesterday", Some(old), Some(old)),
+            (
+                "run-just-finished",
+                "finished-yesterday",
+                Some(old),
+                Some(old),
+            ),
             ("admission-pruned", "gone", Some(old), None),
-            ("released-yesterday", "finished-long-ago", Some(old), Some(recent)),
+            (
+                "released-yesterday",
+                "finished-long-ago",
+                Some(old),
+                Some(recent),
+            ),
         ] {
             connection
                 .execute(
@@ -1712,7 +1781,10 @@ mod tests {
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(left, ["live-run", "released-yesterday", "run-just-finished"]);
+        assert_eq!(
+            left,
+            ["live-run", "released-yesterday", "run-just-finished"]
+        );
         drop(statement);
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1778,19 +1850,31 @@ mod tests {
         assert_eq!(report.quota_readings, 1);
         assert!(report.drained);
         assert_eq!(
-            count(&path, "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/busy'"),
+            count(
+                &path,
+                "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/busy'"
+            ),
             20
         );
         assert_eq!(
-            count(&path, "SELECT MIN(observed_at) FROM model_route_speed_samples WHERE route_key = 'p/busy'"),
+            count(
+                &path,
+                "SELECT MIN(observed_at) FROM model_route_speed_samples WHERE route_key = 'p/busy'"
+            ),
             NOW - 8 * DAY_MS - 14 * HOUR_MS
         );
         assert_eq!(
-            count(&path, "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/quiet'"),
+            count(
+                &path,
+                "SELECT COUNT(*) FROM model_route_speed_samples WHERE route_key = 'p/quiet'"
+            ),
             2
         );
         // The observed-speed read still finds its five samples in the window.
-        assert!(store.get_observed_speed("p/busy", NOW as f64).unwrap().is_some());
+        assert!(store
+            .get_observed_speed("p/busy", NOW as f64)
+            .unwrap()
+            .is_some());
         assert_eq!(
             count(&path, "SELECT started_at_ms FROM routing_call_window"),
             NOW - ROUTING_CALL_COUNT_WINDOW_MS
@@ -1800,7 +1884,13 @@ mod tests {
             count(&path, "SELECT retired_at FROM fence_retired_origin"),
             NOW - DAY_MS
         );
-        assert_eq!(count(&path, "SELECT COUNT(*) FROM routing_unscored_admissible_models"), 1);
+        assert_eq!(
+            count(
+                &path,
+                "SELECT COUNT(*) FROM routing_unscored_admissible_models"
+            ),
+            1
+        );
         assert_eq!(
             count(&path, "SELECT observed_at FROM quota_reading_log"),
             NOW - 2 * DAY_MS

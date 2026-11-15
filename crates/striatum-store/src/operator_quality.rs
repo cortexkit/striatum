@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use striatum_core::{Confidence, ModelFact, ScoreProvenance};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use striatum_core::{Confidence, ModelFact, ScoreProvenance};
 
 use super::{err, RouteStateResult, SqliteRouteStateStore};
 
@@ -63,7 +63,9 @@ pub(super) fn overlay_operator_quality(
                 .as_ref()
                 .is_some_and(|id| decommissioned.values().any(|model| model == id));
         let grade = grades.get(&key).or_else(|| {
-            canonical_id.as_ref().and_then(|id| grades.values().find(|grade| &grade.model == id))
+            canonical_id
+                .as_ref()
+                .and_then(|id| grades.values().find(|grade| &grade.model == id))
         });
         if let Some(grade) = grade {
             fact.scores.elo = grade.elo;
@@ -232,37 +234,71 @@ mod tests {
 
     #[test]
     fn decommissioned_migration_cache_snapshot_restart_and_atomic_replacement() {
-        let dir = cortexkit_test_support::scratch_root().join(format!("decommissioned-store-{}", std::process::id()));
+        let dir = cortexkit_test_support::scratch_root()
+            .join(format!("decommissioned-store-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let descriptor = crate::dev_descriptor("decommissioned-store", dir.join("route.db").to_string_lossy().into_owned());
+        let descriptor = crate::dev_descriptor(
+            "decommissioned-store",
+            dir.join("route.db").to_string_lossy().into_owned(),
+        );
         drop(SqliteRouteStateStore::open_at_version_for_test(&descriptor, 85).unwrap());
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
-        let fact:ModelFact = serde_json::from_value(json!({
+        let fact: ModelFact = serde_json::from_value(json!({
             "providerID":"vendor", "modelID":"retired", "confidence":"curated",
             "scores":{"elo":1000,"eq":1100,"speed":0}
-        })).unwrap();
-        store.upsert_fact(&fact,FactSource::Override).unwrap();
-        let read = |store:&SqliteRouteStateStore|store.get_facts().unwrap().into_iter().find(|f|f.provider_id=="vendor" && f.model_id=="retired").unwrap();
+        }))
+        .unwrap();
+        store.upsert_fact(&fact, FactSource::Override).unwrap();
+        let read = |store: &SqliteRouteStateStore| {
+            store
+                .get_facts()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.provider_id == "vendor" && f.model_id == "retired")
+                .unwrap()
+        };
         assert!(!read(&store).decommissioned);
         let before = store.catalog_fingerprint().unwrap();
-        let flags = BTreeMap::from([("vendor/retired".into(),"vendor/retired".into())]);
-        store.replace_operator_quality_snapshot(false,&BTreeMap::new(),&flags).unwrap();
+        let flags = BTreeMap::from([("vendor/retired".into(), "vendor/retired".into())]);
+        store
+            .replace_operator_quality_snapshot(false, &BTreeMap::new(), &flags)
+            .unwrap();
         assert!(read(&store).decommissioned);
-        assert_eq!(read(&store).score_provenance,ScoreProvenance::Override);
-        assert_ne!(store.catalog_fingerprint().unwrap(),before);
+        assert_eq!(read(&store).score_provenance, ScoreProvenance::Override);
+        assert_ne!(store.catalog_fingerprint().unwrap(), before);
         assert!(read(&store.private_account_copy_for_test(123).unwrap()).decommissioned);
-        assert!(!store.get_fact_by_route_key("vendor/retired").unwrap().unwrap().decommissioned);
+        assert!(
+            !store
+                .get_fact_by_route_key("vendor/retired")
+                .unwrap()
+                .unwrap()
+                .decommissioned
+        );
         store.store.with_conn(|c|c.execute_batch("CREATE TEMP TRIGGER reject_withdrawal BEFORE INSERT ON routing_operator_decommissioned BEGIN SELECT RAISE(ABORT, 'rejected'); END;")).unwrap();
-        let grades = BTreeMap::from([("vendor/retired".into(),OperatorQuality {model:"vendor/retired".into(),elo:1900.0,eq:1900.0})]);
-        assert!(store.replace_operator_quality_snapshot(true,&grades,&flags).is_err());
-        assert!(store.operator_quality().unwrap().is_empty(),"grade replacement must roll back with withdrawals");
+        let grades = BTreeMap::from([(
+            "vendor/retired".into(),
+            OperatorQuality {
+                model: "vendor/retired".into(),
+                elo: 1900.0,
+                eq: 1900.0,
+            },
+        )]);
+        assert!(store
+            .replace_operator_quality_snapshot(true, &grades, &flags)
+            .is_err());
+        assert!(
+            store.operator_quality().unwrap().is_empty(),
+            "grade replacement must roll back with withdrawals"
+        );
         assert!(read(&store).decommissioned);
         drop(store);
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         assert!(read(&store).decommissioned);
-        store.replace_operator_quality_snapshot(false,&BTreeMap::new(),&BTreeMap::new()).unwrap();
+        store
+            .replace_operator_quality_snapshot(false, &BTreeMap::new(), &BTreeMap::new())
+            .unwrap();
         assert!(!read(&store).decommissioned);
-        assert_eq!(store.catalog_fingerprint().unwrap(),before);
+        assert_eq!(store.catalog_fingerprint().unwrap(), before);
     }
     use serde_json::json;
 
@@ -453,7 +489,10 @@ mod tests {
         let adequacy = striatum_core::score_adequacy(
             &graded,
             &striatum_core::ModelRequirements { iq: 10.0, eq: 0.0 },
-            striatum_core::TopRoutableScores { elo: 2000.0, eq: 2000.0 },
+            striatum_core::TopRoutableScores {
+                elo: 2000.0,
+                eq: 2000.0,
+            },
             &striatum_core::RoutingConfig::default(),
         );
         assert_eq!(adequacy.raw_adequacy, 1.0);

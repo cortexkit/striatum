@@ -80,7 +80,10 @@ async fn unknown_account_provider_is_invalid_with_unique_model_provider_suggesti
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(reply.1["code"], "invalid_request", "{}", reply.1);
     assert_eq!(
-        reply.1["detail"], json!({"field":"provider"}), "{}", reply.1
+        reply.1["detail"],
+        json!({"field":"provider"}),
+        "{}",
+        reply.1
     );
     let message = reply.1["message"].as_str().unwrap();
     assert!(message.contains("`antigravity`"), "{message}");
@@ -520,18 +523,34 @@ async fn route_fence_names_eligible_accounts_outside_the_offered_set() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, mut credentials) = setup("synthetic", false);
     let mut rows = credentials.listed_credentials().to_vec();
-    let mut sibling = rows.iter().find(|row| row.id == "oauth:test").unwrap().clone();
+    let mut sibling = rows
+        .iter()
+        .find(|row| row.id == "oauth:test")
+        .unwrap()
+        .clone();
     sibling.id = "oauth:unoffered".into();
     sibling.account_id = Some("unoffered-account".into());
     rows.push(sibling);
-    credentials.apply_listing(&cortexkit_claustrum_client::ScopedCredentialListing {
-        view:"unoffered-sibling".into(), credentials:rows, ..Default::default()
-    }, NOW);
+    credentials.apply_listing(
+        &cortexkit_claustrum_client::ScopedCredentialListing {
+            view: "unoffered-sibling".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW,
+    );
     harness.set_credentials(credentials);
-    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
-        provider:"synthetic".into(), credential_id:"oauth:test".into(), model:"model".into(),
-        until_ms:(NOW + 86_400_000) as i64, decision_id:"offered-wall".into(), recorded_at:NOW as i64,
-    }).unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "model".into(),
+            until_ms: (NOW + 86_400_000) as i64,
+            decision_id: "offered-wall".into(),
+            recorded_at: NOW as i64,
+        })
+        .unwrap();
     let runner = harness.bind(reserved(RUNNER), None).await;
     let mut request = v1_request("synthetic", "offered-wall");
     request["candidates"] = json!({"view_digest":"offered-only", "accounts":[
@@ -541,19 +560,34 @@ async fn route_fence_names_eligible_accounts_outside_the_offered_set() {
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "account_pool_exhausted");
-    assert_eq!(refused.1["detail"]["reset_at_ms"], NOW + 900_000,
-        "the retry still belongs to the offered account");
+    assert_eq!(
+        refused.1["detail"]["reset_at_ms"],
+        NOW + 900_000,
+        "the retry still belongs to the offered account"
+    );
     let diagnostic = json!({"count":1,"credential_ids":["oauth:unoffered"]});
-    assert_eq!(refused.1["detail"]["eligible_accounts_not_offered"], diagnostic);
-    let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(refused.1).unwrap();
+    assert_eq!(
+        refused.1["detail"]["eligible_accounts_not_offered"],
+        diagnostic
+    );
+    let refusal: cortexkit_role_routing::errors::Refusal =
+        serde_json::from_value(refused.1).unwrap();
     let typed: cortexkit_role_routing::errors::ResetDetail = refusal.detail_as().unwrap();
     assert_eq!(typed.reset_at_ms, Some(NOW + 900_000));
     assert_eq!(refusal.wait_until_ms(), Some(NOW + 900_000));
     let lines = crate::take_operator_warnings();
-    let fields: Value = serde_json::from_str(lines.iter().find_map(|line|
-        line.strip_prefix("routing refused an account call: ")).expect("refusal log")).unwrap();
+    let fields: Value = serde_json::from_str(
+        lines
+            .iter()
+            .find_map(|line| line.strip_prefix("routing refused an account call: "))
+            .expect("refusal log"),
+    )
+    .unwrap();
     assert_eq!(fields["eligible_accounts_not_offered"], diagnostic);
-    assert_eq!(fields["offered_candidate_credential_ids"], json!(["oauth:test"]));
+    assert_eq!(
+        fields["offered_candidate_credential_ids"],
+        json!(["oauth:test"])
+    );
     assert_eq!(fields["reason"], "route_fence");
 }
 
@@ -611,11 +645,7 @@ fn undeclared_legacy_codes_become_unavailable() {
     // attached it means no credential of the right kind served the request,
     // so the backstop maps it to the untimed `auth_required`, never a
     // transient retry.
-    for code in [
-        "store_error",
-        "internal_error",
-        "unscoped_caller",
-    ] {
+    for code in ["store_error", "internal_error", "unscoped_caller"] {
         let refusal = super::accounts::account_refusal_for_test(code);
         assert_eq!(
             refusal.code,

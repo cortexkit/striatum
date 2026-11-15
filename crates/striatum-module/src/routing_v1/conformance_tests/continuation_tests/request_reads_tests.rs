@@ -159,7 +159,9 @@ async fn account_for_continue_and_observe_read_no_admission_group_sql() {
     result(reply);
     assert_reads("completed report", &ordinary, &keyed, 2);
     assert!(
-        keyed.iter().any(|sql| sql.contains("model_decision_id = ?1 AND run_id = ?2")),
+        keyed
+            .iter()
+            .any(|sql| sql.contains("model_decision_id = ?1 AND run_id = ?2")),
         "the report did not reach its run's admission lookup: {keyed:#?}"
     );
 }

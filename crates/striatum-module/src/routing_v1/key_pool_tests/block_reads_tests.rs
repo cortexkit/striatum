@@ -89,9 +89,7 @@ fn oracle_reads(store: &striatum_store::SqliteRouteStateStore) -> Vec<(&'static 
         .account_read(|tx| tx.report_credential_refusals())
         .unwrap();
     record("report_credential_refusals");
-    store
-        .account_read(|tx| tx.report_route_fences(0))
-        .unwrap();
+    store.account_read(|tx| tx.report_route_fences(0)).unwrap();
     record("report_route_fences");
     // The SQL key-state reader, for a store without account state.
     store.pool_key_states(POOL, 0).unwrap();
@@ -167,9 +165,7 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
     let mut sync: BTreeSet<String> = trace.take().writer.into_iter().collect();
     // The `tx.fence_rechecks()` read is left out too, for the same reason:
     // the seam's SQL claim paths run it before deciding.
-    store
-        .account_transaction(|tx| tx.fence_rechecks())
-        .unwrap();
+    store.account_transaction(|tx| tx.fence_rechecks()).unwrap();
     sync.extend(trace.take().writer);
     let origins = store.fence_rechecks().unwrap();
     assert_eq!(origins.len(), 1, "{origins:?}");
@@ -222,9 +218,7 @@ fn decision_oracle(now: i64) -> Vec<(&'static str, BTreeSet<String>)> {
         .unwrap();
     record("heal: inconclusive release");
     store
-        .account_transaction(|tx| {
-            tx.classify_credential_quota("oracle-provider", "c", true)
-        })
+        .account_transaction(|tx| tx.classify_credential_quota("oracle-provider", "c", true))
         .unwrap();
     record("heal: credential classification");
     // A success on SQL heals the provider wall the serving login's origins
@@ -361,7 +355,12 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
             "{op} read block tables on the writer: {:#?}",
             seen.writer
         );
-        writer_reads.push((op.to_owned(), seen.maintenance, seen.checks.len(), seen.route_writes.len()));
+        writer_reads.push((
+            op.to_owned(),
+            seen.maintenance,
+            seen.checks.len(),
+            seen.route_writes.len(),
+        ));
         route_writes.extend(seen.route_writes.iter().cloned());
         exempt.extend(seen.checks.into_iter().chain(seen.route_writes));
     };
@@ -421,13 +420,33 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
     check("account_for plain");
     let plain_key = plain_admission["account"]["credential_id"].clone();
     // A failed run on a plain route, then a completed one.
-    let failing = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    let failing = ok(
+        &owner,
+        "route.select",
+        json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+    )
+    .await;
     check("select a plain route to fail");
-    ok(&owner, "route.report", json!({"decision_id":failing["decision_id"],"outcome":"failed"})).await;
+    ok(
+        &owner,
+        "route.report",
+        json!({"decision_id":failing["decision_id"],"outcome":"failed"}),
+    )
+    .await;
     check("report failed");
-    let recovering = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    let recovering = ok(
+        &owner,
+        "route.select",
+        json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+    )
+    .await;
     check("select a plain route to complete");
-    ok(&owner, "route.report", json!({"decision_id":recovering["decision_id"],"outcome":"completed"})).await;
+    ok(
+        &owner,
+        "route.report",
+        json!({"decision_id":recovering["decision_id"],"outcome":"completed"}),
+    )
+    .await;
     check("report completed after a failure");
     // A credential refusal reported for a second plain decision: the report
     // reconciles quota holds inside its command.
@@ -521,7 +540,10 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         .map(|sql| normalize(sql))
         .filter(|sql| !reviewed.contains(sql))
         .collect();
-    assert!(unreviewed.is_empty(), "exempt reads not on the reviewed list: {unreviewed:#?}");
+    assert!(
+        unreviewed.is_empty(),
+        "exempt reads not on the reviewed list: {unreviewed:#?}"
+    );
     assert!(!exempt.is_empty(), "the mix ran checked decisions");
     // Route-writer reads the mix ran (the store's own test drives each of
     // the four writers and pins their statements).
@@ -592,7 +614,12 @@ async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_wa
         })
         .unwrap();
     // The clear lifts the provider wall for model-a.
-    let plain = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN})).await;
+    let plain = ok(
+        &owner,
+        "route.select",
+        json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+    )
+    .await;
     // SQL drops the clear where neither the capture nor a reload sees it.
     store
         .write_unseen_for_test("DELETE FROM fence_recheck_route_clear;")
@@ -604,9 +631,16 @@ async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_wa
                 "conversation_key":"stale-clear","admission_id":"stale-clear"}),
         )
         .await;
-    assert_eq!(reply.0, FrameType::Error, "the live provider wall holds the admission: {}", reply.1);
+    assert_eq!(
+        reply.0,
+        FrameType::Error,
+        "the live provider wall holds the admission: {}",
+        reply.1
+    );
     assert!(
-        reply.1["detail"]["reset_at_ms"].as_i64().is_some_and(|at| at > now as i64),
+        reply.1["detail"]["reset_at_ms"]
+            .as_i64()
+            .is_some_and(|at| at > now as i64),
         "the request is told when to retry: {}",
         reply.1
     );

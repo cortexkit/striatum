@@ -67,10 +67,8 @@ pub fn compact_score_json(
     let Some(Value::Array(candidates)) = score.remove("candidates") else {
         return score_json.to_owned();
     };
-    let mut kept_routes: BTreeSet<String> = selected_route_key
-        .map(str::to_owned)
-        .into_iter()
-        .collect();
+    let mut kept_routes: BTreeSet<String> =
+        selected_route_key.map(str::to_owned).into_iter().collect();
     let route_list = |value: Option<&Value>| -> Vec<String> {
         value
             .and_then(Value::as_array)
@@ -211,9 +209,21 @@ fn strip_batch(
                 batch.sampled += 1;
                 continue;
             }
-            let row: Option<(Option<String>, String, Option<String>, Option<String>, Option<i64>)> =
-                read.query_row([id], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
+            let row: Option<(
+                Option<String>,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<i64>,
+            )> = read
+                .query_row([id], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
                 })
                 .optional()?;
             let Some((selected, score, quota, explanation, None)) = row else {
@@ -253,7 +263,10 @@ mod tests {
     #[test]
     fn sample_membership_follows_the_rate() {
         let ids: Vec<String> = (0..2000).map(|index| format!("decision-{index}")).collect();
-        let sampled = ids.iter().filter(|id| in_full_detail_sample(id, 20)).count();
+        let sampled = ids
+            .iter()
+            .filter(|id| in_full_detail_sample(id, 20))
+            .count();
         // About one in twenty, from a hash rather than from insertion order.
         assert!((70..=130).contains(&sampled), "{sampled}");
         assert!(ids.iter().all(|id| in_full_detail_sample(id, 1)));
@@ -262,8 +275,10 @@ mod tests {
 
     #[test]
     fn the_compact_score_keeps_the_picked_and_adequate_candidates_and_pricing() {
-        let candidate = |route: &str| json!({"routeKey": route, "model": route, "elo": 1.0, "eq": 1.0,
-            "eloSource": "curated", "eqSource": "curated", "eligible": true});
+        let candidate = |route: &str| {
+            json!({"routeKey": route, "model": route, "elo": 1.0, "eq": 1.0,
+            "eloSource": "curated", "eqSource": "curated", "eligible": true})
+        };
         let full = json!({
             "candidates": [candidate("a/pick"), candidate("b/also"), candidate("c/other"), candidate("d/other")],
             "adequacy": 1.0,
@@ -287,7 +302,14 @@ mod tests {
             .collect();
         assert_eq!(kept, ["a/pick", "b/also"]);
         assert_eq!(compact["candidatesOmitted"], 2);
-        for member in ["adequacy", "selectionCost", "metrics", "objective", "alsoAdequate", "pricingMode"] {
+        for member in [
+            "adequacy",
+            "selectionCost",
+            "metrics",
+            "objective",
+            "alsoAdequate",
+            "pricingMode",
+        ] {
             assert_eq!(compact[member], full[member], "{member}");
         }
     }
@@ -327,13 +349,21 @@ mod tests {
     pub(crate) fn live_sized_decision(id: &str) -> striatum_core::route_state_store::DecisionInput {
         let candidates: Vec<Value> = (0..900)
             .map(|index| {
-                let route = format!("provider-{:02}/model-family-name-{index:03}:high", index % 40);
+                let route = format!(
+                    "provider-{:02}/model-family-name-{index:03}:high",
+                    index % 40
+                );
                 json!({"routeKey": route, "model": route, "elo": 1234.5, "eq": 1180.25,
                     "eloSource": "operator_grade", "eqSource": "curated", "eligible": false})
             })
             .collect();
         let also: Vec<String> = (0..15)
-            .map(|index| format!("provider-{:02}/model-family-name-{index:03}:high", index % 40))
+            .map(|index| {
+                format!(
+                    "provider-{:02}/model-family-name-{index:03}:high",
+                    index % 40
+                )
+            })
             .collect();
         let score = json!({
             "candidates": candidates,
@@ -345,8 +375,10 @@ mod tests {
             "pricingMode": "basket",
         });
         let signals: Vec<Value> = (0..160)
-            .map(|index| json!({"capacityKey": format!("provider-{index:03}/pool-weekly"),
-                "pressure": 0.125, "windowModel": "weekly", "exhaustedUntil": null}))
+            .map(|index| {
+                json!({"capacityKey": format!("provider-{index:03}/pool-weekly"),
+                "pressure": 0.125, "windowModel": "weekly", "exhaustedUntil": null})
+            })
             .collect();
         striatum_core::route_state_store::DecisionInput {
             decision_id: Some(id.into()),

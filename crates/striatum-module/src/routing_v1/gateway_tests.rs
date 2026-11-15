@@ -215,9 +215,10 @@ fn fixture_for_catalog(served_provider: &str, model: &str) -> Arc<Harness> {
             fact
         })
         .collect();
-    credentials
-        .wire_apis
-        .insert(format!("{served_provider}/{model}"), "anthropic.messages".into());
+    credentials.wire_apis.insert(
+        format!("{served_provider}/{model}"),
+        "anthropic.messages".into(),
+    );
     credentials.publish_billing_catalog(
         PlaneCatalog::ordinary_test_catalog(&billing).with_wire_apis(&credentials.wire_apis),
     );
@@ -463,10 +464,17 @@ fn set_gateway_limit(harness: &Harness, providers: &[&str], per_harness: bool) {
     } else {
         runner["standing_limits"] = json!({"explicit_providers":providers});
     }
-    harness.credentials().lock().unwrap().runner_declarations.insert(
-        RUNNER.into(),
-        super::runners::parse_declaration(&json!({"runner":runner})).unwrap().unwrap(),
-    );
+    harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .insert(
+            RUNNER.into(),
+            super::runners::parse_declaration(&json!({"runner":runner}))
+                .unwrap()
+                .unwrap(),
+        );
 }
 
 async fn check_gateway_provider_limits(operation: &str) {
@@ -489,7 +497,11 @@ async fn check_gateway_provider_limits(operation: &str) {
                     "runners":[RUNNER], "harness":"claude-code"
                 });
                 set_gateway_limit(&harness, &providers, per_harness);
-                let expected = if allowed { FrameType::Response } else { FrameType::Error };
+                let expected = if allowed {
+                    FrameType::Response
+                } else {
+                    FrameType::Error
+                };
                 // Admission keeps the route and runner bound by selection. Use
                 // the same policy throughout and verify the gateway's own pool.
                 let decision = if operation == "route.account_for" {
@@ -504,9 +516,14 @@ async fn check_gateway_provider_limits(operation: &str) {
                 };
                 if operation == "route.head_choices" {
                     let operator = harness.bind(json!({"kind":"direct"}), None).await;
-                    let choices = operator.call(operation, &json!({
-                        "runner_module":RUNNER, "harness":"claude-code"
-                    })).await;
+                    let choices = operator
+                        .call(
+                            operation,
+                            &json!({
+                                "runner_module":RUNNER, "harness":"claude-code"
+                            }),
+                        )
+                        .await;
                     assert_eq!(choices.0, FrameType::Response, "{context}: {choices:?}");
                     let models = choices.1["result"]["models"].as_array().unwrap();
                     assert_eq!(models.len(), usize::from(allowed), "{context}: {choices:?}");
@@ -516,19 +533,26 @@ async fn check_gateway_provider_limits(operation: &str) {
                     }
                     continue;
                 }
-                let reply = if let Some(decision) = decision {
-                    let runner = harness.bind(reserved(RUNNER), None).await;
-                    runner.call(operation, &json!({
+                let reply =
+                    if let Some(decision) = decision {
+                        let runner = harness.bind(reserved(RUNNER), None).await;
+                        runner.call(operation, &json!({
                         "provider":GATEWAY, "model":model, "decision_id":decision,
                         "conversation_key":"provider-limit", "admission_id":"provider-limit"
                     })).await
-                } else {
-                    consumer.call(operation, &request).await
-                };
+                    } else {
+                        consumer.call(operation, &request).await
+                    };
                 assert_eq!(reply.0, expected, "{context}: {reply:?}");
                 if allowed && operation == "route.account_for" {
-                    assert_eq!(reply.1["result"]["account"]["provider"], GATEWAY, "{context}");
-                    assert_eq!(reply.1["result"]["account"]["credential_id"], "company-gateway", "{context}");
+                    assert_eq!(
+                        reply.1["result"]["account"]["provider"], GATEWAY,
+                        "{context}"
+                    );
+                    assert_eq!(
+                        reply.1["result"]["account"]["credential_id"], "company-gateway",
+                        "{context}"
+                    );
                 }
             }
         }
@@ -551,7 +575,11 @@ async fn gateway_provider_limits_account_admission() {
 }
 
 async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
-    let provider = if method == "gateway" { GATEWAY } else { "anthropic" };
+    let provider = if method == "gateway" {
+        GATEWAY
+    } else {
+        "anthropic"
+    };
     for (per_harness, allowed) in [(false, true), (false, false), (true, true), (true, false)] {
         let harness = fixture_for_catalog("anthropic", "claude-opus-5-5");
         harness.edit_config(|config| {
@@ -560,18 +588,33 @@ async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
         {
             let shared = harness.credentials();
             let mut credentials = shared.lock().unwrap();
-            let mut row = credentials.listed_credentials().iter()
+            let mut row = credentials
+                .listed_credentials()
+                .iter()
                 .find(|row| row.auth_method.as_deref() == Some(method))
-                .unwrap().clone();
+                .unwrap()
+                .clone();
             row.provider_ids = vec![provider.into()];
-            credentials.apply_listing(&ScopedCredentialListing {
-                credentials: vec![row], view: "single-method".into(),
-                ..Default::default()
-            }, crate::now_ms());
-            credentials.refresh_serving_methods(&Default::default(),
-                &harness.store().get_facts().unwrap(), crate::now_ms() as i64, &[]);
+            credentials.apply_listing(
+                &ScopedCredentialListing {
+                    credentials: vec![row],
+                    view: "single-method".into(),
+                    ..Default::default()
+                },
+                crate::now_ms(),
+            );
+            credentials.refresh_serving_methods(
+                &Default::default(),
+                &harness.store().get_facts().unwrap(),
+                crate::now_ms() as i64,
+                &[],
+            );
         }
-        let providers = if allowed { vec!["anthropic"] } else { vec!["openai"] };
+        let providers = if allowed {
+            vec!["anthropic"]
+        } else {
+            vec!["openai"]
+        };
         let mut runner = json!({
             "pairs":[{"wire_api":"anthropic.messages", "auth_method":method}],
             "follows_account_choice":true,
@@ -588,7 +631,11 @@ async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
                 "role_declarations":{"routing/v1":{"runner":runner}}
             }]));
         let consumer = harness.bind(reserved("example-consumer"), None).await;
-        let model = if absent_model && !allowed { "unserved-model" } else { "claude-opus-5-5" };
+        let model = if absent_model && !allowed {
+            "unserved-model"
+        } else {
+            "claude-opus-5-5"
+        };
         let request = json!({
             "consumer":"mason", "requirements":{"iq":0},
             "pin":format!("{provider}/{model}"), "runners":[RUNNER],
@@ -602,12 +649,25 @@ async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
             assert_eq!(reply.0, FrameType::Error, "{context}: {reply:?}");
             assert_eq!(reply.1["code"], "pin_unavailable", "{context}: {reply:?}");
             assert_eq!(reply.1["detail"]["pin"], format!("{provider}/{model}"));
-            assert_eq!(reply.1["detail"]["reason"],
-                if absent_model { "unknown_model" } else { "not_available" }, "{context}: {reply:?}");
+            assert_eq!(
+                reply.1["detail"]["reason"],
+                if absent_model {
+                    "unknown_model"
+                } else {
+                    "not_available"
+                },
+                "{context}: {reply:?}"
+            );
             if !absent_model {
-                assert_eq!(reply.1["detail"]["cause"], "missing_capability", "{context}: {reply:?}");
+                assert_eq!(
+                    reply.1["detail"]["cause"], "missing_capability",
+                    "{context}: {reply:?}"
+                );
             }
-            assert!(reply.1["detail"].get("reset_at_ms").is_none(), "{context}: {reply:?}");
+            assert!(
+                reply.1["detail"].get("reset_at_ms").is_none(),
+                "{context}: {reply:?}"
+            );
             for fallback in [false, true] {
                 let mut routing = request.clone();
                 if fallback {
@@ -618,14 +678,34 @@ async fn check_provider_limit_pin_refusal(method: &str, absent_model: bool) {
                 let unpinned = consumer.call("route.select", &routing).await;
                 assert_eq!(unpinned.0, FrameType::Error, "{context}: {unpinned:?}");
                 assert_eq!(unpinned.1["code"], "no_route", "{context}: {unpinned:?}");
-                assert_eq!(unpinned.1["detail"]["reason"], "missing_capability", "{context}: {unpinned:?}");
+                assert_eq!(
+                    unpinned.1["detail"]["reason"], "missing_capability",
+                    "{context}: {unpinned:?}"
+                );
             }
-            harness.credentials().lock().unwrap().runner_declarations
-                .get_mut(RUNNER).unwrap().pairs[0].wire_api = "openai.responses".into();
+            harness
+                .credentials()
+                .lock()
+                .unwrap()
+                .runner_declarations
+                .get_mut(RUNNER)
+                .unwrap()
+                .pairs[0]
+                .wire_api = "openai.responses".into();
             let incompatible = consumer.call("route.select", &request).await;
-            assert_eq!(incompatible.0, FrameType::Error, "{context}: {incompatible:?}");
-            assert_eq!(incompatible.1["code"], "no_route", "{context}: {incompatible:?}");
-            assert_eq!(incompatible.1["detail"]["reason"], "missing_capability", "{context}: {incompatible:?}");
+            assert_eq!(
+                incompatible.0,
+                FrameType::Error,
+                "{context}: {incompatible:?}"
+            );
+            assert_eq!(
+                incompatible.1["code"], "no_route",
+                "{context}: {incompatible:?}"
+            );
+            assert_eq!(
+                incompatible.1["detail"]["reason"], "missing_capability",
+                "{context}: {incompatible:?}"
+            );
         }
     }
 }

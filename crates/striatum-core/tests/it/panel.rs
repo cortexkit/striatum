@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
+use serde_json::{json, Map};
 use striatum_core::{
     demand_bar, make_capacity_key, make_route_key, model_facts_seed, select_model_route,
     select_panel, select_panel_with_policy, AvailabilitySubstrate, ClassPanelPolicy, Confidence,
@@ -9,7 +10,6 @@ use striatum_core::{
     RequiredCapabilities, RouteRuntimeState, ScoreProvenance, SelectModelRouteInput,
     SelectPanelInput, DEFAULT_DEMAND_EXPONENT, DEFAULT_ROUTING_CONFIG,
 };
-use serde_json::{json, Map};
 
 mod policy_pipeline;
 mod policy_records;
@@ -18,7 +18,8 @@ mod shortfall_diagnostics;
 fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: "p".into(),
@@ -51,7 +52,9 @@ fn fact(model: &str, elo: f64, family: Option<&str>) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
     }
 }
 

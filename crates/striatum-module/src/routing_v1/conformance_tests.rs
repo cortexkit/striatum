@@ -27,10 +27,10 @@ use cortexkit_role_routing_conformance::{
     fixture, run_suite, Catalog, CatalogModule, ConsumerConfig, ConsumerMode, HoldLimits, Reply,
     RouteFailure, RouteStamp, RoutingRoute, RoutingSubject, CHECKS,
 };
+use serde_json::{json, Value};
 use striatum_core::model_facts::{Confidence, ModelScores, ScoreProvenance};
 use striatum_core::route_state_store::FactSource;
 use striatum_core::{ModelFact, RouteStateStore, RouteStateUpdate};
-use serde_json::{json, Value};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use tokio::sync::mpsc;
 
@@ -45,11 +45,11 @@ use crate::{
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod continuation_tests;
-mod zero_config_tests;
 mod first_party_tests;
-mod warm_credential_tests;
 #[path = "media_conformance.rs"]
 mod media_conformance;
+mod warm_credential_tests;
+mod zero_config_tests;
 
 /// The provider id the account allocator's quota readings are filed under
 /// for the kit's subscription accounts; any id other than the routing
@@ -97,12 +97,10 @@ impl Harness {
         );
         let store = Arc::new(
             match version {
-                Some(version) => {
-                    striatum_store::SqliteRouteStateStore::open_at_version_for_test(
-                        &descriptor,
-                        version,
-                    )
-                }
+                Some(version) => striatum_store::SqliteRouteStateStore::open_at_version_for_test(
+                    &descriptor,
+                    version,
+                ),
                 None => striatum_store::SqliteRouteStateStore::open(&descriptor),
             }
             .unwrap(),
@@ -175,7 +173,8 @@ impl Harness {
         crate::config_overrides::attach_reasoning_catalog(
             &self.config_path.lock().unwrap(),
             Arc::new(move || Ok(catalog.clone())),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     pub(crate) fn settings_source(&self, source: Arc<dyn crate::project_settings::Source>) {
@@ -542,7 +541,8 @@ pub(super) fn catalog_fact(
 ) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: model.provider.clone(),
@@ -578,7 +578,9 @@ pub(super) fn catalog_fact(
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
     }
 }
 
@@ -807,7 +809,11 @@ pub(super) fn install_catalog(harness: &Harness, catalog: &Catalog) {
         }
         // The fixture offers its gateway routes for ordinary selection;
         // production otherwise keeps company gateways pin-only by default.
-        for account in catalog.accounts.iter().filter(|account| account.method == "gateway") {
+        for account in catalog
+            .accounts
+            .iter()
+            .filter(|account| account.method == "gateway")
+        {
             config["providers"][&account.provider]["pin_only"] = json!(false);
         }
     });
@@ -1196,13 +1202,15 @@ impl RoutingSubject for KitSubject {
         let catalog_targets = credentials.catalog_targets(&facts);
         let mut serving = std::collections::BTreeSet::new();
         for route in routes {
-            let (provider, model) = route.route_key.split_once('/').ok_or_else(|| {
-                format!("runner route fact {} has no provider", route.route_key)
-            })?;
+            let (provider, model) = route
+                .route_key
+                .split_once('/')
+                .ok_or_else(|| format!("runner route fact {} has no provider", route.route_key))?;
             // Gateway route keys keep the gateway's identity, while wire and
             // billing facts belong to the provider named by its credential's `serves`.
             let catalog_key = if route.auth_method == "gateway" {
-                catalog_targets.get(provider)
+                catalog_targets
+                    .get(provider)
                     .map(|target| format!("{target}/{model}"))
                     .unwrap_or_else(|| route.route_key.clone())
             } else {
@@ -1210,9 +1218,7 @@ impl RoutingSubject for KitSubject {
             };
             let fact = facts
                 .iter_mut()
-                .find(|fact| {
-                    striatum_core::fact_to_route(fact).route_key == catalog_key
-                });
+                .find(|fact| striatum_core::fact_to_route(fact).route_key == catalog_key);
             let Some(fact) = fact else {
                 // A gateway can declare a route with no matching catalog model
                 // under its credential's `serves`. Leave that route absent so
@@ -1225,7 +1231,10 @@ impl RoutingSubject for KitSubject {
                 {
                     continue;
                 }
-                return Err(format!("runner route fact {} has no catalog model", route.route_key));
+                return Err(format!(
+                    "runner route fact {} has no catalog model",
+                    route.route_key
+                ));
             };
             credentials
                 .wire_apis
@@ -1333,7 +1342,10 @@ impl RoutingSubject for KitSubject {
         // The supplied roster can remove spares to test sign-in exclusion or
         // add accounts for chained continuations. Install it exactly rather
         // than limiting it to accounts from the static catalog fixture.
-        catalog.accounts = credentials.iter().map(|credential| credential.account.clone()).collect();
+        catalog.accounts = credentials
+            .iter()
+            .map(|credential| credential.account.clone())
+            .collect();
         install_catalog(&harness, &catalog);
         for credential in credentials {
             for model in catalog.models.iter().filter(|model| {
@@ -1473,9 +1485,10 @@ impl RoutingSubject for KitSubject {
             .collect();
         // A media key for a catalog provider belongs to that provider's fixture
         // account, so media and LLM admissions share its real concurrency cap.
-        let account_ids: std::collections::BTreeMap<_, _> = rows.iter().filter_map(|row| {
-            Some((row.provider_ids.first()?.clone(), row.account_id.clone()?))
-        }).collect();
+        let account_ids: std::collections::BTreeMap<_, _> = rows
+            .iter()
+            .filter_map(|row| Some((row.provider_ids.first()?.clone(), row.account_id.clone()?)))
+            .collect();
         rows.extend(providers.into_iter().map(|provider| ListedCredential {
             account_id: account_ids.get(&provider).cloned(),
             id: format!("synthetic-media-{provider}"),
@@ -1950,7 +1963,11 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let expected_not_applicable: Vec<_> = NOT_APPLICABLE
         .iter()
         .copied()
-        .chain(PENDING_READERS.iter().flat_map(|(_, cases)| cases.iter().copied()))
+        .chain(
+            PENDING_READERS
+                .iter()
+                .flat_map(|(_, cases)| cases.iter().copied()),
+        )
         .collect();
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
@@ -2068,13 +2085,19 @@ async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
         "conversation_key": "upgrade-conversation",
         "admission_id": "preupgrade-v1",
     });
-    let first = (FrameType::Response, seed_062_admission(&harness, &request, true, now));
+    let first = (
+        FrameType::Response,
+        seed_062_admission(&harness, &request, true, now),
+    );
     assert!(first.1["result"]["account"].is_object(), "{}", first.1);
     let mut legacy = request.clone();
     legacy["admission_id"] = json!("preupgrade-legacy");
     legacy["conversation_key"] = json!("legacy-upgrade-conversation");
     legacy["caller"] = json!({"runner": fixture::RUNNER_ONE});
-    let legacy_first = (FrameType::Response, seed_062_admission(&harness, &legacy, false, now));
+    let legacy_first = (
+        FrameType::Response,
+        seed_062_admission(&harness, &legacy, false, now),
+    );
 
     // Release the old store's writer lease before reopening the same file.
     // The placeholder is a separate scratch database, never an upgrade input.
@@ -2187,22 +2210,27 @@ async fn migration_065_restarts_replays_and_binds_preupgrade_admissions() {
 // directly: its model_facts table lacks columns today's fact readers require.
 fn seed_062_admission(harness: &Harness, request: &Value, v1: bool, now: i64) -> Value {
     use cortexkit_role_routing::account::{
-        Account, AccountForAnswer, AccountPin, AccountReason, AccountReasonCode, Admission,
-        parse_account_for_request_serving,
+        parse_account_for_request_serving, Account, AccountForAnswer, AccountPin, AccountReason,
+        AccountReasonCode, Admission,
     };
     use sha2::{Digest, Sha256};
     let provider = request["provider"].as_str().unwrap();
     let model = request["model"].as_str().unwrap();
     let conversation = request["conversation_key"].as_str().unwrap();
     let id = request["admission_id"].as_str().unwrap();
-    let principal = format!("reserved:{}", fixture::RUNNER_ONE.trim_start_matches("reserved:"));
+    let principal = format!(
+        "reserved:{}",
+        fixture::RUNNER_ONE.trim_start_matches("reserved:")
+    );
     let pin = format!("pin-{id}");
     let decision = format!("decision-{id}");
     let conversation_hash = format!("{:x}", Sha256::digest(conversation.as_bytes()));
     assert_ne!(fixture::RUNNER_ONE, crate::legacy_wire::BROCA);
     // Fixed-order identity encoding used by the historical plugin admission.
-    let identity = format!(r#"{{"provider":{},"model":{},"affinity_model":{},"conversation_key":{},"caller":"plugin","mode":"admit","expected_pin":null,"requested_account":null,"preferred_existing_account":null}}"#,
-        request["provider"], request["model"], request["model"], request["conversation_key"]);
+    let identity = format!(
+        r#"{{"provider":{},"model":{},"affinity_model":{},"conversation_key":{},"caller":"plugin","mode":"admit","expected_pin":null,"requested_account":null,"preferred_existing_account":null}}"#,
+        request["provider"], request["model"], request["model"], request["conversation_key"]
+    );
     let fingerprint = format!("{:x}", Sha256::digest(identity.as_bytes()));
     let valid_until = now + 60_000;
     let lease_until = now + 120_000;
@@ -2224,12 +2252,24 @@ fn seed_062_admission(harness: &Harness, request: &Value, v1: bool, now: i64) ->
           affinity_model,account_id,credential_id,pin_mode,decision_id,created_at)
          VALUES (?1,?2,?3,?4,1,?5,'historical-account','historical-credential','conversation_lease',?6,?7)",
         rusqlite::params![pin,principal,conversation_hash,provider,model,decision,now]).unwrap();
-    connection.execute(
-        "INSERT INTO account_affinity (principal,conversation_hash,provider,affinity_model,
+    connection
+        .execute(
+            "INSERT INTO account_affinity (principal,conversation_hash,provider,affinity_model,
           pin_id,pin_generation,account_id,credential_id,credential_binding_revision,policy_version,
           initial_demand_bytes,created_at,last_used_at,expires_at,lease_valid_until)
          VALUES (?1,?2,?3,?4,?5,1,'historical-account','historical-credential',1,2,0,?6,?6,?7,?8)",
-        rusqlite::params![principal,conversation_hash,provider,model,pin,now,affinity_until,lease_until]).unwrap();
+            rusqlite::params![
+                principal,
+                conversation_hash,
+                provider,
+                model,
+                pin,
+                now,
+                affinity_until,
+                lease_until
+            ],
+        )
+        .unwrap();
     connection.execute(
         "INSERT INTO account_admission (principal,admission_id,request_fingerprint,request_mode,
           decision_id,conversation_hash,provider,model,account_id,credential_id,pin_id,pin_generation,
@@ -2240,18 +2280,48 @@ fn seed_062_admission(harness: &Harness, request: &Value, v1: bool, now: i64) ->
         rusqlite::params![principal,id,fingerprint,decision,conversation_hash,provider,model,pin,
             now,valid_until,lease_until,legacy_reply.to_string()]).unwrap();
     let answer = if v1 {
-        let parsed = parse_account_for_request_serving(request, super::describe::CAPABILITIES).unwrap();
+        let parsed =
+            parse_account_for_request_serving(request, super::describe::CAPABILITIES).unwrap();
         let answer = AccountForAnswer::new(
-            Admission { id:id.into(), state:"reserved".into() },
-            Account { provider:provider.into(), account_id:"historical-account".into(),
-                credential_id:"historical-credential".into(), method:"oauth".into() },
-            AccountPin::new(&pin,1,affinity_until as u64,valid_until as u64,lease_until as u64,parsed.mode()),
-            AccountReason { code:AccountReasonCode::parse("cold_scored"),decision_id:decision,
-                policy_version:"2".into(),quota_fetched_at_ms:Some(now as u64),quota_age_band:"fresh".into() },
+            Admission {
+                id: id.into(),
+                state: "reserved".into(),
+            },
+            Account {
+                provider: provider.into(),
+                account_id: "historical-account".into(),
+                credential_id: "historical-credential".into(),
+                method: "oauth".into(),
+            },
+            AccountPin::new(
+                &pin,
+                1,
+                affinity_until as u64,
+                valid_until as u64,
+                lease_until as u64,
+                parsed.mode(),
+            ),
+            AccountReason {
+                code: AccountReasonCode::parse("cold_scored"),
+                decision_id: decision,
+                policy_version: "2".into(),
+                quota_fetched_at_ms: Some(now as u64),
+                quota_age_band: "fresh".into(),
+            },
         );
         let answer = serde_json::to_value(answer).unwrap();
-        connection.execute("INSERT INTO routing_v1_admission VALUES (?1,?2,?3,?4,?5)",
-            rusqlite::params![principal,id,serde_json::to_string(&parsed.normalized()).unwrap(),answer.to_string(),now]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO routing_v1_admission VALUES (?1,?2,?3,?4,?5)",
+                rusqlite::params![
+                    principal,
+                    id,
+                    serde_json::to_string(&parsed.normalized()).unwrap(),
+                    answer.to_string(),
+                    now
+                ],
+            )
+            .unwrap();
         answer
     } else {
         legacy_reply
@@ -2269,17 +2339,14 @@ pub(super) fn upgrade_harness(harness: Arc<Harness>) -> Arc<Harness> {
         state.dir.join("store.db").to_string_lossy(),
     );
     let placeholder = Arc::new(
-        striatum_store::SqliteRouteStateStore::open(
-            &striatum_store::dev_descriptor(
-                "routing-class-upgrade-placeholder",
-                state.dir.join("placeholder/store.db").to_string_lossy(),
-            ),
-        )
+        striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+            "routing-class-upgrade-placeholder",
+            state.dir.join("placeholder/store.db").to_string_lossy(),
+        ))
         .unwrap(),
     );
     drop(std::mem::replace(&mut state.store, placeholder));
-    state.store =
-        Arc::new(striatum_store::SqliteRouteStateStore::open(&descriptor).unwrap());
+    state.store = Arc::new(striatum_store::SqliteRouteStateStore::open(&descriptor).unwrap());
     state.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
     Arc::new(state)
 }

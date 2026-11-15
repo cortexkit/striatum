@@ -807,18 +807,26 @@ fn settings_ladder_harness() -> Arc<Harness> {
 }
 
 fn settings_ladder_wall(h: &Harness, key: &str, reset: u64) {
-    h.store().update_route_state(key, key, &striatum_core::RouteStateUpdate {
-        cooldown_until: Some(reset as f64),
-        observed_at_ms: Some(LADDER_NOW as i64 + 1),
-        wall_class: Some(striatum_core::RouteWallClass::Quota),
-        last_error: Some("quota exhausted".into()),
-        ..Default::default()
-    }).unwrap();
+    h.store()
+        .update_route_state(
+            key,
+            key,
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some(reset as f64),
+                observed_at_ms: Some(LADDER_NOW as i64 + 1),
+                wall_class: Some(striatum_core::RouteWallClass::Quota),
+                last_error: Some("quota exhausted".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 }
 
 async fn settings_ladder_preview(h: &Arc<Harness>, consumer: &str) -> Value {
     let route = h.bind(json!({"kind":"direct"}), None).await;
-    let reply = route.call("route.what_if", &json!({"consumer":consumer,"iqs":[0]})).await;
+    let reply = route
+        .call("route.what_if", &json!({"consumer":consumer,"iqs":[0]}))
+        .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     reply.1["result"]["results"][0].clone()
 }
@@ -832,34 +840,65 @@ async fn settings_ladder_admits_pin_only_routes_in_order_and_preserves_waits() {
         let request = json!({"consumer":consumer,"requirements":{"iq":0},"hold_wait_max_s":0});
         let reply = route.call("route.select", &request).await;
         assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-        assert_eq!(reply.1["result"]["route"]["model"], "model-a", "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-a",
+            "{}",
+            reply.1
+        );
         let preview = settings_ladder_preview(&h, consumer).await;
         assert_eq!(preview["pick"]["route"], SETTINGS_LADDER[0], "{preview}");
         let mut excluded = request.clone();
         excluded["exclude"] = json!([SETTINGS_LADDER[0]]);
         let reply = route.call("route.select", &excluded).await;
         assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-        assert_eq!(reply.1["result"]["route"]["model"], "model-c", "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-c",
+            "{}",
+            reply.1
+        );
     }
-    let request = json!({"consumer":"magic-context.summary","requirements":{"iq":0},"hold_wait_max_s":0});
-    for (key, reset) in SETTINGS_LADDER[..2].iter().zip([LADDER_NOW + 20_000, LADDER_NOW + 30_000]) {
+    let request =
+        json!({"consumer":"magic-context.summary","requirements":{"iq":0},"hold_wait_max_s":0});
+    for (key, reset) in SETTINGS_LADDER[..2]
+        .iter()
+        .zip([LADDER_NOW + 20_000, LADDER_NOW + 30_000])
+    {
         settings_ladder_wall(&h, key, reset);
     }
     let reply = route.call("route.select", &request).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(reply.1["result"]["route"]["model"], "model-d", "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["route"]["model"], "model-d",
+        "{}",
+        reply.1
+    );
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
     assert_eq!(preview["pick"]["route"], SETTINGS_LADDER[2], "{preview}");
     settings_ladder_wall(&h, SETTINGS_LADDER[2], LADDER_NOW + 40_000);
     let reply = route.call("route.select", &request).await;
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(reply.1["code"], "no_route", "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reason"], "quota_or_cooldown", "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reset_at_ms"], LADDER_NOW + 20_000, "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"]["reason"], "quota_or_cooldown",
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        LADDER_NOW + 20_000,
+        "{}",
+        reply.1
+    );
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
     assert_eq!(preview["refusal"]["code"], reply.1["code"], "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"], "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reset_at_ms"], reply.1["detail"]["reset_at_ms"], "{preview}");
+    assert_eq!(
+        preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"],
+        "{preview}"
+    );
+    assert_eq!(
+        preview["refusal"]["detail"]["reset_at_ms"], reply.1["detail"]["reset_at_ms"],
+        "{preview}"
+    );
 }
 
 #[tokio::test]
@@ -870,11 +909,18 @@ async fn settings_ladder_pin_only_admission_still_obeys_not_for_and_only_for() {
     let request = json!({"consumer":"magic-context.summary","requirements":{"iq":0}});
     // The second route is pin-only too: reaching it proves the ladder's pin
     // admission does not bypass the first route's consumer restriction.
-    for restriction in [json!({"not_for":["magic-context"]}), json!({"only_for":["other"]})] {
+    for restriction in [
+        json!({"not_for":["magic-context"]}),
+        json!({"only_for":["other"]}),
+    ] {
         h.edit_config(|config| config["models"][SETTINGS_LADDER[0]] = restriction);
         let reply = route.call("route.select", &request).await;
         assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-        assert_eq!(reply.1["result"]["route"]["model"], "model-c", "{}", reply.1);
+        assert_eq!(
+            reply.1["result"]["route"]["model"], "model-c",
+            "{}",
+            reply.1
+        );
         let preview = settings_ladder_preview(&h, "magic-context.summary").await;
         assert_eq!(preview["pick"]["route"], SETTINGS_LADDER[1], "{preview}");
     }
@@ -884,14 +930,22 @@ async fn settings_ladder_pin_only_admission_still_obeys_not_for_and_only_for() {
 async fn settings_ladder_all_accounts_blocked_without_reset_is_typed() {
     let _clock = crate::InjectedClock::set(LADDER_NOW);
     let h = settings_ladder_harness();
-    let mut third = h.store().get_facts().unwrap().into_iter().find(|fact| {
-        fact.provider_id == "example-subscription" && fact.model_id == "model-c"
-    }).unwrap();
+    let mut third = h
+        .store()
+        .get_facts()
+        .unwrap()
+        .into_iter()
+        .find(|fact| fact.provider_id == "example-subscription" && fact.model_id == "model-c")
+        .unwrap();
     third.model_id = "model-e".into();
-    h.store().upsert_fact(&third, striatum_core::FactSource::Override).unwrap();
+    h.store()
+        .upsert_fact(&third, striatum_core::FactSource::Override)
+        .unwrap();
     h.edit_config(|config| {
         config["consumers"]["magic-context"]["ladder"] = json!([
-            "example-subscription/model-e", SETTINGS_LADDER[1], SETTINGS_LADDER[2]
+            "example-subscription/model-e",
+            SETTINGS_LADDER[1],
+            SETTINGS_LADDER[2]
         ]);
         config["providers"]["example-subscription"]["pin_only"] = json!(true);
     });
@@ -900,7 +954,8 @@ async fn settings_ladder_all_accounts_blocked_without_reset_is_typed() {
         let mut quota = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
         for reading in quota.readings.readings.values_mut() {
             reading.received_at_ms = LADDER_NOW as i64;
-            reading.entry["fetchedAt"] = json!(crate::account_selection::rfc3339(LADDER_NOW as i64));
+            reading.entry["fetchedAt"] =
+                json!(crate::account_selection::rfc3339(LADDER_NOW as i64));
             for name in ["primary", "secondary"] {
                 if let Some(window) = reading.entry["usage"][name].as_object_mut() {
                     window.insert("usedPercent".into(), json!(100.0));
@@ -909,13 +964,20 @@ async fn settings_ladder_all_accounts_blocked_without_reset_is_typed() {
             }
         }
     }
-    let request = json!({"consumer":"magic-context.summary","requirements":{"iq":0},"hold_wait_max_s":0});
+    let request =
+        json!({"consumer":"magic-context.summary","requirements":{"iq":0},"hold_wait_max_s":0});
     let reply = route.call("route.select", &request).await;
     no_route(&reply, "accounts_blocked");
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
     assert_eq!(preview["refusal"]["code"], "no_route", "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reason"], "accounts_blocked", "{preview}");
-    assert!(preview["refusal"]["detail"].get("reset_at_ms").is_none(), "{preview}");
+    assert_eq!(
+        preview["refusal"]["detail"]["reason"], "accounts_blocked",
+        "{preview}"
+    );
+    assert!(
+        preview["refusal"]["detail"].get("reset_at_ms").is_none(),
+        "{preview}"
+    );
 }
 
 #[tokio::test]
@@ -926,18 +988,37 @@ async fn settings_ladder_what_if_admits_operator_pin_only_choices() {
     for (index, expected) in SETTINGS_LADDER.iter().enumerate() {
         let preview = settings_ladder_preview(&h, "magic-context.summary").await;
         assert_eq!(preview["pick"]["route"], *expected, "{preview}");
-        let live = route.call("route.select", &json!({
-            "consumer":"magic-context.summary", "requirements":{"iq":0}, "hold_wait_max_s":0
-        })).await;
+        let live = route
+            .call(
+                "route.select",
+                &json!({
+                    "consumer":"magic-context.summary", "requirements":{"iq":0}, "hold_wait_max_s":0
+                }),
+            )
+            .await;
         assert_eq!(live.0, FrameType::Response, "{}", live.1);
         let live = &live.1["result"]["route"];
-        assert_eq!(format!("{}/{}", live["provider"].as_str().unwrap(), live["model"].as_str().unwrap()), *expected);
+        assert_eq!(
+            format!(
+                "{}/{}",
+                live["provider"].as_str().unwrap(),
+                live["model"].as_str().unwrap()
+            ),
+            *expected
+        );
         settings_ladder_wall(&h, expected, LADDER_NOW + 20_000 + index as u64 * 10_000);
     }
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
     assert_eq!(preview["refusal"]["code"], "no_route", "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reason"], "quota_or_cooldown", "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reset_at_ms"], LADDER_NOW + 20_000, "{preview}");
+    assert_eq!(
+        preview["refusal"]["detail"]["reason"], "quota_or_cooldown",
+        "{preview}"
+    );
+    assert_eq!(
+        preview["refusal"]["detail"]["reset_at_ms"],
+        LADDER_NOW + 20_000,
+        "{preview}"
+    );
 }
 
 #[tokio::test]
@@ -955,11 +1036,19 @@ async fn settings_ladder_legacy_selection_admits_pin_only_but_not_consumer_restr
         "executor":"broca", "substrate":"broca", "requirements":{"iq":30,"eq":0}});
     let reply = route.call("route.select", &request).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[0], "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[0],
+        "{}",
+        reply.1
+    );
     h.edit_config(|config| config["models"][SETTINGS_LADDER[0]]["not_for"] = json!(["codemode"]));
     let reply = route.call("route.select", &request).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[1], "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["selected"]["routeKey"], SETTINGS_LADDER[1],
+        "{}",
+        reply.1
+    );
     for key in &SETTINGS_LADDER[1..] {
         settings_ladder_wall(&h, key, LADDER_NOW + 30_000);
     }
@@ -971,8 +1060,11 @@ const LADDER_VARIANTS: [&str; 3] = ["high", "high", "medium"];
 
 fn variant_ladder_harness(first_variant: &str, legacy: bool) -> Arc<Harness> {
     let h = settings_ladder_harness();
-    let entries: Vec<_> = SETTINGS_LADDER.iter().zip([first_variant, "high", "medium"])
-        .map(|(route, variant)| format!("{route}:{variant}")).collect();
+    let entries: Vec<_> = SETTINGS_LADDER
+        .iter()
+        .zip([first_variant, "high", "medium"])
+        .map(|(route, variant)| format!("{route}:{variant}"))
+        .collect();
     h.edit_config(|config| {
         let consumer = if legacy { "codemode" } else { "magic-context" };
         config["consumers"][consumer]["mode"] = json!("ladder");
@@ -989,13 +1081,28 @@ fn variant_ladder_harness(first_variant: &str, legacy: bool) -> Arc<Harness> {
     });
     for mut fact in h.store().get_facts().unwrap() {
         if SETTINGS_LADDER.contains(&format!("{}/{}", fact.provider_id, fact.model_id).as_str()) {
-            fact.prompt_defaults.get_or_insert_with(Default::default).variant = Some("low".into());
-            h.store().upsert_fact(&fact, striatum_core::FactSource::Override).unwrap();
+            fact.prompt_defaults
+                .get_or_insert_with(Default::default)
+                .variant = Some("low".into());
+            h.store()
+                .upsert_fact(&fact, striatum_core::FactSource::Override)
+                .unwrap();
         }
     }
     h.attach_reasoning_catalog(striatum_store::ReasoningCatalog {
-        models: SETTINGS_LADDER.iter().map(|route| ((*route).to_owned(),
-            striatum_store::PublishedEfforts::Published(vec!["low".into(),"medium".into(),"high".into()]))).collect(),
+        models: SETTINGS_LADDER
+            .iter()
+            .map(|route| {
+                (
+                    (*route).to_owned(),
+                    striatum_store::PublishedEfforts::Published(vec![
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                    ]),
+                )
+            })
+            .collect(),
     });
     h
 }
@@ -1006,22 +1113,58 @@ async fn settings_ladder_preserves_each_explicit_variant_in_decisions_and_what_i
     let h = variant_ladder_harness("high", false);
     let route = h.bind(reserved("magic-context"), None).await;
     for index in 0..SETTINGS_LADDER.len() {
-        let excluded: Vec<_> = SETTINGS_LADDER[..index].iter().zip(&LADDER_VARIANTS[..index])
-            .map(|(key, variant)| format!("{key}/{variant}")).collect();
-        let reply = route.call("route.select", &json!({"consumer":"magic-context.summary",
-            "requirements":{"iq":0}, "exclude":excluded, "hold_wait_max_s":0})).await;
+        let excluded: Vec<_> = SETTINGS_LADDER[..index]
+            .iter()
+            .zip(&LADDER_VARIANTS[..index])
+            .map(|(key, variant)| format!("{key}/{variant}"))
+            .collect();
+        let reply = route
+            .call(
+                "route.select",
+                &json!({"consumer":"magic-context.summary",
+            "requirements":{"iq":0}, "exclude":excluded, "hold_wait_max_s":0}),
+            )
+            .await;
         assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
         let result = &reply.1["result"];
-        assert_eq!(format!("{}/{}", result["route"]["provider"].as_str().unwrap(), result["route"]["model"].as_str().unwrap()), SETTINGS_LADDER[index], "{}", reply.1);
-        assert_eq!(result["route"]["variant"], LADDER_VARIANTS[index], "{}", reply.1);
-        let decision = h.store().v1_decision(result["decision_id"].as_str().unwrap()).unwrap().unwrap();
+        assert_eq!(
+            format!(
+                "{}/{}",
+                result["route"]["provider"].as_str().unwrap(),
+                result["route"]["model"].as_str().unwrap()
+            ),
+            SETTINGS_LADDER[index],
+            "{}",
+            reply.1
+        );
+        assert_eq!(
+            result["route"]["variant"], LADDER_VARIANTS[index],
+            "{}",
+            reply.1
+        );
+        let decision = h
+            .store()
+            .v1_decision(result["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
         assert_eq!(decision.variant.as_deref(), Some(LADDER_VARIANTS[index]));
     }
     for index in 0..SETTINGS_LADDER.len() {
         let preview = settings_ladder_preview(&h, "magic-context.summary").await;
-        assert_eq!(preview["pick"]["variant"], LADDER_VARIANTS[index], "{preview}");
-        assert_eq!(preview["pick"]["route"], format!("{}/{}", SETTINGS_LADDER[index], LADDER_VARIANTS[index]), "{preview}");
-        settings_ladder_wall(&h, SETTINGS_LADDER[index], LADDER_NOW + 20_000 + index as u64 * 10_000);
+        assert_eq!(
+            preview["pick"]["variant"], LADDER_VARIANTS[index],
+            "{preview}"
+        );
+        assert_eq!(
+            preview["pick"]["route"],
+            format!("{}/{}", SETTINGS_LADDER[index], LADDER_VARIANTS[index]),
+            "{preview}"
+        );
+        settings_ladder_wall(
+            &h,
+            SETTINGS_LADDER[index],
+            LADDER_NOW + 20_000 + index as u64 * 10_000,
+        );
     }
 }
 
@@ -1036,13 +1179,24 @@ async fn settings_ladder_unpublished_variant_refuses_like_an_explicit_pin() {
     pinned["pin"] = json!(format!("{}:unsupported", SETTINGS_LADDER[0]));
     let pin_reply = route.call("route.select", &pinned).await;
     assert_eq!(pin_reply.1["code"], "pin_unavailable", "{}", pin_reply.1);
-    assert_eq!(pin_reply.1["detail"]["reason"], "invalid_variant", "{}", pin_reply.1);
+    assert_eq!(
+        pin_reply.1["detail"]["reason"], "invalid_variant",
+        "{}",
+        pin_reply.1
+    );
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(reply.1["code"], pin_reply.1["code"], "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reason"], pin_reply.1["detail"]["reason"], "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"]["reason"], pin_reply.1["detail"]["reason"],
+        "{}",
+        reply.1
+    );
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
     assert_eq!(preview["refusal"]["code"], reply.1["code"], "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"], "{preview}");
+    assert_eq!(
+        preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"],
+        "{preview}"
+    );
 }
 
 #[tokio::test]
@@ -1051,16 +1205,40 @@ async fn settings_ladder_explicit_variant_walls_keep_the_earliest_reset() {
     let h = variant_ladder_harness("high", false);
     let route = h.bind(reserved("magic-context"), None).await;
     for (index, (key, variant)) in SETTINGS_LADDER.iter().zip(LADDER_VARIANTS).enumerate() {
-        settings_ladder_wall(&h, &format!("{key}/{variant}"), LADDER_NOW + 20_000 + index as u64 * 10_000);
+        settings_ladder_wall(
+            &h,
+            &format!("{key}/{variant}"),
+            LADDER_NOW + 20_000 + index as u64 * 10_000,
+        );
     }
-    let reply = route.call("route.select", &json!({"consumer":"magic-context.summary",
-        "requirements":{"iq":0}, "hold_wait_max_s":0})).await;
+    let reply = route
+        .call(
+            "route.select",
+            &json!({"consumer":"magic-context.summary",
+        "requirements":{"iq":0}, "hold_wait_max_s":0}),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reason"], "quota_or_cooldown", "{}", reply.1);
-    assert_eq!(reply.1["detail"]["reset_at_ms"], LADDER_NOW + 20_000, "{}", reply.1);
+    assert_eq!(
+        reply.1["detail"]["reason"], "quota_or_cooldown",
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["detail"]["reset_at_ms"],
+        LADDER_NOW + 20_000,
+        "{}",
+        reply.1
+    );
     let preview = settings_ladder_preview(&h, "magic-context.summary").await;
-    assert_eq!(preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"], "{preview}");
-    assert_eq!(preview["refusal"]["detail"]["reset_at_ms"], reply.1["detail"]["reset_at_ms"], "{preview}");
+    assert_eq!(
+        preview["refusal"]["detail"]["reason"], reply.1["detail"]["reason"],
+        "{preview}"
+    );
+    assert_eq!(
+        preview["refusal"]["detail"]["reset_at_ms"], reply.1["detail"]["reset_at_ms"],
+        "{preview}"
+    );
 }
 
 #[tokio::test]
@@ -1068,11 +1246,25 @@ async fn settings_ladder_legacy_selection_preserves_explicit_variant() {
     let _clock = crate::InjectedClock::set(LADDER_NOW);
     let h = variant_ladder_harness("high", true);
     let route = h.bind(reserved("magic-context"), None).await;
-    let reply = route.call("route.select", &json!({"consumer":"codemode", "targetAgent":"codemode",
-        "executor":"broca", "substrate":"broca", "requirements":{"iq":30,"eq":0}})).await;
+    let reply = route
+        .call(
+            "route.select",
+            &json!({"consumer":"codemode", "targetAgent":"codemode",
+        "executor":"broca", "substrate":"broca", "requirements":{"iq":30,"eq":0}}),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    assert_eq!(reply.1["result"]["selected"]["promptParams"]["variant"], "high", "{}", reply.1);
-    assert_eq!(reply.1["result"]["selected"]["routeKey"], format!("{}/high", SETTINGS_LADDER[0]), "{}", reply.1);
+    assert_eq!(
+        reply.1["result"]["selected"]["promptParams"]["variant"], "high",
+        "{}",
+        reply.1
+    );
+    assert_eq!(
+        reply.1["result"]["selected"]["routeKey"],
+        format!("{}/high", SETTINGS_LADDER[0]),
+        "{}",
+        reply.1
+    );
 }
 
 fn admission_refused(reply: (FrameType, Value), code: &str, consumer: &str) {
@@ -1634,10 +1826,13 @@ async fn settings_only_names_log_info_at_load_without_health_warnings_or_request
     // only to settings load, not to each request using a settings-only name.
     assert_eq!(
         crate::take_operator_infos(),
-        vec![format!(
-            "routing select call {}",
-            json!({"surface":"routing/v1","consumer":"settings-only", "class":"worker","head_request":false})
-        ); 3]
+        vec![
+            format!(
+                "routing select call {}",
+                json!({"surface":"routing/v1","consumer":"settings-only", "class":"worker","head_request":false})
+            );
+            3
+        ]
     );
     assert!(crate::take_operator_warnings().is_empty());
     assert_eq!(consumers::health()["issues"], json!([]));

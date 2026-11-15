@@ -233,8 +233,7 @@ fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
                 decision_id: id.into(),
                 principal: principal.into(),
                 consumer: "summary".into(),
-                allowed_account_class:
-                    striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
+                allowed_account_class: striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
                 project_id: None,
                 provider: "example".into(),
                 model: "model".into(),

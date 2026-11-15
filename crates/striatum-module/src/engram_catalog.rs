@@ -163,23 +163,20 @@ mod tests {
     #[test]
     fn catalog_excluded_tables_exist_in_the_migrated_routing_store_schema() {
         let mut excluded = excluded_tables(CATALOG_BYTES);
-        let mut backup_excluded: Vec<String> =
-            striatum_store::backup::BACKUP_EXCLUDABLE_TABLES
-                .iter()
-                .map(|(table, _)| (*table).to_owned())
-                .collect();
+        let mut backup_excluded: Vec<String> = striatum_store::backup::BACKUP_EXCLUDABLE_TABLES
+            .iter()
+            .map(|(table, _)| (*table).to_owned())
+            .collect();
         excluded.sort();
         backup_excluded.sort();
         assert_eq!(excluded, backup_excluded);
 
         let scratch = cortexkit_test_support::ScratchDir::new("routing-engram-catalog-schema");
         let database = scratch.path().join("store.db");
-        let store = striatum_store::SqliteRouteStateStore::open(
-            &striatum_store::dev_descriptor(
-                "routing-engram-catalog-schema",
-                database.to_string_lossy().into_owned(),
-            ),
-        )
+        let store = striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+            "routing-engram-catalog-schema",
+            database.to_string_lossy().into_owned(),
+        ))
         .expect("open store after migrations");
         drop(store);
 

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use serde_json::json;
 use striatum_core::task_profile::{ProfileLevel, TaskProfile, TokenVector};
 use striatum_core::{fact_to_route, ModelFact};
-use serde_json::json;
 use subc_protocol::FrameType;
 
 use super::dispatch_tests::configured;

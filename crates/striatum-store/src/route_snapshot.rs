@@ -16,9 +16,7 @@ use std::collections::HashMap;
 
 use rusqlite::{Connection, OptionalExtension, Row};
 use striatum_core::model_router::{ModelRouteStateSnapshot, RouteRuntimeState};
-use striatum_core::{
-    derive_provider_key, ProviderCooldownState, RouteStateResult, RouteWallClass,
-};
+use striatum_core::{derive_provider_key, ProviderCooldownState, RouteStateResult, RouteWallClass};
 
 use crate::fence_rechecks::{self, FenceRecheck};
 

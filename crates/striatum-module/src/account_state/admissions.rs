@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use striatum_store::{
     AccountAdmissionRow, AccountAffinityRow, AccountDemandRow, AdmissionGroupRows,
-    AdmissionScanRow, ContinuationStateRow,
-    LatestAdmissionRow, PrunedAdmission, PrunedContinuation, ReservationRef,
+    AdmissionScanRow, ContinuationStateRow, LatestAdmissionRow, PrunedAdmission,
+    PrunedContinuation, ReservationRef,
 };
 
 /// Shards are grouped [`GROUP`] to a group, [`GROUP`] groups to a map. At the
@@ -291,7 +291,10 @@ pub(crate) struct ChainReservation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Effect {
     /// Write the admission's lifecycle columns; it was in state `from`.
-    Admission { row: AccountAdmissionRow, from: String },
+    Admission {
+        row: AccountAdmissionRow,
+        from: String,
+    },
     /// Advance only observation time, including for a closed original row.
     Observed {
         admission: RowKey,
@@ -414,12 +417,11 @@ impl AdmissionState {
         // independent, so they are built on two threads; a live-sized load is
         // about 200,000 rows of each. Started rows are matched to their
         // conversation's current pin afterwards.
-        let ((affinity, affinity_by_pin), (conversations, demand)) =
-            std::thread::scope(|scope| {
-                let affinity = scope.spawn(move || Self::affinity_indexes(affinities));
-                let scanned = Self::scan_admissions(admissions);
-                (affinity.join().expect("affinity index build"), scanned)
-            });
+        let ((affinity, affinity_by_pin), (conversations, demand)) = std::thread::scope(|scope| {
+            let affinity = scope.spawn(move || Self::affinity_indexes(affinities));
+            let scanned = Self::scan_admissions(admissions);
+            (affinity.join().expect("affinity index build"), scanned)
+        });
         state.affinity = affinity;
         state.affinity_by_pin = affinity_by_pin;
         state.demand = demand;
@@ -489,7 +491,9 @@ impl AdmissionState {
         for scanned in admissions {
             let row = scanned.latest;
             let conversation = conversation(&row.principal, &row.conversation_hash, &row.provider);
-            let started = scanned.started.then(|| (row.pin_id.clone(), row.pin_generation));
+            let started = scanned
+                .started
+                .then(|| (row.pin_id.clone(), row.pin_generation));
             if scanned.charged && row.state != "released" {
                 // Look the account up by reference; its key strings are
                 // copied only for the first row of each account.
@@ -500,13 +504,20 @@ impl AdmissionState {
                 if !accounts.contains_key(&row.account_id) {
                     accounts.insert(row.account_id.clone(), AccountDemand::default());
                 }
-                accounts.get_mut(&row.account_id).expect("inserted above").insert(
-                    (row.committed_at, row.principal.clone(), row.admission_id.clone()),
-                    Demand {
-                        state: row.state.clone(),
-                        request_bytes: scanned.request_bytes,
-                    },
-                );
+                accounts
+                    .get_mut(&row.account_id)
+                    .expect("inserted above")
+                    .insert(
+                        (
+                            row.committed_at,
+                            row.principal.clone(),
+                            row.admission_id.clone(),
+                        ),
+                        Demand {
+                            state: row.state.clone(),
+                            request_bytes: scanned.request_bytes,
+                        },
+                    );
             }
             match conversations.entry(conversation) {
                 Entry::Occupied(mut entry) => {
@@ -953,7 +964,10 @@ impl AdmissionState {
         expires_at: i64,
         lease_valid_until: Option<i64>,
     ) -> bool {
-        let Some(row) = self.affinity.get_mut(&conversation(principal, hash, provider)) else {
+        let Some(row) = self
+            .affinity
+            .get_mut(&conversation(principal, hash, provider))
+        else {
             return false;
         };
         if row.pin_id != expected.0 || row.pin_generation != expected.1 {
@@ -1173,27 +1187,29 @@ impl AdmissionState {
 
     /// An already used offer of a live chain, by decision id.
     fn used_row(&self, decision: &str) -> Option<(String, Offer)> {
-        self.chains.iter().find_map(|((principal, original), chain)| {
-            chain.runs.iter().find_map(|(run, rows)| {
-                rows.iter().find_map(|(rowid, row)| {
-                    (row.used && row.decision_id == decision).then(|| {
-                        (
-                            principal.clone(),
-                            Offer {
-                                rowid: *rowid,
-                                run_id: run.clone(),
-                                admission_id: original.clone(),
-                                previous_decision_id: row.previous_decision_id.clone(),
-                                decision_id: row.decision_id.clone(),
-                                reservation_id: row.reservation_id.clone(),
-                                valid_until_ms: 0,
-                                reservation: row.reservation.clone(),
-                            },
-                        )
+        self.chains
+            .iter()
+            .find_map(|((principal, original), chain)| {
+                chain.runs.iter().find_map(|(run, rows)| {
+                    rows.iter().find_map(|(rowid, row)| {
+                        (row.used && row.decision_id == decision).then(|| {
+                            (
+                                principal.clone(),
+                                Offer {
+                                    rowid: *rowid,
+                                    run_id: run.clone(),
+                                    admission_id: original.clone(),
+                                    previous_decision_id: row.previous_decision_id.clone(),
+                                    decision_id: row.decision_id.clone(),
+                                    reservation_id: row.reservation_id.clone(),
+                                    valid_until_ms: 0,
+                                    reservation: row.reservation.clone(),
+                                },
+                            )
+                        })
                     })
                 })
             })
-        })
     }
 
     /// `reservation` is the reserved admission's identity as last known, for
@@ -1292,15 +1308,13 @@ impl AdmissionState {
                     .or(offer.reservation.clone())
                     .is_some_and(|reservation| {
                         reservation.account_id == account
-                            && credential.is_none_or(|credential| {
-                                reservation.credential_id == credential
-                            })
+                            && credential
+                                .is_none_or(|credential| reservation.credential_id == credential)
                     })
             })
             .filter(|(_, offer)| {
-                !chain.is_some_and(|chain| {
-                    chain.used_successors(run_id, &offer.previous_decision_id)
-                })
+                !chain
+                    .is_some_and(|chain| chain.used_successors(run_id, &offer.previous_decision_id))
             })
             .max_by_key(|(_, offer)| offer.rowid)
             .map(|(_, offer)| offer.decision_id.clone())
@@ -1341,8 +1355,7 @@ impl AdmissionState {
                 },
                 -1,
             );
-            let conversation =
-                conversation(&row.principal, &row.conversation_hash, &row.provider);
+            let conversation = conversation(&row.principal, &row.conversation_hash, &row.provider);
             if self
                 .latest
                 .get(&conversation)
@@ -1378,9 +1391,13 @@ impl AdmissionState {
             .iter()
             .filter(|((owner, _), chain)| {
                 owner == principal
-                    && chain.runs.values().flat_map(|rows| rows.values()).any(|row| {
-                        row.reservation_id == reservation_id && row.reservation.is_some()
-                    })
+                    && chain
+                        .runs
+                        .values()
+                        .flat_map(|rows| rows.values())
+                        .any(|row| {
+                            row.reservation_id == reservation_id && row.reservation.is_some()
+                        })
             })
             .map(|(original, _)| original.clone())
             .collect();
@@ -1480,8 +1497,14 @@ impl AdmissionState {
 // Request-path reads. Each answers exactly what the named SQL query answers
 // over the rows this state mirrors.
 impl AdmissionState {
-    pub(crate) fn open_admission(&self, principal: &str, admission_id: &str) -> Option<&OpenAdmission> {
-        self.open.get(&key(principal, admission_id)).map(Arc::as_ref)
+    pub(crate) fn open_admission(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> Option<&OpenAdmission> {
+        self.open
+            .get(&key(principal, admission_id))
+            .map(Arc::as_ref)
     }
 
     pub(crate) fn affinity(

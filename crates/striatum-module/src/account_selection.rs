@@ -17,6 +17,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use striatum_core::accounts::eligibility::{assess_reading, reserve_for};
 use striatum_core::accounts::evidence::{
     confirm_exhaustion, header_window, Carrier, ConfirmationOutcome, Derivation, EvidenceScope,
@@ -38,9 +41,6 @@ use striatum_store::{
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, AccountPoolFenceRow,
     AccountTx, SqliteRouteStateStore, DECISION_MODE_SERVE,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::account_quota::{self, AccountEntry, AccountQuotaState, SharedAccountQuota};
 use crate::account_refusal_log::{because, checking};
@@ -771,7 +771,9 @@ impl ClassContext {
     }
 
     pub(crate) fn joined_account_id(&self, credential: &str) -> Option<&str> {
-        self.account_ids.get(credential).and_then(|account| account.as_deref())
+        self.account_ids
+            .get(credential)
+            .and_then(|account| account.as_deref())
     }
 
     pub(crate) fn probe_accounts(&self) -> BTreeMap<String, String> {
@@ -1021,19 +1023,16 @@ impl ClassContext {
                         continue;
                     }
                     if !runners.iter().any(|runner| {
-                        registry.runs(
-                            runner,
-                            &striatum_core::fact_to_route(fact).route_key,
-                            &key,
-                        ) && registry.get(runner).is_some_and(|runner| {
-                            crate::service_tiers::runner_supports(
-                                &self.credentials,
-                                runner,
-                                fact,
-                                row,
-                                tier,
-                            )
-                        })
+                        registry.runs(runner, &striatum_core::fact_to_route(fact).route_key, &key)
+                            && registry.get(runner).is_some_and(|runner| {
+                                crate::service_tiers::runner_supports(
+                                    &self.credentials,
+                                    runner,
+                                    fact,
+                                    row,
+                                    tier,
+                                )
+                            })
                     }) {
                         rejections.push(reject("runner", Some(row)));
                         continue;
@@ -2174,12 +2173,7 @@ impl ClassContext {
         )
     }
 
-    fn recheck_at(
-        &self,
-        origin: &striatum_store::FenceRecheck,
-        account: &str,
-        model: &str,
-    ) -> i64 {
+    fn recheck_at(&self, origin: &striatum_store::FenceRecheck, account: &str, model: &str) -> i64 {
         if origin.quota {
             let related: Vec<_> = self
                 .rechecks
@@ -2195,10 +2189,7 @@ impl ClassContext {
                             || self.origin_applies(other, &origin.provider, account, "", model))
                 })
                 .collect();
-            striatum_store::FenceRecheck::quota_group_at(
-                related,
-                self.probe_owner.as_deref(),
-            )
+            striatum_store::FenceRecheck::quota_group_at(related, self.probe_owner.as_deref())
         } else {
             origin.due_at()
         }
@@ -2229,11 +2220,7 @@ impl ClassContext {
         }
     }
 
-    fn origin_recovered(
-        &self,
-        origin: &striatum_store::FenceRecheck,
-        account: &str,
-    ) -> bool {
+    fn origin_recovered(&self, origin: &striatum_store::FenceRecheck, account: &str) -> bool {
         if !origin.quota {
             return false;
         }
@@ -2426,7 +2413,10 @@ impl ClassContext {
                     self.rechecks.iter().any(|origin| {
                         origin.kind == "transient_route"
                             && origin.applies(
-                                provider, &account.account_id, &credential.credential_id, model,
+                                provider,
+                                &account.account_id,
+                                &credential.credential_id,
+                                model,
                             )
                             && !self.origin_due(origin, &account.account_id, model)
                     })
@@ -2491,12 +2481,11 @@ impl ClassContext {
         // reservation. A quota route fence must not hide that same probe;
         // allocator quota blocks and observation backoffs still apply.
         let mut fenced = BTreeMap::new();
-        for origin in self.rechecks.iter().filter(|origin| {
-            matches!(
-                origin.kind.as_str(),
-                "account_route" | "observation"
-            )
-        }) {
+        for origin in self
+            .rechecks
+            .iter()
+            .filter(|origin| matches!(origin.kind.as_str(), "account_route" | "observation"))
+        {
             let account = origin.account_id.clone().or_else(|| {
                 origin.credential_id.as_ref().and_then(|id| {
                     crate::credential_fences::credential_account_id(&self.account_ids, id)
@@ -2837,12 +2826,14 @@ impl ClassContext {
         fact: &striatum_core::ModelFact,
         priced: bool,
     ) -> Option<striatum_core::CredentialRefusalMark> {
-        if !self
-            .credentials
-            .listed_credentials()
-            .iter()
-            .any(|row| crate::broca_credentials::credential_serves_fact(row, fact, &self.catalog, &self.credentials))
-        {
+        if !self.credentials.listed_credentials().iter().any(|row| {
+            crate::broca_credentials::credential_serves_fact(
+                row,
+                fact,
+                &self.catalog,
+                &self.credentials,
+            )
+        }) {
             return None;
         }
         let class = self.class(fact, priced);
@@ -2948,7 +2939,7 @@ impl ClassContext {
         }
     }
 
-        /// A legacy send has no later account admission. Claim its selected
+    /// A legacy send has no later account admission. Claim its selected
     /// origins here, or fail closed when the runner cannot pin the credential
     /// needed for a due account-local probe. Route/provider probes need no
     /// pin. A probe that another request holds, or that is not due yet, is a
@@ -2995,12 +2986,17 @@ impl ClassContext {
             // The login this context would launch on. Only an account block
             // that applies to it stops this launch; another login's block
             // does not. Without one, any account block on the provider does.
-            let launch = self.launch_credential(provider, model, priced).ok().map(|credential| {
-                let account =
-                    crate::credential_fences::credential_account_id(&self.account_ids, &credential)
-                        .unwrap_or_else(|| credential.clone());
-                (account, credential)
-            });
+            let launch = self
+                .launch_credential(provider, model, priced)
+                .ok()
+                .map(|credential| {
+                    let account = crate::credential_fences::credential_account_id(
+                        &self.account_ids,
+                        &credential,
+                    )
+                    .unwrap_or_else(|| credential.clone());
+                    (account, credential)
+                });
             let context = self.clone();
             let owned_provider = provider.to_owned();
             let owned_model = model.to_owned();
@@ -3029,8 +3025,9 @@ impl ClassContext {
                     })
                     .filter(|origin| match &launch {
                         Some((account, credential)) => {
-                            context.origin_applies_with(&fences, origin, provider, account, credential, model)
-                                && !context.origin_recovered(origin, account)
+                            context.origin_applies_with(
+                                &fences, origin, provider, account, credential, model,
+                            ) && !context.origin_recovered(origin, account)
                         }
                         None => true,
                     })
@@ -3059,7 +3056,11 @@ impl ClassContext {
                     owner.or(context.probe_owner.as_deref()),
                 )?;
                 Ok((!granted).then(|| {
-                    lost_probe_retry_at(&origins, owner.or(context.probe_owner.as_deref()), context.now_ms)
+                    lost_probe_retry_at(
+                        &origins,
+                        owner.or(context.probe_owner.as_deref()),
+                        context.now_ms,
+                    )
                 }))
             })
             .map_err(LaunchRefusal::store)?;
@@ -3096,8 +3097,14 @@ impl ClassContext {
             let origins: Vec<_> = all
                 .into_iter()
                 .filter(|origin| {
-                    context.origin_applies_with(&fences, origin, provider, &account, &credential, model)
-                        && !context.origin_recovered(origin, &account)
+                    context.origin_applies_with(
+                        &fences,
+                        origin,
+                        provider,
+                        &account,
+                        &credential,
+                        model,
+                    ) && !context.origin_recovered(origin, &account)
                 })
                 .collect();
             tx.check_decision_inputs(&[provider, ""])?;
@@ -3132,7 +3139,9 @@ impl ClassContext {
             {
                 return Ok(Err(LaunchRefusal::Refused {
                     code: "no_eligible_account".into(),
-                    message: format!("{provider}/{model}: a probe requires a credential-pinning runner"),
+                    message: format!(
+                        "{provider}/{model}: a probe requires a credential-pinning runner"
+                    ),
                 }));
             }
             let lost = || LaunchRefusal::Lost {
@@ -3299,10 +3308,7 @@ fn add_spend_inputs(
         let amount = |key: &str| {
             pool.get(key)
                 .and_then(|value| {
-                    serde_json::from_value::<striatum_core::quota::SpendBalance>(
-                        value.clone(),
-                    )
-                    .ok()
+                    serde_json::from_value::<striatum_core::quota::SpendBalance>(value.clone()).ok()
                 })
                 .map(|balance| balance.minor as f64 * 10_f64.powi(-balance.exponent))
         };
@@ -3645,11 +3651,7 @@ fn quota_reading_from_entry(
     let usage = entry.usage.as_ref();
     let reported = usage
         .map(|usage| {
-            striatum_core::quota_extract::account_rate_windows(
-                usage,
-                capacity_key,
-                model_pools,
-            )
+            striatum_core::quota_extract::account_rate_windows(usage, capacity_key, model_pools)
         })
         .unwrap_or_default();
     let general_windows: Vec<_> = reported
@@ -3878,9 +3880,9 @@ fn allocator_roster_for_model(
                         serde_json::from_value::<AccountEntry>(reading.entry.clone()).ok()
                     })
                     .and_then(|entry| entry.usage);
-                let pool_route = capacity_key.as_deref().is_some_and(|key| {
-                    striatum_core::quota_extract::requires_account_pool(key)
-                });
+                let pool_route = capacity_key
+                    .as_deref()
+                    .is_some_and(|key| striatum_core::quota_extract::requires_account_pool(key));
                 let pooled_reading = usage
                     .as_ref()
                     .and_then(|usage| usage.extra_rate_windows.as_ref())
@@ -4092,11 +4094,12 @@ fn quota_reading_binds_origin(
     } else {
         relevant
     };
-    relevant.iter().any(|fence| {
-        striatum_core::accounts::pools::binding_pressure(fence, reading, now, policy)
-    }) || relevant
+    relevant
         .iter()
-        .all(|fence| block_end(fence, reading, now, policy).is_some())
+        .any(|fence| striatum_core::accounts::pools::binding_pressure(fence, reading, now, policy))
+        || relevant
+            .iter()
+            .all(|fence| block_end(fence, reading, now, policy).is_some())
 }
 
 /// Bring the standing blocks on `provider` up to date with the accounts'
@@ -4441,7 +4444,17 @@ pub(crate) fn refresh_credential_quota_holds_in(
     route_fences: &[striatum_store::AccountRouteFence],
     now: EpochMs,
 ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
-    reconcile_credential_quota_holds(tx, credentials, quota, config, refusals, route_fences, now, true, &mut false)
+    reconcile_credential_quota_holds(
+        tx,
+        credentials,
+        quota,
+        config,
+        refusals,
+        route_fences,
+        now,
+        true,
+        &mut false,
+    )
 }
 
 fn reconcile_credential_quota_holds(
@@ -4794,7 +4807,11 @@ fn load_demand(
 /// [`load_demand`] over any source of `ACCOUNT_DEMAND_SQL` rows: SQL, or the
 /// account state, which keeps the same rows in memory.
 fn demand_with(
-    mut read: impl FnMut(&str, &str, Option<i64>) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
+    mut read: impl FnMut(
+        &str,
+        &str,
+        Option<i64>,
+    ) -> RouteStateResult<Vec<striatum_store::AccountDemandRow>>,
     provider: &str,
     roster: Option<&Roster>,
     policy: &AllocatorPolicy,
@@ -5500,8 +5517,7 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
         if let Some(usage) = &entry.usage {
             // Use the allocator's topology: pooled readings ignore misleading
             // aggregate slots and infer pool durations from their producer ids.
-            let reported =
-                striatum_core::quota_extract::account_rate_windows(usage, None, &[]);
+            let reported = striatum_core::quota_extract::account_rate_windows(usage, None, &[]);
             for (_, window) in reported.iter().filter(|(slot, _)| *slot != "extra") {
                 windows.push(status_window(window, None, None));
             }
@@ -5593,10 +5609,10 @@ pub(crate) fn account_status(params: &Value, ctx: &Ctx<'_>) -> OpReply {
 
 mod continuation;
 #[cfg(test)]
-pub(crate) use continuation::inject_continuation_preparation_failure;
-#[cfg(test)]
 pub(crate) use continuation::continue_account;
 pub(crate) use continuation::continue_account_with_call;
+#[cfg(test)]
+pub(crate) use continuation::inject_continuation_preparation_failure;
 pub(crate) mod call_log;
 mod concurrency_gate;
 
@@ -5650,7 +5666,12 @@ pub(crate) fn account_for_parsed(
     // id goes on: the writer command checks it against SQL by key before
     // allocating, and a refusal before the writer checks it here, so a closed
     // admission always replays its stored answer.
-    match crate::account_state::open_preflight_admission(ctx.store, principal, &admission_id, ctx.now_ms) {
+    match crate::account_state::open_preflight_admission(
+        ctx.store,
+        principal,
+        &admission_id,
+        ctx.now_ms,
+    ) {
         Ok(Some(row)) => {
             return replay_command(ctx, principal, row, request_fingerprint, finish);
         }
@@ -5709,9 +5730,11 @@ fn replay_command(
 fn admission_error(error: crate::routing_v1::accounts::AdmissionError) -> OpReply {
     match error {
         crate::routing_v1::accounts::AdmissionError::Store(error) => store_error(error),
-        crate::routing_v1::accounts::AdmissionError::Refusal(refusal) => {
-            OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
-        }
+        crate::routing_v1::accounts::AdmissionError::Refusal(refusal) => OpReply::typed(
+            refusal.code.as_str(),
+            refusal.message,
+            json!(refusal.detail),
+        ),
     }
 }
 
@@ -5816,7 +5839,11 @@ fn prepare_and_admit(
             if let Some(reply) = disjoint_candidates_refusal(&parsed, ctx, &roster, class) {
                 return Err(reply);
             }
-            if roster.roster.as_ref().is_none_or(|roster| roster.accounts.is_empty()) {
+            if roster
+                .roster
+                .as_ref()
+                .is_none_or(|roster| roster.accounts.is_empty())
+            {
                 // No eligible set is available to prove a stable disagreement.
                 // Keep temporary exclusions on the existing retry path.
                 let accounts: BTreeSet<_> = classes.facts.iter()
@@ -5876,8 +5903,9 @@ fn prepare_and_admit(
                 &request_fingerprint,
             )?;
             finish_reply(tx, reply, finish.as_ref(), command_ctx.now_ms)
-        })
-        .unwrap_or_else(admission_error))
+        },
+    )
+    .unwrap_or_else(admission_error))
 }
 
 fn finish_reply(
@@ -5980,7 +6008,8 @@ fn prepare_roster(
                 if cortexkit_role_routing::service_tier::ServiceTier::parse(&tier).is_none() {
                     return Err(unservable_refusal(
                         cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
-                        vec![], vec![],
+                        vec![],
+                        vec![],
                     ));
                 }
                 // A decision made by the older select (every core mason launch)
@@ -6123,8 +6152,13 @@ fn unservable_refusal(
     offered: Vec<String>,
     eligible: Vec<String>,
 ) -> OpReply {
-    let refusal = cortexkit_role_routing::errors::Refusal::account_unservable(reason, offered, eligible);
-    OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
+    let refusal =
+        cortexkit_role_routing::errors::Refusal::account_unservable(reason, offered, eligible);
+    OpReply::typed(
+        refusal.code.as_str(),
+        refusal.message,
+        json!(refusal.detail),
+    )
 }
 
 fn disjoint_candidates_refusal(
@@ -6134,54 +6168,89 @@ fn disjoint_candidates_refusal(
     class: striatum_core::accounts::AllowedAccountClass,
 ) -> Option<OpReply> {
     let candidates = params.candidates.as_ref()?;
-    if roster.roster.iter().flat_map(|r| &r.accounts).any(|account| {
-        account.credentials.iter().any(|credential| {
-            candidates.accounts.iter().any(|candidate| {
-                candidate.account_id == account.account_id
-                    && candidate.credential_id == credential.credential_id
+    if roster
+        .roster
+        .iter()
+        .flat_map(|r| &r.accounts)
+        .any(|account| {
+            account.credentials.iter().any(|credential| {
+                candidates.accounts.iter().any(|candidate| {
+                    candidate.account_id == account.account_id
+                        && candidate.credential_id == credential.credential_id
+                })
             })
         })
-    }) {
+    {
         return None;
     }
     let classes = ctx.classes.as_ref()?;
-    let eligible_rows: Vec<_> = classes.facts.iter()
-        .filter(|fact| fact.provider_id == normalize(&params.provider)
-            && fact.model_id == normalize(&params.model))
-        .flat_map(|fact| classes.eligible_rows(
-            classes.class(fact, class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly).rows,
-            fact,
-        ))
+    let eligible_rows: Vec<_> = classes
+        .facts
+        .iter()
+        .filter(|fact| {
+            fact.provider_id == normalize(&params.provider)
+                && fact.model_id == normalize(&params.model)
+        })
+        .flat_map(|fact| {
+            classes.eligible_rows(
+                classes
+                    .class(
+                        fact,
+                        class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+                    )
+                    .rows,
+                fact,
+            )
+        })
         .collect();
     let eligible: BTreeSet<_> = eligible_rows.iter().map(|row| row.id.clone()).collect();
     // Temporary exclusions are not a disagreement with the runner's list.
     if eligible.is_empty()
-        || candidates.accounts.iter().any(|candidate| eligible.contains(&candidate.credential_id))
+        || candidates
+            .accounts
+            .iter()
+            .any(|candidate| eligible.contains(&candidate.credential_id))
     {
         return None;
     }
-    let accounts: BTreeSet<_> = eligible_rows.iter().map(|row| classes.account_id(row)).collect();
+    let accounts: BTreeSet<_> = eligible_rows
+        .iter()
+        .map(|row| classes.account_id(row))
+        .collect();
     crate::account_refusal_log::allocator_refusal(&json!({"exclusions":
         accounts.into_iter().map(|account| json!({
             "account_id":account, "reason":"not_in_runner_candidates",
         })).collect::<Vec<_>>()
     }));
-    Some(because("candidates_filter", unservable_refusal(
-        cortexkit_role_routing::errors::AccountUnservableReason::CandidatesDisjoint,
-        candidates.accounts.iter().map(|candidate| candidate.credential_id.clone())
-            .collect::<BTreeSet<_>>().into_iter().collect(),
-        eligible.into_iter().collect(),
-    )))
+    Some(because(
+        "candidates_filter",
+        unservable_refusal(
+            cortexkit_role_routing::errors::AccountUnservableReason::CandidatesDisjoint,
+            candidates
+                .accounts
+                .iter()
+                .map(|candidate| candidate.credential_id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+            eligible.into_iter().collect(),
+        ),
+    ))
 }
 
 fn bound_service_tier_refusal(_params: &AccountForParams) -> OpReply {
     checking("bound_service_tier");
     let mut refusal = cortexkit_role_routing::errors::Refusal::account_unservable(
         cortexkit_role_routing::errors::AccountUnservableReason::BoundTierUnavailable,
-        vec![], vec![],
+        vec![],
+        vec![],
     );
     refusal.message = "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.".into();
-    OpReply::typed(refusal.code.as_str(), refusal.message, json!(refusal.detail))
+    OpReply::typed(
+        refusal.code.as_str(),
+        refusal.message,
+        json!(refusal.detail),
+    )
 }
 
 fn prepare_service_tier(
@@ -6205,7 +6274,8 @@ fn prepare_service_tier(
         let tier = ServiceTier::parse(&tier).ok_or_else(|| {
             unservable_refusal(
                 cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
-                vec![], vec![],
+                vec![],
+                vec![],
             )
         })?;
         parsed.service_tier_bound = !tier.is_standard();
@@ -6222,7 +6292,12 @@ fn prepare_service_tier(
             // No account left can serve the tier, but some are only held
             // out for a while: wait for them, as a lost probe does.
             if let Some(until) = held_until {
-                return Err(lost_probe_refusal(until, ctx.now_ms, Value::Null, json!([])));
+                return Err(lost_probe_refusal(
+                    until,
+                    ctx.now_ms,
+                    Value::Null,
+                    json!([]),
+                ));
             }
             return Err(bound_service_tier_refusal(parsed));
         }
@@ -6250,7 +6325,9 @@ fn prepare_service_tier(
             &classes.facts,
             classes.now_ms.max(0) as u64,
         );
-        let runners: Vec<_> = registry.policies().into_iter()
+        let runners: Vec<_> = registry
+            .policies()
+            .into_iter()
             .filter(|runner| runner.module == parsed.caller.runner)
             .collect();
         classes.apply_service_tier(
@@ -6316,9 +6393,10 @@ fn route_fence_refusal(
             params.candidates.as_ref().is_none_or(|candidates| {
                 candidates.accounts.iter().any(|candidate| {
                     candidate.account_id == view.account_id
-                        && view.credentials.iter().any(|credential| {
-                            credential.credential_id == candidate.credential_id
-                        })
+                        && view
+                            .credentials
+                            .iter()
+                            .any(|credential| credential.credential_id == candidate.credential_id)
                 })
             })
         })
@@ -6340,14 +6418,21 @@ fn route_fence_refusal(
         "exclusions": [],
         "reset_at_ms": until,
     });
-    let unoffered: Vec<_> = roster.roster.iter().flat_map(|roster| &roster.accounts)
-        .filter(|view| !wanted(&view.account_id)).collect();
+    let unoffered: Vec<_> = roster
+        .roster
+        .iter()
+        .flat_map(|roster| &roster.accounts)
+        .filter(|view| !wanted(&view.account_id))
+        .collect();
     if !unoffered.is_empty() {
         // The retry belongs to the offered accounts, not the whole route.
         // Credential ids (vault row names, not secrets) identify which eligible
         // accounts the runner left out of its candidates.
-        let credentials: BTreeSet<_> = unoffered.iter().flat_map(|view| &view.credentials)
-            .map(|credential| &credential.credential_id).collect();
+        let credentials: BTreeSet<_> = unoffered
+            .iter()
+            .flat_map(|view| &view.credentials)
+            .map(|credential| &credential.credential_id)
+            .collect();
         detail["eligible_accounts_not_offered"] = json!({
             "count": unoffered.len(), "credential_ids": credentials,
         });
@@ -6464,11 +6549,15 @@ fn empty_roster_refusal(
     {
         // Paid pools borrow the catalog model but keep their own provider id.
         // Their keys need the same spending decision as direct provider keys.
-        classes.facts.iter()
+        classes
+            .facts
+            .iter()
             .filter(|fact| {
                 fact.model_id == model
                     && (fact.provider_id == provider
-                        || classes.targets.get(&fact.provider_id)
+                        || classes
+                            .targets
+                            .get(&fact.provider_id)
                             .is_some_and(|target| target == provider))
             })
             .flat_map(|fact| classes.class(fact, true).rows)
@@ -6489,15 +6578,16 @@ fn empty_roster_refusal(
                 None => Some("unknown_credential"),
                 Some(row)
                     if !paid_rows.iter().any(|paid| paid.id == row.id)
-                        && !crate::broca_credentials::credential_providers(row, &classes.catalog)
+                        && !crate::broca_credentials::credential_providers(
+                            row,
+                            &classes.catalog,
+                        )
                         .iter()
                         .any(|mapped| mapped == provider) =>
                 {
                     Some("wrong_provider")
                 }
-                Some(row)
-                    if classes.account_id(row) != candidate.account_id =>
-                {
+                Some(row) if classes.account_id(row) != candidate.account_id => {
                     Some("account_id_mismatch")
                 }
                 Some(row) if !class_rows.iter().any(|allowed| allowed.id == row.id) => {
@@ -6519,7 +6609,8 @@ fn empty_roster_refusal(
         // for a selection decision before retrying the admission.
         if !candidates.accounts.is_empty()
             && exclusions.len() == candidates.accounts.len()
-            && exclusions.iter()
+            && exclusions
+                .iter()
                 .all(|exclusion| exclusion["reason"] == "routing_decision_required")
         {
             return Some(because("routing_decision_required", OpReply::typed(
@@ -6535,13 +6626,17 @@ fn empty_roster_refusal(
         // and gateways without their own catalog model rows.
         let known_provider = classes.catalog.contains(provider)
             || classes.targets.contains_key(provider)
-            || classes.facts.iter().any(|fact| fact.provider_id == provider)
+            || classes
+                .facts
+                .iter()
+                .any(|fact| fact.provider_id == provider)
             || classes.credentials.listed_credentials().iter().any(|row| {
-                row.categories.iter().any(|category| {
-                    matches!(category.as_str(), "llm-provider" | "llm-gateway")
-                }) && crate::broca_credentials::credential_providers(row, &classes.catalog)
+                row.categories
                     .iter()
-                    .any(|mapped| mapped == provider)
+                    .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
+                    && crate::broca_credentials::credential_providers(row, &classes.catalog)
+                        .iter()
+                        .any(|mapped| mapped == provider)
             });
         if !known_provider {
             checking("unknown_provider");
@@ -6554,7 +6649,9 @@ fn empty_roster_refusal(
             let mut message = format!("Routing does not know provider `{provider}`.");
             if providers.len() == 1 {
                 let suggested = providers.first().unwrap();
-                message.push_str(&format!(" Model `{model}` is served by provider `{suggested}`; use that provider id."));
+                message.push_str(&format!(
+                    " Model `{model}` is served by provider `{suggested}`; use that provider id."
+                ));
             }
             return Some(OpReply::typed(
                 "invalid_request",
@@ -6623,10 +6720,8 @@ fn empty_roster_refusal(
         {
             fenced_cause = true;
             row_resets.push(None);
-            exclusions.push(
-                json!({"account_id":classes.account_id(row),
-                "credential_id":row.id, "reason":"pool_backoff", "reset_at_ms":null}),
-            );
+            exclusions.push(json!({"account_id":classes.account_id(row),
+                "credential_id":row.id, "reason":"pool_backoff", "reset_at_ms":null}));
             continue;
         }
         let account = classes.account_id(row).to_owned();
@@ -6888,10 +6983,12 @@ pub(crate) fn preflight_model_for_class_with_reset(
         None
     } else {
         Some(
-            crate::account_state::published_at(ctx.store, ctx.now_ms).map_err(|error| PreflightRefusal {
-                code: "account_selection_unavailable".into(),
-                message: error.to_string(),
-                reset_at_ms: None,
+            crate::account_state::published_at(ctx.store, ctx.now_ms).map_err(|error| {
+                PreflightRefusal {
+                    code: "account_selection_unavailable".into(),
+                    message: error.to_string(),
+                    reset_at_ms: None,
+                }
             })?,
         )
     };
@@ -7179,9 +7276,7 @@ fn serve(
     tx.check_decision_inputs(&[provider, ""])?;
     // So does which credentials its principal's exclusions rule out.
     tx.check_admission_exclusions(principal, &params.admission_id)?;
-    let targets = |origin: &striatum_store::FenceRecheck,
-                   account: &str,
-                   credential: &str| {
+    let targets = |origin: &striatum_store::FenceRecheck, account: &str, credential: &str| {
         ctx.classes.as_ref().map_or_else(
             || {
                 let named = origin
@@ -7352,10 +7447,11 @@ fn serve(
             params.model_decision_id.is_some() && origin.claim_owner == params.model_decision_id
         };
         let non_quota_due = |origin: &striatum_store::FenceRecheck| {
-            ctx.classes.as_ref().map_or(
-                origin.due_at() <= now || owns_probe(origin),
-                |classes| classes.origin_due(origin, &admission.account_id, &params.model),
-            )
+            ctx.classes
+                .as_ref()
+                .map_or(origin.due_at() <= now || owns_probe(origin), |classes| {
+                    classes.origin_due(origin, &admission.account_id, &params.model)
+                })
         };
         let blocking_transient_until = applicable
             .iter()
@@ -7476,11 +7572,8 @@ fn serve(
                 // this roster. Preserve the actual fence and its retry time
                 // (see `lost_probe_retry_at`); removing only the credential
                 // misreports missing candidates.
-                let until = lost_probe_retry_at(
-                    &applicable,
-                    params.model_decision_id.as_deref(),
-                    now,
-                );
+                let until =
+                    lost_probe_retry_at(&applicable, params.model_decision_id.as_deref(), now);
                 lost_probe_fences.insert(admission.account_id.clone(), until);
                 inputs.credential_probe_notes.remove(&credential);
                 if let Some(roster) = &mut state.roster {
@@ -7542,15 +7635,27 @@ fn serve(
                 return Ok(match lost_probe_fences.values().copied().min() {
                     Some(lost) => {
                         let (decision_id, exclusions, reset) = match &reply {
-                            OpReply::Error { detail: Some(detail), .. } => (
+                            OpReply::Error {
+                                detail: Some(detail),
+                                ..
+                            } => (
                                 detail["decision_id"].clone(),
                                 detail["exclusions"].clone(),
                                 detail["reset_at_ms"].as_i64(),
                             ),
                             _ => (Value::Null, json!([]), None),
                         };
-                        let exclusions = if exclusions.is_null() { json!([]) } else { exclusions };
-                        lost_probe_refusal(reset.map_or(lost, |reset| reset.min(lost)), now, decision_id, exclusions)
+                        let exclusions = if exclusions.is_null() {
+                            json!([])
+                        } else {
+                            exclusions
+                        };
+                        lost_probe_refusal(
+                            reset.map_or(lost, |reset| reset.min(lost)),
+                            now,
+                            decision_id,
+                            exclusions,
+                        )
                     }
                     None => reply,
                 });
@@ -8211,8 +8316,9 @@ pub(crate) fn observe_authorized(
                 &params,
                 &roster_digests,
             )
-        })
-        .unwrap_or_else(store_error)
+        },
+    )
+    .unwrap_or_else(store_error)
 }
 
 fn record_observation(
@@ -8227,7 +8333,10 @@ fn record_observation(
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let runner = normalize(&parsed.caller.runner);
-    let existing = if parsed.attempt_outcome.is_some() || allow_served_account || admission_principal != principal {
+    let existing = if parsed.attempt_outcome.is_some()
+        || allow_served_account
+        || admission_principal != principal
+    {
         tx.observation_by_principal_event(principal, &parsed.event_id)?
     } else {
         tx.observation_by_event(principal, &runner, &parsed.event_id)?
@@ -8282,8 +8391,7 @@ fn record_observation(
                         .listed_credentials()
                         .iter()
                         .filter(|row| {
-                            parsed.served_account_id.as_deref()
-                                == Some(classes.account_id(row))
+                            parsed.served_account_id.as_deref() == Some(classes.account_id(row))
                         })
                         .flat_map(|row| row.serves.iter().chain(&row.provider_ids).cloned())
                         .collect()
@@ -8351,12 +8459,10 @@ fn record_observation(
     if parsed.kind == "credential_refused" {
         apply_credential_refused(&*tx, ctx, parsed, admission.as_ref(), &mut effects)?;
     } else if parsed.kind == "transient_backoff" && parsed.retry_at_ms.is_some() && bound {
-        let until = parsed
-            .retry_at_ms
-            .unwrap()
-            .min((now.max(0) as u64).saturating_add(
-                striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS as u64,
-            ));
+        let until = parsed.retry_at_ms.unwrap().min(
+            (now.max(0) as u64)
+                .saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS as u64),
+        );
         if let Some(admission) = &admission {
             effects.push(
                 json!({"effect":"transient_backoff", "provider":admission.provider,
@@ -8706,9 +8812,8 @@ fn apply_bound_observation(
             if parsed.limit_window.as_deref() == Some("credit") {
                 // Credit is a spending wall on a valid credential, not a quota
                 // pool. Utilization cannot prove that the account can pay again.
-                let cap = now.saturating_add(
-                    striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
-                );
+                let cap =
+                    now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
                 let retry = parsed
                     .retry_at_ms
                     .map(|at| i64::try_from(at).unwrap_or(i64::MAX))
@@ -8727,11 +8832,11 @@ fn apply_bound_observation(
                     recorded_at: now,
                 })?;
                 effects.push(json!({"effect":"fence","fence_id":new_id("acf"),
-                    "fence":wire(&Fence {
-                        account_id: admission.account_id.clone(), pool: None, recovery_set: Vec::new(),
-                        observed_at_ms: now, reset: ResetTime::Missing, retry_hint_ms: Some(until),
-                        source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
-                    })}));
+                "fence":wire(&Fence {
+                    account_id: admission.account_id.clone(), pool: None, recovery_set: Vec::new(),
+                    observed_at_ms: now, reset: ResetTime::Missing, retry_hint_ms: Some(until),
+                    source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
+                })}));
                 return Ok(());
             }
             let observation = ExhaustionObservation {
@@ -8983,8 +9088,9 @@ fn release(params: &Value, principal: &str, ctx: &Ctx<'_>) -> OpReply {
                     "lease_ended": lease_ended,
                 }
             })))
-        })
-        .unwrap_or_else(store_error)
+        },
+    )
+    .unwrap_or_else(store_error)
 }
 
 // ---------------------------------------------------------------------------
@@ -10531,18 +10637,29 @@ mod tests {
                 row.provider_ids = vec!["anthropic".into()];
                 row.auth_method = Some("oauth".into());
             }
-            shared.lock().unwrap().apply_listing(&live_listing, NOW as u64);
+            shared
+                .lock()
+                .unwrap()
+                .apply_listing(&live_listing, NOW as u64);
             let mut ctx = rig.ctx(true, NOW + 1);
             if class_aware {
-                ctx.classes = Some(ClassContext::load(
-                    rig.store(), &shared, Default::default(), Some(&rig.accounts), NOW + 1,
-                ).unwrap());
+                ctx.classes = Some(
+                    ClassContext::load(
+                        rig.store(),
+                        &shared,
+                        Default::default(),
+                        Some(&rig.accounts),
+                        NOW + 1,
+                    )
+                    .unwrap(),
+                );
             }
             request["expected_pin"] = first["pin"].clone();
             request["admission_id"] = json!("other-owner");
             request["model_decision_id"] = json!(other_decision);
             assert_eq!(
-                rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone()).code(),
+                rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request.clone())
+                    .code(),
                 Some("account_hold"),
             );
 
@@ -10552,7 +10669,9 @@ mod tests {
             assert_eq!(admitted["account"]["account_id"], ACCOUNT_A);
             assert_eq!(admitted["pin"]["id"], first["pin"]["id"]);
             assert_eq!(admitted["pin"]["generation"], first["pin"]["generation"]);
-            assert!(rig.store().fence_rechecks().unwrap()[0].claim_owner.is_none());
+            assert!(rig.store().fence_rechecks().unwrap()[0]
+                .claim_owner
+                .is_none());
             request["admission_id"] = json!("owned-probe-again");
             assert_eq!(
                 rig.call(&ctx, ACCOUNT_FOR_OP, BROCA, request).code(),
@@ -10831,12 +10950,7 @@ mod tests {
         let mut snapshot = fixture.store().build_snapshot(NOW as f64).unwrap();
         let windows: Vec<striatum_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        striatum_core::merge_quota_overlay(
-            &mut snapshot,
-            &windows,
-            &facts,
-            &shipped_model_pools(),
-        );
+        striatum_core::merge_quota_overlay(&mut snapshot, &windows, &facts, &shipped_model_pools());
         assert_eq!(snapshot.by_capacity[route].quota_exhausted_until, None);
         let seat = |snapshot| {
             striatum_core::select_panel(striatum_core::SelectPanelInput {
@@ -10867,12 +10981,7 @@ mod tests {
         healthy["usage"]["secondary"]["usedPercent"] = json!(100);
         let windows: Vec<striatum_core::ProviderUsage> =
             serde_json::from_value(json!([exhausted, healthy])).unwrap();
-        striatum_core::merge_quota_overlay(
-            &mut snapshot,
-            &windows,
-            &facts,
-            &shipped_model_pools(),
-        );
+        striatum_core::merge_quota_overlay(&mut snapshot, &windows, &facts, &shipped_model_pools());
         assert!(seat(snapshot).members.is_empty());
     }
 

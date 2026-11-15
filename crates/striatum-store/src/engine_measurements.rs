@@ -1,8 +1,8 @@
 //! Engine measurements are separate from billed usage and LLM speed estimates.
 
-use striatum_core::RouteStateResult;
 use rusqlite::{params, Connection};
 use serde::Serialize;
+use striatum_core::RouteStateResult;
 
 use super::{err, SqliteRouteStateStore};
 

@@ -731,10 +731,13 @@ fn additive_resume_projection_preserves_continuation_and_serving_identity() {
         "account":{"account_id":"current-account","credential_id":"current-credential"}
     }}});
     project_additive_shape_members(&mut observed);
-    assert_eq!(observed, json!({"method":"role.describe","reply":{"result":{
-        "capabilities":["account_continue"],"ops":[],"requirement_fields":[],
-        "account":{"account_id":"current-account","credential_id":"current-credential"}
-    }}}));
+    assert_eq!(
+        observed,
+        json!({"method":"role.describe","reply":{"result":{
+            "capabilities":["account_continue"],"ops":[],"requirement_fields":[],
+            "account":{"account_id":"current-account","credential_id":"current-credential"}
+        }}})
+    );
 }
 
 #[test]
@@ -750,7 +753,10 @@ fn additive_signed_out_projection_keeps_legacy_capabilities_and_sign_in_evidence
         "continuation":evidence
     });
     project_additive_shape_members(&mut observed);
-    assert_eq!(observed["describe"]["reply"]["result"]["capabilities"], json!(["account_continue"]));
+    assert_eq!(
+        observed["describe"]["reply"]["result"]["capabilities"],
+        json!(["account_continue"])
+    );
     assert_eq!(observed["continuation"], evidence);
 }
 
@@ -1002,11 +1008,15 @@ async fn broca_foreign_candidates_are_unservable_with_credential_ids() {
     )
     .unwrap();
     assert_eq!(fields["reason"], "candidates_filter");
-    assert_eq!(fields["eligible_credential_ids"], json!(["oauth:openai:example-a"]));
+    assert_eq!(
+        fields["eligible_credential_ids"],
+        json!(["oauth:openai:example-a"])
+    );
     assert_eq!(fields["eligible_credential_count"], 1);
-    assert_eq!(fields["offered_credential_ids"], json!([
-        "oauth:anthropic:example-a", "oauth:anthropic:example-b",
-    ]));
+    assert_eq!(
+        fields["offered_credential_ids"],
+        json!(["oauth:anthropic:example-a", "oauth:anthropic:example-b",])
+    );
     assert_eq!(fields["offered_credential_count"], 2);
     assert_eq!(
         fields["exclusions"],
@@ -1017,9 +1027,10 @@ async fn broca_foreign_candidates_are_unservable_with_credential_ids() {
     assert_eq!(fields["provider"], "openai");
     assert_eq!(fields["model"], "gpt-6.1-sol");
     assert_eq!(fields["hold_wait_max_s"], 300);
-    assert_eq!(fields["offered_candidate_credential_ids"], json!([
-        "oauth:anthropic:example-a", "oauth:anthropic:example-b",
-    ]));
+    assert_eq!(
+        fields["offered_candidate_credential_ids"],
+        json!(["oauth:anthropic:example-a", "oauth:anthropic:example-b",])
+    );
     for field in [
         "decision_id_present",
         "candidates_present",

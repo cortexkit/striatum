@@ -931,8 +931,8 @@ pub fn admit_routes_with_availability(
         }
         // Catalog-role refusals are structural, not account availability. Keep
         // their reason even for an ungraded model or a route with no account.
-        if let Some(reason) = crate::model_facts::llm_classification_rejection(fact, true)
-            .or_else(|| {
+        if let Some(reason) =
+            crate::model_facts::llm_classification_rejection(fact, true).or_else(|| {
                 availability_rejections
                     .get(&route.route_key)
                     .or_else(|| availability_rejections.get(&route.capacity_key))
@@ -3527,7 +3527,8 @@ mod abundance_tests {
     ) -> ModelFact {
         ModelFact {
             billing_plane: None,
-            auth_methods: None, login_methods_documented: false,
+            auth_methods: None,
+            login_methods_documented: false,
             input_rate: None,
             cache_read_rate: None,
             cache_write_rate: None,
@@ -3560,7 +3561,9 @@ mod abundance_tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
         }
     }
 

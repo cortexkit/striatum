@@ -224,49 +224,55 @@ async fn held_group_refuses_entire_fact_map_and_preserves_runner_level_reach() {
     // Production serves the group; withholding it here pins what a router that
     // doesn't serve it reads from the same declaration.
     describe::without_capability(GROUP, async {
-    let (harness, _) = configured().await;
-    harness.edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
-    let value = slot(json!({"primary":{
-        "exclude":[], "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]
-    }}));
-    let live = read(&value);
-    assert!(!live.declares_harness_facts());
-    assert!(live.harness_limits_error().is_some());
-    let facts = harness.store().get_facts().unwrap();
-    let shared = harness.credentials();
-    let mut credentials = shared.lock().unwrap();
-    credentials.runner_declarations.insert("broca".into(), live);
-    let live_generation = credentials.serving_generation();
-    let config = harness.operator_config();
-    let live_registry =
-        Registry::build_for_selection(config.as_ref(), &credentials, &facts, crate::now_ms(), None);
-    assert_eq!(live_registry.entries[0].pairs.as_ref().unwrap().len(), 2);
-    assert!(crate::take_operator_warnings()
-        .iter()
-        .any(|line| line.contains("runner broca:")
-            && line.contains("using runner-level limits for all harnesses")));
-    drop(credentials);
-    describe::with_candidate_capabilities(&[GROUP], async {
-        let candidate = read(&value);
-        assert!(candidate.declares_harness_facts());
+        let (harness, _) = configured().await;
+        harness
+            .edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
+        let value = slot(json!({"primary":{
+            "exclude":[], "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}]
+        }}));
+        let live = read(&value);
+        assert!(!live.declares_harness_facts());
+        assert!(live.harness_limits_error().is_some());
+        let facts = harness.store().get_facts().unwrap();
+        let shared = harness.credentials();
         let mut credentials = shared.lock().unwrap();
-        credentials
-            .runner_declarations
-            .insert("broca".into(), candidate);
-        assert_ne!(credentials.serving_generation(), live_generation);
-        let candidate_registry = Registry::build_for_selection(
+        credentials.runner_declarations.insert("broca".into(), live);
+        let live_generation = credentials.serving_generation();
+        let config = harness.operator_config();
+        let live_registry = Registry::build_for_selection(
             config.as_ref(),
             &credentials,
             &facts,
             crate::now_ms(),
             None,
         );
-        assert_eq!(
-            candidate_registry.entries[0].pairs.as_ref().unwrap().len(),
-            1
-        );
-    })
-    .await;
+        assert_eq!(live_registry.entries[0].pairs.as_ref().unwrap().len(), 2);
+        assert!(crate::take_operator_warnings()
+            .iter()
+            .any(|line| line.contains("runner broca:")
+                && line.contains("using runner-level limits for all harnesses")));
+        drop(credentials);
+        describe::with_candidate_capabilities(&[GROUP], async {
+            let candidate = read(&value);
+            assert!(candidate.declares_harness_facts());
+            let mut credentials = shared.lock().unwrap();
+            credentials
+                .runner_declarations
+                .insert("broca".into(), candidate);
+            assert_ne!(credentials.serving_generation(), live_generation);
+            let candidate_registry = Registry::build_for_selection(
+                config.as_ref(),
+                &credentials,
+                &facts,
+                crate::now_ms(),
+                None,
+            );
+            assert_eq!(
+                candidate_registry.entries[0].pairs.as_ref().unwrap().len(),
+                1
+            );
+        })
+        .await;
     })
     .await;
 }

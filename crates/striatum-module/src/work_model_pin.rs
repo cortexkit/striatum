@@ -158,7 +158,8 @@ pub(crate) fn select_with_availability(
     if facts.is_empty() {
         return Err(refuse("unknown_model", format!("unknown model {model:?} for provider {provider:?}; valid variants: none (unknown model)")));
     }
-    let variant_warning = validate_variant(pin, provider, model, variant, catalog, catalog_targets)?;
+    let variant_warning =
+        validate_variant(pin, provider, model, variant, catalog, catalog_targets)?;
     let mut fact = facts
         .iter()
         .find(|fact| fact.variant.as_deref() == variant)
@@ -167,11 +168,17 @@ pub(crate) fn select_with_availability(
         .clone();
     let route = fact_to_route(&fact);
     if fact.decommissioned {
-        return Err(refuse("decommissioned", format!("{pin}: model is decommissioned")));
+        return Err(refuse(
+            "decommissioned",
+            format!("{pin}: model is decommissioned"),
+        ));
     }
-    if let Some(reason) = availability_rejections.get(&route.route_key)
+    if let Some(reason) = availability_rejections
+        .get(&route.route_key)
         .or_else(|| availability_rejections.get(&route.capacity_key))
-        .filter(|reason| reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:"))
+        .filter(|reason| {
+            reason.starts_with("not_chat_model:") || reason.starts_with("not_chat_kind:")
+        })
     {
         return Err(refuse(reason, format!("{identity}: {reason}")));
     }
@@ -306,24 +313,31 @@ pub(crate) fn validate_variant(
     catalog: Option<&ReasoningCatalog>,
     catalog_targets: &BTreeMap<String, String>,
 ) -> Result<Option<String>, Refusal> {
-    let Some(variant) = variant else { return Ok(None) };
+    let Some(variant) = variant else {
+        return Ok(None);
+    };
     let identity = format!("{provider}/{model}");
-    match catalog.and_then(|catalog| {
-        variant_policy::published(catalog, catalog_targets, provider, model)
-    }) {
+    match catalog
+        .and_then(|catalog| variant_policy::published(catalog, catalog_targets, provider, model))
+    {
         Some(PublishedEfforts::Published(values)) => {
             if !values.iter().any(|value| value == variant) {
-                return Err(refuse("invalid_model_variant", format!(
-                    "unknown variant {variant:?} for {identity}; valid variants: {}",
-                    variant_policy::render(values)
-                )));
+                return Err(refuse(
+                    "invalid_model_variant",
+                    format!(
+                        "unknown variant {variant:?} for {identity}; valid variants: {}",
+                        variant_policy::render(values)
+                    ),
+                ));
             }
             Ok(None)
         }
         unknown => {
             let why = match (catalog, unknown) {
                 (None, _) => "no reasoning catalog is attached yet",
-                (Some(_), Some(PublishedEfforts::Unread)) => "the catalog has not been read for this model yet",
+                (Some(_), Some(PublishedEfforts::Unread)) => {
+                    "the catalog has not been read for this model yet"
+                }
                 (Some(_), _) => "the catalog has no row for this model",
             };
             let warning = format!("variant {variant} for {identity} not checked: {why}; the runner decides whether it is admitted");
@@ -336,8 +350,8 @@ pub(crate) fn validate_variant(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use striatum_core::model_router::RequiredCapabilities;
     use std::collections::HashSet;
+    use striatum_core::model_router::RequiredCapabilities;
 
     /// The operator's exclude list is an automatic-selection fence only, so an
     /// excluded route named by the head is admitted; hard admission (context,

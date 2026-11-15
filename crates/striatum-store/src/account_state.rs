@@ -197,7 +197,8 @@ impl crate::SqliteRouteStateStore {
     /// How many retries of the load have finished, for
     /// [`Self::retry_account_state_load_after`].
     pub fn account_state_retry_count(&self) -> u64 {
-        self.account_state_retries.load(std::sync::atomic::Ordering::Acquire)
+        self.account_state_retries
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// [`Self::retry_account_state_load`] for a caller that saw the load

@@ -26,10 +26,10 @@ use std::{
     time::Duration,
 };
 
-use striatum_core::{BillingPlane, BillingRate, RouteStateStore as _};
-use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate, SqliteRouteStateStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use striatum_core::{BillingPlane, BillingRate, RouteStateStore as _};
+use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate, SqliteRouteStateStore};
 use subc_protocol::{Flags, Frame, FrameType, Priority};
 use subc_transport::{authenticate_client, connection_file, read_frame, write_frame};
 use tokio::{io::AsyncWriteExt, net::TcpStream};
@@ -70,9 +70,7 @@ impl PlanConcurrencyCatalog {
                 None
             } else {
                 let value = &rows[0]["concurrency"];
-                let limit = value["limit"]
-                    .as_u64()
-                    .filter(|n| *n > 0);
+                let limit = value["limit"].as_u64().filter(|n| *n > 0);
                 let scope = match value["scope"].as_str() {
                     Some("account") => Some(CapScope::Account),
                     Some("account_model") => Some(CapScope::AccountModel),
@@ -1214,7 +1212,11 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
     let mut auth_methods = BTreeMap::new();
-    let documented: BTreeSet<_> = reply.login_methods.iter().map(|row| row.model.clone()).collect();
+    let documented: BTreeSet<_> = reply
+        .login_methods
+        .iter()
+        .map(|row| row.model.clone())
+        .collect();
     for row in reply.curated.into_iter().chain(reply.login_methods) {
         let mut methods = row.auth_methods;
         methods.sort();
@@ -3245,17 +3247,11 @@ mod tests {
             [striatum_core::BasketDimension::FreshInput]
         );
         fact.class_vector = Some(vector);
-        assert_eq!(
-            striatum_core::selection_cost(&fact, true, true),
-            1.0
-        );
+        assert_eq!(striatum_core::selection_cost(&fact, true, true), 1.0);
         fact.billing_plane.as_mut().unwrap().rates.clear();
         fact.cost_per_m_tok_out = None;
         fact.cost_tier = None;
-        assert_eq!(
-            striatum_core::selection_cost(&fact, true, false),
-            1.0
-        );
+        assert_eq!(striatum_core::selection_cost(&fact, true, false), 1.0);
     }
 
     #[test]
@@ -3402,7 +3398,11 @@ mod tests {
             let objective = antigravity_task_objective(&catalog, false);
             let task = objective.task_pricing.unwrap();
             let list = 0.0264;
-            assert_eq!(task.unpriced_dimensions, Vec::<String>::new(), "{refusal:?}");
+            assert_eq!(
+                task.unpriced_dimensions,
+                Vec::<String>::new(),
+                "{refusal:?}"
+            );
             assert!((task.list_cost_usd.unwrap() - list).abs() < 1e-12);
             assert_eq!(task.value_multiplier, 15.0);
             assert_eq!(task.pressure, 2.0);
@@ -3528,10 +3528,7 @@ mod tests {
         }
         facts[0].cost_per_m_tok_out = Some(0.0);
         facts[1].cost_per_m_tok_out = Some(0.5);
-        credentials.price_facts(
-            &mut facts,
-            &striatum_core::RoutePricing::default(),
-        );
+        credentials.price_facts(&mut facts, &striatum_core::RoutePricing::default());
 
         let free = &facts[0];
         let plane = free.billing_plane.as_ref().unwrap();
@@ -3540,14 +3537,8 @@ mod tests {
         assert!(!plane.rates.contains_key("rate.cache_write"));
         assert_eq!(free.basket_rate(CacheWrite), Some(0.0));
         assert_eq!(free.basket_price(&vector()).cost, Some(0.0));
-        assert_eq!(
-            striatum_core::selection_cost(free, false, true),
-            0.0
-        );
-        assert_eq!(
-            striatum_core::selection_cost(free, false, false),
-            0.0
-        );
+        assert_eq!(striatum_core::selection_cost(free, false, true), 0.0);
+        assert_eq!(striatum_core::selection_cost(free, false, false), 0.0);
 
         let paid = &facts[1];
         assert_eq!(paid.basket_rate(CacheWrite), Some(0.0));
@@ -3621,10 +3612,7 @@ mod tests {
             ("openai".into(), "chatgpt".into()),
             decode_plane_get(&get_reply("chatgpt luna — named, unfiltered")).unwrap(),
         );
-        credentials.price_facts(
-            &mut facts,
-            &striatum_core::RoutePricing::default(),
-        );
+        credentials.price_facts(&mut facts, &striatum_core::RoutePricing::default());
         let plane = facts[0].billing_plane.as_ref().unwrap();
         assert_eq!(plane.auth_method, "chatgpt");
         assert_eq!(plane.selection_reason, "roster");
@@ -3760,10 +3748,10 @@ mod tests {
             1
         );
         let mut priced = facts;
-        credentials.lock().unwrap().price_facts(
-            &mut priced,
-            &striatum_core::RoutePricing::default(),
-        );
+        credentials
+            .lock()
+            .unwrap()
+            .price_facts(&mut priced, &striatum_core::RoutePricing::default());
         assert_eq!(
             priced[0].billing_plane.as_ref().unwrap().kind,
             "no_coverage fallback"
@@ -3988,14 +3976,20 @@ mod tests {
                 seen.insert(route.clone());
                 model.model_type = fact.model_type.clone();
                 model.model_kind = fact.model_kind.clone();
-                if let Some(reason) = striatum_core::model_facts::llm_classification_rejection(&model, false) {
+                if let Some(reason) =
+                    striatum_core::model_facts::llm_classification_rejection(&model, false)
+                {
                     excluded.insert((route, reason));
                 }
             }
         }
         assert!(catalogs > 0);
         println!("producer_sha256={:x}", Sha256::digest(&bytes));
-        println!("catalogs={catalogs} distinct_rows={} newly_excluded={}", seen.len(), excluded.len());
+        println!(
+            "catalogs={catalogs} distinct_rows={} newly_excluded={}",
+            seen.len(),
+            excluded.len()
+        );
         for (route, reason) in excluded {
             println!("{route}\t{reason}");
         }
@@ -4284,8 +4278,12 @@ mod tests {
         let store = rig.store();
         apply_mapped_catalog(&store, &snapshot, None, Some("test")).unwrap();
         assert_eq!(
-            store.get_catalog_facts().unwrap().iter()
-                .filter(|row| row.fact.provider_id == "test").count(),
+            store
+                .get_catalog_facts()
+                .unwrap()
+                .iter()
+                .filter(|row| row.fact.provider_id == "test")
+                .count(),
             3
         );
         let quality = store.operator_quality().unwrap();
@@ -4469,9 +4467,9 @@ mod multiplier_fallback_tests {
     //! rates the catalog does not serve behaves the same way.
 
     use crate::broca_credentials::ServingMethod;
+    use serde_json::json;
     use striatum_core::billing::BillingRate;
     use striatum_core::{selection_cost, RoutePricing};
-    use serde_json::json;
 
     use super::{model_rates, BillingPlane, ModelRates, PlaneCatalog, PlaneReply};
 
@@ -4619,8 +4617,7 @@ mod multiplier_fallback_tests {
         let priced = priced_by_oauth_route(&pricing);
         assert_eq!(priced.subscription_multiplier, Some(multiplier));
         let list_dollars = (10_000.0 * 2.0 + 2_000.0 * 6.0 + 5_000.0 * 0.5) / 1_000_000.0;
-        let expected =
-            list_dollars / striatum_core::BASKET_REFERENCE_COST_PER_MESSAGE / multiplier;
+        let expected = list_dollars / striatum_core::BASKET_REFERENCE_COST_PER_MESSAGE / multiplier;
         let basket = priced.basket_price(priced.class_vector.as_ref().unwrap());
         assert!(basket.unpriced.is_empty(), "{:?}", basket.unpriced);
         assert!((basket.cost.unwrap() - expected).abs() < 1e-12);

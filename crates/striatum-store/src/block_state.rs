@@ -409,7 +409,10 @@ fn route_clears_check_sql() -> String {
 
 /// The keyed check of a clock by origin.
 fn by_origin_check_sql(table: usize) -> String {
-    format!("{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2", SELECTS[table])
+    format!(
+        "{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2",
+        SELECTS[table]
+    )
 }
 
 /// Every statement a decision runs to check the state against SQL
@@ -862,15 +865,23 @@ struct Table {
 /// names it), an exclusion's principal and admission ([`exclusion_scope`]),
 /// a route clear's clock ([`clear_scope`]), and a success pool's fence.
 fn scope_of(table: usize, key: &str, held: &Held) -> Option<String> {
-    if PROVIDER_COLUMNS.iter().any(|(provider_table, _)| *provider_table == table) {
+    if PROVIDER_COLUMNS
+        .iter()
+        .any(|(provider_table, _)| *provider_table == table)
+    {
         return row_provider(table, key, held);
     }
     match (table, held) {
         (EXCLUSION_TABLE, _) => {
             let parts: Vec<serde_json::Value> = serde_json::from_str(key).ok()?;
-            Some(exclusion_scope(parts.first()?.as_str()?, parts.get(1)?.as_str()?))
+            Some(exclusion_scope(
+                parts.first()?.as_str()?,
+                parts.get(1)?.as_str()?,
+            ))
         }
-        (ROUTE_CLEAR_TABLE, Held::RouteClear(clear)) => Some(clear_scope(&clear.kind, &clear.origin_key)),
+        (ROUTE_CLEAR_TABLE, Held::RouteClear(clear)) => {
+            Some(clear_scope(&clear.kind, &clear.origin_key))
+        }
         (SUCCESS_POOL_TABLE, Held::SuccessPool(pool)) => Some(pool.fence_id.clone()),
         _ => None,
     }
@@ -1121,7 +1132,12 @@ impl BlockState {
     pub(crate) fn fingerprints(&self) -> Vec<(usize, Option<i64>)> {
         self.tables
             .iter()
-            .map(|table| (table.rows.len, table.rows.iter().map(|(rowid, _)| *rowid).max()))
+            .map(|table| {
+                (
+                    table.rows.len,
+                    table.rows.iter().map(|(rowid, _)| *rowid).max(),
+                )
+            })
             .collect()
     }
 
@@ -1143,12 +1159,14 @@ impl BlockState {
             .take(CLOCK_TABLE)
             .enumerate()
             .flat_map(|(table, rows)| {
-                rows.rows.iter().filter_map(move |(rowid, (_, held))| match &**held {
-                    Held::Source { origins, link, raw } => {
-                        Some((table, *rowid, origins, link, raw))
-                    }
-                    _ => None,
-                })
+                rows.rows
+                    .iter()
+                    .filter_map(move |(rowid, (_, held))| match &**held {
+                        Held::Source { origins, link, raw } => {
+                            Some((table, *rowid, origins, link, raw))
+                        }
+                        _ => None,
+                    })
             })
     }
 
@@ -1367,7 +1385,10 @@ impl BlockState {
         let key: String = conn.query_row(
             &format!(
                 "SELECT json_array({})",
-                (1..=values.len()).map(|at| format!("?{at}")).collect::<Vec<_>>().join(",")
+                (1..=values.len())
+                    .map(|at| format!("?{at}"))
+                    .collect::<Vec<_>>()
+                    .join(",")
             ),
             rusqlite::params_from_iter(&values),
             |r| r.get(0),
@@ -1603,8 +1624,7 @@ impl BlockState {
         &self,
         now: f64,
         recheck_now: i64,
-    ) -> striatum_core::RouteStateResult<striatum_core::model_router::ModelRouteStateSnapshot>
-    {
+    ) -> striatum_core::RouteStateResult<striatum_core::model_router::ModelRouteStateSnapshot> {
         let rechecks = self.fence_rechecks(recheck_now)?;
         let mut rows: Vec<(i64, &crate::route_snapshot::RouteStateRow)> = self
             .raws(ROUTE_TABLE)
@@ -1675,7 +1695,9 @@ impl BlockState {
                     last_used_at,
                     walled_until,
                     cooldown_until,
-                } if owner == provider => Some((credential_id, last_used_at, walled_until, cooldown_until)),
+                } if owner == provider => {
+                    Some((credential_id, last_used_at, walled_until, cooldown_until))
+                }
                 _ => None,
             })
             .map(|(credential, last_used, walled, cooldown)| {
@@ -1739,7 +1761,11 @@ impl BlockState {
             })
             .collect();
         facts.sort_by(|a, b| {
-            (&a.provider, &a.credential_id, &a.model).cmp(&(&b.provider, &b.credential_id, &b.model))
+            (&a.provider, &a.credential_id, &a.model).cmp(&(
+                &b.provider,
+                &b.credential_id,
+                &b.model,
+            ))
         });
         facts
     }
@@ -1786,7 +1812,11 @@ impl BlockState {
                 .collect()
         };
         fences.sort_by(|a, b| {
-            (&a.provider, &a.credential_id, &a.model).cmp(&(&b.provider, &b.credential_id, &b.model))
+            (&a.provider, &a.credential_id, &a.model).cmp(&(
+                &b.provider,
+                &b.credential_id,
+                &b.model,
+            ))
         });
         fences
     }
@@ -1815,10 +1845,11 @@ impl BlockState {
     fn entitlements(
         &self,
     ) -> impl Iterator<Item = &striatum_core::route_state_store::CredentialEntitlementFence> {
-        self.raws(CREDENTIAL_TABLE).filter_map(|(_, raw)| match raw {
-            Raw::Entitlement(row) => Some(row),
-            _ => None,
-        })
+        self.raws(CREDENTIAL_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::Entitlement(row) => Some(row),
+                _ => None,
+            })
     }
 
     /// `credential_entitlement_fences()`: by provider and credential.
@@ -2050,22 +2081,27 @@ impl BlockState {
             if !current {
                 continue;
             }
-            let found = self.tables[CLOCK_TABLE].rows.iter().find_map(|(rowid, (key, held))| {
-                match &**held {
+            let found = self.tables[CLOCK_TABLE]
+                .rows
+                .iter()
+                .find_map(|(rowid, (key, held))| match &**held {
                     Held::Clock(block, None)
                         if block.kind == row.kind && block.origin_key == row.origin_key =>
                     {
                         Some((*rowid, key.clone(), block.clone()))
                     }
                     _ => None,
-                }
-            });
+                });
             if let Some((rowid, key, mut block)) = found {
                 block.next_recheck_at = now;
                 block.last_claimed_at = None;
                 block.claim_owner = None;
                 block.claim_generation += 1;
-                self.tables[CLOCK_TABLE].put(rowid, &key, Some(&Arc::new(Held::Clock(block, None))));
+                self.tables[CLOCK_TABLE].put(
+                    rowid,
+                    &key,
+                    Some(&Arc::new(Held::Clock(block, None))),
+                );
             }
         }
         let held: Vec<(i64, String)> = self.tables[AUTHORIZATION_TABLE]
@@ -2125,10 +2161,11 @@ impl BlockState {
     /// Every stored probe clock, cleared or not, with its `cleared_at`, in no
     /// particular order.
     pub(crate) fn stored_clocks(&self) -> impl Iterator<Item = (&Block, Option<i64>)> {
-        self.rows_of(CLOCK_TABLE).filter_map(|(_, held)| match held {
-            Held::Clock(block, cleared) => Some((block, *cleared)),
-            _ => None,
-        })
+        self.rows_of(CLOCK_TABLE)
+            .filter_map(|(_, held)| match held {
+                Held::Clock(block, cleared) => Some((block, *cleared)),
+                _ => None,
+            })
     }
 
     /// One active account fence, with its pool key and recovery set as JSON.
@@ -2136,16 +2173,17 @@ impl BlockState {
         &self,
         fence_id: &str,
     ) -> Option<(&crate::AccountFenceRow, Option<&str>, &str)> {
-        self.raws(ACCOUNT_FENCE_TABLE).find_map(|(_, raw)| match raw {
-            Raw::AccountFence {
-                row,
-                pool_key_json,
-                recovery_set_json,
-            } if row.fence_id == fence_id => {
-                Some((row, pool_key_json.as_deref(), recovery_set_json.as_str()))
-            }
-            _ => None,
-        })
+        self.raws(ACCOUNT_FENCE_TABLE)
+            .find_map(|(_, raw)| match raw {
+                Raw::AccountFence {
+                    row,
+                    pool_key_json,
+                    recovery_set_json,
+                } if row.fence_id == fence_id => {
+                    Some((row, pool_key_json.as_deref(), recovery_set_json.as_str()))
+                }
+                _ => None,
+            })
     }
 
     /// The `account_route_fence` row of one credential's model, of any wall
@@ -2185,7 +2223,11 @@ impl BlockState {
             .find_map(|(_, held)| match held {
                 Held::Source {
                     origins,
-                    raw: Raw::NonQuotaRouteFence { row, wall_kind: kind },
+                    raw:
+                        Raw::NonQuotaRouteFence {
+                            row,
+                            wall_kind: kind,
+                        },
                     ..
                 } if row.provider == provider
                     && row.credential_id == credential
@@ -2207,7 +2249,11 @@ impl BlockState {
         model: &str,
         size_class: i64,
     ) -> Option<&crate::AccountSizeRefusal> {
-        let table = if quota { SIZE_TABLE } else { NON_QUOTA_SIZE_TABLE };
+        let table = if quota {
+            SIZE_TABLE
+        } else {
+            NON_QUOTA_SIZE_TABLE
+        };
         self.raws(table).find_map(|(_, raw)| match raw {
             Raw::Size(row)
                 if row.provider == provider
@@ -2261,17 +2307,23 @@ impl BlockState {
                     && covering.same_error(wall)
                     && sql_cmp(&wall.observed, &Value::Integer(evidence_at)) == Some(Equal)
                     && sql_cmp(&wall.observed, &Value::Integer(admitted_at)) == Some(Less)
-                    && matches!(sql_cmp(&wall.cooldown, &covering.cooldown), Some(Less | Equal))
+                    && matches!(
+                        sql_cmp(&wall.cooldown, &covering.cooldown),
+                        Some(Less | Equal)
+                    )
                     && matches!(sql_cmp(&wall.quota, &covering.quota), Some(Less | Equal)) =>
                 {
-                    origins.iter().find(|origin| origin.kind == "route").map(|origin| {
-                        (
-                            key.clone(),
-                            origin.evidence.clone(),
-                            wall.last_error.clone(),
-                            wall.observed.clone(),
-                        )
-                    })
+                    origins
+                        .iter()
+                        .find(|origin| origin.kind == "route")
+                        .map(|origin| {
+                            (
+                                key.clone(),
+                                origin.evidence.clone(),
+                                wall.last_error.clone(),
+                                wall.observed.clone(),
+                            )
+                        })
                 }
                 _ => None,
             })
@@ -2443,9 +2495,7 @@ impl crate::AccountTx<'_> {
 /// the working state decided on. The writer rolls the batch back, reloads
 /// the state and runs the batch again (`account_writer::STATE_DIVERGED`).
 pub(crate) fn diverged(what: impl std::fmt::Display) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(
-        format!("{}: {what}", crate::STATE_DIVERGED).into(),
-    )
+    rusqlite::Error::ToSqlConversionFailure(format!("{}: {what}", crate::STATE_DIVERGED).into())
 }
 
 /// Fail with [`diverged`] unless a keyed write changed exactly `expected` rows.

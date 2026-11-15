@@ -1,8 +1,8 @@
 use super::*;
 use crate::{dev_descriptor, route_state_migrations, V1Decision};
-use striatum_core::accounts::AllowedAccountClass;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
+use striatum_core::accounts::AllowedAccountClass;
 
 fn descriptor(
     scratch: &cortexkit_test_support::ScratchDir,

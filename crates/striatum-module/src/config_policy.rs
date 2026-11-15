@@ -751,7 +751,12 @@ pub fn resolve_consumer_policy(
     };
     for (source, is_operator) in [(declared, false), (operator, true)] {
         if is_operator {
-            overlay(request, request.ladder_source.unwrap_or(ConsumerLadderSource::Request));
+            overlay(
+                request,
+                request
+                    .ladder_source
+                    .unwrap_or(ConsumerLadderSource::Request),
+            );
         }
         let mut chain: Vec<_> = source
             .iter()
@@ -762,11 +767,14 @@ pub fn resolve_consumer_policy(
             .collect();
         chain.sort_by_key(|(name, _)| consumer_specificity(name));
         for (_, entry) in chain {
-            overlay(entry, if is_operator {
-                ConsumerLadderSource::OperatorSettings
-            } else {
-                ConsumerLadderSource::Declaration
-            });
+            overlay(
+                entry,
+                if is_operator {
+                    ConsumerLadderSource::OperatorSettings
+                } else {
+                    ConsumerLadderSource::Declaration
+                },
+            );
         }
     }
     let mut result: ConsumerPolicy =

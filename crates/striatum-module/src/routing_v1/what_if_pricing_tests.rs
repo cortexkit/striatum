@@ -177,12 +177,11 @@ async fn what_if_pricing_patch_reproduces_cost_scaled_after_table_without_live_w
             .await
             .unwrap();
         for (index, row) in after["results"].as_array().unwrap().iter().enumerate() {
-            let expected =
-                if index < 6 && (consumer == "mason" || index > 0) {
-                    "google/antigravity-gemini-3.8-flash"
-                } else {
-                    "anthropic/claude-opus-5-5"
-                };
+            let expected = if index < 6 && (consumer == "mason" || index > 0) {
+                "google/antigravity-gemini-3.8-flash"
+            } else {
+                "anthropic/claude-opus-5-5"
+            };
             assert_eq!(
                 row["pick"]["route"],
                 expected,

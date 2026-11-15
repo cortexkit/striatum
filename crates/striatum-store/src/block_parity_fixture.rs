@@ -103,17 +103,25 @@ pub(crate) fn seed_block_parity_fixture(
     };
     conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-fence','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,'[]')", params![serde_json::to_string(&fence).unwrap(),at])?;
     let mut recovery_fence = fence.clone();
-    recovery_fence.recovery_set = [300, 10080].map(|window| striatum_core::accounts::PoolKey {
-        window_minutes: Some(window),
-        scope: striatum_core::accounts::PoolScope::EveryModel,
-        name: None,
-    }).into();
+    recovery_fence.recovery_set = [300, 10080]
+        .map(|window| striatum_core::accounts::PoolKey {
+            window_minutes: Some(window),
+            scope: striatum_core::accounts::PoolScope::EveryModel,
+            name: None,
+        })
+        .into();
     conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-recovery','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,?3)",
         params![serde_json::to_string(&recovery_fence).unwrap(),at,serde_json::to_string(&recovery_fence.recovery_set).unwrap()])?;
     // A completed test proved one pool, but the other pool still needs a
     // test. Its whole-account clock stays active with the claim released.
-    conn.execute("INSERT INTO fence_success_pool VALUES ('parity-recovery',?1,?2,?3)",
-        params![serde_json::to_string(&recovery_fence.recovery_set[0]).unwrap(),at,now])?;
+    conn.execute(
+        "INSERT INTO fence_success_pool VALUES ('parity-recovery',?1,?2,?3)",
+        params![
+            serde_json::to_string(&recovery_fence.recovery_set[0]).unwrap(),
+            at,
+            now
+        ],
+    )?;
     conn.execute_batch(&format!(r#"
                 INSERT INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at})
                   ON CONFLICT(provider_id,credential_id) DO UPDATE SET code=excluded.code,

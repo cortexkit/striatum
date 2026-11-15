@@ -12,11 +12,11 @@
 //! Old account history and runner observations are removed only by the
 //! bounded retention batches in `retention.rs`.
 
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use striatum_core::{
     accounts::{FenceScope, PoolKey},
     RouteStateResult,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::{err, SqliteRouteStateStore};
 
@@ -735,9 +735,8 @@ impl AccountTx<'_> {
         &self,
         provider: &str,
         credential: &str,
-    ) -> RouteStateResult<
-        Option<striatum_core::route_state_store::CredentialEntitlementFence>,
-    > {
+    ) -> RouteStateResult<Option<striatum_core::route_state_store::CredentialEntitlementFence>>
+    {
         self.conn
             .query_row(
                 "SELECT provider_id, credential_id, code, listing_fingerprint, observed_at_ms
@@ -813,15 +812,13 @@ impl AccountTx<'_> {
         account: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
-        let identity = serde_json::to_string(
-            &striatum_core::route_state_store::ProviderOutcome {
-                account_ref: account.into(),
-                credential_id: Some(credential.into()),
-                resets_at_ms: None,
-                credential_refusal: None,
-                ..Default::default()
-            },
-        )
+        let identity = serde_json::to_string(&striatum_core::route_state_store::ProviderOutcome {
+            account_ref: account.into(),
+            credential_id: Some(credential.into()),
+            resets_at_ms: None,
+            credential_refusal: None,
+            ..Default::default()
+        })
         .map_err(err)?;
         self.conn.execute("UPDATE model_route_decisions SET provider_identity_json=?1 WHERE id=?2 AND selected_provider_id=?3 AND selected_model_id=?4",params![identity,decision,provider,model]).map(|_|()).map_err(err)
     }
@@ -1427,10 +1424,7 @@ pub(crate) mod rows {
     }
 
     /// `provider,credential_id,model,until_ms,decision_id,recorded_at`.
-    pub(crate) fn route_fence_at(
-        row: &Row<'_>,
-        at: usize,
-    ) -> rusqlite::Result<AccountRouteFence> {
+    pub(crate) fn route_fence_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountRouteFence> {
         Ok(AccountRouteFence {
             provider: row.get(at)?,
             credential_id: row.get(at + 1)?,
@@ -1443,10 +1437,7 @@ pub(crate) mod rows {
 
     /// `principal,admission_id,credential_id,runner_view_digest,
     /// roster_view_digest,observation_id,recorded_at`.
-    pub(crate) fn exclusion_at(
-        row: &Row<'_>,
-        at: usize,
-    ) -> rusqlite::Result<AccountExclusionRow> {
+    pub(crate) fn exclusion_at(row: &Row<'_>, at: usize) -> rusqlite::Result<AccountExclusionRow> {
         Ok(AccountExclusionRow {
             principal: row.get(at)?,
             admission_id: row.get(at + 1)?,
@@ -2052,18 +2043,34 @@ impl AccountTx<'_> {
     /// End a standing block that a decision read as `row`: the update is
     /// keyed and names the row's evidence, so it fails with
     /// [`crate::block_state::diverged`] if SQL no longer holds that block.
-    pub fn clear_held_fence(&self, row: &AccountFenceRow, at: i64, reason: &str) -> RouteStateResult<()> {
+    pub fn clear_held_fence(
+        &self,
+        row: &AccountFenceRow,
+        at: i64,
+        reason: &str,
+    ) -> RouteStateResult<()> {
         let changed = self
             .conn
             .execute(
                 "UPDATE account_fence SET cleared_at = ?2, cleared_reason = ?3 \
                  WHERE fence_id = ?1 AND cleared_at IS NULL AND observed_at = ?4 \
                    AND created_at = ?5 AND fence_json = ?6",
-                params![row.fence_id, at, reason, row.observed_at, row.created_at, row.fence_json],
+                params![
+                    row.fence_id,
+                    at,
+                    reason,
+                    row.observed_at,
+                    row.created_at,
+                    row.fence_json
+                ],
             )
             .map_err(err)?;
-        crate::block_state::expect_changes(changed, 1, format_args!("clear of fence {}", row.fence_id))
-            .map_err(err)
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("clear of fence {}", row.fence_id),
+        )
+        .map_err(err)
     }
 
     /// [`Self::clear_held_fence`] for a block whose clear was decided on its
@@ -2101,8 +2108,12 @@ impl AccountTx<'_> {
                 ],
             )
             .map_err(err)?;
-        crate::block_state::expect_changes(changed, 1, format_args!("clear of fence {} on its pools", row.fence_id))
-            .map_err(err)
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("clear of fence {} on its pools", row.fence_id),
+        )
+        .map_err(err)
     }
 
     /// Replace a standing whole-account block's recovery set, which only
@@ -2154,7 +2165,9 @@ impl AccountTx<'_> {
             )
             .map_err(err)?;
         let rows = statement
-            .query_map(params![principal, admission_id], |row| rows::exclusion_at(row, 0))
+            .query_map(params![principal, admission_id], |row| {
+                rows::exclusion_at(row, 0)
+            })
             .map_err(err)?;
         rows.collect::<rusqlite::Result<_>>().map_err(err)
     }
@@ -2206,10 +2219,10 @@ impl AccountTx<'_> {
                     params![
                         serde_json::json!([row.principal, row.admission_id, row.credential_id])
                             .to_string(),
-                        row.recorded_at.saturating_add(after_ms.clamp(
-                            0,
-                            striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS
-                        ))
+                        row.recorded_at.saturating_add(
+                            after_ms
+                                .clamp(0, striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS)
+                        )
                     ],
                 )
                 .map_err(err)?;
@@ -2333,8 +2346,11 @@ impl AccountTx<'_> {
         }
         // The rows this observation inserted or moved, returned by the
         // write itself rather than read back from the block table.
-        let keys = self.conn.prepare(INSERT_TRANSIENT_BACKOFFS).map_err(err)?
-            .query_map(params![id,effects], |row| row.get::<_, String>(0))
+        let keys = self
+            .conn
+            .prepare(INSERT_TRANSIENT_BACKOFFS)
+            .map_err(err)?
+            .query_map(params![id, effects], |row| row.get::<_, String>(0))
             .map_err(err)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
@@ -2453,7 +2469,10 @@ impl SqliteRouteStateStore {
         self.direct_account_transaction_with_error(f)
     }
 
-    pub(crate) fn direct_account_transaction_with_error<T, E: From<striatum_core::RouteStateStoreError>>(
+    pub(crate) fn direct_account_transaction_with_error<
+        T,
+        E: From<striatum_core::RouteStateStoreError>,
+    >(
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> Result<T, E>,
     ) -> Result<T, E> {
@@ -2584,9 +2603,7 @@ mod transient_fence_tests {
 
     #[test]
     fn exhausted_transient_retries_never_install_a_model_failure_backoff() {
-        use striatum_core::{
-            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
-        };
+        use striatum_core::{DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore};
         let scratch = cortexkit_test_support::ScratchDir::new("transient-terminal-backoff");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "transient-terminal-backoff",
@@ -2611,13 +2628,11 @@ mod transient_fence_tests {
                 .set_decision_outcome(
                     &decision,
                     &DecisionOutcomeUpdate {
-                        provider_outcome: Some(
-                            striatum_core::route_state_store::ProviderOutcome {
-                                error_class: Some("transient".into()),
-                                provider_code: Some("server_is_overloaded".into()),
-                                ..Default::default()
-                            },
-                        ),
+                        provider_outcome: Some(striatum_core::route_state_store::ProviderOutcome {
+                            error_class: Some("transient".into()),
+                            provider_code: Some("server_is_overloaded".into()),
+                            ..Default::default()
+                        }),
                         outcome: RouteOutcome::SessionError,
                         last_error: Some(error.into()),
                         observed_at_ms: 1_000,

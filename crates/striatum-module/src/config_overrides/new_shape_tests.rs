@@ -678,16 +678,27 @@ fn masons_refuse_below_bar_by_default_but_operator_policy_wins() {
 fn explicit_subscription_marks_keep_kimi_review_and_grok_automatic() {
     use striatum_core::billing::BillingPlane;
     let mut plane = BillingPlane {
-        provider_id: String::new(), auth_method: "apikey".into(), kind: "upstream".into(),
-        selection_reason: "flat-rate plan using an API key".into(), rates: BTreeMap::new(),
+        provider_id: String::new(),
+        auth_method: "apikey".into(),
+        kind: "upstream".into(),
+        selection_reason: "flat-rate plan using an API key".into(),
+        rates: BTreeMap::new(),
     };
     let plans = config(json!({
         "providers": {"kimi-for-coding":{"subscription":true}, "kimi-code-plan-global":{"subscription":true}, "xai":{"subscription":true}, "other":{"subscription":false}},
         "models": {"xai/metered":{"subscription":false}, "other/plan":{"subscription":true}, "xai/manual":{"pin_only":true}}
     }));
-    for (consumer, route) in [("athena.review", "kimi-code-plan-global/k3.1-pro"), ("athena.review", "kimi-for-coding/kimi-k3"), ("head", "xai/grok-4.7"), ("flow", "other/plan")] {
+    for (consumer, route) in [
+        ("athena.review", "kimi-code-plan-global/k3.1-pro"),
+        ("athena.review", "kimi-for-coding/kimi-k3"),
+        ("head", "xai/grok-4.7"),
+        ("flow", "other/plan"),
+    ] {
         plane.provider_id = route.split('/').next().unwrap().into();
-        assert!(plans.route_allowed_on_plane(consumer, route, false, Some(&plane)), "{consumer}: {route}");
+        assert!(
+            plans.route_allowed_on_plane(consumer, route, false, Some(&plane)),
+            "{consumer}: {route}"
+        );
     }
     assert!(!plans.route_allowed_on_plane("head", "xai/metered", false, Some(&plane)));
     assert!(!plans.route_allowed_on_plane("head", "xai/manual", false, Some(&plane)));

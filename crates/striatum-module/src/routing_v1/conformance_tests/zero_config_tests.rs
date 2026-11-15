@@ -381,18 +381,27 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
         }}
     ]));
     let mut credentials = crate::broca_credentials::BrocaCredentials::default();
-    credentials.apply_listing(&ScopedCredentialListing {
-        view: "zero-config-media".into(),
-        credentials: vec![ListedCredential {
-            id: "phone-transcription-key".into(), categories: vec!["media-provider".into()],
-            credential_type: "apikey".into(), auth_method: Some("apikey".into()),
-            state: "active".into(), provider_ids: vec!["openai".into()], ..Default::default()
-        }],
-        grant_tuples: vec![ListedGrant {
-            selector_kind: "category".into(), selector: "media-provider".into(), operation: "list".into()
-        }],
-        ..Default::default()
-    }, crate::now_ms());
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "zero-config-media".into(),
+            credentials: vec![ListedCredential {
+                id: "phone-transcription-key".into(),
+                categories: vec!["media-provider".into()],
+                credential_type: "apikey".into(),
+                auth_method: Some("apikey".into()),
+                state: "active".into(),
+                provider_ids: vec!["openai".into()],
+                ..Default::default()
+            }],
+            grant_tuples: vec![ListedGrant {
+                selector_kind: "category".into(),
+                selector: "media-provider".into(),
+                operation: "list".into(),
+            }],
+            ..Default::default()
+        },
+        crate::now_ms(),
+    );
     harness.set_credentials(credentials);
     let caller = harness.bind(reserved("callosum"), None).await;
     let selected = caller.call("route.select_engine", &json!({
@@ -402,6 +411,13 @@ async fn absent_settings_keeps_remote_media_engines_automatic() {
     assert_eq!(selected.1["result"]["engine"]["provider"], "openai");
     assert_eq!(selected.1["result"]["engine"]["model"], "gpt-transcribe");
     assert!(harness.operator_config().v1_runners().is_empty());
-    assert!(harness.operator_config().operator_policy().exclude.is_empty());
-    assert!(!path.exists(), "media selection must not create routing settings");
+    assert!(harness
+        .operator_config()
+        .operator_policy()
+        .exclude
+        .is_empty());
+    assert!(
+        !path.exists(),
+        "media selection must not create routing settings"
+    );
 }

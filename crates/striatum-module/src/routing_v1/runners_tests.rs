@@ -2,8 +2,8 @@
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use cortexkit_role_routing_conformance::fixture;
-use striatum_core::{ModelFact, RouteStateStore};
 use serde_json::{json, Value};
+use striatum_core::{ModelFact, RouteStateStore};
 use subc_protocol::FrameType;
 
 use super::{
@@ -993,11 +993,14 @@ fn provider_limits_keep_apikey_and_oauth_provider_identity() {
     let route = format!("{provider}/claude-opus-5-5");
     for method in ["apikey", "oauth"] {
         for per_harness in [false, true] {
-            for providers in [vec!["anthropic"], vec![provider], vec!["anthropic", provider]] {
+            for providers in [
+                vec!["anthropic"],
+                vec![provider],
+                vec!["anthropic", provider],
+            ] {
                 let mut facts = vec![fact("anthropic", "claude-opus-5-5", None)];
-                let mut credentials = credentials(
-                    &facts, row(&[provider], &["anthropic"], Some(method)), NOW,
-                );
+                let mut credentials =
+                    credentials(&facts, row(&[provider], &["anthropic"], Some(method)), NOW);
                 credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
                 let targets = credentials.catalog_targets(&facts);
                 assert_eq!(targets.get(provider).map(String::as_str), Some("anthropic"));
@@ -1007,18 +1010,27 @@ fn provider_limits_keep_apikey_and_oauth_provider_identity() {
                     "harnesses":["alpha", "beta"]
                 }});
                 if per_harness {
-                    slot["runner"]["harness_limits"] = json!({"alpha":{"explicit_providers":providers}});
+                    slot["runner"]["harness_limits"] =
+                        json!({"alpha":{"explicit_providers":providers}});
                 } else {
                     slot["runner"]["standing_limits"] = json!({"explicit_providers":providers});
                 }
                 credentials.runner_declarations.insert(
-                    "fixture-runner".into(), runners::parse_declaration(&slot).unwrap().unwrap(),
+                    "fixture-runner".into(),
+                    runners::parse_declaration(&slot).unwrap().unwrap(),
                 );
                 let registry = Registry::build_for_harness(
-                    vec![policy(None)], &credentials, &facts, NOW, Some("alpha"),
+                    vec![policy(None)],
+                    &credentials,
+                    &facts,
+                    NOW,
+                    Some("alpha"),
                 );
-                assert_eq!(registry.runs("fixture-runner", &route, &route), providers.contains(&provider),
-                    "method={method}, per_harness={per_harness}, providers={providers:?}");
+                assert_eq!(
+                    registry.runs("fixture-runner", &route, &route),
+                    providers.contains(&provider),
+                    "method={method}, per_harness={per_harness}, providers={providers:?}"
+                );
             }
         }
     }
@@ -1033,22 +1045,30 @@ fn gateway_provider_limits_use_catalog_targets_not_id_spelling() {
             fact("anthropic", "claude-opus-5-5", None),
             fact("openai", "model-example", None),
         ];
-        let mut credentials = credentials(
-            &facts, row(&[provider], &serves, Some("gateway")), NOW,
-        );
+        let mut credentials = credentials(&facts, row(&[provider], &serves, Some("gateway")), NOW);
         credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
         let targets = credentials.catalog_targets(&facts);
         striatum_core::score_alias::append_alias_rows(&mut facts, &targets);
-        for providers in [vec!["anthropic"], vec!["anthropic", provider], vec![provider]] {
-            credentials.runner_declarations.insert("fixture-runner".into(),
+        for providers in [
+            vec!["anthropic"],
+            vec!["anthropic", provider],
+            vec![provider],
+        ] {
+            credentials.runner_declarations.insert(
+                "fixture-runner".into(),
                 runners::parse_declaration(&json!({"runner": {
                     "pairs":[{"wire_api":"anthropic.messages", "auth_method":"gateway"}],
                     "standing_limits":{"explicit_providers":providers}
-                }})).unwrap().unwrap());
+                }}))
+                .unwrap()
+                .unwrap(),
+            );
             let registry = Registry::build(vec![policy(None)], &credentials, &facts, NOW);
-            assert_eq!(registry.runs("fixture-runner", &route, &route),
+            assert_eq!(
+                registry.runs("fixture-runner", &route, &route),
                 serves == ["anthropic"] && providers.contains(&"anthropic"),
-                "serves={serves:?}, providers={providers:?}");
+                "serves={serves:?}, providers={providers:?}"
+            );
         }
     }
 }
@@ -1676,8 +1696,13 @@ async fn pin_availability_unknown_cause_is_untimed_and_keeps_its_detail() {
     missing.account_id = None;
     harness.set_credentials(credentials(&facts, missing, NOW));
     let caller = harness.bind(reserved("example-consumer"), None).await;
-    let reply = caller.call("route.select", &json!({"consumer":"mason","pin":"xai/grok-4.7",
-        "requirements":{"iq":0}})).await;
+    let reply = caller
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","pin":"xai/grok-4.7",
+        "requirements":{"iq":0}}),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Error, "{reply:?}");
     let refusal: cortexkit_role_routing::errors::Refusal = serde_json::from_value(reply.1).unwrap();
     assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");

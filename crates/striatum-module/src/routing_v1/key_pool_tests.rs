@@ -351,7 +351,8 @@ fn harness_with_pool_keys(
         .map(|fact| FusiformFactUpdate {
             provider_id: fact.provider_id.clone(),
             model_id: fact.model_id.clone(),
-            auth_methods: fact.auth_methods.clone(), login_methods_documented: fact.login_methods_documented,
+            auth_methods: fact.auth_methods.clone(),
+            login_methods_documented: fact.login_methods_documented,
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,
@@ -365,7 +366,9 @@ fn harness_with_pool_keys(
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: None,
             canonical_id: None,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
             lineage: fact.family.clone(),
         })
         .collect();

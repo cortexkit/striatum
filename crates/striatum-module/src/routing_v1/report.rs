@@ -16,9 +16,9 @@
 
 use cortexkit_role_routing::errors::{Refusal, RefusalCode};
 use cortexkit_role_routing::report::{Outcome, ReportAnswer, ReportRequest};
+use serde_json::Value;
 use striatum_core::{RouteOutcome, RouteStateStore};
 use striatum_store::V1Recorded;
-use serde_json::Value;
 
 use super::{now_ms, provider_refusal, store_refusal, Caller, Deps};
 
@@ -211,7 +211,10 @@ fn prepare_account_facts(
     account_ids: &crate::broca_credentials::CredentialAccounts,
 ) -> Result<striatum_store::V1ReportEffects, Refusal> {
     let mut effects = striatum_store::V1ReportEffects::default();
-    effects.reported_credential = params.get("credential_id").and_then(Value::as_str).map(str::to_owned);
+    effects.reported_credential = params
+        .get("credential_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     effects.quota_scope = Some(striatum_store::QuotaSuccessScope {
         family: super::operator_config(deps)
             .allocator_policy(&decision.provider)
@@ -253,14 +256,26 @@ fn prepare_account_facts(
     let serves = |credential: &str| {
         credentials.listed_credentials().iter().any(|row| {
             row.id == credential
-                && crate::broca_credentials::credential_serves_fact(row, fact, &catalog, credentials)
+                && crate::broca_credentials::credential_serves_fact(
+                    row,
+                    fact,
+                    &catalog,
+                    credentials,
+                )
         })
     };
     let quota_contradicted = |credential: &str| {
-        crate::credential_fences::credential_account_id(account_ids, credential).is_some_and(|account| {
-            crate::credential_fences::fresh_headroom_after_for_account(quota, &account, i64::MIN, now,
-                &super::operator_config(deps).allocator_policy(&decision.provider))
-        })
+        crate::credential_fences::credential_account_id(account_ids, credential).is_some_and(
+            |account| {
+                crate::credential_fences::fresh_headroom_after_for_account(
+                    quota,
+                    &account,
+                    i64::MIN,
+                    now,
+                    &super::operator_config(deps).allocator_policy(&decision.provider),
+                )
+            },
+        )
     };
     let code = params
         .get("runner_code")
@@ -301,9 +316,8 @@ fn prepare_account_facts(
                 let contradicted = quota_contradicted(served);
                 if contradicted {
                     let mut fence = effects.route_fence.take().unwrap();
-                    fence.until_ms = now.saturating_add(
-                        striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
-                    );
+                    fence.until_ms =
+                        now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
                     if let Some(reset) = reset.filter(|reset| *reset > now) {
                         fence.until_ms = fence.until_ms.min(reset);
                     }
@@ -371,12 +385,10 @@ fn prepare_account_facts(
                     .unwrap_or(0),
                 observed_at: now,
             });
-            if quota_contradicted(credential)
-            {
+            if quota_contradicted(credential) {
                 let mut fact = effects.size_refusal.take().unwrap();
-                let cap = now.saturating_add(
-                    striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS,
-                );
+                let cap =
+                    now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS);
                 fact.expires_at = if fact.expires_at > now {
                     fact.expires_at.min(cap)
                 } else {
@@ -534,12 +546,10 @@ mod tests {
 
         let scratch = cortexkit_test_support::ScratchDir::new("roster-tier-report-locks");
         let store = Arc::new(
-            striatum_store::SqliteRouteStateStore::open(
-                &striatum_store::dev_descriptor(
-                    "roster-tier-report-locks",
-                    scratch.path().join("store.db").to_string_lossy(),
-                ),
-            )
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+                "roster-tier-report-locks",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
             .unwrap(),
         );
         let fact = crate::tests::fact("provider", "model");

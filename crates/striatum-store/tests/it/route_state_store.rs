@@ -61,7 +61,8 @@ impl Drop for Rig {
 fn fact(provider: &str, model: &str) -> ModelFact {
     ModelFact {
         billing_plane: None,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         speed_is_fleet_median: false,
         decommissioned: false,
         provider_id: provider.into(),
@@ -94,7 +95,9 @@ fn fact(provider: &str, model: &str) -> ModelFact {
         eq_source: None,
         class_vector: None,
         class_vector_is_overlay: false,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
     }
 }
 
@@ -3065,7 +3068,8 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
     assert_eq!(initial.supports_vision, Some(true));
 
     let update = |vision| FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: "anthropic".to_string(),
         model_id: "claude-opus-4-5".to_string(),
         present: true,
@@ -3081,7 +3085,9 @@ fn fusiform_precedence_updates_seed_facts_but_preserves_scores_and_same_field_ov
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     store
@@ -3173,7 +3179,8 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
     let rig = Rig::new("fusiform-pair-key");
     let store = rig.open();
     let fact = |provider: &str| FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: "shared-spelling".to_string(),
         present: true,
@@ -3189,7 +3196,9 @@ fn fusiform_catalog_keys_on_provider_and_model_never_bare_model_id() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     store
@@ -3222,7 +3231,8 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
     let rig = Rig::new("fusiform-provider-scope");
     let store = rig.open();
     let fact = |provider: &str, model: &str| FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: true,
@@ -3238,7 +3248,9 @@ fn fusiform_first_sight_rows_are_minted_only_under_operator_known_providers() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     store
@@ -3281,7 +3293,8 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
     let store = rig.open();
     let route_key = make_route_key("anthropic", "claude-opus-4-5", None);
     let withdrawn = |provider: &str, model: &str| FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: false,
@@ -3297,7 +3310,9 @@ fn withdrawn_model_leaves_the_routable_set_and_is_never_minted_on_first_sight() 
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     let routable_before = store.get_facts().unwrap().len();
@@ -3361,7 +3376,8 @@ fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
     let rig = Rig::new("fusiform-batch-repeat");
     let store = rig.open();
     let entry = |provider: &str, model: &str, context_window: f64| FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: provider.to_string(),
         model_id: model.to_string(),
         present: true,
@@ -3377,7 +3393,9 @@ fn fusiform_apply_treats_a_pair_minted_earlier_in_the_batch_as_stored() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     let before = store.get_catalog_facts().unwrap().len();
@@ -4281,7 +4299,8 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         .unwrap();
 
     let served = FusiformFactUpdate {
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         provider_id: "test".into(),
         model_id: "catalog-served".into(),
         present: true,
@@ -4297,7 +4316,9 @@ fn complete_catalog_sync_stamps_missing_rows_and_prunes_unpicked_absence() {
         supports_tool_use: Some(true),
         reasoning_efforts: None,
         canonical_id: None,
-        upstream_status: None, model_type: None, model_kind: None,
+        upstream_status: None,
+        model_type: None,
+        model_kind: None,
         lineage: None,
     };
     store
@@ -4492,7 +4513,8 @@ fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
     store
         .apply_fusiform_catalog(
             &[FusiformFactUpdate {
-                auth_methods: None, login_methods_documented: false,
+                auth_methods: None,
+                login_methods_documented: false,
                 provider_id: "p".into(),
                 model_id: "discovered".into(),
                 present: true,
@@ -4508,7 +4530,9 @@ fn new_routes_inherit_the_provider_wall_cause_through_the_insert_trigger() {
                 supports_tool_use: Some(true),
                 reasoning_efforts: None,
                 canonical_id: None,
-                upstream_status: None, model_type: None, model_kind: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
                 lineage: None,
             }],
             FusiformCatalogCursor {
@@ -4542,7 +4566,8 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
         provider_id: initial.provider_id.clone(),
         model_id: initial.model_id.clone(),
         present: true,
-        auth_methods: None, login_methods_documented: false,
+        auth_methods: None,
+        login_methods_documented: false,
         context_window: initial.context_window,
         max_output_tokens: initial.max_output_tokens,
         cost_tier: initial.cost_tier,
@@ -4560,11 +4585,18 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
         model_type: model_type.map(str::to_owned),
         model_kind: model_kind.map(str::to_owned),
     };
-    let cursor = FusiformCatalogCursor { catalog_version: 1, resolved_at_ms: 1 };
-    store.apply_fusiform_catalog(&[update(Some("transcription"), None)], cursor).unwrap();
+    let cursor = FusiformCatalogCursor {
+        catalog_version: 1,
+        resolved_at_ms: 1,
+    };
+    store
+        .apply_fusiform_catalog(&[update(Some("transcription"), None)], cursor)
+        .unwrap();
     let typed_fingerprint = store.catalog_fingerprint().unwrap();
     assert_ne!(initial_fingerprint, typed_fingerprint);
-    store.apply_fusiform_catalog(&[update(Some("transcription"), Some("decision"))], cursor).unwrap();
+    store
+        .apply_fusiform_catalog(&[update(Some("transcription"), Some("decision"))], cursor)
+        .unwrap();
     assert_ne!(typed_fingerprint, store.catalog_fingerprint().unwrap());
     let mut variant = initial.clone();
     variant.variant = Some("high".into());
@@ -4577,16 +4609,25 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
     let mut discovered = update(Some("image"), Some("extraction"));
     discovered.model_id = "new-image-engine".into();
     store.apply_fusiform_catalog(&[discovered], cursor).unwrap();
-    let fact = store.get_fact_by_route_key("anthropic/new-image-engine").unwrap().unwrap();
+    let fact = store
+        .get_fact_by_route_key("anthropic/new-image-engine")
+        .unwrap()
+        .unwrap();
     assert_eq!(fact.model_type.as_deref(), Some("image"));
     assert_eq!(fact.model_kind.as_deref(), Some("extraction"));
-    store.apply_fusiform_catalog(&[update(None, None)], cursor).unwrap();
+    store
+        .apply_fusiform_catalog(&[update(None, None)], cursor)
+        .unwrap();
     // An older score-edit copy must not reintroduce a classification the catalog removed.
     variant.variant = Some("low".into());
     variant.model_type = Some("image".into());
     variant.model_kind = Some("extraction".into());
     store.upsert_fact(&variant, FactSource::Override).unwrap();
-    for key in [key, "anthropic/claude-opus-4-5/high", "anthropic/claude-opus-4-5/low"] {
+    for key in [
+        key,
+        "anthropic/claude-opus-4-5/high",
+        "anthropic/claude-opus-4-5/low",
+    ] {
         let fact = store.get_fact_by_route_key(key).unwrap().unwrap();
         assert_eq!(fact.model_type, None);
         assert_eq!(fact.model_kind, None);
@@ -4596,7 +4637,9 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
     let reopened = rig.open();
     assert_eq!(reopened.catalog_fingerprint().unwrap(), fingerprint);
     drop(reopened);
-    let error = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 82).err().unwrap();
+    let error = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 82)
+        .err()
+        .unwrap();
     assert!(error.to_string().contains("store_ahead"));
     let latest = SqliteRouteStateStore::latest_migration_version_for_test();
     assert!(error.to_string().contains(&latest.to_string()));

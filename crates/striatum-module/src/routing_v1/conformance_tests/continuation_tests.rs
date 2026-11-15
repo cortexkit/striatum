@@ -332,13 +332,12 @@ async fn continuation_first_usageless_report_consumes_reservation_for_every_end_
         drop(runner);
         drop(harness);
         drop(subject);
-        let reopened = striatum_store::SqliteRouteStateStore::open(
-            &striatum_store::dev_descriptor(
+        let reopened =
+            striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
                 "striatum",
                 restart_path.to_string_lossy().into_owned(),
-            ),
-        )
-        .unwrap();
+            ))
+            .unwrap();
         reopened
             .account_transaction(|tx| {
                 tx.release_expired_continuations(until + 2)?;
@@ -368,7 +367,10 @@ async fn continuation_preparation_unknown_decision_refuses_with_original_detail(
     assert_eq!(answer["kind"], "refuse", "{answer}");
     assert_eq!(answer["routing_code"], "unknown_decision", "{answer}");
     assert_eq!(answer["detail"], json!({}));
-    assert_eq!(result(runner.call("route.account_for", &request).await), answer);
+    assert_eq!(
+        result(runner.call("route.account_for", &request).await),
+        answer
+    );
 }
 
 #[tokio::test]
@@ -389,10 +391,16 @@ async fn continuation_preparation_store_unavailable_holds_with_original_detail()
     );
     let answer = result(runner.call("route.account_for", &request).await);
     assert_eq!(answer["kind"], "hold", "{answer}");
-    assert_eq!(answer["routing_code"], "account_selection_unavailable", "{answer}");
+    assert_eq!(
+        answer["routing_code"], "account_selection_unavailable",
+        "{answer}"
+    );
     assert_eq!(answer["detail"], detail);
     assert!(answer.get("until_ms").is_none(), "{answer}");
-    assert_eq!(result(runner.call("route.account_for", &request).await), answer);
+    assert_eq!(
+        result(runner.call("route.account_for", &request).await),
+        answer
+    );
     request["selection_id"] = json!("preparation-input-ready");
     let ready = result(runner.call("route.account_for", &request).await);
     assert_eq!(ready["kind"], "offer", "{ready}");
@@ -562,17 +570,14 @@ async fn continuation_offer_replays_after_store_reopen() {
         state.dir.join("store.db").to_string_lossy(),
     );
     let placeholder = Arc::new(
-        striatum_store::SqliteRouteStateStore::open(
-            &striatum_store::dev_descriptor(
-                "continue-placeholder",
-                state.dir.join("placeholder.db").to_string_lossy(),
-            ),
-        )
+        striatum_store::SqliteRouteStateStore::open(&striatum_store::dev_descriptor(
+            "continue-placeholder",
+            state.dir.join("placeholder.db").to_string_lossy(),
+        ))
         .unwrap(),
     );
     drop(std::mem::replace(&mut state.store, placeholder));
-    state.store =
-        Arc::new(striatum_store::SqliteRouteStateStore::open(&descriptor).unwrap());
+    state.store = Arc::new(striatum_store::SqliteRouteStateStore::open(&descriptor).unwrap());
     state.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
     let harness = Arc::new(state);
     let previous = harness
@@ -666,9 +671,12 @@ async fn continuation_observation_started_uses_offer_and_is_idempotent() {
     assert_eq!(used.3.as_deref(), Some("run"));
     assert_eq!(used.4, used.0);
     let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
-    conn.execute_batch("CREATE TABLE continuation_use_audit (writes INTEGER);
+    conn.execute_batch(
+        "CREATE TABLE continuation_use_audit (writes INTEGER);
         CREATE TRIGGER continuation_use_repeat AFTER UPDATE OF used_at_ms ON account_continue
-        BEGIN INSERT INTO continuation_use_audit VALUES (1); END;").unwrap();
+        BEGIN INSERT INTO continuation_use_audit VALUES (1); END;",
+    )
+    .unwrap();
     let duplicate = result(runner.call("route.account_observe", &observation).await);
     assert_eq!(duplicate["observation"]["duplicate"], true);
     let mut later = observation;
@@ -679,7 +687,12 @@ async fn continuation_observation_started_uses_offer_and_is_idempotent() {
     result(runner.call("route.account_observe", &later).await);
     expire_offers(&subject, offer["valid_until_ms"].as_i64().unwrap());
     assert_eq!(offer_state(&subject, &offer), used);
-    assert_eq!(conn.query_row("SELECT count(*) FROM continuation_use_audit", [], |r| r.get::<_,i64>(0)).unwrap(), 0);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM continuation_use_audit", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -703,8 +716,15 @@ async fn continuation_observation_identity_guards_record_only() {
     result(runner.call("route.account_for", &json!({"provider":fixture::SUBSCRIPTION_PROVIDER,
         "model":"model-c","decision_id":request["previous_decision_id"],
         "admission_id":"different-admission","conversation_key":"other-conversation","initial_input_bytes":65536})).await);
-    result(runner.call("route.account_observe", &json!({"event_id":"other-start", "kind":"admission_started",
-        "admission_id":"different-admission","run_id":"run"})).await);
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &json!({"event_id":"other-start", "kind":"admission_started",
+        "admission_id":"different-admission","run_id":"run"}),
+            )
+            .await,
+    );
     let initial = offer_state(&subject, &offer);
     for (index, kind, field, value) in [
         (
@@ -800,11 +820,19 @@ async fn continuation_observation_newest_same_account_sibling_wins() {
     );
     assert!(offer_state(&subject, &newest).0.is_some());
     let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
-    let lease: i64 = conn.query_row("SELECT f.lease_valid_until FROM account_affinity f
+    let lease: i64 = conn
+        .query_row(
+            "SELECT f.lease_valid_until FROM account_affinity f
         JOIN account_admission a ON a.pin_id=f.pin_id JOIN account_continue c
         ON c.principal=a.principal AND c.reservation_id=a.admission_id WHERE c.decision_id=?1",
-        [newest["decision_id"].as_str().unwrap()], |r| r.get(0)).unwrap();
-    assert!(lease > account_selection::now_ms(), "releasing a sibling must not end the serving pin's lease");
+            [newest["decision_id"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        lease > account_selection::now_ms(),
+        "releasing a sibling must not end the serving pin's lease"
+    );
     let released = offer_state(&subject, &first);
     assert_eq!(released.0, None);
     assert!(released.1.is_some());

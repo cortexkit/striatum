@@ -6,9 +6,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use striatum_core::blocks::{Block, Cause, LifetimeClass, Origin, Scope};
 use striatum_core::RouteStateResult;
 
-pub use striatum_core::fence_lifetimes::{
-    NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS,
-};
+pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRecheck {
@@ -92,7 +90,11 @@ impl FenceRecheck {
         // A reset can schedule an extra check, but cannot lend a second probe
         // to another decision while the first decision still owns the slot.
         if origins.iter().any(|origin| origin.claim_owner.is_some()) {
-            return origins.iter().map(|origin| origin.next_recheck_at).max().unwrap_or(i64::MIN);
+            return origins
+                .iter()
+                .map(|origin| origin.next_recheck_at)
+                .max()
+                .unwrap_or(i64::MIN);
         }
         origins
             .iter()
@@ -182,7 +184,8 @@ pub(crate) fn sync(conn: &Connection) -> rusqlite::Result<()> {
 
 /// The expired, unmanaged origins `sync` retires at `now`: their non-quota
 /// deadline passed and no clock holds their evidence.
-const RETIRING: &str = "SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
+const RETIRING: &str =
+    "SELECT o.kind,o.origin_key,o.evidence,o.evidence_at,?1 FROM current_fence_origin o
     WHERE o.quota=0 AND o.deadline<?1 AND NOT EXISTS (SELECT 1 FROM fence_recheck r
         WHERE r.kind=o.kind AND r.origin_key=o.origin_key AND r.evidence=o.evidence)";
 
@@ -201,7 +204,10 @@ pub(crate) fn retire_expired(conn: &Connection, now: i64) -> rusqlite::Result<us
         ),
         [now],
     )?;
-    conn.execute(&format!("INSERT INTO fence_retired_origin {RETIRING}"), [now])
+    conn.execute(
+        &format!("INSERT INTO fence_retired_origin {RETIRING}"),
+        [now],
+    )
 }
 
 /// [`sync`] at a given time.
@@ -265,7 +271,9 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
         .into_iter()
         .filter(|origin| {
             origin.quota == Some(false)
-                && origin.deadline.is_some_and(|deadline| deadline < now as f64)
+                && origin
+                    .deadline
+                    .is_some_and(|deadline| deadline < now as f64)
                 && state
                     .clock(&origin.kind, &origin.origin_key)
                     .is_none_or(|(clock, _)| clock.evidence != origin.evidence)
@@ -284,7 +292,13 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
     for origin in &retiring {
         tx.conn.execute(
             "INSERT INTO fence_retired_origin VALUES (?1,?2,?3,?4,?5)",
-            params![origin.kind, origin.origin_key, origin.evidence, origin.evidence_at, now],
+            params![
+                origin.kind,
+                origin.origin_key,
+                origin.evidence,
+                origin.evidence_at,
+                now
+            ],
         )?;
     }
     // The archive trigger ended the retired sources: read the state again.
@@ -405,7 +419,9 @@ impl SqlNumber {
             }
             let whole = real.trunc() as i64;
             whole.cmp(&integer).then_with(|| {
-                (real - real.trunc()).partial_cmp(&0.0).unwrap_or(Ordering::Equal)
+                (real - real.trunc())
+                    .partial_cmp(&0.0)
+                    .unwrap_or(Ordering::Equal)
             })
         }
         match (self, other) {
@@ -443,7 +459,9 @@ pub(crate) fn clock_schedule(
         }
     };
     let reset = reset_at.filter(|reset| {
-        quota && SqlNumber::Real(*reset).cmp(SqlNumber::Integer(evidence_at)) == std::cmp::Ordering::Greater
+        quota
+            && SqlNumber::Real(*reset).cmp(SqlNumber::Integer(evidence_at))
+                == std::cmp::Ordering::Greater
     });
     (next.cast_integer(), reset)
 }
@@ -485,7 +503,10 @@ fn upsert_clock_on(
             crate::block_state::expect_changes(
                 inserted,
                 1,
-                format_args!("installing the clock of {} {}", origin.kind, origin.origin_key),
+                format_args!(
+                    "installing the clock of {} {}",
+                    origin.kind, origin.origin_key
+                ),
             )
         }
         Some((clock, _)) if clock.evidence != origin.evidence => {
@@ -517,7 +538,10 @@ fn upsert_clock_on(
             crate::block_state::expect_changes(
                 moved,
                 1,
-                format_args!("renewing the clock of {} {}", origin.kind, origin.origin_key),
+                format_args!(
+                    "renewing the clock of {} {}",
+                    origin.kind, origin.origin_key
+                ),
             )
         }
         Some(_) => Ok(()),
@@ -535,7 +559,11 @@ fn delete_clock_on(
         "DELETE FROM fence_recheck WHERE kind=?1 AND origin_key=?2 AND evidence=?3",
         params![kind, key, evidence],
     )?;
-    crate::block_state::expect_changes(deleted, 1, format_args!("deleting the clock of {kind} {key}"))
+    crate::block_state::expect_changes(
+        deleted,
+        1,
+        format_args!("deleting the clock of {kind} {key}"),
+    )
 }
 
 /// A command-level error carried through SQL code: its text, which keeps a
@@ -664,7 +692,10 @@ pub(crate) fn read_effective(conn: &Connection) -> rusqlite::Result<Vec<FenceRec
     read_effective_at(conn, crate::now_ms())
 }
 
-pub(crate) fn read_effective_at(conn: &Connection, now: i64) -> rusqlite::Result<Vec<FenceRecheck>> {
+pub(crate) fn read_effective_at(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<Vec<FenceRecheck>> {
     if !enabled(conn)? {
         return Ok(Vec::new());
     }
@@ -1027,14 +1058,17 @@ fn test_is_current(
     row: &crate::block_state::ProbeAuthorization,
     admission_owned: bool,
 ) -> bool {
-    blocks.clock(&row.kind, &row.origin_key).is_some_and(|(clock, cleared)| {
-        let owner = clock.claim_owner.as_deref();
-        cleared.is_none()
-            && clock.evidence == row.evidence
-            && clock.evidence_at == row.evidence_at
-            && ((owner.is_none_or(|by| by == row.owner) && clock.claim_generation == row.claim_generation)
-                || (admission_owned && owner == Some(row.owner.as_str())))
-    })
+    blocks
+        .clock(&row.kind, &row.origin_key)
+        .is_some_and(|(clock, cleared)| {
+            let owner = clock.claim_owner.as_deref();
+            cleared.is_none()
+                && clock.evidence == row.evidence
+                && clock.evidence_at == row.evidence_at
+                && ((owner.is_none_or(|by| by == row.owner)
+                    && clock.claim_generation == row.claim_generation)
+                    || (admission_owned && owner == Some(row.owner.as_str())))
+        })
 }
 
 /// [`test_is_current`] as a join of authorization `a` to its clock `r`, with
@@ -1154,7 +1188,11 @@ pub(crate) fn no_authorized_clock_check_sql(model: bool) -> String {
         "{} UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
             AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5{}",
         crate::block_state::STATE_CHECK,
-        if model { " AND quota=0 AND (model IS NULL OR model=?6)" } else { "" }
+        if model {
+            " AND quota=0 AND (model IS NULL OR model=?6)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1220,11 +1258,21 @@ fn claim_decided(
     let mut quota_next = i64::MIN;
     let mut quota_evidence = i64::MIN;
     let mut quota_resets = Vec::new();
-    for (origin, state) in origins.iter().copied().zip(claim_states(conn, blocks, &origins)?) {
+    for (origin, state) in origins
+        .iter()
+        .copied()
+        .zip(claim_states(conn, blocks, &origins)?)
+    {
         let Some(state) = state else {
             return Ok(false);
         };
-        let ClaimState { quota, next, reset, ref owner, .. } = state;
+        let ClaimState {
+            quota,
+            next,
+            reset,
+            ref owner,
+            ..
+        } = state;
         if quota != origin.quota {
             return Ok(false);
         }
@@ -1234,7 +1282,11 @@ fn claim_decided(
         }
         // Admission reuses its decision's generation even if a provider reset
         // arrived while the decision held the slot.
-        let due = if owned { next <= now } else { reset.map_or(next, |reset| reset.min(next)) <= now };
+        let due = if owned {
+            next <= now
+        } else {
+            reset.map_or(next, |reset| reset.min(next)) <= now
+        };
         if !quota && !due && !owned {
             return Ok(false);
         }
@@ -1320,7 +1372,6 @@ fn claim_decided(
     }
     Ok(true)
 }
-
 
 impl SqliteRouteStateStore {
     pub fn load_blocks(&self, now: i64) -> RouteStateResult<LoadedBlocks> {
@@ -1652,61 +1703,119 @@ impl AccountTx<'_> {
         if origins.is_empty() {
             return Ok(true);
         }
-        if origins.iter().all(|origin| origin.claim_owner.as_deref() == Some(from)) {
+        if origins
+            .iter()
+            .all(|origin| origin.claim_owner.as_deref() == Some(from))
+        {
             self.transfer_probe_authorization(from, decision)?;
             self.rebind_claim_owner(from, decision)?;
         } else if !self.grant_fence_rechecks(origins, now, Some(decision))? {
             return Ok(false);
         }
         let identity = striatum_core::route_state_store::ProviderOutcome {
-            account_ref: account.into(), credential_id: Some(credential.into()), ..Default::default()
+            account_ref: account.into(),
+            credential_id: Some(credential.into()),
+            ..Default::default()
         };
-        self.conn.execute("UPDATE model_route_decisions SET provider_identity_json=?2 WHERE id=?1",
-            params![decision,serde_json::to_string(&identity).map_err(err)?]).map_err(err)?;
+        self.conn
+            .execute(
+                "UPDATE model_route_decisions SET provider_identity_json=?2 WHERE id=?1",
+                params![decision, serde_json::to_string(&identity).map_err(err)?],
+            )
+            .map_err(err)?;
         Ok(true)
     }
 
     /// A report naming another credential, or an expired/replaced generation,
     /// cannot settle the selected probe. Reports without a probe authorization
     /// keep their ordinary account-evidence behavior.
-    pub fn probe_report_matches(&self, owner: &str, credential: Option<&str>, preserve: bool) -> RouteStateResult<bool> {
-        if !enabled(self.conn).map_err(err)? { return Ok(true); }
+    pub fn probe_report_matches(
+        &self,
+        owner: &str,
+        credential: Option<&str>,
+        preserve: bool,
+    ) -> RouteStateResult<bool> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(true);
+        }
         sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             // The answer gates the report's effects and healing.
             self.check_probe_inputs(&blocks, owner, !preserve)?;
             let authorizations = blocks.authorizations_of(owner);
-            if authorizations.is_empty() { return Ok(true); }
-            if preserve { return Ok(false); }
+            if authorizations.is_empty() {
+                return Ok(true);
+            }
+            if preserve {
+                return Ok(false);
+            }
             let clocks = blocks.live_clocks();
             let current = authorizations.iter().any(|authorization| {
-                clocks.get(&(authorization.kind.as_str(), authorization.origin_key.as_str())).is_some_and(|clock| {
-                    clock.evidence == authorization.evidence && clock.evidence_at == authorization.evidence_at
-                        && clock.claim_generation == authorization.claim_generation
-                })
+                clocks
+                    .get(&(
+                        authorization.kind.as_str(),
+                        authorization.origin_key.as_str(),
+                    ))
+                    .is_some_and(|clock| {
+                        clock.evidence == authorization.evidence
+                            && clock.evidence_at == authorization.evidence_at
+                            && clock.claim_generation == authorization.claim_generation
+                    })
             });
-            if !current { return Ok(false); }
+            if !current {
+                return Ok(false);
+            }
             return self.decision_names_credential(owner, credential);
         }
-        let authorized: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)", [owner], |row| row.get(0)).map_err(err)?;
-        if !authorized { return Ok(true); }
-        if preserve { return Ok(false); }
-        let current: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a JOIN fence_recheck r
+        let authorized: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
+                [owner],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if !authorized {
+            return Ok(true);
+        }
+        if preserve {
+            return Ok(false);
+        }
+        let current: bool = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization a JOIN fence_recheck r
              ON a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
              AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation
-             WHERE a.owner=?1 AND r.cleared_at IS NULL)", [owner], |row| row.get(0)).map_err(err)?;
-        if !current { return Ok(false); }
+             WHERE a.owner=?1 AND r.cleared_at IS NULL)",
+                [owner],
+                |row| row.get(0),
+            )
+            .map_err(err)?;
+        if !current {
+            return Ok(false);
+        }
         self.decision_names_credential(owner, credential)
     }
 
     /// Whether the decision's remembered serving identity names `credential`;
     /// true when no credential is reported.
-    fn decision_names_credential(&self, decision: &str, credential: Option<&str>) -> RouteStateResult<bool> {
-        let Some(credential) = credential else { return Ok(true); };
-        self.conn.query_row("SELECT COALESCE(json_extract(provider_identity_json,'$.credentialId')=?2,0)
-            FROM model_route_decisions WHERE id=?1", params![decision,credential], |row| row.get(0)).map_err(err)
+    fn decision_names_credential(
+        &self,
+        decision: &str,
+        credential: Option<&str>,
+    ) -> RouteStateResult<bool> {
+        let Some(credential) = credential else {
+            return Ok(true);
+        };
+        self.conn
+            .query_row(
+                "SELECT COALESCE(json_extract(provider_identity_json,'$.credentialId')=?2,0)
+            FROM model_route_decisions WHERE id=?1",
+                params![decision, credential],
+                |row| row.get(0),
+            )
+            .map_err(err)
     }
 
     /// Claim, renew or consume `origins`' clocks for the named owners after
@@ -1722,12 +1831,25 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<bool> {
         sync_on(self, crate::now_ms()).map_err(err)?;
         let blocks = self.working_blocks()?;
-        claim_decided(self.conn, blocks.as_deref(), origins, now, consume_owner, grant_owner, authorization)
-            .map_err(err)
+        claim_decided(
+            self.conn,
+            blocks.as_deref(),
+            origins,
+            now,
+            consume_owner,
+            grant_owner,
+            authorization,
+        )
+        .map_err(err)
     }
 
     /// Claim `origins` for a pool key lease, which holds their authorization.
-    pub(crate) fn claim_for_lease(&self, origins: &[FenceRecheck], now: i64, lease: &str) -> RouteStateResult<bool> {
+    pub(crate) fn claim_for_lease(
+        &self,
+        origins: &[FenceRecheck],
+        now: i64,
+        lease: &str,
+    ) -> RouteStateResult<bool> {
         self.claim_owned(origins, now, None, None, Some(lease))
     }
 
@@ -1735,22 +1857,52 @@ impl AccountTx<'_> {
     /// clock is updated by key and must still hold the claim the state shows.
     fn rebind_claim_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
         let Some(blocks) = self.working_blocks()? else {
-            self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
-                params![from,to]).map_err(err)?;
+            self.conn
+                .execute(
+                    "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                    params![from, to],
+                )
+                .map_err(err)?;
             return Ok(());
         };
         for (clock, _) in blocks.clocks_claimed_by(from) {
-            let changed = self.conn.execute("UPDATE fence_recheck SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
+            let changed = self
+                .conn
+                .execute(
+                    "UPDATE fence_recheck SET claim_owner=?3 WHERE kind=?1 AND origin_key=?2
                 AND claim_owner=?4 AND evidence=?5 AND evidence_at=?6 AND claim_generation=?7",
-                params![clock.kind,clock.origin_key,to,from,clock.evidence,clock.evidence_at,clock.claim_generation]).map_err(err)?;
-            crate::block_state::expect_changes(changed, 1,
-                format_args!("rebind of {} {} from {from}", clock.kind, clock.origin_key)).map_err(err)?;
+                    params![
+                        clock.kind,
+                        clock.origin_key,
+                        to,
+                        from,
+                        clock.evidence,
+                        clock.evidence_at,
+                        clock.claim_generation
+                    ],
+                )
+                .map_err(err)?;
+            crate::block_state::expect_changes(
+                changed,
+                1,
+                format_args!("rebind of {} {} from {from}", clock.kind, clock.origin_key),
+            )
+            .map_err(err)?;
         }
         // No clock the state does not show may still be claimed by `from`.
-        let left = self.conn.execute("UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
-            params![from,to]).map_err(err)?;
-        crate::block_state::expect_changes(left, 0, format_args!("clocks claimed by {from} the state does not hold"))
-            .map_err(err)
+        let left = self
+            .conn
+            .execute(
+                "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                params![from, to],
+            )
+            .map_err(err)?;
+        crate::block_state::expect_changes(
+            left,
+            0,
+            format_args!("clocks claimed by {from} the state does not hold"),
+        )
+        .map_err(err)
     }
 
     /// Fail with [`crate::block_state::diverged`] if SQL holds an uncleared
@@ -1765,13 +1917,38 @@ impl AccountTx<'_> {
         model: Option<&str>,
     ) -> RouteStateResult<()> {
         let changed = match model {
-            None => self.conn.execute(&no_authorized_clock_check_sql(false), params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
-            Some(model) => self.conn.execute(&no_authorized_clock_check_sql(true),
-                params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation,model]),
+            None => self.conn.execute(
+                &no_authorized_clock_check_sql(false),
+                params![
+                    row.kind,
+                    row.origin_key,
+                    row.evidence,
+                    row.evidence_at,
+                    row.claim_generation
+                ],
+            ),
+            Some(model) => self.conn.execute(
+                &no_authorized_clock_check_sql(true),
+                params![
+                    row.kind,
+                    row.origin_key,
+                    row.evidence,
+                    row.evidence_at,
+                    row.claim_generation,
+                    model
+                ],
+            ),
         }
         .map_err(err)?;
-        crate::block_state::expect_changes(changed, 0,
-            format_args!("authorized clock of {} {} for {}", row.kind, row.origin_key, row.owner)).map_err(err)
+        crate::block_state::expect_changes(
+            changed,
+            0,
+            format_args!(
+                "authorized clock of {} {} for {}",
+                row.kind, row.origin_key, row.owner
+            ),
+        )
+        .map_err(err)
     }
 
     /// Compare what a decision read about `owner`'s probe from the working
@@ -1807,28 +1984,48 @@ impl AccountTx<'_> {
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(err)?;
         if stored != held {
-            return Err(err(diverged(format_args!("authorizations of {owner}: state {held:?}, SQL {stored:?}"))));
+            return Err(err(diverged(format_args!(
+                "authorizations of {owner}: state {held:?}, SQL {stored:?}"
+            ))));
         }
         if !clocks {
             return Ok(());
         }
         for row in &held {
-            let shown = blocks.clock(&row.kind, &row.origin_key).map(|(clock, cleared)| {
-                (clock.evidence.clone(), clock.evidence_at, clock.claim_generation, clock.scope.credential_id.clone(),
-                    clock.scope.model.clone(), cleared, clock.claim_owner.clone())
-            });
+            let shown = blocks
+                .clock(&row.kind, &row.origin_key)
+                .map(|(clock, cleared)| {
+                    (
+                        clock.evidence.clone(),
+                        clock.evidence_at,
+                        clock.claim_generation,
+                        clock.scope.credential_id.clone(),
+                        clock.scope.model.clone(),
+                        cleared,
+                        clock.claim_owner.clone(),
+                    )
+                });
             let stored = self
                 .conn
                 .prepare_cached(&probe_clock_check_sql())
                 .map_err(err)?
                 .query_row([&row.kind, &row.origin_key], |r| {
-                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
                 })
                 .optional()
                 .map_err(err)?;
             if stored != shown {
                 return Err(err(diverged(format_args!(
-                    "clock of {} {}: state {shown:?}, SQL {stored:?}", row.kind, row.origin_key
+                    "clock of {} {}: state {shown:?}, SQL {stored:?}",
+                    row.kind, row.origin_key
                 ))));
             }
         }
@@ -1843,19 +2040,44 @@ impl AccountTx<'_> {
             return Ok(());
         }
         match self.working_blocks()? {
-            Some(blocks) => self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner))),
+            Some(blocks) => {
+                self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner)))
+            }
             None => self.delete_authorizations(owner, None),
         }
     }
 
     /// Delete one probe authorization the working state holds, by key and
     /// naming every value the state shows.
-    fn delete_authorization(&self, row: &crate::block_state::ProbeAuthorization) -> RouteStateResult<()> {
-        let changed = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
+    fn delete_authorization(
+        &self,
+        row: &crate::block_state::ProbeAuthorization,
+    ) -> RouteStateResult<()> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1 AND kind=?2 AND origin_key=?3
             AND evidence=?4 AND evidence_at=?5 AND claimed_at=?6 AND claim_generation=?7",
-            params![row.owner,row.kind,row.origin_key,row.evidence,row.evidence_at,row.claimed_at,row.claim_generation]).map_err(err)?;
-        crate::block_state::expect_changes(changed, 1,
-            format_args!("authorization of {} for {} {}", row.owner, row.kind, row.origin_key)).map_err(err)
+                params![
+                    row.owner,
+                    row.kind,
+                    row.origin_key,
+                    row.evidence,
+                    row.evidence_at,
+                    row.claimed_at,
+                    row.claim_generation
+                ],
+            )
+            .map_err(err)?;
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!(
+                "authorization of {} for {} {}",
+                row.owner, row.kind, row.origin_key
+            ),
+        )
+        .map_err(err)
     }
 
     /// Delete every probe authorization `owner` holds. With a working state
@@ -1871,10 +2093,20 @@ impl AccountTx<'_> {
                 self.delete_authorization(row)?;
             }
         }
-        let left = self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+        let left = self
+            .conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1",
+                [owner],
+            )
+            .map_err(err)?;
         if held.is_some() {
-            crate::block_state::expect_changes(left, 0, format_args!("authorizations of {owner} the state does not hold"))
-                .map_err(err)?;
+            crate::block_state::expect_changes(
+                left,
+                0,
+                format_args!("authorizations of {owner} the state does not hold"),
+            )
+            .map_err(err)?;
         }
         Ok(())
     }
@@ -1884,18 +2116,30 @@ impl AccountTx<'_> {
     /// too, so a later unstarted-admission expiry cannot reopen a reported send.
     /// Inconclusive local/request failures still release non-quota probes;
     /// quota probes retain their periodic limit regardless of failure attribution.
-    pub fn fail_authorized_probe(&self, owner: &str, now: i64, inconclusive: bool) -> RouteStateResult<()> {
-        if !enabled(self.conn).map_err(err)? { return Ok(()); }
+    pub fn fail_authorized_probe(
+        &self,
+        owner: &str,
+        now: i64,
+        inconclusive: bool,
+    ) -> RouteStateResult<()> {
+        if !enabled(self.conn).map_err(err)? {
+            return Ok(());
+        }
         sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             let held = blocks.authorizations_of(owner);
             // Consume each clock still on the authorized evidence and
             // generation, keyed and naming the state it was decided on.
             for row in &held {
-                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
-                    cleared.is_none() && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
-                        && clock.claim_generation == row.claim_generation
-                });
+                let held_clock =
+                    blocks
+                        .clock(&row.kind, &row.origin_key)
+                        .filter(|(clock, cleared)| {
+                            cleared.is_none()
+                                && clock.evidence == row.evidence
+                                && clock.evidence_at == row.evidence_at
+                                && clock.claim_generation == row.claim_generation
+                        });
                 let Some((clock, _)) = held_clock else {
                     self.expect_no_authorized_clock(row, None)?;
                     continue;
@@ -1906,14 +2150,31 @@ impl AccountTx<'_> {
                     params![row.kind,row.origin_key,now,QUOTA_FENCE_RECHECK_MS,NON_QUOTA_FENCE_MAX_MS,inconclusive,
                         clock.evidence,clock.evidence_at,clock.lifetime == LifetimeClass::Quota,clock.next_recheck_at,
                         clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
-                crate::block_state::expect_changes(changed, 1,
-                    format_args!("failed probe of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+                crate::block_state::expect_changes(
+                    changed,
+                    1,
+                    format_args!(
+                        "failed probe of {} {} for {owner}",
+                        row.kind, row.origin_key
+                    ),
+                )
+                .map_err(err)?;
             }
             // Other owners' copies of the same generations are retired too.
-            let copies: Vec<_> = blocks.authorizations().filter(|other| other.owner != owner && held.iter().any(|row| {
-                row.kind == other.kind && row.origin_key == other.origin_key && row.evidence == other.evidence
-                    && row.evidence_at == other.evidence_at && row.claim_generation == other.claim_generation
-            })).cloned().collect();
+            let copies: Vec<_> = blocks
+                .authorizations()
+                .filter(|other| {
+                    other.owner != owner
+                        && held.iter().any(|row| {
+                            row.kind == other.kind
+                                && row.origin_key == other.origin_key
+                                && row.evidence == other.evidence
+                                && row.evidence_at == other.evidence_at
+                                && row.claim_generation == other.claim_generation
+                        })
+                })
+                .cloned()
+                .collect();
             for copy in &copies {
                 self.delete_authorization(copy)?;
             }
@@ -1929,7 +2190,12 @@ impl AccountTx<'_> {
             SELECT 1 FROM fence_probe_authorization p WHERE p.owner=?1 AND p.kind=a.kind AND p.origin_key=a.origin_key
             AND p.evidence=a.evidence AND p.evidence_at=a.evidence_at AND p.claim_generation=a.claim_generation)",
             [owner]).map_err(err)?;
-        self.conn.execute("DELETE FROM fence_probe_authorization WHERE owner=?1", [owner]).map_err(err)?;
+        self.conn
+            .execute(
+                "DELETE FROM fence_probe_authorization WHERE owner=?1",
+                [owner],
+            )
+            .map_err(err)?;
         Ok(())
     }
 
@@ -1957,7 +2223,11 @@ impl AccountTx<'_> {
             return Ok(false);
         }
         self.conn
-            .query_row(&format!("SELECT EXISTS({EXPIRED_ADMISSION_PROBES})"), [now], |row| row.get(0))
+            .query_row(
+                &format!("SELECT EXISTS({EXPIRED_ADMISSION_PROBES})"),
+                [now],
+                |row| row.get(0),
+            )
             .map_err(err)
     }
 
@@ -2043,8 +2313,12 @@ impl AccountTx<'_> {
                             claim_generation=claim_generation+1 WHERE kind=?1 AND origin_key=?2 AND cleared_at IS NULL
                             AND evidence=?4 AND evidence_at=?5 AND claim_generation=?6",
                             params![row.kind,row.origin_key,now,row.evidence,row.evidence_at,row.claim_generation]).map_err(err)?;
-                        crate::block_state::expect_changes(changed, usize::from(current),
-                            format_args!("release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+                        crate::block_state::expect_changes(
+                            changed,
+                            usize::from(current),
+                            format_args!("release of {} {} for {owner}", row.kind, row.origin_key),
+                        )
+                        .map_err(err)?;
                     }
                     self.delete_authorizations(&owner, Some(&held))?;
                 }
@@ -2081,11 +2355,18 @@ impl AccountTx<'_> {
             self.check_probe_inputs(&blocks, owner, true)?;
             let clocks = blocks.live_clocks();
             return Ok(blocks.authorizations_of(owner).iter().any(|row| {
-                clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
-                    clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
-                        && clock.scope.credential_id.as_deref() == Some(credential)
-                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
-                })
+                clocks
+                    .get(&(row.kind.as_str(), row.origin_key.as_str()))
+                    .is_some_and(|clock| {
+                        clock.evidence == row.evidence
+                            && clock.evidence_at == row.evidence_at
+                            && clock.scope.credential_id.as_deref() == Some(credential)
+                            && clock
+                                .scope
+                                .model
+                                .as_deref()
+                                .is_none_or(|named| named == model)
+                    })
             }));
         }
         self.conn
@@ -2152,30 +2433,69 @@ impl AccountTx<'_> {
         if let Some(blocks) = self.working_blocks()? {
             let held = blocks.authorizations_of(owner);
             for row in &held {
-                let held_clock = blocks.clock(&row.kind, &row.origin_key).filter(|(clock, cleared)| {
-                    cleared.is_none() && clock.lifetime != LifetimeClass::Quota
-                        && clock.scope.model.as_deref().is_none_or(|named| named == model)
-                        && clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
-                        && clock.claim_generation == row.claim_generation
-                });
+                let held_clock =
+                    blocks
+                        .clock(&row.kind, &row.origin_key)
+                        .filter(|(clock, cleared)| {
+                            cleared.is_none()
+                                && clock.lifetime != LifetimeClass::Quota
+                                && clock
+                                    .scope
+                                    .model
+                                    .as_deref()
+                                    .is_none_or(|named| named == model)
+                                && clock.evidence == row.evidence
+                                && clock.evidence_at == row.evidence_at
+                                && clock.claim_generation == row.claim_generation
+                        });
                 let Some((clock, _)) = held_clock else {
                     self.expect_no_authorized_clock(row, Some(model))?;
                     continue;
                 };
-                let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3,claim_owner=NULL
-                    WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(4)),
-                    params![row.kind,row.origin_key,now,clock.evidence,clock.evidence_at,false,clock.next_recheck_at,
-                        clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
-                crate::block_state::expect_changes(changed, 1,
-                    format_args!("inconclusive release of {} {} for {owner}", row.kind, row.origin_key)).map_err(err)?;
+                let changed = self
+                    .conn
+                    .execute(
+                        &format!(
+                            "UPDATE fence_recheck SET next_recheck_at=?3,claim_owner=NULL
+                    WHERE kind=?1 AND origin_key=?2 AND {}",
+                            clock_held(4)
+                        ),
+                        params![
+                            row.kind,
+                            row.origin_key,
+                            now,
+                            clock.evidence,
+                            clock.evidence_at,
+                            false,
+                            clock.next_recheck_at,
+                            clock.reset_check_at,
+                            clock.claim_owner,
+                            clock.claim_generation
+                        ],
+                    )
+                    .map_err(err)?;
+                crate::block_state::expect_changes(
+                    changed,
+                    1,
+                    format_args!(
+                        "inconclusive release of {} {} for {owner}",
+                        row.kind, row.origin_key
+                    ),
+                )
+                .map_err(err)?;
             }
             return self.delete_authorizations(owner, Some(&held));
         }
-        self.conn.execute("UPDATE fence_recheck AS r SET next_recheck_at=?3,claim_owner=NULL
+        self.conn
+            .execute(
+                "UPDATE fence_recheck AS r SET next_recheck_at=?3,claim_owner=NULL
             WHERE r.quota=0 AND r.cleared_at IS NULL AND (r.model IS NULL OR r.model=?2)
             AND EXISTS (SELECT 1 FROM fence_probe_authorization a WHERE a.owner=?1
                 AND a.kind=r.kind AND a.origin_key=r.origin_key AND a.evidence=r.evidence
-                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",params![owner,model,now]).map_err(err)?;
+                 AND a.evidence_at=r.evidence_at AND a.claim_generation=r.claim_generation)",
+                params![owner, model, now],
+            )
+            .map_err(err)?;
         self.conn
             .execute(
                 "DELETE FROM fence_probe_authorization WHERE owner=?1",
@@ -2251,7 +2571,9 @@ impl AccountTx<'_> {
             }
         }
         match self.working_blocks()? {
-            Some(blocks) => self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner))),
+            Some(blocks) => {
+                self.delete_authorizations(owner, Some(&blocks.authorizations_of(owner)))
+            }
             None => self.delete_authorizations(owner, None),
         }
     }
@@ -2372,7 +2694,10 @@ impl AccountTx<'_> {
                 crate::block_state::expect_changes(
                     changed,
                     expected,
-                    format_args!("settled test of {} {} for {owner}", origin.kind, origin.origin_key),
+                    format_args!(
+                        "settled test of {} {} for {owner}",
+                        origin.kind, origin.origin_key
+                    ),
                 )
                 .map_err(err)?;
             }
@@ -2529,9 +2854,15 @@ impl AccountTx<'_> {
                 // Only active fences are held: a fence already cleared is
                 // not cleared again.
                 let fence = key[0].as_str().and_then(|id| blocks.account_fence(id));
-                let older = |row: &crate::AccountFenceRow| row.observed_at.min(row.created_at) < admitted_at;
+                let older = |row: &crate::AccountFenceRow| {
+                    row.observed_at.min(row.created_at) < admitted_at
+                };
                 let Some((row, pool, recovery)) = fence else {
-                    return if authorized { self.clear_held_clock(origin, now) } else { Ok(()) };
+                    return if authorized {
+                        self.clear_held_clock(origin, now)
+                    } else {
+                        Ok(())
+                    };
                 };
                 let needed: Vec<striatum_core::accounts::PoolKey> = match pool {
                     Some(pool) => vec![serde_json::from_str(pool).map_err(err)?],
@@ -2555,17 +2886,31 @@ impl AccountTx<'_> {
                 let row = row.clone();
                 let (pool_json, recovery_json) = (pool.map(str::to_owned), recovery.to_owned());
                 drop(blocks);
-                for pool in needed.iter().filter(|pool| scope.is_some_and(|scope| scope.used(pool, model))) {
-                    self.put_success_pool(&row.fence_id, &serde_json::to_string(pool).map_err(err)?, origin.evidence_at, now)?;
+                for pool in needed
+                    .iter()
+                    .filter(|pool| scope.is_some_and(|scope| scope.used(pool, model)))
+                {
+                    self.put_success_pool(
+                        &row.fence_id,
+                        &serde_json::to_string(pool).map_err(err)?,
+                        origin.evidence_at,
+                        now,
+                    )?;
                 }
                 let healed = self
                     .working()?
                     .success_pools()
-                    .filter(|pool| pool.fence_id == row.fence_id && pool.evidence_at == origin.evidence_at)
+                    .filter(|pool| {
+                        pool.fence_id == row.fence_id && pool.evidence_at == origin.evidence_at
+                    })
                     .map(|pool| serde_json::from_str(&pool.pool_key_json).map_err(err))
                     .collect::<RouteStateResult<Vec<striatum_core::accounts::PoolKey>>>()?;
                 if !needed.iter().all(|pool| healed.contains(pool)) {
-                    return if authorized { self.defer_recovery_test(origin, now) } else { Ok(()) };
+                    return if authorized {
+                        self.defer_recovery_test(origin, now)
+                    } else {
+                        Ok(())
+                    };
                 }
                 if older(&row) {
                     // Decided on the fence's pools and on the successes
@@ -2576,14 +2921,20 @@ impl AccountTx<'_> {
                         &recovery_json,
                         (origin.evidence_at, healed.len()),
                         now,
-                        if authorized { "probe_succeeded" } else { "run_succeeded" },
+                        if authorized {
+                            "probe_succeeded"
+                        } else {
+                            "run_succeeded"
+                        },
                     )?;
                 }
             }
             "credential" => {
                 if origin.quota {
-                    let prefix =
-                        format!("credential-quota:{}:", serde_json::json!([provider, credential]));
+                    let prefix = format!(
+                        "credential-quota:{}:",
+                        serde_json::json!([provider, credential])
+                    );
                     if blocks
                         .active_fences(provider)
                         .iter()
@@ -2611,7 +2962,11 @@ impl AccountTx<'_> {
                 }
             }
             "non_quota_route" | "transient_route" => {
-                let kind = if origin.kind == "transient_route" { "transient" } else { "billing" };
+                let kind = if origin.kind == "transient_route" {
+                    "transient"
+                } else {
+                    "billing"
+                };
                 if let Some((row, last)) = blocks
                     .non_quota_route_fence(provider, credential, model, kind)
                     .filter(|(_, last)| *last < admitted_at)
@@ -2624,7 +2979,11 @@ impl AccountTx<'_> {
             }
             "size" | "non_quota_size" => {
                 let quota = origin.kind == "size";
-                let table = if quota { "account_size_refusal" } else { "account_non_quota_size_refusal" };
+                let table = if quota {
+                    "account_size_refusal"
+                } else {
+                    "account_non_quota_size_refusal"
+                };
                 if let Some(row) = origin.size_class.and_then(|class| {
                     blocks
                         .size_refusal(quota, provider, credential, model, class)
@@ -2643,9 +3002,16 @@ impl AccountTx<'_> {
                     ("cooldown_until", "json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at))")
                 };
                 if let Some(held) = blocks.source_origin(&origin.kind, &origin.origin_key) {
-                    let changed = self.conn.execute(&format!("UPDATE pool_key_state SET {field}=NULL
-                        WHERE provider=?1 AND credential_id=?2 AND {evidence}=?3"),
-                        params![provider,credential,held.evidence]).map_err(err)?;
+                    let changed = self
+                        .conn
+                        .execute(
+                            &format!(
+                                "UPDATE pool_key_state SET {field}=NULL
+                        WHERE provider=?1 AND credential_id=?2 AND {evidence}=?3"
+                            ),
+                            params![provider, credential, held.evidence],
+                        )
+                        .map_err(err)?;
                     expect_changes(changed, 1, &what).map_err(err)?;
                 }
             }
@@ -2667,7 +3033,8 @@ impl AccountTx<'_> {
                         WHERE route_key=?1 AND json_array(cooldown_until,quota_exhausted_until,wall_observed_at)=?2
                         AND last_error IS ?3 AND COALESCE(wall_observed_at,last_error_at,updated_at)=?4",
                         params![route,evidence,last_error,observed]).map_err(err)?;
-                    expect_changes(changed, 1, format_args!("{what}: route {route}")).map_err(err)?;
+                    expect_changes(changed, 1, format_args!("{what}: route {route}"))
+                        .map_err(err)?;
                 }
                 if let Some(held) = blocks.source_origin("provider", &origin.origin_key) {
                     let changed = self.conn.execute("UPDATE provider_cooldown_state SET cooldown_until=NULL,quota_exhausted_until=NULL
@@ -2691,23 +3058,44 @@ impl AccountTx<'_> {
 
     /// Record that `pool` succeeded for one account fence's evidence, keyed
     /// and naming the success the working state holds for it, if any.
-    fn put_success_pool(&self, fence_id: &str, pool: &str, evidence_at: i64, now: i64) -> RouteStateResult<()> {
+    fn put_success_pool(
+        &self,
+        fence_id: &str,
+        pool: &str,
+        evidence_at: i64,
+        now: i64,
+    ) -> RouteStateResult<()> {
         let held = self
             .working()?
             .success_pools()
             .find(|row| row.fence_id == fence_id && row.pool_key_json == pool)
             .cloned();
         let changed = match held {
-            Some(held) => self.conn.execute("UPDATE fence_success_pool SET evidence_at=?3,healed_at=?4
+            Some(held) => self.conn.execute(
+                "UPDATE fence_success_pool SET evidence_at=?3,healed_at=?4
                 WHERE fence_id=?1 AND pool_key_json=?2 AND evidence_at=?5 AND healed_at=?6",
-                params![fence_id,pool,evidence_at,now,held.evidence_at,held.healed_at]),
-            None => self.conn.execute("INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
+                params![
+                    fence_id,
+                    pool,
+                    evidence_at,
+                    now,
+                    held.evidence_at,
+                    held.healed_at
+                ],
+            ),
+            None => self.conn.execute(
+                "INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
                 ON CONFLICT(fence_id,pool_key_json) DO NOTHING",
-                params![fence_id,pool,evidence_at,now]),
+                params![fence_id, pool, evidence_at, now],
+            ),
         }
         .map_err(err)?;
-        crate::block_state::expect_changes(changed, 1, format_args!("success of {fence_id} for {pool}"))
-            .map_err(err)
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("success of {fence_id} for {pool}"),
+        )
+        .map_err(err)
     }
 
     /// Clear an origin's stored clock, naming the clock the working state
@@ -2717,13 +3105,31 @@ impl AccountTx<'_> {
         let Some((clock, cleared)) = blocks.clock(&origin.kind, &origin.origin_key) else {
             return Ok(());
         };
-        let changed = self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2
             AND evidence=?4 AND evidence_at=?5 AND cleared_at IS ?6 AND next_recheck_at=?7
             AND claim_owner IS ?8 AND claim_generation=?9",
-            params![origin.kind,origin.origin_key,now,clock.evidence,clock.evidence_at,cleared,
-                clock.next_recheck_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
-        crate::block_state::expect_changes(changed, 1,
-            format_args!("clock heal of {} {}", origin.kind, origin.origin_key)).map_err(err)
+                params![
+                    origin.kind,
+                    origin.origin_key,
+                    now,
+                    clock.evidence,
+                    clock.evidence_at,
+                    cleared,
+                    clock.next_recheck_at,
+                    clock.claim_owner,
+                    clock.claim_generation
+                ],
+            )
+            .map_err(err)?;
+        crate::block_state::expect_changes(
+            changed,
+            1,
+            format_args!("clock heal of {} {}", origin.kind, origin.origin_key),
+        )
+        .map_err(err)
     }
 
     /// A successful test with pools still unproved consumes its quota test
@@ -2734,19 +3140,45 @@ impl AccountTx<'_> {
             let Some((clock, _)) = blocks.clock(&origin.kind, &origin.origin_key) else {
                 return Ok(());
             };
-            let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3+?4,
+            let changed = self
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE fence_recheck SET next_recheck_at=?3+?4,
                 claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
-                WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(5)),
-                params![origin.kind,origin.origin_key,now,QUOTA_FENCE_RECHECK_MS,
-                    clock.evidence,clock.evidence_at,clock.lifetime == LifetimeClass::Quota,
-                    clock.next_recheck_at,clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
-            return crate::block_state::expect_changes(changed, 1,
-                format_args!("partial recovery of {} {}", origin.kind, origin.origin_key)).map_err(err);
+                WHERE kind=?1 AND origin_key=?2 AND {}",
+                        clock_held(5)
+                    ),
+                    params![
+                        origin.kind,
+                        origin.origin_key,
+                        now,
+                        QUOTA_FENCE_RECHECK_MS,
+                        clock.evidence,
+                        clock.evidence_at,
+                        clock.lifetime == LifetimeClass::Quota,
+                        clock.next_recheck_at,
+                        clock.reset_check_at,
+                        clock.claim_owner,
+                        clock.claim_generation
+                    ],
+                )
+                .map_err(err)?;
+            return crate::block_state::expect_changes(
+                changed,
+                1,
+                format_args!("partial recovery of {} {}", origin.kind, origin.origin_key),
+            )
+            .map_err(err);
         }
-        self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3+?4,
+        self.conn
+            .execute(
+                "UPDATE fence_recheck SET next_recheck_at=?3+?4,
             claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
             WHERE kind=?1 AND origin_key=?2",
-            params![origin.kind,origin.origin_key,now,QUOTA_FENCE_RECHECK_MS]).map_err(err)?;
+                params![origin.kind, origin.origin_key, now, QUOTA_FENCE_RECHECK_MS],
+            )
+            .map_err(err)?;
         Ok(())
     }
 
@@ -2788,7 +3220,10 @@ impl AccountTx<'_> {
                     if needed.is_empty() {
                         continue;
                     }
-                    for pool in needed.iter().filter(|pool| scope.is_some_and(|scope| scope.used(pool, model))) {
+                    for pool in needed
+                        .iter()
+                        .filter(|pool| scope.is_some_and(|scope| scope.used(pool, model)))
+                    {
                         self.conn.execute("INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
                             ON CONFLICT(fence_id,pool_key_json) DO UPDATE SET evidence_at=excluded.evidence_at,healed_at=excluded.healed_at",
                             params![id,serde_json::to_string(pool).map_err(err)?,origin.evidence_at,now]).map_err(err)?;
@@ -2891,12 +3326,17 @@ impl AccountTx<'_> {
         if !enabled(self.conn).map_err(err)? {
             return Ok((proposed, false));
         }
-        let prior = self.conn.query_row(
-            "SELECT r.quota FROM fence_recheck r JOIN fence_origin o
+        let prior = self
+            .conn
+            .query_row(
+                "SELECT r.quota FROM fence_recheck r JOIN fence_origin o
              ON o.kind=r.kind AND o.origin_key=r.origin_key AND o.evidence=r.evidence
              WHERE r.kind='credential' AND r.provider=?1 AND r.credential_id=?2 AND r.classified=1",
-            params![provider, credential], |row| row.get(0),
-        ).optional().map_err(err)?;
+                params![provider, credential],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
         Ok((prior.unwrap_or(proposed), prior.is_none()))
     }
 
@@ -2927,13 +3367,21 @@ impl AccountTx<'_> {
                     AND evidence=?5 AND evidence_at=?6 AND quota=?7 AND next_recheck_at=?8 AND cleared_at IS ?9",
                     params![clock.origin_key,provider,quota,credential,clock.evidence,clock.evidence_at,
                         clock.lifetime == LifetimeClass::Quota,clock.next_recheck_at,cleared]).map_err(err)?;
-                crate::block_state::expect_changes(changed, 1,
-                    format_args!("classification of credential {}", clock.origin_key)).map_err(err)?;
+                crate::block_state::expect_changes(
+                    changed,
+                    1,
+                    format_args!("classification of credential {}", clock.origin_key),
+                )
+                .map_err(err)?;
             }
             // The class each clock now holds: a new classification, or the
             // one an earlier decision stored.
             return Ok(clocks.first().is_some_and(|(clock, _)| {
-                if clock.classified { clock.lifetime == LifetimeClass::Quota } else { quota }
+                if clock.classified {
+                    clock.lifetime == LifetimeClass::Quota
+                } else {
+                    quota
+                }
             }));
         }
         self.conn.execute("UPDATE fence_recheck SET quota=?3,classified=1,next_recheck_at=MIN(next_recheck_at,evidence_at+CASE WHEN ?3 THEN 900000 ELSE 3600000 END)
@@ -3065,15 +3513,21 @@ mod tests {
         for newer_evidence in [false, true] {
             let scratch = cortexkit_test_support::ScratchDir::new("expired-probe-generation");
             let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-                "expired-probe-generation", scratch.path().join("store.db").to_string_lossy(),
-            )).unwrap();
+                "expired-probe-generation",
+                scratch.path().join("store.db").to_string_lossy(),
+            ))
+            .unwrap();
             let fence = crate::AccountRouteFence {
-                provider:"p".into(), credential_id:"c".into(), model:"m".into(),
-                until_ms:1000, recorded_at:100, decision_id:"d".into(),
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                until_ms: 1000,
+                recorded_at: 100,
+                decision_id: "d".into(),
             };
             store.record_billing_account_route_fence(&fence).unwrap();
             let origins = store.fence_rechecks().unwrap();
-            let owner = serde_json::json!(["account_admission","p","a"]).to_string();
+            let owner = serde_json::json!(["account_admission", "p", "a"]).to_string();
             store.account_transaction(|tx| {
                 tx.insert_pin(&crate::AccountPinRow {
                     pin_id:"pin".into(), principal:"p".into(), conversation_hash:"".into(),
@@ -3093,22 +3547,32 @@ mod tests {
             }).unwrap();
             let now = 3_601_001;
             if newer_evidence {
-                store.record_billing_account_route_fence(&crate::AccountRouteFence {
-                    recorded_at:now, until_ms:now + 100_000, ..fence
-                }).unwrap();
+                store
+                    .record_billing_account_route_fence(&crate::AccountRouteFence {
+                        recorded_at: now,
+                        until_ms: now + 100_000,
+                        ..fence
+                    })
+                    .unwrap();
             } else {
                 let origins = store.fence_rechecks().unwrap();
-                assert!(store.account_transaction(|tx| tx.grant_fence_rechecks(
-                    &origins,now,Some("new-owner"),
-                )).unwrap());
+                assert!(store
+                    .account_transaction(|tx| tx.grant_fence_rechecks(
+                        &origins,
+                        now,
+                        Some("new-owner"),
+                    ))
+                    .unwrap());
             }
             let before = store.fence_rechecks().unwrap().remove(0);
-            store.account_transaction(|tx| {
-                assert!(tx.has_expired_admission_probes(now)?);
-                tx.release_expired_admission_probes(now)?;
-                assert!(!tx.has_expired_admission_probes(now)?);
-                Ok(())
-            }).unwrap();
+            store
+                .account_transaction(|tx| {
+                    assert!(tx.has_expired_admission_probes(now)?);
+                    tx.release_expired_admission_probes(now)?;
+                    assert!(!tx.has_expired_admission_probes(now)?);
+                    Ok(())
+                })
+                .unwrap();
             let after = store.fence_rechecks().unwrap().remove(0);
             assert_eq!(after.next_recheck_at, before.next_recheck_at);
             assert_eq!(after.last_claimed_at, before.last_claimed_at);
@@ -3603,40 +4067,102 @@ mod tests {
         use striatum_core::{RouteStateStore, RouteStateUpdate};
         let scratch = cortexkit_test_support::ScratchDir::new("alias-pool-neutral-probe");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "alias-pool-neutral-probe", scratch.path().join("store.db").to_string_lossy(),
-        )).unwrap();
-        store.pool_wall("alias", "key", crate::PoolWallKind::Billing, 1000, "credits", 100).unwrap();
-        store.record_provider_cooldown("target", "target/m", "target/m", &RouteStateUpdate {
-            cooldown_until: Some(1000.0), observed_at_ms: Some(100), unscoped_wall: true,
-            last_error: Some("rate limit".into()), ..Default::default()
-        }).unwrap();
-        store.pool_wall("unrelated", "key", crate::PoolWallKind::Billing, 2000, "credits", 100).unwrap();
+            "alias-pool-neutral-probe",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .pool_wall(
+                "alias",
+                "key",
+                crate::PoolWallKind::Billing,
+                1000,
+                "credits",
+                100,
+            )
+            .unwrap();
+        store
+            .record_provider_cooldown(
+                "target",
+                "target/m",
+                "target/m",
+                &RouteStateUpdate {
+                    cooldown_until: Some(1000.0),
+                    observed_at_ms: Some(100),
+                    unscoped_wall: true,
+                    last_error: Some("rate limit".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .pool_wall(
+                "unrelated",
+                "key",
+                crate::PoolWallKind::Billing,
+                2000,
+                "credits",
+                100,
+            )
+            .unwrap();
         let keys = vec![PoolKey::new("key", Some("a"), "active")];
-        let crate::PoolAcquireOutcome::Leased(lease) = store.pool_acquire_for_route(
-            &crate::PoolAcquire {
-                provider: "alias", session_id: "s", keys: &keys, now_ms: 1000,
-                lease_ms: 120_000, affinity_idle_ms: 120_000,
-            }, &["alias", "target"], "m", &[], &Default::default(),
-        ).unwrap() else { panic!("both due origins must admit one lease") };
-        store.bind_fence_probe_owner(&lease.lease_id, "decision").unwrap();
-        store.account_transaction(|tx| {
-            tx.release_inconclusive_probe("decision", "target", "m", 1001)
-        }).unwrap();
+        let crate::PoolAcquireOutcome::Leased(lease) = store
+            .pool_acquire_for_route(
+                &crate::PoolAcquire {
+                    provider: "alias",
+                    session_id: "s",
+                    keys: &keys,
+                    now_ms: 1000,
+                    lease_ms: 120_000,
+                    affinity_idle_ms: 120_000,
+                },
+                &["alias", "target"],
+                "m",
+                &[],
+                &Default::default(),
+            )
+            .unwrap()
+        else {
+            panic!("both due origins must admit one lease")
+        };
+        store
+            .bind_fence_probe_owner(&lease.lease_id, "decision")
+            .unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.release_inconclusive_probe("decision", "target", "m", 1001)
+            })
+            .unwrap();
         let clocks = store.fence_rechecks().unwrap();
-        assert_eq!(clocks.len(), 3, "a neutral outcome releases claims without healing evidence");
+        assert_eq!(
+            clocks.len(),
+            3,
+            "a neutral outcome releases claims without healing evidence"
+        );
         let mut released = Vec::new();
         for clock in clocks {
             if clock.provider == "unrelated" {
-                assert_eq!(clock.next_recheck_at, 2000, "an unclaimed origin is untouched");
+                assert_eq!(
+                    clock.next_recheck_at, 2000,
+                    "an unclaimed origin is untouched"
+                );
             } else {
-                assert_eq!(clock.next_recheck_at, 1001, "{} must reopen its exact authorization", clock.provider);
+                assert_eq!(
+                    clock.next_recheck_at, 1001,
+                    "{} must reopen its exact authorization",
+                    clock.provider
+                );
                 assert!(clock.claim_owner.is_none());
                 released.push(clock);
             }
         }
         assert_eq!(released.len(), 2);
-        assert!(store.account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001)).unwrap());
-        assert!(!store.account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001)).unwrap());
+        assert!(store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001))
+            .unwrap());
+        assert!(!store
+            .account_transaction(|tx| tx.claim_fence_rechecks(&released, 1001))
+            .unwrap());
     }
 
     #[test]
@@ -4674,9 +5200,7 @@ mod tests {
 
     #[test]
     fn outcome_retry_wall_replaces_migrated_horizon_and_refreshes_evidence() {
-        use striatum_core::{
-            DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore,
-        };
+        use striatum_core::{DecisionInput, DecisionOutcomeUpdate, RouteOutcome, RouteStateStore};
         let scratch = cortexkit_test_support::ScratchDir::new("outcome-wall-generation");
         let descriptor = crate::dev_descriptor(
             "outcome-wall-generation",
@@ -4759,17 +5283,35 @@ mod tests {
         };
         let scratch = cortexkit_test_support::ScratchDir::new("new-model-wall-generation");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "new-model-wall-generation", scratch.path().join("store.db").to_string_lossy(),
-        )).unwrap();
+            "new-model-wall-generation",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
         let now = crate::now_ms();
-        store.record_provider_cooldown("p", "p/seed", "p/seed", &RouteStateUpdate {
-            quota_exhausted_until: Some((now + NON_QUOTA_FENCE_MAX_MS) as f64),
-            observed_at_ms: Some(now - 100), last_error: Some("provider capacity".into()),
-            ..Default::default()
-        }).unwrap();
-        store.update_route_state("p/telemetry", "p/telemetry", &RouteStateUpdate {
-            observed_at_ms: Some(now), latency_ema_ms: Some(50.0), ..Default::default()
-        }).unwrap();
+        store
+            .record_provider_cooldown(
+                "p",
+                "p/seed",
+                "p/seed",
+                &RouteStateUpdate {
+                    quota_exhausted_until: Some((now + NON_QUOTA_FENCE_MAX_MS) as f64),
+                    observed_at_ms: Some(now - 100),
+                    last_error: Some("provider capacity".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_route_state(
+                "p/telemetry",
+                "p/telemetry",
+                &RouteStateUpdate {
+                    observed_at_ms: Some(now),
+                    latency_ema_ms: Some(50.0),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         store.store.with_conn(|conn| {
             let inherited: (i64, bool) = conn.query_row(
                 "SELECT wall_observed_at,wall_unscoped FROM model_route_state WHERE route_key='p/telemetry'",
@@ -4780,35 +5322,71 @@ mod tests {
         }).unwrap();
         let report = |at, seconds| {
             if outcome {
-                let id = store.record_decision(&DecisionInput {
-                    selected_route_key: Some("p/new".into()),
-                    selected_provider_id: Some("p".into()), selected_model_id: Some("new".into()),
-                    ..Default::default()
-                }).unwrap();
-                store.set_decision_outcome(&id, &DecisionOutcomeUpdate {
-                    outcome: RouteOutcome::QuotaExhausted { retry_after_secs: seconds },
-                    observed_at_ms: at, last_error: Some("model capacity".into()),
-                    provider_outcome: None, failure_backoff: Default::default(),
-                }).unwrap();
+                let id = store
+                    .record_decision(&DecisionInput {
+                        selected_route_key: Some("p/new".into()),
+                        selected_provider_id: Some("p".into()),
+                        selected_model_id: Some("new".into()),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                store
+                    .set_decision_outcome(
+                        &id,
+                        &DecisionOutcomeUpdate {
+                            outcome: RouteOutcome::QuotaExhausted {
+                                retry_after_secs: seconds,
+                            },
+                            observed_at_ms: at,
+                            last_error: Some("model capacity".into()),
+                            provider_outcome: None,
+                            failure_backoff: Default::default(),
+                        },
+                    )
+                    .unwrap();
             } else {
-                store.update_route_state("p/new", "p/new", &RouteStateUpdate {
-                    quota_exhausted_until: Some((at + seconds as i64 * 1000) as f64),
-                    observed_at_ms: Some(at), unscoped_wall: true,
-                    last_error: Some("model capacity".into()), ..Default::default()
-                }).unwrap();
+                store
+                    .update_route_state(
+                        "p/new",
+                        "p/new",
+                        &RouteStateUpdate {
+                            quota_exhausted_until: Some((at + seconds as i64 * 1000) as f64),
+                            observed_at_ms: Some(at),
+                            unscoped_wall: true,
+                            last_error: Some("model capacity".into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
             }
         };
         report(now, 10);
         let assert_generation = || {
             let clocks = store.fence_rechecks().unwrap();
-            let route = clocks.iter().find(|o| o.kind == "route" && o.model.as_deref() == Some("new")).unwrap();
-            assert_eq!(route.evidence_at, now, "a direct new-row refusal must retain its own stamp");
+            let route = clocks
+                .iter()
+                .find(|o| o.kind == "route" && o.model.as_deref() == Some("new"))
+                .unwrap();
+            assert_eq!(
+                route.evidence_at, now,
+                "a direct new-row refusal must retain its own stamp"
+            );
             assert_eq!(route.next_recheck_at, now + 10_000);
-            store.store.with_conn(|conn| {
-                let unscoped: bool = conn.query_row("SELECT wall_unscoped FROM model_route_state WHERE route_key='p/new'", [], |row| row.get(0))?;
-                assert!(unscoped, "the model refusal must not inherit the provider's scope");
-                Ok(())
-            }).unwrap();
+            store
+                .store
+                .with_conn(|conn| {
+                    let unscoped: bool = conn.query_row(
+                        "SELECT wall_unscoped FROM model_route_state WHERE route_key='p/new'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    assert!(
+                        unscoped,
+                        "the model refusal must not inherit the provider's scope"
+                    );
+                    Ok(())
+                })
+                .unwrap();
         };
         assert_generation();
         report(now - 50, 3600);

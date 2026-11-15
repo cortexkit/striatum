@@ -190,7 +190,9 @@ impl Rig {
                 let sql = self
                     .store
                     .with_reader_for_test(move |conn| {
-                        Ok(crate::route_snapshot::read_snapshot(conn, now as f64, recheck))
+                        Ok(crate::route_snapshot::read_snapshot(
+                            conn, now as f64, recheck,
+                        ))
                     })
                     .unwrap()
                     .unwrap();
@@ -353,15 +355,21 @@ impl Rig {
         );
         assert_eq!(
             memory.needs_sync(),
-            store.with_reader_for_test(fence_rechecks::needs_sync).unwrap(),
+            store
+                .with_reader_for_test(fence_rechecks::needs_sync)
+                .unwrap(),
             "needs_sync: {context}"
         );
         for provider in PROVIDERS {
             let sql = store
-                .with_reader_for_test(|conn| crate::key_pool::read_key_states(conn, provider, now, None))
+                .with_reader_for_test(|conn| {
+                    crate::key_pool::read_key_states(conn, provider, now, None)
+                })
                 .unwrap();
             let leases = store
-                .with_reader_for_test(|conn| crate::key_pool::lease_counts(conn, provider, now, None))
+                .with_reader_for_test(|conn| {
+                    crate::key_pool::lease_counts(conn, provider, now, None)
+                })
                 .unwrap();
             let from_memory = crate::key_pool::key_states_from(
                 provider,
@@ -500,7 +508,9 @@ fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
     ));
     let rowid = |rig: &Rig| -> i64 {
         rig.store
-            .with_reader_for_test(|conn| conn.query_row("SELECT rowid FROM pool_key_state", [], |r| r.get(0)))
+            .with_reader_for_test(|conn| {
+                conn.query_row("SELECT rowid FROM pool_key_state", [], |r| r.get(0))
+            })
             .unwrap()
     };
     let before = rowid(&rig);
@@ -516,7 +526,10 @@ fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
         vec![("c".to_owned(), Some(NOW), None, None)],
         "the held row is the replacement"
     );
-    assert!(state.fingerprints()[4] == (1, Some(after)), "held at its new rowid");
+    assert!(
+        state.fingerprints()[4] == (1, Some(after)),
+        "held at its new rowid"
+    );
     rig.check(&[NOW], "pool key replaced");
 }
 
@@ -545,7 +558,10 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
                 if path.file_name().is_some_and(|name| name != "target") {
                     files(&path, out);
                 }
-            } else if matches!(path.extension().and_then(|e| e.to_str()), Some("rs" | "sql")) {
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("rs" | "sql")
+            ) {
                 out.push(path);
             }
         }
@@ -561,7 +577,9 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
     // `name/` beside the declaring module (or inside its directory).
     let mut test_only: Vec<PathBuf> = Vec::new();
     for path in &all {
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let lines: Vec<&str> = text.lines().map(str::trim).collect();
         for pair in lines.windows(2) {
             let declared = ["mod ", "pub mod ", "pub(crate) mod ", "pub(super) mod "]
@@ -570,7 +588,10 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
                 .and_then(|rest| rest.strip_suffix(';'));
             if let (true, Some(name)) = (pair[0] == "#[cfg(test)]", declared) {
                 let dir = path.parent().unwrap();
-                let base = if path.file_stem().is_some_and(|stem| stem == "lib" || stem == "main" || stem == "mod") {
+                let base = if path
+                    .file_stem()
+                    .is_some_and(|stem| stem == "lib" || stem == "main" || stem == "mod")
+                {
                     dir.to_path_buf()
                 } else {
                     dir.join(path.file_stem().unwrap())
@@ -599,7 +620,10 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
             } else if let Some(after) = rest.strip_prefix("--") {
                 // A comment ends at a newline, or at a `\n` escape inside
                 // a Rust string literal.
-                let end = [after.find('\n'), after.find("\\n")].into_iter().flatten().min();
+                let end = [after.find('\n'), after.find("\\n")]
+                    .into_iter()
+                    .flatten()
+                    .min();
                 rest = end.map_or("", |end| &after[end..]);
                 out.push(' ');
             } else {
@@ -639,28 +663,61 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
             .collect()
     };
     // The scan sees every spelling and every table.
-    assert_eq!(scan("x(\"INSERT  OR\n   Replace INTO `fence_recheck`(kind) VALUES (1)\")"), ["or replace", "replace into"]);
+    assert_eq!(
+        scan("x(\"INSERT  OR\n   Replace INTO `fence_recheck`(kind) VALUES (1)\")"),
+        ["or replace", "replace into"]
+    );
     assert_eq!(scan("replace into anything values (1)"), ["replace into"]);
-    assert_eq!(scan("UPDATE OR REPLACE pool_key_state SET a=1"), ["or replace"]);
-    assert_eq!(scan("CREATE TABLE t (a TEXT UNIQUE ON CONFLICT REPLACE);"), ["on conflict replace"]);
+    assert_eq!(
+        scan("UPDATE OR REPLACE pool_key_state SET a=1"),
+        ["or replace"]
+    );
+    assert_eq!(
+        scan("CREATE TABLE t (a TEXT UNIQUE ON CONFLICT REPLACE);"),
+        ["on conflict replace"]
+    );
     assert!(scan("let s = text.replace('a', \"b\"); color_replace").is_empty());
     assert_eq!(scan("INSERT OR/**/REPLACE t VALUES (1)"), ["or replace"]);
-    assert_eq!(scan("INSERT OR -- keep the newest\n  REPLACE t VALUES (1)"), ["or replace"]);
-    assert_eq!(scan("x(\"INSERT OR \\\n         REPLACE t VALUES (1)\")"), ["or replace"]);
-    assert_eq!(scan("x(\"-- the newest\\nINSERT OR REPLACE t VALUES (1)\"); // --"), ["or replace"]);
-    assert_eq!(scan("-- INSERT OR REPLACE, even commented out\nSELECT 1"), ["or replace"]);
+    assert_eq!(
+        scan("INSERT OR -- keep the newest\n  REPLACE t VALUES (1)"),
+        ["or replace"]
+    );
+    assert_eq!(
+        scan("x(\"INSERT OR \\\n         REPLACE t VALUES (1)\")"),
+        ["or replace"]
+    );
+    assert_eq!(
+        scan("x(\"-- the newest\\nINSERT OR REPLACE t VALUES (1)\"); // --"),
+        ["or replace"]
+    );
+    assert_eq!(
+        scan("-- INSERT OR REPLACE, even commented out\nSELECT 1"),
+        ["or replace"]
+    );
     let mut violations = Vec::new();
     let mut scanned = 0;
     for path in all.iter().filter(|path| !is_test(path)) {
-        if path.file_name().is_some_and(|name| SUPERSEDED.iter().any(|superseded| name == *superseded)) {
+        if path
+            .file_name()
+            .is_some_and(|name| SUPERSEDED.iter().any(|superseded| name == *superseded))
+        {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         scanned += 1;
-        violations.extend(scan(&text).into_iter().map(|found| format!("{}: {found}", path.display())));
+        violations.extend(
+            scan(&text)
+                .into_iter()
+                .map(|found| format!("{}: {found}", path.display())),
+        );
     }
     assert!(scanned > 100, "the scan found the sources: {scanned} files");
-    assert!(violations.is_empty(), "REPLACE conflict resolution: {violations:#?}");
+    assert!(
+        violations.is_empty(),
+        "REPLACE conflict resolution: {violations:#?}"
+    );
 
     // The migrated schema: no trigger or table resolves a conflict by
     // REPLACE, and the two recreated triggers' target tables have no
@@ -683,10 +740,24 @@ fn no_production_code_or_schema_resolves_a_conflict_by_replace() {
             Ok((schema, own))
         })
         .unwrap();
-    assert!(schema.len() > 50, "the schema was read: {} objects", schema.len());
-    let replacing: Vec<_> = schema.iter().filter(|(_, sql)| !scan(sql).is_empty()).map(|(name, _)| name).collect();
-    assert!(replacing.is_empty(), "schema objects resolving a conflict by REPLACE: {replacing:?}");
-    assert_eq!(own_triggers, 0, "no trigger on the copies' target tables or on the archive besides retirement");
+    assert!(
+        schema.len() > 50,
+        "the schema was read: {} objects",
+        schema.len()
+    );
+    let replacing: Vec<_> = schema
+        .iter()
+        .filter(|(_, sql)| !scan(sql).is_empty())
+        .map(|(name, _)| name)
+        .collect();
+    assert!(
+        replacing.is_empty(),
+        "schema objects resolving a conflict by REPLACE: {replacing:?}"
+    );
+    assert_eq!(
+        own_triggers, 0,
+        "no trigger on the copies' target tables or on the archive besides retirement"
+    );
 }
 
 /// Migration 092's copy triggers, which update a conflicting row, leave the
@@ -711,8 +782,18 @@ fn copy_triggers_without_replace_leave_the_rows_the_replace_left() {
                observation_id TEXT, bound INTEGER, effects_json TEXT, received_at INTEGER);",
         )
         .unwrap();
-        conn.execute_batch(&statement(old_054, "CREATE TABLE IF NOT EXISTS model_route_parent_failures", ");")).unwrap();
-        conn.execute_batch(&statement(old_056, "CREATE TABLE IF NOT EXISTS account_observation_event", ");")).unwrap();
+        conn.execute_batch(&statement(
+            old_054,
+            "CREATE TABLE IF NOT EXISTS model_route_parent_failures",
+            ");",
+        ))
+        .unwrap();
+        conn.execute_batch(&statement(
+            old_056,
+            "CREATE TABLE IF NOT EXISTS account_observation_event",
+            ");",
+        ))
+        .unwrap();
         for trigger in triggers {
             conn.execute_batch(&trigger).unwrap();
         }
@@ -739,24 +820,48 @@ fn copy_triggers_without_replace_leave_the_rows_the_replace_left() {
             while let Some(row) = query.next().unwrap() {
                 rows.push(format!(
                     "{:?}",
-                    (0..columns).map(|at| row.get::<_, Value>(at).unwrap()).collect::<Vec<_>>()
+                    (0..columns)
+                        .map(|at| row.get::<_, Value>(at).unwrap())
+                        .collect::<Vec<_>>()
                 ));
             }
         }
         rows
     };
     let replaced = run([
-        statement(old_054, "CREATE TRIGGER IF NOT EXISTS model_route_parent_failures_on_insert", "END;"),
-        statement(old_056, "CREATE TRIGGER IF NOT EXISTS account_observation_event_on_insert", "END;"),
+        statement(
+            old_054,
+            "CREATE TRIGGER IF NOT EXISTS model_route_parent_failures_on_insert",
+            "END;",
+        ),
+        statement(
+            old_056,
+            "CREATE TRIGGER IF NOT EXISTS account_observation_event_on_insert",
+            "END;",
+        ),
     ]);
     let updated = run([
-        statement(new, "CREATE TRIGGER model_route_parent_failures_on_insert", "END;"),
-        statement(new, "CREATE TRIGGER account_observation_event_on_insert", "END;"),
+        statement(
+            new,
+            "CREATE TRIGGER model_route_parent_failures_on_insert",
+            "END;",
+        ),
+        statement(
+            new,
+            "CREATE TRIGGER account_observation_event_on_insert",
+            "END;",
+        ),
     ]);
     assert_eq!(updated, replaced);
     assert_eq!(replaced.len(), 4, "{replaced:#?}");
-    assert!(replaced.iter().any(|row| row.contains("\"s2\"")), "{replaced:#?}");
-    assert!(replaced.iter().any(|row| row.contains("\"o2\"")), "{replaced:#?}");
+    assert!(
+        replaced.iter().any(|row| row.contains("\"s2\"")),
+        "{replaced:#?}"
+    );
+    assert!(
+        replaced.iter().any(|row| row.contains("\"o2\"")),
+        "{replaced:#?}"
+    );
 }
 
 #[test]
@@ -878,9 +983,16 @@ fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
     // keyed update finds no such row, the batch rolls back, and it runs again
     // on a fresh load, which refuses the loser.
     let loads = rig.owner.loads.load(Ordering::Relaxed);
-    rig.owner.stale.lock().unwrap().push(before_the_winner.clone());
+    rig.owner
+        .stale
+        .lock()
+        .unwrap()
+        .push(before_the_winner.clone());
     rig.owner.request_reload();
-    assert!(!claim("loser").unwrap(), "the rerun sees the winner's claim");
+    assert!(
+        !claim("loser").unwrap(),
+        "the rerun sees the winner's claim"
+    );
     assert_eq!(rig.owner.loads.load(Ordering::Relaxed) - loads, 2);
     let owners = |rig: &Rig| {
         rig.store
@@ -931,10 +1043,9 @@ fn a_heal_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
         "UPDATE account_route_fence SET last_reported_at={newer} WHERE credential_id='c0';"
     ));
     let heal = || {
-        rig.store
-            .account_command(AccountCommandKind::Report, |tx| {
-                tx.heal_serving_fences_in_scope("p0", "a0", "c0", "m0", None, NOW, NOW + 1, None)
-            })
+        rig.store.account_command(AccountCommandKind::Report, |tx| {
+            tx.heal_serving_fences_in_scope("p0", "a0", "c0", "m0", None, NOW, NOW + 1, None)
+        })
     };
     let reported = |rig: &Rig| {
         rig.store
@@ -946,11 +1057,23 @@ fn a_heal_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
             .unwrap()
     };
     let loads = rig.owner.loads.load(Ordering::Relaxed);
-    rig.owner.stale.lock().unwrap().push(before_the_refusal.clone());
+    rig.owner
+        .stale
+        .lock()
+        .unwrap()
+        .push(before_the_refusal.clone());
     rig.owner.request_reload();
     heal().unwrap();
-    assert_eq!(rig.owner.loads.load(Ordering::Relaxed) - loads, 2, "the stale run, then a fresh one");
-    assert_eq!(reported(&rig), [newer], "the refusal after the admission stands");
+    assert_eq!(
+        rig.owner.loads.load(Ordering::Relaxed) - loads,
+        2,
+        "the stale run, then a fresh one"
+    );
+    assert_eq!(
+        reported(&rig),
+        [newer],
+        "the refusal after the admission stands"
+    );
     rig.check(&[NOW], "after the rerun");
 
     // Stale on the rerun too: the batch fails with the divergence and
@@ -1091,7 +1214,10 @@ fn probe_answers_read_from_a_stale_state_run_again_on_a_fresh_load() {
             tx.probe_report_matches("decision", None, true)
         })
         .unwrap();
-    assert!(!settles, "a preserved report never settles the decision's probe");
+    assert!(
+        !settles,
+        "a preserved report never settles the decision's probe"
+    );
     assert_eq!(rig.loads_since(loads), 2, "the stale run, then a fresh one");
 
     let loads = rig.decide_next_on(before_the_grant);
@@ -1169,9 +1295,15 @@ fn an_admission_release_the_state_calls_superseded_runs_again_on_a_fresh_load() 
         .unwrap());
     // A state whose clock is one generation past the admission's, while
     // SQL keeps the admission's generation.
-    rig.sql("UPDATE fence_recheck SET claim_generation=claim_generation+1 WHERE kind='credential';".into());
+    rig.sql(
+        "UPDATE fence_recheck SET claim_generation=claim_generation+1 WHERE kind='credential';"
+            .into(),
+    );
     let superseded = rig.published();
-    rig.sql("UPDATE fence_recheck SET claim_generation=claim_generation-1 WHERE kind='credential';".into());
+    rig.sql(
+        "UPDATE fence_recheck SET claim_generation=claim_generation-1 WHERE kind='credential';"
+            .into(),
+    );
     let generation = |rig: &Rig| {
         rig.store
             .with_reader_for_test(|conn| {
@@ -1241,7 +1373,10 @@ fn a_rebind_leaves_no_clock_claimed_by_the_old_owner() {
                 .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap();
-    assert_eq!(owners, [Some("decision".to_owned()), Some("decision".to_owned())]);
+    assert_eq!(
+        owners,
+        [Some("decision".to_owned()), Some("decision".to_owned())]
+    );
     rig.check(&[NOW], "after the rebind");
 }
 
@@ -1259,9 +1394,15 @@ fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
     };
     rig.sql(row("seen"));
     UNSEEN.with(|unseen| unseen.set(true));
-    rig.store.bypass_account_writer_for_test(&row("unseen")).unwrap();
+    rig.store
+        .bypass_account_writer_for_test(&row("unseen"))
+        .unwrap();
     UNSEEN.with(|unseen| unseen.set(false));
-    assert_eq!(rig.store.block_writes_outside_command(), 0, "nothing reported the write");
+    assert_eq!(
+        rig.store.block_writes_outside_command(),
+        0,
+        "nothing reported the write"
+    );
     rig.sql("SELECT 1;".into());
     assert_ne!(rig.published(), rig.fresh(), "the state missed the write");
     let reloads = block_reconcile_reloads();
@@ -1269,7 +1410,11 @@ fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
     rig.store
         .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW))
         .unwrap();
-    assert_eq!(block_reconcile_reloads() - reloads, 1, "one mismatch counted");
+    assert_eq!(
+        block_reconcile_reloads() - reloads,
+        1,
+        "one mismatch counted"
+    );
     assert_eq!(rig.loads_since(loads), 1, "one reload");
     rig.check(&[NOW], "after the tick");
 }
@@ -1393,7 +1538,11 @@ fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
     let active: i64 = rig
         .store
         .with_reader_for_test(|conn| {
-            conn.query_row("SELECT count(*) FROM account_fence WHERE cleared_at IS NULL", [], |r| r.get(0))
+            conn.query_row(
+                "SELECT count(*) FROM account_fence WHERE cleared_at IS NULL",
+                [],
+                |r| r.get(0),
+            )
         })
         .unwrap();
     assert_eq!(active, 1, "the block waits for its uncovered pool");
@@ -1406,11 +1555,13 @@ fn authorized_recovery_rig(empty: bool) -> Rig {
     let pools: Vec<_> = if empty {
         Vec::new()
     } else {
-        ["a", "b"].map(|model| PoolKey {
-            window_minutes: Some(300),
-            scope: PoolScope::Models([model.to_owned(), "both".to_owned()].into()),
-            name: None,
-        }).into()
+        ["a", "b"]
+            .map(|model| PoolKey {
+                window_minutes: Some(300),
+                scope: PoolScope::Models([model.to_owned(), "both".to_owned()].into()),
+                name: None,
+            })
+            .into()
     };
     rig.sql(format!(
         "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
@@ -1424,53 +1575,83 @@ fn authorized_recovery_rig(empty: bool) -> Rig {
 /// working state, comparing every block-table row as well as the answer.
 fn authorized_recovery_success(rig: &Rig, model: &str, known: bool, at: i64) {
     let model = model.to_owned();
-    rig.store.account_command(AccountCommandKind::Report, move |tx| {
-        let owner = owner_name(2);
-        let claim = |tx: &crate::AccountTx<'_>| -> RouteStateResult<()> {
-            let origins = tx.fence_rechecks()?;
-            assert!(tx.grant_fence_rechecks(&origins, at, Some("owner1"))?);
-            assert!(tx.claim_fence_rechecks_for_authorized_admission(&origins, at, Some("owner1"), &owner)?);
-            tx.conn.execute("UPDATE fence_recheck SET reset_check_at=?1 WHERE kind='account'", [at + if known { 100 } else { 5 }]).map_err(err)?;
-            Ok(())
-        };
-        let settle = |tx: &crate::AccountTx<'_>| {
-            let admission = admission_row("p0", "c0", &model, at);
-            let scope = known.then_some(crate::QuotaSuccessScope {
-                family: striatum_core::accounts::ModelFamily::Other,
-                pool: None,
-            });
-            tx.heal_admission_success(&admission, None, Some("owner1"), scope.as_ref(), at + 10)
-        };
-        for stage in ["claim", "settle"] {
-            let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<String> {
-                let answer = if stage == "claim" {
-                    claim(tx)?;
-                    Vec::new()
-                } else {
-                    settle(tx)?
-                };
-                Ok(format!("{answer:?} {:#?}", block_rows(tx.conn)?))
+    rig.store
+        .account_command(AccountCommandKind::Report, move |tx| {
+            let owner = owner_name(2);
+            let claim = |tx: &crate::AccountTx<'_>| -> RouteStateResult<()> {
+                let origins = tx.fence_rechecks()?;
+                assert!(tx.grant_fence_rechecks(&origins, at, Some("owner1"))?);
+                assert!(tx.claim_fence_rechecks_for_authorized_admission(
+                    &origins,
+                    at,
+                    Some("owner1"),
+                    &owner
+                )?);
+                tx.conn
+                    .execute(
+                        "UPDATE fence_recheck SET reset_check_at=?1 WHERE kind='account'",
+                        [at + if known { 100 } else { 5 }],
+                    )
+                    .map_err(err)?;
+                Ok(())
             };
-            tx.conn.execute_batch("SAVEPOINT recovery_oracle").map_err(err)?;
-            let sql = run(&crate::AccountTx::sql(tx.conn))?;
-            tx.conn.execute_batch("ROLLBACK TO recovery_oracle; RELEASE recovery_oracle").map_err(err)?;
-            assert_eq!(run(tx)?, sql, "{stage}: working-state and SQL recovery agree");
-        }
-        Ok(())
-    }).unwrap();
+            let settle = |tx: &crate::AccountTx<'_>| {
+                let admission = admission_row("p0", "c0", &model, at);
+                let scope = known.then_some(crate::QuotaSuccessScope {
+                    family: striatum_core::accounts::ModelFamily::Other,
+                    pool: None,
+                });
+                tx.heal_admission_success(&admission, None, Some("owner1"), scope.as_ref(), at + 10)
+            };
+            for stage in ["claim", "settle"] {
+                let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<String> {
+                    let answer = if stage == "claim" {
+                        claim(tx)?;
+                        Vec::new()
+                    } else {
+                        settle(tx)?
+                    };
+                    Ok(format!("{answer:?} {:#?}", block_rows(tx.conn)?))
+                };
+                tx.conn
+                    .execute_batch("SAVEPOINT recovery_oracle")
+                    .map_err(err)?;
+                let sql = run(&crate::AccountTx::sql(tx.conn))?;
+                tx.conn
+                    .execute_batch("ROLLBACK TO recovery_oracle; RELEASE recovery_oracle")
+                    .map_err(err)?;
+                assert_eq!(
+                    run(tx)?,
+                    sql,
+                    "{stage}: working-state and SQL recovery agree"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
     rig.check(&[at + 10], "authorized recovery success");
 }
 
 fn assert_outstanding_authorized_recovery(rig: &Rig, successes: usize, at: i64) {
     let blocks = rig.published();
-    assert!(blocks.account_fence("whole").is_some(), "unproved pools keep the fence");
+    assert!(
+        blocks.account_fence("whole").is_some(),
+        "unproved pools keep the fence"
+    );
     assert_eq!(blocks.success_pools().count(), successes);
     let (clock, cleared) = blocks.clock("account", "[\"whole\"]").unwrap();
     assert_eq!(cleared, None, "the outstanding block's clock stays active");
     assert_eq!(clock.claim_owner, None, "the test releases its claim");
-    assert_eq!(clock.next_recheck_at, at + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS);
+    assert_eq!(
+        clock.next_recheck_at,
+        at + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS
+    );
     assert_eq!(clock.reset_check_at, (successes > 0).then_some(at + 100));
-    assert_eq!(blocks.authorizations().count(), 0, "owner and decision copy are retired");
+    assert_eq!(
+        blocks.authorizations().count(),
+        0,
+        "owner and decision copy are retired"
+    );
 }
 
 #[test]
@@ -1480,11 +1661,20 @@ fn authorized_whole_account_recovery_proves_only_a_then_b_clears() {
     assert_outstanding_authorized_recovery(&rig, 1, NOW);
     let blocks = rig.published();
     let proof = blocks.success_pools().next().unwrap();
-    let pool: striatum_core::accounts::PoolKey = serde_json::from_str(&proof.pool_key_json).unwrap();
-    assert_eq!(pool.scope, striatum_core::accounts::PoolScope::Models(["a".into(), "both".into()].into()));
+    let pool: striatum_core::accounts::PoolKey =
+        serde_json::from_str(&proof.pool_key_json).unwrap();
+    assert_eq!(
+        pool.scope,
+        striatum_core::accounts::PoolScope::Models(["a".into(), "both".into()].into())
+    );
     assert_eq!(proof.evidence_at, NOW - 1_000_000);
     assert_eq!(proof.healed_at, NOW + 10);
-    authorized_recovery_success(&rig, "b", true, NOW + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS);
+    authorized_recovery_success(
+        &rig,
+        "b",
+        true,
+        NOW + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS,
+    );
     assert!(rig.published().account_fence("whole").is_none());
     assert_eq!(rig.published().success_pools().count(), 2);
     assert!(rig.published().fence_rechecks(NOW).unwrap().is_empty());
@@ -1528,7 +1718,9 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
     // Its clock is installed first, so no sync below decides about the
     // origin (a decision would check the row and catch the change itself).
     rig.store
-        .account_command(AccountCommandKind::Maintenance, |tx| tx.sync_fence_rechecks())
+        .account_command(AccountCommandKind::Maintenance, |tx| {
+            tx.sync_fence_rechecks()
+        })
         .unwrap();
     UNSEEN.with(|unseen| unseen.set(true));
     rig.store
@@ -1545,12 +1737,24 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
     };
     let reloads = block_reconcile_reloads();
     tick();
-    assert_eq!(block_reconcile_reloads(), reloads, "counts and rowids match");
-    assert_ne!(rig.published(), rig.fresh(), "the state still misses the change");
+    assert_eq!(
+        block_reconcile_reloads(),
+        reloads,
+        "counts and rowids match"
+    );
+    assert_ne!(
+        rig.published(),
+        rig.fresh(),
+        "the state still misses the change"
+    );
     for _ in 0..5 {
         tick();
     }
-    assert_eq!(block_reconcile_reloads() - reloads, 1, "the full comparison found it");
+    assert_eq!(
+        block_reconcile_reloads() - reloads,
+        1,
+        "the full comparison found it"
+    );
     rig.check(&[NOW], "after the full comparison");
 }
 
@@ -1571,16 +1775,23 @@ fn a_commit_from_another_connection_just_before_a_batch_is_loaded_inside_it() {
         Box::new(move || {
             // Another process commits after the writer's freshness check.
             let conn = Connection::open(&outside).unwrap();
-            conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
             conn.execute_batch(&row("outside")).unwrap();
         }),
     ));
     rig.sql(row("second"));
     assert!(
-        crate::account_writer::BEFORE_BEGIN.lock().unwrap().is_empty(),
+        crate::account_writer::BEFORE_BEGIN
+            .lock()
+            .unwrap()
+            .is_empty(),
         "the hook ran"
     );
-    rig.check(&[NOW], "after an outside commit just before the batch began");
+    rig.check(
+        &[NOW],
+        "after an outside commit just before the batch began",
+    );
 }
 
 #[test]
@@ -1621,7 +1832,10 @@ fn a_report_from_an_owner_whose_claim_was_superseded_does_not_match() {
             })
             .unwrap()
     };
-    assert!(!matches("first"), "a superseded claim cannot settle the probe");
+    assert!(
+        !matches("first"),
+        "a superseded claim cannot settle the probe"
+    );
     assert!(matches("second"));
 }
 
@@ -2089,8 +2303,12 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                     done?;
                     Ok(block_rows(tx.conn)? != before)
                 };
-                let effective: Vec<FenceRecheck> =
-                    tx.fence_rechecks()?.into_iter().skip(first).take(count).collect();
+                let effective: Vec<FenceRecheck> = tx
+                    .fence_rechecks()?
+                    .into_iter()
+                    .skip(first)
+                    .take(count)
+                    .collect();
                 // Most heals are tried at the edge of their first block: on
                 // its own provider, login and model, admitted just before, at
                 // or just after its evidence.
@@ -2116,7 +2334,9 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                     4 => tx.bind_decision_probe(&chosen, &owner, &other, "a0", &credential, at),
                     5 => tx.probe_report_matches(&owner, named.then_some(&*credential), preserve),
                     6 => tx.probe_authorization_names_credential(&owner, &credential, &model),
-                    7 => tx.transfer_probe_authorization(&owner, &other).map(|()| true),
+                    7 => tx
+                        .transfer_probe_authorization(&owner, &other)
+                        .map(|()| true),
                     8 => healed(tx.heal_authorized_probe(&owner, &provider, &model, at)),
                     9 => healed(tx.heal_serving_fences_in_scope(
                         &provider,
@@ -2128,7 +2348,14 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                         at,
                         scope.as_ref(),
                     )),
-                    10 => healed(tx.heal_origins(&effective, &model, admitted, at, scope.as_ref(), flag)),
+                    10 => healed(tx.heal_origins(
+                        &effective,
+                        &model,
+                        admitted,
+                        at,
+                        scope.as_ref(),
+                        flag,
+                    )),
                     11 => {
                         let effective = tx.fence_rechecks()?;
                         healed(tx.heal_report_probe(
@@ -2145,8 +2372,14 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                     12 => {
                         let admission = admission_row(&provider, &credential, &model, admitted);
                         healed(
-                            tx.heal_admission_success(&admission, size, Some(other.as_str()), scope.as_ref(), at)
-                                .map(drop),
+                            tx.heal_admission_success(
+                                &admission,
+                                size,
+                                Some(other.as_str()),
+                                scope.as_ref(),
+                                at,
+                            )
+                            .map(drop),
                         )
                     }
                     13 => healed(tx.fail_authorized_probe(&owner, at, flag)),
@@ -2179,7 +2412,10 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
             Ok((sql, decide(tx)?))
         })
         .unwrap();
-    let name = DECISIONS.get(which).copied().unwrap_or("decide: classify credential");
+    let name = DECISIONS
+        .get(which)
+        .copied()
+        .unwrap_or("decide: classify credential");
     DECIDED.with(|decided| {
         decided
             .borrow_mut()
@@ -2410,21 +2646,24 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
     let decided = DECIDED.with(|decided| decided.take());
     // Every decision answered both ways, except a transfer, which has no
     // answer of its own.
-    for name in operations
-        .keys()
-        .filter(|name| {
-            (name.starts_with("decide: ") || name.starts_with("heal: "))
-                && **name != "decide: transfer authorization"
-        })
-    {
+    for name in operations.keys().filter(|name| {
+        (name.starts_with("decide: ") || name.starts_with("heal: "))
+            && **name != "decide: transfer authorization"
+    }) {
         for answer in [true, false] {
             assert!(
-                decided.iter().any(|(decision, yes, _)| decision == name && *yes == answer),
+                decided
+                    .iter()
+                    .any(|(decision, yes, _)| decision == name && *yes == answer),
                 "{name} answered {answer} at least once: {decided:?}"
             );
         }
     }
-    assert_eq!(operations.len(), 31 + 16, "every operation ran: {operations:?}");
+    assert_eq!(
+        operations.len(),
+        31 + 16,
+        "every operation ran: {operations:?}"
+    );
     let Reached {
         credential_quota_from_hold,
         route_hidden_by_provider,
@@ -2450,7 +2689,10 @@ fn generated_block_writes_keep_memory_equal_to_a_fresh_load() {
         classified_credential,
         "a classified credential clock matching its source"
     );
-    assert!(repeated_exclusion, "a credential excluded by two admissions");
+    assert!(
+        repeated_exclusion,
+        "a credential excluded by two admissions"
+    );
     assert!(
         credential_quota_from_hold,
         "a credential classified by an active hold"
@@ -2552,7 +2794,9 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                     "claim clocks"
                 }
                 4 => {
-                    rig.sql(format!("DELETE FROM model_route_state WHERE route_key='{route}';"));
+                    rig.sql(format!(
+                        "DELETE FROM model_route_state WHERE route_key='{route}';"
+                    ));
                     "delete a route row"
                 }
                 5 => {
@@ -2577,7 +2821,10 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
             *operations.entry(operation).or_default() += 1;
             let context = format!("seed={seed} step={index} op={operation}");
             rig.check(&[now - 3_600_000, now, now + 3_600_000], &context);
-            let snapshot = rig.published().route_state_snapshot(now as f64, now).unwrap();
+            let snapshot = rig
+                .published()
+                .route_state_snapshot(now as f64, now)
+                .unwrap();
             billing_capacity |= snapshot
                 .by_capacity
                 .values()
@@ -2607,7 +2854,10 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
     }
     assert_eq!(operations.len(), 7, "every operation ran: {operations:?}");
     assert!(shared_capacity, "variants sharing one capacity");
-    assert!(clock_scheduled, "a route deadline a claimed clock rescheduled");
+    assert!(
+        clock_scheduled,
+        "a route deadline a claimed clock rescheduled"
+    );
     assert!(billing_capacity, "a capacity walled by billing");
     assert!(quarantined, "a quarantined route or provider row");
     let cooled = COOLED.with(|seen| seen.borrow().clone());
@@ -2637,7 +2887,11 @@ fn seed_live_sized(rig: &Rig, scale: usize, eligibility: usize) {
         } else {
             format!("fence-{i}")
         };
-        let cleared = if i % 3 == 0 { "NULL".to_owned() } else { NOW.to_string() };
+        let cleared = if i % 3 == 0 {
+            "NULL".to_owned()
+        } else {
+            NOW.to_string()
+        };
         sql += &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('{id}','p{}','a{i}','{{}}','{{\"reset\":{{\"at_ms\":{}}}}}','broca_account_limit',{},'x',{},NULL,'[]',{cleared});\n", i % 8, NOW + 3_600_000, NOW - i as i64, NOW - i as i64);
     }
     for i in 0..n(4) {
@@ -2653,11 +2907,19 @@ fn seed_live_sized(rig: &Rig, scale: usize, eligibility: usize) {
         sql += &format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_unscoped,last_error,last_error_at,updated_at) VALUES ('p{i}',{},{NOW},1,'provider capacity',{NOW},{NOW});\n", NOW + 600_000);
     }
     for i in 0..n(850) {
-        let wall = if i % 50 == 0 { (NOW + 600_000).to_string() } else { "NULL".into() };
+        let wall = if i % 50 == 0 {
+            (NOW + 600_000).to_string()
+        } else {
+            "NULL".into()
+        };
         sql += &format!("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,wall_unscoped,last_error_at,updated_at) VALUES ('p{}/m{i}','p{}/m{i}','p{}','m{i}',{wall},{NOW},1,{NOW},{NOW});\n", i % 8, i % 8, i % 8);
     }
     for i in 0..n(2) {
-        sql += &format!("INSERT INTO account_transient_backoff VALUES ('p{}','a{i}',{},{NOW},'k{i}','[]');\n", i % 8, NOW + 600_000);
+        sql += &format!(
+            "INSERT INTO account_transient_backoff VALUES ('p{}','a{i}',{},{NOW},'k{i}','[]');\n",
+            i % 8,
+            NOW + 600_000
+        );
     }
     for i in 0..eligibility {
         sql += &format!("INSERT INTO account_eligibility VALUES ('p{}','c{}','m{i}','l0','model_unsupported',{NOW});\n", i % 8, i % 40);
@@ -2775,7 +3037,10 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     rig.store
         .upsert_fact(&fact("p0", "m0"), FactSource::Seed)
         .unwrap();
-    step("upsert_fact (catalogue trigger creates the route row)", &rig);
+    step(
+        "upsert_fact (catalogue trigger creates the route row)",
+        &rig,
+    );
     rig.store
         .apply_fusiform_catalog(
             &[crate::FusiformFactUpdate {
@@ -2867,7 +3132,10 @@ fn every_production_block_writer_writes_inside_an_account_command() {
             )
             .unwrap();
     }
-    step("set_decision_outcome (terminal failures start a backoff)", &rig);
+    step(
+        "set_decision_outcome (terminal failures start a backoff)",
+        &rig,
+    );
     rig.store.clear_failure_backoff(route).unwrap();
     step("clear_failure_backoff", &rig);
     rig.store.clear_route_cooldowns(route).unwrap();
@@ -2910,10 +3178,24 @@ fn every_production_block_writer_writes_inside_an_account_command() {
         PoolKey::new("k1", None, "active"),
     ];
     rig.store
-        .pool_wall("p1", "k0", crate::PoolWallKind::RateLimited, now + 60_000, "429", now)
+        .pool_wall(
+            "p1",
+            "k0",
+            crate::PoolWallKind::RateLimited,
+            now + 60_000,
+            "429",
+            now,
+        )
         .unwrap();
     rig.store
-        .pool_wall("p1", "k0", crate::PoolWallKind::Billing, now + 60_000, "402", now)
+        .pool_wall(
+            "p1",
+            "k0",
+            crate::PoolWallKind::Billing,
+            now + 60_000,
+            "402",
+            now,
+        )
         .unwrap();
     step("pool_wall", &rig);
     let lease = match rig
@@ -2950,7 +3232,10 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     // The catalogue no longer lists it (setup: model_facts is no block table).
     rig.sql("UPDATE model_facts SET fusiform_present=0 WHERE route_key='p1/m9';".into());
     assert!(
-        !rig.store.prune_unserved_unpicked_facts().unwrap().is_empty(),
+        !rig.store
+            .prune_unserved_unpicked_facts()
+            .unwrap()
+            .is_empty(),
         "the unserved seed route is pruned"
     );
     step("prune_unserved_unpicked_facts", &rig);
@@ -2977,7 +3262,10 @@ fn every_production_block_writer_writes_inside_an_account_command() {
         .iter()
         .filter(|(name, rows)| *rows == 0 && !may_be_silent.contains(name))
         .collect();
-    assert!(silent.is_empty(), "steps that changed no block row: {silent:?}");
+    assert!(
+        silent.is_empty(),
+        "steps that changed no block row: {silent:?}"
+    );
 }
 
 /// One `sync` decision taken on a stale state. `before` runs on two stores;
@@ -2996,7 +3284,9 @@ fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
     let loads = state.decide_next_on(stale);
     state
         .store
-        .account_command(AccountCommandKind::Maintenance, |tx| tx.sync_fence_rechecks())
+        .account_command(AccountCommandKind::Maintenance, |tx| {
+            tx.sync_fence_rechecks()
+        })
         .unwrap();
     assert_eq!(
         state.loads_since(loads),
@@ -3013,22 +3303,41 @@ fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
             .unwrap()
             .unwrap()
             .into_iter()
-            .filter(|row| row.starts_with("fence_recheck ") || row.starts_with("provider_cooldown_state "))
+            .filter(|row| {
+                row.starts_with("fence_recheck ") || row.starts_with("provider_cooldown_state ")
+            })
             .collect();
         rows.extend(
             rig.store
                 .with_reader_for_test(|conn| {
-                    conn.prepare("SELECT kind,origin_key,evidence FROM fence_retired_origin ORDER BY rowid")?
-                        .query_map([], |r| Ok(format!("retired {:?}", (r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))))?
-                        .collect::<rusqlite::Result<Vec<_>>>()
+                    conn.prepare(
+                        "SELECT kind,origin_key,evidence FROM fence_retired_origin ORDER BY rowid",
+                    )?
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "retired {:?}",
+                            (
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, String>(2)?
+                            )
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
                 })
                 .unwrap(),
         );
         rows
     };
     let (from_state, from_sql) = (rows(&state), rows(&oracle));
-    let only_state: Vec<_> = from_state.iter().filter(|row| !from_sql.contains(row)).collect();
-    let only_sql: Vec<_> = from_sql.iter().filter(|row| !from_state.contains(row)).collect();
+    let only_state: Vec<_> = from_state
+        .iter()
+        .filter(|row| !from_sql.contains(row))
+        .collect();
+    let only_sql: Vec<_> = from_sql
+        .iter()
+        .filter(|row| !from_state.contains(row))
+        .collect();
     assert_eq!(
         from_state, from_sql,
         "{name}: the rows a SQL sync leaves; only after the state's sync: {only_state:#?}; only after SQL's: {only_sql:#?}"
@@ -3095,7 +3404,8 @@ fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
     // agreeing: retirement's clock check (SQL holds a clock the state does
     // not), the install's insert-changed-nothing check, the renewal's
     // evidence and next_recheck_at guards, and the drop's evidence guard.
-    let register = |rig: &Rig| rig.run(|conn| fence_rechecks::register(conn, "provider", r#"["p0"]"#));
+    let register =
+        |rig: &Rig| rig.run(|conn| fence_rechecks::register(conn, "provider", r#"["p0"]"#));
     stale_sync_case(
         "stale-sync-retire-clock-only",
         |rig| provider_wall(rig, wall - 3_600_000, wall - 7_200_000, capacity),
@@ -3113,7 +3423,9 @@ fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
             sync(rig);
             provider_wall(rig, wall + 7_200_000, wall + 1, capacity);
         },
-        |rig| rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider';".into()),
+        |rig| {
+            rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider';".into())
+        },
     );
     stale_sync_case(
         "stale-sync-renew-schedule",
@@ -3122,7 +3434,12 @@ fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
             sync(rig);
             provider_wall(rig, wall + 7_200_000, wall + 1, capacity);
         },
-        |rig| rig.sql("UPDATE fence_recheck SET next_recheck_at=next_recheck_at-1 WHERE kind='provider';".into()),
+        |rig| {
+            rig.sql(
+                "UPDATE fence_recheck SET next_recheck_at=next_recheck_at-1 WHERE kind='provider';"
+                    .into(),
+            )
+        },
     );
     stale_sync_case(
         "stale-sync-drop-evidence",
@@ -3131,7 +3448,9 @@ fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
             sync(rig);
             rig.sql("DELETE FROM provider_cooldown_state;".into());
         },
-        |rig| rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider';".into()),
+        |rig| {
+            rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider';".into())
+        },
     );
     stale_sync_case(
         "stale-sync-quarantine",
@@ -3182,57 +3501,67 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
             // origin, and an origin a clock holds is never archived, so the
             // other steps leave new origins for the sync below to archive.
             if index % 2 == 0 {
-            let (sql, memory, counts) = rig
-                .store
-                .account_command(AccountCommandKind::Maintenance, move |tx| {
-                    let origins: Vec<(String, String, bool, bool)> = tx
-                        .working_blocks()?
-                        .map(|state| {
-                            state
-                                .view_origins_in_scan_order()
-                                .into_iter()
-                                .map(|origin| {
-                                    let renew = state
-                                        .clock(&origin.kind, &origin.origin_key)
-                                        .is_some_and(|(clock, _)| clock.evidence != origin.evidence);
-                                    let lapsed = origin.deadline.is_some_and(|deadline| deadline <= now as f64);
-                                    (origin.kind, origin.origin_key, renew, lapsed)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<(Vec<String>, (usize, usize, usize))> {
-                        let mut rows = Vec::new();
-                        let mut counts = (0, 0, 0);
-                        let mut last = block_rows(tx.conn)?;
-                        for (kind, key, renew, lapsed) in &origins {
-                            fence_rechecks::register_on(tx, kind, key).map_err(err)?;
-                            let after = block_rows(tx.conn)?;
-                            if after != last {
-                                counts.0 += 1;
-                                counts.1 += usize::from(*renew);
-                                counts.2 += usize::from(*lapsed);
-                            }
-                            rows.extend(after.iter().cloned());
-                            last = after;
-                        }
-                        rows.extend(archive(tx.conn)?);
-                        Ok((rows, counts))
-                    };
-                    tx.conn.execute_batch("SAVEPOINT oracle").map_err(err)?;
-                    let sql = run(&crate::AccountTx::sql(tx.conn))?.0;
-                    tx.conn
-                        .execute_batch("ROLLBACK TO oracle; RELEASE oracle")
-                        .map_err(err)?;
-                    let (memory, counts) = run(tx)?;
-                    Ok((sql, memory, counts))
-                })
-                .unwrap();
-            assert_eq!(memory, sql, "seed={seed} step={index} op={operation}: register alone");
-            installs += counts.0;
-            renewals += counts.1;
-            expired += counts.2;
-            rig.check(&[now], &format!("seed={seed} step={index} after register"));
+                let (sql, memory, counts) = rig
+                    .store
+                    .account_command(AccountCommandKind::Maintenance, move |tx| {
+                        let origins: Vec<(String, String, bool, bool)> = tx
+                            .working_blocks()?
+                            .map(|state| {
+                                state
+                                    .view_origins_in_scan_order()
+                                    .into_iter()
+                                    .map(|origin| {
+                                        let renew = state
+                                            .clock(&origin.kind, &origin.origin_key)
+                                            .is_some_and(|(clock, _)| {
+                                                clock.evidence != origin.evidence
+                                            });
+                                        let lapsed = origin
+                                            .deadline
+                                            .is_some_and(|deadline| deadline <= now as f64);
+                                        (origin.kind, origin.origin_key, renew, lapsed)
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<(
+                                Vec<String>,
+                                (usize, usize, usize),
+                            )> {
+                                let mut rows = Vec::new();
+                                let mut counts = (0, 0, 0);
+                                let mut last = block_rows(tx.conn)?;
+                                for (kind, key, renew, lapsed) in &origins {
+                                    fence_rechecks::register_on(tx, kind, key).map_err(err)?;
+                                    let after = block_rows(tx.conn)?;
+                                    if after != last {
+                                        counts.0 += 1;
+                                        counts.1 += usize::from(*renew);
+                                        counts.2 += usize::from(*lapsed);
+                                    }
+                                    rows.extend(after.iter().cloned());
+                                    last = after;
+                                }
+                                rows.extend(archive(tx.conn)?);
+                                Ok((rows, counts))
+                            };
+                        tx.conn.execute_batch("SAVEPOINT oracle").map_err(err)?;
+                        let sql = run(&crate::AccountTx::sql(tx.conn))?.0;
+                        tx.conn
+                            .execute_batch("ROLLBACK TO oracle; RELEASE oracle")
+                            .map_err(err)?;
+                        let (memory, counts) = run(tx)?;
+                        Ok((sql, memory, counts))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    memory, sql,
+                    "seed={seed} step={index} op={operation}: register alone"
+                );
+                installs += counts.0;
+                renewals += counts.1;
+                expired += counts.2;
+                rig.check(&[now], &format!("seed={seed} step={index} after register"));
             }
             // At, an hour after or two hours after the generated evidence:
             // late enough that expired origins are archived.
@@ -3272,7 +3601,11 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
             compared += origins;
             archived = rig
                 .store
-                .with_reader_for_test(|conn| conn.query_row("SELECT count(*) FROM fence_retired_origin", [], |r| r.get::<_, usize>(0)))
+                .with_reader_for_test(|conn| {
+                    conn.query_row("SELECT count(*) FROM fence_retired_origin", [], |r| {
+                        r.get::<_, usize>(0)
+                    })
+                })
                 .unwrap()
                 .max(archived);
             rig.check(&[now], &format!("seed={seed} step={index} after sync"));
@@ -3310,10 +3643,20 @@ fn a_lease_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
             .unwrap()
     };
     let first = acquire("s0");
-    assert!(matches!(first, crate::PoolAcquireOutcome::Leased(_)), "{first:?}");
+    assert!(
+        matches!(first, crate::PoolAcquireOutcome::Leased(_)),
+        "{first:?}"
+    );
     let before_the_wall = rig.published();
     rig.store
-        .pool_wall("p1", "k0", crate::PoolWallKind::Billing, NOW + 600_000, "402", NOW)
+        .pool_wall(
+            "p1",
+            "k0",
+            crate::PoolWallKind::Billing,
+            NOW + 600_000,
+            "402",
+            NOW,
+        )
         .unwrap();
     let loads = rig.decide_next_on(before_the_wall);
     let second = acquire("s1");
@@ -3338,9 +3681,18 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
     type Step = fn(&Rig);
     type Act = fn(&Rig) -> String;
     fn keys() -> Vec<PoolKey> {
-        vec![PoolKey::new("k0", None, "active"), PoolKey::new("k1", None, "active")]
+        vec![
+            PoolKey::new("k0", None, "active"),
+            PoolKey::new("k1", None, "active"),
+        ]
     }
-    fn acquire(rig: &Rig, session: &str, providers: &[&str], model: &str, keys: &[PoolKey]) -> String {
+    fn acquire(
+        rig: &Rig,
+        session: &str,
+        providers: &[&str],
+        model: &str,
+        keys: &[PoolKey],
+    ) -> String {
         let outcome = rig
             .store
             .pool_acquire_for_route(
@@ -3384,7 +3736,14 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
     fn wall_both_keys(rig: &Rig) {
         for key in ["k0", "k1"] {
             rig.store
-                .pool_wall("p1", key, crate::PoolWallKind::Billing, NOW + 600_000, "402", NOW - 1_000)
+                .pool_wall(
+                    "p1",
+                    key,
+                    crate::PoolWallKind::Billing,
+                    NOW + 600_000,
+                    "402",
+                    NOW - 1_000,
+                )
                 .unwrap();
         }
     }
@@ -3402,24 +3761,48 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
         (
             "a source wall in SQL that needs a clock the state never installed",
             |_| {},
-            |rig| rig.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1',{},{},'provider capacity',{2},{2});", NOW + 3_600_000, NOW - 1_000, NOW - 1_000)),
+            |rig| {
+                rig.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1',{},{},'provider capacity',{2},{2});", NOW + 3_600_000, NOW - 1_000, NOW - 1_000))
+            },
             |rig| acquire(rig, "s1", &["p1"], "m", &keys()),
             "exhausted",
         ),
         (
             "only a key's last use",
             |rig| {
-                acquire(rig, "s0", &["p1"], "", &[PoolKey::new("k0", None, "active")]);
-                acquire(rig, "s2", &["p1"], "", &[PoolKey::new("k1", None, "active")]);
+                acquire(
+                    rig,
+                    "s0",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k0", None, "active")],
+                );
+                acquire(
+                    rig,
+                    "s2",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k1", None, "active")],
+                );
             },
-            |rig| rig.sql(format!("UPDATE pool_key_state SET last_used_at={} WHERE credential_id='k1';", NOW + 1)),
+            |rig| {
+                rig.sql(format!(
+                    "UPDATE pool_key_state SET last_used_at={} WHERE credential_id='k1';",
+                    NOW + 1
+                ))
+            },
             |rig| acquire(rig, "s1", &["p1"], "", &keys()),
             "leased k0 reused=false",
         ),
         (
             "only a clock: SQL already made the walled keys' probe due",
             wall_both_keys,
-            |rig| rig.sql(format!("UPDATE fence_recheck SET next_recheck_at={} WHERE provider='p1';", NOW - 1)),
+            |rig| {
+                rig.sql(format!(
+                    "UPDATE fence_recheck SET next_recheck_at={} WHERE provider='p1';",
+                    NOW - 1
+                ))
+            },
             |rig| acquire(rig, "s1", &["p1"], "", &keys()),
             "leased k0 reused=false",
         ),
@@ -3433,20 +3816,53 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
         (
             "the reuse of a live lease on a key SQL has since walled",
             |rig| {
-                acquire(rig, "s0", &["p1"], "", &[PoolKey::new("k0", None, "active")]);
+                acquire(
+                    rig,
+                    "s0",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k0", None, "active")],
+                );
             },
             wall_both_keys,
-            |rig| acquire(rig, "s0", &["p1"], "", &[PoolKey::new("k0", None, "active")]),
+            |rig| {
+                acquire(
+                    rig,
+                    "s0",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k0", None, "active")],
+                )
+            },
             "exhausted",
         ),
         (
             "a release of a live lease whose key SQL has since unwalled",
             |rig| {
-                acquire(rig, "s0", &["p1"], "", &[PoolKey::new("k0", None, "active")]);
+                acquire(
+                    rig,
+                    "s0",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k0", None, "active")],
+                );
                 wall_both_keys(rig);
             },
-            |rig| rig.sql("UPDATE pool_key_state SET walled_until=NULL; DELETE FROM fence_recheck;".into()),
-            |rig| acquire(rig, "s0", &["p1"], "", &[PoolKey::new("k0", None, "active")]),
+            |rig| {
+                rig.sql(
+                    "UPDATE pool_key_state SET walled_until=NULL; DELETE FROM fence_recheck;"
+                        .into(),
+                )
+            },
+            |rig| {
+                acquire(
+                    rig,
+                    "s0",
+                    &["p1"],
+                    "",
+                    &[PoolKey::new("k0", None, "active")],
+                )
+            },
             "leased k0 reused=true",
         ),
         (
@@ -3466,7 +3882,9 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
         (
             "a refusal to rehydrate on a clock SQL has since cleared",
             |rig| provider_wall(rig, "p1"),
-            |rig| rig.sql("DELETE FROM provider_cooldown_state; DELETE FROM model_route_state; DELETE FROM fence_recheck;".into()),
+            |rig| {
+                rig.sql("DELETE FROM provider_cooldown_state; DELETE FROM model_route_state; DELETE FROM fence_recheck;".into())
+            },
             |rig| {
                 format!(
                     "{:?}",
@@ -3481,25 +3899,90 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
     // One more case per table the pool check compares, each a row of the
     // provider SQL holds and the stale state lacks; the answer is the twin's.
     fn drift_row(rig: &Rig, sql: &str) {
-        rig.sql(sql.replace("{NOW}", &NOW.to_string()).replace("{LATER}", &(NOW + 600_000).to_string()).replace("{BEFORE}", &(NOW - 1_000).to_string()));
+        rig.sql(
+            sql.replace("{NOW}", &NOW.to_string())
+                .replace("{LATER}", &(NOW + 600_000).to_string())
+                .replace("{BEFORE}", &(NOW - 1_000).to_string()),
+        );
     }
     let any = |rig: &Rig| acquire(rig, "s1", &["p1"], "m", &keys());
     let table_cases: Vec<(&str, Step, Step)> = vec![
-        ("account_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{}','{\"reset\":{\"at_ms\":{LATER}}}','broca_account_limit',{BEFORE},'x',{BEFORE},NULL,'[]',NULL);")),
-        ("credential_entitlement_fences", |_| {}, |rig| drift_row(rig, "INSERT INTO credential_entitlement_fences VALUES ('p1','k0','billing_exhausted','l0',{BEFORE});")),
-        ("account_route_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_route_fence(provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'quota');")),
-        ("account_non_quota_route_fence", |_| {}, |rig| drift_row(rig, "INSERT INTO account_non_quota_route_fence VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'transient');")),
-        ("model_route_state", |_| {}, |rig| drift_row(rig, "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1/m','p1/m','p1','m',{LATER},{BEFORE},'route capacity',{BEFORE},{BEFORE});")),
-        ("account_size_refusal", |_| {}, |rig| drift_row(rig, "INSERT INTO account_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")),
-        ("account_non_quota_size_refusal", |_| {}, |rig| drift_row(rig, "INSERT INTO account_non_quota_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")),
-        ("account_transient_backoff", |_| {}, |rig| drift_row(rig, "INSERT INTO account_transient_backoff VALUES ('p1','a0',{LATER},{BEFORE},'k','[]');")),
-        ("fence_success_pool",
-            |rig| drift_row(rig, &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{{}}','{{\"reset\":{{\"at_ms\":{{LATER}}}}}}','broca_account_limit',{{BEFORE}},'x',{{BEFORE}},'{}','[{},{}]',NULL);", pool_key(1), pool_key(1), pool_key(2))),
-            |rig| drift_row(rig, &format!("INSERT INTO fence_success_pool VALUES ('drift-fence','{}',{{BEFORE}},{{NOW}});", pool_key(2)))),
+        (
+            "account_fence",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{}','{\"reset\":{\"at_ms\":{LATER}}}','broca_account_limit',{BEFORE},'x',{BEFORE},NULL,'[]',NULL);")
+            },
+        ),
+        (
+            "credential_entitlement_fences",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO credential_entitlement_fences VALUES ('p1','k0','billing_exhausted','l0',{BEFORE});")
+            },
+        ),
+        (
+            "account_route_fence",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO account_route_fence(provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'quota');")
+            },
+        ),
+        (
+            "account_non_quota_route_fence",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO account_non_quota_route_fence VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'transient');")
+            },
+        ),
+        (
+            "model_route_state",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1/m','p1/m','p1','m',{LATER},{BEFORE},'route capacity',{BEFORE},{BEFORE});")
+            },
+        ),
+        (
+            "account_size_refusal",
+            |_| {},
+            |rig| {
+                drift_row(
+                    rig,
+                    "INSERT INTO account_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});",
+                )
+            },
+        ),
+        (
+            "account_non_quota_size_refusal",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO account_non_quota_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")
+            },
+        ),
+        (
+            "account_transient_backoff",
+            |_| {},
+            |rig| {
+                drift_row(rig, "INSERT INTO account_transient_backoff VALUES ('p1','a0',{LATER},{BEFORE},'k','[]');")
+            },
+        ),
+        (
+            "fence_success_pool",
+            |rig| {
+                drift_row(rig, &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{{}}','{{\"reset\":{{\"at_ms\":{{LATER}}}}}}','broca_account_limit',{{BEFORE}},'x',{{BEFORE}},'{}','[{},{}]',NULL);", pool_key(1), pool_key(1), pool_key(2)))
+            },
+            |rig| {
+                drift_row(rig, &format!("INSERT INTO fence_success_pool VALUES ('drift-fence','{}',{{BEFORE}},{{NOW}});", pool_key(2)))
+            },
+        ),
     ];
     let cases: Vec<(&str, Step, Step, Act, &str)> = cases
         .into_iter()
-        .chain(table_cases.into_iter().map(|(name, setup, drift)| (name, setup, drift, any as Act, "")))
+        .chain(
+            table_cases
+                .into_iter()
+                .map(|(name, setup, drift)| (name, setup, drift, any as Act, "")),
+        )
         .collect();
     let _ = any;
     for (name, setup, drift, act, expected) in cases {
@@ -3517,7 +4000,11 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
         drift(&rig);
         let loads = rig.decide_next_on(stale);
         let answer = act(&rig);
-        assert_eq!(rig.loads_since(loads), 2, "{name}: the stale decision is caught");
+        assert_eq!(
+            rig.loads_since(loads),
+            2,
+            "{name}: the stale decision is caught"
+        );
         assert_eq!(answer, fresh, "{name}: answered as a fresh load does");
         rig.check(&[NOW], name);
     }
@@ -3531,25 +4018,56 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
 #[test]
 fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_store() {
     let changes: [(&str, String); 3] = [
-        ("a key's wall", format!("UPDATE pool_key_state SET walled_until={} WHERE credential_id='k0';", NOW + 900_000)),
-        ("a key's last use", format!("UPDATE pool_key_state SET last_used_at={} WHERE credential_id='k0';", NOW + 5)),
-        ("a clock's evidence", "UPDATE fence_recheck SET evidence=evidence||' ' WHERE provider='p1';".into()),
+        (
+            "a key's wall",
+            format!(
+                "UPDATE pool_key_state SET walled_until={} WHERE credential_id='k0';",
+                NOW + 900_000
+            ),
+        ),
+        (
+            "a key's last use",
+            format!(
+                "UPDATE pool_key_state SET last_used_at={} WHERE credential_id='k0';",
+                NOW + 5
+            ),
+        ),
+        (
+            "a clock's evidence",
+            "UPDATE fence_recheck SET evidence=evidence||' ' WHERE provider='p1';".into(),
+        ),
     ];
     for (name, change) in changes {
         let missed = rig("block-state-missed-in-place");
         let other = rig("block-state-other-store");
         for rig in [&missed, &other] {
             rig.store
-                .pool_wall("p1", "k0", crate::PoolWallKind::Billing, NOW + 600_000, "402", NOW - 1_000)
+                .pool_wall(
+                    "p1",
+                    "k0",
+                    crate::PoolWallKind::Billing,
+                    NOW + 600_000,
+                    "402",
+                    NOW - 1_000,
+                )
                 .unwrap();
             rig.store
-                .account_command(AccountCommandKind::Maintenance, |tx| tx.sync_fence_rechecks())
+                .account_command(AccountCommandKind::Maintenance, |tx| {
+                    tx.sync_fence_rechecks()
+                })
                 .unwrap();
         }
         UNSEEN.with(|unseen| unseen.set(true));
-        missed.store.bypass_account_writer_for_test(&change).unwrap();
+        missed
+            .store
+            .bypass_account_writer_for_test(&change)
+            .unwrap();
         UNSEEN.with(|unseen| unseen.set(false));
-        assert_ne!(missed.published(), missed.fresh(), "{name}: the state misses the change");
+        assert_ne!(
+            missed.published(),
+            missed.fresh(),
+            "{name}: the state misses the change"
+        );
         let tick = |rig: &Rig| {
             rig.store
                 .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW))
@@ -3562,7 +4080,11 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
             tick(&missed);
             tick(&other);
         }
-        assert_eq!(block_reconcile_reloads() - reloads, 1, "{name}: found within six of its ticks");
+        assert_eq!(
+            block_reconcile_reloads() - reloads,
+            1,
+            "{name}: found within six of its ticks"
+        );
         missed.check(&[NOW], name);
         other.check(&[NOW], name);
     }
@@ -3575,30 +4097,38 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
 #[test]
 fn every_exempt_read_is_keyed() {
     let rig = rig("block-state-exempt-reads-keyed");
-    let scans = rig.store.with_reader_for_test(|conn| {
-        let mut scans = Vec::new();
-        for sql in reviewed_exempt_reads() {
-            let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
-            let unbound = vec![rusqlite::types::Value::Null; plan.parameter_count()];
-            let details: Vec<String> = plan
-                .query_map(rusqlite::params_from_iter(unbound), |r| r.get::<_, String>(3))?
-                .collect::<rusqlite::Result<_>>()?;
-            let scanned: Vec<&String> = details
-                .iter()
-                .filter(|detail| {
-                    detail.starts_with("SCAN ")
-                        && !detail.starts_with("SCAN json_each")
-                        && !detail.starts_with("SCAN CONSTANT ROW")
-                })
-                .collect();
-            if !scanned.is_empty() {
-                scans.push(format!("{sql}\n  plan: {details:?}"));
+    let scans = rig
+        .store
+        .with_reader_for_test(|conn| {
+            let mut scans = Vec::new();
+            for sql in reviewed_exempt_reads() {
+                let mut plan = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let unbound = vec![rusqlite::types::Value::Null; plan.parameter_count()];
+                let details: Vec<String> = plan
+                    .query_map(rusqlite::params_from_iter(unbound), |r| {
+                        r.get::<_, String>(3)
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                let scanned: Vec<&String> = details
+                    .iter()
+                    .filter(|detail| {
+                        detail.starts_with("SCAN ")
+                            && !detail.starts_with("SCAN json_each")
+                            && !detail.starts_with("SCAN CONSTANT ROW")
+                    })
+                    .collect();
+                if !scanned.is_empty() {
+                    scans.push(format!("{sql}\n  plan: {details:?}"));
+                }
             }
-        }
-        Ok(scans)
-    })
-    .unwrap();
-    assert!(scans.is_empty(), "exempt reads that scan:\n{}", scans.join("\n"));
+            Ok(scans)
+        })
+        .unwrap();
+    assert!(
+        scans.is_empty(),
+        "exempt reads that scan:\n{}",
+        scans.join("\n")
+    );
     assert!(reviewed_exempt_reads().len() >= 30);
 }
 
@@ -3684,17 +4214,31 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
     use striatum_core::{DecisionInput, DecisionOutcomeUpdate, FailureBackoffConfig, RouteOutcome};
     let rig = rig("block-state-route-writer-reads");
     let normalize = |sql: &str| sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let reviewed: Vec<String> = reviewed_exempt_reads().iter().map(|sql| normalize(sql)).collect();
+    let reviewed: Vec<String> = reviewed_exempt_reads()
+        .iter()
+        .map(|sql| normalize(sql))
+        .collect();
     let trace = rig.store.trace_block_reads_for_test().unwrap();
     let mut seen_writers = Vec::new();
     let mut ran: std::collections::BTreeSet<String> = Default::default();
     // Each writer's marked reads, and the key each bound: the rows it read.
     let mut expect = |writer: &'static str, statements: usize, keys: &[&str]| {
         let seen = trace.take();
-        assert!(seen.reader.is_empty() && seen.writer.is_empty(), "{writer}: {seen:#?}");
-        assert_eq!(seen.route_writes.len(), statements, "{writer}: {:#?}", seen.route_writes);
+        assert!(
+            seen.reader.is_empty() && seen.writer.is_empty(),
+            "{writer}: {seen:#?}"
+        );
+        assert_eq!(
+            seen.route_writes.len(),
+            statements,
+            "{writer}: {:#?}",
+            seen.route_writes
+        );
         for sql in &seen.route_writes {
-            assert!(reviewed.contains(&normalize(sql)), "{writer}: unreviewed {sql}");
+            assert!(
+                reviewed.contains(&normalize(sql)),
+                "{writer}: unreviewed {sql}"
+            );
             ran.insert(normalize(sql));
         }
         for row in &seen.route_write_rows {
@@ -3770,7 +4314,10 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
         .map(|sql| normalize(sql))
         .collect();
     assert_eq!(
-        reviewed_exempt_reads().iter().filter(|sql| sql.contains(crate::ROUTE_WRITE_READ)).count(),
+        reviewed_exempt_reads()
+            .iter()
+            .filter(|sql| sql.contains(crate::ROUTE_WRITE_READ))
+            .count(),
         8
     );
     assert_eq!(ran, marked);
@@ -3824,14 +4371,28 @@ fn a_heal_that_finds_no_test_on_a_stale_state_runs_again_and_heals() {
                 "authorized probe" => tx.heal_authorized_probe("decision", "p0", "m0", NOW + 10),
                 _ => {
                     let origins = tx.fence_rechecks()?;
-                    tx.heal_report_probe("decision", None, false, "m0", NOW + 5, &origins, None, NOW + 10)
+                    tx.heal_report_probe(
+                        "decision",
+                        None,
+                        false,
+                        "m0",
+                        NOW + 5,
+                        &origins,
+                        None,
+                        NOW + 10,
+                    )
                 }
             })
             .unwrap();
-        assert_eq!(rig.loads_since(loads), 2, "{path}: the stale run, then a fresh one");
+        assert_eq!(
+            rig.loads_since(loads),
+            2,
+            "{path}: the stale run, then a fresh one"
+        );
         let left = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
         assert!(
-            left.iter().all(|clock| clock.credential_id.as_deref() != Some("c0")),
+            left.iter()
+                .all(|clock| clock.credential_id.as_deref() != Some("c0")),
             "{path}: the test request's success healed its block: {left:?}"
         );
         rig.check(&[NOW], path);
@@ -3934,7 +4495,10 @@ fn only_principal_rows_have_the_empty_provider() {
             let mut empty_sources = Vec::new();
             for (table, column) in PROVIDER_COLUMNS {
                 let count: i64 = conn.query_row(
-                    &format!("SELECT count(*) FROM {} WHERE {column}=''", BLOCK_TABLES[table]),
+                    &format!(
+                        "SELECT count(*) FROM {} WHERE {column}=''",
+                        BLOCK_TABLES[table]
+                    ),
                     [],
                     |r| r.get(0),
                 )?;
@@ -3943,7 +4507,11 @@ fn only_principal_rows_have_the_empty_provider() {
             Ok((view, empty_sources))
         })
         .unwrap();
-    assert_eq!(view, vec!["principal".to_owned()], "only the principal branch projects ''");
+    assert_eq!(
+        view,
+        vec!["principal".to_owned()],
+        "only the principal branch projects ''"
+    );
     for (table, count) in empty_sources {
         if table == BLOCK_TABLES[CLOCK_TABLE] {
             assert!(count > 0, "the principal clocks have the empty provider");
@@ -3963,15 +4531,25 @@ fn only_principal_rows_have_the_empty_provider() {
                 );
             }
         } else {
-            assert!(rows.is_empty(), "{} holds no empty-provider row", BLOCK_TABLES[table]);
+            assert!(
+                rows.is_empty(),
+                "{} holds no empty-provider row",
+                BLOCK_TABLES[table]
+            );
         }
     }
     let stale = rig.published();
     rig.sql("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='principal';".into());
     let loads = rig.decide_next_on(stale);
     rig.store
-        .account_command(AccountCommandKind::Maintenance, |tx| tx.check_decision_inputs(&[""]))
+        .account_command(AccountCommandKind::Maintenance, |tx| {
+            tx.check_decision_inputs(&[""])
+        })
         .unwrap();
-    assert_eq!(rig.loads_since(loads), 2, "a stale principal clock is caught");
+    assert_eq!(
+        rig.loads_since(loads),
+        2,
+        "a stale principal clock is caught"
+    );
     rig.check(&[NOW], "after the empty-provider check");
 }

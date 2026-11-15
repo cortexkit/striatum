@@ -1,6 +1,4 @@
-use std::{
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 use serde_json::json;

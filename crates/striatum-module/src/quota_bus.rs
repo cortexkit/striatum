@@ -151,17 +151,19 @@ async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
         async move {
             // NATS requires a Sync callback future; the SDK reconnect future is
             // only Send. A task handle preserves that bound without sharing it.
-            let reply = tokio::spawn(async move { route
-                .call(
-                    "ckbus.nonce_sign",
-                    json!({
-                        "credential_public": key, "nonce_b64": STANDARD.encode(nonce),
-                    }),
-                )
-                .await })
-                .await
-                .map_err(|_| async_nats::AuthError::new("ckbus signing task failed"))?
-                .map_err(async_nats::AuthError::new)?;
+            let reply = tokio::spawn(async move {
+                route
+                    .call(
+                        "ckbus.nonce_sign",
+                        json!({
+                            "credential_public": key, "nonce_b64": STANDARD.encode(nonce),
+                        }),
+                    )
+                    .await
+            })
+            .await
+            .map_err(|_| async_nats::AuthError::new("ckbus signing task failed"))?
+            .map_err(async_nats::AuthError::new)?;
             let signature = reply["signature_b64"]
                 .as_str()
                 .ok_or_else(|| async_nats::AuthError::new("ckbus signature absent"))?;

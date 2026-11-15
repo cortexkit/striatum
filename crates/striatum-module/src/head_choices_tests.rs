@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
-use striatum_core::{make_route_key, ModelPromptDefaults, RouteStateStore};
 use serde_json::{json, Value};
+use striatum_core::{make_route_key, ModelPromptDefaults, RouteStateStore};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{reserved, Harness, Route};
@@ -281,7 +281,10 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         .iter()
         .filter(|(_, row)| {
             let api = &row["wire.api"];
-            api.get("value").unwrap_or(api).as_str().is_some_and(|s| !s.trim().is_empty())
+            api.get("value")
+                .unwrap_or(api)
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
         })
         .map(|(key, _)| key.clone())
         .collect();
@@ -367,7 +370,8 @@ async fn decommissioned_models_are_absent_from_head_choices() {
             "openai/a-head":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
         }
     })).unwrap()).unwrap();
-    fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("openai")).unwrap();
+    fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("openai"))
+        .unwrap();
     assert!(!ids(&query(&harness, RUNNER).await).contains(&"openai/a-head".into()));
 }
 
@@ -518,14 +522,17 @@ async fn head_choices_hide_api_key_pool_aliases_on_every_runner() {
         },
         crate::now_ms(),
     );
-    credentials.runner_declarations.insert("broca".into(), super::runners::parse_declaration(
-        &json!({"runner":{"pairs":[
+    credentials.runner_declarations.insert(
+        "broca".into(),
+        super::runners::parse_declaration(&json!({"runner":{"pairs":[
             {"wire_api":WIRE,"auth_method":"oauth"},
             {"wire_api":WIRE,"auth_method":"apikey"},
             {"wire_api":"anthropic.messages","auth_method":"oauth"},
             {"wire_api":"anthropic.messages","auth_method":"apikey"}
-        ],"follows_account_choice":true}})
-    ).unwrap().unwrap());
+        ],"follows_account_choice":true}}))
+        .unwrap()
+        .unwrap(),
+    );
     harness.edit_config(|config| {
         config["runners"].as_array_mut().unwrap().push(json!({
             "module":"broca", "via_vault":true
@@ -535,8 +542,14 @@ async fn head_choices_hide_api_key_pool_aliases_on_every_runner() {
     harness.set_credentials(credentials.clone());
     let mut before = Vec::new();
     for runner in [
-        "broca", LEGACY, RUNNER, NO_TIERS, API_KEY_RUNNER,
-        "policy-runner", "pin-runner", "anthropic-wire-support",
+        "broca",
+        LEGACY,
+        RUNNER,
+        NO_TIERS,
+        API_KEY_RUNNER,
+        "policy-runner",
+        "pin-runner",
+        "anthropic-wire-support",
     ] {
         before.push((runner, query(&harness, runner).await));
     }
@@ -577,7 +590,9 @@ async fn head_choices_hide_api_key_pool_aliases_on_every_runner() {
     for (runner, expected) in before {
         let reply = query(&harness, runner).await;
         assert!(
-            ids(&reply).iter().all(|id| !id.starts_with("anthropic-platform/")),
+            ids(&reply)
+                .iter()
+                .all(|id| !id.starts_with("anthropic-platform/")),
             "{runner}: {reply}"
         );
         assert_eq!(reply, expected, "non-pool choices changed for {runner}");
@@ -1013,13 +1028,10 @@ async fn serving_bytes_match_tagged_vectors() {
     );
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
-        config["runners"]
-            .as_array_mut()
-            .unwrap()
-            .extend([
-                json!({"module":non_starting_runner,"via_vault":true}),
-                json!({"module":harness_runner,"via_vault":true}),
-            ]);
+        config["runners"].as_array_mut().unwrap().extend([
+            json!({"module":non_starting_runner,"via_vault":true}),
+            json!({"module":harness_runner,"via_vault":true}),
+        ]);
     });
     let route = harness.bind(reserved("occipital"), None).await;
     let live_harness = broca_live_catalog_fixture();
@@ -1037,7 +1049,11 @@ async fn serving_bytes_match_tagged_vectors() {
         ("unknown-runner.json", "missing", None),
         ("non-starting-runner.json", non_starting_runner, None),
         ("harness-narrowed.json", harness_runner, Some("claude-code")),
-        ("harness-runner-wide.json", harness_runner, Some("opencode2")),
+        (
+            "harness-runner-wide.json",
+            harness_runner,
+            Some("opencode2"),
+        ),
         ("harness-unavailable.json", harness_runner, Some("pi")),
         ("broca-live-catalog.json", "broca", None),
     ] {
@@ -1045,7 +1061,11 @@ async fn serving_bytes_match_tagged_vectors() {
         if let Some(selected_harness) = selected_harness {
             request["params"]["harness"] = json!(selected_harness);
         }
-        let selected_route = if runner == "broca" { &live_route } else { &route };
+        let selected_route = if runner == "broca" {
+            &live_route
+        } else {
+            &route
+        };
         let (ty, bytes) = selected_route
             .call_raw("route.head_choices", &request["params"])
             .await;
@@ -1073,7 +1093,10 @@ async fn serving_bytes_match_tagged_vectors() {
                 assert!(models.iter().any(|model| model["pin_only"] == true));
                 assert!(models.iter().any(|model| model["billing"] == "per_token"));
                 assert!(models.iter().any(|model| model["service_tiers"]
-                    .as_array().unwrap().iter().any(|tier| tier == "fast")));
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tier| tier == "fast")));
             }
             match selected_harness {
                 Some("claude-code") => {
@@ -1109,42 +1132,71 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
     use std::collections::BTreeSet;
     let harness = Harness::new("golden-login-funnel");
     for row in harness.store().get_facts().unwrap() {
-        harness.store().delete_fact(&make_route_key(&row.provider_id, &row.model_id, row.variant.as_deref())).unwrap();
+        harness
+            .store()
+            .delete_fact(&make_route_key(
+                &row.provider_id,
+                &row.model_id,
+                row.variant.as_deref(),
+            ))
+            .unwrap();
     }
-    let golden: Value = serde_json::from_slice(include_bytes!("../fixtures/served-payloads.json")).unwrap();
-    let mut catalog = json!({"catalog_version":1,"resolved_at_ms":123,"models":{},"login_methods":[]});
-    for name in ["catalog.get — upstream ChatGPT login allowlist",
+    let golden: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/served-payloads.json")).unwrap();
+    let mut catalog =
+        json!({"catalog_version":1,"resolved_at_ms":123,"models":{},"login_methods":[]});
+    for name in [
+        "catalog.get — upstream ChatGPT login allowlist",
         "catalog.get — upstream API-key-only login allowlist",
-        "catalog.get — upstream login availability not established"] {
+        "catalog.get — upstream login availability not established",
+    ] {
         let response = &golden[name]["response"];
-        catalog["models"].as_object_mut().unwrap().extend(response["models"].as_object().unwrap().clone());
+        catalog["models"]
+            .as_object_mut()
+            .unwrap()
+            .extend(response["models"].as_object().unwrap().clone());
         if let Some(rows) = response["login_methods"].as_array() {
-            catalog["login_methods"].as_array_mut().unwrap().extend(rows.clone());
+            catalog["login_methods"]
+                .as_array_mut()
+                .unwrap()
+                .extend(rows.clone());
         }
     }
     for key in ["anthropic/claude-control", "google/gemini-control"] {
         catalog["models"][key] = json!({"rate.input":{"state":"priced","currency":"USD","units":100,"exponent":0},
             "rate.output":{"state":"priced","currency":"USD","units":100,"exponent":0}});
     }
-    let muse: Value = serde_json::from_slice(include_bytes!("../fixtures/muse-curated.json")).unwrap();
+    let muse: Value =
+        serde_json::from_slice(include_bytes!("../fixtures/muse-curated.json")).unwrap();
     catalog["curated"] = muse["curated"].clone();
-    for model in ["muse-wonder-full-1.0", "muse-spark-1.3-contributor", "muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0"] {
+    for model in [
+        "muse-wonder-full-1.0",
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3",
+        "muse-wonder-1.0",
+        "muse-ember-1.0",
+    ] {
         catalog["models"][format!("meta/{model}")] = json!({
             "rate.input":{"state":"priced","currency":"USD","units":100,"exponent":0},
             "rate.output":{"state":"priced","currency":"USD","units":100,"exponent":0}});
     }
-    let facts: Vec<_> = catalog["models"].as_object_mut().unwrap().iter_mut().map(|(key, entry)| {
-        // The golden's rate-filtered reads omit existence and capabilities.
-        // Scores and capabilities here are fixture inputs, not model claims.
-        entry["existence"] = json!("present");
-        entry["capability.tool_call"] = json!(true);
-        entry["limit.context"] = json!(200000);
-        let (provider, model) = key.split_once('/').unwrap();
-        entry["model.lineage"] = json!(provider);
-        let mut row = fact(provider, model);
-        row.family = Some(provider.into());
-        row
-    }).collect();
+    let facts: Vec<_> = catalog["models"]
+        .as_object_mut()
+        .unwrap()
+        .iter_mut()
+        .map(|(key, entry)| {
+            // The golden's rate-filtered reads omit existence and capabilities.
+            // Scores and capabilities here are fixture inputs, not model claims.
+            entry["existence"] = json!("present");
+            entry["capability.tool_call"] = json!(true);
+            entry["limit.context"] = json!(200000);
+            let (provider, model) = key.split_once('/').unwrap();
+            entry["model.lineage"] = json!(provider);
+            let mut row = fact(provider, model);
+            row.family = Some(provider.into());
+            row
+        })
+        .collect();
     harness.install_facts(&facts);
     harness.edit_config(|config| {
         config["runners"] = json!([{"module":"broca","via_vault":true}]);
@@ -1154,60 +1206,135 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
     });
     let now = crate::now_ms();
     let mut credentials = BrocaCredentials::default();
-    credentials.apply_listing(&ScopedCredentialListing {
-        view:"golden-login-funnel".into(),
-        credentials:[("openai","chatgpt"),("anthropic","oauth"),("google","antigravity"),("meta","oauth")].into_iter().map(|(provider,method)| ListedCredential {
-            id:format!("{method}:{provider}"), account_id:Some(format!("account-{provider}")), state:"active".into(), categories:vec!["llm-provider".into()],
-            provider_ids:vec![provider.into()], serves:vec![provider.into()], credential_type:"oauth".into(),
-            auth_method:Some(method.into()), ..Default::default()
-        }).collect(), ..Default::default()
-    }, now);
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "golden-login-funnel".into(),
+            credentials: [
+                ("openai", "chatgpt"),
+                ("anthropic", "oauth"),
+                ("google", "antigravity"),
+                ("meta", "oauth"),
+            ]
+            .into_iter()
+            .map(|(provider, method)| ListedCredential {
+                id: format!("{method}:{provider}"),
+                account_id: Some(format!("account-{provider}")),
+                state: "active".into(),
+                categories: vec!["llm-provider".into()],
+                provider_ids: vec![provider.into()],
+                serves: vec![provider.into()],
+                credential_type: "oauth".into(),
+                auth_method: Some(method.into()),
+                ..Default::default()
+            })
+            .collect(),
+            ..Default::default()
+        },
+        now,
+    );
     let operator = harness.bind(json!({"kind":"direct"}), None).await;
     let owner = harness.bind(reserved("prefrontal-core"), None).await;
     let policy = catalog["login_methods"].clone();
     let mut measurements = Vec::new();
-    for (version, policies) in [(1,json!([])),(2,policy),(3,json!([]))] {
+    for (version, policies) in [(1, json!([])), (2, policy), (3, json!([]))] {
         catalog["catalog_version"] = json!(version);
         catalog["login_methods"] = policies;
-        let snapshot = fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap()).unwrap();
-        let (updates,cursor) = snapshot.parts();
-        harness.store().apply_fusiform_catalog(updates,cursor).unwrap();
+        let snapshot =
+            fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let (updates, cursor) = snapshot.parts();
+        harness
+            .store()
+            .apply_fusiform_catalog(updates, cursor)
+            .unwrap();
         let current = harness.store().get_facts().unwrap();
         credentials.catalog_snapshot = Some(Arc::new(snapshot));
-        credentials.publish_billing_catalog(fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&current)
-            .with_test_catalog(&serde_json::to_vec(&catalog).unwrap()));
+        credentials.publish_billing_catalog(
+            fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&current)
+                .with_test_catalog(&serde_json::to_vec(&catalog).unwrap()),
+        );
         credentials.refresh_serving_methods(&Default::default(), &current, now as i64, &[]);
         harness.set_credentials(credentials.clone());
-        let picker = ids(&query(&harness,"broca").await).into_iter().collect::<BTreeSet<_>>();
-        let (ty,dry) = operator.call("route.what_if", &json!({"consumer":"athena","iqs":[0],"panel":{"class":"audit"}})).await;
-        assert_eq!(ty,FrameType::Response,"{dry}");
-        let (ty,live) = owner.call("route.select", &json!({"consumer":"athena","requirements":{"iq":0},"detail":true})).await;
-        assert_eq!(ty,FrameType::Response,"{live}");
-        let pick = format!("{}/{}", live["result"]["route"]["provider"].as_str().unwrap(),live["result"]["route"]["model"].as_str().unwrap());
-        assert_eq!(dry["result"]["results"][0]["pick"]["route"],pick,"{dry}");
-        let candidates: BTreeSet<_> = dry["result"]["results"][0]["adequate"].as_array().unwrap().iter()
-            .map(|row| row["route"].as_str().unwrap().to_string()).collect();
+        let picker = ids(&query(&harness, "broca").await)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let (ty, dry) = operator
+            .call(
+                "route.what_if",
+                &json!({"consumer":"athena","iqs":[0],"panel":{"class":"audit"}}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Response, "{dry}");
+        let (ty, live) = owner
+            .call(
+                "route.select",
+                &json!({"consumer":"athena","requirements":{"iq":0},"detail":true}),
+            )
+            .await;
+        assert_eq!(ty, FrameType::Response, "{live}");
+        let pick = format!(
+            "{}/{}",
+            live["result"]["route"]["provider"].as_str().unwrap(),
+            live["result"]["route"]["model"].as_str().unwrap()
+        );
+        assert_eq!(dry["result"]["results"][0]["pick"]["route"], pick, "{dry}");
+        let candidates: BTreeSet<_> = dry["result"]["results"][0]["adequate"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["route"].as_str().unwrap().to_string())
+            .collect();
         let funnel = dry["result"]["panels"][0]["funnel"].clone();
         let (ty,pinned) = owner.call("route.select", &json!({"consumer":"athena","pin":"openai/gpt-4o","requirements":{"iq":0},"hold_wait_max_s":0})).await;
-        assert_eq!(ty,if version == 2 {FrameType::Error} else {FrameType::Response},"{pinned}");
+        assert_eq!(
+            ty,
+            if version == 2 {
+                FrameType::Error
+            } else {
+                FrameType::Response
+            },
+            "{pinned}"
+        );
         if version == 2 {
-            assert_eq!(pinned["code"],"pin_unavailable","{pinned}");
+            assert_eq!(pinned["code"], "pin_unavailable", "{pinned}");
         }
-        measurements.push((picker,candidates,pick,funnel));
+        measurements.push((picker, candidates, pick, funnel));
     }
-    let removed = BTreeSet::from(["openai/gpt-4o".to_string(),"openai/gpt-5.5".to_string()]);
-    assert_eq!(measurements[0].0.len(),10);
-    assert_eq!(measurements[1].0.len(),8);
-    assert_eq!(measurements[0].0.difference(&measurements[1].0).cloned().collect::<BTreeSet<_>>(),removed);
-    assert_eq!(measurements[0].1.difference(&measurements[1].1).cloned().collect::<BTreeSet<_>>(),removed);
+    let removed = BTreeSet::from(["openai/gpt-4o".to_string(), "openai/gpt-5.5".to_string()]);
+    assert_eq!(measurements[0].0.len(), 10);
+    assert_eq!(measurements[1].0.len(), 8);
+    assert_eq!(
+        measurements[0]
+            .0
+            .difference(&measurements[1].0)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        removed
+    );
+    assert_eq!(
+        measurements[0]
+            .1
+            .difference(&measurements[1].1)
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        removed
+    );
     assert!(measurements[1].0.is_subset(&measurements[0].0));
     assert!(measurements[1].1.is_subset(&measurements[0].1));
-    assert_eq!(measurements[0].3["reachable"],10);
-    assert_eq!(measurements[1].3["reachable"],8);
-    for model in ["muse-wonder-full-1.0", "muse-spark-1.3-contributor", "muse-spark-1.3", "muse-wonder-1.0", "muse-ember-1.0"] {
+    assert_eq!(measurements[0].3["reachable"], 10);
+    assert_eq!(measurements[1].3["reachable"], 8);
+    for model in [
+        "muse-wonder-full-1.0",
+        "muse-spark-1.3-contributor",
+        "muse-spark-1.3",
+        "muse-wonder-1.0",
+        "muse-ember-1.0",
+    ] {
         assert!(measurements[1].0.contains(&format!("meta/{model}")));
         assert!(measurements[1].1.contains(&format!("meta/{model}")));
     }
-    assert_eq!(measurements[0],measurements[2],"dropping the listing restores every surface, even after the serving index was warmed");
+    assert_eq!(
+        measurements[0], measurements[2],
+        "dropping the listing restores every surface, even after the serving index was warmed"
+    );
     println!("golden-derived fixture before/after/restored: {measurements:#?}");
 }

@@ -6,8 +6,8 @@
 use std::sync::Arc;
 
 use cortexkit_role_routing_conformance::fixture;
-use striatum_store::{DecisionExplainRow, DecisionListFilter};
 use serde_json::{json, Value};
+use striatum_store::{DecisionExplainRow, DecisionListFilter};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{install_catalog, reserved, Harness, Route};

@@ -9,12 +9,15 @@ impl AccountTx<'_> {
         admission: &str,
         run: &str,
     ) -> RouteStateResult<Vec<String>> {
-        let mut statement = self.conn.prepare(
-            "SELECT DISTINCT json_extract(body_json,'$.exhausted.credential_id')
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT json_extract(body_json,'$.exhausted.credential_id')
              FROM (SELECT observation_json AS body_json FROM account_observation
                WHERE principal=?1 AND admission_id=?2 AND bound=1 AND kind='signed_out')
              WHERE json_extract(body_json,'$.run_id')=?3",
-        ).map_err(err)?;
+            )
+            .map_err(err)?;
         let rows = statement
             .query_map(params![principal, admission, run], |row| row.get(0))
             .map_err(err)?
@@ -30,12 +33,20 @@ impl AccountTx<'_> {
         fence: &striatum_core::route_state_store::CredentialEntitlementFence,
         fingerprint: &str,
     ) -> RouteStateResult<()> {
-        self.conn.execute(
-            "UPDATE credential_entitlement_fences SET listing_fingerprint=?1
+        self.conn
+            .execute(
+                "UPDATE credential_entitlement_fences SET listing_fingerprint=?1
              WHERE provider_id=?2 AND credential_id=?3 AND code='signed_out'
              AND observed_at_ms=?4 AND listing_fingerprint IS ?5",
-            params![fingerprint, fence.provider_id, fence.credential_id, fence.observed_at_ms, fence.listing_fingerprint],
-        ).map_err(err)?;
+                params![
+                    fingerprint,
+                    fence.provider_id,
+                    fence.credential_id,
+                    fence.observed_at_ms,
+                    fence.listing_fingerprint
+                ],
+            )
+            .map_err(err)?;
         Ok(())
     }
 

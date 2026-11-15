@@ -349,7 +349,9 @@ impl Registry {
         harness: Option<&str>,
         resolve_default: bool,
     ) -> Self {
-        let catalog = facts.iter().collect::<crate::broca_credentials::AuthCatalog>();
+        let catalog = facts
+            .iter()
+            .collect::<crate::broca_credentials::AuthCatalog>();
         let entries = source
             .enrolled(credentials)
             .into_iter()
@@ -455,7 +457,8 @@ impl Registry {
                                     ) else {
                                         if provider_allowed {
                                             unverified_wire_models.insert(format!(
-                                                "{}/{}", fact.provider_id, fact.model_id
+                                                "{}/{}",
+                                                fact.provider_id, fact.model_id
                                             ));
                                         }
                                         return false;
@@ -476,13 +479,17 @@ impl Registry {
                                             .admits_pair_row(
                                                 pair,
                                                 indexed_row.map_or_else(
-                                                    || credentials.row_serves_wire_api(fact, method),
+                                                    || {
+                                                        credentials
+                                                            .row_serves_wire_api(fact, method)
+                                                    },
                                                     |row| row.has_endpoint,
                                                 ),
                                             );
                                         if !admitted && provider_allowed {
                                             missing_wire_api_models.insert(format!(
-                                                "{}/{}", fact.provider_id, fact.model_id
+                                                "{}/{}",
+                                                fact.provider_id, fact.model_id
                                             ));
                                         }
                                         admitted
@@ -502,9 +509,8 @@ impl Registry {
                                     offers
                                 };
                                 if otherwise_allowed && !provider_allowed {
-                                    provider_limit_models.insert(format!(
-                                        "{}/{}", fact.provider_id, fact.model_id
-                                    ));
+                                    provider_limit_models
+                                        .insert(format!("{}/{}", fact.provider_id, fact.model_id));
                                 }
                                 otherwise_allowed && provider_allowed
                             })
@@ -963,7 +969,10 @@ pub(crate) fn tier_discovery_modules(
                 .get("nonce_verified")
                 .and_then(serde_json::Value::as_bool)
                 != Some(true)
-                && entry.get("first_party").and_then(serde_json::Value::as_bool) != Some(true)
+                && entry
+                    .get("first_party")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
             {
                 return None;
             }

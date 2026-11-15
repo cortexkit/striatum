@@ -47,9 +47,13 @@ fn unavailable(error: impl std::fmt::Display) -> Refusal {
 fn invalid_stored_state() -> ContinueAnswer {
     let refusal = Refusal::account_unservable(
         cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
-        vec![], vec![],
+        vec![],
+        vec![],
     );
-    ContinueAnswer::Refuse(ContinueRefusal::new(refusal.code.as_str(), json!(refusal.detail)))
+    ContinueAnswer::Refuse(ContinueRefusal::new(
+        refusal.code.as_str(),
+        json!(refusal.detail),
+    ))
 }
 
 fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refusal> {
@@ -62,10 +66,12 @@ fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refu
             "selection_id already names a different request",
         ));
     }
-    Ok(match serde_json::from_str::<ContinueAnswer>(&record.answer_json) {
-        Ok(answer) => json!(answer),
-        Err(_) => json!(invalid_stored_state()),
-    })
+    Ok(
+        match serde_json::from_str::<ContinueAnswer>(&record.answer_json) {
+            Ok(answer) => json!(answer),
+            Err(_) => json!(invalid_stored_state()),
+        },
+    )
 }
 
 fn record_signed_out(
@@ -79,7 +85,10 @@ fn record_signed_out(
 ) -> RouteStateResult<()> {
     let code = striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE;
     let fingerprint = ctx.classes.as_ref().and_then(|classes| {
-        match classes.credentials.signed_out_fingerprint(&request.exhausted.credential_id) {
+        match classes
+            .credentials
+            .signed_out_fingerprint(&request.exhausted.credential_id)
+        {
             crate::broca_credentials::ListingLookup::Listed(value) => Some(value),
             _ => None,
         }
@@ -219,22 +228,44 @@ pub(crate) fn continue_account_with_call(
         let (mut roster, fenced, class) = prepare_roster(params, ctx)?;
         let inputs_pending = ctx.classes.as_ref().is_some_and(|classes| {
             crate::service_tiers::unobserved_account_input(&classes.credentials).is_some()
-                || crate::routing_v1::runners::tier_view_unknown(&classes.credentials, &params.caller.runner, ctx.now_ms)
+                || crate::routing_v1::runners::tier_view_unknown(
+                    &classes.credentials,
+                    &params.caller.runner,
+                    ctx.now_ms,
+                )
         });
         if params.model_decision_id.is_some() && !inputs_pending {
             let mut params = params.clone();
-            let held_until = fenced.values().copied().chain(ctx.classes.iter().flat_map(|classes| {
-                classes.reserved_probe_accounts(&normalize(&params.provider), &normalize(&params.model), &params)
-                    .into_iter().map(|(_, until)| until)
-            })).filter(|until| *until > ctx.now_ms).min();
+            let held_until = fenced
+                .values()
+                .copied()
+                .chain(ctx.classes.iter().flat_map(|classes| {
+                    classes
+                        .reserved_probe_accounts(
+                            &normalize(&params.provider),
+                            &normalize(&params.model),
+                            &params,
+                        )
+                        .into_iter()
+                        .map(|(_, until)| until)
+                }))
+                .filter(|until| *until > ctx.now_ms)
+                .min();
             prepare_service_tier(&mut params, ctx, &mut roster, class, held_until)?;
         }
         if route_fence_refusal(&roster, &fenced, params, ctx.now_ms).is_none()
-            && ctx.classes.as_ref().is_some_and(|classes| empty_roster_refusal(
-                classes, &normalize(&params.provider), &normalize(&params.model),
-                class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
-                &fenced, ctx.now_ms, Some(params),
-            ).is_none())
+            && ctx.classes.as_ref().is_some_and(|classes| {
+                empty_roster_refusal(
+                    classes,
+                    &normalize(&params.provider),
+                    &normalize(&params.model),
+                    class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+                    &fenced,
+                    ctx.now_ms,
+                    Some(params),
+                )
+                .is_none()
+            })
         {
             if let Some(reply) = disjoint_candidates_refusal(params, ctx, &roster, class) {
                 return Err(reply);
@@ -257,17 +288,32 @@ pub(crate) fn continue_account_with_call(
             let sign_in: BTreeSet<_> = classes
                 .refusals
                 .iter()
-                .filter(|fence| fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE)
+                .filter(|fence| {
+                    fence.code == striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE
+                })
                 .map(|fence| (fence.provider_id.clone(), fence.credential_id.clone()))
                 .collect();
-            let rechecks = classes.rechecks.iter().filter(|origin| {
-                !(origin.kind == "credential" && origin.credential_id.as_ref()
-                    .is_some_and(|credential| sign_in.contains(&(origin.provider.clone(), credential.clone()))))
-            }).cloned().collect();
-            let refusals = classes.refusals.iter().filter(|fence| {
-                !crate::credential_fences::is_billing_code(&fence.code)
-                    && !sign_in.contains(&(fence.provider_id.clone(), fence.credential_id.clone()))
-            }).cloned().collect();
+            let rechecks = classes
+                .rechecks
+                .iter()
+                .filter(|origin| {
+                    !(origin.kind == "credential"
+                        && origin.credential_id.as_ref().is_some_and(|credential| {
+                            sign_in.contains(&(origin.provider.clone(), credential.clone()))
+                        }))
+                })
+                .cloned()
+                .collect();
+            let refusals = classes
+                .refusals
+                .iter()
+                .filter(|fence| {
+                    !crate::credential_fences::is_billing_code(&fence.code)
+                        && !sign_in
+                            .contains(&(fence.provider_id.clone(), fence.credential_id.clone()))
+                })
+                .cloned()
+                .collect();
             classes.replace_refusals(refusals);
             classes.replace_rechecks(rechecks);
             classes.route_fences.clear();

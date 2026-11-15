@@ -92,11 +92,7 @@ const EXEMPTIONS: &[Exemption] = &[
 ];
 
 /// Crates whose `src/` trees the census reads.
-const SCANNED_CRATES: &[&str] = &[
-    "striatum-core",
-    "striatum-store",
-    "striatum-module",
-];
+const SCANNED_CRATES: &[&str] = &["striatum-core", "striatum-store", "striatum-module"];
 
 fn crates_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -876,10 +872,7 @@ fn a_planted_literal_of_each_class_fails() {
             "striatum-core/src/launch_policy.rs",
             "ollama-cloud".to_string(),
         ),
-        (
-            "striatum-module/src/config_convert.rs",
-            "broca".to_string(),
-        ),
+        ("striatum-module/src/config_convert.rs", "broca".to_string()),
         (
             "striatum-module/src/quota_consumer.rs",
             id_of_class(&ids, IdClass::VaultProvider),

@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rusqlite::{params, Connection};
 use striatum_core::{
     OBSERVED_SPEED_SAMPLE_LIMIT, OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS,
     USAGE_MIN_OUTPUT_TOKENS,
@@ -8,7 +9,6 @@ use striatum_store::{
     dev_descriptor, SqliteRouteStateStore, OBSERVED_SPEED_SAMPLES_SQL,
     WORKLOAD_CLASS_USAGE_SAMPLES_SQL,
 };
-use rusqlite::{params, Connection};
 
 static NEXT_DATABASE: AtomicU64 = AtomicU64::new(0);
 

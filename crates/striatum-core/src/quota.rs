@@ -852,7 +852,8 @@ mod tests {
     fn fact(provider: &str, model: &str, speed: f64) -> ModelFact {
         ModelFact {
             billing_plane: None,
-            auth_methods: None, login_methods_documented: false,
+            auth_methods: None,
+            login_methods_documented: false,
             input_rate: None,
             cache_read_rate: None,
             cache_write_rate: None,
@@ -885,7 +886,9 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
         }
     }
 

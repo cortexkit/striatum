@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
-use striatum_core::billing::{BillingPlane, BillingRate};
-use striatum_core::RouteStateStore;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use striatum_core::billing::{BillingPlane, BillingRate};
+use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::{
@@ -12,8 +12,8 @@ use super::{
     runners,
 };
 use crate::broca_credentials::BrocaCredentials;
-mod unservable_tests;
 mod finish_rollback_tests;
+mod unservable_tests;
 
 const NOW: u64 = 1_800_000_000_000;
 const MODEL: &str = "gpt-6.1-sol";
@@ -295,7 +295,10 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "account_unservable");
-    assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
+    assert_eq!(
+        refused.1["detail"],
+        json!({"reason":"bound_tier_unavailable"})
+    );
 }
 
 #[tokio::test]
@@ -616,7 +619,10 @@ async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() 
             refused.1
         );
         assert_eq!(refused.1["code"], "account_unservable");
-        assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
+        assert_eq!(
+            refused.1["detail"],
+            json!({"reason":"bound_tier_unavailable"})
+        );
         assert_eq!(
             refused.1["message"],
             "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision."
@@ -652,22 +658,35 @@ async fn account_bound_tier_mismatch_is_a_permanent_invalid_request() {
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
-    assert_eq!(refused.1["detail"], json!({
-        "field":"service_tier", "decision_id":decision,
-        "requested_service_tier":"standard", "bound_service_tier":"fast",
-    }));
+    assert_eq!(
+        refused.1["detail"],
+        json!({
+            "field":"service_tier", "decision_id":decision,
+            "requested_service_tier":"standard", "bound_service_tier":"fast",
+        })
+    );
     assert_eq!(
         cortexkit_role_routing::refusals::retry_class("invalid_request", &refused.1["detail"]),
         cortexkit_role_routing::refusals::RetryClass::Permanent,
     );
-    assert!(harness.store().v1_admission(&format!("reserved:{RUNNER}"), "tier-mismatch").unwrap().is_none());
-    harness.store().record_service_tier(decision.as_str().unwrap(), "future-tier", &[]).unwrap();
+    assert!(harness
+        .store()
+        .v1_admission(&format!("reserved:{RUNNER}"), "tier-mismatch")
+        .unwrap()
+        .is_none());
+    harness
+        .store()
+        .record_service_tier(decision.as_str().unwrap(), "future-tier", &[])
+        .unwrap();
     let mut unfamiliar = account_request("unfamiliar-recorded-tier", None);
     unfamiliar["decision_id"] = decision;
     let refused = runner.call("route.account_for", &unfamiliar).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "account_unservable", "{}", refused.1);
-    assert_eq!(refused.1["detail"], json!({"reason":"stored_state_invalid"}));
+    assert_eq!(
+        refused.1["detail"],
+        json!({"reason":"stored_state_invalid"})
+    );
 }
 
 #[tokio::test]
@@ -694,11 +713,7 @@ async fn account_service_tier_bound_decision_keeps_exact_tier_or_refuses() {
     let mut lower = account_request("lower-ceiling", Some("standard"));
     lower["decision_id"] = decision.clone();
     let refused = runner.call("route.account_for", &lower).await;
-    assert_eq!(
-        refused.1["code"], "invalid_request",
-        "{}",
-        refused.1
-    );
+    assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
     let mut rows = credentials.listed_credentials().to_vec();
     rows[1].plan_tier = Some("unknown".into());
     credentials.apply_listing(
@@ -729,8 +744,12 @@ async fn account_service_tier_requires_calling_runner_and_model_support() {
         if missing == "runner" {
             let declaration = credentials.runner_declarations[RUNNER].clone();
             let tiers = credentials.runner_service_tiers[RUNNER].clone();
-            credentials.runner_declarations.insert("other-tier-runner".into(), declaration);
-            credentials.runner_service_tiers.insert("other-tier-runner".into(), tiers);
+            credentials
+                .runner_declarations
+                .insert("other-tier-runner".into(), declaration);
+            credentials
+                .runner_service_tiers
+                .insert("other-tier-runner".into(), tiers);
             runners::DescribeCache::default().reply(
                 RUNNER,
                 Some(&json!({"capabilities":[]})),

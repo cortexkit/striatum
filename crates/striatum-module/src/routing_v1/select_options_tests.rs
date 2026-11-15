@@ -31,13 +31,25 @@ async fn decommissioned_pin_uses_contract_refusal_even_when_policy_would_admit_i
             (MODEL_B):{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
         }
     })).unwrap()).unwrap();
-    crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("example-provider")).unwrap();
-    let refused = route.call("route.select", &select_body(json!({"pin":MODEL_B}))).await;
+    crate::fusiform_catalog::apply_mapped_catalog(
+        &harness.store(),
+        &snapshot,
+        None,
+        Some("example-provider"),
+    )
+    .unwrap();
+    let refused = route
+        .call("route.select", &select_body(json!({"pin":MODEL_B})))
+        .await;
     assert_eq!(refused.0, FrameType::Error, "{refused:?}");
     assert_eq!(refused.1["code"], "pin_unavailable");
-    assert_eq!(refused.1["detail"], json!({"pin":MODEL_B,"reason":"decommissioned"}));
-    let parsed: cortexkit_role_routing::errors::Refusal = serde_json::from_value(refused.1).unwrap();
-    assert_eq!(parsed.wait_until_ms(),None);
+    assert_eq!(
+        refused.1["detail"],
+        json!({"pin":MODEL_B,"reason":"decommissioned"})
+    );
+    let parsed: cortexkit_role_routing::errors::Refusal =
+        serde_json::from_value(refused.1).unwrap();
+    assert_eq!(parsed.wait_until_ms(), None);
 }
 
 async fn answered(route: &Route, extra: Value) -> Value {

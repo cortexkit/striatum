@@ -8,10 +8,10 @@
 use std::sync::Arc;
 
 use cortexkit_role_routing_conformance::CatalogModel;
+use serde_json::{json, Value};
 use striatum_core::billing::{BillingPlane, BillingRate};
 use striatum_core::{ModelFact, RouteStateStore};
 use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
-use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{catalog_fact, reserved, Harness};
@@ -71,7 +71,8 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
         .map(|fact| FusiformFactUpdate {
             provider_id: fact.provider_id.clone(),
             model_id: fact.model_id.clone(),
-            auth_methods: Some(vec!["apikey".into()]), login_methods_documented: false,
+            auth_methods: Some(vec!["apikey".into()]),
+            login_methods_documented: false,
             present: true,
             context_window: fact.context_window,
             max_output_tokens: fact.max_output_tokens,
@@ -85,7 +86,9 @@ fn harness(specs: &[(&str, bool, bool, u64)]) -> Arc<Harness> {
             supports_tool_use: fact.supports_tool_use,
             reasoning_efforts: None,
             canonical_id: None,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
             lineage: fact.family.clone(),
         })
         .collect();
@@ -118,11 +121,20 @@ fn select(consumer: &str) -> Value {
 #[tokio::test]
 async fn non_chat_catalog_rows_cannot_be_selected_or_pinned() {
     for (classification, reason) in [
-        (json!({"model.type": "transcription"}), "not_chat_model:transcription"),
+        (
+            json!({"model.type": "transcription"}),
+            "not_chat_model:transcription",
+        ),
         (json!({"model.type": "image"}), "not_chat_model:image"),
-        (json!({"model.type": "future-engine"}), "not_chat_model:future-engine"),
+        (
+            json!({"model.type": "future-engine"}),
+            "not_chat_model:future-engine",
+        ),
         (json!({"model.kind": "decision"}), "not_chat_kind:decision"),
-        (json!({"model.kind": "extraction"}), "not_chat_kind:extraction"),
+        (
+            json!({"model.kind": "extraction"}),
+            "not_chat_kind:extraction",
+        ),
         (json!({"model.type": "chat"}), ""),
         (json!({}), ""),
     ] {
@@ -141,24 +153,45 @@ async fn check_chat_classification(classification: Value, reason: &str) {
             "capability.output_modalities": ["text"], "wire.family": "openai-chat",
             "capability.tool_call": true, "limit.context": 200000, "limit.output": 32000}
     }});
-    payload["models"][CHEAP].as_object_mut().unwrap().extend(classification.as_object().unwrap().clone());
+    payload["models"][CHEAP]
+        .as_object_mut()
+        .unwrap()
+        .extend(classification.as_object().unwrap().clone());
     if classification["model.type"] == "image" {
         payload["models"][CHEAP]["capability.output_modalities"] = json!(["image"]);
     }
-    let catalog = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    let catalog =
+        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&payload).unwrap())
+            .unwrap();
     let (updates, cursor) = catalog.parts();
-    harness.store().apply_fusiform_catalog(updates, cursor).unwrap();
+    harness
+        .store()
+        .apply_fusiform_catalog(updates, cursor)
+        .unwrap();
     harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(catalog));
     let route = harness.bind(reserved("example-consumer"), None).await;
     let automatic = route.call("route.select", &select("mason")).await;
     let excluded = !reason.is_empty();
-    assert_eq!(route_of(&automatic), if excluded { DEAR } else { CHEAP }, "{}", automatic.1);
+    assert_eq!(
+        route_of(&automatic),
+        if excluded { DEAR } else { CHEAP },
+        "{}",
+        automatic.1
+    );
     let legacy = json!({"consumer": "mason", "targetAgent": "mason",
         "executor": "broca", "substrate": "broca", "requirements": {"iq": 30, "eq": 0}});
     let legacy_selected = route.call("route.select", &legacy).await;
-    assert_eq!(legacy_route(&legacy_selected), if excluded { DEAR } else { CHEAP });
+    assert_eq!(
+        legacy_route(&legacy_selected),
+        if excluded { DEAR } else { CHEAP }
+    );
     for pin in [CHEAP.to_owned(), format!("{CHEAP}:high")] {
-        let pinned = route.call("route.select", &json!({"consumer": "mason", "requirements": {"iq": 30}, "pin": pin})).await;
+        let pinned = route
+            .call(
+                "route.select",
+                &json!({"consumer": "mason", "requirements": {"iq": 30}, "pin": pin}),
+            )
+            .await;
         let mut legacy_pin = legacy.clone();
         legacy_pin["modelPin"] = json!(pin);
         let legacy_pinned = route.call("route.select", &legacy_pin).await;
@@ -171,26 +204,68 @@ async fn check_chat_classification(classification: Value, reason: &str) {
             }
         }
     }
-    let choices = route.call("route.head_choices", &json!({"runner_module": "zeta-runner"})).await;
+    let choices = route
+        .call(
+            "route.head_choices",
+            &json!({"runner_module": "zeta-runner"}),
+        )
+        .await;
     assert_eq!(choices.0, FrameType::Response, "{}", choices.1);
     let models = choices.1["result"]["models"].as_array().unwrap();
-    assert!(models.iter().any(|model| model["provider"] == "dear-provider"), "{}", choices.1);
-    assert_eq!(models.iter().any(|model| model["provider"] == "cheap-provider"), !excluded, "{}", choices.1);
+    assert!(
+        models
+            .iter()
+            .any(|model| model["provider"] == "dear-provider"),
+        "{}",
+        choices.1
+    );
+    assert_eq!(
+        models
+            .iter()
+            .any(|model| model["provider"] == "cheap-provider"),
+        !excluded,
+        "{}",
+        choices.1
+    );
     if excluded {
-        let panel = route.call("route.select_panel", &json!({"consumer": "mason", "class": "audit", "available_routes": [CHEAP, DEAR]})).await;
+        let panel = route
+            .call(
+                "route.select_panel",
+                &json!({"consumer": "mason", "class": "audit", "available_routes": [CHEAP, DEAR]}),
+            )
+            .await;
         assert_eq!(panel.0, FrameType::Response, "{}", panel.1);
         let seats = panel.1["result"]["seats"].as_array().unwrap();
         assert_eq!(seats.len(), 1, "{}", panel.1);
-        assert_eq!(seats[0]["answer"]["route"]["provider"], "dear-provider", "{}", panel.1);
+        assert_eq!(
+            seats[0]["answer"]["route"]["provider"], "dear-provider",
+            "{}",
+            panel.1
+        );
         let operator = harness.bind(json!({"kind": "direct"}), None).await;
-        let sweep = operator.call("route.what_if", &json!({"consumer": "mason", "iqs": [30]})).await;
+        let sweep = operator
+            .call("route.what_if", &json!({"consumer": "mason", "iqs": [30]}))
+            .await;
         assert_eq!(sweep.0, FrameType::Response, "{}", sweep.1);
-        assert!(sweep.1["result"]["results"][0]["excluded"].as_array().unwrap().iter()
-            .any(|row| row["route"] == CHEAP && row["reason"] == reason), "{}", sweep.1);
+        assert!(
+            sweep.1["result"]["results"][0]["excluded"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["route"] == CHEAP && row["reason"] == reason),
+            "{}",
+            sweep.1
+        );
         let decision = legacy_selected.1["result"]["decisionID"].as_str().unwrap();
-        let explanation = route.call("route.explain", &json!({"decisionID": decision})).await;
+        let explanation = route
+            .call("route.explain", &json!({"decisionID": decision}))
+            .await;
         assert_eq!(explanation.0, FrameType::Response, "{}", explanation.1);
-        assert!(explanation.1.to_string().contains(reason), "{}", explanation.1);
+        assert!(
+            explanation.1.to_string().contains(reason),
+            "{}",
+            explanation.1
+        );
     }
 }
 
@@ -261,7 +336,10 @@ async fn a_compacted_selection_keeps_the_fields_core_reads() {
     let route = harness.bind(reserved("example-consumer"), None).await;
     let reply = route.call("route.select", &select("mason")).await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    let decision = reply.1["result"]["decision_id"].as_str().unwrap().to_owned();
+    let decision = reply.1["result"]["decision_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let store = harness.store();
     let full = store.get_decision_by_id(&decision).unwrap().unwrap();
     let full_score: Value = serde_json::from_str(&full.score_json).unwrap();
@@ -275,7 +353,13 @@ async fn a_compacted_selection_keeps_the_fields_core_reads() {
     let compact = store.get_decision_by_id(&decision).unwrap().unwrap();
     assert!(compact.detail_stripped_at.is_some());
     let compact_score: Value = serde_json::from_str(&compact.score_json).unwrap();
-    for member in ["objective", "metrics", "alsoAdequate", "adequacy", "selectionCost"] {
+    for member in [
+        "objective",
+        "metrics",
+        "alsoAdequate",
+        "adequacy",
+        "selectionCost",
+    ] {
         assert_eq!(compact_score[member], full_score[member], "{member}");
     }
     assert_eq!(compact.policy_revision, full.policy_revision);
@@ -367,7 +451,10 @@ async fn below_bar_policy_is_shared_by_v1_legacy_and_what_if_and_bypassed_by_pin
     let refused = route.call("route.select", &v1).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["detail"]["reason"], "all_inadequate");
-    assert_eq!(route.call("route.select", &legacy).await.0, FrameType::Error);
+    assert_eq!(
+        route.call("route.select", &legacy).await.0,
+        FrameType::Error
+    );
     harness.edit_config(|config| config["consumers"]["mason"]["below_bar"] = json!("best_effort"));
     let selected = route.call("route.select", &v1).await;
     assert_eq!(route_of(&selected), CHEAP);

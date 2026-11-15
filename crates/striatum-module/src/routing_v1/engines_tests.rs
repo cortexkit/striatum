@@ -41,7 +41,9 @@ fn request() -> Value {
 async fn media_account_continue_is_a_permanent_invalid_mode() {
     let harness = setup(vec![engine("remote", false)]);
     let route = harness.bind(reserved("colliculus"), None).await;
-    let refused = route.call("route.account_for", &json!({"mode":"continue"})).await;
+    let refused = route
+        .call("route.account_for", &json!({"mode":"continue"}))
+        .await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
     assert_eq!(refused.1["detail"], json!({"field":"mode"}));
@@ -53,19 +55,28 @@ async fn media_account_continue_is_a_permanent_invalid_mode() {
 
 #[tokio::test]
 async fn decommissioned_media_engine_is_skipped_even_when_it_is_local() {
-    for local in [false,true] {
-        let harness = setup(vec![engine("retired",local)]);
+    for local in [false, true] {
+        let harness = setup(vec![engine("retired", local)]);
         let route = harness.bind(reserved("colliculus"), None).await;
-        assert_eq!(route.call("route.select_engine", &request()).await.0, FrameType::Response);
+        assert_eq!(
+            route.call("route.select_engine", &request()).await.0,
+            FrameType::Response
+        );
         let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
             "catalog_version":94,"resolved_at_ms":123,"models":{
                 "media-vendor/retired":{"existence":"present","quality.decommissioned":true,"model.kind":"transcribe"}
             }
         })).unwrap()).unwrap();
-        crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("media-vendor")).unwrap();
+        crate::fusiform_catalog::apply_mapped_catalog(
+            &harness.store(),
+            &snapshot,
+            None,
+            Some("media-vendor"),
+        )
+        .unwrap();
         let refused = route.call("route.select_engine", &request()).await;
         assert_eq!(refused.0, FrameType::Error, "{refused:?}");
-        assert_eq!(refused.1["code"],"no_engine");
+        assert_eq!(refused.1["code"], "no_engine");
     }
 }
 
@@ -622,15 +633,23 @@ async fn engine_admission_refused_after_its_twin_committed_replays_the_twin() {
         "model":"remote","decision_id":answer["decision_id"],"hold_wait_max_s":0});
     let twin = Arc::new(std::sync::Mutex::new(None));
     {
-        let (route, params, twin, credentials) =
-            (route.clone(), params.clone(), twin.clone(), harness.credentials());
+        let (route, params, twin, credentials) = (
+            route.clone(),
+            params.clone(),
+            twin.clone(),
+            harness.credentials(),
+        );
         crate::account_selection::after_roster_prepared("v1-replay-checked:twin", move || {
             *twin.lock().unwrap() = Some(route.account_for_direct(&params));
             credentials.lock().unwrap().engine_clock_offset_ms = 600_000;
         });
     }
     let late = route.account_for_direct(&params);
-    let twin = twin.lock().unwrap().take().expect("the twin ran inside the request");
+    let twin = twin
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the twin ran inside the request");
     let twin = twin.expect("the twin was admitted");
     assert_eq!(twin["admission"]["state"], "reserved");
     assert_eq!(late.map_err(|refusal| refusal.code), Ok(twin));
@@ -641,11 +660,17 @@ async fn remote_engines_are_automatic_without_llm_spending_opt_in() {
     let harness = setup(vec![engine("remote", false)]);
     harness.edit_config(|config| config["providers"] = json!({}));
     let route = harness.bind(reserved("colliculus"), None).await;
-    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
+    assert_eq!(
+        selected(&route, &request()).await["engine"]["model"],
+        "remote"
+    );
     harness.edit_config(|config| config["providers"]["media-vendor"]["pin_only"] = json!(true));
     let mut local_request = request();
     local_request["caller_local"] = json!([engine("local", true)]);
-    assert_eq!(selected(&route, &local_request).await["engine"]["model"], "local");
+    assert_eq!(
+        selected(&route, &local_request).await["engine"]["model"],
+        "local"
+    );
 }
 
 #[tokio::test]
@@ -653,25 +678,39 @@ async fn remote_engine_operator_rules_refuse_by_consumer_but_ignore_pin_only() {
     let harness = setup(vec![engine("remote", false)]);
     let route = harness.bind(reserved("colliculus"), None).await;
     // A consumer-scoped refusal still keeps the engine out.
-    harness.edit_config(|config| config["providers"]["media-vendor"] = json!({"not_for":["colliculus"]}));
+    harness.edit_config(|config| {
+        config["providers"]["media-vendor"] = json!({"not_for":["colliculus"]})
+    });
     let refused = route.call("route.select_engine", &request()).await;
     assert_eq!(refused.0, FrameType::Error, "{refused:?}");
     assert_eq!(refused.1["code"], "no_engine");
     // Engines have no pin operation, so a pin-only rule must not make them
     // unusable: a provider marked pin-only for chat models still serves media.
     harness.edit_config(|config| config["providers"]["media-vendor"] = json!({"pin_only":true}));
-    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
+    assert_eq!(
+        selected(&route, &request()).await["engine"]["model"],
+        "remote"
+    );
     harness.edit_config(|config| {
         config["providers"]["media-vendor"] = json!({"pin_only":true});
         config["models"]["media-vendor/remote"] = json!({"pin_only":true});
     });
-    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
+    assert_eq!(
+        selected(&route, &request()).await["engine"]["model"],
+        "remote"
+    );
     // The old exclude grammar converts to pin-only entity rules, which are
     // likewise not a refusal for an engine.
-    let excluded = crate::config_convert::convert_value(json!({"model_routing":{"exclude":{"all":["media-vendor"]}}})).unwrap();
+    let excluded = crate::config_convert::convert_value(
+        json!({"model_routing":{"exclude":{"all":["media-vendor"]}}}),
+    )
+    .unwrap();
     harness.edit_config(|config| {
         config["providers"] = excluded["providers"].clone();
         config["models"] = json!({});
     });
-    assert_eq!(selected(&route, &request()).await["engine"]["model"], "remote");
+    assert_eq!(
+        selected(&route, &request()).await["engine"]["model"],
+        "remote"
+    );
 }

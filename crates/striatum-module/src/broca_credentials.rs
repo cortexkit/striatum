@@ -47,7 +47,9 @@ impl<'a> FromIterator<&'a ModelFact> for AuthCatalog {
                 .flatten()
                 .filter(|method| *method != "apikey")
             {
-                catalog.signins.entry(fact.provider_id.clone())
+                catalog
+                    .signins
+                    .entry(fact.provider_id.clone())
                     .or_default()
                     .insert(method.clone());
             }
@@ -73,9 +75,14 @@ impl AuthCatalog {
     }
 
     fn allows(&self, fact: &ModelFact, method: Option<&str>) -> bool {
-        if method.is_some_and(|method| method != "apikey"
-            && self.signins.get(&fact.provider_id).is_some_and(|methods| methods.contains(method)))
-            && !fact.login_methods_documented {
+        if method.is_some_and(|method| {
+            method != "apikey"
+                && self
+                    .signins
+                    .get(&fact.provider_id)
+                    .is_some_and(|methods| methods.contains(method))
+        }) && !fact.login_methods_documented
+        {
             return false;
         }
         fact.auth_methods.as_ref().is_none_or(|allowed| {
@@ -286,13 +293,22 @@ pub type SharedBrocaCredentials = Arc<Mutex<BrocaCredentials>>;
 /// Persisted listings are restored before serving, so only a fresh store (or an
 /// older store without a full listing) whose vault is unreachable should time out.
 pub(crate) fn wait_for_first_listing(credentials: &SharedBrocaCredentials) -> bool {
-    let Ok(loaded) = credentials.lock().map(|guard| Arc::clone(&guard.listing_loaded)) else {
+    let Ok(loaded) = credentials
+        .lock()
+        .map(|guard| Arc::clone(&guard.listing_loaded))
+    else {
         // Let context loading report a poisoned cache, not a missing listing.
         return true;
     };
-    let ready = loaded.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (ready, _) = loaded.1
-        .wait_timeout_while(ready, std::time::Duration::from_millis(1500), |ready| !*ready)
+    let ready = loaded
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (ready, _) = loaded
+        .1
+        .wait_timeout_while(ready, std::time::Duration::from_millis(1500), |ready| {
+            !*ready
+        })
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *ready
 }
@@ -301,9 +317,13 @@ pub(crate) fn listing_not_ready(params: &serde_json::Value) -> crate::account_se
     // Keep the 3-second startup retry interval and candidate explanation, so
     // this earlier check does not change an existing caller's retry behavior.
     let exclusions: Vec<_> = params["candidates"]["accounts"]
-        .as_array().into_iter().flatten()
-        .map(|candidate| serde_json::json!({"account_id": candidate["account_id"],
-            "reason": "routing just started and hasn't read the credential list yet"}))
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|candidate| {
+            serde_json::json!({"account_id": candidate["account_id"],
+            "reason": "routing just started and hasn't read the credential list yet"})
+        })
         .collect();
     crate::account_selection::OpReply::typed(
         "account_selection_unavailable",
@@ -419,9 +439,10 @@ impl CredentialData {
             return true;
         };
         self.runner_declarations.values().any(|runner| {
-            runner.pairs.iter().any(|pair| {
-                pair.wire_api == wire && Some(pair.auth_method.as_str()) == method
-            })
+            runner
+                .pairs
+                .iter()
+                .any(|pair| pair.wire_api == wire && Some(pair.auth_method.as_str()) == method)
         })
     }
 
@@ -516,8 +537,7 @@ impl CredentialData {
         pricing: &striatum_core::RoutePricing,
     ) {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
-        let catalog_key =
-            striatum_core::score_alias::catalog_key(&self.priced_targets, &key);
+        let catalog_key = striatum_core::score_alias::catalog_key(&self.priced_targets, &key);
         let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
         fact.billing_plane = Some(self.billing_catalog.for_route(
             &catalog_key,
@@ -555,7 +575,8 @@ impl CredentialData {
             .find(|row| row.id == credential_id)
             .map_or(ListingLookup::Absent, |row| {
                 ListingLookup::Listed(
-                    serde_json::json!([listing_fingerprint_of(row), row.record_version]).to_string(),
+                    serde_json::json!([listing_fingerprint_of(row), row.record_version])
+                        .to_string(),
                 )
             })
     }
@@ -579,7 +600,9 @@ impl CredentialData {
         {
             return Vec::new();
         }
-        let serving = self.serving_method(fact, &self.catalog_providers).auth_method;
+        let serving = self
+            .serving_method(fact, &self.catalog_providers)
+            .auth_method;
         self.listed
             .iter()
             .filter(|row| credential_serves_fact(row, fact, &self.catalog_providers, self))
@@ -596,25 +619,31 @@ impl CredentialData {
     /// credentials listed for it (the same fallback pricing uses).
     fn serving_method(&self, fact: &ModelFact, catalog: &AuthCatalog) -> ServingMethod {
         let key = format!("{}/{}", fact.provider_id, fact.model_id);
-        self.serving.get(&key).filter(|serving| {
-            match serving.auth_method.as_deref() {
-                Some(method) => catalog.allows(fact, Some(method)),
-                // Removing the provider's last listing for a sign-in lets that
-                // sign-in reach unlisted models again. Recompute unresolved
-                // methods when coverage changes before the next roster refresh.
-                None => self.catalog_providers.signins.get(&fact.provider_id)
-                    == catalog.signins.get(&fact.provider_id),
-            }
-        }).cloned().unwrap_or_else(|| {
-            choose_method(
-                BTreeSet::new(),
-                self.listed
-                    .iter()
-                    .filter(|row| credential_serves_fact(row, fact, catalog, self))
-                    .filter_map(|row| row.auth_method.clone())
-                    .collect(),
-            )
-        })
+        self.serving
+            .get(&key)
+            .filter(|serving| {
+                match serving.auth_method.as_deref() {
+                    Some(method) => catalog.allows(fact, Some(method)),
+                    // Removing the provider's last listing for a sign-in lets that
+                    // sign-in reach unlisted models again. Recompute unresolved
+                    // methods when coverage changes before the next roster refresh.
+                    None => {
+                        self.catalog_providers.signins.get(&fact.provider_id)
+                            == catalog.signins.get(&fact.provider_id)
+                    }
+                }
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                choose_method(
+                    BTreeSet::new(),
+                    self.listed
+                        .iter()
+                        .filter(|row| credential_serves_fact(row, fact, catalog, self))
+                        .filter_map(|row| row.auth_method.clone())
+                        .collect(),
+                )
+            })
     }
     pub(crate) fn publish_billing_catalog(
         &mut self,
@@ -1006,11 +1035,9 @@ impl CredentialData {
                 // A resolved provider is priced on its catalog provider's plane,
                 // the only one Fusiform knows, under its own credential method.
                 let provider = key.split_once('/')?.0;
-                let provider = striatum_core::score_alias::alias_target(
-                    &self.priced_targets,
-                    provider,
-                )
-                .unwrap_or(provider);
+                let provider =
+                    striatum_core::score_alias::alias_target(&self.priced_targets, provider)
+                        .unwrap_or(provider);
                 Some((provider.to_string(), method.auth_method.clone()?))
             })
             .collect();
@@ -1025,20 +1052,20 @@ impl CredentialData {
                     .any(|category| matches!(category.as_str(), "llm-provider" | "llm-gateway"))
             {
                 for provider in &row.provider_ids {
-                    if row.auth_method.as_deref().is_some_and(
-                        striatum_core::billing::is_api_metered_auth_method,
-                    ) && self
-                        .serving
-                        .keys()
-                        .any(|key| key.split_once('/').is_some_and(|(id, _)| id == provider))
+                    if row
+                        .auth_method
+                        .as_deref()
+                        .is_some_and(striatum_core::billing::is_api_metered_auth_method)
+                        && self
+                            .serving
+                            .keys()
+                            .any(|key| key.split_once('/').is_some_and(|(id, _)| id == provider))
                     {
                         continue;
                     }
-                    let provider = striatum_core::score_alias::alias_target(
-                        &self.priced_targets,
-                        provider,
-                    )
-                    .unwrap_or(provider);
+                    let provider =
+                        striatum_core::score_alias::alias_target(&self.priced_targets, provider)
+                            .unwrap_or(provider);
                     if let Some(method) = &row.auth_method {
                         keys.insert((provider.to_string(), method.clone()));
                     }
@@ -1068,8 +1095,7 @@ impl CredentialData {
         for fact in facts {
             let key = format!("{}/{}", fact.provider_id, fact.model_id);
             let method = self.serving_method(fact, &catalog);
-            let catalog_key =
-                striatum_core::score_alias::catalog_key(&self.priced_targets, &key);
+            let catalog_key = striatum_core::score_alias::catalog_key(&self.priced_targets, &key);
             let multiplier_configured = pricing.subscription_multiplier(&key).is_some();
             fact.billing_plane = Some(self.billing_catalog.for_route(
                 &catalog_key,
@@ -1236,21 +1262,31 @@ mod tests {
         let mut credentials = super::BrocaCredentials::default();
         let mut fact = crate::tests::fact("vendor", "listed");
         credentials.catalog_providers = [&fact].into_iter().collect();
-        credentials.serving.insert("vendor/listed".into(), super::ServingMethod {
-            auth_method: Some("custom-signin".into()), reason: "roster".into(),
-        });
+        credentials.serving.insert(
+            "vendor/listed".into(),
+            super::ServingMethod {
+                auth_method: Some("custom-signin".into()),
+                reason: "roster".into(),
+            },
+        );
         fact.auth_methods = Some(vec!["apikey".into(), "custom-signin".into()]);
         fact.login_methods_documented = true;
         let catalog = [&fact].into_iter().collect();
-        assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
-            "new positive coverage must not discard a valid quota roster choice");
+        assert_eq!(
+            credentials.serving_method(&fact, &catalog).reason,
+            "roster",
+            "new positive coverage must not discard a valid quota roster choice"
+        );
 
         let mut other = crate::tests::fact("other-vendor", "listed");
         other.auth_methods = Some(vec!["another-signin".into()]);
         other.login_methods_documented = true;
         let catalog = [&fact, &other].into_iter().collect();
-        assert_eq!(credentials.serving_method(&fact, &catalog).reason, "roster",
-            "a different provider's coverage must not affect this model's pricing");
+        assert_eq!(
+            credentials.serving_method(&fact, &catalog).reason,
+            "roster",
+            "a different provider's coverage must not affect this model's pricing"
+        );
     }
 
     #[test]
@@ -1902,10 +1938,17 @@ mod tests {
         fixed.account_id = Some("vault-account".into());
         let mut inferred = credential("inferred", &[]);
         inferred.serves = vec!["anthropic".into()];
-        credentials.apply_listing(&listing(vec![fixed, inferred,
-            credential("joined", &["anthropic"]), credential("ambiguous", &["anthropic"]),
-            credential("wrong", &["anthropic"]), credential("gone", &["anthropic"]),
-        ]), 1);
+        credentials.apply_listing(
+            &listing(vec![
+                fixed,
+                inferred,
+                credential("joined", &["anthropic"]),
+                credential("ambiguous", &["anthropic"]),
+                credential("wrong", &["anthropic"]),
+                credential("gone", &["anthropic"]),
+            ]),
+            1,
+        );
         credentials.refresh_serving_methods(&Default::default(), &facts(), 1, &[]);
         let mut quota = crate::account_quota::AccountQuotaState::default();
         for (n, (id, account, provider, tombstoned)) in [
@@ -1913,22 +1956,39 @@ mod tests {
             ("inferred", "inferred-account", "anthropic", false),
             ("joined", "joined-account", "anthropic", false),
             ("joined", "joined-account", "anthropic", false),
-            ("ambiguous", "a", "anthropic", false), ("ambiguous", "b", "anthropic", false),
+            ("ambiguous", "a", "anthropic", false),
+            ("ambiguous", "b", "anthropic", false),
             ("wrong", "wrong-account", "uncredentialed", false),
             ("gone", "gone-account", "anthropic", true),
-        ].into_iter().enumerate() {
-            quota.readings.readings.insert((format!("source-{n}"), account.into()), crate::account_quota::StoredReading {
-                provider: format!("source-{n}"), account_id: account.into(),
-                entry: serde_json::json!({"credentialRef":id,"apiProvider":provider}),
-                received_at_ms: 1, tombstoned_at_ms: tombstoned.then_some(1),
-            });
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            quota.readings.readings.insert(
+                (format!("source-{n}"), account.into()),
+                crate::account_quota::StoredReading {
+                    provider: format!("source-{n}"),
+                    account_id: account.into(),
+                    entry: serde_json::json!({"credentialRef":id,"apiProvider":provider}),
+                    received_at_ms: 1,
+                    tombstoned_at_ms: tombstoned.then_some(1),
+                },
+            );
         }
         let accounts = credentials.quota_account_ids(&quota);
         assert_eq!(accounts["fixed"].as_deref(), Some("vault-account"));
         assert_eq!(accounts["inferred"].as_deref(), Some("inferred-account"));
         assert_eq!(accounts["joined"].as_deref(), Some("joined-account"));
-        for id in ["ambiguous", "wrong", "gone"] { assert!(accounts[id].is_none()); }
-        assert!(credentials.listed_credentials().iter().find(|r| r.id == "joined").unwrap().account_id.is_none());
+        for id in ["ambiguous", "wrong", "gone"] {
+            assert!(accounts[id].is_none());
+        }
+        assert!(credentials
+            .listed_credentials()
+            .iter()
+            .find(|r| r.id == "joined")
+            .unwrap()
+            .account_id
+            .is_none());
     }
 
     #[test]
@@ -1938,7 +1998,10 @@ mod tests {
         assert!(Arc::ptr_eq(&credentials.inner, &snapshot.inner));
         credentials.apply_listing(&listing(vec![credential("new", &["anthropic"])]), 2);
         assert!(!Arc::ptr_eq(&credentials.inner, &snapshot.inner));
-        assert_ne!(credentials.listed_credentials()[0].id, snapshot.listed_credentials()[0].id);
+        assert_ne!(
+            credentials.listed_credentials()[0].id,
+            snapshot.listed_credentials()[0].id
+        );
     }
 
     #[tokio::test]
@@ -2040,10 +2103,7 @@ mod tests {
             &facts,
             &shared,
         );
-        assert_eq!(
-            substrate,
-            striatum_core::AvailabilitySubstrate::Broca
-        );
+        assert_eq!(substrate, striatum_core::AvailabilitySubstrate::Broca);
         assert_eq!(available, HashSet::from(["anthropic/m1".into()]));
     }
 
@@ -2081,10 +2141,7 @@ mod tests {
             assert!(!selection.note.unwrap().contains("unmapped"));
             let (substrate, available) =
                 crate::panel_availability(Some("broca"), HashSet::new(), &facts, &shared);
-            assert_eq!(
-                substrate,
-                striatum_core::AvailabilitySubstrate::Broca
-            );
+            assert_eq!(substrate, striatum_core::AvailabilitySubstrate::Broca);
             assert_eq!(available, HashSet::from(["anthropic/m1".into()]));
 
             // The unmapped row remains visible, but it cannot widen the routes

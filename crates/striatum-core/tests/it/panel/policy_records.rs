@@ -217,9 +217,10 @@ fn design_review_and_diagnose_policy_readback_fixtures() {
             for key in ["adequacyEligible", "distinctFamilies", "initiallyAdmitted"] {
                 expected["funnel"][key] = json!(2);
             }
-            expected["seats"].as_array_mut().unwrap().push(
-                json!({"slot":1,"routeKey":"p/D","reason":"topK","rank":2}),
-            );
+            expected["seats"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"slot":1,"routeKey":"p/D","reason":"topK","rank":2}));
             expected["seatedVariants"]
                 .as_array_mut()
                 .unwrap()

@@ -1,8 +1,8 @@
 //! Request-local tier eligibility and pricing. Public facts never infer a plan.
 
 use cortexkit_claustrum_client::ListedCredential;
-use striatum_core::{BillingRate, ModelFact};
 use serde_json::Value;
+use striatum_core::{BillingRate, ModelFact};
 
 use crate::broca_credentials::BrocaCredentials;
 

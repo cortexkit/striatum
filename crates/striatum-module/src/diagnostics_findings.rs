@@ -33,6 +33,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use striatum_core::accounts::ResetTime;
 use striatum_core::route_state_store::CredentialEntitlementFence;
 use striatum_core::{RouteStateStore, RouteWallClass};
@@ -40,8 +42,6 @@ use striatum_store::{
     DiagnosticAccountBlock, DiagnosticAccountHold, DiagnosticDecision, DiagnosticKeyWall,
     DiagnosticRouteWall, SqliteRouteStateStore,
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
 use subc_protocol::{ErrorBody, Flags, Frame, FrameType, Priority};
 use tokio::sync::mpsc;
 
@@ -174,9 +174,7 @@ impl Evidence {
                 .get_facts()
                 .map_err(text)?
                 .iter()
-                .map(|fact| {
-                    striatum_core::make_capacity_key(&fact.provider_id, &fact.model_id)
-                })
+                .map(|fact| striatum_core::make_capacity_key(&fact.provider_id, &fact.model_id))
                 .collect(),
             quota: crate::ACCOUNT_QUOTA
                 .get()
@@ -490,10 +488,8 @@ struct RouteWall<'a> {
 /// error that concerns one account is set aside, exactly as selection sets it
 /// aside, because it does not block the route for other accounts.
 fn live_route_wall(row: &DiagnosticRouteWall, now_ms: i64) -> Option<RouteWall<'_>> {
-    let account_scoped = striatum_core::account_wall::account_scoped_wall(
-        row.last_error.as_deref(),
-        row.wall_class,
-    );
+    let account_scoped =
+        striatum_core::account_wall::account_scoped_wall(row.last_error.as_deref(), row.wall_class);
     let mut candidates = Vec::new();
     if !account_scoped {
         candidates.push((
@@ -1206,13 +1202,13 @@ mod tests {
     #[test]
     fn unscored_admissible_model_vector_matches_bytes() {
         let mut evidence = empty();
-        evidence.unscored_admissible_models.push(
-            striatum_store::UnscoredAdmissibleModel {
+        evidence
+            .unscored_admissible_models
+            .push(striatum_store::UnscoredAdmissibleModel {
                 model: "synthetic-lab/ungraded-model".into(),
                 first_seen_ms: 1_799_999_990_000,
                 last_seen_ms: 1_799_999_999_000,
-            },
-        );
+            });
         let reply = json!({"result": report(&evidence, 1_800_000_000_000, 60_000)});
         let mut bytes = serde_json::to_vec_pretty(&reply).unwrap();
         bytes.push(b'\n');
@@ -1225,10 +1221,18 @@ mod tests {
 
     #[test]
     fn signed_out_finding_describes_sign_in_not_a_refused_key() {
-        let findings = credential_fences(&[CredentialEntitlementFence {
-            provider_id: "provider".into(), credential_id: "oauth".into(),
-            code: "signed_out".into(), listing_fingerprint: None, observed_at_ms: NOW,
-        }], &Default::default(), &[], NOW);
+        let findings = credential_fences(
+            &[CredentialEntitlementFence {
+                provider_id: "provider".into(),
+                credential_id: "oauth".into(),
+                code: "signed_out".into(),
+                listing_fingerprint: None,
+                observed_at_ms: NOW,
+            }],
+            &Default::default(),
+            &[],
+            NOW,
+        );
         assert_eq!(findings[0].samples[0]["kind"], "sign_in");
         assert!(findings[0].hint.contains("Sign in"));
         assert!(!findings[0].hint.contains("refused"));

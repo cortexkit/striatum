@@ -5,10 +5,10 @@
 use std::sync::Arc;
 
 use cortexkit_role_routing_conformance::CatalogModel;
+use serde_json::{json, Value};
 use striatum_core::billing::{BillingPlane, BillingRate};
 use striatum_core::ModelFact;
 use striatum_store::{FusiformCatalogCursor, FusiformFactUpdate};
-use serde_json::{json, Value};
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{catalog_fact, reserved, Harness};
@@ -82,7 +82,8 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
                 &[FusiformFactUpdate {
                     provider_id: fact.provider_id.clone(),
                     model_id: fact.model_id.clone(),
-                    auth_methods: Some(vec!["apikey".into()]), login_methods_documented: false,
+                    auth_methods: Some(vec!["apikey".into()]),
+                    login_methods_documented: false,
                     present: true,
                     context_window: fact.context_window,
                     max_output_tokens: fact.max_output_tokens,
@@ -96,7 +97,9 @@ fn harness_of(route_keys: &[&str], plan_prices: Value) -> Arc<Harness> {
                     supports_tool_use: fact.supports_tool_use,
                     reasoning_efforts: None,
                     canonical_id: None,
-                    upstream_status: None, model_type: None, model_kind: None,
+                    upstream_status: None,
+                    model_type: None,
+                    model_kind: None,
                     lineage: None,
                 }],
                 FusiformCatalogCursor {
@@ -329,10 +332,7 @@ async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
         assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
         // Legacy and v1 selections both claim a chosen probe's durable
         // interval before a runner asks for its account admission.
-        assert_eq!(
-            refused.1["detail"]["reset_at_ms"],
-            FENCE_NOW + 3_600_000
-        );
+        assert_eq!(refused.1["detail"]["reset_at_ms"], FENCE_NOW + 3_600_000);
 
         let request = broca_account_request(
             &selected[0].1["result"]["decision_id"],
@@ -430,8 +430,14 @@ fn a_legacy_launch_whose_probe_another_selection_bound_is_told_when_to_retry() {
     let _binding = first
         .bind_selected_probe(harness.store(), "inception", "mercury-3", true, "winner")
         .unwrap();
-    let launched =
-        second.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, Some("loser"));
+    let launched = second.claim_launch_credential(
+        harness.store(),
+        "inception",
+        "mercury-3",
+        true,
+        true,
+        Some("loser"),
+    );
     // Compared through Debug, so the check also compiles against a refusal
     // type that carries only a code and a message, and fails there.
     let shown = format!("{launched:?}");
@@ -458,8 +464,14 @@ fn a_selection_claiming_its_launch_probe_twice_keeps_it() {
         .reserve_selection_probes(harness.store(), &harness.credentials())
         .unwrap();
     for attempt in ["first", "second"] {
-        let launched =
-            context.claim_launch_credential(harness.store(), "inception", "mercury-3", true, true, None);
+        let launched = context.claim_launch_credential(
+            harness.store(),
+            "inception",
+            "mercury-3",
+            true,
+            true,
+            None,
+        );
         assert!(launched.is_ok(), "{attempt}: {launched:?}");
     }
 }
@@ -572,15 +584,21 @@ async fn broca_unstarted_probe_admission_expires_after_one_minute() {
         let harness = broca_fence_harness();
         fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
         if quota {
-            harness.store().account_transaction(|tx| {
-                tx.classify_credential_quota("inception", "apikey:inception", true)
-            }).unwrap();
+            harness
+                .store()
+                .account_transaction(|tx| {
+                    tx.classify_credential_quota("inception", "apikey:inception", true)
+                })
+                .unwrap();
         }
         let runner = harness.bind(reserved("broca"), None).await;
         let first = broca_account_request(&Value::Null, "abandoned", false);
         let admitted = runner.call("route.account_for", &first).await;
         assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
-        assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe");
+        assert_eq!(
+            admitted.1["result"]["reason"]["code"],
+            "credential_fence_probe"
+        );
 
         let _before_expiry = crate::InjectedClock::set(FENCE_NOW + 59_999);
         let waiting = broca_account_request(&Value::Null, "too-soon", false);
@@ -596,15 +614,29 @@ async fn broca_unstarted_probe_admission_expires_after_one_minute() {
             runner.call("route.account_for", &b),
         );
         let replies = [a, b];
-        assert_eq!(replies.iter().filter(|r| r.0 == FrameType::Response).count(), 1,
-            "one replacement must take the unused probe, quota={quota}: {replies:?}");
+        assert_eq!(
+            replies
+                .iter()
+                .filter(|r| r.0 == FrameType::Response)
+                .count(),
+            1,
+            "one replacement must take the unused probe, quota={quota}: {replies:?}"
+        );
         let admitted = replies.iter().find(|r| r.0 == FrameType::Response).unwrap();
-        assert_eq!(admitted.1["result"]["account"]["credential_id"], "apikey:inception");
-        assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe");
+        assert_eq!(
+            admitted.1["result"]["account"]["credential_id"],
+            "apikey:inception"
+        );
+        assert_eq!(
+            admitted.1["result"]["reason"]["code"],
+            "credential_fence_probe"
+        );
         let refused = replies.iter().find(|r| r.0 == FrameType::Error).unwrap();
         assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
-        assert!(!harness.store().fence_rechecks().unwrap().is_empty(),
-            "expiry releases the claim, not the underlying refusal");
+        assert!(
+            !harness.store().fence_rechecks().unwrap().is_empty(),
+            "expiry releases the claim, not the underlying refusal"
+        );
     }
 }
 
@@ -661,20 +693,28 @@ async fn broca_abandoned_probe_selection_holds_until_its_interval() {
 
 pub(super) fn quota_probe_harness() -> Arc<Harness> {
     let harness = broca_fence_harness();
-    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
-        provider: "inception".into(),
-        credential_id: "apikey:inception".into(),
-        model: "mercury-3".into(),
-        until_ms: FENCE_NOW as i64 + 5 * 86_400_000,
-        decision_id: "previous-refusal".into(),
-        recorded_at: FENCE_NOW as i64 - 900_000,
-    }).unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "inception".into(),
+            credential_id: "apikey:inception".into(),
+            model: "mercury-3".into(),
+            until_ms: FENCE_NOW as i64 + 5 * 86_400_000,
+            decision_id: "previous-refusal".into(),
+            recorded_at: FENCE_NOW as i64 - 900_000,
+        })
+        .unwrap();
     harness
 }
 
 fn quota_probe_clock(harness: &Harness) -> striatum_store::FenceRecheck {
-    harness.store().fence_rechecks().unwrap().into_iter()
-        .find(|origin| origin.kind == "account_route").unwrap()
+    harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .into_iter()
+        .find(|origin| origin.kind == "account_route")
+        .unwrap()
 }
 
 #[tokio::test]
@@ -682,17 +722,29 @@ async fn decision_probe_without_account_admission_holds_for_fifteen_minutes() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = quota_probe_harness();
     let selected = broca_select(&harness, false).await;
-    assert_eq!(broca_selected_route(&selected, false), "inception/mercury-3");
+    assert_eq!(
+        broca_selected_route(&selected, false),
+        "inception/mercury-3"
+    );
     let clock = quota_probe_clock(&harness);
     assert_eq!(clock.last_claimed_at, Some(FENCE_NOW as i64));
     assert_eq!(clock.next_recheck_at, FENCE_NOW as i64 + 900_000);
-    assert_eq!(clock.claim_owner.as_deref(), selected.1["result"]["decision_id"].as_str());
+    assert_eq!(
+        clock.claim_owner.as_deref(),
+        selected.1["result"]["decision_id"].as_str()
+    );
     for elapsed in [120_000, 600_001, 899_999] {
         let _later = crate::InjectedClock::set(FENCE_NOW + elapsed);
-        assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "muse/model");
+        assert_eq!(
+            broca_selected_route(&broca_select(&harness, false).await, false),
+            "muse/model"
+        );
     }
     let _interval = crate::InjectedClock::set(FENCE_NOW + 900_000);
-    assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "inception/mercury-3");
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "inception/mercury-3"
+    );
 }
 
 #[tokio::test]
@@ -705,15 +757,37 @@ async fn decision_probe_failure_without_account_admission_advances_once() {
     let _failure = crate::InjectedClock::set(FENCE_NOW + 200_000);
     let reported = reporter.call("route.report", &body).await;
     assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
-    assert_eq!(quota_probe_clock(&harness).next_recheck_at, FENCE_NOW as i64 + 1_100_000);
+    assert_eq!(
+        quota_probe_clock(&harness).next_recheck_at,
+        FENCE_NOW as i64 + 1_100_000
+    );
     let _duplicate = crate::InjectedClock::set(FENCE_NOW + 300_000);
-    assert_eq!(reporter.call("route.report", &body).await.0, FrameType::Response);
-    assert_eq!(quota_probe_clock(&harness).next_recheck_at, FENCE_NOW as i64 + 1_100_000);
+    assert_eq!(
+        reporter.call("route.report", &body).await.0,
+        FrameType::Response
+    );
+    assert_eq!(
+        quota_probe_clock(&harness).next_recheck_at,
+        FENCE_NOW as i64 + 1_100_000
+    );
     let _original_interval = crate::InjectedClock::set(FENCE_NOW + 900_000);
-    assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "muse/model");
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "muse/model"
+    );
     let _next = crate::InjectedClock::set(FENCE_NOW + 1_100_000);
-    assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "inception/mercury-3");
-    assert_eq!(harness.store().account_route_fences(FENCE_NOW as i64).unwrap().len(), 1);
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "inception/mercury-3"
+    );
+    assert_eq!(
+        harness
+            .store()
+            .account_route_fences(FENCE_NOW as i64)
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -734,7 +808,11 @@ async fn decision_probe_ignores_rejected_unknown_and_other_credential_reports() 
         let reported = reporter.call("route.report", &body).await;
         assert_eq!(reported.0, FrameType::Response, "{outcome}: {}", reported.1);
         let after = quota_probe_clock(&harness);
-        assert_eq!(after.next_recheck_at, FENCE_NOW as i64 + 900_000, "{outcome}");
+        assert_eq!(
+            after.next_recheck_at,
+            FENCE_NOW as i64 + 900_000,
+            "{outcome}"
+        );
         assert_eq!(after.claim_owner, before.claim_owner, "{outcome}");
     }
 }
@@ -745,11 +823,20 @@ async fn decision_probe_success_without_account_admission_heals_its_fence() {
     let harness = quota_probe_harness();
     let selected = broca_select(&harness, false).await;
     let reporter = harness.bind(reserved("example-consumer"), None).await;
-    let reported = reporter.call("route.report", &json!({
-        "decision_id":selected.1["result"]["decision_id"],"outcome":"completed"
-    })).await;
+    let reported = reporter
+        .call(
+            "route.report",
+            &json!({
+                "decision_id":selected.1["result"]["decision_id"],"outcome":"completed"
+            }),
+        )
+        .await;
     assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
-    assert!(harness.store().account_route_fences(FENCE_NOW as i64).unwrap().is_empty());
+    assert!(harness
+        .store()
+        .account_route_fences(FENCE_NOW as i64)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -762,13 +849,21 @@ async fn decision_probe_late_failure_cannot_advance_a_newer_generation() {
     assert_eq!(broca_selected_route(&second, false), "inception/mercury-3");
     let reporter = harness.bind(reserved("example-consumer"), None).await;
     let _later = crate::InjectedClock::set(FENCE_NOW + 1_000_000);
-    let reported = reporter.call("route.report", &json!({
-        "decision_id":first.1["result"]["decision_id"],"outcome":"failed"
-    })).await;
+    let reported = reporter
+        .call(
+            "route.report",
+            &json!({
+                "decision_id":first.1["result"]["decision_id"],"outcome":"failed"
+            }),
+        )
+        .await;
     assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
     let clock = quota_probe_clock(&harness);
     assert_eq!(clock.next_recheck_at, FENCE_NOW as i64 + 1_800_000);
-    assert_eq!(clock.claim_owner.as_deref(), second.1["result"]["decision_id"].as_str());
+    assert_eq!(
+        clock.claim_owner.as_deref(),
+        second.1["result"]["decision_id"].as_str()
+    );
 }
 
 #[tokio::test]
@@ -778,39 +873,82 @@ async fn decision_probe_unstarted_admission_returns_its_exact_generation() {
     let selected = broca_select(&harness, false).await;
     let _admission = crate::InjectedClock::set(FENCE_NOW + 30_000);
     let runner = harness.bind(reserved("broca"), None).await;
-    let request = broca_account_request(&selected.1["result"]["decision_id"], "selected-unused", false);
+    let request = broca_account_request(
+        &selected.1["result"]["decision_id"],
+        "selected-unused",
+        false,
+    );
     let admitted = runner.call("route.account_for", &request).await;
     assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
-    assert_eq!(quota_probe_clock(&harness).next_recheck_at, FENCE_NOW as i64 + 900_000);
+    assert_eq!(
+        quota_probe_clock(&harness).next_recheck_at,
+        FENCE_NOW as i64 + 900_000
+    );
     let _expiry = crate::InjectedClock::set(FENCE_NOW + 91_000);
     let replacement = broca_select(&harness, false).await;
-    assert_eq!(broca_selected_route(&replacement, false), "inception/mercury-3");
+    assert_eq!(
+        broca_selected_route(&replacement, false),
+        "inception/mercury-3"
+    );
     let reporter = harness.bind(reserved("example-consumer"), None).await;
     let _late = crate::InjectedClock::set(FENCE_NOW + 92_000);
-    assert_eq!(reporter.call("route.report", &json!({
-        "decision_id":selected.1["result"]["decision_id"],"outcome":"failed"
-    })).await.0, FrameType::Response);
-    assert_eq!(quota_probe_clock(&harness).next_recheck_at, FENCE_NOW as i64 + 991_000);
+    assert_eq!(
+        reporter
+            .call(
+                "route.report",
+                &json!({
+                    "decision_id":selected.1["result"]["decision_id"],"outcome":"failed"
+                })
+            )
+            .await
+            .0,
+        FrameType::Response
+    );
+    assert_eq!(
+        quota_probe_clock(&harness).next_recheck_at,
+        FENCE_NOW as i64 + 991_000
+    );
 }
 
 #[tokio::test]
 async fn decision_probe_reset_check_cannot_bypass_a_held_slot() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = quota_probe_harness();
-    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
-        provider: "inception".into(), credential_id: "apikey:inception".into(), model: "mercury-3".into(),
-        until_ms: FENCE_NOW as i64 + 60_000, decision_id: "earlier-reset".into(),
-        recorded_at: FENCE_NOW as i64 - 900_000,
-    }).unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "inception".into(),
+            credential_id: "apikey:inception".into(),
+            model: "mercury-3".into(),
+            until_ms: FENCE_NOW as i64 + 60_000,
+            decision_id: "earlier-reset".into(),
+            recorded_at: FENCE_NOW as i64 - 900_000,
+        })
+        .unwrap();
     let selected = broca_select(&harness, false).await;
-    assert_eq!(broca_selected_route(&selected, false), "inception/mercury-3");
+    assert_eq!(
+        broca_selected_route(&selected, false),
+        "inception/mercury-3"
+    );
     let _reset = crate::InjectedClock::set(FENCE_NOW + 120_000);
-    assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "muse/model");
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "muse/model"
+    );
     let runner = harness.bind(reserved("broca"), None).await;
-    let denied = runner.call("route.account_for", &broca_account_request(&Value::Null, "reset-bypass", false)).await;
+    let denied = runner
+        .call(
+            "route.account_for",
+            &broca_account_request(&Value::Null, "reset-bypass", false),
+        )
+        .await;
     assert_eq!(denied.0, FrameType::Error, "{}", denied.1);
-    let reused = runner.call("route.account_for", &broca_account_request(
-        &selected.1["result"]["decision_id"], "reset-owner", false)).await;
+    let reused = runner
+        .call(
+            "route.account_for",
+            &broca_account_request(&selected.1["result"]["decision_id"], "reset-owner", false),
+        )
+        .await;
     assert_eq!(reused.0, FrameType::Response, "{}", reused.1);
     let clock = quota_probe_clock(&harness);
     assert_eq!(clock.last_claimed_at, Some(FENCE_NOW as i64));
@@ -821,22 +959,41 @@ async fn decision_probe_reset_check_cannot_bypass_a_held_slot() {
 async fn a_held_quota_probe_answers_a_reset_time_racer_with_its_interval() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = quota_probe_harness();
-    harness.store().record_account_route_fence(&striatum_store::AccountRouteFence {
-        provider: "inception".into(), credential_id: "apikey:inception".into(), model: "mercury-3".into(),
-        until_ms: FENCE_NOW as i64 + 60_000, decision_id: "earlier-reset".into(),
-        recorded_at: FENCE_NOW as i64 - 900_000,
-    }).unwrap();
+    harness
+        .store()
+        .record_account_route_fence(&striatum_store::AccountRouteFence {
+            provider: "inception".into(),
+            credential_id: "apikey:inception".into(),
+            model: "mercury-3".into(),
+            until_ms: FENCE_NOW as i64 + 60_000,
+            decision_id: "earlier-reset".into(),
+            recorded_at: FENCE_NOW as i64 - 900_000,
+        })
+        .unwrap();
     let selected = broca_select(&harness, false).await;
-    assert_eq!(broca_selected_route(&selected, false), "inception/mercury-3");
+    assert_eq!(
+        broca_selected_route(&selected, false),
+        "inception/mercury-3"
+    );
     // The provider's reset is past, but the selected decision still holds
     // the quota probe: another admission loses the race for it, and is told
     // when the holder's interval ends.
     let _reset = crate::InjectedClock::set(FENCE_NOW + 120_000);
     let runner = harness.bind(reserved("broca"), None).await;
-    let lost = runner.call("route.account_for", &broca_account_request(&Value::Null, "reset-racer", false)).await;
+    let lost = runner
+        .call(
+            "route.account_for",
+            &broca_account_request(&Value::Null, "reset-racer", false),
+        )
+        .await;
     assert_eq!(lost.0, FrameType::Error, "{}", lost.1);
     assert_eq!(lost.1["code"], "account_pool_exhausted", "{}", lost.1);
-    assert_eq!(lost.1["detail"]["reset_at_ms"], FENCE_NOW + 900_000, "{}", lost.1);
+    assert_eq!(
+        lost.1["detail"]["reset_at_ms"],
+        FENCE_NOW + 900_000,
+        "{}",
+        lost.1
+    );
     assert_eq!(lost.1["detail"]["retry_after_s"], 780, "{}", lost.1);
 }
 
@@ -846,20 +1003,39 @@ async fn decision_probe_reported_admission_cannot_expire_back_to_due() {
     let harness = quota_probe_harness();
     let selected = broca_select(&harness, false).await;
     let runner = harness.bind(reserved("broca"), None).await;
-    let admitted = runner.call("route.account_for", &broca_account_request(
-        &selected.1["result"]["decision_id"], "reported-before-start", false)).await;
+    let admitted = runner
+        .call(
+            "route.account_for",
+            &broca_account_request(
+                &selected.1["result"]["decision_id"],
+                "reported-before-start",
+                false,
+            ),
+        )
+        .await;
     assert_eq!(admitted.0, FrameType::Response, "{}", admitted.1);
     let reporter = harness.bind(reserved("example-consumer"), None).await;
     let _failure = crate::InjectedClock::set(FENCE_NOW + 30_000);
-    let reported = reporter.call("route.report", &json!({
-        "decision_id":selected.1["result"]["decision_id"], "outcome":"failed",
-        "credential_id":"apikey:inception", "runner_code":"account_limit_exhausted",
-        "reset_at_ms":FENCE_NOW + 5 * 86_400_000,
-    })).await;
+    let reported = reporter
+        .call(
+            "route.report",
+            &json!({
+                "decision_id":selected.1["result"]["decision_id"], "outcome":"failed",
+                "credential_id":"apikey:inception", "runner_code":"account_limit_exhausted",
+                "reset_at_ms":FENCE_NOW + 5 * 86_400_000,
+            }),
+        )
+        .await;
     assert_eq!(reported.0, FrameType::Response, "{}", reported.1);
     let _expiry = crate::InjectedClock::set(FENCE_NOW + 61_000);
-    assert_eq!(broca_selected_route(&broca_select(&harness, false).await, false), "muse/model");
-    assert_eq!(quota_probe_clock(&harness).next_recheck_at, FENCE_NOW as i64 + 930_000);
+    assert_eq!(
+        broca_selected_route(&broca_select(&harness, false).await, false),
+        "muse/model"
+    );
+    assert_eq!(
+        quota_probe_clock(&harness).next_recheck_at,
+        FENCE_NOW as i64 + 930_000
+    );
 }
 
 #[tokio::test]
@@ -1037,7 +1213,8 @@ async fn explicit_metered_consumers_rank_at_list_price_without_subscription_subs
         json!({ "prices": [{ "provider_id": "plan-provider" }] }),
     );
     harness.edit_config(|config| {
-        config["providers"]["metered-b"] = json!({ "subscription_multiplier": 40.0, "pin_only": false });
+        config["providers"]["metered-b"] =
+            json!({ "subscription_multiplier": 40.0, "pin_only": false });
     });
     let route = harness.bind(reserved("example-consumer"), None).await;
 
@@ -1097,9 +1274,20 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
     let runner = harness.bind(reserved("broca"), None).await;
     let first = broca_account_request(&Value::Null, "abandoned", false);
     let admitted = runner.call("route.account_for", &first).await;
-    assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe", "{}", admitted.1);
-    let held = crate::account_state::published(harness.store(), crate::account_selection::now_ms()).unwrap().block_state().unwrap().clone();
-    assert!(!held.authorization_owners().is_empty(), "the admission holds the probe");
+    assert_eq!(
+        admitted.1["result"]["reason"]["code"], "credential_fence_probe",
+        "{}",
+        admitted.1
+    );
+    let held = crate::account_state::published(harness.store(), crate::account_selection::now_ms())
+        .unwrap()
+        .block_state()
+        .unwrap()
+        .clone();
+    assert!(
+        !held.authorization_owners().is_empty(),
+        "the admission holds the probe"
+    );
 
     let now = FENCE_NOW as i64 + 61_000;
     let _after = crate::InjectedClock::set(now as u64);
@@ -1117,14 +1305,27 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
         commits,
         "reading an expired probe sends no command"
     );
-    let read = crate::account_state::published(harness.store(), now).unwrap().block_state().unwrap().clone();
-    assert!(read.authorization_owners().is_empty(), "the reader sees the probe released");
+    let read = crate::account_state::published(harness.store(), now)
+        .unwrap()
+        .block_state()
+        .unwrap()
+        .clone();
+    assert!(
+        read.authorization_owners().is_empty(),
+        "the reader sees the probe released"
+    );
 
     let _tick = crate::InjectedClock::set(now as u64 + 30_000);
     crate::account_writer::tick(harness.store(), now + 30_000).unwrap();
-    assert!(harness.store().writer_commit_count_for_test() > commits, "the Tick releases it durably");
+    assert!(
+        harness.store().writer_commit_count_for_test() > commits,
+        "the Tick releases it durably"
+    );
     let stored = crate::account_state::snapshot(harness.store()).unwrap();
-    assert!(stored.blocks == read, "the release writes exactly what the reader saw");
+    assert!(
+        stored.blocks == read,
+        "the release writes exactly what the reader saw"
+    );
 
     let a = broca_account_request(&Value::Null, "replacement-a", false);
     let b = broca_account_request(&Value::Null, "replacement-b", false);
@@ -1134,7 +1335,10 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
     );
     let replies = [a, b];
     assert_eq!(
-        replies.iter().filter(|r| r.0 == FrameType::Response).count(),
+        replies
+            .iter()
+            .filter(|r| r.0 == FrameType::Response)
+            .count(),
         1,
         "the reopened probe is taken once: {replies:?}"
     );
@@ -1142,5 +1346,9 @@ async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_
     let refused = runner.call("route.account_for", &later).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
-    assert!(refused.1["detail"]["reset_at_ms"].is_i64() || refused.1["detail"]["reset_at_ms"].is_u64(), "a timed wait: {}", refused.1);
+    assert!(
+        refused.1["detail"]["reset_at_ms"].is_i64() || refused.1["detail"]["reset_at_ms"].is_u64(),
+        "a timed wait: {}",
+        refused.1
+    );
 }

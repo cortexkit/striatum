@@ -96,7 +96,9 @@ fn write_batch(
     // command decides on rows older than the ones it writes over.
     if let Err(error) = writer.reload_if_moved(conn) {
         transaction.rollback()?;
-        return Ok(BatchOutcome::Diverged(format!("reload account state: {error}")));
+        return Ok(BatchOutcome::Diverged(format!(
+            "reload account state: {error}"
+        )));
     }
     let state = &mut writer.working;
     for queued in batch.iter_mut() {
@@ -204,8 +206,9 @@ fn run_batch(
 /// A hook run once on the writer thread just before the next batch on the
 /// database at the given path opens its write transaction.
 #[cfg(test)]
-pub(crate) static BEFORE_BEGIN: std::sync::Mutex<Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static BEFORE_BEGIN: std::sync::Mutex<
+    Vec<(std::path::PathBuf, Box<dyn FnOnce() + Send>)>,
+> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
 fn before_begin_for_test(conn: &Connection) {
@@ -296,7 +299,10 @@ where
         // only the last run's result is replied.
         let result = (self.run)(tx, state);
         let status = result.as_ref().map(|_| ()).map_err(|error| {
-            error.store_error().map(err).unwrap_or_else(|| err("account command refused"))
+            error
+                .store_error()
+                .map(err)
+                .unwrap_or_else(|| err("account command refused"))
         });
         self.result = Some(result);
         status
@@ -343,7 +349,6 @@ impl<T> AccountReply<T> {
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
         }
     }
-
 }
 
 impl<T, E: AccountCommandError> AccountReply<T, E> {
@@ -508,8 +513,12 @@ impl AccountWriter {
 
     fn enqueue_inner_with_error<T: Send + 'static, E: AccountCommandError>(
         &self,
-        f: impl FnMut(&AccountTx<'_>, Option<&mut (dyn crate::AccountWorkingState + 'static)>) -> Result<T, E>
-            + Send + 'static,
+        f: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> Result<T, E>
+            + Send
+            + 'static,
         initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T, E>> {
         if self.dead.load(Ordering::Acquire) {
@@ -552,7 +561,9 @@ impl SqliteRouteStateStore {
         let bound = self
             .account_state
             .get()
-            .map_or(std::time::Duration::from_secs(60), |bridge| bridge.load_wait());
+            .map_or(std::time::Duration::from_secs(60), |bridge| {
+                bridge.load_wait()
+            });
         let result = self
             .account_writer_engine()
             .enqueue_inner(|_, _| Ok(()), true)
@@ -563,7 +574,10 @@ impl SqliteRouteStateStore {
         // publication get the error instead of waiting forever. A load still
         // running is not a failure: it publishes when it ends.
         if let (Err(error), Some(bridge)) = (&result, self.account_state.get()) {
-            if !error.to_string().contains(crate::ACCOUNT_STATE_LOAD_PENDING) {
+            if !error
+                .to_string()
+                .contains(crate::ACCOUNT_STATE_LOAD_PENDING)
+            {
                 bridge.failed(&error.to_string());
             }
         }
@@ -614,8 +628,12 @@ impl SqliteRouteStateStore {
     pub fn enqueue_account_state_command_with_error<T: Send + 'static, E: AccountCommandError>(
         &self,
         kind: AccountCommandKind,
-        mut f: impl FnMut(&AccountTx<'_>, Option<&mut (dyn crate::AccountWorkingState + 'static)>) -> Result<T, E>
-            + Send + 'static,
+        mut f: impl FnMut(
+                &AccountTx<'_>,
+                Option<&mut (dyn crate::AccountWorkingState + 'static)>,
+            ) -> Result<T, E>
+            + Send
+            + 'static,
     ) -> RouteStateResult<AccountReply<T, E>> {
         if self.store.is_projection() {
             return Err(err(
@@ -668,7 +686,8 @@ impl SqliteRouteStateStore {
         if self.store.is_projection() {
             return self.direct_account_transaction_with_error(f);
         }
-        self.enqueue_account_state_command_with_error(kind, move |tx, _| f(tx))?.wait()
+        self.enqueue_account_state_command_with_error(kind, move |tx, _| f(tx))?
+            .wait()
     }
 
     #[cfg(any(test, feature = "test-support"))]

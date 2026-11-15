@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
 use cortexkit_role_routing_conformance::fixture;
-use striatum_core::RouteStateStore;
 use rusqlite::{types::Value as SqlValue, Connection};
 use serde_json::{json, Value};
+use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{reserved, Harness, Route};
@@ -48,16 +48,34 @@ async fn decommissioned_what_if_excludes_route_from_adequacy_and_keeps_reason() 
             "example-provider/model-b":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
         }
     })).unwrap()).unwrap();
-    crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("example-provider")).unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(
+        &harness.store(),
+        &snapshot,
+        None,
+        Some("example-provider"),
+    )
+    .unwrap();
     let before = rows(&harness);
     let direct = operator(&harness).await;
     let answer = evaluate(&direct, json!({"iqs":[0]})).await;
     let row = &answer["results"][0];
-    assert!(row["excluded"].as_array().unwrap().iter().any(|entry|
-        entry["route"]=="example-provider/model-b" && entry["reason"]=="decommissioned"), "{answer}");
-    assert!(!row["adequate"].to_string().contains("example-provider/model-b"), "{answer}");
-    assert_ne!(row["pick"]["route"]["model"],"model-b", "{answer}");
-    assert_eq!(rows(&harness),before);
+    assert!(
+        row["excluded"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["route"] == "example-provider/model-b"
+                && entry["reason"] == "decommissioned"),
+        "{answer}"
+    );
+    assert!(
+        !row["adequate"]
+            .to_string()
+            .contains("example-provider/model-b"),
+        "{answer}"
+    );
+    assert_ne!(row["pick"]["route"]["model"], "model-b", "{answer}");
+    assert_eq!(rows(&harness), before);
 }
 
 #[tokio::test]
@@ -553,7 +571,10 @@ async fn what_if_reports_the_same_estimated_task_dollars_as_live_selection() {
 async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() {
     for (settings, anchor) in [
         (json!({}), 5),
-        (json!({"providers":{"example-subscription":{"banked_resets":"capacity"}}}), 5),
+        (
+            json!({"providers":{"example-subscription":{"banked_resets":"capacity"}}}),
+            5,
+        ),
         (json!({"overqualification":{"mode":"cost_scaled"}}), 7),
     ] {
         let (harness, consumer) = configured().await;
@@ -566,21 +587,36 @@ async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() 
             }
         });
         for (request, id_field) in [
-            (json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}), "decision_id"),
-            (json!({"targetAgent":"mason","requirements":{"iq":50,"eq":50},"availableModels":["example-provider/model-a"]}), "decisionID"),
+            (
+                json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}),
+                "decision_id",
+            ),
+            (
+                json!({"targetAgent":"mason","requirements":{"iq":50,"eq":50},"availableModels":["example-provider/model-a"]}),
+                "decisionID",
+            ),
         ] {
             let (ty, reply) = consumer.call("route.select", &request).await;
             assert_eq!(ty, FrameType::Response, "{reply}");
-            let decision = harness.store().get_decision_by_id(
-                reply["result"][id_field].as_str().unwrap(),
-            ).unwrap().unwrap();
+            let decision = harness
+                .store()
+                .get_decision_by_id(reply["result"][id_field].as_str().unwrap())
+                .unwrap()
+                .unwrap();
             assert_eq!(decision.anchor_version, anchor, "{settings}: {reply}");
         }
         let operator = operator(&harness).await;
         let before = rows(&harness);
-        assert_eq!(evaluate(&operator, json!({"iqs":[50]})).await["anchor_version"], anchor);
-        for (mode, expected) in [("additive",5),("cost_scaled",7)] {
-            let preview = evaluate(&operator, json!({"iqs":[50],"pricing_patch":{"overqualification":mode}})).await;
+        assert_eq!(
+            evaluate(&operator, json!({"iqs":[50]})).await["anchor_version"],
+            anchor
+        );
+        for (mode, expected) in [("additive", 5), ("cost_scaled", 7)] {
+            let preview = evaluate(
+                &operator,
+                json!({"iqs":[50],"pricing_patch":{"overqualification":mode}}),
+            )
+            .await;
             assert_eq!(preview["anchor_version"], expected);
         }
         assert_eq!(

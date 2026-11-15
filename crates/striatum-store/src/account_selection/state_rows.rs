@@ -448,7 +448,10 @@ mod lookup_plan_tests {
                 .any(|line| line.contains("account_admission_by_conversation")),
             "{plan:?}"
         );
-        assert!(!plan.iter().any(|line| line.contains("TEMP B-TREE")), "{plan:?}");
+        assert!(
+            !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
     }
 
     #[test]

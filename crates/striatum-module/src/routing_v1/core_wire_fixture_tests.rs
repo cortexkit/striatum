@@ -1,9 +1,9 @@
 //! Routing owns the state assertions for the request bodies core records by path.
 use super::conformance_tests::{Harness, Route};
-use striatum_core::{DecisionInput, FactSource, RouteOutcome, RouteStateStore};
-use striatum_store::V1Decision;
 use serde_json::{json, Value};
 use std::path::Path;
+use striatum_core::{DecisionInput, FactSource, RouteOutcome, RouteStateStore};
+use striatum_store::V1Decision;
 
 fn cases(kind: &str) -> Vec<Value> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/routing-wire/states.json");

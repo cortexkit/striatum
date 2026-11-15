@@ -125,10 +125,7 @@ fn json_route_open(_project_root: &Path) -> Value {
     let target = RouteTarget::ManagementSurface {
         module_id: MODULE_ID.to_string(),
     };
-    let identity = BindIdentity::new(
-        "striatum-e2e".to_string(),
-        "session-1".to_string(),
-    );
+    let identity = BindIdentity::new("striatum-e2e".to_string(), "session-1".to_string());
     // NOTE: subc-protocol 0.4 (commit e0e7ce77) removed the route.open `config`
     // relay + ConfigTier; the current shape is { op, target, identity } only.
     serde_json::json!({ "op": "route.open", "target": target, "identity": identity })

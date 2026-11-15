@@ -415,7 +415,9 @@ impl BlockReadTrace {
             rusqlite::hooks::Authorization::Allow
         }));
         let prepared = conn.prepare(sql).map(drop);
-        conn.authorizer(None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>);
+        conn.authorizer(
+            None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+        );
         let triggers: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='trigger' UNION SELECT name FROM sqlite_temp_master WHERE type='trigger'")
             .and_then(|mut statement| {
@@ -430,7 +432,10 @@ impl BlockReadTrace {
                 // The accessor names the innermost trigger or view; a view's
                 // reads are the statement's own.
                 let trigger = |accessor: &Option<String>| {
-                    accessor.as_ref().filter(|name| triggers.contains(name)).cloned()
+                    accessor
+                        .as_ref()
+                        .filter(|name| triggers.contains(name))
+                        .cloned()
                 };
                 let target = events
                     .iter()
@@ -466,7 +471,10 @@ impl BlockReadTrace {
                     .collect();
                 fired.sort();
                 fired.dedup();
-                Classified { read, triggers: fired }
+                Classified {
+                    read,
+                    triggers: fired,
+                }
             }
             Err(_)
                 if reads_tables(sql, &BLOCK_TRACE_TABLES)
@@ -512,11 +520,11 @@ unsafe extern "C" fn on_block_statement(
         if found.triggers.is_empty() {
             return 0;
         }
-        if found
-            .triggers
-            .iter()
-            .all(|name| REVIEWED_TRIGGERS.iter().any(|(reviewed, _)| reviewed == name))
-        {
+        if found.triggers.iter().all(|name| {
+            REVIEWED_TRIGGERS
+                .iter()
+                .any(|(reviewed, _)| reviewed == name)
+        }) {
             tap.trace.triggers.lock().unwrap().push(text.into_owned());
             return 0;
         }
@@ -543,7 +551,11 @@ unsafe extern "C" fn on_block_statement(
             .lock()
             .unwrap()
             .push(expanded.unwrap_or_else(|| text.to_string()));
-        tap.trace.route_writes.lock().unwrap().push(text.into_owned());
+        tap.trace
+            .route_writes
+            .lock()
+            .unwrap()
+            .push(text.into_owned());
     } else if tap.writer {
         tap.trace.writer.lock().unwrap().push(text.into_owned());
     } else {
@@ -559,7 +571,8 @@ fn attach_block_tap(conn: &Connection, tap: &'static BlockTap) {
             if let Some(path) = conn.path().filter(|path| !path.is_empty()) {
                 let side = Connection::open_with_flags(
                     path,
-                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                        | rusqlite::OpenFlags::SQLITE_OPEN_URI,
                 )
                 .expect("open the classifier connection");
                 // The sync's TEMP snapshot, so statements naming it prepare.
@@ -629,7 +642,9 @@ mod tests {
             "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM trace_keys)",
         ];
         for sql in reads {
-            store.with_writer_for_test(|conn| conn.execute_batch(sql)).unwrap();
+            store
+                .with_writer_for_test(|conn| conn.execute_batch(sql))
+                .unwrap();
             assert_eq!(trace.take().writer.len(), 1, "a read: {sql}");
         }
         for sql in [
@@ -639,7 +654,9 @@ mod tests {
                WHERE excluded.updated_at>=pool_key_state.updated_at",
             "SELECT count(*) FROM trace_log",
         ] {
-            store.with_writer_for_test(|conn| conn.execute_batch(sql)).unwrap();
+            store
+                .with_writer_for_test(|conn| conn.execute_batch(sql))
+                .unwrap();
             assert!(trace.take().writer.is_empty(), "not a block read: {sql}");
         }
     }

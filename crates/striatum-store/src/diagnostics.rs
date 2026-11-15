@@ -7,8 +7,8 @@
 //! the few fields the checks need inside SQLite, so a window of large
 //! rejection payloads is never copied out of the store.
 
-use striatum_core::{RouteStateResult, RouteWallClass};
 use rusqlite::{params, Connection};
+use striatum_core::{RouteStateResult, RouteWallClass};
 
 use super::{err, row_wall_class, SqliteRouteStateStore};
 
@@ -311,8 +311,8 @@ impl SqliteRouteStateStore {
 mod tests {
     use super::*;
     use crate::dev_descriptor;
-    use striatum_core::{DecisionInput, RouteStateStore};
     use serde_json::json;
+    use striatum_core::{DecisionInput, RouteStateStore};
 
     const NOW: i64 = 1_800_000_000_000;
 

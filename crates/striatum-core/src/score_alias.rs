@@ -202,8 +202,11 @@ mod tests {
 
     #[test]
     fn an_owned_alias_row_cannot_erase_the_catalog_classification() {
-        let mut source = model_facts_seed().iter()
-            .find(|fact| fact.provider_id == "anthropic").unwrap().clone();
+        let mut source = model_facts_seed()
+            .iter()
+            .find(|fact| fact.provider_id == "anthropic")
+            .unwrap()
+            .clone();
         source.model_type = Some("image".into());
         source.model_kind = Some("extraction".into());
         let mut owned = source.clone();

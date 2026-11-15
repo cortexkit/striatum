@@ -1,7 +1,7 @@
 //! Replay only on a disposable database, never on the running routing store.
+use rusqlite::Connection;
 use striatum_core::{RouteStateStore, UsageObservation};
 use striatum_store::{dev_descriptor, SqliteRouteStateStore};
-use rusqlite::Connection;
 
 #[cfg(target_os = "macos")]
 fn disk_bytes() -> (u64, u64) {

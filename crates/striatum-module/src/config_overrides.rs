@@ -12,6 +12,9 @@ use crate::config_policy::{
     ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy, VariantGroups,
 };
 use crate::substrate_policy::SubstrateGroups;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use striatum_core::model_facts::{
     Confidence, ModelFact, ModelScores, RoutePricing, ScoreProvenance,
 };
@@ -23,9 +26,6 @@ use striatum_core::{
 #[cfg(test)]
 use striatum_core::{model_facts_seed, CatalogFactField, FactSource, RouteStateStore};
 use striatum_store::ReasoningCatalog;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
@@ -999,10 +999,12 @@ impl LiveConfig {
                     && crate::config_policy::consumer_matches(name, consumer)
             })
             .filter_map(|(name, policy)| {
-                policy
-                    .projects
-                    .get(project_id)
-                    .map(|project| (crate::config_policy::consumer_specificity(name), project.pin.as_str()))
+                policy.projects.get(project_id).map(|project| {
+                    (
+                        crate::config_policy::consumer_specificity(name),
+                        project.pin.as_str(),
+                    )
+                })
             })
             .max_by_key(|(length, _)| *length)
             .map(|(_, pin)| pin)
@@ -2382,7 +2384,8 @@ fn apply_overrides<S: RouteStateStore>(
             .or_else(|| seed_fact.cloned())
             .unwrap_or_else(|| ModelFact {
                 billing_plane: None,
-                auth_methods: None, login_methods_documented: false,
+                auth_methods: None,
+                login_methods_documented: false,
                 speed_is_fleet_median: false,
                 decommissioned: false,
                 provider_id,
@@ -2411,7 +2414,9 @@ fn apply_overrides<S: RouteStateStore>(
                 eq_source: None,
                 class_vector: None,
                 class_vector_is_overlay: false,
-                upstream_status: None, model_type: None, model_kind: None,
+                upstream_status: None,
+                model_type: None,
+                model_kind: None,
             });
         // Score provenance does not distinguish config from route.model_upsert.
         // Preserving absent score fields avoids erasing an upsert placement on restart;
@@ -2494,7 +2499,8 @@ mod tests {
     fn model_overrides_preserve_catalog_family_and_refuse_family_writes() {
         let base = ModelFact {
             billing_plane: None,
-            auth_methods: None, login_methods_documented: false,
+            auth_methods: None,
+            login_methods_documented: false,
             speed_is_fleet_median: false,
             decommissioned: false,
             provider_id: "p".into(),
@@ -2527,7 +2533,9 @@ mod tests {
             eq_source: None,
             class_vector: None,
             class_vector_is_overlay: false,
-            upstream_status: None, model_type: None, model_kind: None,
+            upstream_status: None,
+            model_type: None,
+            model_kind: None,
         };
         let ov = ModelFactOverride {
             vision: Some(true),
@@ -2883,12 +2891,11 @@ mod tests {
         apply_overrides_from_config(&store, &config_path).unwrap();
 
         // The fact must still exist, demoted to seed, not deleted.
-        let fact =
-            striatum_core::route_state_store::RouteStateStore::get_fact_by_route_key(
-                &store,
-                "anthropic/claude-opus-5",
-            )
-            .unwrap();
+        let fact = striatum_core::route_state_store::RouteStateStore::get_fact_by_route_key(
+            &store,
+            "anthropic/claude-opus-5",
+        )
+        .unwrap();
         assert!(
             fact.is_some(),
             "removing an override must never delete a migration-seeded fact"

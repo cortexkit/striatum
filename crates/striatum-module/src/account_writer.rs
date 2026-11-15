@@ -66,16 +66,18 @@ pub(crate) fn execute_with_error<T: Send + 'static, E: striatum_store::AccountCo
     }
     #[cfg(test)]
     let inputs = crate::TestThreadState::capture();
-    let mut command = move |tx: &AccountTx<'_>,
-                        state: Option<&mut (dyn AccountWorkingState + 'static)>| {
-        #[cfg(test)]
-        let _inputs = inputs.clone().install();
-        command(&mut AccountCommand::new(tx, state))
-    };
+    let mut command =
+        move |tx: &AccountTx<'_>, state: Option<&mut (dyn AccountWorkingState + 'static)>| {
+            #[cfg(test)]
+            let _inputs = inputs.clone().install();
+            command(&mut AccountCommand::new(tx, state))
+        };
     if store.is_private_account_copy() {
         store.account_command_with_error(kind, move |tx| command(tx, None))
     } else {
-        store.enqueue_account_state_command_with_error(kind, command)?.wait()
+        store
+            .enqueue_account_state_command_with_error(kind, command)?
+            .wait()
     }
 }
 
@@ -254,8 +256,11 @@ pub(crate) fn pool_renew(
     now_ms: i64,
     lease_ms: i64,
 ) -> RouteStateResult<Option<i64>> {
-    let (provider, session_id, lease_id) =
-        (provider.to_owned(), session_id.to_owned(), lease_id.to_owned());
+    let (provider, session_id, lease_id) = (
+        provider.to_owned(),
+        session_id.to_owned(),
+        lease_id.to_owned(),
+    );
     let credential_id = credential_id.map(str::to_owned);
     execute(store, AccountCommandKind::Maintenance, move |tx| {
         tx.release_expired(now_ms)?;

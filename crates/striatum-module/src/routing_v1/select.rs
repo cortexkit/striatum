@@ -908,9 +908,8 @@ async fn prepare_selection(
     // An operator's consumer pin is a hard selection, not a one-route ladder:
     // it bypasses automatic pin-only fences but still uses all pin admission
     // and account checks. Never let a caller's fallback preference replace it.
-    let consumer_pinned = request.pin.is_none()
-        && request.pin_slot.is_none()
-        && consumer_policy.pin.is_some();
+    let consumer_pinned =
+        request.pin.is_none() && request.pin_slot.is_none() && consumer_policy.pin.is_some();
     if consumer_pinned {
         let pin = consumer_policy.pin.as_ref().unwrap();
         request.pin = Some(pin.variant.as_ref().map_or_else(
@@ -1055,9 +1054,13 @@ async fn prepare_selection(
         })
         .filter(|runner| {
             request.harness.as_deref().is_none_or(|harness| {
-                runner.harness.as_deref().is_none_or(|entry| entry == harness) && registry
-                    .get(runner)
-                    .is_some_and(|runner| runner.harnesses.iter().any(|hosted| hosted == harness))
+                runner
+                    .harness
+                    .as_deref()
+                    .is_none_or(|entry| entry == harness)
+                    && registry.get(runner).is_some_and(|runner| {
+                        runner.harnesses.iter().any(|hosted| hosted == harness)
+                    })
             })
         })
         .collect();
@@ -1307,9 +1310,9 @@ async fn select_at_tier_attempt(
     // structured output, so it cannot confirm a route serves them and answers
     // none.
     let eligible_catalog_empty = request.eligible_routes.is_some()
-        && !facts.iter().any(|fact| {
-            eligible_routes::includes_model(request.eligible_routes.as_deref(), fact)
-        });
+        && !facts
+            .iter()
+            .any(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact));
     let reachable: Vec<&ModelFact> = facts
         .iter()
         .filter(|fact| eligible_routes::includes_model(request.eligible_routes.as_deref(), fact))
@@ -1322,11 +1325,7 @@ async fn select_at_tier_attempt(
             let route = fact_to_route(fact);
             runners.iter().any(|runner| {
                 registry.can_run(runner, &route.route_key, &route.capacity_key)
-                    || registry.excluded_by_harness(
-                        runner,
-                        &route.route_key,
-                        &route.capacity_key,
-                    )
+                    || registry.excluded_by_harness(runner, &route.route_key, &route.capacity_key)
             })
         })
         .collect();
@@ -1341,9 +1340,10 @@ async fn select_at_tier_attempt(
             if reachable.is_empty()
                 && (request.pin.is_some() || request.pin_slot.is_some())
                 && request.pin_fallback != Some(PinFallback::Route)
-                && request.available_routes.as_ref().is_none_or(|routes| {
-                    routes.contains(&route.capacity_key)
-                })
+                && request
+                    .available_routes
+                    .as_ref()
+                    .is_none_or(|routes| routes.contains(&route.capacity_key))
                 && runners.iter().any(|runner| {
                     registry.provider_limit(runner, &route.route_key, &route.capacity_key)
                 })
@@ -1354,11 +1354,7 @@ async fn select_at_tier_attempt(
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
-                    registry.requires_wire_api(
-                        runner,
-                        &route.route_key,
-                        &route.capacity_key,
-                    )
+                    registry.requires_wire_api(runner, &route.route_key, &route.capacity_key)
                 })
             {
                 return Some((
@@ -1370,11 +1366,7 @@ async fn select_at_tier_attempt(
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
-                    registry.no_runner_account(
-                        runner,
-                        &route.route_key,
-                        &route.capacity_key,
-                    )
+                    registry.no_runner_account(runner, &route.route_key, &route.capacity_key)
                 })
             {
                 return Some((route.route_key, "no_runner_account".into()));
@@ -1383,11 +1375,7 @@ async fn select_at_tier_attempt(
                 .iter()
                 .any(|runner| runs(runner, &route.route_key, &route.capacity_key))
                 && runners.iter().any(|runner| {
-                    registry.wire_family_unverified(
-                        runner,
-                        &route.route_key,
-                        &route.capacity_key,
-                    )
+                    registry.wire_family_unverified(runner, &route.route_key, &route.capacity_key)
                 });
             unverified.then(|| {
                 (
@@ -1458,9 +1446,9 @@ async fn select_at_tier_attempt(
         .iter()
         .filter_map(|fact| {
             let route = fact_to_route(fact);
-            (!runners.iter().any(|runner| {
-                registry.can_run(runner, &route.route_key, &route.capacity_key)
-            }))
+            (!runners
+                .iter()
+                .any(|runner| registry.can_run(runner, &route.route_key, &route.capacity_key)))
             .then_some(route.route_key)
         })
         .collect();
@@ -1717,7 +1705,13 @@ async fn select_at_tier_attempt(
     // Ordinary route.what_if model previews still return all three diagnostics.
     if let Some(view) = evaluation.filter(|_| !panel_seat) {
         let mut evidence = view.evidence.lock().unwrap();
-        let _ = selection.score_candidates_evaluated(&usable, consumer_policy.operator_ladder(), None, None, Some(&mut evidence));
+        let _ = selection.score_candidates_evaluated(
+            &usable,
+            consumer_policy.operator_ladder(),
+            None,
+            None,
+            Some(&mut evidence),
+        );
     }
 
     let project_pin = request
@@ -2049,14 +2043,26 @@ async fn select_at_tier_attempt(
                     {
                         return None;
                     }
-                    let variant = consumer_policy.operator_ladder().then(|| {
-                        consumer_policy.ladder.iter().flatten().find_map(|entry| {
-                            let route = RouteRef::parse_pin(entry)?;
-                            (format!("{}/{}", route.provider, route.model) == *key).then_some(route.variant).flatten()
+                    let variant = consumer_policy
+                        .operator_ladder()
+                        .then(|| {
+                            consumer_policy.ladder.iter().flatten().find_map(|entry| {
+                                let route = RouteRef::parse_pin(entry)?;
+                                (format!("{}/{}", route.provider, route.model) == *key)
+                                    .then_some(route.variant)
+                                    .flatten()
+                            })
                         })
-                    }).flatten();
+                        .flatten();
                     if !available.contains(key)
-                        || selection.score_ladder(&HashSet::from([key.clone()]), &consumer_policy, variant.as_deref(), Some(key)).is_err()
+                        || selection
+                            .score_ladder(
+                                &HashSet::from([key.clone()]),
+                                &consumer_policy,
+                                variant.as_deref(),
+                                Some(key),
+                            )
+                            .is_err()
                     {
                         return None;
                     }
@@ -2611,7 +2617,13 @@ impl<'a> Selection<'a> {
         self.score_candidates_evaluated(available, false, None, None, None)
     }
 
-    fn score_ladder(&self, available: &HashSet<String>, policy: &crate::config_policy::ConsumerPolicy, variant: Option<&str>, key: Option<&str>) -> Result<SelectedModelRoute, NoRouteError> {
+    fn score_ladder(
+        &self,
+        available: &HashSet<String>,
+        policy: &crate::config_policy::ConsumerPolicy,
+        variant: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<SelectedModelRoute, NoRouteError> {
         if policy.operator_ladder() {
             self.score_candidates_evaluated(available, true, variant, key, None)
         } else {
@@ -2619,9 +2631,18 @@ impl<'a> Selection<'a> {
         }
     }
 
-    fn check_ladder_variant(&self, selected: &SelectedModelRoute, variant: Option<&str>) -> Result<(), Refusal> {
-        let Some(variant) = variant else { return Ok(()) };
-        let pin = format!("{}/{}:{variant}", selected.model.provider_id, selected.model.model_id);
+    fn check_ladder_variant(
+        &self,
+        selected: &SelectedModelRoute,
+        variant: Option<&str>,
+    ) -> Result<(), Refusal> {
+        let Some(variant) = variant else {
+            return Ok(());
+        };
+        let pin = format!(
+            "{}/{}:{variant}",
+            selected.model.provider_id, selected.model.model_id
+        );
         work_model_pin::validate_variant(
             &pin,
             &selected.model.provider_id,
@@ -2629,7 +2650,9 @@ impl<'a> Selection<'a> {
             Some(variant),
             config_overrides::reasoning_catalog_for(self.sources.operator_config_path).as_ref(),
             self.sources.catalog_targets,
-        ).map(|_| ()).map_err(|_| Refusal::pin_unavailable(&pin, PinUnavailableReason::InvalidVariant, None))
+        )
+        .map(|_| ())
+        .map_err(|_| Refusal::pin_unavailable(&pin, PinUnavailableReason::InvalidVariant, None))
     }
 
     fn scoring_snapshot(&self, pinned: bool) -> ModelRouteStateSnapshot {
@@ -2697,7 +2720,9 @@ impl<'a> Selection<'a> {
                     .filter_map(|fact| {
                         let key = fact_to_route(fact).route_key;
                         if !self.recovery_available.contains(&key)
-                            || recovery_key.is_some_and(|only| key != only && !key.starts_with(&format!("{only}/")))
+                            || recovery_key.is_some_and(|only| {
+                                key != only && !key.starts_with(&format!("{only}/"))
+                            })
                             || !self.sources.operator_config.route_allowed(
                                 self.consumer,
                                 &key,
@@ -2723,7 +2748,9 @@ impl<'a> Selection<'a> {
                     .recovery_available
                     .iter()
                     .filter(|key| {
-                        if recovery_key.is_some_and(|only| *key != only && !key.starts_with(&format!("{only}/"))) {
+                        if recovery_key.is_some_and(|only| {
+                            *key != only && !key.starts_with(&format!("{only}/"))
+                        }) {
                             return false;
                         }
                         self.sources
@@ -2735,11 +2762,14 @@ impl<'a> Selection<'a> {
                     .cloned()
                     .collect();
                 recovery_available.extend(account_resets.keys().cloned());
-                let mut recovery_input = self
-                    .pass()
-                    .input_with_policy(&recovery_available, self.scoring_snapshot(pinned), pinned);
+                let mut recovery_input = self.pass().input_with_policy(
+                    &recovery_available,
+                    self.scoring_snapshot(pinned),
+                    pinned,
+                );
                 select_policy::apply_explicit_variant(&mut recovery_input, explicit_variant);
-                let recovery_rejections = self.eligible_rejections(&recovery_input.facts, explicit_variant);
+                let recovery_rejections =
+                    self.eligible_rejections(&recovery_input.facts, explicit_variant);
                 (error.earliest_reset, error.earliest_reset_route) =
                     striatum_core::model_router::earliest_admissible_recovery(
                         &recovery_input,
@@ -2894,7 +2924,10 @@ impl<'a> Selection<'a> {
         let snapshot = self.snapshot.clone();
         let refused = |code: &str, message: String| {
             let provider_limited = (code == "not_available" || code == RUNNER_PROVIDER_LIMIT)
-                && self.rejections.get(&pin_key).or_else(|| self.rejections.get(&pin_capacity))
+                && self
+                    .rejections
+                    .get(&pin_key)
+                    .or_else(|| self.rejections.get(&pin_capacity))
                     .is_some_and(|cause| cause == RUNNER_PROVIDER_LIMIT);
             let (mut reason, mut reset) = if provider_limited {
                 (PinUnavailableReason::NotAvailable, None)
@@ -2902,12 +2935,13 @@ impl<'a> Selection<'a> {
                 pin_reason(code, &snapshot, &pin_key, &pin_capacity, self.now)
             };
             let unknown = reason == PinUnavailableReason::NotAvailable;
-            if !provider_limited && ((unknown
-                && matches!(
-                    code,
-                    "not_available" | "no_eligible_account" | "no_available_model"
-                ))
-                || code == "credential_billing_exhausted")
+            if !provider_limited
+                && ((unknown
+                    && matches!(
+                        code,
+                        "not_available" | "no_eligible_account" | "no_available_model"
+                    ))
+                    || code == "credential_billing_exhausted")
             {
                 reset = self.pin_account_recovery(
                     &pin_key,
@@ -2923,7 +2957,9 @@ impl<'a> Selection<'a> {
             if provider_limited {
                 // A declared provider limit has no recovery time. Keep the
                 // missing_capability cause alongside the pin's wire reason.
-                refusal.detail.insert("cause".into(), json!("missing_capability"));
+                refusal
+                    .detail
+                    .insert("cause".into(), json!("missing_capability"));
             }
             if unknown {
                 // Availability's specific cause lives in the private refusal's
@@ -3604,32 +3640,50 @@ mod tests {
         if quota {
             *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
             let at = RECOVERY_NOW as i64 - 900_001;
-            let scope = striatum_core::accounts::FenceScope::General(striatum_core::accounts::GeneralWindow::FiveHour);
+            let scope = striatum_core::accounts::FenceScope::General(
+                striatum_core::accounts::GeneralWindow::FiveHour,
+            );
             let fence = striatum_core::accounts::Fence {
                 account_id: catalog.accounts[0].account_id.clone(),
-                pool: Some(scope.clone().into()), recovery_set: Vec::new(), observed_at_ms: at,
+                pool: Some(scope.clone().into()),
+                recovery_set: Vec::new(),
+                observed_at_ms: at,
                 reset: striatum_core::accounts::ResetTime::At(RECOVERY_NOW as i64 + 5 * 86_400_000),
-                retry_hint_ms: None, source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
+                retry_hint_ms: None,
+                source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
             };
-            harness.store().account_transaction(|tx| {
-                tx.insert_fence(&striatum_store::AccountFenceRow {
-                    fence_id: "shared-panel-quota".into(), provider: fixture::SUBSCRIPTION_PROVIDER.into(),
-                    account_id: fence.account_id.clone(), scope_json: serde_json::to_string(&scope).unwrap(),
-                    fence_json: serde_json::to_string(&fence).unwrap(), source: "broca_limit_exhausted".into(),
-                    observed_at: at, principal: "test".into(), admission_id: None, observation_id: None,
-                    created_at: at, cleared_at: None, cleared_reason: None,
+            harness
+                .store()
+                .account_transaction(|tx| {
+                    tx.insert_fence(&striatum_store::AccountFenceRow {
+                        fence_id: "shared-panel-quota".into(),
+                        provider: fixture::SUBSCRIPTION_PROVIDER.into(),
+                        account_id: fence.account_id.clone(),
+                        scope_json: serde_json::to_string(&scope).unwrap(),
+                        fence_json: serde_json::to_string(&fence).unwrap(),
+                        source: "broca_limit_exhausted".into(),
+                        observed_at: at,
+                        principal: "test".into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: at,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    })
                 })
-            }).unwrap();
+                .unwrap();
         } else {
             crate::credential_fences::record(
-                harness.store(), &harness.credentials(),
+                harness.store(),
+                &harness.credentials(),
                 &striatum_core::route_state_store::CredentialRefusal {
                     provider_id: fixture::SUBSCRIPTION_PROVIDER.into(),
                     credential_id: catalog.accounts[0].credential_id.clone(),
                     code: "billing_exhausted".into(),
                 },
                 RECOVERY_NOW as i64 - crate::credential_fences::FENCE_PROBE_RECHECK_MS - 1,
-            ).unwrap();
+            )
+            .unwrap();
         }
         take_input_builds(&harness);
         let probe = route.call("route.select_panel", &request).await;
@@ -3646,29 +3700,56 @@ mod tests {
             baseline.1["result"]["seats"][0]["answer"]["route"]
         );
         assert_eq!(take_input_builds(&harness), [1, 2, 2]);
-        if !quota { return; }
+        if !quota {
+            return;
+        }
         let decision = seats[0]["answer"]["decision_id"].clone();
         let _later_panel = crate::InjectedClock::set(RECOVERY_NOW + 120_000);
         let later = route.call("route.select_panel", &request).await;
         assert_eq!(later.0, subc_protocol::FrameType::Response, "{later:?}");
-        assert_eq!(later.1["result"]["seats"].as_array().unwrap().len(), 0,
-            "a later panel cannot reuse the same quota probe: {later:?}");
+        assert_eq!(
+            later.1["result"]["seats"].as_array().unwrap().len(),
+            0,
+            "a later panel cannot reuse the same quota probe: {later:?}"
+        );
         let _failure = crate::InjectedClock::set(RECOVERY_NOW + 200_000);
-        let reported = route.call("route.report", &json!({"decision_id":decision,"outcome":"failed"})).await;
-        assert_eq!(reported.0, subc_protocol::FrameType::Response, "{reported:?}");
+        let reported = route
+            .call(
+                "route.report",
+                &json!({"decision_id":decision,"outcome":"failed"}),
+            )
+            .await;
+        assert_eq!(
+            reported.0,
+            subc_protocol::FrameType::Response,
+            "{reported:?}"
+        );
         let _old_interval = crate::InjectedClock::set(RECOVERY_NOW + 900_000);
         let waiting = route.call("route.select_panel", &request).await;
-        assert_eq!(waiting.1["result"]["seats"].as_array().unwrap().len(), 0, "{waiting:?}");
+        assert_eq!(
+            waiting.1["result"]["seats"].as_array().unwrap().len(),
+            0,
+            "{waiting:?}"
+        );
         let _next_interval = crate::InjectedClock::set(RECOVERY_NOW + 1_100_000);
         let credentials = harness.credentials();
         let mut credentials = credentials.lock().unwrap();
         let rows = credentials.listed_credentials().to_vec();
-        credentials.apply_listing(&cortexkit_claustrum_client::ScopedCredentialListing {
-            view: "next-panel-interval".into(), credentials: rows, ..Default::default()
-        }, RECOVERY_NOW + 1_100_000);
+        credentials.apply_listing(
+            &cortexkit_claustrum_client::ScopedCredentialListing {
+                view: "next-panel-interval".into(),
+                credentials: rows,
+                ..Default::default()
+            },
+            RECOVERY_NOW + 1_100_000,
+        );
         drop(credentials);
         let next = route.call("route.select_panel", &request).await;
-        assert_eq!(next.1["result"]["seats"].as_array().unwrap().len(), 1, "{next:?}");
+        assert_eq!(
+            next.1["result"]["seats"].as_array().unwrap().len(),
+            1,
+            "{next:?}"
+        );
     }
 
     const ACCOUNT_RESET: u64 = RECOVERY_NOW + 600_000;

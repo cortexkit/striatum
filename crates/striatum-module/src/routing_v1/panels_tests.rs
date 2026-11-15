@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use cortexkit_role_routing::{budget, panel::*};
 use cortexkit_role_routing_conformance::fixture;
-use striatum_core::RouteStateStore;
 use serde_json::{json, Value};
+use striatum_core::RouteStateStore;
 use subc_protocol::FrameType;
 
 use super::conformance_tests::{
@@ -60,18 +60,29 @@ async fn panel(route: &Route, request: &Value) -> SelectPanelAnswer {
 #[tokio::test]
 async fn decommissioned_panel_candidate_is_not_seated_or_named_in_shortfall() {
     let (harness, route, mut request) = configured().await;
-    harness.edit_config(|config| config["panels"]["audit"] = json!({"topK":5,"by":"iq","extra":0,"floor":0}));
+    harness.edit_config(|config| {
+        config["panels"]["audit"] = json!({"topK":5,"by":"iq","extra":0,"floor":0})
+    });
     request.as_object_mut().unwrap().remove("temperatures");
-    assert_eq!(panel(&route, &request).await.seats.len(),5);
+    assert_eq!(panel(&route, &request).await.seats.len(), 5);
     let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
         "catalog_version":93,"resolved_at_ms":123,"models":{
             "example-provider/panel-0":{"existence":"present","quality.decommissioned":true,"capability.tool_call":true}
         }
     })).unwrap()).unwrap();
-    crate::fusiform_catalog::apply_mapped_catalog(&harness.store(), &snapshot, None, Some("example-provider")).unwrap();
+    crate::fusiform_catalog::apply_mapped_catalog(
+        &harness.store(),
+        &snapshot,
+        None,
+        Some("example-provider"),
+    )
+    .unwrap();
     let answer = panel(&route, &request).await;
-    assert_eq!(answer.seats.len(),4, "{answer:?}");
-    assert!(answer.seats.iter().all(|seat|seat.answer.route.model != "panel-0"));
+    assert_eq!(answer.seats.len(), 4, "{answer:?}");
+    assert!(answer
+        .seats
+        .iter()
+        .all(|seat| seat.answer.route.model != "panel-0"));
     let shortfall = serde_json::to_value(answer.shortfall.expect("missing fifth family")).unwrap();
     assert!(!shortfall.to_string().contains("panel-0"), "{shortfall}");
 }
@@ -490,8 +501,7 @@ async fn panel_athena_and_spec_match_frozen_seats_variants_and_budgets() {
         serde_json::from_str(include_str!("../../fixtures/replay/panels.golden.json")).unwrap();
     let _clock = crate::InjectedClock::set(frozen["clock_ms"].as_u64().unwrap());
     let _inputs =
-        striatum_store::replay::Inputs::new(frozen["clock_ms"].as_i64().unwrap())
-            .install();
+        striatum_store::replay::Inputs::new(frozen["clock_ms"].as_i64().unwrap()).install();
     let h = Harness::new("public-panel-goldens");
     let facts: Vec<striatum_core::ModelFact> =
         serde_json::from_value(frozen["catalog"].clone()).unwrap();

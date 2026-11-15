@@ -12,6 +12,11 @@
 
 use cortexkit_store::{open_sqlite, Migration, SqliteStore};
 use cortexkit_store_types::{Isolation, StorageBackend, StorageDescriptor};
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::Serialize;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use striatum_core::canonical_scores::resolve_canonical_scores;
 use striatum_core::model_facts::{
     ClassVector, Confidence, FamilySource, GrandFamily, ModelFact, ModelPromptDefaults,
@@ -31,11 +36,6 @@ use striatum_core::{
     OBSERVED_SPEED_MIN_OUTPUT_TOKENS, OBSERVED_SPEED_MIN_SAMPLES, OBSERVED_SPEED_SAMPLE_LIMIT,
     OBSERVED_SPEED_WINDOW_MS, USAGE_MIN_DURATION_MS, USAGE_MIN_OUTPUT_TOKENS,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row};
-use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 mod account_selection;
 mod call_counts;
@@ -60,9 +60,9 @@ mod diagnostics;
 mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
+mod block_state;
 mod engine_measurements;
 mod fence_rechecks;
-mod block_state;
 mod route_snapshot;
 #[cfg(any(test, feature = "test-support"))]
 pub use block_state::reviewed_exempt_reads;
@@ -71,13 +71,12 @@ pub use block_state::{
     ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub mod group_reads;
-#[cfg(any(test, feature = "test-support"))]
 mod block_parity_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub mod group_reads;
 mod key_pool;
 pub use fence_rechecks::{
-    BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope, ReleasedAdmissionProbes,
-    ViewOrigin,
+    BlockParity, FenceRecheck, LoadedBlocks, QuotaSuccessScope, ReleasedAdmissionProbes, ViewOrigin,
 };
 #[cfg(test)]
 mod continuation_migration_tests;
@@ -115,14 +114,13 @@ pub use task_usage::{ClosedTaskUsage, ProviderTokenReporting, TaskTokenTotals};
 pub use account_selection::AccountServingCounts;
 pub use account_selection::ContinuationSourceRow;
 pub use account_selection::{
-    AccountAdmissionRow, AccountAffinityRow, AccountDecisionRecord, AccountDemandRow,
-    AccountEligibilityFact, AccountExclusionRow, AccountFenceRow, AccountHoldRow,
-    AccountObservationRow, AccountPinRow, AccountPoolFenceRow, AccountRouteFence,
-    AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionStateRow, ContinuationStateRow,
-    AdmissionScanRow, CredentialProbeClaim, LatestAdmissionRow, PrunedAdmission,
-    PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, KEYED_EXCEPTION,
-    keyed_exception_reads, note_keyed_exception,
-    OBSERVATION_BACKOFFS_SQL,
+    keyed_exception_reads, note_keyed_exception, AccountAdmissionRow, AccountAffinityRow,
+    AccountDecisionRecord, AccountDemandRow, AccountEligibilityFact, AccountExclusionRow,
+    AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, AccountPoolFenceRow,
+    AccountRouteFence, AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionScanRow,
+    AdmissionStateRow, ContinuationStateRow, CredentialProbeClaim, LatestAdmissionRow,
+    PrunedAdmission, PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
+    KEYED_EXCEPTION, OBSERVATION_BACKOFFS_SQL,
 };
 
 pub struct ClearedRouteCooldowns {
@@ -747,7 +745,10 @@ pub(crate) const ROUTE_WRITE_READ: &str = route_write_read!();
 
 // The marked reads, one constant per statement, so the reviewed list of
 // exempt reads (`reviewed_exempt_reads`) names exactly these texts.
-pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(route_write_read!(), "SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1");
+pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(
+    route_write_read!(),
+    "SELECT wall_observed_at FROM provider_cooldown_state WHERE provider_key=?1"
+);
 pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_write_read!(), "SELECT route_key FROM model_route_state m WHERE provider_id=?1 AND
                     ((cooldown_until IS NULL AND quota_exhausted_until IS NULL) OR EXISTS
                      (SELECT 1 FROM provider_cooldown_state p WHERE p.provider_key=?1
@@ -755,23 +756,38 @@ pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_writ
                       AND m.last_error IS p.last_error
                       AND COALESCE(m.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
                       AND COALESCE(m.quota_exhausted_until,0)<=COALESCE(p.quota_exhausted_until,0)))");
-pub(crate) const ROUTE_READ_PROVIDER_EXISTING: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+pub(crate) const ROUTE_READ_PROVIDER_EXISTING: &str = concat!(
+    route_write_read!(),
+    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
                                 last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1");
-pub(crate) const ROUTE_READ_ROUTE_PRIOR_OBSERVED: &str = concat!(route_write_read!(), "SELECT wall_observed_at FROM model_route_state WHERE route_key=?1");
-pub(crate) const ROUTE_READ_ROUTE_EXISTING: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+                         FROM provider_cooldown_state WHERE provider_key = ?1"
+);
+pub(crate) const ROUTE_READ_ROUTE_PRIOR_OBSERVED: &str = concat!(
+    route_write_read!(),
+    "SELECT wall_observed_at FROM model_route_state WHERE route_key=?1"
+);
+pub(crate) const ROUTE_READ_ROUTE_EXISTING: &str = concat!(
+    route_write_read!(),
+    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
                                 latency_ema_ms, success_ema, failure_count, quota_error_count,
                                 last_error, last_error_at, wall_class
-                         FROM model_route_state WHERE route_key = ?1");
-pub(crate) const ROUTE_READ_ROUTE_PROVIDER_ROW: &str = concat!(route_write_read!(), "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
+                         FROM model_route_state WHERE route_key = ?1"
+);
+pub(crate) const ROUTE_READ_ROUTE_PROVIDER_ROW: &str = concat!(
+    route_write_read!(),
+    "SELECT cooldown_until, quota_exhausted_until, quota_pressure,
                                 last_error, last_error_at, wall_class
-                         FROM provider_cooldown_state WHERE provider_key = ?1");
+                         FROM provider_cooldown_state WHERE provider_key = ?1"
+);
 pub(crate) const ROUTE_READ_OUTCOME_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
                                 failure_backoff_reason,COALESCE(failure_observed_at,last_error_at,updated_at)
                          FROM model_route_state WHERE route_key=?1");
-pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(route_write_read!(), "SELECT consecutive_terminal_failures, failure_backoff_until,
+pub(crate) const ROUTE_READ_CLEAR_FAILURE_STATE: &str = concat!(
+    route_write_read!(),
+    "SELECT consecutive_terminal_failures, failure_backoff_until,
                                 failure_backoff_reason
-                         FROM model_route_state WHERE route_key = ?1");
+                         FROM model_route_state WHERE route_key = ?1"
+);
 
 // Writes that run a `SELECT` of their own, over a bound `json_each` list,
 // and read their target table only for the rows they write. The block read
@@ -1908,7 +1924,10 @@ impl SqliteRouteStateStore {
     /// cached entry over a different catalog and serve that entry's value.
     /// A failed install is only logged; the next read tries again.
     fn reinstall_catalog_change_tracking(&self, connection: &Connection, cause: &rusqlite::Error) {
-        *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .resolved_facts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
         *self.catalog_facts.lock().unwrap_or_else(|p| p.into_inner()) = None;
         *self
             .catalog_fingerprint
@@ -2923,9 +2942,7 @@ impl SqliteRouteStateStore {
             })
             .map_err(err)?;
         value
-            .map(|value| {
-                striatum_core::accounts::AllowedAccountClass::parse(&value).map_err(err)
-            })
+            .map(|value| striatum_core::accounts::AllowedAccountClass::parse(&value).map_err(err))
             .transpose()
     }
 
@@ -4183,9 +4200,8 @@ struct ExistingState {
 /// credential. Such a wall is not provider or route evidence: the credential's
 /// fence covers it, so it neither blocks nor lends its horizon to a later write.
 pub(crate) fn credential_refusal_wall(last_error: Option<&str>) -> bool {
-    last_error.is_some_and(|error| {
-        striatum_core::account_wall::credential_refusal_in(error).is_some()
-    })
+    last_error
+        .is_some_and(|error| striatum_core::account_wall::credential_refusal_in(error).is_some())
 }
 
 /// `max` over two optional times, treating `None` as "no value" (the defined one
@@ -6679,7 +6695,8 @@ mod tests {
         store
             .apply_fusiform_catalog(
                 &[FusiformFactUpdate {
-                    auth_methods: None, login_methods_documented: false,
+                    auth_methods: None,
+                    login_methods_documented: false,
                     provider_id: fact.provider_id.clone(),
                     model_id: "fingerprint-cache-probe".to_string(),
                     present: true,
@@ -6695,7 +6712,9 @@ mod tests {
                     supports_tool_use: Some(true),
                     reasoning_efforts: None,
                     canonical_id: None,
-                    upstream_status: None, model_type: None, model_kind: None,
+                    upstream_status: None,
+                    model_type: None,
+                    model_kind: None,
                     lineage: None,
                 }],
                 FusiformCatalogCursor {
@@ -6749,34 +6768,91 @@ mod tests {
         fact.variant = None;
         fact.scores.elo = 1234.0;
         store.upsert_fact(&fact, FactSource::Override).unwrap();
-        let read = || store.get_facts().unwrap().into_iter().find(|f| f.provider_id == "cache-provider").unwrap();
+        let read = || {
+            store
+                .get_facts()
+                .unwrap()
+                .into_iter()
+                .find(|f| f.provider_id == "cache-provider")
+                .unwrap()
+        };
         assert_eq!(read().scores.elo, 1234.0);
-        let cached_ptr = || store.resolved_facts.lock().unwrap().as_ref().unwrap().1.as_ptr() as usize;
+        let cached_ptr = || {
+            store
+                .resolved_facts
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1
+                .as_ptr() as usize
+        };
         let before = cached_ptr();
-        store.store.with_conn(|c| c.execute("UPDATE model_route_state SET updated_at=updated_at+1", [])).unwrap();
+        store
+            .store
+            .with_conn(|c| c.execute("UPDATE model_route_state SET updated_at=updated_at+1", []))
+            .unwrap();
         assert_eq!(read().scores.elo, 1234.0);
-        assert_eq!(cached_ptr(), before, "ordinary routing writes must not decode the catalog again");
-        store.replace_operator_quality(true, &[("cache-provider/cache-model".into(), OperatorQuality {
-            model: "cache-model".into(), elo: 2345.0, eq: 2456.0,
-        })].into_iter().collect()).unwrap();
+        assert_eq!(
+            cached_ptr(),
+            before,
+            "ordinary routing writes must not decode the catalog again"
+        );
+        store
+            .replace_operator_quality(
+                true,
+                &[(
+                    "cache-provider/cache-model".into(),
+                    OperatorQuality {
+                        model: "cache-model".into(),
+                        elo: 2345.0,
+                        eq: 2456.0,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .unwrap();
         assert_eq!(read().scores.elo, 2345.0);
-        assert_eq!(store.get_fact_by_route_key("cache-provider/cache-model").unwrap().unwrap().scores.elo, 1234.0);
-        store.replace_operator_quality(false, &Default::default()).unwrap();
+        assert_eq!(
+            store
+                .get_fact_by_route_key("cache-provider/cache-model")
+                .unwrap()
+                .unwrap()
+                .scores
+                .elo,
+            1234.0
+        );
+        store
+            .replace_operator_quality(false, &Default::default())
+            .unwrap();
         assert_eq!(read().scores.elo, 1234.0);
         let external = rusqlite::Connection::open(scratch.path().join("store.db")).unwrap();
-        external.execute("UPDATE model_facts SET context_window=765432 WHERE provider_id='cache-provider'", []).unwrap();
+        external
+            .execute(
+                "UPDATE model_facts SET context_window=765432 WHERE provider_id='cache-provider'",
+                [],
+            )
+            .unwrap();
         assert_eq!(read().context_window, Some(765432.0));
         store.store.with_conn(|c| c.execute_batch("BEGIN; UPDATE model_facts SET context_window=888 WHERE provider_id='cache-provider'")).unwrap();
         assert_eq!(read().context_window, Some(888.0));
         store.store.with_conn(|c| c.execute_batch("ROLLBACK; UPDATE model_facts SET context_window=999 WHERE provider_id='cache-provider'")).unwrap();
         assert_eq!(read().context_window, Some(999.0));
-        store.store.with_conn(|c| c.execute_batch("DROP TABLE temp.catalog_facts_writes")).unwrap();
+        store
+            .store
+            .with_conn(|c| c.execute_batch("DROP TABLE temp.catalog_facts_writes"))
+            .unwrap();
         assert_eq!(read().context_window, Some(999.0));
         fact.context_window = Some(111.0);
         store.upsert_fact(&fact, FactSource::Override).unwrap();
         assert_eq!(read().context_window, Some(111.0));
         store.delete_fact("cache-provider/cache-model").unwrap();
-        assert!(!store.get_facts().unwrap().iter().any(|f| f.provider_id == "cache-provider"));
+        assert!(!store
+            .get_facts()
+            .unwrap()
+            .iter()
+            .any(|f| f.provider_id == "cache-provider"));
     }
 
     #[test]
@@ -6862,11 +6938,7 @@ mod tests {
 
     fn first_route_key(store: &SqliteRouteStateStore) -> String {
         let fact = store.get_facts().unwrap().remove(0);
-        striatum_core::make_route_key(
-            &fact.provider_id,
-            &fact.model_id,
-            fact.variant.as_deref(),
-        )
+        striatum_core::make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref())
     }
 
     #[test]

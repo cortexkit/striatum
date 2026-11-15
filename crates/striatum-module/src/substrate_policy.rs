@@ -6,9 +6,9 @@
 
 use std::collections::BTreeMap;
 
-use striatum_core::provider_model_spec::{parse_spec, spec_names_key};
 use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Deserializer, Serialize};
+use striatum_core::provider_model_spec::{parse_spec, spec_names_key};
 
 use crate::select_policy::Consumer;
 

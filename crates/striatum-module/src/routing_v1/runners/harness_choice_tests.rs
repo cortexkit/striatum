@@ -564,55 +564,55 @@ async fn harness_choice_candidate_facts_do_not_leak_into_held_legacy_picks_or_re
     // Production serves the group; withholding it here pins what a router that
     // doesn't serve it answers for the same declaration.
     describe::without_capability(GROUP, async {
-    let (harness, route) = configured().await;
-    setup(&harness, json!([{"module":"declaring"}]));
-    install(&harness, "declaring", &slot(json!({})));
-    let params = request(json!({"iq":0}));
-    let baseline = selected(route.call("route.select", &params).await);
-    let fingerprint = harness
-        .store()
-        .get_decision_by_id(baseline["decision_id"].as_str().unwrap())
-        .unwrap()
-        .unwrap()
-        .catalog_fingerprint;
-    let bad = request(json!({"iq":0,"tool_capabilities":["test:absent/v1"]}));
-    let baseline_refusal = route.call("route.select", &bad).await;
-    let value = slot(json!({"primary":{"starts_sessions":false}}));
-    describe::with_candidate_capabilities(&[GROUP], async {
+        let (harness, route) = configured().await;
+        setup(&harness, json!([{"module":"declaring"}]));
+        install(&harness, "declaring", &slot(json!({})));
+        let params = request(json!({"iq":0}));
+        let baseline = selected(route.call("route.select", &params).await);
+        let fingerprint = harness
+            .store()
+            .get_decision_by_id(baseline["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap()
+            .catalog_fingerprint;
+        let bad = request(json!({"iq":0,"tool_capabilities":["test:absent/v1"]}));
+        let baseline_refusal = route.call("route.select", &bad).await;
+        let value = slot(json!({"primary":{"starts_sessions":false}}));
+        describe::with_candidate_capabilities(&[GROUP], async {
+            install(&harness, "declaring", &value);
+            let parsed = super::PARSES.load(std::sync::atomic::Ordering::Relaxed);
+            for _ in 0..3 {
+                let answer = selected(route.call("route.select", &params).await);
+                assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+            }
+            assert_eq!(
+                super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
+                parsed
+            );
+        })
+        .await;
+        assert!(!describe::capabilities().contains(&GROUP));
         install(&harness, "declaring", &value);
         let parsed = super::PARSES.load(std::sync::atomic::Ordering::Relaxed);
         for _ in 0..3 {
             let answer = selected(route.call("route.select", &params).await);
-            assert_eq!(answer["runner"]["harness"], "secondary", "{answer}");
+            assert_eq!(answer["route"], baseline["route"]);
+            assert_eq!(answer["runner"], baseline["runner"]);
+            assert_eq!(
+                harness
+                    .store()
+                    .get_decision_by_id(answer["decision_id"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap()
+                    .catalog_fingerprint,
+                fingerprint
+            );
+            assert_eq!(route.call("route.select", &bad).await, baseline_refusal);
         }
         assert_eq!(
             super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
             parsed
         );
-    })
-    .await;
-    assert!(!describe::capabilities().contains(&GROUP));
-    install(&harness, "declaring", &value);
-    let parsed = super::PARSES.load(std::sync::atomic::Ordering::Relaxed);
-    for _ in 0..3 {
-        let answer = selected(route.call("route.select", &params).await);
-        assert_eq!(answer["route"], baseline["route"]);
-        assert_eq!(answer["runner"], baseline["runner"]);
-        assert_eq!(
-            harness
-                .store()
-                .get_decision_by_id(answer["decision_id"].as_str().unwrap())
-                .unwrap()
-                .unwrap()
-                .catalog_fingerprint,
-            fingerprint
-        );
-        assert_eq!(route.call("route.select", &bad).await, baseline_refusal);
-    }
-    assert_eq!(
-        super::PARSES.load(std::sync::atomic::Ordering::Relaxed),
-        parsed
-    );
     })
     .await;
 }

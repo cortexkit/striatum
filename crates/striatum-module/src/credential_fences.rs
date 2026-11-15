@@ -347,7 +347,9 @@ pub(crate) fn credential_account_id(
     accounts: &crate::broca_credentials::CredentialAccounts,
     credential_id: &str,
 ) -> Option<String> {
-    accounts.get(credential_id).map(|account| account.clone().unwrap_or_else(|| credential_id.to_owned()))
+    accounts
+        .get(credential_id)
+        .map(|account| account.clone().unwrap_or_else(|| credential_id.to_owned()))
 }
 
 /// Stable link from refusal evidence to its ordinary account pool blocks.
@@ -502,7 +504,8 @@ pub(crate) fn live_with_eligibility(
     credentials: &SharedBrocaCredentials,
     reconcile_eligibility: bool,
 ) -> Result<Vec<CredentialEntitlementFence>, String> {
-    let blocks = crate::account_state::published(store, crate::account_selection::now_ms()).map_err(|e| e.to_string())?;
+    let blocks = crate::account_state::published(store, crate::account_selection::now_ms())
+        .map_err(|e| e.to_string())?;
     let fences = blocks
         .report_credential_refusals()
         .map_err(|e| e.to_string())?;

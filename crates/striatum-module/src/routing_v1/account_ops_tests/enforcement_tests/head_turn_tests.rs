@@ -16,12 +16,14 @@ async fn head_turn_auto_enrolled_first_party_runner_is_trusted_on_both_surfaces(
             let mut credentials = shared.lock().unwrap();
             crate::routing_v1::runners::DescribeCache::default().catalog(
                 &json!([{"module_id":"class-runner","first_party":true,
-                    "incarnation":"daemon-a","spawn":7,
-                    "role_declarations":{"routing/v1":{"runner":{
-                        "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"},
-                            {"wire_api":"anthropic.messages","auth_method":"apikey"}]
-                    }}}}]),
-                &[], &mut credentials, NOW as i64,
+                "incarnation":"daemon-a","spawn":7,
+                "role_declarations":{"routing/v1":{"runner":{
+                    "pairs":[{"wire_api":"anthropic.messages","auth_method":"oauth"},
+                        {"wire_api":"anthropic.messages","auth_method":"apikey"}]
+                }}}}]),
+                &[],
+                &mut credentials,
+                NOW as i64,
             );
         }
         assert!(harness.operator_config().v1_runners().is_empty());
