@@ -1451,7 +1451,8 @@ async fn service_tier_never_upgrades_and_unknown_plan_or_runner_falls_to_standar
 #[test]
 fn service_tier_kimi_apikey_plane_prices_fast_without_changing_subscription_draw() {
     // Captured Kimi responses: the ordinary row states zero, while the API-key
-    // quota-proxy plane quotes Highspeed at $4 input and $20 output per million tokens.
+    // billing plane quotes the fast tier (Kimi's "Highspeed" twin) at $4 input
+    // and $20 output per million tokens.
     let payload: Value = serde_json::from_str(include_str!(
         "../../fixtures/service-tier-v1/kimi-served-payloads.json"
     ))
