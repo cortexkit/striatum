@@ -167,10 +167,70 @@ struct ServingInputs {
     routed_accounts: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct ServingRefreshInputs {
+    catalog: striatum_store::CatalogFingerprintKey,
+    view: Option<String>,
+    listed: Vec<ListedCredential>,
+    declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    billing: crate::fusiform_catalog::PlaneCatalog,
+    wire_apis: BTreeMap<String, String>,
+    identities: Option<Vec<(String, String, Vec<String>)>>,
+    provider_links: Vec<(String, Option<String>)>,
+}
+
+impl ServingRefreshInputs {
+    fn read(
+        credentials: &CredentialData,
+        state: &crate::account_quota::AccountQuotaState,
+        catalog: striatum_store::CatalogFingerprintKey,
+    ) -> Self {
+        // Keep refresh_serving_methods' structural dependencies in this one key.
+        // Adding an input to that join requires adding it here too. The account
+        // roster supplies credential IDs through identity/account/provider joins; quota
+        // values, model reach, poll times and current time do not filter those IDs.
+        Self {
+            catalog,
+            view: credentials.view.clone(),
+            listed: credentials.listed.clone(),
+            declarations: credentials.runner_declarations.clone(),
+            billing: credentials.billing_catalog.clone(),
+            wire_apis: credentials.wire_apis.clone(),
+            identities: state.roster.as_ref().map(|roster| {
+                roster
+                    .identities
+                    .iter()
+                    .map(|identity| {
+                        (
+                            identity.refresh_adapter.clone(),
+                            identity.account_id.clone(),
+                            identity.credential_ids.clone(),
+                        )
+                    })
+                    .collect()
+            }),
+            provider_links: state
+                .readings
+                .readings
+                .values()
+                .map(|reading| {
+                    (
+                        reading.account_id.clone(),
+                        reading.routing_provider().map(str::to_owned),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug, Clone, Default)]
 pub struct CredentialData {
     serving_revision: ServingRevision,
+    serving_refresh_inputs: Option<ServingRefreshInputs>,
+    #[cfg(test)]
+    serving_refresh_builds: usize,
     view: Option<String>,
     reached_at_ms: Option<u64>,
     providers: HashSet<String>,
@@ -953,6 +1013,23 @@ impl CredentialData {
         self.catalog_resolution(facts).targets
     }
 
+    pub(crate) fn refresh_serving_methods_if_changed(
+        &mut self,
+        state: &crate::account_quota::AccountQuotaState,
+        catalog: &striatum_store::CatalogFactsSnapshot,
+        at_ms: i64,
+        model_pools: &[striatum_core::quota_extract::ModelPool],
+    ) {
+        let inputs = ServingRefreshInputs::read(self, state, catalog.generation);
+        if self.serving_refresh_inputs.as_ref() == Some(&inputs) {
+            // Admission caps consume live quota values even when auth joins do not.
+            self.concurrency_caps.publish_roster(state);
+            return;
+        }
+        self.refresh_serving_methods(state, &catalog.facts, at_ms, model_pools);
+        self.serving_refresh_inputs = Some(inputs);
+    }
+
     pub(crate) fn refresh_serving_methods(
         &mut self,
         state: &crate::account_quota::AccountQuotaState,
@@ -960,6 +1037,11 @@ impl CredentialData {
         at_ms: i64,
         model_pools: &[striatum_core::quota_extract::ModelPool],
     ) {
+        self.serving_refresh_inputs = None;
+        #[cfg(test)]
+        {
+            self.serving_refresh_builds += 1;
+        }
         self.concurrency_caps.publish_roster(state);
         self.catalog_providers = facts.iter().collect();
         self.providers.clear();
@@ -1351,6 +1433,194 @@ mod tests {
             "an old request keeps its own generation"
         );
     }
+
+    fn serving_refresh_case(
+        change: impl FnOnce(
+            &striatum_store::SqliteRouteStateStore,
+            &mut BrocaCredentials,
+            &mut crate::account_quota::AccountQuotaState,
+        ),
+        rebuilds: usize,
+    ) {
+        use crate::account_quota::{RosterIdentity, StoredReading, VaultRoster};
+        use crate::routing_v1::request_cpu_bench as bench;
+        let fixture = bench::representative_fixture(bench::FixtureCounts {
+            subscription_rules: 1,
+            exclusion_rules: 1,
+            runner_route_rules: 0,
+            catalog_facts: 3,
+            listed_credentials: 2,
+        });
+        let mut credentials = fixture.credentials().lock().unwrap().snapshot();
+        let mut state = crate::account_quota::AccountQuotaState {
+            roster: Some(VaultRoster {
+                view: "roster".into(),
+                fetched_at_ms: 1,
+                grants: vec![],
+                identities: vec![RosterIdentity {
+                    refresh_adapter: "adapter".into(),
+                    account_id: "account".into(),
+                    credential_ids: vec![credentials.listed[0].id.clone()],
+                    active_credential_ids: vec![],
+                    first_seen_ms: 1,
+                    plan_tier: None,
+                }],
+            }),
+            ..Default::default()
+        };
+        state.readings.readings.insert(
+            ("adapter".into(), "account".into()),
+            StoredReading {
+                provider: "adapter".into(),
+                account_id: "account".into(),
+                entry: serde_json::json!({"apiProvider":"cpu-provider-0"}),
+                received_at_ms: 1,
+                tombstoned_at_ms: None,
+            },
+        );
+        let catalog = fixture.store().get_selection_catalog().unwrap();
+        let initial = credentials.serving_refresh_builds;
+        credentials.refresh_serving_methods_if_changed(&state, &catalog, 1, &[]);
+        assert_eq!(credentials.serving_refresh_builds, initial + 1);
+        change(fixture.store(), &mut credentials, &mut state);
+        let catalog = fixture.store().get_selection_catalog().unwrap();
+        credentials.refresh_serving_methods_if_changed(&state, &catalog, 100_000_000, &[]);
+        assert_eq!(credentials.serving_refresh_builds, initial + rebuilds);
+    }
+
+    #[test]
+    fn serving_refresh_unchanged_second_pass_does_not_rebuild() {
+        serving_refresh_case(|_, _, _| {}, 1);
+    }
+
+    #[test]
+    fn serving_refresh_catalog_generation_change_rebuilds() {
+        serving_refresh_case(
+            |store, _, _| {
+                store
+                    .with_writer_for_test(|connection| {
+                        connection.execute(
+                            "UPDATE model_facts SET auth_methods_json='[\"apikey\"]'",
+                            [],
+                        )
+                    })
+                    .unwrap();
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_credential_listing_change_rebuilds() {
+        serving_refresh_case(
+            |_, credentials, _| {
+                let mut rows = credentials.listed.clone();
+                rows[0].state = "disabled".into();
+                credentials.apply_listing(
+                    &ScopedCredentialListing {
+                        view: "changed-listing".into(),
+                        credentials: rows,
+                        ..Default::default()
+                    },
+                    2,
+                );
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_equal_listing_with_new_view_rebuilds() {
+        serving_refresh_case(
+            |_, credentials, _| {
+                let rows = credentials.listed.clone();
+                credentials.apply_listing(
+                    &ScopedCredentialListing {
+                        view: "new-view".into(),
+                        credentials: rows,
+                        ..Default::default()
+                    },
+                    2,
+                );
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_runner_declarations_change_rebuilds() {
+        serving_refresh_case(
+            |_, credentials, _| {
+                let declaration = crate::routing_v1::runners::parse_declaration(&serde_json::json!({
+                "runner":{"pairs":[{"wire_api":"messages","auth_method":"oauth"}],"follows_account_choice":true}
+            })).unwrap().unwrap();
+                credentials
+                    .runner_declarations
+                    .insert("changed-runner".into(), declaration);
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_billing_catalog_change_rebuilds() {
+        serving_refresh_case(
+            |_, credentials, _| {
+                assert_ne!(credentials.billing_catalog, Default::default());
+                credentials.publish_billing_catalog(Default::default());
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_wire_apis_change_rebuilds() {
+        serving_refresh_case(
+            |_, credentials, _| {
+                credentials
+                    .wire_apis
+                    .insert("cpu-provider-0/model-0".into(), "messages".into());
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_roster_identity_change_rebuilds() {
+        serving_refresh_case(
+            |_, _, state| {
+                state.roster.as_mut().unwrap().identities[0]
+                    .credential_ids
+                    .push("another-credential".into());
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_account_provider_link_change_rebuilds() {
+        serving_refresh_case(
+            |_, _, state| {
+                state.readings.readings.values_mut().next().unwrap().entry["apiProvider"] =
+                    serde_json::json!("another-provider");
+            },
+            2,
+        );
+    }
+
+    #[test]
+    fn serving_refresh_quota_value_only_change_does_not_rebuild() {
+        serving_refresh_case(
+            |_, _, state| {
+                let reading = state.readings.readings.values_mut().next().unwrap();
+                reading.entry["usage"] = serde_json::json!({"primary":{"used_percent":90}});
+                reading.received_at_ms += 60_000;
+                state.roster.as_mut().unwrap().fetched_at_ms += 60_000;
+            },
+            1,
+        );
+    }
+
     #[test]
     fn api_key_provider_mapping_uses_active_metadata_and_expires() {
         let mut explicit = credential("opaque-key", &["opencode-go", "another-provider"]);
