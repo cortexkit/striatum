@@ -1117,6 +1117,71 @@ async fn head_choices_request_cpu() {
 }
 
 #[tokio::test]
+async fn head_choices_logs_only_slow_calls() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = representative_fixture(FixtureCounts::smoke());
+    super::conformance_tests::install_head_snapshot(&fixture.harness);
+    let route = fixture
+        .harness
+        .bind(reserved(fixture::CONSUMER), None)
+        .await;
+    let params = json!({"runner_module": fixture.catalog.runners[0].module});
+    for slow in [true, false] {
+        crate::stage_timing::LOG_LINES.with(|lines| *lines.borrow_mut() = Some(Vec::new()));
+        if slow {
+            crate::stage_timing::ACCOUNT_DELAY.with(|delay| {
+                delay.set(
+                    crate::stage_timing::SLOW_ACCOUNT_CALL + std::time::Duration::from_millis(50),
+                )
+            });
+        }
+        let (ty, body) = fixture
+            .harness
+            .finish_dispatched(route.request_frame("route.head_choices", &params))
+            .await;
+        assert_eq!(ty, FrameType::Response, "{body}");
+        let lines = crate::stage_timing::LOG_LINES.with(|lines| lines.borrow_mut().take().unwrap());
+        if !slow {
+            assert!(lines.is_empty(), "{lines:?}");
+            continue;
+        }
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.starts_with("[routing] slow route.head_choices total_ms="),
+            "{line}"
+        );
+        assert!(line.ends_with(" operation=route.head_choices"), "{line}");
+        for field in [
+            "total_ms",
+            "writer_queue_wait_ms",
+            "sql_ms",
+            "commit_ms",
+            "serialization_ms",
+        ] {
+            let value = line
+                .split_whitespace()
+                .find_map(|part| part.strip_prefix(&format!("{field}=")))
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            assert!(
+                value >= if field == "total_ms" { 250.0 } else { 0.0 },
+                "{line}"
+            );
+            if field == "sql_ms" {
+                assert!(value > 0.0, "{line}");
+            }
+        }
+        assert_eq!(line.lines().count(), 1);
+        assert!(
+            !line.contains("account") && !line.contains("credential"),
+            "{line}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn slow_account_calls_emit_one_anonymous_line_per_operation() {
     assert_eq!(
         crate::stage_timing::SLOW_ACCOUNT_CALL,

@@ -247,7 +247,10 @@ pub(crate) async fn serve(
             #[cfg(test)]
             if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
+                ops::ROUTE_ACCOUNT_FOR
+                    | ops::ROUTE_ACCOUNT_OBSERVE
+                    | ops::ROUTE_SELECT_PANEL
+                    | ops::ROUTE_HEAD_CHOICES
             ) {
                 crate::stage_timing::ACCOUNT_DELAY
                     .with(|delay| std::thread::sleep(delay.replace(std::time::Duration::ZERO)));
@@ -284,7 +287,10 @@ pub(crate) async fn serve(
             // awaiting panel cannot pick up another request's store work.
             let (reply, stages) = if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
+                ops::ROUTE_ACCOUNT_FOR
+                    | ops::ROUTE_ACCOUNT_OBSERVE
+                    | ops::ROUTE_SELECT_PANEL
+                    | ops::ROUTE_HEAD_CHOICES
             ) {
                 striatum_store::scope_stage_timing(call).await
             } else {
@@ -352,6 +358,8 @@ pub(crate) async fn serve(
             serialization,
             call_stages,
         );
+    } else if operation == ops::ROUTE_HEAD_CHOICES {
+        timing.emit_head_choices(total, serialization, call_stages);
     }
     let reply = Frame::build_with_version(
         ver,
