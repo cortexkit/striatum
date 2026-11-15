@@ -1644,7 +1644,7 @@ impl ClassContext {
                 // going ahead. One that is already due is claimed for the
                 // decision here: a legacy send has no later admission or
                 // launch claim to take it, and would otherwise go ahead
-                // with the recovery slot unclaimed.
+                // without claiming that due probe.
                 if self.probe_eligible(provider, model, &admission.credential_id) {
                     return Ok(ProbeBinding::Bound);
                 }
@@ -1697,8 +1697,9 @@ impl ClassContext {
                     ) && !context.origin_recovered(origin, &admission.account_id)
                 })
                 .collect();
-            // The rows that chose these origins (and left others out)
-            // are checked before the claim, which names only these.
+            // The block rows these origins were chosen from (and the rows
+            // that ruled others out) are checked against SQL before the
+            // claim, because the claim names only the chosen origins.
             tx.check_decision_inputs(&[provider, ""])?;
             let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
             let claimed = tx.bind_decision_probe(
@@ -2610,7 +2611,8 @@ impl ClassContext {
     }
 
     /// Probe each roster account independently, without an affinity lookup or a
-    /// reservation. A blocked sibling must not hide a full eligible account.
+    /// reservation. A blocked sibling must not prevent an otherwise eligible
+    /// account from being returned.
     pub(crate) fn select_eligible_accounts(
         &self,
         provider: &str,
@@ -7170,9 +7172,10 @@ fn serve(
                 })
         })
         .collect();
-    // Which clocks apply to this admission, and whether any does, was read
-    // from the working state; the admission and its claim name none of the
-    // rows that left a clock out. Check them first.
+    // Which probe clocks (the fence_recheck rows that schedule each block's
+    // recovery test) apply to this admission was decided from the working
+    // state, and neither the admission nor its claim names the rows that
+    // ruled a clock out. Check those rows against SQL first.
     tx.check_decision_inputs(&[provider, ""])?;
     // So does which credentials its principal's exclusions rule out.
     tx.check_admission_exclusions(principal, &params.admission_id)?;

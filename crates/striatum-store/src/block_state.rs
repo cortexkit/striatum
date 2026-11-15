@@ -1444,8 +1444,9 @@ impl BlockState {
     /// its rows through the table's scope index, so the check visits only
     /// `provider`'s rows.
     ///
-    /// The empty provider names the principal clocks: the view projects a
-    /// principal exclusion's provider as `''`, and every other source row
+    /// The empty provider names the principal clocks: the probe clocks of
+    /// principal exclusions (a caller excluding one of its own credentials),
+    /// whose provider the view projects as `''`. Every other source row
     /// carries the provider it was recorded for. So for it only the clocks
     /// and their clears are compared; the other tables and the success pools
     /// hold no row of the empty provider
@@ -2344,13 +2345,16 @@ impl crate::AccountTx<'_> {
 
     /// Check that SQL holds every block row of each of `providers` as the
     /// working state does (`BlockState::check_provider_rows`), raising
-    /// `STATE_DIVERGED` on a difference. A decision that chose which probe
+    /// `STATE_DIVERGED` on a difference. A probe clock (a `fence_recheck`
+    /// row) schedules the single recovery test of one block. A decision that
+    /// chose which probe
     /// clocks apply from the state (a route clear removes one; an account
     /// fence decides whether its clock applies; sync's finding that no
     /// other source row needs a clock) runs this before it claims or
     /// admits, because neither the claim nor the admission names the rows
     /// that left a clock out. The empty provider names the principal
-    /// clocks. Without a working state SQL decided, and there is nothing to
+    /// clocks (see `check_provider_rows`). Without a working state SQL
+    /// decided, and there is nothing to
     /// check.
     pub fn check_decision_inputs(&self, providers: &[&str]) -> striatum_core::RouteStateResult<()> {
         let Some(state) = self.working_blocks()? else {

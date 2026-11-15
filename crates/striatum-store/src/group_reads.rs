@@ -296,7 +296,8 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 3] = [
 ];
 
 /// Writes that run a `SELECT` of their own over other tables (a bound
-/// `json_each` list, a bound observation) yet read their own target only
+/// `json_each` list, or the fields of an `account_observe` report bound as
+/// parameters) yet read their own target only
 /// for the rows they write: the row predicate, an upsert's guard,
 /// `RETURNING`. Any other write running a `SELECT` has every read of its
 /// target counted, because the authorizer does not say which select a read

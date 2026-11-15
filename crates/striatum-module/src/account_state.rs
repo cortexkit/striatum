@@ -473,7 +473,8 @@ impl AccountCommand<'_> {
     }
 
     /// The ledger and the waiters of the working state, for the concurrency
-    /// check. `None` for a private projection, which keeps neither.
+    /// check. `None` when this view has no working state (a private copy
+    /// built for a preview or a test), which keeps neither.
     pub(crate) fn concurrency_view(&self) -> Option<(&InflightLedger, &Waiters)> {
         self.state
             .as_deref()

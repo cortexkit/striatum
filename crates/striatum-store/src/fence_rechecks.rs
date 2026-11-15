@@ -2201,7 +2201,9 @@ impl AccountTx<'_> {
         // Which test this owner holds (if any) decides both the heal and the
         // authorization delete below, and a missed heal is never retried:
         // check the owner's authorizations and their clocks against SQL
-        // first, so a stale state runs again instead of healing nothing.
+        // first. On a mismatch this returns STATE_DIVERGED before healing or
+        // deleting anything, and the account writer reloads its state and
+        // runs the batch again.
         if let Some(blocks) = self.working_blocks()? {
             self.check_probe_inputs(&blocks, owner, true)?;
         }

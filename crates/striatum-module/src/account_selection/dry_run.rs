@@ -1,6 +1,7 @@
 //! Sweep-private account evidence. The published snapshot supplies the initial
-//! state; repairs change only this copy and survive later IQ-threshold
-//! evaluations and the eligibility checks for later panel seats.
+//! state; repairs change only this copy and survive the preview's later
+//! evaluations at other demand levels (IQ, the request's reasoning-demand
+//! score) and the eligibility checks for later panel seats.
 
 use super::*;
 use crate::account_state::{AccountState, Published};
@@ -43,7 +44,8 @@ impl Sweep {
     /// the captured route rows with their measurements (pressure, latency,
     /// success, last error) as captured, and this copy's block overlay. A
     /// route-state write committed during the sweep changes neither, so
-    /// every IQ and seat of one preview is judged against one state.
+    /// every demand level (IQ) and every panel seat of one preview is judged
+    /// against one state.
     pub(crate) fn route_snapshot(
         &self,
         now: f64,
