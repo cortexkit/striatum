@@ -46,15 +46,34 @@ fn diagnostics(subject: &KitSubject, answer: &Value) -> (Value, Value) {
 }
 
 fn quota_used(subject: &KitSubject, used: f64) {
+    quota_used_on(&subject.harness(), &["account-2"], used);
+}
+
+pub(super) fn quota_used_on(harness: &Harness, accounts: &[&str], used: f64) {
+    quota_used_reset_on(harness, accounts, used, 7_200_000);
+}
+
+pub(super) fn quota_used_reset_on(
+    harness: &Harness,
+    accounts: &[&str],
+    used: f64,
+    reset_after_ms: i64,
+) {
     let now = account_selection::now_ms();
-    let body = json!({"result":[{"provider":QUOTA_SOURCE,
-    "apiProvider":fixture::SUBSCRIPTION_PROVIDER,"account":"account-2","source":"vault",
-    "fetchedAt":account_selection::rfc3339(now),"usage":{
-        "primary":{"usedPercent":used,"windowMinutes":300,
-            "resetsAt":account_selection::rfc3339(now+7_200_000)},
-        "secondary":{"usedPercent":20.0,"windowMinutes":10080,
-            "resetsAt":account_selection::rfc3339(now+259_200_000)}
-    }}]});
+    let readings = accounts
+        .iter()
+        .map(|account| {
+            json!({"provider":QUOTA_SOURCE,
+            "apiProvider":fixture::SUBSCRIPTION_PROVIDER,"account":account,"source":"vault",
+            "fetchedAt":account_selection::rfc3339(now),"usage":{
+                "primary":{"usedPercent":used,"windowMinutes":300,
+                    "resetsAt":account_selection::rfc3339(now+reset_after_ms)},
+                "secondary":{"usedPercent":20.0,"windowMinutes":10080,
+                    "resetsAt":account_selection::rfc3339(now+259_200_000)}
+            }})
+        })
+        .collect::<Vec<_>>();
+    let body = json!({"result":readings});
     account_quota::apply_provider_reply(
         &mut crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap(),
         QUOTA_SOURCE,
@@ -64,7 +83,6 @@ fn quota_used(subject: &KitSubject, used: f64) {
     .unwrap();
     // Quota evidence is written through the same up-front writer helper used
     // by live refreshes, so tests exercise the allocator's durable block path.
-    let harness = subject.harness();
     let state = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap().clone();
     account_selection::refresh_all_blocks(harness.store(), &state, &harness.operator_config(), now)
         .unwrap();

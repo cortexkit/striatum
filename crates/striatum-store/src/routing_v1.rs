@@ -359,6 +359,9 @@ impl crate::AccountTx<'_> {
         recorded: &V1Recorded,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::routing_v1::v1_record_admission");
         self.conn
             .execute(
                 "INSERT INTO routing_v1_admission
@@ -574,6 +577,9 @@ mod tests {
 
 impl crate::AccountTx<'_> {
     pub fn v1_record_decision(&self, decision: &V1Decision) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::routing_v1::v1_record_decision");
         self.v1_record_selection(decision, None)
     }
 
@@ -582,6 +588,9 @@ impl crate::AccountTx<'_> {
         decision: &V1Decision,
         selection_json: Option<&str>,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::routing_v1::v1_record_selection");
         self.command_sql(|c: &Connection| {
                 let tx = c;
                 tx.execute(
@@ -639,6 +648,9 @@ impl crate::AccountTx<'_> {
         failed: bool,
         now_ms: i64,
     ) -> RouteStateResult<V1Recorded> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::routing_v1::v1_record_report");
         self.command_sql(|c: &Connection| {
             let tx = c;
             let inserted = tx.execute(

@@ -4,8 +4,32 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "authorization/tests.rs"]
+mod authorization;
+#[path = "catalogue/tests.rs"]
+mod catalogue;
+#[path = "claims/tests.rs"]
+mod claims;
+#[path = "continuation/tests.rs"]
+mod continuation;
+#[path = "credential/tests.rs"]
+mod credential;
+#[path = "fences/tests.rs"]
+mod fences;
+#[path = "history/tests.rs"]
+mod history;
+#[path = "ledger/tests.rs"]
+mod ledger;
+#[path = "maintenance/tests.rs"]
+mod maintenance;
 #[path = "metadata/tests.rs"]
 mod metadata;
+#[path = "probes/tests.rs"]
+mod probes;
+#[path = "quota/tests.rs"]
+mod quota;
+#[path = "read_only/tests.rs"]
+mod read_only;
 
 const START: u64 = 1_800_000_000_000;
 const POOL_PROVIDER: &str = "pool-provider";
@@ -32,6 +56,8 @@ struct World {
     commands: BTreeSet<String>,
     trace: striatum_store::writer_entry_trace::Trace,
     _trace_install: striatum_store::writer_entry_trace::Installed,
+    bridge_loads: Arc<std::sync::atomic::AtomicU64>,
+    expected_bridge_loads: u64,
 }
 
 impl World {
@@ -46,6 +72,16 @@ impl World {
             .await
             .unwrap();
         let mut catalog = fixture::catalog();
+        // The writer sequences select the subscription model as well as using
+        // its allocator, so let that shared model satisfy tool-using consumers.
+        catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model.provider == fixture::SUBSCRIPTION_PROVIDER && model.model == "model-c"
+            })
+            .unwrap()
+            .tool_calls = true;
         // Keep the exact subscription-account seed; add the existing grouped
         // pool test's model shapes and one key serving that borrowed catalogue.
         let pool_models = crate::routing_v1::key_pool_tests::catalog_models();
@@ -90,7 +126,13 @@ impl World {
         let store = harness.store();
         let trace = striatum_store::writer_entry_trace::Trace::default();
         let trace_install = trace.install();
-        crate::account_state::initialize_at(&store, START as i64).unwrap();
+        let bridge_loads =
+            crate::account_state::initialize_counted_at(&store, START as i64).unwrap();
+        let expected_bridge_loads = bridge_loads.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            expected_bridge_loads > 0,
+            "the load counter is not attached to the installed bridge"
+        );
         let frozen = store.frozen_block_data_for_test().unwrap();
         let outside = store.outside_account_writer_count_for_test();
         let world = Self {
@@ -107,12 +149,19 @@ impl World {
             commands: BTreeSet::new(),
             trace,
             _trace_install: trace_install,
+            bridge_loads,
+            expected_bridge_loads,
         };
         world.compare("seed");
         world
     }
 
     fn compare(&self, operation: &str) {
+        assert_eq!(
+            self.bridge_loads.load(std::sync::atomic::Ordering::Relaxed),
+            self.expected_bridge_loads,
+            "{operation}: an implicit bridge reload could hide a missing writer mirror"
+        );
         let store = self.harness.store();
         let context = format!("step={} now={} op={operation}", self.sequence, self.now);
         crate::account_state::assert_fresh_load_for_test(&store, self.now as i64, &context);
@@ -161,7 +210,7 @@ impl World {
             striatum_store::AccountCommandKind::Repair,
             change,
         )
-        .unwrap();
+        .unwrap_or_else(|error| panic!("{name}: {error}"));
         self.sequence += 1;
         self.commands.insert(name.into());
         self.compare(name);
@@ -180,6 +229,7 @@ impl World {
             .account_state_bridge()
             .unwrap()
             .request_reload();
+        self.expected_bridge_loads += 1;
         let now = self.now as i64;
         self.command("reload", move |tx| tx.tick(now));
     }
@@ -191,6 +241,22 @@ impl World {
         self.commands
             .insert("catalogue/listing/quota publication".into());
         self.compare("catalogue/listing/quota publication");
+    }
+
+    fn adapter<T>(
+        &mut self,
+        name: &str,
+        operation: impl FnOnce(
+            &striatum_store::SqliteRouteStateStore,
+        ) -> striatum_core::route_state_store::RouteStateResult<T>,
+    ) -> T {
+        let _clock = crate::InjectedClock::set(self.now);
+        let result =
+            operation(self.harness.store()).unwrap_or_else(|error| panic!("{name}: {error}"));
+        self.sequence += 1;
+        self.commands.insert(name.into());
+        self.compare(name);
+        result
     }
 
     async fn request_group(&mut self, draw: u8, nonce: u64) {
@@ -217,13 +283,20 @@ impl World {
                 self.ok(Caller::Runner,"route.account_observe",json!({"kind":"run_finished","event_id":format!("finish-{key}"),"admission_id":key,"run_id":key})).await;
             }
             1 | 2 => {
+                let route = self
+                    .catalog
+                    .models
+                    .iter()
+                    .find(|model| model.route_key().ends_with(&format!("/{POOL_MODEL}")))
+                    .unwrap()
+                    .route_key();
                 self.ok(
                     Caller::Operator,
                     "route.clear_cooldown",
-                    json!({"routeKey":subscription}),
+                    json!({"routeKey":route}),
                 )
                 .await;
-                let selected = self.request(Caller::Owner,"route.select",json!({"consumer":self.consumer,"requirements":{"iq":30},"pin":subscription,"affinity":key})).await;
+                let selected = self.request(Caller::Owner,"route.select",json!({"consumer":self.consumer,"requirements":{"iq":30},"pin":route,"affinity":key})).await;
                 if selected.0 == FrameType::Error {
                     assert_eq!(
                         selected.1["code"], "no_route",
@@ -242,13 +315,22 @@ impl World {
                 );
             }
             3 => {
-                let lease = self
-                    .ok(
+                let reply = self
+                    .request(
                         Caller::Operator,
                         "route.pool_acquire",
                         json!({"provider":POOL_PROVIDER,"model":POOL_MODEL,"session":key}),
                     )
                     .await;
+                if reply.0 == FrameType::Error {
+                    assert_eq!(
+                        reply.1["code"], "explicit_provider_pool_exhausted",
+                        "unexpected generated pool refusal: {}",
+                        reply.1
+                    );
+                    return;
+                }
+                let lease = reply.1["result"].clone();
                 self.ok(Caller::Operator,"route.pool_renew",json!({"provider":POOL_PROVIDER,"session":key,"leaseId":lease["leaseId"],"credentialId":lease["credentialId"]})).await;
                 self.ok(Caller::Operator,"route.pool_release",json!({"provider":POOL_PROVIDER,"session":key,"leaseId":lease["leaseId"],"endSession":true})).await;
             }
@@ -267,6 +349,17 @@ impl World {
             }
             7 => self.reload(),
             8 => self.publish_catalog(),
+            9 => self.maintenance_group(),
+            10 => self.credential_group(nonce),
+            11 => self.catalogue_group(nonce),
+            12 => self.fences_group(nonce),
+            13 => self.pool_probe_group(nonce).await,
+            14 => self.ledger_group(nonce).await,
+            15 => self.quota_group(nonce).await,
+            16 => self.authorization_group(nonce).await,
+            17 => self.history_group(nonce).await,
+            18 => self.claims_group(nonce).await,
+            19 => self.continuation_group(nonce).await,
             _ => panic!("unrecognised request group: {draw}"),
         }
     }
@@ -340,10 +433,10 @@ fn assert_trace_is_declared(trace: &striatum_store::writer_entry_trace::Trace) {
         !declared.is_empty(),
         "the production producer declarations were not read"
     );
-    for (name, reason) in TRANSIENT_COMMANDS {
+    for (name, reason) in TRANSIENT_COMMANDS.iter().chain(read_only::entries()) {
         assert!(
             declared.contains(*name),
-            "stale transient-command exclusion: {name}: {reason}"
+            "stale non-writer exclusion: {name}: {reason}"
         );
     }
     for entry in trace.entries() {
@@ -357,15 +450,39 @@ fn assert_trace_is_declared(trace: &striatum_store::writer_entry_trace::Trace) {
             .expect("a producer scope did not finish before its reply");
         if let Some((_, reason)) = TRANSIENT_COMMANDS
             .iter()
+            .chain(read_only::entries())
             .find(|(name, _)| *name == entry.name)
         {
             assert_eq!(
                 rows, 0,
-                "excluded transient helper wrote durable account state: {}: {reason}",
+                "excluded non-writer wrote durable account state: {}: {reason}",
                 entry.name
             );
         }
     }
+}
+
+fn assert_all_producers_driven(trace: &striatum_store::writer_entry_trace::Trace) {
+    assert_trace_is_declared(trace);
+    let mut expected = declared_adapters();
+    expected.extend(declared_mutable_commands());
+    expected.extend(metadata::native_declarations());
+    for (name, _) in TRANSIENT_COMMANDS.iter().chain(read_only::entries()) {
+        assert!(
+            expected.remove(*name),
+            "stale or duplicate non-writer exclusion: {name}"
+        );
+    }
+    let observed: BTreeSet<_> = trace
+        .entries()
+        .into_iter()
+        .map(|entry| entry.name.to_owned())
+        .collect();
+    let missing = expected.difference(&observed).collect::<Vec<_>>();
+    assert!(
+        missing.is_empty(),
+        "declared producers not driven by the real generator: {missing:#?}"
+    );
 }
 
 fn public_headers(source: &str) -> std::collections::BTreeMap<String, String> {
@@ -426,11 +543,11 @@ fn shuffled_request_groups(seed: u64) -> Vec<(u8, u64)> {
         random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
         random >> 32
     };
-    let mut plan: Vec<_> = (0..9u8).map(|group| (group, next())).collect();
+    let mut plan: Vec<_> = (0..20u8).map(|group| (group, next())).collect();
     for index in (1..plan.len()).rev() {
         plan.swap(index, next() as usize % (index + 1));
     }
-    plan.extend((0..24).map(|_| ((next() % 9) as u8, next())));
+    plan.extend((0..24).map(|_| ((next() % 20) as u8, next())));
     plan
 }
 
@@ -443,5 +560,21 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
             world.request_group(draw, nonce).await;
         }
         assert_trace_is_declared(&world.trace);
+        assert_all_producers_driven(&world.trace);
     }
+}
+
+#[tokio::test]
+async fn reviewed_reader_scopes_remain_non_writing_on_real_rows() {
+    let _clock = crate::InjectedClock::set(START);
+    let mut world = World::new("whole-writer-reader-scope").await;
+    world.credential_group(1);
+    assert_trace_is_declared(&world.trace);
+    let entry = world
+        .trace
+        .entries()
+        .into_iter()
+        .find(|entry| entry.name == "account_tx::fence_rechecks::credential_quota_classification")
+        .expect("the real classification reader was not driven");
+    assert_eq!(entry.account_rows_written, Some(0));
 }
