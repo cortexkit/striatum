@@ -2785,7 +2785,7 @@ impl ClassContext {
                     continue;
                 }
                 // Only origins participating in the named recovery determine
-                // its class; a later non-quota wall on another account is unrelated.
+                // its class; a later non-quota block origin on another account is unrelated.
                 if origin.quota {
                     if !non_quota {
                         block.lifetime = LifetimeClass::Quota;
@@ -5134,20 +5134,20 @@ struct PinRef {
     generation: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidateParams {
     account_id: String,
     credential_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidatesParams {
     view_digest: String,
     #[serde(default)]
     accounts: Vec<CandidateParams>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AccountRefParams {
     #[serde(default)]
     account_id: Option<String>,
@@ -5169,6 +5169,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(skip)]
+    continuation_input: Option<continuation::Inputs>,
     #[serde(default)]
     head_turn: bool,
     #[serde(skip)]
@@ -5244,6 +5246,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            continuation_input: None,
             head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
@@ -5883,7 +5886,7 @@ fn prepare_and_admit(
             ),
         ));
     }
-    let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
+    let (mut roster, route_fenced, class, selection) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
         Err(reply) => return Err(reply),
     };
@@ -5907,6 +5910,13 @@ fn prepare_and_admit(
             Ok(tier) => tier,
             Err(reply) => return Err(reply),
         };
+    parsed.continuation_input = Some(continuation::Inputs::prepare(
+        &parsed,
+        principal,
+        ctx.classes.as_ref(),
+        class,
+        selection.as_ref(),
+    ));
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return Err(because("route_fence", reply));
     }
@@ -6068,25 +6078,30 @@ fn prepare_roster(
         RosterBuild,
         BTreeMap<String, i64>,
         striatum_core::accounts::AllowedAccountClass,
+        Option<striatum_store::V1Decision>,
     ),
     OpReply,
 > {
     let provider = normalize(&parsed.provider);
-    let class = match parsed.model_decision_id.as_deref() {
-        None => striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
-        Some(id) => match ctx.store.v1_decision(id) {
-            Ok(Some(decision)) => decision.allowed_account_class,
-            Ok(None) => match ctx.store.decision_account_class(id) {
-                Ok(Some(class)) => class,
-                Ok(None) => {
-                    checking("unknown_decision");
-                    return Err(OpReply::error(
-                        "unknown_decision",
-                        "selection decision does not exist",
-                    ));
-                }
-                Err(error) => return Err(store_error(error)),
-            },
+    let selection = parsed
+        .model_decision_id
+        .as_deref()
+        .map(|id| ctx.store.v1_decision(id))
+        .transpose()
+        .map_err(store_error)?
+        .flatten();
+    let class = match (parsed.model_decision_id.as_deref(), selection.as_ref()) {
+        (_, Some(decision)) => decision.allowed_account_class,
+        (None, None) => striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
+        (Some(id), None) => match ctx.store.decision_account_class(id) {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                checking("unknown_decision");
+                return Err(OpReply::error(
+                    "unknown_decision",
+                    "selection decision does not exist",
+                ));
+            }
             Err(error) => return Err(store_error(error)),
         },
     };
@@ -6116,13 +6131,10 @@ fn prepare_roster(
                 // A decision made by the older select (every core mason launch)
                 // has no v1 row naming its runner. The runner asking is then the
                 // one that will serve the run, so its tier support is checked.
-                let runner = match ctx.store.v1_decision(id) {
-                    Ok(decision) => Some(decision.map_or_else(
-                        || normalize(&parsed.caller.runner),
-                        |decision| decision.runner_module,
-                    )),
-                    Err(error) => return Err(store_error(error)),
-                };
+                let runner = Some(selection.as_ref().map_or_else(
+                    || normalize(&parsed.caller.runner),
+                    |decision| decision.runner_module.clone(),
+                ));
                 let registry = ctx.classes.as_ref().map(|classes| {
                     crate::routing_v1::runners::Registry::build(
                         classes.config.as_ref(),
@@ -6200,7 +6212,7 @@ fn prepare_roster(
                 .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
         );
     }
-    Ok((roster, route_fenced, class))
+    Ok((roster, route_fenced, class, selection))
 }
 
 fn tier_candidate_matches(
@@ -7770,6 +7782,16 @@ fn serve(
     }
     let decision_id = new_id("acd");
     let mut context = json!({ "roster": roster.context });
+    if let (Some(input), Outcome::Admit(admitted)) = (&params.continuation_input, &decision.outcome)
+    {
+        let mut input = input.clone();
+        input.auth_method = ctx
+            .classes
+            .as_ref()
+            .map_or("oauth", |classes| classes.method(&admitted.credential_id))
+            .into();
+        context["continuation_input"] = json!(input);
+    }
     if let Some(credential) = &params.warm_credential {
         let result = if affinity_row.is_some() {
             json!({"kind":"ignored", "reason":"existing_affinity"})
@@ -7991,6 +8013,14 @@ fn replay(
     let mut reply: Value = serde_json::from_str(&existing.reply_json).map_err(|error| {
         RouteStateStoreError(format!("stored admission reply undecodable: {error}"))
     })?;
+    if existing.request_mode == "admit" && state == "started" {
+        if let Some(current) = tx.latest_used_continuation(principal, &existing.admission_id)? {
+            reply = serde_json::from_str(&current.reply_json).map_err(|error| {
+                RouteStateStoreError(format!("stored continuation reply undecodable: {error}"))
+            })?;
+            reply["admission"]["id"] = json!(existing.admission_id);
+        }
+    }
     reply["admission"]["state"] = json!(state);
     Ok(OpReply::Result(reply))
 }

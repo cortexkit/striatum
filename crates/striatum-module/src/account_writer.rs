@@ -319,8 +319,12 @@ pub(crate) fn prune_account_pins(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    let keys = store.plan_account_pins(before, limit)?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_pins(before, limit)
+        tx.delete_account_pins(before, &keys)
     })
 }
 

@@ -724,11 +724,11 @@ fn route_state_migrations() -> [Migration; 93] {
     ]
 }
 
-/// Trigger truncation when the allocated WAL exceeds 16 MiB.
+/// Retain at most 16 MiB when the writer reuses a fully checkpointed WAL.
 pub const WAL_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 /// SQLite negative cache sizes are KiB, allowing up to 8 MiB per pooled reader.
 pub const READER_CACHE_SIZE_KIB: i64 = -8192;
-/// Maximum SQLite busy wait for a truncating checkpoint; retry on the next tick.
+/// Maintenance connection busy-timeout bound; passive checkpoints never wait.
 pub const WAL_TRUNCATE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Marks a route-state writer's read of the row it is about to write
@@ -1710,25 +1710,11 @@ impl SqliteRouteStateStore {
             return Ok(());
         };
         let conn = maintenance.lock().unwrap_or_else(|p| p.into_inner());
-        (|| -> rusqlite::Result<()> {
-            let log: i64 =
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))?;
-            if log < 0 {
-                return Ok(());
-            }
-            let page_size: u64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
-            // A fully backfilled WAL may still occupy its allocated file size.
-            let path = conn.path().unwrap_or_default();
-            let bytes = std::fs::metadata(format!("{path}-wal"))
-                .map(|m| m.len())
-                .unwrap_or_else(|_| (log as u64) * (page_size + 24) + 32);
-            if bytes > WAL_SIZE_CAP_BYTES {
-                let _busy: i64 =
-                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-            }
-            Ok(())
-        })()
-        .map_err(err)
+        // Resetting the WAL on another connection changes the writer's
+        // data_version even when no account rows changed. Let the writer reset
+        // its own WAL on the next commit instead, using journal_size_limit.
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+            .map_err(err)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1871,6 +1857,7 @@ impl SqliteRouteStateStore {
         store
             .with_conn(|conn| {
                 conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                conn.pragma_update(None, "journal_size_limit", WAL_SIZE_CAP_BYTES)?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
                 // Savepoint statement journals otherwise create and delete a
                 // temp file per account command once they spill out of memory.

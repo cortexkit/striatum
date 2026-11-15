@@ -4,6 +4,7 @@ mod account_decision_tests;
 mod enforcement_tests;
 mod head_turn_tests;
 mod inflight_tests;
+mod legacy_tests;
 mod request_reads_tests;
 mod shadow_lines_tests;
 mod signed_out_tests;
@@ -481,7 +482,9 @@ async fn continuation_refuses_a_caller_pinned_account_and_records_exhaustion() {
     let (subject, _, runner, request) = paused_with_pin(true).await;
     let answer = result(runner.call("route.account_for", &request).await);
     assert_eq!(answer["kind"], "refuse", "{answer}");
-    assert_eq!(answer["routing_code"], "account_pinned");
+    // CONTRACT.md 1493-1499: explicit account pins are continuation refusals.
+    assert_eq!(answer["routing_code"], "pin_unavailable");
+    assert_eq!(answer["detail"]["reason"], "caller_pinned");
     let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
     let evidence: String = conn
         .query_row(

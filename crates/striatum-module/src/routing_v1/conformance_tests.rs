@@ -44,6 +44,7 @@ use crate::{
 
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
+mod admission_cost_tests;
 mod continuation_tests;
 mod first_party_tests;
 #[path = "media_conformance.rs"]
