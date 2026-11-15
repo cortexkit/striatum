@@ -68,8 +68,11 @@ pub(super) fn search_effects(
         }
         AttemptStatus::Quota | AttemptStatus::Credential => {
             // The module owns the account. Without an account identity, the
-            // refusal can only apply a one-hour cooldown to this route.
-            update.cooldown_until = Some(now.saturating_add(3_600_000) as f64);
+            // refusal can only block this route, for the non-quota maximum.
+            update.cooldown_until = Some(
+                now.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS as u64)
+                    as f64,
+            );
             update.wall_class = Some(RouteWallClass::Billing);
         }
         _ => return V1ReportEffects::default(),
