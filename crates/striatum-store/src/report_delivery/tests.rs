@@ -145,7 +145,7 @@ fn report_admission_probe_settlement_retires_only_its_matching_decision_copy() {
         let origins = store.fence_rechecks().unwrap();
         store
             .account_transaction(|tx| {
-                tx.heal_report_probe(&owner, Some("d"), true, "model", 2, &origins, 4)
+                tx.heal_report_probe(&owner, Some("d"), true, "model", 2, &origins, None, 4)
             })
             .unwrap();
         assert_eq!(

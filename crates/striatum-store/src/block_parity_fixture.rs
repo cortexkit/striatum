@@ -67,6 +67,13 @@ impl SqliteRouteStateStore {
             assert_ne!(view_quota,stored_quota,"credential stored class differs from view");
             assert!(classified);
             assert!(loaded.blocks.iter().any(|b|b.kind=="credential" && b.classified && (b.lifetime==LifetimeClass::Quota)==stored_quota));
+            let (pool, recovery, proved): (Option<String>, String, i64) = conn.query_row(
+                "SELECT pool_key_json,recovery_set_json,(SELECT count(*) FROM fence_success_pool WHERE fence_id='parity-recovery') FROM account_fence WHERE fence_id='parity-recovery'",
+                [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
+            assert!(pool.is_none());
+            assert_eq!(serde_json::from_str::<Vec<striatum_core::accounts::PoolKey>>(&recovery).unwrap().len(), 2);
+            assert_eq!(proved, 1, "partially proved whole-account recovery");
+            assert!(loaded.blocks.iter().any(|b| b.origin_key == "[\"parity-recovery\"]" && b.claim_owner.is_none() && b.next_recheck_at > now));
             Ok(())
         }).unwrap();
     }
@@ -95,6 +102,18 @@ pub(crate) fn seed_block_parity_fixture(
         source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
     };
     conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-fence','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,'[]')", params![serde_json::to_string(&fence).unwrap(),at])?;
+    let mut recovery_fence = fence.clone();
+    recovery_fence.recovery_set = [300, 10080].map(|window| striatum_core::accounts::PoolKey {
+        window_minutes: Some(window),
+        scope: striatum_core::accounts::PoolScope::EveryModel,
+        name: None,
+    }).into();
+    conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('parity-recovery','cpu-provider-0','account-0','{}',?1,'broca_account_limit',?2,'parity',?2,NULL,?3)",
+        params![serde_json::to_string(&recovery_fence).unwrap(),at,serde_json::to_string(&recovery_fence.recovery_set).unwrap()])?;
+    // A completed test proved one pool, but the other pool still needs a
+    // test. Its whole-account clock stays active with the claim released.
+    conn.execute("INSERT INTO fence_success_pool VALUES ('parity-recovery',?1,?2,?3)",
+        params![serde_json::to_string(&recovery_fence.recovery_set[0]).unwrap(),at,now])?;
     conn.execute_batch(&format!(r#"
                 INSERT INTO credential_entitlement_fences VALUES ('cpu-provider-0','oauth:cpu-0','billing_exhausted',NULL,{at})
                   ON CONFLICT(provider_id,credential_id) DO UPDATE SET code=excluded.code,
@@ -117,6 +136,8 @@ pub(crate) fn seed_block_parity_fixture(
                 INSERT INTO fence_retired_origin SELECT kind,origin_key,evidence,evidence_at,{now} FROM fence_origin WHERE provider='parity-retired';
             "#))?;
     fence_rechecks::sync(conn)?;
+    conn.execute("UPDATE fence_recheck SET last_claimed_at=?1,next_recheck_at=?1+?2,claim_generation=1 WHERE origin_key='[\"parity-recovery\"]' AND kind='account'",
+        params![now,fence_rechecks::QUOTA_FENCE_RECHECK_MS])?;
     conn.execute_batch(&format!(r#"
                 UPDATE fence_recheck SET quota=1,classified=1,claim_generation=7 WHERE kind='credential' AND credential_id='oauth:cpu-0';
                 UPDATE fence_recheck SET claim_owner='parity-owner',claim_generation=3,last_claimed_at={now},next_recheck_at={now}+900000 WHERE kind='account_route';

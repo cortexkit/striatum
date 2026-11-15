@@ -2269,6 +2269,7 @@ impl AccountTx<'_> {
         model: &str,
         admitted_at: i64,
         origins: &[FenceRecheck],
+        scope: Option<&QuotaSuccessScope>,
         now: i64,
     ) -> RouteStateResult<()> {
         // The report is recorded as delivered whatever this finds, so a heal
@@ -2326,7 +2327,7 @@ impl AccountTx<'_> {
                 model,
                 admitted_at,
                 now,
-                None,
+                scope,
                 true,
             )?;
             // The owner's row, and the decision's copy of the same test when
@@ -2527,26 +2528,32 @@ impl AccountTx<'_> {
                 // not cleared again.
                 let fence = key[0].as_str().and_then(|id| blocks.account_fence(id));
                 let older = |row: &crate::AccountFenceRow| row.observed_at.min(row.created_at) < admitted_at;
-                if authorized {
-                    if let Some((row, _, _)) = fence.filter(|(row, _, _)| older(row)) {
-                        self.clear_held_fence(row, now, "probe_succeeded")?;
-                    }
-                    return self.clear_held_clock(origin, now);
-                }
-                let (Some(scope), Some((row, pool, recovery))) = (scope, fence) else {
-                    return Ok(());
+                let Some((row, pool, recovery)) = fence else {
+                    return if authorized { self.clear_held_clock(origin, now) } else { Ok(()) };
                 };
                 let needed: Vec<striatum_core::accounts::PoolKey> = match pool {
                     Some(pool) => vec![serde_json::from_str(pool).map_err(err)?],
                     None => serde_json::from_str(recovery).map_err(err)?,
                 };
+                // Authorization permits the test, not recovery of pools the
+                // request did not use. An empty whole-account recovery set
+                // and pool-keyed fences retain their authorized clear.
+                if authorized && (pool.is_some() || needed.is_empty()) {
+                    if older(row) {
+                        self.clear_held_fence(row, now, "probe_succeeded")?;
+                    }
+                    return self.clear_held_clock(origin, now);
+                }
+                if scope.is_none() && !authorized {
+                    return Ok(());
+                }
                 if needed.is_empty() {
                     return Ok(());
                 }
                 let row = row.clone();
                 let (pool_json, recovery_json) = (pool.map(str::to_owned), recovery.to_owned());
                 drop(blocks);
-                for pool in needed.iter().filter(|pool| scope.used(pool, model)) {
+                for pool in needed.iter().filter(|pool| scope.is_some_and(|scope| scope.used(pool, model))) {
                     self.put_success_pool(&row.fence_id, &serde_json::to_string(pool).map_err(err)?, origin.evidence_at, now)?;
                 }
                 let healed = self
@@ -2556,7 +2563,7 @@ impl AccountTx<'_> {
                     .map(|pool| serde_json::from_str(&pool.pool_key_json).map_err(err))
                     .collect::<RouteStateResult<Vec<striatum_core::accounts::PoolKey>>>()?;
                 if !needed.iter().all(|pool| healed.contains(pool)) {
-                    return Ok(());
+                    return if authorized { self.defer_recovery_test(origin, now) } else { Ok(()) };
                 }
                 if older(&row) {
                     // Decided on the fence's pools and on the successes
@@ -2567,7 +2574,7 @@ impl AccountTx<'_> {
                         &recovery_json,
                         (origin.evidence_at, healed.len()),
                         now,
-                        "run_succeeded",
+                        if authorized { "probe_succeeded" } else { "run_succeeded" },
                     )?;
                 }
             }
@@ -2717,6 +2724,30 @@ impl AccountTx<'_> {
             format_args!("clock heal of {} {}", origin.kind, origin.origin_key)).map_err(err)
     }
 
+    /// A successful test with pools still unproved consumes its quota test
+    /// slot without clearing the block. Another request may test it after
+    /// the same interval used for an unsuccessful quota test.
+    fn defer_recovery_test(&self, origin: &FenceRecheck, now: i64) -> RouteStateResult<()> {
+        if let Some(blocks) = self.working_blocks()? {
+            let Some((clock, _)) = blocks.clock(&origin.kind, &origin.origin_key) else {
+                return Ok(());
+            };
+            let changed = self.conn.execute(&format!("UPDATE fence_recheck SET next_recheck_at=?3+?4,
+                claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
+                WHERE kind=?1 AND origin_key=?2 AND {}", clock_held(5)),
+                params![origin.kind,origin.origin_key,now,QUOTA_FENCE_RECHECK_MS,
+                    clock.evidence,clock.evidence_at,clock.lifetime == LifetimeClass::Quota,
+                    clock.next_recheck_at,clock.reset_check_at,clock.claim_owner,clock.claim_generation]).map_err(err)?;
+            return crate::block_state::expect_changes(changed, 1,
+                format_args!("partial recovery of {} {}", origin.kind, origin.origin_key)).map_err(err);
+        }
+        self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3+?4,
+            claim_owner=NULL,reset_check_at=CASE WHEN reset_check_at>?3 THEN reset_check_at END
+            WHERE kind=?1 AND origin_key=?2",
+            params![origin.kind,origin.origin_key,now,QUOTA_FENCE_RECHECK_MS]).map_err(err)?;
+        Ok(())
+    }
+
     fn heal_origins_on_sql(
         &self,
         origins: &[FenceRecheck],
@@ -2733,17 +2764,9 @@ impl AccountTx<'_> {
                 serde_json::from_str(&origin.origin_key).map_err(err)?;
             match origin.kind.as_str() {
                 "account" => {
-                    if authorized {
-                        self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='probe_succeeded'
-                            WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
-                        self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",params![origin.kind,origin.origin_key,now]).map_err(err)?;
-                        continue;
-                    }
-                    let Some(scope) = scope else {
-                        continue;
-                    };
                     let id = key[0].as_str().unwrap_or("");
                     let (pool,needed):(Option<String>,Option<String>)=self.conn.query_row("SELECT pool_key_json,recovery_set_json FROM account_fence WHERE fence_id=?1",[id],|row|Ok((row.get(0)?,row.get(1)?))).map_err(err)?;
+                    let pool_keyed = pool.is_some();
                     let needed: Vec<striatum_core::accounts::PoolKey> = match pool {
                         Some(pool) => vec![serde_json::from_str(&pool).map_err(err)?],
                         None => needed
@@ -2751,19 +2774,31 @@ impl AccountTx<'_> {
                             .transpose()?
                             .unwrap_or_default(),
                     };
+                    if authorized && (pool_keyed || needed.is_empty()) {
+                        self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='probe_succeeded'
+                            WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
+                        self.conn.execute("UPDATE fence_recheck SET cleared_at=?3 WHERE kind=?1 AND origin_key=?2",params![origin.kind,origin.origin_key,now]).map_err(err)?;
+                        continue;
+                    }
+                    if scope.is_none() && !authorized {
+                        continue;
+                    }
                     if needed.is_empty() {
                         continue;
                     }
-                    for pool in needed.iter().filter(|pool| scope.used(pool, model)) {
+                    for pool in needed.iter().filter(|pool| scope.is_some_and(|scope| scope.used(pool, model))) {
                         self.conn.execute("INSERT INTO fence_success_pool VALUES (?1,?2,?3,?4)
                             ON CONFLICT(fence_id,pool_key_json) DO UPDATE SET evidence_at=excluded.evidence_at,healed_at=excluded.healed_at",
                             params![id,serde_json::to_string(pool).map_err(err)?,origin.evidence_at,now]).map_err(err)?;
                     }
                     let healed = self.successful_quota_pools(id, origin.evidence_at)?;
                     if !needed.iter().all(|pool| healed.contains(pool)) {
+                        if authorized {
+                            self.defer_recovery_test(origin, now)?;
+                        }
                         continue;
                     }
-                    self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason='run_succeeded' WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at]).map_err(err)?;
+                    self.conn.execute("UPDATE account_fence SET cleared_at=?2,cleared_reason=?4 WHERE fence_id=?1 AND MIN(observed_at,created_at)<?3",params![key[0].as_str(),now,admitted_at,if authorized { "probe_succeeded" } else { "run_succeeded" }]).map_err(err)?;
                 }
                 "credential" => {
                     if origin.quota {

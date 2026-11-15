@@ -1400,6 +1400,121 @@ fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
     rig.check(&[NOW], "after the heal");
 }
 
+fn authorized_recovery_rig(empty: bool) -> Rig {
+    use striatum_core::accounts::{PoolKey, PoolScope};
+    let rig = rig("authorized-whole-account-recovery");
+    let pools: Vec<_> = if empty {
+        Vec::new()
+    } else {
+        ["a", "b"].map(|model| PoolKey {
+            window_minutes: Some(300),
+            scope: PoolScope::Models([model.to_owned(), "both".to_owned()].into()),
+            name: None,
+        }).into()
+    };
+    rig.sql(format!(
+        "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
+         VALUES ('whole','p0','a0','{{}}','{{}}','broca_account_limit',{},'x',{},NULL,'{}');",
+        NOW - 1_000_000, NOW - 1_000_000, serde_json::to_string(&pools).unwrap()
+    ));
+    rig
+}
+
+/// Run each claim and settlement first on SQL under rollback, then on the
+/// working state, comparing every block-table row as well as the answer.
+fn authorized_recovery_success(rig: &Rig, model: &str, known: bool, at: i64) {
+    let model = model.to_owned();
+    rig.store.account_command(AccountCommandKind::Report, move |tx| {
+        let owner = owner_name(2);
+        let claim = |tx: &crate::AccountTx<'_>| -> RouteStateResult<()> {
+            let origins = tx.fence_rechecks()?;
+            assert!(tx.grant_fence_rechecks(&origins, at, Some("owner1"))?);
+            assert!(tx.claim_fence_rechecks_for_authorized_admission(&origins, at, Some("owner1"), &owner)?);
+            tx.conn.execute("UPDATE fence_recheck SET reset_check_at=?1 WHERE kind='account'", [at + if known { 100 } else { 5 }]).map_err(err)?;
+            Ok(())
+        };
+        let settle = |tx: &crate::AccountTx<'_>| {
+            let admission = admission_row("p0", "c0", &model, at);
+            let scope = known.then_some(crate::QuotaSuccessScope {
+                family: striatum_core::accounts::ModelFamily::Other,
+                pool: None,
+            });
+            tx.heal_admission_success(&admission, None, Some("owner1"), scope.as_ref(), at + 10)
+        };
+        for stage in ["claim", "settle"] {
+            let run = |tx: &crate::AccountTx<'_>| -> RouteStateResult<String> {
+                let answer = if stage == "claim" {
+                    claim(tx)?;
+                    Vec::new()
+                } else {
+                    settle(tx)?
+                };
+                Ok(format!("{answer:?} {:#?}", block_rows(tx.conn)?))
+            };
+            tx.conn.execute_batch("SAVEPOINT recovery_oracle").map_err(err)?;
+            let sql = run(&crate::AccountTx::sql(tx.conn))?;
+            tx.conn.execute_batch("ROLLBACK TO recovery_oracle; RELEASE recovery_oracle").map_err(err)?;
+            assert_eq!(run(tx)?, sql, "{stage}: working-state and SQL recovery agree");
+        }
+        Ok(())
+    }).unwrap();
+    rig.check(&[at + 10], "authorized recovery success");
+}
+
+fn assert_outstanding_authorized_recovery(rig: &Rig, successes: usize, at: i64) {
+    let blocks = rig.published();
+    assert!(blocks.account_fence("whole").is_some(), "unproved pools keep the fence");
+    assert_eq!(blocks.success_pools().count(), successes);
+    let (clock, cleared) = blocks.clock("account", "[\"whole\"]").unwrap();
+    assert_eq!(cleared, None, "the outstanding block's clock stays active");
+    assert_eq!(clock.claim_owner, None, "the test releases its claim");
+    assert_eq!(clock.next_recheck_at, at + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS);
+    assert_eq!(clock.reset_check_at, (successes > 0).then_some(at + 100));
+    assert_eq!(blocks.authorizations().count(), 0, "owner and decision copy are retired");
+}
+
+#[test]
+fn authorized_whole_account_recovery_proves_only_a_then_b_clears() {
+    let rig = authorized_recovery_rig(false);
+    authorized_recovery_success(&rig, "a", true, NOW);
+    assert_outstanding_authorized_recovery(&rig, 1, NOW);
+    let blocks = rig.published();
+    let proof = blocks.success_pools().next().unwrap();
+    let pool: striatum_core::accounts::PoolKey = serde_json::from_str(&proof.pool_key_json).unwrap();
+    assert_eq!(pool.scope, striatum_core::accounts::PoolScope::Models(["a".into(), "both".into()].into()));
+    assert_eq!(proof.evidence_at, NOW - 1_000_000);
+    assert_eq!(proof.healed_at, NOW + 10);
+    authorized_recovery_success(&rig, "b", true, NOW + 10 + striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS);
+    assert!(rig.published().account_fence("whole").is_none());
+    assert_eq!(rig.published().success_pools().count(), 2);
+    assert!(rig.published().fence_rechecks(NOW).unwrap().is_empty());
+}
+
+#[test]
+fn authorized_whole_account_recovery_both_used_clears_at_once() {
+    let rig = authorized_recovery_rig(false);
+    authorized_recovery_success(&rig, "both", true, NOW);
+    assert!(rig.published().account_fence("whole").is_none());
+    assert_eq!(rig.published().success_pools().count(), 2);
+    assert!(rig.published().fence_rechecks(NOW).unwrap().is_empty());
+}
+
+#[test]
+fn authorized_whole_account_recovery_unknown_scope_heals_nothing() {
+    let rig = authorized_recovery_rig(false);
+    authorized_recovery_success(&rig, "both", false, NOW);
+    assert_outstanding_authorized_recovery(&rig, 0, NOW);
+}
+
+#[test]
+fn authorized_whole_account_recovery_empty_set_still_clears() {
+    let rig = authorized_recovery_rig(true);
+    authorized_recovery_success(&rig, "both", false, NOW);
+    assert!(rig.published().account_fence("whole").is_none());
+    assert_eq!(rig.published().success_pools().count(), 0);
+    assert!(rig.published().fence_rechecks(NOW).unwrap().is_empty());
+}
+
 /// A block row changed in place without the capture seeing it keeps every
 /// table's row count and highest rowid, so the per-tick comparison misses
 /// it. A full comparison with a fresh load, every sixth tick, finds it.
@@ -1554,7 +1669,7 @@ fn a_superseded_test_request_heals_nothing_by_any_settling_path() {
                 "authorized success" => tx.heal_authorized_probe("first", "p0", "m0", later),
                 _ => {
                     let origins = tx.fence_rechecks()?;
-                    tx.heal_report_probe("first", None, true, "m0", later, &origins, later)
+                    tx.heal_report_probe("first", None, true, "m0", later, &origins, None, later)
                 }
             })
             .unwrap();
@@ -1607,7 +1722,7 @@ fn a_superseded_test_request_heals_nothing() {
     rig.store
         .account_command(AccountCommandKind::Report, move |tx| {
             let origins = tx.fence_rechecks()?;
-            tx.heal_report_probe("first", None, false, "m0", later, &origins, later)
+            tx.heal_report_probe("first", None, false, "m0", later, &origins, None, later)
         })
         .unwrap();
     assert_eq!(
@@ -2023,6 +2138,7 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                             &model,
                             admitted,
                             &effective,
+                            scope.as_ref(),
                             at,
                         ))
                     }
@@ -3708,7 +3824,7 @@ fn a_heal_that_finds_no_test_on_a_stale_state_runs_again_and_heals() {
                 "authorized probe" => tx.heal_authorized_probe("decision", "p0", "m0", NOW + 10),
                 _ => {
                     let origins = tx.fence_rechecks()?;
-                    tx.heal_report_probe("decision", None, false, "m0", NOW + 5, &origins, NOW + 10)
+                    tx.heal_report_probe("decision", None, false, "m0", NOW + 5, &origins, None, NOW + 10)
                 }
             })
             .unwrap();
