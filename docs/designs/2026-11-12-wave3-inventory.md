@@ -80,7 +80,7 @@ the blast radius rather than dropping a guard during a structural transition.
 | I12 — clock generation distinct from authorization launch time | `S/fence_rechecks.rs::fence_rechecks::tests::consumed_authorization_neutral_release_reopens_the_claim_generation` | S fence, grant/consume/release under test: **replace**. | A |
 | I13 — old credential refusals retained, never six-hour expiry | `S/fence_rechecks.rs::fence_rechecks::tests::migration_retires_real_deadlines_but_preserves_quota_and_credential_evidence`;<br>`S/fence_rechecks.rs::fence_rechecks::tests::classification_preserves_old_credentials_and_tolerates_removed_credentials` | Q version-81 migration fixture + store reads/claims; Q standing refusal + store classification/removal: **replace** both for live behaviour. Preserve historical migration coverage separately when retiring the live-store tests. | A |
 | I14 — newer evidence wins; lease touch is not evidence; stale recovery cannot clear a newer refusal | `S/key_pool.rs::key_pool::wall_generation_tests::first_pool_refusal_survives_a_later_lease_touch`;<br>`S/key_pool.rs::key_pool::wall_generation_tests::newer_pool_refusal_replaces_a_long_migrated_deadline_with_its_short_retry`;<br>`S/fence_rechecks.rs::fence_rechecks::tests::provider_repeat_keeps_an_independent_model_origin_and_its_generation`;<br>`S/fence_rechecks.rs::fence_rechecks::tests::an_older_completed_decision_cannot_reset_a_newer_failure_backoff` | S pool API; Q migrated pool + S refusal; S route/provider updates; S decision/outcome + Q timestamps. Store operations under test: **replace** all four. I3's sibling-report race pins the concurrent clear side. | A |
-| I15 — retirement cannot resurrect; backups/projections carry proofs and authorizations | `ST/backup_exclusion.rs::backup_exclusion::every_routing_table_is_classed_exactly_once_with_a_reason`;<br>`ST/backup_exclusion.rs::backup_exclusion::no_backed_up_table_holds_a_foreign_key_into_a_skippable_one`;<br>`S/evaluation_snapshot.rs::evaluation_snapshot::tests::snapshot_carries_fence_archive_authorizations_and_triggers` | N schema inspection: **schema** for first two; Q cooldown/auth, snapshot + sync under test: **replace**, with owner approval before S8b. At S8c retain the old store test in an oracle harness when deleting the production projection; delete the store test at S7b, not earlier. **Missing:** an end-to-end backup/restore pin seeded with all proof/authorization/retirement rows. | A |
+| I15 — retirement cannot resurrect; backups/projections carry proofs and authorizations | `ST/backup_exclusion.rs::backup_exclusion::every_routing_table_is_classed_exactly_once_with_a_reason`;<br>`ST/backup_exclusion.rs::backup_exclusion::no_backed_up_table_holds_a_foreign_key_into_a_skippable_one`;<br>`S/evaluation_snapshot.rs::connection_store::tests::snapshot_carries_fence_archive_authorizations_and_triggers` | N schema inspection: **schema** for first two; Q cooldown/auth, snapshot + sync under test: **replace**, with owner approval before S8b. At S8c retain the old store test in an oracle harness when deleting the production projection; delete the store test at S7b, not earlier. **Missing:** an end-to-end backup/restore pin seeded with all proof/authorization/retirement rows. | A |
 | I16 — quarantine account-local model/provider errors, preserve siblings | `S/lib.rs::tests::legacy_account_wall_is_quarantined_without_erasing_evidence_or_real_walls` | Q legacy errors and independent real wall; store snapshot under test: **replace** with module snapshot/status coverage. | A |
 | I17 — losing concurrent probe retains fence diagnostics | `M/account_selection.rs::account_selection::tests::a_probe_claimed_after_roster_preparation_returns_its_fence_not_missing_candidates` | S fence and competing claim then internal `serve`: **replace** with writer-queued interleaving. | A |
 | I18 — scoring/what-if read-only; admission owns materialization | `M/routing_v1/what_if_tests.rs::routing_v1::what_if_tests::what_if_changes_no_rows_even_when_account_loading_reconciles_old_evidence`;<br>`M/routing_v1/account_classes_tests.rs::routing_v1::account_classes_tests::selection_with_unchanged_context_opens_no_account_write_transactions` | Q old evidence then H what-if; S/P prepared context then H selection, counter inspection: **native** both (flush before counters when needed). Decision-seat grants in I23 remain the specified selection exception. | A |
@@ -103,7 +103,7 @@ filters deliberately include nearby regressions. Do not use `--run-ignored all`:
 the ignored CPU/hold measurements have their own prescribed runs.
 
 ```sh
-PINS='test(/^(fence_lifetimes::tests::|fence_rechecks::tests::|key_pool::wall_generation_tests::|report_delivery::tests::|routing_v1::(account_classes_tests|metered_tests|what_if_tests)::|account_selection::tests::|evaluation_snapshot::tests::|prune_facts::tests::|backup_exclusion::)/) | test(/^tests::(xai_spending_limit|legacy_completed|anonymous_legacy|legacy_account_wall|route_handler_isolation::)/)'
+PINS='test(/^(fence_lifetimes::tests::|fence_rechecks::tests::|key_pool::wall_generation_tests::|report_delivery::tests::|routing_v1::(account_classes_tests|metered_tests|what_if_tests)::|account_selection::tests::|connection_store::tests::|prune_facts::tests::|backup_exclusion::)/) | test(/^tests::(xai_spending_limit|legacy_completed|anonymous_legacy|legacy_account_wall|route_handler_isolation::)/)'
 ```
 
 Each row gives one executable filter assignment. `PINS` expands to the expression
@@ -120,7 +120,7 @@ tests. Update filters and test paths when an approved replacement moves a pin.
 | S8a-3 | `FILTER="$PINS | test(account_writer::) | test(transaction_contention_tests::)"` | Full writer-handler coverage, source negative and per-table bypass counter. |
 | S8b-1 | `FILTER="$PINS | test(account_writer::) | test(account_state::)"` | Startup/load/reload, round trip and command-answer properties; replacement sign-offs already obtained. |
 | S8b-2 | `FILTER="$PINS | test(account_state::) | test(reads_off_writer::)"` | Reader-answer property, counted reader negatives, panel/key-pool mix, route-state differential. |
-| S8c | `FILTER="$PINS | test(account_state::)"` | Coherent sweep plus sweep-private quota/listing repair effects. |
+| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
 | S7b | `FILTER="$PINS | test(account_state::) | test(backup_exclusion::)"` | Block migration, frozen data, tombstones, stored-deadline provider status cases. |
 | S9a | `FILTER="$PINS | test(backup_exclusion::) | test(task_usage::) | test(observed_speed)"` | Split script Python check, open/refusal/history-chain, outbox freshness and idempotent mover. |
 | S9b-1 | `FILTER="$PINS"` | Derive windows/predicates/triggers/decision columns, no executable change. |
@@ -598,3 +598,71 @@ The owner's call-count placement ruling follows the in-place update paths in
 `S/call_counts.rs:69–158`. S9b-1 must cite the closed-bucket boundary before S9b
 ages either counter table. As with usage, this inventory authorizes aging only
 after the live/update window, not a new cross-file counter-update protocol.
+
+## S8c: coverage of the former dry-run SQL copy
+
+The production copy is replaced by `account_selection::Sweep`: one published
+`AccountState` and one `RequestInputs` catalogue/configuration view per sweep.
+The sweep's private account copy retains classification, listing, expiry and
+headroom repairs across IQ points and panel seats; it is never published. Route
+measurements, quota-cache windows, process quota state and the clock remain
+per-evaluation inputs. `head_choices` deliberately makes its separate catalogue
+read before the sweep. Probe grants and admission writes are disabled.
+
+The former SQL copy contains 23 tables, including
+`routing_operator_decommissioned`, as listed below.
+The SQL copy survives only under test/test-support as an independent oracle;
+its connection wrapper, row-capture hook and DELETE authorizer now live in
+`crates/striatum-store/src/connection_store.rs`.
+
+| Former copied object | Coverage in the dry-run path |
+|---|---|
+| `model_facts` | `RequestInputs.catalog_snapshot` and its resolved/priced facts; one catalogue generation for IQs and panels. |
+| `routing_operator_decommissioned` | Resolved catalogue facts carry the operator decommissioning overlay; no separate account read. |
+| `fence_recheck` | `AccountState.blocks` clocks, including classification, generation, claimant and cleared evidence. |
+| `fence_recheck_route_clear` | `AccountState.blocks` route clears and each derived block's cleared models. |
+| `fence_success_pool` | `AccountState.blocks` success pools remove recovered pools from account-fence recovery sets. |
+| `fence_probe_authorization` | `AccountState.blocks` authorizations; unstarted-expiry release changes only matching evidence/generations in the private copy. |
+| `fence_retired_origin` | Not needed: retirement records guard later SQL evidence insertion; dry runs report no new evidence and never insert into the live store. Expired origins are omitted by the pure derivation. |
+| `account_non_quota_route_fence` | `AccountState.blocks` non-quota/transient route origins and raw rows. |
+| `account_non_quota_size_refusal` | `AccountState.blocks` size origins; no size-admission command is run. |
+| `account_transient_backoff` | `AccountState.blocks` transient-backoff origins. |
+| `account_principal_exclusion` | `AccountState.blocks` exclusion origins/rows; no admission principal is allocated by an evaluation. |
+| `model_route_state` | Captured `AccountState.blocks` route block columns and clocks. `dry_run_route_snapshot` reads only route measurements from live SQL per evaluation, under the separately counted `route_data` category, excluded from the request-path account-state SQL-read counter. Refreshed diagnostic `last_error` cannot reclassify the captured block's scope. |
+| `provider_cooldown_state` | Captured `AccountState.blocks` provider origin, quarantine and inherited-route overlay. |
+| `credential_entitlement_fences` | `AccountState.blocks` credential sources; private listing reconciliation, classification and quota-heal operations retain their effects. |
+| `account_eligibility` | `AccountState.blocks` eligibility facts; private listing reconciliation removes obsolete facts. |
+| `account_size_refusal` | `AccountState.blocks` size sources; expired entries are filtered at read and fresh headroom clears the private source. |
+| `account_route_fence` | `AccountState.blocks` raw route evidence, latest-report ordering and clocks; private recovery/reset reconciliation. |
+| `account_fence` | `AccountState.blocks` active account/pool fences, recovery sets and origins; private fresh-headroom heals and quota holds. Cleared rows are not loaded. |
+| `account_admission` | `AccountState.admissions` open admissions and `inflight` ledger; concurrency diagnostics use the initial snapshot, and expired unstarted probe owners are released privately. No `Admit` is sent. |
+| `account_continue` | `AccountState.admissions` open offers/chains; private expiry releases offers. No continuation is created or consumed. |
+| `account_observation` | Not needed by selection evaluation: signed-out run exclusions and event de-duplication are admission/observation-handler work, which a dry run never invokes. Account/principal enforcement is already represented by block sources. |
+| `pool_key_state` | `AccountState.blocks` pool billing/rate origins and effective probe due times supply the wall flags ClassContext consumes. `last_used_at` is not used by ClassContext. |
+| `pool_key_lease` | Not needed: ClassContext tests only pool wall flags; it does not consume the `in_flight` count. Dry runs never choose/acquire a pool key or reserve a probe. |
+| `fence_origin` view | `BlockState` source origins plus `fence_rechecks::derive_blocks`, the same derivation used by the SQL adapter. |
+| `fence_retire_enforcement` trigger | No durable retirement is needed in a dry run: pure lifetime evaluation omits expired enforcement without a live delete/insert. |
+| `model_route_state_inherit_fence_scope` trigger | No route-state row is written in a dry run. Captured source provenance/quarantine fields are already held by `BlockState`, and so are the route measurements: a sweep judges every evaluation against the rows it captured. |
+
+S8c filter: keep the invariant test filters above, use
+`connection_store::tests::` for the moved SQL-reference tests, and add
+`test(what_if_tests::sweep::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference)`.
+`account_writer::tests::` and `block_state::tests::` also protect the moved
+capture/authorizer hooks and the private account-repair support. Route
+measurements are captured with the rest of the account state, so a route-state
+write during a sweep changes neither later evaluations nor the scope of a
+captured wall (`a_route_state_write_during_a_sweep_leaves_its_later_evaluations_alone`,
+in the sweep filter). Capped sweeps and standalone panel estimates also
+assert one account snapshot, no SQL reads counted as account-state reads and
+no writer commands.
+The new sweep tests compare whole responses (timings removed), including every
+pick/refusal/exclusion, bar, top-routable and adequate list, panels and head
+choices. The quota-replacement fixtures are recorded through the test-only SQL
+repair path and replayed through the memory path. The acquisition-count pin in
+`s4b_what_if_fresh_headroom_repairs_only_its_snapshot` remains 2: one catalogue
+facts/generation checkout and one observed-speed aggregate checkout; its warm
+class-vector cache takes no writer checkout.
+
+The routing-service campaign owner accepted this coverage mapping. Before
+merge, whole-response SQL comparisons must also cover a pool wall on a key-pool
+route and an unused open continuation offer.

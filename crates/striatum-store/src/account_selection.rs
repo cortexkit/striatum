@@ -2435,7 +2435,7 @@ impl SqliteRouteStateStore {
                 let result = f(&AccountTx::sql(conn));
                 if result.is_ok() {
                     if let Some(tx) = tx {
-                        crate::evaluation_snapshot::timed_commit(tx)?;
+                        crate::connection_store::timed_commit(tx)?;
                     }
                 }
                 Ok(result)
@@ -2460,6 +2460,13 @@ impl SqliteRouteStateStore {
         &self,
         f: impl FnOnce(&AccountTx<'_>) -> RouteStateResult<T>,
     ) -> RouteStateResult<T> {
+        self.direct_account_transaction_with_error(f)
+    }
+
+    pub(crate) fn direct_account_transaction_with_error<T, E: From<striatum_core::RouteStateStoreError>>(
+        &self,
+        f: impl FnOnce(&AccountTx<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
         #[cfg(not(any(test, feature = "test-support")))]
         assert!(
             self.store.is_projection(),
@@ -2477,7 +2484,7 @@ impl SqliteRouteStateStore {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx::sql(&tx));
                 if result.is_ok() {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    crate::connection_store::timed_commit(tx)?;
                     wrote = conn.total_changes() != before;
                 }
                 Ok(result)
@@ -2505,7 +2512,7 @@ impl SqliteRouteStateStore {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx::sql(&tx));
                 if matches!(result, Ok(true)) {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    crate::connection_store::timed_commit(tx)?;
                 }
                 Ok(result)
             })

@@ -100,9 +100,10 @@ pub(super) fn select_media(
     )
 }
 
-/// Media evidence is copied before the first preview row. Account loading can
-/// clear obsolete credential refusals, so it must use the disposable store in `Deps`.
+/// Media evidence is captured before the first preview row. Account loading
+/// may heal evidence only in the private sweep, never in the live `Deps` store.
 pub(super) struct MediaEvaluation {
+    pub accounts: std::sync::Arc<crate::account_selection::Sweep>,
     pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
     pub consumers: std::sync::Arc<super::consumers::Registry>,
     pub joined: std::sync::Arc<super::consumers::MediaRoutes>,
@@ -367,7 +368,7 @@ fn select_request(
         }
         allowed
     });
-    let mut accounts = crate::account_selection::ClassContext::read_with_catalog(
+    let mut accounts = crate::account_selection::ClassContext::read_for_sweep(
         deps.store,
         deps.broca_credentials,
         config.clone(),
@@ -378,6 +379,7 @@ fn select_request(
         inputs.facts.clone(),
         &inputs.catalog_snapshot,
         now as i64,
+        evaluation.as_ref().map(|view| view.accounts.as_ref()),
     )
     .map_err(store_refusal)?;
     let mut top_routes = std::collections::BTreeSet::new();

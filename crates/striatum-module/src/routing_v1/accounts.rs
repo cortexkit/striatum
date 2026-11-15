@@ -11,7 +11,7 @@ use cortexkit_role_routing::account::{
     parse_account_for_request_serving, Account, AccountForAnswer, AccountForRequest, AccountPin,
     AccountReason, AccountReasonCode, Admission,
 };
-use cortexkit_role_routing::errors::{NoRouteReason, Refusal, RefusalCode};
+use cortexkit_role_routing::errors::{AccountUnservableDetail, AccountUnservableReason, NoRouteReason, Refusal, RefusalCode};
 use cortexkit_role_routing::observe::{
     parse_account_observe_request_serving, AccountObserveAnswer, Observation,
 };
@@ -358,10 +358,11 @@ fn account_for_inner(
             }) {
                 checking("bound_service_tier");
                 let message = "A request bound to an earlier routing decision keeps that decision's service tier. Send the same tier, or ask routing for a new decision to change it.";
-                // An unfamiliar stored tier is not an invalid tier in the
-                // caller's request, so keep the existing refusal for that case.
+                // The stored tier, not the caller's request, is invalid.
                 if bound_tier.as_deref().and_then(ServiceTier::parse).is_none() {
-                    return Err(account_unavailable(message));
+                    return Err(Refusal::account_unservable(
+                        AccountUnservableReason::StoredStateInvalid, vec![], vec![],
+                    ));
                 }
                 return Err(Refusal::with(
                     RefusalCode::InvalidRequest,
@@ -434,6 +435,8 @@ fn account_for_inner(
                 .map_err(store_unavailable)?;
         }
         let record = AdmissionRecord {
+            #[cfg(test)]
+            answer_mutation: FINISH_ANSWERS.lock().unwrap().remove(&request.admission_id),
             principal,
             request,
             body_json,
@@ -476,6 +479,38 @@ pub(crate) struct AdmissionRecord {
     request: AccountForRequest,
     body_json: String,
     bound_tier: Option<String>,
+    #[cfg(test)]
+    answer_mutation: Option<fn(&mut Value)>,
+}
+
+#[cfg(test)]
+static FINISH_ANSWERS: std::sync::LazyLock<std::sync::Mutex<std::collections::BTreeMap<String, fn(&mut Value)>>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+pub(crate) fn inject_finish_answer(admission_id: &str, mutation: fn(&mut Value)) {
+    assert!(FINISH_ANSWERS.lock().unwrap().insert(admission_id.into(), mutation).is_none());
+}
+
+#[derive(Debug)]
+pub(crate) enum AdmissionError {
+    Store(striatum_core::RouteStateStoreError),
+    Refusal(Refusal),
+}
+
+impl From<striatum_core::RouteStateStoreError> for AdmissionError {
+    fn from(error: striatum_core::RouteStateStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl striatum_store::AccountCommandError for AdmissionError {
+    fn store_error(&self) -> Option<&striatum_core::RouteStateStoreError> {
+        match self {
+            Self::Store(error) => Some(error),
+            Self::Refusal(_) => None,
+        }
+    }
 }
 
 impl AdmissionRecord {
@@ -484,19 +519,20 @@ impl AdmissionRecord {
         tx: &striatum_store::AccountTx<'_>,
         reply: OpReply,
         now: i64,
-    ) -> striatum_core::route_state_store::RouteStateResult<OpReply> {
+    ) -> Result<OpReply, AdmissionError> {
         let result = match reply {
             OpReply::Result(result) => result,
             error => return Ok(error),
         };
-        let answer = match self.answer(&result) {
-            Ok(answer) => answer,
-            Err(refusal) => {
-                return Err(striatum_core::route_state_store::RouteStateStoreError(
-                    refusal.message,
-                ))
+        #[cfg(test)]
+        let result = {
+            let mut result = result;
+            if let Some(mutation) = self.answer_mutation {
+                mutation(&mut result);
             }
+            result
         };
+        let answer = self.answer(&result).map_err(AdmissionError::Refusal)?;
         let standing = tx.v1_record_admission(
             &self.principal,
             &self.request.admission_id,
@@ -534,18 +570,10 @@ impl AdmissionRecord {
                 .is_some_and(|tier| tier != "standard" && chosen != Some(tier))
         {
             checking("chosen_service_tier");
-            let mut refusal = account_unavailable(
-            "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.",
-        );
-            let detail = json!({
-                "code": "account_selection_unavailable",
-                "retry_after_s": null,
-                "decision_id": request.decision_id,
-                "exclusions": request.candidates.iter().flat_map(|candidates| &candidates.accounts)
-                    .map(|candidate| json!({"account_id":candidate.account_id,"reason":"bound_service_tier_unavailable"}))
-                    .collect::<Vec<_>>(),
-            });
-            refusal.detail.extend(detail.as_object().unwrap().clone());
+            let mut refusal = Refusal::account_unservable(
+                AccountUnservableReason::BoundTierUnavailable, vec![], vec![],
+            );
+            refusal.message = "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision.".into();
             return Err(refusal);
         }
         Ok(answer)
@@ -695,10 +723,11 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
             .map(|ms| ms.max(0) as u64)
     };
     let missing = |what: &str| {
-        provider_refusal(
-            "account_selection_unavailable",
-            format!("the allocator's answer has no {what}"),
-        )
+        let mut refusal = Refusal::account_unservable(
+            AccountUnservableReason::AllocatorInvariant, vec![], vec![],
+        );
+        refusal.message = format!("the allocator's answer has no {what}");
+        refusal
     };
     let reason = &result["reason"];
     let reason_code = match &reason["code"] {
@@ -762,8 +791,9 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 /// timed by the wait the allocator states. Account-selection unavailability
 /// also preserves candidate exclusions and an optional short retry delay.
 /// Legacy codes the contract does not declare (`store_error`,
-/// `internal_error`, `no_eligible_account`, `unscoped_caller`) become the
-/// transient `account_selection_unavailable`. `account_selection_disabled`
+/// `internal_error`, `unscoped_caller`) become the transient
+/// `account_selection_unavailable`. Stable `no_eligible_account` becomes
+/// `account_unservable`. `account_selection_disabled`
 /// is preserved verbatim so it stays distinguishable from quota or
 /// authentication refusals; the contract declares it (0.5.2) as untimed
 /// with empty detail. A legacy `account_selection_unsupported` that reaches
@@ -847,7 +877,37 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             }
             refusal
         }
-        "store_error" | "internal_error" | "no_eligible_account" | "unscoped_caller" => {
+        "no_eligible_account" => Refusal::account_unservable(
+            AccountUnservableReason::NoEligibleAccount, vec![], vec![],
+        ),
+        "account_unservable" => {
+            // The allocator already used the bounded constructor. Preserve its
+            // full counts rather than counting the truncated lists again.
+            match detail.and_then(|detail| serde_json::from_value::<AccountUnservableDetail>(detail.clone()).ok()) {
+                Some(detail) => {
+                    let mut refusal = Refusal::account_unservable(
+                        detail.reason,
+                        detail.offered_credential_ids.unwrap_or_default(),
+                        detail.eligible_credential_ids.unwrap_or_default(),
+                    );
+                    for (key, count) in [
+                        ("offered_credential_count", detail.offered_credential_count),
+                        ("eligible_credential_count", detail.eligible_credential_count),
+                    ] {
+                        if refusal.detail.contains_key(key) {
+                            if let Some(count) = count {
+                                refusal.detail.insert(key.into(), json!(count));
+                            }
+                        }
+                    }
+                    refusal
+                }
+                None => Refusal::account_unservable(
+                    AccountUnservableReason::Unknown("unspecified".into()), vec![], vec![],
+                ),
+            }
+        }
+        "store_error" | "internal_error" | "unscoped_caller" => {
             account_unavailable(message.clone())
         }
         other => Refusal::new(RefusalCode::parse(other), message.clone()),
@@ -1060,6 +1120,7 @@ pub(crate) fn account_refusal_for_test_detail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod unservable_tests;
 
     #[test]
     fn account_service_tier_absent_preserves_legacy_answer_bytes() {

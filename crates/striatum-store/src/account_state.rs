@@ -159,7 +159,7 @@ impl WriterAccountState {
 }
 
 impl crate::SqliteRouteStateStore {
-    pub fn is_account_evaluation_projection(&self) -> bool {
+    pub fn is_private_account_copy(&self) -> bool {
         self.store.is_projection()
     }
 

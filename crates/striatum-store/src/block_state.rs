@@ -37,6 +37,9 @@ use striatum_core::blocks::Block;
 
 use crate::fence_rechecks::{self, Clocks, FenceRecheck, LoadedBlocks, RouteClear, ViewOrigin};
 
+mod dry_run;
+pub use dry_run::DryRunRepair;
+
 /// Every table whose rows the block state holds. The writer connection's
 /// update hook and delete authorizer watch exactly these.
 pub const BLOCK_TABLES: [&str; 16] = [

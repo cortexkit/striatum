@@ -17,7 +17,7 @@ mod inflight;
 mod waiters;
 
 pub(crate) use admissions::AdmissionState;
-pub(crate) use blocks::{published, writer, BlockReads, Published};
+pub(crate) use blocks::{published, BlockReads, Published};
 pub(crate) use inflight::{InflightLedger, InflightScope};
 pub(crate) use waiters::{matched as matched_waiters, CapCount, Waiter, Waiters};
 
@@ -142,7 +142,7 @@ pub(crate) fn open_preflight_admission(
     admission_id: &str,
     now_ms: i64,
 ) -> RouteStateResult<Option<AccountAdmissionRow>> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return store.account_read(|tx| tx.admission(principal, admission_id));
     }
     Ok(published_at(store, now_ms)?
@@ -160,7 +160,7 @@ pub(crate) fn closed_admission(
     principal: &str,
     admission_id: &str,
 ) -> RouteStateResult<Option<AccountAdmissionRow>> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return Ok(None);
     }
     keyed_exception();
@@ -326,7 +326,13 @@ pub(crate) fn published_at(
     Ok(snapshot(store)?.as_of(now))
 }
 
+#[cfg(test)]
+pub(crate) static SNAPSHOT_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<AccountState>> {
+    #[cfg(test)]
+    SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
     initialize(store)?;
     #[cfg(test)]
     {

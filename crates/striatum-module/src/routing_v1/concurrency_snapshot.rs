@@ -1,12 +1,11 @@
-//! A call-local view of the published ledger and cap policy. Counting never
-//! reloads admissions from the disposable SQL projection used for eligibility.
+//! A call-local view of the captured account ledger and cap policy. Counting
+//! never rereads admissions or takes another account-state snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use cortexkit_role_routing::errors::Refusal;
 use serde_json::{json, Value};
-use striatum_core::RouteStateStore;
 
 use crate::account_state::{AccountState, CapCount, InflightScope};
 use crate::concurrency_caps::{CapScope, ResolvedCaps};
@@ -22,14 +21,16 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub(super) fn capture(
+    pub(super) fn from_snapshot(
         deps: &Deps<'_>,
         config: &crate::config_overrides::LiveConfig,
-        catalog_store: &striatum_store::SqliteRouteStateStore,
+        state: Arc<AccountState>,
+        facts: &[striatum_core::ModelFact],
         now: i64,
     ) -> Result<Self, Refusal> {
-        let state =
-            crate::account_state::published_at(deps.store, now).map_err(store_refusal)?;
+        // Read as of `now`: expired probes and offers released, as request
+        // paths see them.
+        let state = state.as_of(now);
         let mut credentials = deps
             .broca_credentials
             .lock()
@@ -56,7 +57,6 @@ impl Snapshot {
                 .entry((provider.to_owned(), account.to_owned()))
                 .or_default();
         }
-        let facts = catalog_store.get_facts().map_err(store_refusal)?;
         let providers = facts.iter().map(|fact| fact.provider_id.clone()).collect();
         let quota = crate::ACCOUNT_QUOTA
             .get()

@@ -52,17 +52,20 @@ pub(super) async fn select_panel(
     super::consumers::effective(&config).admit(&request.consumer, caller)?;
     let policy = request_policy(&request, &config)?;
     if request.estimate == Some(true) {
-        // Account loading can reconcile stale evidence. Keep those writes on a
-        // disposable snapshot, and never reserve a live probe or recovery test.
-        let account_store = Arc::new(
-            deps.store
-                .account_evaluation_snapshot(super::now_ms() as i64)
-                .map_err(store_refusal)?,
-        );
+        // Keep stale-evidence repairs local to this estimate and never reserve
+        // a live probe or recovery test.
+        let accounts =
+            crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
+        let inputs = super::select::RequestInputs::read_with_config(
+            deps,
+            crate::config_overrides::live_config(deps.routing_config_path),
+            config.clone(),
+        )?;
         let dry = DryRun {
-            live_config: crate::config_overrides::live_config(deps.routing_config_path),
+            live_config: inputs.live_config.clone(),
             operator_config: config,
-            account_store: &account_store,
+            accounts: &accounts,
+            inputs: &inputs,
             profile_lookup: &super::select::live_profile_lookup,
         };
         let evaluated = evaluate_panel(&request, policy, caller, deps, &dry).await?;
@@ -149,13 +152,14 @@ pub(super) fn request_policy(
 }
 
 /// Call-local inputs for read-only panel sizing or an operator what-if:
-/// configuration and a disposable account-evidence store. Seats are checked by
+/// configuration/catalogue inputs and a private account-state copy. Seats use
 /// select's evaluation path, which returns before recording a decision, taking
 /// a hold or acquiring a pool key, and no panel row is written.
 pub(super) struct DryRun<'a> {
     pub live_config: Arc<crate::config_overrides::LiveConfig>,
     pub operator_config: Arc<crate::config_overrides::LiveConfig>,
-    pub account_store: &'a crate::SharedStore,
+    pub accounts: &'a crate::account_selection::Sweep,
+    pub inputs: &'a super::select::RequestInputs,
     pub profile_lookup: &'a super::select::ProfileLookup,
 }
 
@@ -555,12 +559,13 @@ async fn evaluate_seat(
     let view = super::select::Evaluation {
         live_config: dry.live_config.clone(),
         operator_config: dry.operator_config.clone(),
-        account_store: dry.account_store,
+        accounts: dry.accounts,
+        inputs: dry.inputs,
         iq: 0.0,
         eq: None,
         evidence: Mutex::new(Default::default()),
     };
-    let answer = match super::select::evaluate_with_inputs(
+    let evaluated = super::select::evaluate_with_inputs(
         &select,
         caller,
         deps,
@@ -569,8 +574,10 @@ async fn evaluate_seat(
         shared,
         true,
     )
-    .await
-    {
+    .await;
+    dry.accounts
+        .after_evaluation(deps.routing_config_path, true, slot as usize + 1);
+    let answer = match evaluated {
         Ok(answer) => answer,
         Err(refusal) => {
             return seat_rejection(&route, &refusal)
@@ -686,6 +693,9 @@ fn panel_inputs(
     deps: &Deps<'_>,
     dry: Option<&DryRun<'_>>,
 ) -> Result<super::select::RequestInputs, Refusal> {
+    if let Some(dry) = dry {
+        return Ok(dry.inputs.clone());
+    }
     super::select::RequestInputs::read_with_config(
         deps,
         dry.map_or_else(
@@ -718,7 +728,7 @@ async fn candidates(
     // Validate the requested project id against the caller's daemon-stamped
     // project before reading candidates, even if the panel will be empty.
     let layers = settings(request, caller, deps).await?;
-    let mut prepared = shared.prepare(deps)?;
+    let mut prepared = shared.prepare_for_sweep(deps, dry.map(|dry| dry.accounts))?;
     let aliases = &shared.catalog_targets;
     let consumers = super::consumers::effective(&config);
     let policy =
@@ -733,18 +743,19 @@ async fn candidates(
         operator_config_path: deps.operator_config_path,
         catalog_targets: &aliases,
     };
-    // A dry run reads accounts from its disposable snapshot and reserves no
+    // A dry run reads and repairs its private account state and grants no
     // probe, exactly as select's evaluation path does.
-    let mut priced = crate::select::price_selection_inputs_with_catalog(
+    let mut priced = crate::select::price_selection_inputs_for_sweep(
         &mut prepared.facts,
         prepared.quota_signal_json.clone(),
         &sources,
         Some(&prepared.catalog_snapshot),
-        dry.map_or(deps.store, |dry| dry.account_store),
+        deps.store,
         deps.broca_credentials,
         true,
         metered,
         dry.is_none(),
+        dry.map(|dry| dry.accounts),
     )
     .map_err(store_refusal)?;
     let registry = {

@@ -8,6 +8,9 @@ use cortexkit_role_routing::refusals::{retry_class, RetryClass};
 use striatum_store::{V1Decision, V1Recorded};
 
 #[cfg(test)]
+mod unservable_tests;
+
+#[cfg(test)]
 static PREPARATION_FAILURES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, OpReply>>> =
     std::sync::LazyLock::new(Default::default);
 
@@ -15,7 +18,7 @@ static PREPARATION_FAILURES: std::sync::LazyLock<std::sync::Mutex<BTreeMap<Strin
 pub(crate) fn inject_continuation_preparation_failure(selection_id: &str, reply: OpReply) {
     assert!(matches!(
         reply.code(),
-        Some("unknown_decision" | "account_selection_unavailable")
+        Some("unknown_decision" | "account_selection_unavailable" | "account_unservable")
     ));
     assert!(PREPARATION_FAILURES
         .lock()
@@ -41,15 +44,28 @@ fn unavailable(error: impl std::fmt::Display) -> Refusal {
     )
 }
 
+fn invalid_stored_state() -> ContinueAnswer {
+    let refusal = Refusal::account_unservable(
+        cortexkit_role_routing::errors::AccountUnservableReason::StoredStateInvalid,
+        vec![], vec![],
+    );
+    ContinueAnswer::Refuse(ContinueRefusal::new(refusal.code.as_str(), json!(refusal.detail)))
+}
+
 fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refusal> {
-    let first: ContinueRequest = serde_json::from_str(&record.body_json).map_err(unavailable)?;
+    let Ok(first) = serde_json::from_str::<ContinueRequest>(&record.body_json) else {
+        return Ok(json!(invalid_stored_state()));
+    };
     if !first.same_question(request) {
         return Err(Refusal::invalid_request(
             "selection_id",
             "selection_id already names a different request",
         ));
     }
-    serde_json::from_str(&record.answer_json).map_err(unavailable)
+    Ok(match serde_json::from_str::<ContinueAnswer>(&record.answer_json) {
+        Ok(answer) => json!(answer),
+        Err(_) => json!(invalid_stored_state()),
+    })
 }
 
 fn record_signed_out(
@@ -165,11 +181,17 @@ pub(crate) fn continue_account_with_call(
         .store
         .v1_admission(principal, &request.admission_id)
         .map_err(unavailable)?;
-    let original: Option<Value> = original
+    let original: Option<Value> = match original
         .map(|record| serde_json::from_str(&record.body_json))
         .transpose()
-        .map_err(unavailable)?;
-    let parsed = original
+    {
+        Ok(original) => original,
+        Err(_) => return Ok(json!(invalid_stored_state())),
+    };
+    if original.as_ref().is_some_and(|body| !body.is_object()) {
+        return Ok(json!(invalid_stored_state()));
+    }
+    let parsed = match original
         .as_ref()
         .map(|body| {
             let mut body = body.clone();
@@ -189,8 +211,37 @@ pub(crate) fn continue_account_with_call(
             })
         })
         .transpose()
-        .map_err(unavailable)?;
-    let prepared = parsed.as_ref().map(|params| prepare_roster(params, ctx));
+    {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(json!(invalid_stored_state())),
+    };
+    let prepared = parsed.as_ref().map(|params| {
+        let (mut roster, fenced, class) = prepare_roster(params, ctx)?;
+        let inputs_pending = ctx.classes.as_ref().is_some_and(|classes| {
+            crate::service_tiers::unobserved_account_input(&classes.credentials).is_some()
+                || crate::routing_v1::runners::tier_view_unknown(&classes.credentials, &params.caller.runner, ctx.now_ms)
+        });
+        if params.model_decision_id.is_some() && !inputs_pending {
+            let mut params = params.clone();
+            let held_until = fenced.values().copied().chain(ctx.classes.iter().flat_map(|classes| {
+                classes.reserved_probe_accounts(&normalize(&params.provider), &normalize(&params.model), &params)
+                    .into_iter().map(|(_, until)| until)
+            })).filter(|until| *until > ctx.now_ms).min();
+            prepare_service_tier(&mut params, ctx, &mut roster, class, held_until)?;
+        }
+        if route_fence_refusal(&roster, &fenced, params, ctx.now_ms).is_none()
+            && ctx.classes.as_ref().is_some_and(|classes| empty_roster_refusal(
+                classes, &normalize(&params.provider), &normalize(&params.model),
+                class == striatum_core::accounts::AllowedAccountClass::PricedPerTokenOnly,
+                &fenced, ctx.now_ms, Some(params),
+            ).is_none())
+        {
+            if let Some(reply) = disjoint_candidates_refusal(params, ctx, &roster, class) {
+                return Err(reply);
+            }
+        }
+        Ok((roster, fenced, class))
+    });
     #[cfg(test)]
     let prepared = PREPARATION_FAILURES
         .lock()
@@ -337,7 +388,12 @@ pub(crate) fn continue_account_with_call(
                 return Ok(refuse("account_pinned", "the caller pinned an account"));
             }
             let Some(classes) = ctx.classes.as_ref() else { return Ok(refuse("unknown_decision", "previous authentication method is unknown")); };
-            let committed: Value = serde_json::from_str(&current.reply_json).map_err(|e|RouteStateStoreError(e.to_string()))?;
+            let Ok(committed) = serde_json::from_str::<Value>(&current.reply_json) else {
+                return Ok(invalid_stored_state());
+            };
+            if !committed["account"]["method"].is_string() {
+                return Ok(invalid_stored_state());
+            }
             let Some(method) = committed["account"]["method"].as_str().filter(|method|*method!="unknown") else {
                 return Ok(refuse("unknown_decision", "previous authentication method is unknown"));
             };
@@ -425,6 +481,18 @@ pub(crate) fn continue_account_with_call(
                     Ok(ContinueAnswer::Offer(ContinueOffer::new(row.credential_id,row.account_id,id,row.admission_valid_until.max(0) as u64)))
                 }
                 OpReply::Error {code,detail,..} => {
+                    if code == "account_unservable" || code == "no_eligible_account" {
+                        let (code, detail) = if code == "no_eligible_account" {
+                            let refusal = Refusal::account_unservable(
+                                cortexkit_role_routing::errors::AccountUnservableReason::NoEligibleAccount,
+                                vec![], vec![],
+                            );
+                            (refusal.code.as_str().to_owned(), json!(refusal.detail))
+                        } else {
+                            (code, detail.unwrap_or_else(|| json!({})))
+                        };
+                        return Ok(ContinueAnswer::Refuse(ContinueRefusal::new(code, detail)));
+                    }
                     if let Some(at) = detail.as_ref().and_then(|d|d["reset_at_ms"].as_i64()).filter(|at|*at>ctx.now_ms) {
                         until=Some(until.map_or(at,|old|old.min(at)));
                     }

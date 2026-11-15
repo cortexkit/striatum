@@ -232,8 +232,22 @@ impl SqliteRouteStateStore {
     /// Trace block-table reads, telling the writer's from the pooled
     /// readers'. Each reader is checked out at once, so none can escape the
     /// trace.
+    pub fn trace_account_reads_for_test(&self) -> RouteStateResult<&'static BlockReadTrace> {
+        self.trace_block_reads_kind(true)
+    }
+
     pub fn trace_block_reads_for_test(&self) -> RouteStateResult<&'static BlockReadTrace> {
-        let trace: &'static BlockReadTrace = Box::leak(Box::default());
+        self.trace_block_reads_kind(false)
+    }
+
+    fn trace_block_reads_kind(
+        &self,
+        all_account: bool,
+    ) -> RouteStateResult<&'static BlockReadTrace> {
+        let trace: &'static BlockReadTrace = Box::leak(Box::new(BlockReadTrace {
+            all_account,
+            ..Default::default()
+        }));
         let writer: &'static BlockTap = Box::leak(Box::new(BlockTap {
             trace,
             writer: true,
@@ -319,6 +333,7 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 3] = [
 /// Block-table reads seen since the last [`BlockReadTrace::take`].
 #[derive(Default)]
 pub struct BlockReadTrace {
+    all_account: bool,
     reader: Mutex<Vec<String>>,
     writer: Mutex<Vec<String>>,
     maintenance: Mutex<usize>,
@@ -374,6 +389,13 @@ impl BlockReadTrace {
             route_write_rows: std::mem::take(&mut self.route_write_rows.lock().unwrap()),
             triggers: std::mem::take(&mut self.triggers.lock().unwrap()),
         }
+    }
+
+    /// Whether a read of `table` is traced: the block tables always, and
+    /// every account table when the trace was asked for all of them.
+    fn watches(&self, table: &str) -> bool {
+        BLOCK_TRACE_TABLES.contains(&table)
+            || self.all_account && crate::connection_store::ACCOUNT_TABLES.contains(&table)
     }
 
     /// The watched tables `sql` reads, as SQLite's authorizer reports them
@@ -439,9 +461,7 @@ impl BlockReadTrace {
                 let own_row = |table: &str| {
                     target.as_deref() == Some(table) && !selects_from(sql, table)
                 };
-                let watched = |kind: &u8, table: &String| {
-                    *kind == 0 && BLOCK_TRACE_TABLES.contains(&table.as_str())
-                };
+                let watched = |kind: &u8, table: &String| *kind == 0 && self.watches(table);
                 let mut read: Vec<String> = events
                     .iter()
                     .filter(|(kind, table, accessor)| {
@@ -460,10 +480,16 @@ impl BlockReadTrace {
                 fired.dedup();
                 Classified { read, triggers: fired }
             }
-            Err(_) if reads_tables(sql, &BLOCK_TRACE_TABLES) => Classified {
-                read: vec!["(unprepared)".into()],
-                triggers: Vec::new(),
-            },
+            Err(_)
+                if reads_tables(sql, &BLOCK_TRACE_TABLES)
+                    || self.all_account
+                        && reads_tables(sql, crate::connection_store::ACCOUNT_TABLES) =>
+            {
+                Classified {
+                    read: vec!["(unprepared)".into()],
+                    triggers: Vec::new(),
+                }
+            }
             Err(_) => Classified::default(),
         };
         cache.insert(sql.to_owned(), found.clone());

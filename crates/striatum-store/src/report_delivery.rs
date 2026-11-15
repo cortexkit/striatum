@@ -174,7 +174,7 @@ impl SqliteRouteStateStore {
             Ok((Some(recorded.clone()), usage.is_some()))
             })().map_err(err)
         };
-        let result = if self.is_account_evaluation_projection() {
+        let result = if self.is_private_account_copy() {
             self.account_command(AccountCommandKind::Report, move |account| {
                 command(account, None)
             })?

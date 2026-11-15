@@ -455,20 +455,20 @@
             "service_tier": "fast"
           },
           "reply": {
-            "code": "account_selection_unavailable",
+            "code": "account_unservable",
             "detail": {
-              "code": "account_selection_unavailable",
-              "decision_id": "acd_c88f052097dde3394a9d2be3",
-              "exclusions": [
-                {
-                  "account_id": "acct-openai-a",
-                  "reason": "not_in_runner_candidates"
-                }
+              "eligible_credential_count": 1,
+              "eligible_credential_ids": [
+                "oauth:openai:example-a"
               ],
-              "reset_at_ms": null,
-              "retry_after_s": null
+              "offered_credential_count": 2,
+              "offered_credential_ids": [
+                "oauth:anthropic:example-a",
+                "oauth:anthropic:example-b"
+              ],
+              "reason": "candidates_disjoint"
             },
-            "message": "no account admitted: account_selection_unavailable"
+            "message": "the account request cannot be served"
           },
           "setup": [
             {
@@ -512,97 +512,7 @@
           "state": {
             "account_admission": [],
             "account_affinity": [],
-            "account_decision": [
-              {
-                "account_id": null,
-                "admission_id": "run-sid-EXAMPLEadmission0000000",
-                "code": "account_selection_unavailable",
-                "context_json": {
-                  "roster": {
-                    "account_classes": true,
-                    "provider": "openai"
-                  }
-                },
-                "created_at": 1800000000000,
-                "credential_id": null,
-                "decision_id": "acd_c88f052097dde3394a9d2be3",
-                "decision_json": {
-                  "explanation": {
-                    "accounts": [
-                      {
-                        "account_id": "acct-openai-a",
-                        "age_band": null,
-                        "age_factor": null,
-                        "credential_id": null,
-                        "exclusions": [
-                          {
-                            "reason": "not_in_runner_candidates"
-                          }
-                        ],
-                        "fable_preserved": false,
-                        "pending_bytes": null,
-                        "scoped_list": null,
-                        "score": null,
-                        "weight": null,
-                        "window_weights": []
-                      }
-                    ],
-                    "affinity": {
-                      "kind": "none"
-                    },
-                    "affinity_model": "gpt-6.1-sol",
-                    "conversation_key_source": "caller",
-                    "direct_opus": false,
-                    "family": "other",
-                    "import": null,
-                    "model": "gpt-6.1-sol",
-                    "operator_override": null,
-                    "policy_version": 2,
-                    "previous_pin": null,
-                    "provider": "openai",
-                    "request_bytes": 32768,
-                    "request_bytes_estimated": true,
-                    "requested_account": null,
-                    "roster": {
-                      "account_ids": [
-                        "acct-openai-a"
-                      ],
-                      "expired": false,
-                      "fetched_at_ms": 1800000000000,
-                      "view_digest": "conformance-credentials"
-                    },
-                    "runner_candidates": [
-                      {
-                        "account_id": "acct-example-a",
-                        "credential_id": "oauth:anthropic:example-a"
-                      },
-                      {
-                        "account_id": "acct-example-b",
-                        "credential_id": "oauth:anthropic:example-b"
-                      }
-                    ],
-                    "runner_view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-                  },
-                  "outcome": {
-                    "code": "account_selection_unavailable",
-                    "kind": "refuse",
-                    "retry_after_s": null,
-                    "retryable": true
-                  }
-                },
-                "family": "other",
-                "mode": "serve",
-                "model": "gpt-6.1-sol",
-                "outcome": "refuse",
-                "policy_version": 2,
-                "principal": "reserved:broca",
-                "provider": "openai",
-                "request_mode": "admit",
-                "service_tier_chosen": "standard",
-                "service_tier_requested": "fast",
-                "trigger": "request"
-              }
-            ],
+            "account_decision": [],
             "account_fence": [],
             "account_pin": [],
             "account_route_fence": [],

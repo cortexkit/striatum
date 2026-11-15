@@ -614,7 +614,6 @@ fn undeclared_legacy_codes_become_unavailable() {
     for code in [
         "store_error",
         "internal_error",
-        "no_eligible_account",
         "unscoped_caller",
     ] {
         let refusal = super::accounts::account_refusal_for_test(code);

@@ -1,4 +1,5 @@
 use super::*;
+mod unservable_tests;
 
 const MODEL: &str = "claude-haiku-5-5";
 const POOL: &str = "anthropic-platform";

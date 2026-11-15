@@ -60,6 +60,10 @@ pub(crate) trait BlockReads {
     /// The writer transaction, for a helper that writes what it decided.
     /// `None` outside a command.
     fn writer(&self) -> Option<&AccountTx<'_>>;
+
+    fn repair(&self, repair: striatum_store::DryRunRepair, now: i64) -> RouteStateResult<bool> {
+        crate::account_writer::apply_block_repair(writer(self)?, repair, now)
+    }
 }
 
 /// The writer transaction of a helper that only writes inside a command.
@@ -290,7 +294,7 @@ pub(crate) fn published(
     store: &SqliteRouteStateStore,
     now_ms: i64,
 ) -> RouteStateResult<Published<'_>> {
-    if store.is_account_evaluation_projection() {
+    if store.is_private_account_copy() {
         return Ok(Published::Sql(store));
     }
     // Expired probes and offers read as released: the next command
@@ -359,7 +363,9 @@ impl Published<'_> {
     ) -> RouteStateResult<Option<ProviderCooldownState>> {
         match self.blocks() {
             Some(blocks) => blocks.provider_cooldown(provider_key),
-            None => striatum_core::RouteStateStore::get_provider_cooldown(self.store(), provider_key),
+            None => {
+                striatum_core::RouteStateStore::get_provider_cooldown(self.store(), provider_key)
+            }
         }
     }
 

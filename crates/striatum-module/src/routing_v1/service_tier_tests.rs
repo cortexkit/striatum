@@ -12,6 +12,8 @@ use super::{
     runners,
 };
 use crate::broca_credentials::BrocaCredentials;
+mod unservable_tests;
+mod finish_rollback_tests;
 
 const NOW: u64 = 1_800_000_000_000;
 const MODEL: &str = "gpt-6.1-sol";
@@ -292,7 +294,8 @@ async fn bound_fast_resume_is_admitted_after_a_missed_describe_poll() {
     request["admission_id"] = json!("fast-after-settled-tier-removal");
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-    assert_eq!(refused.1["code"], "account_selection_unavailable");
+    assert_eq!(refused.1["code"], "account_unservable");
+    assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
 }
 
 #[tokio::test]
@@ -612,7 +615,8 @@ async fn account_service_tier_legacy_bound_decision_refuses_an_ineligible_pin() 
             "{failure}, hint={hint}: {}",
             refused.1
         );
-        assert_eq!(refused.1["code"], "account_selection_unavailable");
+        assert_eq!(refused.1["code"], "account_unservable");
+        assert_eq!(refused.1["detail"], json!({"reason":"bound_tier_unavailable"}));
         assert_eq!(
             refused.1["message"],
             "No account can serve this routing decision's service tier any more, and a bound decision never steps down to a lower tier. Ask routing for a new decision."
@@ -662,7 +666,8 @@ async fn account_bound_tier_mismatch_is_a_permanent_invalid_request() {
     unfamiliar["decision_id"] = decision;
     let refused = runner.call("route.account_for", &unfamiliar).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
-    assert_eq!(refused.1["code"], "account_selection_unavailable", "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_unservable", "{}", refused.1);
+    assert_eq!(refused.1["detail"], json!({"reason":"stored_state_invalid"}));
 }
 
 #[tokio::test]

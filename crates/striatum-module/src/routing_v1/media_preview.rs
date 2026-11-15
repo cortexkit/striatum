@@ -73,24 +73,26 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
                 .map_err(store_refusal)
         })
         .transpose()?;
-    // Route state, model facts and measurements are read into owned values.
-    // The account projection intentionally has no decision or measurement tables.
+    // Capture account state and catalogue once before reading preview rows.
+    let accounts =
+        Arc::new(crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?);
     let inputs = Arc::new(
-        crate::prepare_selection_inputs(
+        crate::select::prepare_selection_inputs_for_sweep(
             &quota,
             deps.store,
             config.pricing(),
             &config.quota_model_pools(),
+            Some(&accounts),
         )
         .map_err(store_refusal)?,
     );
-    let store = Arc::new(
-        deps.store
-            .account_evaluation_snapshot(engines::now(deps) as i64)
-            .map_err(store_refusal)?,
-    );
-    let concurrency =
-        super::concurrency::Snapshot::capture(deps, &live, &store, engines::now(deps) as i64)?;
+    let concurrency = super::concurrency::Snapshot::from_snapshot(
+        deps,
+        &live,
+        accounts.initial.clone(),
+        &inputs.catalog_snapshot.facts,
+        engines::now(deps) as i64,
+    )?;
     let joined = super::super::consumers::media_routes(
         credentials
             .lock()
@@ -130,7 +132,7 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
     }
     let deps = Deps {
         quota_cache: &quota,
-        store: &store,
+        store: deps.store,
         broca_credentials: &credentials,
         routing_config_path: deps.routing_config_path,
         operator_config_path: deps.operator_config_path,
@@ -139,6 +141,7 @@ pub(super) fn what_if(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Resul
     let mut results = Vec::new();
     for iq in iqs.map_or_else(|| vec![None], |iqs| iqs.into_iter().map(Some).collect()) {
         let mut view = engines::MediaEvaluation {
+            accounts: accounts.clone(),
             config: config.clone(),
             consumers: consumers.clone(),
             joined: joined.clone(),
