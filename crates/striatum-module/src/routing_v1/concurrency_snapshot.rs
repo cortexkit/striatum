@@ -28,6 +28,9 @@ impl Snapshot {
         facts: &[striatum_core::ModelFact],
         now: i64,
     ) -> Result<Self, Refusal> {
+        // Read as of `now`: expired probes and offers released, as request
+        // paths see them.
+        let state = state.as_of(now);
         let mut credentials = deps
             .broca_credentials
             .lock()

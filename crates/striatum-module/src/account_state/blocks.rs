@@ -29,7 +29,7 @@ use striatum_store::{
     SqliteRouteStateStore,
 };
 
-use super::{snapshot, AccountCommand, AccountState};
+use super::{AccountCommand, AccountState};
 
 /// The time `SqliteRouteStateStore::fence_rechecks` evaluates expiry at: the
 /// store's clock when the read runs (the wall clock, or a replayed request's
@@ -288,11 +288,18 @@ pub(crate) enum Published<'s> {
 }
 
 /// The published block tables of `store`.
-pub(crate) fn published(store: &SqliteRouteStateStore) -> RouteStateResult<Published<'_>> {
+/// `now_ms` is the request's own time, the one its command uses, so the
+/// expiry releases the view applies are the ones the command makes.
+pub(crate) fn published(
+    store: &SqliteRouteStateStore,
+    now_ms: i64,
+) -> RouteStateResult<Published<'_>> {
     if store.is_private_account_copy() {
         return Ok(Published::Sql(store));
     }
-    let state = snapshot(store)?;
+    // Expired probes and offers read as released: the next command
+    // releases them before it decides (`AccountCommand::release_expired`).
+    let state = super::published_at(store, now_ms)?;
     Ok(if state.blocks.enabled() {
         Published::State(state)
     } else {
@@ -301,6 +308,11 @@ pub(crate) fn published(store: &SqliteRouteStateStore) -> RouteStateResult<Publi
 }
 
 impl Published<'_> {
+    /// The published block state, or `None` where SQL answers.
+    pub(crate) fn block_state(&self) -> Option<&BlockState> {
+        self.blocks()
+    }
+
     fn blocks(&self) -> Option<&BlockState> {
         match self {
             Self::State(state) => Some(&state.blocks),

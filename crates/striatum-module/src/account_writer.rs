@@ -34,7 +34,8 @@ pub(crate) fn pool_key_states(
     provider: &str,
     now_ms: i64,
 ) -> RouteStateResult<BTreeMap<String, striatum_core::key_pool::PoolKeyState>> {
-    store.pool_key_states(provider, now_ms)
+    let published = crate::account_state::published(store, now_ms)?;
+    store.pool_key_states_from(provider, now_ms, published.block_state())
 }
 
 pub(crate) fn prune_unserved_unpicked_facts(
@@ -210,10 +211,38 @@ pub(crate) fn pool_acquire_for_route(
     request: &PoolAcquire<'_>,
     providers: &[&str],
     model: &str,
-    recovered: &[(String, String)],
+    recovered: &[striatum_store::RecoveredOrigin],
     accounts: &BTreeMap<String, String>,
 ) -> RouteStateResult<PoolAcquireOutcome> {
-    store.pool_acquire_for_route(request, providers, model, recovered, accounts)
+    // A module command, so expired probes are released before the lease is
+    // decided, as the readers' view already shows them.
+    let provider = request.provider.to_owned();
+    let session = request.session_id.to_owned();
+    let keys = request.keys.to_vec();
+    let (now_ms, lease_ms, affinity_idle_ms) =
+        (request.now_ms, request.lease_ms, request.affinity_idle_ms);
+    let providers: Vec<String> = providers.iter().map(|p| (*p).to_owned()).collect();
+    let model = model.to_owned();
+    let recovered = recovered.to_vec();
+    let accounts = accounts.clone();
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.release_expired(now_ms)?;
+        let providers: Vec<&str> = providers.iter().map(String::as_str).collect();
+        tx.pool_acquire_for_route(
+            &PoolAcquire {
+                provider: &provider,
+                session_id: &session,
+                keys: &keys,
+                now_ms,
+                lease_ms,
+                affinity_idle_ms,
+            },
+            &providers,
+            &model,
+            &recovered,
+            &accounts,
+        )
+    })
 }
 
 pub(crate) fn pool_renew(
@@ -225,14 +254,20 @@ pub(crate) fn pool_renew(
     now_ms: i64,
     lease_ms: i64,
 ) -> RouteStateResult<Option<i64>> {
-    store.pool_renew(
-        provider,
-        session_id,
-        lease_id,
-        credential_id,
-        now_ms,
-        lease_ms,
-    )
+    let (provider, session_id, lease_id) =
+        (provider.to_owned(), session_id.to_owned(), lease_id.to_owned());
+    let credential_id = credential_id.map(str::to_owned);
+    execute(store, AccountCommandKind::Maintenance, move |tx| {
+        tx.release_expired(now_ms)?;
+        tx.pool_renew(
+            &provider,
+            &session_id,
+            &lease_id,
+            credential_id.as_deref(),
+            now_ms,
+            lease_ms,
+        )
+    })
 }
 
 pub(crate) fn pool_release(

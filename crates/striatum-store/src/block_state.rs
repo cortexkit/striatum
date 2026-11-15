@@ -90,7 +90,7 @@ thread_local! {
     /// Whether a test seeding seam is writing on this thread.
     static SEEDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Whether a test makes writes on this thread that the capture misses.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) static UNSEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -98,7 +98,7 @@ thread_local! {
 /// account command is running on this thread, which means the write bypassed
 /// the account writer.
 pub(crate) fn capture(table: u8, rowid: i64) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if UNSEEN.with(std::cell::Cell::get) {
         // A write the capture misses, and nothing reports.
         return true;
@@ -208,7 +208,8 @@ const SELECTS: [&str; 16] = [
         walled_until IS NOT NULL,'pool_billing',json_array(provider,credential_id),provider,NULL,credential_id,NULL,NULL,NULL,NULL,
         json_array(walled_until,wall_reason,COALESCE(wall_observed_at,updated_at)),COALESCE(wall_observed_at,updated_at),0,walled_until,NULL,
         cooldown_until IS NOT NULL,'pool_rate',json_array(provider,credential_id),provider,NULL,credential_id,NULL,NULL,NULL,NULL,
-        json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at)),COALESCE(cooldown_observed_at,updated_at),0,cooldown_until,NULL
+        json_array(cooldown_until,cooldown_reason,COALESCE(cooldown_observed_at,updated_at)),COALESCE(cooldown_observed_at,updated_at),0,cooldown_until,NULL,
+        provider,credential_id,last_used_at,walled_until,cooldown_until
      FROM pool_key_state",
     // provider_cooldown_state: every row is held, because a route origin
     // is compared with its provider's row whether or not that row walls, and
@@ -284,7 +285,7 @@ const HELD_ROWS: [&str; 16] = [
     "1",
     "1",
     "1",
-    "walled_until IS NOT NULL OR cooldown_until IS NOT NULL",
+    "1",
     "1",
     "1",
     "1",
@@ -298,11 +299,179 @@ const HELD_ROWS: [&str; 16] = [
     "1",
 ];
 
+/// The primary-key columns of each source table, in the order of the key
+/// `SELECTS` computes for its rows (`json_array(pk…)`).
+const SOURCE_KEYS: [&[&str]; 11] = [
+    &["fence_id"],
+    &["provider_id", "credential_id"],
+    &["provider", "credential_id", "model"],
+    &["provider", "credential_id", "model", "wall_kind"],
+    &["provider", "credential_id"],
+    &["provider_key"],
+    &["route_key"],
+    &["provider", "credential_id", "model", "size_class"],
+    &["provider", "credential_id", "model", "size_class"],
+    &["principal", "admission_id", "credential_id"],
+    &["provider", "account_id"],
+];
+
+/// The block tables a provider's pool decisions read, each with the column
+/// that names the provider; an index or the primary key leads with it.
+/// Principal exclusions are not by provider and never apply to a pool.
+const PROVIDER_COLUMNS: [(usize, &str); 11] = [
+    (ACCOUNT_FENCE_TABLE, "provider"),
+    (CREDENTIAL_TABLE, "provider_id"),
+    (ROUTE_FENCE_TABLE, "provider"),
+    (NON_QUOTA_ROUTE_FENCE_TABLE, "provider"),
+    (4, "provider"),
+    (PROVIDER_TABLE, "provider_key"),
+    (ROUTE_TABLE, "provider_id"),
+    (SIZE_TABLE, "provider"),
+    (NON_QUOTA_SIZE_TABLE, "provider"),
+    (10, "provider"),
+    (CLOCK_TABLE, "provider"),
+];
+
+/// The provider a held row of `table` belongs to, as [`PROVIDER_COLUMNS`]
+/// names it: an account fence's provider column, a route row's
+/// `provider_id`, a clock's scope, and otherwise the first column of the
+/// row's primary key.
+fn row_provider(table: usize, key: &str, held: &Held) -> Option<String> {
+    match held {
+        Held::Clock(block, _) => return Some(block.scope.provider.clone()),
+        Held::Source {
+            raw: Raw::AccountFence { row, .. },
+            ..
+        } => return Some(row.provider.clone()),
+        Held::Source {
+            link: Link::Route { provider, .. },
+            ..
+        } => return Some(provider.clone()),
+        _ => {}
+    }
+    if table == ACCOUNT_FENCE_TABLE || table == ROUTE_TABLE {
+        return None;
+    }
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(key).ok()?;
+    parsed.first()?.as_str().map(str::to_owned)
+}
+
+/// The keyed check of one source row by its primary key.
+fn source_check_sql(table: usize) -> String {
+    let predicate = SOURCE_KEYS[table]
+        .iter()
+        .enumerate()
+        .map(|(at, column)| format!("{column}=?{}", at + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    format!("{STATE_CHECK} {} WHERE {predicate}", SELECTS[table])
+}
+
+/// The keyed check of a credential's quota holds: a primary-key range of
+/// `account_fence` ids.
+fn quota_hold_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} SELECT fence_id FROM account_fence
+                         WHERE fence_id>=?1 AND fence_id<?2 AND cleared_at IS NULL ORDER BY fence_id"
+    )
+}
+
+/// The check of one table's rows of a provider, by its provider column.
+fn provider_rows_check_sql(table: usize, column: &str) -> String {
+    format!("{STATE_CHECK} {} WHERE {column}=?1", SELECTS[table])
+}
+
+/// The keyed check of one admission's principal exclusions.
+fn exclusions_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} {} WHERE principal=?1 AND admission_id=?2",
+        SELECTS[EXCLUSION_TABLE]
+    )
+}
+
+/// The check of a provider's active account fences' success pools, by the
+/// pool table's primary key under the fences' provider index.
+fn success_pools_check_sql() -> String {
+    format!(
+        "{STATE_CHECK} {} WHERE fence_id IN (SELECT fence_id FROM account_fence WHERE provider=?1 AND cleared_at IS NULL)",
+        SELECTS[SUCCESS_POOL_TABLE]
+    )
+}
+
+/// The keyed check of a clock, or of its route clears, by origin.
+fn by_origin_check_sql(table: usize) -> String {
+    format!("{STATE_CHECK} {} WHERE kind=?1 AND origin_key=?2", SELECTS[table])
+}
+
+/// Every statement a decision runs to check the state against SQL
+/// (`STATE_CHECK`) or a route-state writer runs to read the row it writes
+/// (`ROUTE_WRITE_READ`): the reviewed list of exempt reads. The block read
+/// trace fails on any marked read not listed here, and
+/// `every_exempt_read_is_keyed` proves each listed one keyed.
+#[cfg(any(test, feature = "test-support"))]
+pub fn reviewed_exempt_reads() -> Vec<String> {
+    let mut reads: Vec<String> = (0..SOURCE_KEYS.len()).map(source_check_sql).collect();
+    reads.push(quota_hold_check_sql());
+    reads.extend(
+        PROVIDER_COLUMNS
+            .iter()
+            .map(|(table, column)| provider_rows_check_sql(*table, column)),
+    );
+    reads.push(by_origin_check_sql(ROUTE_CLEAR_TABLE));
+    reads.push(exclusions_check_sql());
+    reads.push(success_pools_check_sql());
+    reads.push(by_origin_check_sql(CLOCK_TABLE));
+    reads.push(fence_rechecks::authorization_check_sql());
+    reads.push(fence_rechecks::probe_clock_check_sql());
+    reads.push(fence_rechecks::no_authorized_clock_check_sql(false));
+    reads.push(fence_rechecks::no_authorized_clock_check_sql(true));
+    reads.push(fence_rechecks::unstarted_admission_check_sql());
+    reads.extend(
+        [
+            crate::ROUTE_READ_PROVIDER_PRIOR_OBSERVED,
+            crate::ROUTE_READ_PROVIDER_INHERITED_ROUTES,
+            crate::ROUTE_READ_PROVIDER_EXISTING,
+            crate::ROUTE_READ_ROUTE_PRIOR_OBSERVED,
+            crate::ROUTE_READ_ROUTE_EXISTING,
+            crate::ROUTE_READ_ROUTE_PROVIDER_ROW,
+            crate::ROUTE_READ_OUTCOME_FAILURE_STATE,
+            crate::ROUTE_READ_CLEAR_FAILURE_STATE,
+        ]
+        .map(str::to_owned),
+    );
+    reads
+}
+
+/// The source table of an origin kind, and the key column a kind adds to its
+/// origin key (the wall kind of an `account_non_quota_route_fence` row).
+fn source_of(kind: &str) -> Option<(usize, Option<&'static str>)> {
+    Some(match kind {
+        "account" => (ACCOUNT_FENCE_TABLE, None),
+        "credential" => (CREDENTIAL_TABLE, None),
+        "account_route" => (ROUTE_FENCE_TABLE, None),
+        "non_quota_route" => (NON_QUOTA_ROUTE_FENCE_TABLE, Some("billing")),
+        "transient_route" => (NON_QUOTA_ROUTE_FENCE_TABLE, Some("transient")),
+        "pool_billing" | "pool_rate" => (4, None),
+        "provider" => (PROVIDER_TABLE, None),
+        "route" | "failure" => (ROUTE_TABLE, None),
+        "size" => (SIZE_TABLE, None),
+        "non_quota_size" => (NON_QUOTA_SIZE_TABLE, None),
+        "principal" => (EXCLUSION_TABLE, None),
+        "observation" => (10, None),
+        _ => return None,
+    })
+}
+
 static RECONCILE_RELOADS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Calls of the reconcile so far, to run its full comparison on every
-/// [`FULL_RECONCILE_EVERY`]th.
-static RECONCILE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+thread_local! {
+    /// Calls of the reconcile so far on this thread, to run its full
+    /// comparison on every [`FULL_RECONCILE_EVERY`]th. The reconcile runs in
+    /// the Tick command, on the store's own account-writer thread, so this
+    /// counts per store: stores sharing a process cannot take each other's
+    /// full comparisons.
+    static RECONCILE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// How many reconciles apart the full comparison runs: six ten-second ticks.
 const FULL_RECONCILE_EVERY: u64 = 6;
@@ -422,6 +591,16 @@ enum Raw {
     Provider(crate::route_snapshot::ProviderCooldownRow),
     /// A `model_route_state` row as the route-state snapshot reads it.
     Route(crate::route_snapshot::RouteStateRow),
+    /// A `pool_key_state` row as pool acquisition reads it. The times are
+    /// kept as stored and read as integers when a pool reads them, so a row
+    /// a pool cannot read fails that read, not the write that changed it.
+    PoolKey {
+        provider: String,
+        credential_id: String,
+        last_used_at: Value,
+        walled_until: Value,
+        cooldown_until: Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -525,7 +704,20 @@ fn decode(table: usize, r: &Row<'_>) -> rusqlite::Result<(i64, String, Option<He
             false,
         ),
         10 => source(vec![slot(2)?], Link::None, Raw::None, false),
-        4 => source(vec![slot(2)?, slot(17)?], Link::None, Raw::None, false),
+        // Every key row is held, walled or not: pool acquisition reads each
+        // key's last use too.
+        4 => source(
+            vec![slot(2)?, slot(17)?],
+            Link::None,
+            Raw::PoolKey {
+                provider: r.get(32)?,
+                credential_id: r.get(33)?,
+                last_used_at: r.get(34)?,
+                walled_until: r.get(35)?,
+                cooldown_until: r.get(36)?,
+            },
+            true,
+        ),
         PROVIDER_TABLE => source(
             vec![slot(2)?],
             Link::Provider {
@@ -956,7 +1148,7 @@ impl BlockState {
 
     /// The rows of the `fence_origin` view in the order a full scan of the
     /// view returns them: branch by branch, each table in rowid order.
-    fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
+    pub(crate) fn view_origins_in_scan_order(&self) -> Vec<ViewOrigin> {
         let mut view = self.view_rows();
         view.sort_by_key(|(position, _)| *position);
         view.into_iter().map(|(_, row)| row).collect()
@@ -964,7 +1156,7 @@ impl BlockState {
 
     /// The route and provider origins whose rows hold one account's error,
     /// keyed as `fence_rechecks::quarantined_origins` keys them.
-    fn quarantined(&self) -> Vec<(String, String)> {
+    pub(crate) fn quarantined(&self) -> Vec<(String, String)> {
         self.sources()
             .filter_map(|(_, _, _, link, _)| match link {
                 Link::Provider {
@@ -1052,6 +1244,290 @@ impl BlockState {
         Ok(loaded.blocks.iter().map(FenceRecheck::from).collect())
     }
 
+    /// Check, by primary key, that SQL holds the source row of origin
+    /// `origin_key` of `kind` exactly as this state does: the same row, or
+    /// none, or a row the state does not hold. A decision about the origin
+    /// (archive it, install or move its clock, drop its clock) runs this
+    /// first, and fails with [`diverged`] when SQL disagrees: these writes
+    /// are keyed on the origin, not on the source values the state read.
+    /// A route origin's presence also depends on its provider's row, and a
+    /// credential origin's class on the account fences named after it; both
+    /// are checked too.
+    pub(crate) fn check_source(
+        &self,
+        conn: &Connection,
+        kind: &str,
+        origin_key: &str,
+        provider: &str,
+    ) -> rusqlite::Result<()> {
+        let Some((table, extra)) = source_of(kind) else {
+            return Ok(());
+        };
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(origin_key)
+            .map_err(|error| diverged(format_args!("{kind} origin key {origin_key}: {error}")))?;
+        let mut values: Vec<Value> = parsed
+            .into_iter()
+            .map(|value| match value {
+                serde_json::Value::String(text) => Value::Text(text),
+                serde_json::Value::Number(number) => number
+                    .as_i64()
+                    .map(Value::Integer)
+                    .unwrap_or_else(|| Value::Real(number.as_f64().unwrap_or_default())),
+                serde_json::Value::Null => Value::Null,
+                other => Value::Text(other.to_string()),
+            })
+            .collect();
+        values.extend(extra.map(|wall_kind| Value::Text(wall_kind.into())));
+        let columns = SOURCE_KEYS[table];
+        if values.len() != columns.len() {
+            return Err(diverged(format_args!(
+                "{kind} origin key {origin_key} does not name a {} row",
+                BLOCK_TABLES[table]
+            )));
+        }
+        let in_sql = conn
+            .prepare_cached(&source_check_sql(table))?
+            .query_row(rusqlite::params_from_iter(&values), |r| decode(table, r))
+            .optional()?;
+        let key: String = conn.query_row(
+            &format!(
+                "SELECT json_array({})",
+                (1..=values.len()).map(|at| format!("?{at}")).collect::<Vec<_>>().join(",")
+            ),
+            rusqlite::params_from_iter(&values),
+            |r| r.get(0),
+        )?;
+        let held = &self.tables[table];
+        let in_state = held
+            .keys
+            .get(&key)
+            .and_then(|rowid| held.rows.get(rowid).map(|(_, row)| (*rowid, &**row)));
+        let same = match (&in_sql, in_state) {
+            (None | Some((_, _, None)), None) => true,
+            (Some((rowid, _, Some(row))), Some((held_rowid, held_row))) => {
+                *rowid == held_rowid && row == held_row
+            }
+            _ => false,
+        };
+        if !same {
+            return Err(diverged(format_args!(
+                "the {} row of {kind} origin {origin_key} differs from the state's",
+                BLOCK_TABLES[table]
+            )));
+        }
+        match kind {
+            "route" => self.check_source(
+                conn,
+                "provider",
+                &serde_json::json!([provider]).to_string(),
+                provider,
+            ),
+            "credential" => {
+                // The view's quota-hold prefix: the origin key is the same
+                // `json_array(provider_id,credential_id)` text.
+                let prefix = format!("credential-quota:{origin_key}:");
+                // The prefix ends with ':'; ';' is the next character.
+                let end = format!("{};", &prefix[..prefix.len() - 1]);
+                let in_sql = conn
+                    .prepare_cached(&quota_hold_check_sql())?
+                    .query_map([&prefix, &end], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut in_state: Vec<String> = self
+                    .sources()
+                    .filter_map(|(_, _, _, link, _)| match link {
+                        Link::AccountFence(id) if id.starts_with(&prefix) => Some(id.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                in_state.sort();
+                if in_sql != in_state {
+                    return Err(diverged(format_args!(
+                        "the quota holds of credential origin {origin_key} differ from the state's"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Check that SQL holds every block row of `provider` exactly as this
+    /// state does: each source table's rows (whatever view branch they feed,
+    /// and the pool key rows a pool reads), the probe clocks, and the route
+    /// clears of those clocks. A decision about `provider`'s pools (a lease
+    /// granted, reused or rehydrated, a lease released or refused because
+    /// its key is blocked) runs this first, because none of its writes name
+    /// the rows that decided it: the key states, the clocks that apply to
+    /// the route (a clear removes a clock from it), and sync's finding that
+    /// no further source row needs a clock. A difference raises
+    /// [`diverged`].
+    ///
+    /// Every statement is keyed by `provider`: each table's primary key or
+    /// an index leads with its provider column (`account_fence_by_account`,
+    /// `model_route_state(provider_id)`, `fence_recheck_scope`), and a
+    /// clock's clears by the clear table's primary key.
+    pub(crate) fn check_provider_rows(
+        &self,
+        conn: &Connection,
+        provider: &str,
+    ) -> rusqlite::Result<()> {
+        for (table, column) in PROVIDER_COLUMNS {
+            let mut in_sql: Vec<(i64, Held)> = Vec::new();
+            let mut statement = conn.prepare_cached(&provider_rows_check_sql(table, column))?;
+            let mut rows = statement.query([provider])?;
+            while let Some(row) = rows.next()? {
+                if let (rowid, _, Some(held)) = decode(table, row)? {
+                    in_sql.push((rowid, held));
+                }
+            }
+            in_sql.sort_by_key(|(rowid, _)| *rowid);
+            let mut in_state: Vec<(i64, Held)> = self.tables[table]
+                .rows
+                .iter()
+                .filter(|(_, (key, held))| row_provider(table, key, held).as_deref() == Some(provider))
+                .map(|(rowid, (_, held))| (*rowid, (**held).clone()))
+                .collect();
+            in_state.sort_by_key(|(rowid, _)| *rowid);
+            if in_sql != in_state {
+                return Err(diverged(format_args!(
+                    "the {} rows of provider {provider} differ from the state's",
+                    BLOCK_TABLES[table]
+                )));
+            }
+        }
+        for (_, held) in self.rows_of(CLOCK_TABLE) {
+            let Held::Clock(block, _) = held else { continue };
+            if block.scope.provider != provider {
+                continue;
+            }
+            let mut in_sql: Vec<(i64, Held)> = Vec::new();
+            let mut statement = conn.prepare_cached(&by_origin_check_sql(ROUTE_CLEAR_TABLE))?;
+            let mut rows = statement.query([&block.kind, &block.origin_key])?;
+            while let Some(row) = rows.next()? {
+                if let (rowid, _, Some(held)) = decode(ROUTE_CLEAR_TABLE, row)? {
+                    in_sql.push((rowid, held));
+                }
+            }
+            in_sql.sort_by_key(|(rowid, _)| *rowid);
+            let mut in_state: Vec<(i64, Held)> = self
+                .rows_of(ROUTE_CLEAR_TABLE)
+                .filter(|(_, held)| {
+                    matches!(held, Held::RouteClear(clear)
+                        if clear.kind == block.kind && clear.origin_key == block.origin_key)
+                })
+                .map(|(rowid, held)| (rowid, held.clone()))
+                .collect();
+            in_state.sort_by_key(|(rowid, _)| *rowid);
+            if in_sql != in_state {
+                return Err(diverged(format_args!(
+                    "the route clears of {} origin {} differ from the state's",
+                    block.kind, block.origin_key
+                )));
+            }
+        }
+        // The pools a success healed of the provider's active account
+        // fences, which decide which of a fence's pools still block. The
+        // fences themselves agree by now.
+        let fences: std::collections::HashSet<String> = self
+            .raws(ACCOUNT_FENCE_TABLE)
+            .filter_map(|(_, raw)| match raw {
+                Raw::AccountFence { row, .. } if row.provider == provider => Some(row.fence_id.clone()),
+                _ => None,
+            })
+            .collect();
+        self.check_rows(
+            conn,
+            SUCCESS_POOL_TABLE,
+            &success_pools_check_sql(),
+            [provider],
+            |_, held| matches!(held, Held::SuccessPool(pool) if fences.contains(&pool.fence_id)),
+            format_args!("the success pools of provider {provider}"),
+        )
+    }
+
+    /// Compare the rows `statement` (bound to `params`) returns from SQL with
+    /// the rows of `table` this state holds that `keep` selects, by rowid.
+    fn check_rows(
+        &self,
+        conn: &Connection,
+        table: usize,
+        statement: &str,
+        params: impl rusqlite::Params,
+        keep: impl Fn(&str, &Held) -> bool,
+        what: std::fmt::Arguments<'_>,
+    ) -> rusqlite::Result<()> {
+        let mut in_sql: Vec<(i64, Held)> = Vec::new();
+        let mut prepared = conn.prepare_cached(statement)?;
+        let mut rows = prepared.query(params)?;
+        while let Some(row) = rows.next()? {
+            if let (rowid, _, Some(held)) = decode(table, row)? {
+                in_sql.push((rowid, held));
+            }
+        }
+        in_sql.sort_by_key(|(rowid, _)| *rowid);
+        let mut in_state: Vec<(i64, Held)> = self.tables[table]
+            .rows
+            .iter()
+            .filter(|(_, (key, held))| keep(key, held))
+            .map(|(rowid, (_, held))| (*rowid, (**held).clone()))
+            .collect();
+        in_state.sort_by_key(|(rowid, _)| *rowid);
+        if in_sql != in_state {
+            return Err(diverged(format_args!("{what} differ from the state's")));
+        }
+        Ok(())
+    }
+
+    /// Check that SQL holds the principal exclusions of one admission as this
+    /// state does (by the table's primary-key prefix). An admission that
+    /// skips excluded credentials decided on these.
+    pub(crate) fn check_exclusions(
+        &self,
+        conn: &Connection,
+        principal: &str,
+        admission_id: &str,
+    ) -> rusqlite::Result<()> {
+        self.check_rows(
+            conn,
+            EXCLUSION_TABLE,
+            &exclusions_check_sql(),
+            [principal, admission_id],
+            |key, _| {
+                serde_json::from_str::<Vec<serde_json::Value>>(key).is_ok_and(|parts| {
+                    parts.first().and_then(|v| v.as_str()) == Some(principal)
+                        && parts.get(1).and_then(|v| v.as_str()) == Some(admission_id)
+                })
+            },
+            format_args!("the exclusions of admission {principal} {admission_id}"),
+        )
+    }
+
+    /// Check, by primary key, that SQL holds the probe clock of one origin
+    /// as this state does, or holds none where the state holds none.
+    pub(crate) fn check_clock(
+        &self,
+        conn: &Connection,
+        kind: &str,
+        origin_key: &str,
+    ) -> rusqlite::Result<()> {
+        let in_sql = conn
+            .prepare_cached(&by_origin_check_sql(CLOCK_TABLE))?
+            .query_row([kind, origin_key], |r| decode(CLOCK_TABLE, r))
+            .optional()?
+            .and_then(|(_, _, held)| held);
+        let in_state = self.clock(kind, origin_key).map(|(block, cleared)| {
+            let mut block = block.clone();
+            block.cleared_models.clear();
+            Held::Clock(block, cleared)
+        });
+        if in_sql != in_state {
+            return Err(diverged(format_args!(
+                "the clock of {kind} origin {origin_key} differs from the state's"
+            )));
+        }
+        Ok(())
+    }
+
     /// The route-state snapshot at `now`, as `SqliteRouteStateStore::build_snapshot`
     /// builds it from SQL: every route row in table order, its deadlines
     /// scheduled by the effective probe clocks evaluated at `recheck_now`
@@ -1090,6 +1566,95 @@ impl BlockState {
             _ => None,
         });
         crate::route_snapshot::provider_cooldown(row)
+    }
+
+    /// The stored clocks that are not cleared, each with its route clears,
+    /// as `fence_rechecks::read` returns them: by kind and origin key.
+    pub fn clock_rechecks(&self) -> Vec<FenceRecheck> {
+        if !self.enabled {
+            return Vec::new();
+        }
+        let mut clocks: Vec<FenceRecheck> = self
+            .clocks(true)
+            .into_values()
+            .filter(|(_, cleared)| cleared.is_none())
+            .map(|(block, _)| FenceRecheck::from(&block))
+            .collect();
+        clocks.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
+        clocks
+    }
+
+    /// Every `pool_key_state` row of `provider`: its credential, last use,
+    /// and wall and cooldown deadlines, as `key_pool` reads them from SQL.
+    pub fn pool_key_rows(
+        &self,
+        provider: &str,
+    ) -> rusqlite::Result<Vec<(String, Option<i64>, Option<i64>, Option<i64>)>> {
+        fn time(value: &Value, column: usize) -> rusqlite::Result<Option<i64>> {
+            match value {
+                Value::Null => Ok(None),
+                Value::Integer(at) => Ok(Some(*at)),
+                other => Err(rusqlite::Error::InvalidColumnType(
+                    column,
+                    "pool_key_state time".into(),
+                    other.data_type(),
+                )),
+            }
+        }
+        self.raws(4)
+            .filter_map(|(_, raw)| match raw {
+                Raw::PoolKey {
+                    provider: owner,
+                    credential_id,
+                    last_used_at,
+                    walled_until,
+                    cooldown_until,
+                } if owner == provider => Some((credential_id, last_used_at, walled_until, cooldown_until)),
+                _ => None,
+            })
+            .map(|(credential, last_used, walled, cooldown)| {
+                Ok((
+                    credential.clone(),
+                    time(last_used, 1)?,
+                    time(walled, 2)?,
+                    time(cooldown, 3)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// What `fence_rechecks::needs_sync` answers on SQL: whether a sync
+    /// would change any clock. A quarantined row holds a clock, a view
+    /// origin's clock is missing or holds other evidence, or a clock other
+    /// than an observation's has no origin.
+    pub fn needs_sync(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let quarantined: std::collections::HashSet<(String, String)> =
+            self.quarantined().into_iter().collect();
+        let mut clocks: HashMap<(String, String), String> = self
+            .stored_clocks()
+            .map(|(block, _)| {
+                (
+                    (block.kind.clone(), block.origin_key.clone()),
+                    block.evidence.clone(),
+                )
+            })
+            .collect();
+        if quarantined.iter().any(|key| clocks.contains_key(key)) {
+            return true;
+        }
+        for origin in self.view_origins_in_scan_order() {
+            let key = (origin.kind, origin.origin_key);
+            if quarantined.contains(&key) {
+                continue;
+            }
+            if clocks.remove(&key).as_deref() != Some(origin.evidence.as_str()) {
+                return true;
+            }
+        }
+        clocks.keys().any(|(kind, _)| kind != "observation")
     }
 
     /// Whether the store has the block schema. Without it the state holds
@@ -1388,6 +1953,68 @@ impl BlockState {
         rows
     }
 
+    /// What releasing `owner`'s probe gives up, as `release_admission_probes`
+    /// decides it: each authorization `owner` holds, with whether its clock
+    /// is still the one it claimed (uncleared, same evidence, evidence time
+    /// and claim generation). Only such a clock is reopened.
+    pub fn probe_release(&self, owner: &str) -> Vec<(ProbeAuthorization, bool)> {
+        let clocks = self.live_clocks();
+        self.authorizations_of(owner)
+            .into_iter()
+            .map(|row| {
+                let current = clocks
+                    .get(&(row.kind.as_str(), row.origin_key.as_str()))
+                    .is_some_and(|clock| {
+                        clock.evidence == row.evidence
+                            && clock.evidence_at == row.evidence_at
+                            && clock.claim_generation == row.claim_generation
+                    });
+                (row, current)
+            })
+            .collect()
+    }
+
+    /// Apply in memory exactly what `release_admission_probes` writes for
+    /// `owner` at `now`, from the same [`Self::probe_release`] decision:
+    /// each current clock is due at `now`, unclaimed, one generation on, and
+    /// every authorization of `owner` is gone. A reader sees an expired
+    /// admission's probe released before any command releases it.
+    pub fn apply_probe_release(&mut self, owner: &str, now: i64) {
+        for (row, current) in self.probe_release(owner) {
+            if !current {
+                continue;
+            }
+            let found = self.tables[CLOCK_TABLE].rows.iter().find_map(|(rowid, (key, held))| {
+                match &**held {
+                    Held::Clock(block, None)
+                        if block.kind == row.kind && block.origin_key == row.origin_key =>
+                    {
+                        Some((*rowid, key.clone(), block.clone()))
+                    }
+                    _ => None,
+                }
+            });
+            if let Some((rowid, key, mut block)) = found {
+                block.next_recheck_at = now;
+                block.last_claimed_at = None;
+                block.claim_owner = None;
+                block.claim_generation += 1;
+                self.tables[CLOCK_TABLE].put(rowid, &key, Some(&Arc::new(Held::Clock(block, None))));
+            }
+        }
+        let held: Vec<(i64, String)> = self.tables[AUTHORIZATION_TABLE]
+            .rows
+            .iter()
+            .filter_map(|(rowid, (key, held))| match &**held {
+                Held::Authorization(row) if row.owner == owner => Some((*rowid, key.clone())),
+                _ => None,
+            })
+            .collect();
+        for (rowid, key) in held {
+            self.tables[AUTHORIZATION_TABLE].put(rowid, &key, None);
+        }
+    }
+
     /// Every stored probe clock that is not cleared, by kind and origin key.
     pub(crate) fn live_clocks(&self) -> HashMap<(&str, &str), &Block> {
         self.rows_of(CLOCK_TABLE)
@@ -1634,7 +2261,11 @@ impl crate::AccountTx<'_> {
         // Counts and rowids cannot see a row changed in place. Every few
         // calls (about once a minute at the tick's period), compare a full
         // load, about a millisecond at live size.
-        let call = RECONCILE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let call = RECONCILE_CALLS.with(|calls| {
+            let call = calls.get();
+            calls.set(call + 1);
+            call
+        });
         if call % FULL_RECONCILE_EVERY == FULL_RECONCILE_EVERY - 1 {
             let loaded = BlockState::load(self.conn).map_err(crate::err)?;
             if loaded != *blocks {
@@ -1644,6 +2275,44 @@ impl crate::AccountTx<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Check that SQL holds every block row of each of `providers` as the
+    /// working state does (`BlockState::check_provider_rows`), raising
+    /// `STATE_DIVERGED` on a difference. A decision that chose which probe
+    /// clocks apply from the state (a route clear removes one; an account
+    /// fence decides whether its clock applies; sync's finding that no
+    /// other source row needs a clock) runs this before it claims or
+    /// admits, because neither the claim nor the admission names the rows
+    /// that left a clock out. The empty provider names the principal
+    /// clocks. Without a working state SQL decided, and there is nothing to
+    /// check.
+    pub fn check_decision_inputs(&self, providers: &[&str]) -> striatum_core::RouteStateResult<()> {
+        let Some(state) = self.working_blocks()? else {
+            return Ok(());
+        };
+        for provider in providers {
+            state
+                .check_provider_rows(self.conn, provider)
+                .map_err(crate::err)?;
+        }
+        Ok(())
+    }
+
+    /// Check that SQL holds one admission's principal exclusions as the
+    /// working state does, raising `STATE_DIVERGED` on a difference: an
+    /// admission decides which credentials it may use on them.
+    pub fn check_admission_exclusions(
+        &self,
+        principal: &str,
+        admission_id: &str,
+    ) -> striatum_core::RouteStateResult<()> {
+        let Some(state) = self.working_blocks()? else {
+            return Ok(());
+        };
+        state
+            .check_exclusions(self.conn, principal, admission_id)
+            .map_err(crate::err)
     }
 
     /// The block tables, read in the state loader's transaction.

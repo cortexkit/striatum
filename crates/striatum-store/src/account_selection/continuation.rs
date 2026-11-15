@@ -107,11 +107,15 @@ impl AccountTx<'_> {
         if !self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_continue')", [], |row|row.get::<_,bool>(0)).map_err(err)? {
             return Ok(());
         }
+        // Each release is recorded at the offer's own deadline, not when a
+        // command noticed it lapsed, so every releaser (a reader's view of
+        // the state, any command, the Tick) records the same time. A
+        // reservation named by several lapsed offers takes the first offer's.
         self.conn.execute(
-            "UPDATE account_admission SET state='released', released_at=?1 WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1)", params![now],
+            "UPDATE account_admission SET state='released', released_at=(SELECT c.valid_until_ms FROM account_continue c WHERE c.principal=account_admission.principal AND c.reservation_id=account_admission.admission_id AND c.used_at_ms IS NULL AND c.released_at_ms IS NULL AND c.valid_until_ms<=?1 ORDER BY c.rowid LIMIT 1) WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1)", params![now],
         ).map_err(err)?;
         self.conn.execute(
-            "UPDATE account_continue SET released_at_ms=?1 WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1", params![now],
+            "UPDATE account_continue SET released_at_ms=valid_until_ms WHERE used_at_ms IS NULL AND released_at_ms IS NULL AND valid_until_ms<=?1", params![now],
         ).map(|_|()).map_err(err)
     }
 

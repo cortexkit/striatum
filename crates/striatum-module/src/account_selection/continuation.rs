@@ -131,13 +131,8 @@ pub(crate) fn continue_account_with_call(
     ctx: &Ctx<'_>,
     call: Option<call_log::AccountCall>,
 ) -> Result<Value, Refusal> {
-    let now_ms = ctx.now_ms;
-    if crate::account_state::has_expired_continuations(ctx.store, now_ms).map_err(unavailable)? {
-        crate::account_writer::repair(ctx.store, move |tx| {
-            tx.release_expired_continuations(now_ms)
-        })
-        .map_err(unavailable)?;
-    }
+    // Expired offers are released by the command below before it decides
+    // (`AccountCommand::release_expired`); this read sends no command.
     // A recorded selection replays inside the writer command below, where
     // the keyed lookup sees every earlier command, including this batch's.
     for (field, value) in [
@@ -330,6 +325,7 @@ pub(crate) fn continue_account_with_call(
         let principal = principal.as_str();
         let runner = runner.as_str();
         let project = project.as_deref();
+        tx.release_expired(ctx.now_ms)?;
         tx.release_expired_continuations(ctx.now_ms)?;
         if let Some(first) = tx.continuation(principal, &request.selection_id)? {
             return Ok(standing(first, request));

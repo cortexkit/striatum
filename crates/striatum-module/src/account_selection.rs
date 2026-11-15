@@ -833,14 +833,20 @@ impl ClassContext {
         model: &str,
         account: &str,
         credential: &str,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<striatum_store::RecoveredOrigin> {
         self.rechecks
             .iter()
             .filter(|origin| {
                 self.origin_applies(origin, provider, account, credential, model)
                     && self.origin_recovered(origin, account)
             })
-            .map(|origin| (origin.kind.clone(), origin.origin_key.clone()))
+            .map(|origin| {
+                (
+                    origin.kind.clone(),
+                    origin.origin_key.clone(),
+                    origin.evidence.clone(),
+                )
+            })
             .collect()
     }
     /// A media admission uses only media vault metadata, even when its provider
@@ -1174,26 +1180,12 @@ impl ClassContext {
         }
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
+        // Expired admission probes and continuation offers read as released
+        // through the published state's `as_of` view; the next command
+        // releases them durably, so this read sends no release command. A
+        // sweep's private copy applies the same releases to itself.
         if let Some(sweep) = sweep {
             sweep.expire(now_ms);
-        }
-        if sweep.is_none()
-            && crate::account_state::has_expired_admission_probes(store, now_ms)
-                .map_err(|error| error.to_string())?
-        {
-            crate::account_writer::repair(store, move |tx| {
-                tx.release_expired_admission_probes(now_ms)
-            })
-            .map_err(|error| error.to_string())?;
-        }
-        if sweep.is_none()
-            && crate::account_state::has_expired_continuations(store, now_ms)
-                .map_err(|error| error.to_string())?
-        {
-            crate::account_writer::repair(store, move |tx| {
-                tx.release_expired_continuations(now_ms)
-            })
-            .map_err(|error| error.to_string())?;
         }
         let refusals = match sweep {
             Some(sweep) => sweep.listing(credentials, now_ms)?,
@@ -1204,10 +1196,10 @@ impl ClassContext {
             .lock()
             .map_err(|error| error.to_string())?
             .snapshot();
-        let eligibility = dry_run::published(store, sweep)
+        let eligibility = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.account_eligibility())
             .map_err(|error| error.to_string())?;
-        let mut size_refusals = dry_run::published(store, sweep)
+        let mut size_refusals = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
         let mut catalog: crate::broca_credentials::AuthCatalog =
@@ -1261,7 +1253,7 @@ impl ClassContext {
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
         let account_ids = credentials.quota_account_ids(&quota);
-        let size_clocks = dry_run::published(store, sweep)
+        let size_clocks = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.fence_rechecks())
             .map_err(|error| error.to_string())?;
         for fact in &size_refusals {
@@ -1306,10 +1298,10 @@ impl ClassContext {
         }
         // Each read below takes the state published after the commands
         // above, so it sees what they changed.
-        size_refusals = dry_run::published(store, sweep)
+        size_refusals = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
-        let blocks = dry_run::published(store, sweep).map_err(|error| error.to_string())?;
+        let blocks = dry_run::published(store, sweep, now_ms).map_err(|error| error.to_string())?;
         let mut route_fences = blocks
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
@@ -1331,7 +1323,7 @@ impl ClassContext {
         } else {
             repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
         }
-        route_fences = dry_run::published(store, sweep)
+        route_fences = dry_run::published(store, sweep, now_ms)
             .and_then(|blocks| blocks.account_route_fences(now_ms))
             .map_err(|error| error.to_string())?;
         for fence in &mut route_fences {
@@ -1399,7 +1391,7 @@ impl ClassContext {
                 now_ms,
             )?
         };
-        let blocks = dry_run::published(store, sweep).map_err(|error| error.to_string())?;
+        let blocks = dry_run::published(store, sweep, now_ms).map_err(|error| error.to_string())?;
         let fences = facts
             .iter()
             .map(|fact| fact.provider_id.clone())
@@ -1492,7 +1484,7 @@ impl ClassContext {
             };
             context.replace_fences(fences);
             context.replace_rechecks(
-                dry_run::published(store, sweep)
+                dry_run::published(store, sweep, now_ms)
                     .and_then(|blocks| blocks.fence_rechecks())
                     .map_err(|error| error.to_string())?,
             );
@@ -1538,7 +1530,7 @@ impl ClassContext {
             self.now_ms,
         )?);
         self.replace_rechecks(
-            crate::account_state::published(store)
+            crate::account_state::published(store, self.now_ms)
                 .and_then(|blocks| blocks.fence_rechecks())
                 .map_err(|error| error.to_string())?,
         );
@@ -1555,13 +1547,13 @@ impl ClassContext {
         priced: bool,
         decision: &str,
     ) -> RouteStateResult<ProbeBinding> {
-        let Some(hold) = &self.selection_probes else {
-            return Ok(ProbeBinding::Bound);
-        };
         let Outcome::Admit(admission) = self
             .probe(provider, model, priced, false, None, "probe-reservation")
             .outcome
         else {
+            if self.selection_probes.is_none() {
+                return Ok(ProbeBinding::Bound);
+            }
             return Ok(ProbeBinding::Lost {
                 retry_at: self
                     .blocked_reset(provider, model, priced)
@@ -1569,7 +1561,60 @@ impl ClassContext {
                     .unwrap_or(self.now_ms.saturating_add(120_000)),
             });
         };
-        if self.probe_eligible(provider, model, &admission.credential_id) {
+        // A block recorded since this context was read must still be
+        // claimed or waited for: ask the current published state, which
+        // holds every committed block, what applies now that this context
+        // did not see; only then is a command needed.
+        // Only blocks this context has not seen: what it saw, the selection
+        // already weighed (some, such as a transient retry, it lets pass
+        // until admission).
+        let applies_now = || -> RouteStateResult<Vec<striatum_store::FenceRecheck>> {
+            let published = crate::account_state::published(store, self.now_ms)?;
+            let fences = load_fences(&published, provider)?;
+            Ok(published
+                .fence_rechecks()?
+                .into_iter()
+                .filter(|origin| {
+                    !self.rechecks.iter().any(|seen| {
+                        seen.kind == origin.kind
+                            && seen.origin_key == origin.origin_key
+                            && seen.evidence == origin.evidence
+                    })
+                })
+                .filter(|origin| {
+                    self.origin_applies_with(
+                        &fences,
+                        origin,
+                        provider,
+                        &admission.account_id,
+                        &admission.credential_id,
+                        model,
+                    ) && !self.origin_recovered(origin, &admission.account_id)
+                })
+                .collect())
+        };
+        let Some(hold) = &self.selection_probes else {
+            // No probe reservation to bind; the admission claims any due
+            // probe. A block this context did not see that is not due yet
+            // makes the selection wait for it instead of going ahead.
+            if self.probe_eligible(provider, model, &admission.credential_id) {
+                return Ok(ProbeBinding::Bound);
+            }
+            let waiting: Vec<_> = applies_now()?
+                .into_iter()
+                .filter(|origin| origin.due_at() > self.now_ms)
+                .collect();
+            return Ok(if waiting.is_empty() {
+                ProbeBinding::Bound
+            } else {
+                ProbeBinding::Lost {
+                    retry_at: lost_probe_retry_at(&waiting, None, self.now_ms),
+                }
+            });
+        };
+        let probe_now = self.probe_eligible(provider, model, &admission.credential_id)
+            || !applies_now()?.is_empty();
+        if probe_now {
             #[cfg(test)]
             run_before_probe_bind_hook(&self.probe_scope, store);
             let context = self.clone();
@@ -1578,15 +1623,22 @@ impl ClassContext {
             let decision = decision.to_owned();
             let owner = hold.owner.clone();
             let claimed_admission = admission.clone();
+            let release_at = self.now_ms;
             let (claimed, retry_at) = crate::account_writer::repair(store, move |tx| {
+                // What the selection read as released is released first.
+                tx.release_expired(release_at)?;
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
                 let admission = claimed_admission.clone();
+                // The command's own fences, not the context's: a block
+                // recorded after the context was read is claimed too.
+                let fences = load_fences(&*tx, provider)?;
                 let origins: Vec<_> = tx
                     .fence_rechecks()?
                     .into_iter()
                     .filter(|origin| {
-                        context.origin_applies(
+                        context.origin_applies_with(
+                            &fences,
                             origin,
                             &provider,
                             &admission.account_id,
@@ -1595,6 +1647,9 @@ impl ClassContext {
                         ) && !context.origin_recovered(origin, &admission.account_id)
                     })
                     .collect();
+                // The rows that chose these origins (and left others out)
+                // are checked before the claim, which names only these.
+                tx.check_decision_inputs(&[provider, ""])?;
                 let retry_at = origins.iter().map(|origin| origin.next_recheck_at).max();
                 let claimed = tx.bind_decision_probe(
                     &origins,
@@ -1967,11 +2022,28 @@ impl ClassContext {
         credential: &str,
         model: &str,
     ) -> bool {
+        let fences = self.fences.get(provider).map_or(&[][..], Vec::as_slice);
+        self.origin_applies_with(fences, origin, provider, account, credential, model)
+    }
+
+    /// [`Self::origin_applies`] with the account fences given instead of the
+    /// ones this context read. A writer command passes the fences it loaded
+    /// from its own working state, so an account block recorded after this
+    /// context was read still decides what the command claims.
+    fn origin_applies_with(
+        &self,
+        fences: &[Fence],
+        origin: &striatum_store::FenceRecheck,
+        provider: &str,
+        account: &str,
+        credential: &str,
+        model: &str,
+    ) -> bool {
         striatum_core::blocks::origin_applies(
             &origin.origin(),
             || self.origin_targets(origin, provider, account, credential, model),
             || {
-                self.fences.get(provider).is_some_and(|fences| {
+                Some(fences).is_some_and(|fences| {
                     fences.iter().any(|fence| {
                         fence.account_id == account
                             && fence.observed_at_ms == origin.evidence_at
@@ -2836,34 +2908,62 @@ impl ClassContext {
         pinnable: bool,
         owner: Option<&str>,
     ) -> Result<String, LaunchRefusal> {
-        if !self.needs_credential_pin(provider, model)
-            && !self.rechecks.iter().any(|origin| {
+        // Whether anything needs claiming, and which branch claims it, is
+        // decided on the current published state, which holds every block
+        // committed since this context was read.
+        let current = crate::account_state::published(store, self.now_ms)
+            .and_then(|published| published.fence_rechecks())
+            .map_err(LaunchRefusal::store)?;
+        let account_scoped = |origin: &striatum_store::FenceRecheck| {
+            origin.provider == provider
+                && origin.model.as_deref().is_none_or(|named| named == model)
+                && (origin.account_id.is_some() || origin.credential_id.is_some())
+                && origin.principal.is_none()
+                && origin.size_class.is_none()
+        };
+        if !self.needs_credential_pin_with(&current, provider, model)
+            && !current.iter().any(|origin| {
                 origin.provider == provider
                     && origin.model.as_deref().is_none_or(|named| named == model)
             })
         {
             return Ok(String::new());
         }
-        if !pinnable
-            && !self.rechecks.iter().any(|origin| {
-                origin.provider == provider
-                    && origin.model.as_deref().is_none_or(|named| named == model)
-                    && (origin.account_id.is_some() || origin.credential_id.is_some())
-                    && origin.principal.is_none()
-                    && origin.size_class.is_none()
-            })
-        {
+        if !pinnable && !current.iter().any(account_scoped) {
             let context = self.clone();
             let owned_provider = provider.to_owned();
             let owned_model = model.to_owned();
             let owned_owner = owner.map(str::to_owned);
+            let release_at = context.now_ms;
             let granted = crate::account_writer::repair(store, move |tx| {
+                tx.release_expired(release_at)?;
                 let provider = owned_provider.as_str();
                 let model = owned_model.as_str();
                 let owner = owned_owner.as_deref();
 
-                let origins: Vec<_> = tx
-                    .fence_rechecks()?
+                let all = tx.fence_rechecks()?;
+                tx.check_decision_inputs(&[provider, ""])?;
+                // An account block recorded since the branch was chosen: this
+                // runner cannot pin its credential, so it waits for it.
+                let scoped: Vec<_> = all
+                    .iter()
+                    .filter(|origin| {
+                        origin.provider == provider
+                            && origin.model.as_deref().is_none_or(|named| named == model)
+                            && (origin.account_id.is_some() || origin.credential_id.is_some())
+                            && origin.principal.is_none()
+                            && origin.size_class.is_none()
+                    })
+                    .cloned()
+                    .collect();
+                if !scoped.is_empty() {
+                    return Ok(Some(lost_probe_retry_at(
+                        &scoped,
+                        owner.or(context.probe_owner.as_deref()),
+                        context.now_ms,
+                    )));
+                }
+                let origins: Vec<_> = all
                     .into_iter()
                     .filter(|origin| {
                         origin.account_id.is_none()
@@ -2897,7 +2997,9 @@ impl ClassContext {
         let owned_model = model.to_owned();
         let owned_owner = owner.map(str::to_owned);
         let owned_credential = credential.clone();
+        let release_at = context.now_ms;
         let claimed = crate::account_writer::repair(store, move |tx| {
+            tx.release_expired(release_at)?;
             let provider = owned_provider.as_str();
             let model = owned_model.as_str();
             // The claim is made for this owner, or for the selection's probe
@@ -2905,15 +3007,17 @@ impl ClassContext {
             // already claimed counts as its own claim.
             let owner = owned_owner.as_deref().or(context.probe_owner.as_deref());
             let credential = owned_credential.clone();
-
+            // The command's own fences, not the context's (see bind).
+            let fences = load_fences(&*tx, provider)?;
             let origins: Vec<_> = tx
                 .fence_rechecks()?
                 .into_iter()
                 .filter(|origin| {
-                    context.origin_applies(origin, provider, &account, &credential, model)
+                    context.origin_applies_with(&fences, origin, provider, &account, &credential, model)
                         && !context.origin_recovered(origin, &account)
                 })
                 .collect();
+            tx.check_decision_inputs(&[provider, ""])?;
             if !pinnable
                 && origins
                     .iter()
@@ -2946,7 +3050,18 @@ impl ClassContext {
     }
 
     pub(crate) fn needs_credential_pin(&self, provider: &str, model: &str) -> bool {
-        if self.rechecks.iter().any(|origin| {
+        self.needs_credential_pin_with(&self.rechecks, provider, model)
+    }
+
+    /// [`Self::needs_credential_pin`] over the clocks given rather than the
+    /// ones this context read.
+    fn needs_credential_pin_with(
+        &self,
+        rechecks: &[striatum_store::FenceRecheck],
+        provider: &str,
+        model: &str,
+    ) -> bool {
+        if rechecks.iter().any(|origin| {
             origin.provider == provider
                 && origin.principal.is_none()
                 && origin.size_class.is_none()
@@ -4019,7 +4134,7 @@ pub(crate) fn repair_route_fences(
     if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
         return legacy_route_fence_repair(store, account_ids, quota, config, now_ms);
     }
-    let recoveries = crate::account_state::published(store)
+    let recoveries = crate::account_state::published(store, now_ms)
         .and_then(|blocks| route_fence_recoveries(&blocks, account_ids, quota, config, now_ms))
         .map_err(|error| error.to_string())?;
     if recoveries.is_empty() {
@@ -4148,7 +4263,7 @@ pub(crate) fn refresh_credential_quota_holds(
     }
     let captured_refusals = refusals.clone();
     let mut changed = false;
-    let kept = crate::account_state::published(store)
+    let kept = crate::account_state::published(store, now)
         .and_then(|blocks| {
             reconcile_credential_quota_holds(
                 &blocks,
@@ -5433,7 +5548,7 @@ pub(crate) fn account_for_parsed(
     // id goes on: the writer command checks it against SQL by key before
     // allocating, and a refusal before the writer checks it here, so a closed
     // admission always replays its stored answer.
-    match crate::account_state::open_preflight_admission(ctx.store, principal, &admission_id) {
+    match crate::account_state::open_preflight_admission(ctx.store, principal, &admission_id, ctx.now_ms) {
         Ok(Some(row)) => {
             return replay_command(ctx, principal, row, request_fingerprint, finish);
         }
@@ -5645,6 +5760,9 @@ fn prepare_and_admit(
         ctx.store,
         striatum_store::AccountCommandKind::Admit,
         move |tx| {
+            // Expired probes and offers the selection read as released are
+            // released before the admission decides.
+            tx.release_expired(command_ctx.now_ms)?;
             tx.release_expired_continuations(command_ctx.now_ms)?;
             let reply = serve(
                 tx,
@@ -6668,7 +6786,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
         None
     } else {
         Some(
-            crate::account_state::snapshot(ctx.store).map_err(|error| PreflightRefusal {
+            crate::account_state::published_at(ctx.store, ctx.now_ms).map_err(|error| PreflightRefusal {
                 code: "account_selection_unavailable".into(),
                 message: error.to_string(),
                 reset_at_ms: None,
@@ -6687,7 +6805,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
             &crate::account_state::Published::State(std::sync::Arc::clone(state)),
             provider,
         ),
-        _ => crate::account_state::published(ctx.store)
+        _ => crate::account_state::published(ctx.store, ctx.now_ms)
             .and_then(|blocks| load_fences(&blocks, provider)),
     }
     .map_err(unavailable)?;
@@ -6952,6 +7070,12 @@ fn serve(
                 })
         })
         .collect();
+    // Which clocks apply to this admission, and whether any does, was read
+    // from the working state; the admission and its claim name none of the
+    // rows that left a clock out. Check them first.
+    tx.check_decision_inputs(&[provider, ""])?;
+    // So does which credentials its principal's exclusions rule out.
+    tx.check_admission_exclusions(principal, &params.admission_id)?;
     let targets = |origin: &striatum_store::FenceRecheck,
                    account: &str,
                    credential: &str| {

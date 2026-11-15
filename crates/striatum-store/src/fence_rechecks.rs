@@ -242,6 +242,308 @@ pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Re
     upsert_clocks(conn, Some(kind), Some(key))
 }
 
+/// [`sync_at`] for a command: decided on the command's working state when it
+/// has one, and on SQL otherwise (a projection, a test seam, a store without
+/// the block schema).
+///
+/// The state answers what `sync_at` would read from the `fence_origin` view
+/// and `fence_recheck`, so no request path copies the view. Each write the
+/// state decides is keyed on its row and checked: an archived origin and an
+/// installed or moved clock first check, by primary key, that SQL holds the
+/// origin's source rows as the state does (`BlockState::check_source`);
+/// clock updates and deletes name the clock values the state showed; an
+/// insert must not meet an existing clock. A miss raises `STATE_DIVERGED`.
+pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<()> {
+    let Some(state) = tx.working_blocks().map_err(command_error)? else {
+        return sync_at(tx.conn, now);
+    };
+    let state = state.into_owned();
+    // Archive the expired, unmanaged origins: quota=0, deadline passed, and
+    // no clock holds their evidence (`RETIRING`).
+    let retiring: Vec<ViewOrigin> = state
+        .view_origins_in_scan_order()
+        .into_iter()
+        .filter(|origin| {
+            origin.quota == Some(false)
+                && origin.deadline.is_some_and(|deadline| deadline < now as f64)
+                && state
+                    .clock(&origin.kind, &origin.origin_key)
+                    .is_none_or(|(clock, _)| clock.evidence != origin.evidence)
+        })
+        .collect();
+    for origin in &retiring {
+        state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
+        state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
+    }
+    for origin in &retiring {
+        tx.conn.execute(
+            "DELETE FROM fence_retired_origin WHERE kind=?1 AND origin_key=?2 AND evidence=?3",
+            params![origin.kind, origin.origin_key, origin.evidence],
+        )?;
+    }
+    for origin in &retiring {
+        tx.conn.execute(
+            "INSERT INTO fence_retired_origin VALUES (?1,?2,?3,?4,?5)",
+            params![origin.kind, origin.origin_key, origin.evidence, origin.evidence_at, now],
+        )?;
+    }
+    // The archive trigger ended the retired sources: read the state again.
+    let state = if retiring.is_empty() {
+        state
+    } else {
+        tx.working_blocks()
+            .map_err(command_error)?
+            .map(std::borrow::Cow::into_owned)
+            .unwrap_or(state)
+    };
+    let view = state.view_origins_in_scan_order();
+    for origin in &view {
+        upsert_clock_on(tx, &state, origin)?;
+    }
+    // Observation evidence is append-only and read through a bounded sparse
+    // index. Its clock survives that lookback until a successful probe heals
+    // it. Every other clock goes with its origin.
+    let live: std::collections::HashSet<(&str, &str)> = view
+        .iter()
+        .map(|origin| (origin.kind.as_str(), origin.origin_key.as_str()))
+        .collect();
+    let state = tx
+        .working_blocks()
+        .map_err(command_error)?
+        .map(std::borrow::Cow::into_owned)
+        .unwrap_or(state);
+    let stale: Vec<(String, String, String, String)> = state
+        .stored_clocks()
+        .filter(|(clock, _)| {
+            clock.kind != "observation"
+                && !live.contains(&(clock.kind.as_str(), clock.origin_key.as_str()))
+        })
+        .map(|(clock, _)| {
+            (
+                clock.kind.clone(),
+                clock.origin_key.clone(),
+                clock.evidence.clone(),
+                clock.scope.provider.clone(),
+            )
+        })
+        .collect();
+    for (kind, key, evidence, provider) in &stale {
+        state.check_source(tx.conn, kind, key, provider)?;
+        delete_clock_on(tx, kind, key, evidence)?;
+    }
+    // Older writers stored account-local errors on model/provider rows.
+    // Snapshot reads ignore those rows as model/provider walls. Exclude their
+    // retry clocks too, so one account's error cannot hide healthy siblings.
+    for (kind, key) in state.quarantined() {
+        let Some((clock, _)) = state.clock(&kind, &key) else {
+            continue;
+        };
+        if stale.iter().any(|(k, o, _, _)| *k == kind && *o == key) {
+            continue;
+        }
+        let evidence = clock.evidence.clone();
+        let provider = clock.scope.provider.clone();
+        state.check_source(tx.conn, &kind, &key, &provider)?;
+        delete_clock_on(tx, &kind, &key, &evidence)?;
+    }
+    Ok(())
+}
+
+/// [`register`] for a command, decided on its working state when it has one.
+pub(crate) fn register_on(
+    tx: &crate::AccountTx<'_>,
+    kind: &str,
+    key: &str,
+) -> rusqlite::Result<()> {
+    let Some(state) = tx.working_blocks().map_err(command_error)? else {
+        return register(tx.conn, kind, key);
+    };
+    let Some(origin) = state
+        .view_origins_in_scan_order()
+        .into_iter()
+        .find(|origin| origin.kind == kind && origin.origin_key == key)
+    else {
+        return Ok(());
+    };
+    upsert_clock_on(tx, &state, &origin)
+}
+
+/// A number as SQLite computes it: an integer, or a real once integer
+/// arithmetic overflows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SqlNumber {
+    Integer(i64),
+    Real(f64),
+}
+
+impl SqlNumber {
+    /// `a + b` as SQLite adds two integers: on overflow the sum is real.
+    fn add(a: i64, b: i64) -> Self {
+        a.checked_add(b)
+            .map_or(Self::Real(a as f64 + b as f64), Self::Integer)
+    }
+
+    /// `CAST(x AS INTEGER)`: a real truncates toward zero and saturates at
+    /// the integer range, as Rust's `as` does.
+    fn cast_integer(self) -> i64 {
+        match self {
+            Self::Integer(value) => value,
+            Self::Real(value) => value as i64,
+        }
+    }
+
+    /// Order as SQLite orders an integer and a real: by exact value, not
+    /// by rounding the integer to a real.
+    fn cmp(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        fn real_vs_integer(real: f64, integer: i64) -> Ordering {
+            if real < -9_223_372_036_854_775_808.0 {
+                return Ordering::Less;
+            }
+            if real >= 9_223_372_036_854_775_808.0 {
+                return Ordering::Greater;
+            }
+            let whole = real.trunc() as i64;
+            whole.cmp(&integer).then_with(|| {
+                (real - real.trunc()).partial_cmp(&0.0).unwrap_or(Ordering::Equal)
+            })
+        }
+        match (self, other) {
+            (Self::Integer(a), Self::Integer(b)) => a.cmp(&b),
+            (Self::Real(a), Self::Real(b)) => a.partial_cmp(&b).unwrap_or(Ordering::Equal),
+            (Self::Real(a), Self::Integer(b)) => real_vs_integer(a, b),
+            (Self::Integer(a), Self::Real(b)) => real_vs_integer(b, a).reverse(),
+        }
+    }
+}
+
+/// A new clock's `next_recheck_at` and `reset_check_at`, exactly as
+/// `upsert_clocks` computes them in SQL:
+/// `CAST(CASE WHEN quota=1 THEN evidence_at+900000 ELSE
+/// MIN(COALESCE(deadline,evidence_at+3600000),evidence_at+3600000) END AS INTEGER)`
+/// and `CASE WHEN quota=1 AND reset_at>evidence_at THEN reset_at END`,
+/// including SQLite's promotion of an overflowing sum to a real and its
+/// saturating cast.
+pub(crate) fn clock_schedule(
+    quota: bool,
+    evidence_at: i64,
+    deadline: Option<f64>,
+    reset_at: Option<f64>,
+) -> (i64, Option<f64>) {
+    let next = if quota {
+        SqlNumber::add(evidence_at, 900_000)
+    } else {
+        let cap = SqlNumber::add(evidence_at, 3_600_000);
+        let first = deadline.map_or(cap, SqlNumber::Real);
+        // SQLite's min() keeps the first of equal arguments.
+        if cap.cmp(first) == std::cmp::Ordering::Less {
+            cap
+        } else {
+            first
+        }
+    };
+    let reset = reset_at.filter(|reset| {
+        quota && SqlNumber::Real(*reset).cmp(SqlNumber::Integer(evidence_at)) == std::cmp::Ordering::Greater
+    });
+    (next.cast_integer(), reset)
+}
+
+/// The clock `upsert_clocks` writes for one origin: its evidence, class and
+/// schedule. A changed evidence value is new evidence, not a probe.
+fn upsert_clock_on(
+    tx: &crate::AccountTx<'_>,
+    state: &crate::BlockState,
+    origin: &ViewOrigin,
+) -> rusqlite::Result<()> {
+    let quota = origin.quota.unwrap_or(false);
+    let (next, reset) = clock_schedule(quota, origin.evidence_at, origin.deadline, origin.reset_at);
+    match state.clock(&origin.kind, &origin.origin_key) {
+        None => {
+            state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
+            let inserted = tx.conn.execute(
+                "INSERT INTO fence_recheck (kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
+                  evidence,evidence_at,quota,next_recheck_at,reset_check_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 ON CONFLICT(kind,origin_key) DO NOTHING",
+                params![
+                    origin.kind,
+                    origin.origin_key,
+                    origin.provider,
+                    origin.account_id,
+                    origin.credential_id,
+                    origin.model,
+                    origin.size_class,
+                    origin.principal,
+                    origin.admission_id,
+                    origin.evidence,
+                    origin.evidence_at,
+                    quota,
+                    next,
+                    reset,
+                ],
+            )?;
+            crate::block_state::expect_changes(
+                inserted,
+                1,
+                format_args!("installing the clock of {} {}", origin.kind, origin.origin_key),
+            )
+        }
+        Some((clock, _)) if clock.evidence != origin.evidence => {
+            state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
+            let claimed = clock.last_claimed_at.unwrap_or(i64::MIN);
+            let next = if origin.evidence_at >= claimed {
+                next
+            } else {
+                next.max(clock.next_recheck_at)
+            };
+            let reset = reset.filter(|reset| *reset > claimed as f64);
+            let moved = tx.conn.execute(
+                "UPDATE fence_recheck SET evidence=?3,evidence_at=?4,quota=?5,next_recheck_at=?6,reset_check_at=?7,
+                  classified=0,cleared_at=NULL,claim_owner=NULL
+                 WHERE kind=?1 AND origin_key=?2 AND evidence=?8 AND next_recheck_at=?9 AND last_claimed_at IS ?10",
+                params![
+                    origin.kind,
+                    origin.origin_key,
+                    origin.evidence,
+                    origin.evidence_at,
+                    quota,
+                    next,
+                    reset,
+                    clock.evidence,
+                    clock.next_recheck_at,
+                    clock.last_claimed_at,
+                ],
+            )?;
+            crate::block_state::expect_changes(
+                moved,
+                1,
+                format_args!("renewing the clock of {} {}", origin.kind, origin.origin_key),
+            )
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+/// Delete one clock, keyed on the evidence the state showed.
+fn delete_clock_on(
+    tx: &crate::AccountTx<'_>,
+    kind: &str,
+    key: &str,
+    evidence: &str,
+) -> rusqlite::Result<()> {
+    let deleted = tx.conn.execute(
+        "DELETE FROM fence_recheck WHERE kind=?1 AND origin_key=?2 AND evidence=?3",
+        params![kind, key, evidence],
+    )?;
+    crate::block_state::expect_changes(deleted, 1, format_args!("deleting the clock of {kind} {key}"))
+}
+
+/// A command-level error carried through SQL code: its text, which keeps a
+/// `STATE_DIVERGED` marker, is what the writer looks for.
+fn command_error(error: striatum_core::RouteStateStoreError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(error.0.into())
+}
+
 pub(crate) fn snapshot_origins(conn: &Connection) -> rusqlite::Result<()> {
     // Materialize once and index the compound origin key. A correlated lookup
     // against the UNION view otherwise rebuilds its JSON keys for every clock.
@@ -843,11 +1145,59 @@ fn claim_states(
         .collect()
 }
 
+/// A keyed check written as a no-op update: it changes no row, and its
+/// count of matched rows is the answer. Whether SQL still holds the clock an
+/// authorization names, with that evidence and claim generation (and, with
+/// `model`, as a non-quota clock of that model or of none).
+pub(crate) fn no_authorized_clock_check_sql(model: bool) -> String {
+    format!(
+        "{} UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
+            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5{}",
+        crate::block_state::STATE_CHECK,
+        if model { " AND quota=0 AND (model IS NULL OR model=?6)" } else { "" }
+    )
+}
+
+/// A keyed no-op update that answers whether an admission is still
+/// unstarted (`reserved` or `expired`) and, if so, its deadline.
+pub(crate) fn unstarted_admission_check_sql() -> String {
+    format!(
+        "{} UPDATE account_admission SET state = state WHERE principal=?1 \
+           AND admission_id=?2 AND state IN ('reserved','expired') \
+           AND started_at IS NULL RETURNING admission_valid_until",
+        crate::block_state::STATE_CHECK
+    )
+}
+
+/// The keyed check of one owner's probe authorizations against the state.
+pub(crate) fn authorization_check_sql() -> String {
+    format!(
+        "{} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
+                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key",
+        crate::block_state::STATE_CHECK
+    )
+}
+
+/// The keyed check of the clock an authorization names against the state.
+pub(crate) fn probe_clock_check_sql() -> String {
+    format!(
+        "{} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
+                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2",
+        crate::block_state::STATE_CHECK
+    )
+}
+
 /// Claim every origin's probe clock or none of them, deciding on `blocks`
 /// when given (the command's working state) and on SQL otherwise. The caller
 /// synchronizes the clocks first. Each clock update is keyed and names the
 /// state it was decided on; a clock SQL holds differently fails the command
 /// with [`crate::block_state::diverged`].
+///
+/// It checks only the clocks it is given. Which clocks apply was decided by
+/// the caller from the state (a route clear, for one, removes a clock), so an
+/// empty or shortened list claims nothing and checks nothing: the caller must
+/// have checked the rows that chose the list, as pool leases do with
+/// `check_lease_inputs` before calling it.
 fn claim_decided(
     conn: &Connection,
     blocks: Option<&crate::BlockState>,
@@ -1276,7 +1626,7 @@ impl AccountTx<'_> {
         account: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         self.conn
             .execute(
                 "UPDATE fence_recheck SET next_recheck_at=0,reset_check_at=NULL,claim_owner=NULL
@@ -1321,7 +1671,7 @@ impl AccountTx<'_> {
     /// keep their ordinary account-evidence behavior.
     pub fn probe_report_matches(&self, owner: &str, credential: Option<&str>, preserve: bool) -> RouteStateResult<bool> {
         if !enabled(self.conn).map_err(err)? { return Ok(true); }
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             // The answer gates the report's effects and healing.
             self.check_probe_inputs(&blocks, owner, !preserve)?;
@@ -1370,7 +1720,7 @@ impl AccountTx<'_> {
         grant_owner: Option<&str>,
         authorization: Option<&str>,
     ) -> RouteStateResult<bool> {
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         let blocks = self.working_blocks()?;
         claim_decided(self.conn, blocks.as_deref(), origins, now, consume_owner, grant_owner, authorization)
             .map_err(err)
@@ -1414,11 +1764,9 @@ impl AccountTx<'_> {
         row: &crate::block_state::ProbeAuthorization,
         model: Option<&str>,
     ) -> RouteStateResult<()> {
-        let keyed = "UPDATE fence_recheck SET claim_owner=claim_owner WHERE kind=?1 AND origin_key=?2
-            AND cleared_at IS NULL AND evidence=?3 AND evidence_at=?4 AND claim_generation=?5";
         let changed = match model {
-            None => self.conn.execute(keyed, params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
-            Some(model) => self.conn.execute(&format!("{keyed} AND quota=0 AND (model IS NULL OR model=?6)"),
+            None => self.conn.execute(&no_authorized_clock_check_sql(false), params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation]),
+            Some(model) => self.conn.execute(&no_authorized_clock_check_sql(true),
                 params![row.kind,row.origin_key,row.evidence,row.evidence_at,row.claim_generation,model]),
         }
         .map_err(err)?;
@@ -1438,12 +1786,11 @@ impl AccountTx<'_> {
         owner: &str,
         clocks: bool,
     ) -> RouteStateResult<()> {
-        use crate::block_state::{diverged, ProbeAuthorization, STATE_CHECK};
+        use crate::block_state::{diverged, ProbeAuthorization};
         let held = blocks.authorizations_of(owner);
         let stored = self
             .conn
-            .prepare_cached(&format!("{STATE_CHECK} SELECT owner,kind,origin_key,evidence,evidence_at,claimed_at,claim_generation
-                FROM fence_probe_authorization WHERE owner=?1 ORDER BY kind,origin_key"))
+            .prepare_cached(&authorization_check_sql())
             .map_err(err)?
             .query_map([owner], |r| {
                 Ok(ProbeAuthorization {
@@ -1472,8 +1819,7 @@ impl AccountTx<'_> {
             });
             let stored = self
                 .conn
-                .prepare_cached(&format!("{STATE_CHECK} SELECT evidence,evidence_at,claim_generation,credential_id,model,cleared_at,claim_owner
-                    FROM fence_recheck WHERE kind=?1 AND origin_key=?2"))
+                .prepare_cached(&probe_clock_check_sql())
                 .map_err(err)?
                 .query_row([&row.kind, &row.origin_key], |r| {
                     Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
@@ -1540,7 +1886,7 @@ impl AccountTx<'_> {
     /// quota probes retain their periodic limit regardless of failure attribution.
     pub fn fail_authorized_probe(&self, owner: &str, now: i64, inconclusive: bool) -> RouteStateResult<()> {
         if !enabled(self.conn).map_err(err)? { return Ok(()); }
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             let held = blocks.authorizations_of(owner);
             // Consume each clock still on the authorized evidence and
@@ -1656,38 +2002,41 @@ impl AccountTx<'_> {
         if expired.is_empty() {
             return Ok(released);
         }
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         for (principal, admission, owner) in expired {
             // Only an admission that is still unstarted, in `reserved` or
             // `expired`, gives up its probe; one that started or closed keeps
             // its authorization. (`expired` is included because a replay
             // expires an admission without releasing its probe.) The check
             // comes first, so nothing changes for an admission that fails it.
-            let unstarted = self
+            let deadline: Option<i64> = self
                 .conn
-                .execute(
-                    "UPDATE account_admission SET state = state WHERE principal=?1 \
-                       AND admission_id=?2 AND state IN ('reserved','expired') \
-                       AND started_at IS NULL",
+                .query_row(
+                    &unstarted_admission_check_sql(),
                     params![principal, admission],
+                    |row| row.get(0),
                 )
-                .map_err(err)?
-                == 1;
-            if !unstarted {
+                .optional()
+                .map_err(err)?;
+            let Some(deadline) = deadline else {
                 continue;
-            }
+            };
+            // The probe reopens as of the admission's own deadline, not when
+            // a command noticed it lapsed, so every releaser (a reader's view
+            // of the state, any command, the Tick) records the same time. The
+            // deadline has passed, so the reopened probe is due at once.
+            let now = deadline.min(now);
             released.released += 1;
             // Reopen only the authorized evidence and claim generation. The
             // fence stays in place, and an older expiry cannot undo a new probe.
             match self.working_blocks()? {
                 Some(blocks) => {
-                    let held = blocks.authorizations_of(&owner);
-                    let clocks = blocks.live_clocks();
-                    for row in &held {
-                        let current = clocks.get(&(row.kind.as_str(), row.origin_key.as_str())).is_some_and(|clock| {
-                            clock.evidence == row.evidence && clock.evidence_at == row.evidence_at
-                                && clock.claim_generation == row.claim_generation
-                        });
+                    // The same decision the account state's `as_of` view
+                    // applies in memory (`BlockState::apply_probe_release`).
+                    let release = blocks.probe_release(&owner);
+                    let held: Vec<_> = release.iter().map(|(row, _)| row.clone()).collect();
+                    for (row, current) in &release {
+                        let current = *current;
                         // Run for a clock the state calls superseded too: SQL
                         // must then change nothing, or it disagrees.
                         let changed = self.conn.execute("UPDATE fence_recheck SET next_recheck_at=?3,last_claimed_at=NULL,claim_owner=NULL,
@@ -1726,7 +2075,7 @@ impl AccountTx<'_> {
         credential: &str,
         model: &str,
     ) -> RouteStateResult<bool> {
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             // The answer decides whether the report may heal the probe.
             self.check_probe_inputs(&blocks, owner, true)?;
@@ -1797,7 +2146,7 @@ impl AccountTx<'_> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         // An alias/target launch may own origins from multiple providers. Only
         // its exact authorized generations may reopen, regardless of provider.
         if let Some(blocks) = self.working_blocks()? {
@@ -1849,6 +2198,13 @@ impl AccountTx<'_> {
             return Ok(());
         }
         let origins = self.fence_rechecks()?;
+        // Which test this owner holds (if any) decides both the heal and the
+        // authorization delete below, and a missed heal is never retried:
+        // check the owner's authorizations and their clocks against SQL
+        // first, so a stale state runs again instead of healing nothing.
+        if let Some(blocks) = self.working_blocks()? {
+            self.check_probe_inputs(&blocks, owner, true)?;
+        }
         // A pool lease can probe both an alias key's billing refusal and the
         // target provider's cooldown. Each proof keeps its own provider scope.
         for origin in origins
@@ -1915,6 +2271,15 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<()> {
+        // The report is recorded as delivered whatever this finds, so a heal
+        // skipped on a stale state would be lost: check the owner's (and the
+        // decision copy's) authorizations and their clocks against SQL first.
+        if let Some(blocks) = self.working_blocks()? {
+            self.check_probe_inputs(&blocks, owner, true)?;
+            if let Some(copy) = decision_copy.filter(|copy| *copy != owner) {
+                self.check_probe_inputs(&blocks, copy, true)?;
+            }
+        }
         for origin in origins.iter().filter(|origin| {
             origin.evidence_at < admitted_at
                 && origin.model.as_deref().is_none_or(|value| value == model)
@@ -2507,7 +2872,7 @@ impl AccountTx<'_> {
         if !enabled(self.conn).map_err(err)? {
             return Ok(quota);
         }
-        sync(self.conn).map_err(err)?;
+        sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             let clocks: Vec<(Block, Option<i64>)> = blocks
                 .stored_clocks()

@@ -536,3 +536,44 @@ async fn s8c_capped_sweep_reuses_the_account_snapshot() {
     );
     assert_eq!(before, rows(&harness));
 }
+
+/// A sweep judges every evaluation against the route rows it captured,
+/// measurements included. A route-state write committed during the sweep
+/// (here a new wall and error text on a captured route) changes
+/// neither a later evaluation's snapshot nor its error-based wall scope; a
+/// new sweep sees it.
+#[tokio::test]
+async fn a_route_state_write_during_a_sweep_leaves_its_later_evaluations_alone() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (harness, _) = fixture_with_repairs().await;
+    let sweep = crate::account_selection::Sweep::capture(harness.store()).unwrap();
+    let before = sweep.route_snapshot(NOW as f64).unwrap();
+    let route = before
+        .by_route
+        .keys()
+        .next()
+        .expect("the fixture holds route rows")
+        .clone();
+    // Written through route.cooldown_update's handler, a production
+    // route-state writer that runs in an account command.
+    crate::record_cooldown_update(
+        harness.store(),
+        &serde_json::from_value(json!({
+            "routeKey": route, "capacityKey": route,
+            "cooldownUntil": NOW + 600_000,
+            "lastError": "{\"class\":\"transient\",\"provider_code\":\"socket_timeout\"}"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        sweep.route_snapshot(NOW as f64).unwrap(),
+        before,
+        "an evaluation later in the same sweep"
+    );
+    let next = crate::account_selection::Sweep::capture(harness.store())
+        .unwrap()
+        .route_snapshot(NOW as f64)
+        .unwrap();
+    assert_ne!(next, before, "a new sweep sees the committed write");
+}

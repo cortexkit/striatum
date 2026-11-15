@@ -1085,7 +1085,8 @@ impl AdmissionState {
     }
 
     /// Offers past their deadline release their reserved admission, then
-    /// stop being offers, in the order of the two SQL updates.
+    /// stop being offers, in the order of the two SQL updates. Each release
+    /// is recorded at the offer's own deadline, as the SQL records it.
     pub(crate) fn release_expired_continuations(&mut self, now: i64) {
         let mut expired: Vec<(RowKey, Arc<Offer>)> = self
             .offers
@@ -1097,11 +1098,11 @@ impl AdmissionState {
         for (selection, offer) in &expired {
             self.transition(&selection.0, &offer.reservation_id, &["reserved"], |row| {
                 row.state = "released".into();
-                row.released_at = Some(now);
+                row.released_at = Some(offer.valid_until_ms);
             });
         }
-        for (selection, _) in &expired {
-            self.remove_offer(selection, Settle::Released(now));
+        for (selection, offer) in &expired {
+            self.remove_offer(selection, Settle::Released(offer.valid_until_ms));
         }
     }
 

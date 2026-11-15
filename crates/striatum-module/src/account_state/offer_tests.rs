@@ -562,3 +562,66 @@ fn migration_keeps_recent_moved_attempt_on_destination_not_original_account() {
         counts(&store, &owner, T + 29 * MINUTE, [0, 0, 0]);
     }
 }
+
+/// An offer that lapses before its reservation's own deadline stops counting
+/// toward concurrency at the offer's deadline: through the readers' view
+/// before any command, and in the stored state after the Tick releases it,
+/// stamped at that deadline.
+#[test]
+fn a_lapsed_offer_stops_counting_at_its_deadline_before_and_after_any_command() {
+    let (_scratch, store, _owner) = fixture("offer-lapse-view");
+    original(&store);
+    run(&store, T + 1, |tx| {
+        let mut reservation = row("lapsing", T + 1);
+        reservation.account_id = "b".into();
+        reservation.credential_id = "credential-b".into();
+        // The reservation outlives its offer, so only the offer's lapse can
+        // free its slot.
+        reservation.admission_valid_until = T + 1 + 10 * MINUTE;
+        insert(tx, &reservation)?;
+        tx.record_continuation(
+            "p",
+            "lapsing",
+            &V1Recorded {
+                body_json: "{}".into(),
+                answer_json: "{}".into(),
+            },
+            "run",
+            "original",
+            "decision-original",
+            Some((&reservation.decision_id, "lapsing", T + 1 + MINUTE)),
+        )
+    })
+    .unwrap();
+    let count_b = |state: &AccountState, now: i64| {
+        state.inflight.count("provider", "b", InflightScope::Account, now)
+    };
+    let deadline = T + 1 + MINUTE;
+    let before = published_at(&store, deadline - 1).unwrap();
+    assert_eq!(count_b(&before, deadline - 1), 1, "the live offer holds its slot");
+    let commits = store.writer_commit_count_for_test();
+    let read = published_at(&store, deadline).unwrap();
+    assert_eq!(count_b(&read, deadline), 0, "lapsed offer, before any command");
+    assert_eq!(
+        read.admissions.open_admission("p", "lapsing").map(|open| open.row.state.clone()),
+        None,
+        "the view releases the reservation"
+    );
+    let later = published_at(&store, deadline + 1).unwrap();
+    assert_eq!(count_b(&later, deadline + 1), 0, "lapsed offer, read after its deadline");
+    assert_eq!(store.writer_commit_count_for_test(), commits, "reading sends no command");
+    // The Tick a millisecond later stamps the deadline, not its own time.
+    crate::account_writer::tick(&store, deadline + 1).unwrap();
+    let stored = snapshot(&store).unwrap();
+    assert_eq!(count_b(&stored, deadline + 1), 0, "after the Tick releases it");
+    let row = store
+        .account_read(|tx| tx.admission("p", "lapsing"))
+        .unwrap()
+        .unwrap();
+    assert_eq!((row.state.as_str(), row.released_at), ("released", Some(deadline)));
+    assert_eq!(
+        count_b(&loaded(&store, deadline + 1), deadline + 1),
+        0,
+        "after a restart"
+    );
+}

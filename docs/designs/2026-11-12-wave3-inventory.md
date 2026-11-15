@@ -120,7 +120,7 @@ tests. Update filters and test paths when an approved replacement moves a pin.
 | S8a-3 | `FILTER="$PINS | test(account_writer::) | test(transaction_contention_tests::)"` | Full writer-handler coverage, source negative and per-table bypass counter. |
 | S8b-1 | `FILTER="$PINS | test(account_writer::) | test(account_state::)"` | Startup/load/reload, round trip and command-answer properties; replacement sign-offs already obtained. |
 | S8b-2 | `FILTER="$PINS | test(account_state::) | test(reads_off_writer::)"` | Reader-answer property, counted reader negatives, panel/key-pool mix, route-state differential. |
-| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::) | test(block_state::dry_run::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
+| S8c | `FILTER="$PINS | test(account_state::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference) | test(account_writer::tests::) | test(block_state::tests::)"` | Coherent sweep, private quota/listing repairs, pool walls/open offers and moved connection hooks. |
 | S7b | `FILTER="$PINS | test(account_state::) | test(backup_exclusion::)"` | Block migration, frozen data, tombstones, stored-deadline provider status cases. |
 | S9a | `FILTER="$PINS | test(backup_exclusion::) | test(task_usage::) | test(observed_speed)"` | Split script Python check, open/refusal/history-chain, outbox freshness and idempotent mover. |
 | S9b-1 | `FILTER="$PINS"` | Derive windows/predicates/triggers/decision columns, no executable change. |
@@ -394,6 +394,50 @@ reasoning-catalogue reads are exempt catalogue reads, not a T-read escape hatch
 for an account operation. `read_counts_offline` in `S/reasoning_catalog.rs` reads
 the persisted roster only offline and is not a daemon reader.
 
+## S8b-2 recorded exceptions to "no block-table SQL reads on request paths"
+
+After S8b-2 every request-path decision about block rows reads the account
+state, and the block read trace (`S/group_reads.rs`, authorizer-based) fails on
+any other read. Three classes of SQL read remain, each counted apart by the
+trace and each statement pinned in `S/block_state.rs::reviewed_exempt_reads`
+(proven keyed by `every_exempt_read_is_keyed`, which rejects any table scan in
+its query plan):
+
+* **Decision checks (`STATE_CHECK`).** A decision taken on the state reads, by
+  key, the rows it decided on and raises `STATE_DIVERGED` if SQL differs
+  (claims, probe answers, healing, sync, pool leases, admissions).
+* **Route-state writers' own-row reads (`ROUTE_WRITE_READ`), owner-approved
+  bounded exception.** These four writers read the row they are about to write,
+  inside the account command that writes it, by primary key or the indexed
+  `provider_id`. The merge is decided in SQL, which is the single decider for
+  these writes, and a read's result decides only that statement's own write:
+  * `record_provider_cooldown`: prior provider observation time, inherited
+    route rows, the existing provider row;
+  * `update_route_state`: prior route observation time, the existing route row,
+    and its provider's `provider_cooldown_state` row;
+  * the route-outcome recorder in `set_decision_outcome`: the route's failure
+    streak and backoff;
+  * `clear_failure_backoff`: the route's failure streak and backoff, for its
+    prior-state reply.
+  Eight statements in all (three, three, one and one), each a `ROUTE_READ_*`
+  constant in `S/lib.rs`. Pinned by
+  `the_route_state_writers_read_only_their_own_rows_through_reviewed_statements`,
+  which drives each writer, requires all eight to run and checks the key each
+  bound.
+* **Reviewed reading triggers.** Schema triggers that read block tables when a
+  write fires them, each keyed (`S/group_reads.rs::REVIEWED_TRIGGERS`):
+  * `model_route_state_inherit_fence_scope`: `provider_cooldown_state` by
+    `provider_key = NEW.provider_id`;
+  * `model_facts_inherit_provider_cooldown`: `provider_cooldown_state` by
+    `provider_key = NEW.provider_id`;
+  * `fence_retire_enforcement`: each source table by the primary key in
+    `NEW.origin_key`; `model_route_state` by the indexed `provider_id`, with
+    `provider_cooldown_state` by `provider_key`.
+  A read from any other trigger counts as an ordinary read and fails the trace.
+
+The state's own load and read-backs (`MAINTENANCE_READ`) keep it current and
+are not request reads.
+
 ## Mixed-table columns
 
 Here **ordering** means a writer's **report-ordering guard**, not a selector's
@@ -598,15 +642,17 @@ its connection wrapper, row-capture hook and DELETE authorizer now live in
 | `pool_key_lease` | Not needed: ClassContext tests only pool wall flags; it does not consume the `in_flight` count. Dry runs never choose/acquire a pool key or reserve a probe. |
 | `fence_origin` view | `BlockState` source origins plus `fence_rechecks::derive_blocks`, the same derivation used by the SQL adapter. |
 | `fence_retire_enforcement` trigger | No durable retirement is needed in a dry run: pure lifetime evaluation omits expired enforcement without a live delete/insert. |
-| `model_route_state_inherit_fence_scope` trigger | No route-state row is written in a dry run. Captured source provenance/quarantine fields are already held by `BlockState`; route measurements are overlaid separately. |
+| `model_route_state_inherit_fence_scope` trigger | No route-state row is written in a dry run. Captured source provenance/quarantine fields are already held by `BlockState`, and so are the route measurements: a sweep judges every evaluation against the rows it captured. |
 
 S8c filter: keep the invariant test filters above, use
 `connection_store::tests::` for the moved SQL-reference tests, and add
 `test(what_if_tests::sweep::) | test(panels_estimate_tests::) | test(media_samples_tests::) | test(key_pool_tests::s8c_pool_wall_and_open_offer_match_the_sql_reference)`.
 `account_writer::tests::` and `block_state::tests::` also protect the moved
-capture/authorizer hooks and the private account-repair support. The additional
-`block_state::dry_run::tests::` filter covers fresh diagnostic errors without
-reclassifying captured walls. Capped sweeps and standalone panel estimates also
+capture/authorizer hooks and the private account-repair support. Route
+measurements are captured with the rest of the account state, so a route-state
+write during a sweep changes neither later evaluations nor the scope of a
+captured wall (`a_route_state_write_during_a_sweep_leaves_its_later_evaluations_alone`,
+in the sweep filter). Capped sweeps and standalone panel estimates also
 assert one account snapshot, no SQL reads counted as account-state reads and
 no writer commands.
 The new sweep tests compare whole responses (timings removed), including every

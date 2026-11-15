@@ -695,8 +695,8 @@ impl RequestInputs {
         // Read after the previous seat's admission, before this seat reserves
         // its own probes. Only the immutable catalog is shared between seats.
         let mut snapshot = match sweep {
-            Some(sweep) => sweep.route_snapshot(deps.store, now),
-            None => crate::account_state::published(deps.store)
+            Some(sweep) => sweep.route_snapshot(now),
+            None => crate::account_state::published(deps.store, now as i64)
                 .and_then(|blocks| blocks.route_state_snapshot(now)),
         }
         .map_err(store_refusal)?;

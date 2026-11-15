@@ -674,6 +674,38 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     for batch in 0..batches {
         admission_burst(&fixture, &runner, batch, &mut times[6]).await;
     }
+    // Pool acquisitions through the account writer, last so the earlier
+    // measurements keep their fixture history: each a new session picking
+    // among four keys of a provider that holds fences and probe clocks.
+    let mut pool_samples = Samples::default();
+    let keys: Vec<striatum_core::key_pool::PoolKey> = (0..4)
+        .map(|k| striatum_core::key_pool::PoolKey::new(&format!("bench-key-{k}"), None, "active"))
+        .collect();
+    for batch in 0..batches {
+        for i in 0..30 {
+            let session = format!("bench-pool-{batch}-{i}");
+            let before = Before::new(harness.store());
+            let leased = crate::account_writer::pool_acquire_for_route(
+                harness.store(),
+                &striatum_store::PoolAcquire {
+                    provider: "cpu-provider-0",
+                    session_id: &session,
+                    keys: &keys,
+                    now_ms: FIXTURE_NOW as i64,
+                    lease_ms: 60_000,
+                    affinity_idle_ms: 60_000,
+                },
+                &["cpu-provider-0"],
+                "model-0",
+                &[],
+                &std::collections::BTreeMap::new(),
+            );
+            before.finish(harness.store(), &mut pool_samples);
+            if !matches!(leased, Ok(striatum_store::PoolAcquireOutcome::Leased(_))) {
+                pool_samples.refusals += 1;
+            }
+        }
+    }
     assert_eq!(
         harness.store().outside_account_writer_count_for_test(),
         outside_before,
@@ -693,6 +725,7 @@ async fn measure(fixture: RequestFixture, batches: usize) {
     {
         samples.print(name);
     }
+    pool_samples.print("pool_acquire");
     crate::account_state::report_admission_state(harness.store());
     if std::env::var_os("STRIATUM_CPU_WAL_TICKS").is_some() {
         println!(

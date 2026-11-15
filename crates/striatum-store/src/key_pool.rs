@@ -33,6 +33,13 @@ pub struct PoolAcquire<'a> {
     pub affinity_idle_ms: i64,
 }
 
+/// A probe origin the caller found recovered for a pool key (its quota
+/// reading shows room again): kind, origin key and the evidence it was
+/// recovered from. Acquisition skips only a clock that still holds that
+/// evidence, so a recovery read from an older state cannot lift a block
+/// renewed since, including on a run again after `STATE_DIVERGED`.
+pub type RecoveredOrigin = (String, String, String);
+
 /// A granted lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolLease {
@@ -101,6 +108,7 @@ mod lease_id_tests {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn key_states(
     conn: &Connection,
     provider: &str,
@@ -111,33 +119,53 @@ fn key_states(
     read_key_states(conn, provider, now_ms, excluded_lease)
 }
 
-fn read_key_states(
+/// One key's row: credential, last use, wall and cooldown deadlines.
+type KeyRow = (String, Option<i64>, Option<i64>, Option<i64>);
+
+pub(crate) fn read_key_states(
     conn: &Connection,
     provider: &str,
     now_ms: i64,
     excluded_lease: Option<&str>,
 ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
-    let mut states: BTreeMap<String, PoolKeyState> = BTreeMap::new();
     let mut statement = conn.prepare(
         "SELECT credential_id, last_used_at, walled_until, cooldown_until
          FROM pool_key_state WHERE provider = ?1",
     )?;
-    for row in statement.query_map(params![provider], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<i64>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-        ))
-    })? {
-        let (id, last_used, walled, cooldown) = row?;
+    let rows = statement
+        .query_map(params![provider], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<KeyRow>>>()?;
+    let rechecks = crate::fence_rechecks::read(conn)?;
+    let clock_schema = crate::fence_rechecks::enabled(conn)?;
+    let leases = lease_counts(conn, provider, now_ms, excluded_lease)?;
+    Ok(key_states_from(provider, rows, &rechecks, clock_schema, leases))
+}
+
+/// Key states from the key rows, the stored clocks and the live lease
+/// counts, wherever they were read. With probe clocks, a key's wall and
+/// cooldown are its clocks' due times, not the row's raw deadlines.
+pub(crate) fn key_states_from(
+    provider: &str,
+    rows: Vec<KeyRow>,
+    rechecks: &[crate::FenceRecheck],
+    clock_schema: bool,
+    leases: Vec<(String, i64)>,
+) -> BTreeMap<String, PoolKeyState> {
+    let mut states: BTreeMap<String, PoolKeyState> = BTreeMap::new();
+    for (id, last_used, walled, cooldown) in rows {
         let state = states.entry(id).or_default();
         state.last_used_at_ms = last_used;
         state.walled_until_ms = walled;
         state.cooldown_until_ms = cooldown;
     }
-    let rechecks = crate::fence_rechecks::read(conn)?;
-    if crate::fence_rechecks::enabled(conn)? {
+    if clock_schema {
         for state in states.values_mut() {
             state.walled_until_ms = None;
             state.cooldown_until_ms = None;
@@ -161,19 +189,30 @@ fn read_key_states(
             *field = Some(field.unwrap_or(0).max(origin.due_at()));
         }
     }
-    let mut statement = conn.prepare(
+    for (id, count) in leases {
+        states.entry(id).or_default().in_flight = u32::try_from(count).unwrap_or(u32::MAX);
+    }
+    states
+}
+
+/// Live leases per key of `provider`, from the lease table, which the
+/// account state does not hold.
+pub(crate) fn lease_counts(
+    conn: &Connection,
+    provider: &str,
+    now_ms: i64,
+    excluded_lease: Option<&str>,
+) -> rusqlite::Result<Vec<(String, i64)>> {
+    let mut statement = conn.prepare_cached(
         "SELECT credential_id, COUNT(*) FROM pool_key_lease
          WHERE provider = ?1 AND released_at IS NULL AND valid_until > ?2
            AND lease_id IS NOT ?3
          GROUP BY credential_id",
     )?;
-    for row in statement.query_map(params![provider, now_ms, excluded_lease], |row| {
+    let rows = statement.query_map(params![provider, now_ms, excluded_lease], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })? {
-        let (id, count) = row?;
-        states.entry(id).or_default().in_flight = u32::try_from(count).unwrap_or(u32::MAX);
-    }
-    Ok(states)
+    })?;
+    rows.collect()
 }
 
 fn touch(
@@ -246,7 +285,7 @@ impl SqliteRouteStateStore {
         request: &PoolAcquire<'_>,
         providers: &[&str],
         model: &str,
-        recovered: &[(String, String)],
+        recovered: &[RecoveredOrigin],
         accounts: &BTreeMap<String, String>,
     ) -> RouteStateResult<PoolAcquireOutcome> {
         let provider = request.provider.to_owned();
@@ -379,6 +418,34 @@ impl SqliteRouteStateStore {
         self.account_transaction(|tx| key_states(tx.conn, provider, now_ms, None).map_err(err))
     }
 
+    /// Key states for a request outside the writer, from `published`, the
+    /// account state's block tables, with the live leases from a pooled
+    /// reader. A command synchronizes the clocks first only when the state
+    /// shows a sync would change one. Without a state this is the SQL
+    /// [`Self::pool_key_states`].
+    pub fn pool_key_states_from(
+        &self,
+        provider: &str,
+        now_ms: i64,
+        published: Option<&crate::BlockState>,
+    ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
+        let Some(state) = published.filter(|state| state.enabled()) else {
+            return self.pool_key_states(provider, now_ms);
+        };
+        if !state.needs_sync() {
+            let rows = state.pool_key_rows(provider).map_err(err)?;
+            let leases = self
+                .store
+                .with_read(|conn: &Connection| Ok(lease_counts(conn, provider, now_ms, None)?))
+                .map_err(err)?;
+            return Ok(key_states_from(provider, rows, &state.clock_rechecks(), true, leases));
+        }
+        let provider = provider.to_owned();
+        self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
+            tx.key_states_on(&provider, now_ms, None).map_err(err)
+        })
+    }
+
     fn read_first_key_states(
         &self,
         provider: &str,
@@ -388,14 +455,12 @@ impl SqliteRouteStateStore {
         let (states, needs_sync) = self
             .store
             .with_read(|conn: &Connection| {
-                // Key states join the probe clocks, read here from SQL: the
-                // pool lease tables are not held in the account state.
-                crate::group_reads::declared_exception("pool key states", || {
-                    Ok((
-                        read_key_states(conn, provider, now_ms, None)?,
-                        crate::fence_rechecks::needs_sync(conn)?,
-                    ))
-                })
+                // The SQL reader, for a store without account state; request
+                // paths use `pool_key_states_from`.
+                Ok((
+                    read_key_states(conn, provider, now_ms, None)?,
+                    crate::fence_rechecks::needs_sync(conn)?,
+                ))
             })
             .map_err(err)?;
         if !needs_sync {
@@ -419,6 +484,55 @@ impl SqliteRouteStateStore {
 }
 
 impl crate::AccountTx<'_> {
+    /// Key states inside a command: the clocks synchronized first, then the
+    /// key rows and clocks read from the working state (SQL without one),
+    /// and the live leases from the lease table.
+    fn key_states_on(
+        &self,
+        provider: &str,
+        now_ms: i64,
+        excluded_lease: Option<&str>,
+    ) -> rusqlite::Result<BTreeMap<String, PoolKeyState>> {
+        crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+        let state = self
+            .working_blocks()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))?;
+        match state {
+            Some(state) => Ok(key_states_from(
+                provider,
+                state.pool_key_rows(provider)?,
+                &state.clock_rechecks(),
+                true,
+                lease_counts(self.conn, provider, now_ms, excluded_lease)?,
+            )),
+            None => read_key_states(self.conn, provider, now_ms, excluded_lease),
+        }
+    }
+
+    /// A lease is granted, reused, released or refused on key states, clocks
+    /// and route clears read from the working state, and on sync's finding
+    /// that no other source row needs a clock; none of its writes names
+    /// them. So before deciding, check that SQL holds each provider's block
+    /// rows exactly as the state does (`BlockState::check_provider_rows`); a
+    /// difference raises `STATE_DIVERGED`, and the batch runs again on a
+    /// fresh load. Without a state SQL decided.
+    fn check_lease_inputs(&self, providers: &[&str]) -> rusqlite::Result<()> {
+        self.check_decision_inputs(providers)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))
+    }
+
+    /// The stored, uncleared clocks: from the working state, or SQL
+    /// without one.
+    fn clock_rechecks_on(&self) -> rusqlite::Result<Vec<crate::FenceRecheck>> {
+        match self
+            .working_blocks()
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.0.into()))?
+        {
+            Some(state) => Ok(state.clock_rechecks()),
+            None => crate::fence_rechecks::read(self.conn),
+        }
+    }
+
     /// Wall a key atomically with the observation that reported the refusal.
     pub fn pool_wall(
         &self,
@@ -453,8 +567,8 @@ impl crate::AccountTx<'_> {
             } else {
                 "pool_rate"
             };
-            crate::fence_rechecks::register(
-                self.conn,
+            crate::fence_rechecks::register_on(
+                self,
                 origin,
                 &serde_json::json!([provider, credential_id]).to_string(),
             )
@@ -597,7 +711,7 @@ impl crate::AccountTx<'_> {
         request: &PoolAcquire<'_>,
         providers: &[&str],
         model: &str,
-        recovered: &[(String, String)],
+        recovered: &[RecoveredOrigin],
         accounts: &BTreeMap<String, String>,
     ) -> RouteStateResult<PoolAcquireOutcome> {
         self.pool_sql(|conn| {
@@ -612,8 +726,7 @@ impl crate::AccountTx<'_> {
                     |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let mut states = key_states(
-                conn,
+            let mut states = self.key_states_on(
                 request.provider,
                 now,
                 existing.as_ref().map(|(lease, _, _)| lease.as_str()),
@@ -624,9 +737,18 @@ impl crate::AccountTx<'_> {
                     && accounts.get(*id).is_some_and(|id|id==account)).unwrap_or(credential);
                 providers.contains(&origin.provider.as_str())
                 && origin.applies(&origin.provider,account,named,model) && origin.principal.is_none() && origin.size_class.is_none()
-                && !recovered.contains(&(origin.kind.clone(),origin.origin_key.clone()))
+                && !recovered.iter().any(|(kind,key,evidence)|*kind==origin.kind && *key==origin.origin_key && *evidence==origin.evidence)
             };
-            let origins=crate::fence_rechecks::read(conn)?;
+            let origins=self.clock_rechecks_on()?;
+            // The pool's own provider (its key rows and pool clocks) and
+            // every provider whose clocks apply to the route.
+            let mut lease_providers: Vec<&str> = providers.to_vec();
+            if !lease_providers.contains(&request.provider) {
+                lease_providers.push(request.provider);
+            }
+            // Every decision below (reuse, refusal, release, a new pick)
+            // rests on these providers' rows as the state shows them.
+            self.check_lease_inputs(&lease_providers)?;
             for key in request.keys {
                 let quota_at=crate::FenceRecheck::quota_group_at(origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)),None);
                 for origin in origins.iter().filter(|origin|applies(origin,&key.workspace,&key.credential_id)) {
@@ -742,8 +864,11 @@ impl crate::AccountTx<'_> {
                     let Some(credential_id) = credential_id else {
                         return Ok(None);
                     };
-                    crate::fence_rechecks::sync(conn)?;
-                    if crate::fence_rechecks::read(conn)?.iter().any(|origin|origin.provider==provider) {
+                    crate::fence_rechecks::sync_on(self, crate::now_ms())?;
+                    // The refusal below and the grant both rest on the
+                    // provider's rows as the state shows them.
+                    self.check_lease_inputs(&[provider])?;
+                    if self.clock_rechecks_on()?.iter().any(|origin|origin.provider==provider) {
                         // Rehydrating an unknown lease cannot prove that it
                         // owns a fenced account's one probe authorization.
                         return Ok(None);

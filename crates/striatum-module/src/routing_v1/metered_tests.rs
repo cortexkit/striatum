@@ -1083,3 +1083,64 @@ async fn profile_metered_routes_pay_list_price_even_with_provider_multiplier_ove
         );
     }
 }
+
+/// An unstarted test request's probe lapses at its admission's deadline. A
+/// reader then sees the probe released with no command sent; the Tick later
+/// writes exactly the state the reader saw, the probe reopened as of that
+/// deadline; and the reopened probe is taken once, by one of two racers,
+/// while a later request waits with a time.
+#[tokio::test]
+async fn an_expired_probe_reads_released_with_no_command_and_the_release_writes_what_was_read() {
+    let _clock = crate::InjectedClock::set(FENCE_NOW);
+    let harness = broca_fence_harness();
+    fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
+    let runner = harness.bind(reserved("broca"), None).await;
+    let first = broca_account_request(&Value::Null, "abandoned", false);
+    let admitted = runner.call("route.account_for", &first).await;
+    assert_eq!(admitted.1["result"]["reason"]["code"], "credential_fence_probe", "{}", admitted.1);
+    let held = crate::account_state::published(harness.store(), crate::account_selection::now_ms()).unwrap().block_state().unwrap().clone();
+    assert!(!held.authorization_owners().is_empty(), "the admission holds the probe");
+
+    let now = FENCE_NOW as i64 + 61_000;
+    let _after = crate::InjectedClock::set(now as u64);
+    let commits = harness.store().writer_commit_count_for_test();
+    crate::account_selection::ClassContext::load(
+        harness.store(),
+        &harness.credentials(),
+        harness.operator_config(),
+        crate::ACCOUNT_QUOTA.get(),
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        harness.store().writer_commit_count_for_test(),
+        commits,
+        "reading an expired probe sends no command"
+    );
+    let read = crate::account_state::published(harness.store(), now).unwrap().block_state().unwrap().clone();
+    assert!(read.authorization_owners().is_empty(), "the reader sees the probe released");
+
+    let _tick = crate::InjectedClock::set(now as u64 + 30_000);
+    crate::account_writer::tick(harness.store(), now + 30_000).unwrap();
+    assert!(harness.store().writer_commit_count_for_test() > commits, "the Tick releases it durably");
+    let stored = crate::account_state::snapshot(harness.store()).unwrap();
+    assert!(stored.blocks == read, "the release writes exactly what the reader saw");
+
+    let a = broca_account_request(&Value::Null, "replacement-a", false);
+    let b = broca_account_request(&Value::Null, "replacement-b", false);
+    let (a, b) = tokio::join!(
+        runner.call("route.account_for", &a),
+        runner.call("route.account_for", &b),
+    );
+    let replies = [a, b];
+    assert_eq!(
+        replies.iter().filter(|r| r.0 == FrameType::Response).count(),
+        1,
+        "the reopened probe is taken once: {replies:?}"
+    );
+    let later = broca_account_request(&Value::Null, "later", false);
+    let refused = runner.call("route.account_for", &later).await;
+    assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
+    assert_eq!(refused.1["code"], "account_pool_exhausted", "{}", refused.1);
+    assert!(refused.1["detail"]["reset_at_ms"].is_i64() || refused.1["detail"]["reset_at_ms"].is_u64(), "a timed wait: {}", refused.1);
+}

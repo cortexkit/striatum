@@ -280,6 +280,21 @@ impl crate::SqliteRouteStateStore {
             .wait()
     }
 
+    /// Write block rows on the writer connection where neither the capture
+    /// nor any reload sees them, so the next command decides on a state that
+    /// differs from SQL in exactly these rows: the stale state a missed
+    /// write would leave.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn write_unseen_for_test(&self, sql: &str) -> RouteStateResult<()> {
+        crate::block_state::UNSEEN.with(|unseen| unseen.set(true));
+        let written = self
+            .store
+            .with_conn(|conn: &rusqlite::Connection| conn.execute_batch(sql))
+            .map_err(crate::err);
+        crate::block_state::UNSEEN.with(|unseen| unseen.set(false));
+        written
+    }
+
     /// Write a block row outside any account command and outside the test
     /// seeding seams, as a production bypass would.
     #[cfg(any(test, feature = "test-support"))]

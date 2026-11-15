@@ -39,26 +39,33 @@ impl Sweep {
         Published::State(Arc::new(self.state.lock().unwrap().clone()))
     }
 
+    /// The route-state snapshot this sweep judges every evaluation against:
+    /// the captured route rows with their measurements (pressure, latency,
+    /// success, last error) as captured, and this copy's block overlay. A
+    /// route-state write committed during the sweep changes neither, so
+    /// every IQ and seat of one preview is judged against one state.
     pub(crate) fn route_snapshot(
         &self,
-        store: &SqliteRouteStateStore,
         now: f64,
     ) -> RouteStateResult<striatum_core::model_router::ModelRouteStateSnapshot> {
-        store.dry_run_route_snapshot(
-            &self.state.lock().unwrap().blocks,
-            now,
-            crate::account_selection::now_ms(),
-        )
+        // Probe clocks are evaluated at the wall clock, as the live
+        // route-state snapshot evaluates them.
+        self.state
+            .lock()
+            .unwrap()
+            .blocks
+            .route_state_snapshot(now, crate::account_selection::now_ms())
     }
 
+    /// Release this copy's expired admission probes and continuation offers
+    /// at `now`, exactly as a live reader's view (`AccountState::as_of`) and
+    /// the writer's commands release them: probe clocks reopened one
+    /// generation on as of the admission's deadline, offers stamped at
+    /// theirs.
     pub(super) fn expire(&self, now: i64) {
         let mut state = self.state.lock().unwrap();
-        let expired = state
-            .admissions
-            .expired_probe_admissions(state.blocks.authorization_owners(), now);
-        let owners: Vec<_> = expired.into_iter().map(|(_, _, owner)| owner).collect();
-        state.blocks.dry_run_release_owners(&owners, now);
-        state.admissions.release_expired_continuations(now);
+        let released = std::sync::Arc::new(state.clone()).as_of(now);
+        *state = (*released).clone();
     }
 
     pub(super) fn listing(
@@ -190,10 +197,11 @@ impl Sweep {
 pub(super) fn published<'a>(
     store: &'a SqliteRouteStateStore,
     sweep: Option<&'a Sweep>,
+    now_ms: i64,
 ) -> RouteStateResult<Published<'a>> {
     match sweep {
         Some(sweep) => Ok(sweep.published()),
-        None => crate::account_state::published(store),
+        None => crate::account_state::published(store, now_ms),
     }
 }
 

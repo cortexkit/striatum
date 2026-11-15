@@ -664,8 +664,8 @@ pub(super) fn prepare_selection_inputs_for_sweep(
         .get_facts_with_observed_speed_and_generation(now, pricing)
         .map_err(|e| format!("reading facts from route-state store: {e}"))?;
     let mut snapshot = match sweep {
-        Some(sweep) => sweep.route_snapshot(store, now),
-        None => crate::account_state::published(store)
+        Some(sweep) => sweep.route_snapshot(now),
+        None => crate::account_state::published(store, now as i64)
             .and_then(|blocks| blocks.route_state_snapshot(now)),
     }
     .map_err(|e| format!("building route-state snapshot: {e}"))?;

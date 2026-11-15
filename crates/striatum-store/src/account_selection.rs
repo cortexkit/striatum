@@ -785,7 +785,7 @@ impl AccountTx<'_> {
         before: i64,
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
-        crate::fence_rechecks::sync(self.conn).map_err(err)?;
+        crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)?;
         let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,
             next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
             WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND evidence_at<?3
@@ -2181,8 +2181,8 @@ impl AccountTx<'_> {
             )
             .map_err(err)?;
         if changed == 1 {
-            crate::fence_rechecks::register(
-                self.conn,
+            crate::fence_rechecks::register_on(
+                self,
                 "principal",
                 &serde_json::json!([row.principal, row.admission_id, row.credential_id])
                     .to_string(),
@@ -2331,7 +2331,9 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        let changed=self.conn.execute("INSERT INTO account_transient_backoff
+        // The rows this observation inserted or moved, returned by the
+        // write itself rather than read back from the block table.
+        let keys = self.conn.prepare("INSERT INTO account_transient_backoff
             SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
                 o.received_at,json_array(o.observation_id,e.key),e.value
             FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
@@ -2340,17 +2342,14 @@ impl AccountTx<'_> {
                 AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
                 AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')
             ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_at=excluded.evidence_at,
-                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at",params![id,effects]).map_err(err)?;
-        if changed > 0 {
-            let mut statement=self.conn.prepare("SELECT json_array(provider,account_id) FROM account_transient_backoff WHERE json_extract(evidence_key,'$[0]')=?1").map_err(err)?;
-            let keys = statement
-                .query_map([id], |row| row.get::<_, String>(0))
-                .map_err(err)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(err)?;
-            for key in keys {
-                crate::fence_rechecks::register(self.conn, "observation", &key).map_err(err)?;
-            }
+                evidence_key=excluded.evidence_key,effects_json=excluded.effects_json WHERE excluded.evidence_at>=account_transient_backoff.evidence_at
+            RETURNING json_array(provider,account_id)").map_err(err)?
+            .query_map(params![id,effects], |row| row.get::<_, String>(0))
+            .map_err(err)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(err)?;
+        for key in keys {
+            crate::fence_rechecks::register_on(self, "observation", &key).map_err(err)?;
         }
         Ok(())
     }
