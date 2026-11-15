@@ -4701,6 +4701,28 @@
                 "admission_id": "report-replay",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "runner-one",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "model-c",
+                    "model_decision_id": "dec_000000000000",
+                    "owner_scope": {
+                      "owner": "reserved:example-consumer",
+                      "project_id": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "example-subscription",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "example-subscription"
@@ -5261,6 +5283,28 @@
                 "admission_id": "report-replay",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "runner-one",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "model-c",
+                    "model_decision_id": "dec_000000000000",
+                    "owner_scope": {
+                      "owner": "reserved:example-consumer",
+                      "project_id": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "example-subscription",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "example-subscription"
