@@ -11,6 +11,24 @@ pub(crate) async fn read_application_frame(
         let Some(request) = read_frame(stream).await? else {
             return Ok(None);
         };
+        if request.header.channel == 0
+            && serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .is_some_and(|body| body["op"] == "catalog.watch")
+        {
+            let reply = Frame::build(
+                FrameType::Error,
+                Flags::new(false, Priority::Interactive, false),
+                0,
+                request.header.epoch,
+                request.header.corr,
+                serde_json::to_vec(&json!({"code":"unknown_op", "message":"watch not faked"}))
+                    .unwrap(),
+            )
+            .unwrap();
+            write_frame(stream, &reply).await?;
+            continue;
+        }
         if request.header.channel != 0
             || request.header.ty != FrameType::Request
             || serde_json::from_slice::<serde_json::Value>(&request.body)
