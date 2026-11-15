@@ -243,21 +243,13 @@ impl AccountTx<'_> {
             if origin.kind == "account" {
                 let key: Vec<serde_json::Value> =
                     serde_json::from_str(&origin.origin_key).map_err(err)?;
-                let pool: Option<String> = match self.working_blocks()? {
-                    // Only active fences are held; one already cleared has
-                    // nothing left to heal.
-                    Some(blocks) => match key[0].as_str().and_then(|id| blocks.account_fence(id)) {
-                        Some((_, pool, _)) => pool.map(str::to_owned),
-                        None => continue,
-                    },
-                    None => self
-                        .conn
-                        .query_row(
-                            "SELECT pool_key_json FROM account_fence WHERE fence_id=?1",
-                            [key[0].as_str()],
-                            |row| row.get(0),
-                        )
-                        .map_err(err)?,
+                let blocks = self.current_blocks()?;
+                // A cleared source has nothing left for this success to heal,
+                // whether the command uses published state or must load it
+                // from its database connection.
+                let pool = match key[0].as_str().and_then(|id| blocks.account_fence(id)) {
+                    Some((_, pool, _)) => pool.map(str::to_owned),
+                    None => continue,
                 };
                 if let Some(pool) = pool {
                     let pool = serde_json::from_str(&pool).map_err(err)?;
@@ -362,17 +354,10 @@ impl AccountTx<'_> {
                 [decision], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             ).map_err(err)?;
             if self.probe_report_matches(decision, effects.reported_credential.as_deref(), false)? {
-                let authorized: bool = match self.working_blocks()? {
-                    Some(blocks) => !blocks.authorizations_of(decision).is_empty(),
-                    None => self
-                        .conn
-                        .query_row(
-                            "SELECT EXISTS(SELECT 1 FROM fence_probe_authorization WHERE owner=?1)",
-                            [decision],
-                            |row| row.get(0),
-                        )
-                        .map_err(err)?,
-                };
+                let authorized = !self
+                    .current_blocks()?
+                    .authorizations_of(decision)
+                    .is_empty();
                 self.heal_report_probe(
                     decision,
                     None,
@@ -577,16 +562,7 @@ fn apply_account_effects(
         tx.record_non_quota_route_fence(fence).map_err(sql_error)?;
     }
     if let Some(fence) = &effects.route_fence {
-        conn.execute(
-            "INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class)
-             VALUES (?1,?2,?3,?4,?5,?6,?6,'quota') ON CONFLICT(provider,credential_id,model) DO UPDATE SET
-             until_ms=CASE WHEN excluded.recorded_at>=COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at)
-               THEN excluded.until_ms ELSE account_route_fence.until_ms END,
-             wall_class='quota', recorded_at=MIN(account_route_fence.recorded_at,excluded.recorded_at),
-             last_reported_at=MAX(COALESCE(account_route_fence.last_reported_at,account_route_fence.recorded_at),excluded.recorded_at)",
-            params![fence.provider, fence.credential_id, fence.model, fence.until_ms, fence.decision_id, fence.recorded_at],
-        )?;
-        conn.execute("UPDATE fence_recheck SET claim_owner=NULL WHERE kind='account_route' AND origin_key=?1",[serde_json::json!([fence.provider,fence.credential_id,fence.model]).to_string()])?;
+        tx.record_account_route_fence(fence).map_err(sql_error)?;
     }
     if let Some(fact) = &effects.eligibility {
         tx.record_eligibility(fact).map_err(sql_error)?;
@@ -595,6 +571,12 @@ fn apply_account_effects(
         let state = tx
             .current_blocks()
             .map_err(crate::fence_rechecks::command_error)?;
+        state.check_source(
+            conn,
+            "credential",
+            &serde_json::json!([refusal.provider_id, refusal.credential_id]).to_string(),
+            &refusal.provider_id,
+        )?;
         let prior = state.entitlement_fence(&refusal.provider_id, &refusal.credential_id);
         let changed = if refusal.code == "signed_out"
             && prior.as_ref().is_some_and(|row| row.code != "signed_out")
@@ -636,10 +618,7 @@ fn apply_account_effects(
         }
     }
     if let Some(fact) = &effects.size_refusal {
-        conn.execute("INSERT INTO account_size_refusal VALUES (?1,?2,?3,?4,?5,?6)
-            ON CONFLICT(provider,credential_id,model,size_class) DO UPDATE SET expires_at=excluded.expires_at,observed_at=excluded.observed_at
-            WHERE excluded.observed_at>=account_size_refusal.observed_at",
-            params![fact.provider, fact.credential_id, fact.model, fact.size_class, fact.expires_at, fact.observed_at])?;
+        tx.record_account_size_refusal(fact).map_err(sql_error)?;
     }
     if let Some(fact) = &effects.non_quota_size_refusal {
         tx.record_non_quota_size_refusal(fact, now)

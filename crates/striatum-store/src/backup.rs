@@ -141,16 +141,11 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
     ),
     (
         "model_route_state",
-        "route health, quota walls and failure backoff",
+        "route health telemetry and report ordering; block evidence is backed up separately",
     ),
     (
         "provider_cooldown_state",
-        "provider wall evidence and new-route inheritance; retry permissions are backed up separately",
-    ),
-    (
-        "credential_entitlement_fences",
-        "credentials a provider refused permanently (no entitlement, empty balance); \
-         empty, routing selects them again and the next run repeats the refusal",
+        "provider telemetry and report ordering; block evidence is backed up separately",
     ),
     (
         "account_selection_salt",
@@ -176,35 +171,16 @@ pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
         "account_hold",
         "client-visible retry answers within their window",
     ),
-    ("account_fence", "confirmed account exhaustion fences"),
-    ("fence_recheck", "durable one-probe retry permissions; losing claims would admit duplicate probes"),
-    ("fence_probe_authorization", "links an admitted probe to the exact refusal evidence its success may heal"),
-    ("fence_retired_origin", "archived expired refusal generations retained after their enforcement is retired"),
-    ("fence_recheck_route_clear", "route-specific recovery from provider evidence; losing it reblocks recovered routes"),
-    ("fence_success_pool", "scoped success proofs required to recover whole-account quota without erasing another pool"),
-    ("account_transient_backoff", "active account backoff, independent of excludable observation history"),
-    ("account_non_quota_route_fence", "account-local non-quota refusals cannot be reconstructed from quota readings"),
-    ("account_non_quota_size_refusal", "size-scoped non-quota refusals remain binding until their own permitted trial"),
+    ("block", "refusal evidence, retry clocks, partial route recovery, classification and source tombstones; losing them repeats refused requests or admits duplicate probes"),
+    ("probe_authorization", "links an admitted probe to the exact refusal evidence its success may heal"),
+    ("retirement_tombstone", "all retired refusal generations; restoring them empty can re-arm delayed evidence"),
+    ("success_proof", "scoped success proofs required to recover whole-account quota without erasing another pool"),
     (
         "account_eligibility",
         "model/account eligibility facts retained until the credential listing changes; \
          restoring them empty would repeat refusals already learned",
     ),
-    (
-        "account_size_refusal",
-        "size-specific quota evidence has no fixed expiry; losing it would repeat \
-         oversized requests before fresh headroom or a successful same-class trial",
-    ),
-    (
-        "account_route_fence",
-        "account-route quota evidence has no fixed expiry; restoring it empty would \
-         forget a provider refusal before headroom or a permitted trial proves recovery",
-    ),
-    (
-        "account_principal_exclusion",
-        "scoped credential exclusions",
-    ),
-    ("pool_key_state", "key-pool walls"),
+    ("pool_key_state", "key-pool usage and report ordering; walls are backed up in block"),
     ("pool_key_lease", "live key leases"),
     ("pool_session_affinity", "session-to-key binding"),
     (

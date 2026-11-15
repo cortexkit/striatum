@@ -111,13 +111,13 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let mut statement = c.prepare(
-                    "SELECT route_key, capacity_key, provider_id, model_id, cooldown_until,
-                            quota_exhausted_until, failure_backoff_until, failure_backoff_reason,
-                            last_error, last_error_at, wall_class
-                     FROM model_route_state
-                     WHERE cooldown_until > ?1 OR quota_exhausted_until > ?1
-                        OR failure_backoff_until > ?1
-                     ORDER BY capacity_key, route_key",
+                    "SELECT m.route_key,m.capacity_key,m.provider_id,m.model_id,b.cooldown_until,
+                             b.quota_exhausted_until,f.deadline,f.reason,m.last_error,m.last_error_at,b.wall_class
+                      FROM model_route_state m
+                      LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+                      LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
+                      WHERE b.cooldown_until>?1 OR b.quota_exhausted_until>?1 OR f.deadline>?1
+                      ORDER BY m.capacity_key,m.route_key",
                 )?;
                 let rows = statement.query_map(params![now_ms], |row| {
                     Ok(DiagnosticRouteWall {
@@ -177,10 +177,10 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let mut statement = c.prepare(
-                    "SELECT fence_id, provider, account_id, pool_key_json, fence_json, source,
-                            observed_at, created_at
-                     FROM account_fence WHERE cleared_at IS NULL
-                     ORDER BY created_at, fence_id",
+                    "SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
+                             json_extract(meta,'$.fence_json'),json_extract(meta,'$.source'),observed_at,created_at
+                      FROM block WHERE kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
+                      ORDER BY created_at,json_extract(origin_key,'$[0]')",
                 )?;
                 let rows = statement.query_map([], |row| {
                     Ok(DiagnosticAccountBlock {
@@ -205,11 +205,11 @@ impl SqliteRouteStateStore {
         self.store
             .with_conn(|c: &Connection| {
                 let mut statement = c.prepare(
-                    "SELECT provider, credential_id, walled_until, wall_reason, cooldown_until,
-                            cooldown_reason, updated_at
-                     FROM pool_key_state
-                     WHERE walled_until > ?1 OR cooldown_until > ?1
-                     ORDER BY provider, credential_id",
+                    "SELECT p.provider,p.credential_id,b.deadline,b.reason,r.deadline,r.reason,p.updated_at
+                      FROM pool_key_state p
+                      LEFT JOIN block b ON b.kind='pool_billing' AND b.origin_key=json_array(p.provider,p.credential_id) AND b.is_origin=1 AND b.source_present=1
+                      LEFT JOIN block r ON r.kind='pool_rate' AND r.origin_key=json_array(p.provider,p.credential_id) AND r.is_origin=1 AND r.source_present=1
+                      WHERE b.deadline>?1 OR r.deadline>?1 ORDER BY p.provider,p.credential_id",
                 )?;
                 let rows = statement.query_map(params![now_ms], |row| {
                     Ok(DiagnosticKeyWall {

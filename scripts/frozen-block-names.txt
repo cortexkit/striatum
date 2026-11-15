@@ -1,0 +1,36 @@
+# These relations and trigger names have no production SQL reader or writer.
+# They are dropped by the migration; rollback restores its pre-migration backup.
+table account_fence
+table credential_entitlement_fences
+table account_route_fence
+table account_non_quota_route_fence
+table account_size_refusal
+table account_non_quota_size_refusal
+table account_principal_exclusion
+table account_transient_backoff
+table fence_recheck
+table fence_probe_authorization
+table fence_recheck_route_clear
+table fence_success_pool
+table fence_retired_origin
+table fence_origin
+trigger fence_retire_enforcement
+trigger model_route_state_inherit_fence_scope
+
+# Mixed tables keep telemetry and ordering live. These block columns are never
+# read or written after migration. The last token is their new-row SQL value;
+# the legacy NOT NULL unscoped flags retain their accepted zero default.
+column model_route_state.cooldown_until null
+column model_route_state.quota_exhausted_until null
+column model_route_state.failure_backoff_until null
+column model_route_state.failure_backoff_reason null
+column model_route_state.wall_class null
+column model_route_state.wall_unscoped 0
+column provider_cooldown_state.cooldown_until null
+column provider_cooldown_state.quota_exhausted_until null
+column provider_cooldown_state.wall_class null
+column provider_cooldown_state.wall_unscoped 0
+column pool_key_state.walled_until null
+column pool_key_state.wall_reason null
+column pool_key_state.cooldown_until null
+column pool_key_state.cooldown_reason null

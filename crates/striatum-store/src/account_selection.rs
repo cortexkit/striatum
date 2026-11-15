@@ -767,16 +767,19 @@ impl AccountTx<'_> {
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
         crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)?;
-        let changed=self.conn.execute("UPDATE fence_recheck SET last_claimed_at=?4,
+        let changed=self.conn.execute("UPDATE block SET last_claimed_at=?4,
             next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
-            WHERE kind='credential' AND provider=?1 AND credential_id=?2 AND evidence_at<?3
+             WHERE kind='credential' AND is_origin=1 AND managed=1 AND provider=?1 AND credential_id=?2 AND evidence_at<?3
             AND MIN(next_recheck_at,COALESCE(reset_check_at,next_recheck_at))<=?4 AND cleared_at IS NULL",params![provider,credential,before,at,
                 striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS,
                 striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS]).map_err(err)?;
         if changed > 0 {
             return Ok(CredentialProbeClaim::Claimed);
         }
-        let exists: bool=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM block WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2)",params![provider,credential],|row|row.get(0)).map_err(err)?;
+        let exists = self
+            .current_blocks()?
+            .entitlement_fence(provider, credential)
+            .is_some();
         Ok(if exists {
             CredentialProbeClaim::Blocked
         } else {

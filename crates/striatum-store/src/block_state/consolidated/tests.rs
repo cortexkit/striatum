@@ -5,8 +5,12 @@ mod credential;
 
 #[path = "decisions/tests.rs"]
 mod decisions;
+#[path = "frozen/tests.rs"]
+mod frozen;
 #[path = "observation/tests.rs"]
 mod observation;
+#[path = "operator/tests.rs"]
+mod operator;
 #[path = "pool/tests.rs"]
 mod pool;
 #[path = "provider/tests.rs"]

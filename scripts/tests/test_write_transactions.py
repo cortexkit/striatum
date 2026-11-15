@@ -1,4 +1,6 @@
 import runpy
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,137 @@ GUARD = runpy.run_path(str(ROOT / "scripts/write-transactions.py"))
 
 
 class WriteTransactionsTests(unittest.TestCase):
+    def frozen(self, source):
+        rules = GUARD["read_frozen_names"](GUARD["FROZEN_NAMES"])
+        return GUARD["frozen_sql_sites"](source, rules)[1]
+
+    def test_frozen_relations_are_detected_in_reads_writes_and_quoted_sql(self):
+        for sql in (
+            "SELECT * FROM account_fence",
+            "UPDATE credential_entitlement_fences SET code=?1",
+            "DELETE FROM fence_recheck WHERE kind=?1",
+            "INSERT INTO account_size_refusal VALUES (?1)",
+            'SELECT * FROM main."fence_origin"',
+            "SELECT * FROM [account_principal_exclusion]",
+            "SELECT * FROM 'account_transient_backoff'",
+            "DROP TRIGGER fence_retire_enforcement",
+        ):
+            with self.subTest(sql=sql):
+                self.assertTrue(self.frozen(f'fn write() {{ let sql = r###"{sql}"###; }}'))
+
+    def test_frozen_columns_follow_aliases_but_not_dto_fields_or_joined_block_columns(self):
+        for sql in (
+            "SELECT m.cooldown_until FROM model_route_state AS m",
+            "SELECT p.`wall_reason` FROM pool_key_state p",
+            "SELECT [p].[wall_class] FROM provider_cooldown_state [p]",
+            "UPDATE model_route_state SET quota_exhausted_until=?1",
+            "SELECT cooldown_until FROM model_route_state",
+            "SELECT x.cooldown_until FROM block b, model_route_state x",
+            "SELECT m.* FROM model_route_state m",
+            "SELECT * FROM pool_key_state",
+        ):
+            with self.subTest(sql=sql):
+                self.assertTrue(self.frozen(f'const SQL: &str = r#"{sql}"#;'))
+        for source in (
+            "fn write(update: Update) { let until = update.cooldown_until; }",
+            'const FIELD: &str = "cooldown_until";',
+            'const SQL: &str = "SELECT b.cooldown_until FROM model_route_state m JOIN block b ON b.origin_key=json_array(m.route_key)";',
+            'const SQL: &str = "UPDATE block SET cooldown_until=?1 WHERE kind=\'route\'";',
+            'const SQL: &str = "SELECT COUNT(*) FROM model_route_state";',
+            'const SQL: &str = "SELECT \'cooldown_until\',m.route_key FROM model_route_state m";',
+            'const SQL: &str = "SELECT b.cooldown_until FROM block b -- FROM model_route_state\\n";',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.frozen(source), [])
+
+    def test_comments_attributes_and_test_only_oracle_items_are_not_serving_sql(self):
+        self.assertEqual(self.frozen('''
+// const SQL: &str = "SELECT * FROM account_fence";
+/* outer /* nested */ "SELECT * FROM fence_origin" */
+#[cfg(test)]
+fn old() { conn.prepare("SELECT * FROM fence_origin"); }
+#[cfg(any(test, feature = "test-support"))]
+const OLD: &str = r#"SELECT * FROM account_fence"#;
+#[cfg(feature = "test-support")]
+fn oracle() { conn.prepare("SELECT * FROM account_route_fence"); }
+#[test]
+fn invariant() { conn.prepare("SELECT * FROM fence_recheck"); }
+const LIVE: &str = "SELECT provider FROM block";
+'''), [])
+        errors = self.frozen('''
+#[cfg(any(test, feature = "test-support"))]
+fn old() { conn.prepare("SELECT * FROM fence_origin"); }
+fn serving() { conn.prepare("SELECT * FROM account_fence"); }
+''')
+        self.assertEqual(errors, [(4, "frozen relation account_fence")])
+
+    def test_rust_literal_decoding_cannot_hide_a_frozen_name(self):
+        for spelling in (
+            '"SELECT * FROM account_\\x66ence"',
+            '"SELECT * FROM fence_\\u{6f}rigin"',
+            'r"SELECT * FROM account_fence"',
+            'r####"SELECT * FROM account_fence"####',
+            '"SELECT * \\\n            FROM account_fence"',
+            '"SELECT * FROM \\"account_fence\\""',
+        ):
+            with self.subTest(spelling=spelling):
+                self.assertTrue(self.frozen(f"const SQL: &str = {spelling};"))
+
+    def test_literal_concat_and_format_cannot_split_a_frozen_column_from_its_table(self):
+        for expression in (
+            'concat!("SELECT ", "cooldown_until", " FROM model_route_state")',
+            'concat!("SELECT * FROM ", "account_", "fence")',
+            'format!("SELECT {} FROM model_route_state", "cooldown_until")',
+            'format!("SELECT {0} FROM {1}", "wall_reason", "pool_key_state")',
+        ):
+            with self.subTest(expression=expression):
+                self.assertTrue(self.frozen(f"fn serving() {{ let sql = {expression}; }}"))
+                self.assertEqual(self.frozen(f"#[cfg(test)] fn oracle() {{ let sql = {expression}; }}"), [])
+
+    def test_test_only_module_descendants_are_excluded_but_filenames_do_not_exempt(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        rules = GUARD["read_frozen_names"](GUARD["FROZEN_NAMES"])
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            source = root / "crates/probe/src"
+            (source / "old").mkdir(parents=True)
+            (source / "lib.rs").write_text('#[cfg(any(test, feature="test-support"))]\nmod old;\n')
+            (source / "old.rs").write_text('mod child;\nconst SQL: &str = "SELECT * FROM account_fence";')
+            (source / "old/child.rs").write_text('const SQL: &str = "SELECT * FROM fence_origin";')
+            self.assertEqual(GUARD["frozen_sql_violations"](root, rules)[1], [])
+            live = source / "production_tests.rs"
+            live.write_text('const SQL: &str = "SELECT * FROM fence_origin";')
+            errors = GUARD["frozen_sql_violations"](root, rules)[1]
+            self.assertEqual(len(errors), 1)
+            self.assertIn("production_tests.rs:1: frozen relation fence_origin", errors[0])
+            (source / "lib.rs").write_text('mod old;\n')
+            errors = GUARD["frozen_sql_violations"](root, rules)[1]
+            self.assertEqual(len(errors), 3)
+
+    def test_cli_runs_frozen_checks_from_the_committed_catalogue(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            source = root / "crates/probe/src/lib.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text('const SQL: &str = "SELECT * FROM fence_origin";')
+            empty = root / "empty.txt"
+            empty.write_text("")
+            globals_ = GUARD["main"].__globals__
+            previous = {name: globals_[name] for name in ("ROOT", "ALLOWLIST", "ACCOUNT_ENTRIES")}
+            try:
+                globals_.update(ROOT=root, ALLOWLIST=empty, ACCOUNT_ENTRIES=empty)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    result = GUARD["main"]()
+                self.assertTrue(result)
+                self.assertIn("crates/probe/src/lib.rs:1: frozen relation fence_origin", output.getvalue())
+                self.assertIn("1 violations", output.getvalue())
+            finally:
+                globals_.update(previous)
+
     def sites(self, source):
         return GUARD["transaction_sites"](source)
 

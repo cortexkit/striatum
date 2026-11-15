@@ -64,6 +64,9 @@ mod block_state;
 mod block_storage;
 mod engine_measurements;
 mod fence_rechecks;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "frozen_block_data/tests.rs"]
+mod frozen_block_data;
 mod route_snapshot;
 mod sql_real;
 #[cfg(any(test, feature = "test-support"))]
@@ -72,6 +75,8 @@ pub use block_state::{
     block_read_backs, block_reconcile_reloads, BlockRows, BlockState, DryRunRepair,
     ProbeAuthorization, SuccessPool, BLOCK_TABLES,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use frozen_block_data::FrozenBlockData;
 #[cfg(any(test, feature = "test-support"))]
 mod block_parity_fixture;
 #[cfg(any(test, feature = "test-support"))]
@@ -7394,6 +7399,12 @@ impl crate::AccountTx<'_> {
             let state = self
                 .current_blocks()
                 .map_err(fence_rechecks::command_error)?;
+            state.check_source(
+                tx,
+                "credential",
+                &serde_json::json!([provider_id, credential_id]).to_string(),
+                provider_id,
+            )?;
             let changed =
                 if let Some(mut fence) = state.entitlement_fence(provider_id, credential_id) {
                     fence.observed_at_ms = observed_at_ms;

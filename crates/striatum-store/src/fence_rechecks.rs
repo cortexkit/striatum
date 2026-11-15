@@ -5191,7 +5191,7 @@ impl crate::AccountTx<'_> {
             tx.transfer_probe_authorization(from, to)?;
             tx.conn
                 .execute(
-                    "UPDATE fence_recheck SET claim_owner=?2 WHERE claim_owner=?1",
+                    "UPDATE block SET claim_owner=?2 WHERE is_origin=1 AND managed=1 AND claim_owner=?1",
                     params![from, to],
                 )
                 .map(|_| ())
