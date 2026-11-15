@@ -18,7 +18,8 @@ CREATE TABLE block (
   evidence_at INTEGER NOT NULL,
   quota INTEGER NOT NULL CHECK (quota IN (0,1)),
   classified INTEGER NOT NULL DEFAULT 0 CHECK (classified IN (0,1)),
-  deadline INTEGER,
+  deadline INTEGER CHECK (kind NOT IN ('pool_billing','pool_rate')
+    OR typeof(deadline) IN ('integer','null')),
   reset_at INTEGER,
   next_recheck_at INTEGER NOT NULL,
   reset_check_at INTEGER,

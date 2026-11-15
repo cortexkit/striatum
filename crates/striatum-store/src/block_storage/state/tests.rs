@@ -13,6 +13,8 @@ use crate::fence_rechecks::{self, FenceRecheck, LoadedBlocks, ViewOrigin};
 
 #[path = "decisions/tests.rs"]
 mod decisions;
+#[path = "pool/tests.rs"]
+mod pool;
 #[path = "provider/tests.rs"]
 mod provider;
 
@@ -807,7 +809,7 @@ impl BlockState {
                 self.block(kind, &key)
                     .filter(|row| row.source_present)
                     .and_then(|row| row.deadline)
-                    .map(|at| at as i64)
+                    .and_then(block_storage::Deadline::integer)
             };
             rows.push((
                 row.credential_id.clone(),
@@ -867,7 +869,7 @@ impl BlockState {
                 row.wall_unscoped = block.wall_unscoped;
             }
             if let Some(block) = failure {
-                row.failure_backoff_until = block.deadline;
+                row.failure_backoff_until = block.deadline.map(block_storage::Deadline::as_f64);
                 row.failure_backoff_reason = block.reason.clone();
             }
             rows.push((rowid, row));
@@ -1222,7 +1224,7 @@ impl StoredBlock {
             provider: self.block.scope.provider.clone(),
             credential_id: self.block.scope.credential_id.clone()?,
             model: self.block.scope.model.clone()?,
-            until_ms: self.deadline? as i64,
+            until_ms: self.deadline?.as_f64() as i64,
             decision_id: meta.decision_id.clone(),
             recorded_at: self.recorded_at?,
         })
@@ -1234,7 +1236,7 @@ impl StoredBlock {
             credential_id: self.block.scope.credential_id.clone()?,
             model: self.block.scope.model.clone()?,
             size_class: self.block.scope.size_class?.try_into().ok()?,
-            expires_at: self.deadline? as i64,
+            expires_at: self.deadline?.as_f64() as i64,
             observed_at: self.observed_at?,
         })
     }

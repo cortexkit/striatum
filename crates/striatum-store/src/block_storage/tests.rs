@@ -96,6 +96,38 @@ impl Meta {
 
 pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Deadline {
+    Integer(i64),
+    Real(f64),
+}
+
+impl Deadline {
+    pub(crate) fn as_f64(self) -> f64 {
+        match self {
+            Self::Integer(value) => value as f64,
+            Self::Real(value) => value,
+        }
+    }
+
+    pub(crate) fn integer(self) -> Option<i64> {
+        match self {
+            Self::Integer(value) => Some(value),
+            Self::Real(_) => None,
+        }
+    }
+}
+
+impl rusqlite::types::FromSql for Deadline {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        match value {
+            rusqlite::types::ValueRef::Integer(value) => Ok(Self::Integer(value)),
+            rusqlite::types::ValueRef::Real(value) => Ok(Self::Real(value)),
+            _ => Err(rusqlite::types::FromSqlError::InvalidType),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredBlock {
     pub rowid: i64,
@@ -109,7 +141,7 @@ pub(crate) struct StoredBlock {
     pub source_order: i64,
     pub observation_id: Option<String>,
     pub pool_key_json: Option<String>,
-    pub deadline: Option<f64>,
+    pub deadline: Option<Deadline>,
     pub reset_at: Option<f64>,
     pub observed_at: Option<i64>,
     pub created_at: Option<i64>,
@@ -136,6 +168,14 @@ fn json_error(column: usize, error: serde_json::Error) -> rusqlite::Error {
 
 pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
     let (block, cleared_at) = crate::fence_rechecks::clock_row(row, 1)?;
+    // Pool timestamps are integer-valued storage, not floating point route
+    // deadlines. Keep their full precision and reject malformed external rows.
+    let deadline = if matches!(block.kind.as_str(), "pool_billing" | "pool_rate") {
+        row.get::<_, Option<i64>>("deadline")?
+            .map(Deadline::Integer)
+    } else {
+        row.get("deadline")?
+    };
     let clears: String = row.get("cleared_models")?;
     let cleared_models = serde_json::from_str(&clears).map_err(|e| json_error(41, e))?;
     let meta: String = row.get("meta")?;
@@ -161,7 +201,7 @@ pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
         source_order: row.get("source_order")?,
         observation_id: row.get("observation_id")?,
         pool_key_json: row.get("pool_key_json")?,
-        deadline: row.get("deadline")?,
+        deadline,
         reset_at: row.get("reset_at")?,
         observed_at: row.get("observed_at")?,
         created_at: row.get("created_at")?,
@@ -212,7 +252,7 @@ impl StoredBlock {
             evidence: self.block.evidence.clone(),
             evidence_at: self.block.evidence_at,
             quota: Some(self.block.lifetime == striatum_core::blocks::LifetimeClass::Quota),
-            deadline: self.deadline,
+            deadline: self.deadline.map(Deadline::as_f64),
             reset_at: self.reset_at,
         }
     }
@@ -231,7 +271,7 @@ pub(crate) fn effective(
     for row in rows.iter().filter(|r| r.held()) {
         if row.managed
             || row.block.lifetime == striatum_core::blocks::LifetimeClass::Quota
-            || row.deadline.is_none_or(|at| at >= now as f64)
+            || row.deadline.is_none_or(|at| at.as_f64() >= now as f64)
         {
             let mut block = row.block.clone();
             block.cleared_models = row.cleared_models.clone();
