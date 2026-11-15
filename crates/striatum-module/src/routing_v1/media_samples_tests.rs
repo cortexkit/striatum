@@ -23,6 +23,7 @@ use crate::routing_v1::{
 const NOW: i64 = 1_750_000_000_000;
 const VOICE: &str = "colliculus.voice_message";
 const DICTATION: &str = "colliculus.dictation_token";
+const VOICE_FRONT: &str = "colliculus.voice_front_token";
 
 fn served_row(route: &str) -> Value {
     let payloads: Value =
@@ -105,18 +106,18 @@ fn voice_request() -> Value {
         "requirements":{"duration_ms":30000,"format":"audio/wav"}})
 }
 
-fn fixture_for_dictation(with_realtime: bool) -> Arc<Harness> {
+fn fixture_for_realtime(with_realtime: bool) -> Arc<Harness> {
     let harness = super::super::setup(vec![]);
     let mut media: Value = serde_json::from_str(include_str!(
-        "../../fixtures/colliculus-media-v1/media-role-describe.json"
+        "../../fixtures/colliculus-5b/media-role-describe.json"
     ))
     .unwrap();
     let routing: Value = serde_json::from_str(include_str!(
-        "../../fixtures/colliculus-media-v1/routing-v1-declaration.json"
+        "../../fixtures/colliculus-5b/routing-v1-declaration.json"
     ))
     .unwrap();
-    assert_eq!(media["engines"].as_array().unwrap().len(), 9);
-    assert_eq!(routing["consumers"].as_array().unwrap().len(), 5);
+    assert_eq!(media["engines"].as_array().unwrap().len(), 10);
+    assert_eq!(routing["consumers"].as_array().unwrap().len(), 6);
     if !with_realtime {
         // Keep stream_transcribe: the same model cannot satisfy a different kind.
         media["engines"]
@@ -125,29 +126,219 @@ fn fixture_for_dictation(with_realtime: bool) -> Arc<Harness> {
             .retain(|engine| engine["kind"] != "realtime");
         assert_eq!(media["engines"].as_array().unwrap().len(), 8);
     }
+    crate::take_operator_warnings();
     consumers::replace_catalog(&json!([{
         "module_id":"colliculus", "nonce_verified":true, "role_declarations":{
             "routing/v1":routing, "media-provider/v1":media
         }
     }]));
+    assert!(crate::take_operator_warnings().is_empty());
     harness.edit_config(|config| {
-        config["consumers"][DICTATION] = json!({"mode":"demand","iq":40});
+        config["consumers"][DICTATION] = json!({"iq":40});
+        config["consumers"][VOICE_FRONT] = json!({"iq":40});
     });
     let mut key = super::super::key("opaque-openai-media");
     key.provider_ids = vec!["openai".into()];
     harness.set_credentials(super::super::media_credentials(vec![key]));
+    install_realtime_catalog(&harness, 80, 80);
+    harness
+}
+
+fn install_realtime_catalog(harness: &Harness, live_grade: u8, voice_grade: u8) {
     let mut live = served_row("openai/gpt-live-transcribe");
-    live["quality.grade"] = json!(80);
+    live["quality.grade"] = json!(live_grade);
+    let mut voice = served_row("openai/gpt-realtime-2.1");
+    voice["quality.grade"] = json!(voice_grade);
+    // The rate-only snapshots need synthetic type/existence facts for realtime grades.
+    for row in [&mut live, &mut voice] {
+        row["existence"] = json!("present");
+        row["model.type"] = json!("realtime");
+    }
     let catalog = json!({
         "catalog_version":41,"resolved_at_ms":NOW,
         "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
-        "models":{"openai/gpt-live-transcribe":live}
+        "models":{
+            "openai/gpt-live-transcribe":live,
+            "openai/gpt-realtime-2.1":voice
+        }
     });
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
             .unwrap();
+    assert_eq!(
+        snapshot.media_grade("realtime", "openai/gpt-live-transcribe"),
+        Some(f64::from(live_grade))
+    );
+    assert_eq!(
+        snapshot.media_grade("realtime", "openai/gpt-realtime-2.1"),
+        Some(f64::from(voice_grade))
+    );
     harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
-    harness
+}
+
+#[tokio::test]
+async fn colliculus_5b_declarations_parse_without_warnings_and_keep_other_consumers() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let routing: Value = serde_json::from_str(include_str!(
+        "../../fixtures/colliculus-5b/routing-v1-declaration.json"
+    ))
+    .unwrap();
+    let media: Value = serde_json::from_str(include_str!(
+        "../../fixtures/colliculus-5b/media-role-describe.json"
+    ))
+    .unwrap();
+    let parsed = cortexkit_role_routing::declarations::parse_consumer_declarations_serving(
+        &routing,
+        &describe::capabilities(),
+    )
+    .unwrap();
+    assert_eq!(parsed.consumers.len(), 6);
+    let parsed = cortexkit_role_routing::parse_engine_declarations(&media).unwrap();
+    assert_eq!(parsed.engines.len(), 10);
+    let previous: Value = serde_json::from_str(include_str!(
+        "../../fixtures/colliculus-media-v1/routing-v1-declaration.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        routing["consumers"].as_array().unwrap()[..4],
+        previous["consumers"].as_array().unwrap()[..4]
+    );
+    for (index, consumer, model) in [
+        (4, DICTATION, "gpt-live-transcribe"),
+        (5, VOICE_FRONT, "gpt-realtime-2.1"),
+    ] {
+        assert_eq!(
+            routing["consumers"][index],
+            json!({
+                "name":consumer, "kind":"realtime", "selectors":["callosum"],
+                "ladder":[format!("openai/{model}")]
+            })
+        );
+    }
+    // Catalog ingestion must accept both complete declarations without warnings.
+    let _harness = fixture_for_realtime(true);
+}
+
+async fn assert_realtime_ladder(consumer: &str, model: &str, other: &str, cause: &str) {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let harness = fixture_for_realtime(true);
+    // Without the declared ladder, demand mode must prefer the other engine.
+    // Both engines remain priced and keyed; only the other engine meets IQ 100.
+    let (live_grade, voice_grade) = if model == "gpt-live-transcribe" {
+        (80, 100)
+    } else {
+        (100, 80)
+    };
+    install_realtime_catalog(&harness, live_grade, voice_grade);
+    harness.edit_config(|config| config["consumers"][consumer]["iq"] = json!(100));
+    match cause {
+        "available" => {}
+        "no-key" => {
+            // Fence the sole key for this model only, leaving the other engine usable.
+            harness
+                .store()
+                .record_account_route_fence(&striatum_store::AccountRouteFence {
+                    provider: "openai".into(),
+                    credential_id: "opaque-openai-media".into(),
+                    model: model.into(),
+                    until_ms: NOW + 60_000,
+                    decision_id: String::new(),
+                    recorded_at: NOW,
+                })
+                .unwrap();
+        }
+        "excluded" => harness.edit_config(|config| {
+            config["models"][format!("openai/{model}")] = json!({"not_for":[consumer]});
+        }),
+        _ => panic!("unknown realtime ladder test cause: {cause}"),
+    }
+    let phone = harness.bind(reserved("callosum"), None).await;
+    let request = json!({"consumer":consumer,"kind":"realtime",
+        "requirements":{},"privacy":"remote_allowed"});
+    let (frame, reply) = phone.call("route.select", &request).await;
+    if cause == "available" {
+        assert_eq!(frame, FrameType::Response, "{reply}");
+        assert_eq!(
+            reply["result"]["engine"]["model"], model,
+            "{consumer} must never select {other}: {reply}"
+        );
+        assert_eq!(reply["result"]["engine"]["provider"], "openai");
+        assert_eq!(reply["result"]["engine"]["module"], "colliculus");
+    } else {
+        assert_eq!(
+            frame,
+            FrameType::Error,
+            "{consumer} must refuse, never substitute {other}: {reply}"
+        );
+        assert_eq!(reply["code"], "no_route", "{reply}");
+        assert_eq!(reply["detail"], json!({"reason":"no_available_model"}));
+    }
+}
+
+#[tokio::test]
+async fn colliculus_5b_dictation_never_selects_voice() {
+    assert_realtime_ladder(
+        DICTATION,
+        "gpt-live-transcribe",
+        "gpt-realtime-2.1",
+        "available",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn colliculus_5b_dictation_no_key_never_substitutes_voice() {
+    assert_realtime_ladder(
+        DICTATION,
+        "gpt-live-transcribe",
+        "gpt-realtime-2.1",
+        "no-key",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn colliculus_5b_dictation_excluded_never_substitutes_voice() {
+    assert_realtime_ladder(
+        DICTATION,
+        "gpt-live-transcribe",
+        "gpt-realtime-2.1",
+        "excluded",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn colliculus_5b_voice_never_selects_dictation() {
+    assert_realtime_ladder(
+        VOICE_FRONT,
+        "gpt-realtime-2.1",
+        "gpt-live-transcribe",
+        "available",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn colliculus_5b_voice_no_key_never_substitutes_dictation() {
+    assert_realtime_ladder(
+        VOICE_FRONT,
+        "gpt-realtime-2.1",
+        "gpt-live-transcribe",
+        "no-key",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn colliculus_5b_voice_excluded_never_substitutes_dictation() {
+    assert_realtime_ladder(
+        VOICE_FRONT,
+        "gpt-realtime-2.1",
+        "gpt-live-transcribe",
+        "excluded",
+    )
+    .await;
 }
 
 #[derive(Default)]
@@ -343,6 +534,7 @@ async fn serving_bytes_match_media_vectors() {
     capture_unavailable(&mut samples).await;
     capture_phone_languages(&mut samples).await;
     capture_dictation(&mut samples).await;
+    capture_voice_front(&mut samples).await;
     samples.verify();
 }
 
@@ -353,7 +545,7 @@ async fn capture_dictation(samples: &mut Samples) {
         ("dictation-token-realtime", true),
         ("dictation-token-no-engine", false),
     ] {
-        let harness = fixture_for_dictation(with_realtime);
+        let harness = fixture_for_realtime(with_realtime);
         let phone = harness.bind(reserved("callosum"), None).await;
         let selected = samples
             .capture(
@@ -369,6 +561,24 @@ async fn capture_dictation(samples: &mut Samples) {
             assert_eq!(selected["result"]["engine"]["caller_local"], false);
         }
     }
+}
+
+async fn capture_voice_front(samples: &mut Samples) {
+    let harness = fixture_for_realtime(true);
+    let phone = harness.bind(reserved("callosum"), None).await;
+    let request = json!({"consumer":VOICE_FRONT,"kind":"realtime",
+        "requirements":{},"privacy":"remote_allowed"});
+    let selected = samples
+        .capture(
+            "voice-front-token-realtime",
+            &harness,
+            &phone,
+            &request,
+            Some("gpt-realtime-2.1"),
+        )
+        .await;
+    assert_eq!(selected["result"]["engine"]["provider"], "openai");
+    assert_eq!(selected["result"]["engine"]["caller_local"], false);
 }
 
 async fn capture_phone_languages(samples: &mut Samples) {

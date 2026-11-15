@@ -1,0 +1,52 @@
+{
+  "consumers": [
+    {
+      "kind": "transcribe",
+      "name": "colliculus.voice_message",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "synthesize",
+      "name": "colliculus.speech",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "image",
+      "name": "colliculus.image",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "video",
+      "name": "colliculus.video",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "realtime",
+      "ladder": [
+        "openai/gpt-live-transcribe"
+      ],
+      "name": "colliculus.dictation_token",
+      "selectors": [
+        "callosum"
+      ]
+    },
+    {
+      "kind": "realtime",
+      "ladder": [
+        "openai/gpt-realtime-2.1"
+      ],
+      "name": "colliculus.voice_front_token",
+      "selectors": [
+        "callosum"
+      ]
+    }
+  ]
+}

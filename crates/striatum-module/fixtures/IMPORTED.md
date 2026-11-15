@@ -41,3 +41,23 @@ generation 1 and an empty daemon-operation list (`subc_ops`). The engine
 regression decodes that reply through the pinned catalog client's actual reply
 type before replacing routing's catalog and selecting both colliculus
 transcription engines. No other module entries are retained.
+
+## Colliculus realtime dictation and voice-front declarations
+
+`colliculus-5b/` preserves the supplied declaration snapshots byte for byte from
+Colliculus commit `5ccd00f69eb93d7515b4e3b45938ca751bf00098`. The source directory was
+`CortexKit-scratch/shared-striatum-readers/colliculus-5b/`. Its `PROVENANCE.txt`
+records generation by `service::sets::tests::write_declaration_goldens`, using the
+real handler and manifest with priced, keyed model rows,
+including `gpt-realtime-2.1`.
+
+Before import, the supplied `SHA256SUMS` was verified against the independently
+provided digest below, then every artifact was checked against that manifest.
+The manifest and provenance are retained alongside the JSON inputs.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `colliculus-5b/routing-v1-declaration.json` | `be5266ca59b114e19dc9bebead17d816f7a30268c7bdce67b55b10068ac1a508` |
+| `colliculus-5b/media-role-describe.json` | `4f9856a6c68ac918e645b2cef2419b17625469b61cfbc64b11723a6991d5e7cd` |
+| `colliculus-5b/PROVENANCE.txt` | `34332247a2606f54598ae67a89929f990af41a79fdcaf0b84efa42fc55457b0c` |
+| `colliculus-5b/SHA256SUMS` | `4c74fa6cff5438da8e0b98a87e80a1365e778aa2063d098d647a9d24ebcd574a` |
