@@ -5033,20 +5033,20 @@ struct PinRef {
     generation: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidateParams {
     account_id: String,
     credential_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidatesParams {
     view_digest: String,
     #[serde(default)]
     accounts: Vec<CandidateParams>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AccountRefParams {
     #[serde(default)]
     account_id: Option<String>,
@@ -5068,6 +5068,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(skip)]
+    continuation_input: Option<continuation::Inputs>,
     #[serde(default)]
     head_turn: bool,
     #[serde(skip)]
@@ -5143,6 +5145,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            continuation_input: None,
             head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
@@ -5806,6 +5809,9 @@ fn prepare_and_admit(
             Ok(tier) => tier,
             Err(reply) => return Err(reply),
         };
+    parsed.continuation_input = Some(continuation::Inputs::prepare(
+        &parsed, principal, ctx, class,
+    )?);
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return Err(because("route_fence", reply));
     }
@@ -7669,6 +7675,16 @@ fn serve(
     }
     let decision_id = new_id("acd");
     let mut context = json!({ "roster": roster.context });
+    if let (Some(input), Outcome::Admit(admitted)) = (&params.continuation_input, &decision.outcome)
+    {
+        let mut input = input.clone();
+        input.auth_method = ctx
+            .classes
+            .as_ref()
+            .map_or("oauth", |classes| classes.method(&admitted.credential_id))
+            .into();
+        context["continuation_input"] = json!(input);
+    }
     if let Some(credential) = &params.warm_credential {
         let result = if affinity_row.is_some() {
             json!({"kind":"ignored", "reason":"existing_affinity"})
@@ -7890,6 +7906,14 @@ fn replay(
     let mut reply: Value = serde_json::from_str(&existing.reply_json).map_err(|error| {
         RouteStateStoreError(format!("stored admission reply undecodable: {error}"))
     })?;
+    if existing.request_mode == "admit" && state == "started" {
+        if let Some(current) = tx.latest_used_continuation(principal, &existing.admission_id)? {
+            reply = serde_json::from_str(&current.reply_json).map_err(|error| {
+                RouteStateStoreError(format!("stored continuation reply undecodable: {error}"))
+            })?;
+            reply["admission"]["id"] = json!(existing.admission_id);
+        }
+    }
     reply["admission"]["state"] = json!(state);
     Ok(OpReply::Result(reply))
 }
