@@ -1,284 +1,274 @@
-use super::*;
-use crate::SqliteRouteStateStore;
-use std::collections::BTreeSet;
+//! The durable representation of refusal evidence. Scheduling and identity
+//! fields are columns so indexed checks cannot silently inspect JSON detail.
 
-#[test]
-fn migration_preserves_each_kind_metadata_and_claimed_generation() {
-    let scratch = cortexkit_test_support::ScratchDir::new("block-migration");
-    let store = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "block-migration",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
+use rusqlite::{Connection, Row};
+use serde::{Deserialize, Serialize};
+use striatum_core::blocks::Block;
+
+pub(crate) const MIGRATION: &str = include_str!("../../migrations/094_block_storage.sql");
+
+/// Migration SQL calls the same quarantine predicate as routing. Keeping the
+/// predicate in Rust avoids a second, incomplete SQL copy of error parsing.
+pub(crate) fn install_migration_function(conn: &Connection) -> rusqlite::Result<()> {
+    conn.create_scalar_function(
+        "block_migration_quarantined",
+        3,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let unscoped: bool = ctx.get(0)?;
+            let error: Option<String> = ctx.get(1)?;
+            let class: Option<String> = ctx.get(2)?;
+            Ok(crate::fence_rechecks::quarantined_row(
+                unscoped,
+                error.as_deref(),
+                class.as_deref(),
+            ))
+        },
     )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store.assert_block_parity_fixture_coverage_for_test(now);
-    store.with_writer_for_test(|conn| {
-        conn.execute("INSERT INTO account_size_refusal VALUES ('unmanaged','credential','model',13,?1,?2)",
-            rusqlite::params![now+700,now-500])?;
-        Ok(())
-    }).unwrap();
-    let before = store.load_blocks(now).unwrap();
-    let times = store.block_parity_times(now).unwrap();
-    let expected = times
-        .iter()
-        .map(|at| {
-            let mut blocks = store.load_blocks(*at).unwrap().blocks;
-            blocks.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
-            blocks
-        })
-        .collect::<Vec<_>>();
-    store
-        .with_writer_for_test(|conn| {
-            install_migration_function(conn)?;
-            conn.execute_batch(MIGRATION)?;
-            let rows = read(conn)?;
-            assert_eq!(
-                rows.iter()
-                    .map(|r| r.block.kind.as_str())
-                    .collect::<BTreeSet<_>>(),
-                striatum_core::blocks::SOURCE_KINDS.into_iter().collect()
-            );
-            for row in &rows {
-                let encoded = row.meta.encode().unwrap();
-                let kind = if !row.source_present && encoded == "{}" {
-                    ""
-                } else {
-                    row.block.kind.as_str()
-                };
-                assert_eq!(
-                    Meta::decode(kind, &encoded).unwrap(),
-                    row.meta,
-                    "{} {}",
-                    row.block.kind,
-                    row.block.origin_key
-                );
-            }
-            for expected in &before.blocks {
-                let actual = rows
-                    .iter()
-                    .find(|r| {
-                        r.block.kind == expected.kind && r.block.origin_key == expected.origin_key
-                    })
-                    .unwrap();
-                assert_eq!(&actual.block, expected);
-                assert!(actual.cleared_at.is_none());
-            }
-            assert!(rows
-                .iter()
-                .any(|r| r.block.claim_owner.is_some() && r.block.claim_generation > 0));
-            assert!(rows
-                .iter()
-                .any(|r| r.block.kind == "credential" && r.block.classified));
-            assert!(rows.iter().any(|r| !r.block.cleared_models.is_empty()));
-            for (at, expected) in times.iter().zip(&expected) {
-                assert_eq!(
-                    &effective(&rows, *at)?.blocks,
-                    expected,
-                    "effective block parity at {at}"
-                );
-            }
-            Ok(())
-        })
-        .unwrap();
 }
 
-#[test]
-fn metadata_rejects_unknown_fields_for_every_kind() {
-    for kind in striatum_core::blocks::SOURCE_KINDS {
-        assert!(Meta::decode(kind, r#"{"unknown":true}"#).is_err(), "{kind}");
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AccountMeta {
+    pub scope_json: String,
+    pub fence_json: String,
+    pub source: String,
+    pub principal: String,
+    pub admission_id: Option<String>,
+    pub recovery_set_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CredentialMeta {
+    pub listing_fingerprint: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RouteMeta {
+    pub decision_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrincipalMeta {
+    pub runner_view_digest: String,
+    pub roster_view_digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EmptyMeta {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Meta {
+    Account(AccountMeta),
+    Credential(CredentialMeta),
+    Route(RouteMeta),
+    Principal(PrincipalMeta),
+    Empty(EmptyMeta),
+}
+
+impl Meta {
+    pub(crate) fn decode(kind: &str, json: &str) -> serde_json::Result<Self> {
+        Ok(match kind {
+            "account" => Self::Account(serde_json::from_str(json)?),
+            "credential" => Self::Credential(serde_json::from_str(json)?),
+            "account_route" | "non_quota_route" | "transient_route" => {
+                Self::Route(serde_json::from_str(json)?)
+            }
+            "principal" => Self::Principal(serde_json::from_str(json)?),
+            _ => Self::Empty(serde_json::from_str(json)?),
+        })
+    }
+
+    pub(crate) fn encode(&self) -> serde_json::Result<String> {
+        match self {
+            Self::Account(value) => serde_json::to_string(value),
+            Self::Credential(value) => serde_json::to_string(value),
+            Self::Route(value) => serde_json::to_string(value),
+            Self::Principal(value) => serde_json::to_string(value),
+            Self::Empty(value) => serde_json::to_string(value),
+        }
     }
 }
 
-#[test]
-fn migration_keeps_heals_retirement_generations_and_quota_hold_identity() {
-    let scratch = cortexkit_test_support::ScratchDir::new("block-evidence-parity");
-    let store = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "block-evidence-parity",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
-    )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store.with_writer_for_test(|conn| {
-        conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,observation_id,created_at,cleared_at,cleared_reason,pool_key_json,recovery_set_json)
-          SELECT 'credential-quota:[\"cpu-provider-0\",\"oauth:cpu-0\"]:minted-id',provider,account_id,scope_json,fence_json,source,observed_at,principal,'retained-observation',created_at,NULL,NULL,pool_key_json,recovery_set_json
-          FROM account_fence WHERE fence_id='parity-fence'",[])?;
-        conn.execute("UPDATE fence_recheck SET cleared_at=?1 WHERE kind='principal'",[now])?;
-        conn.execute("UPDATE account_fence SET cleared_at=?1,cleared_reason='healed' WHERE fence_id='parity-fence'",[now])?;
-        conn.execute("INSERT INTO fence_retired_origin VALUES ('route','[\"retired/route\"]','first',?1,?2),('route','[\"retired/route\"]','second',?2,?2)",rusqlite::params![now-10,now])?;
-        let retired=conn.prepare("SELECT kind,origin_key,evidence,evidence_at,retired_at FROM fence_retired_origin ORDER BY kind,origin_key,evidence")?
-            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        install_migration_function(conn)?;
-        conn.execute_batch(MIGRATION)?;
-        let after=conn.prepare("SELECT kind,origin_key,evidence,evidence_at,retired_at FROM retirement_tombstone ORDER BY kind,origin_key,evidence")?
-            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        assert_eq!(after,retired,"every retirement generation survives verbatim");
-        let rows=read(conn)?;
-        let healed=rows.iter().find(|r|r.block.kind=="principal").unwrap();
-        assert_eq!(healed.cleared_at,Some(now));
-        assert_eq!(healed.cleared_by.as_deref(),Some("kept"));
-        assert!(healed.held(),"the source still carries the cleared evidence");
-        let cleared=rows.iter().find(|r|r.block.origin_key=="[\"parity-fence\"]").unwrap();
-        assert!(!cleared.held(),"cleared minted fence ids are not live snapshot records");
-        let hold=rows.iter().find(|r|r.observation_id.as_deref()==Some("retained-observation")).unwrap();
-        assert_eq!(hold.block.kind,"account");
-        assert_eq!(hold.block.origin_key,r#"["credential-quota:[\"cpu-provider-0\",\"oauth:cpu-0\"]:minted-id"]"#);
-        assert_eq!(hold.block.lifetime,striatum_core::blocks::LifetimeClass::Quota);
-        assert!(!effective(&rows,now)?.blocks.iter().any(|b|b.kind=="principal" || b.origin_key=="[\"parity-fence\"]"));
-        Ok(())
-    }).unwrap();
+pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,claim_owner,claim_generation,cleared_at";
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StoredBlock {
+    pub rowid: i64,
+    pub block: Block,
+    pub cleared_at: Option<i64>,
+    pub cleared_by: Option<String>,
+    pub cleared_reason: Option<String>,
+    pub source_present: bool,
+    pub managed: bool,
+    pub source_order: i64,
+    pub observation_id: Option<String>,
+    pub pool_key_json: Option<String>,
+    pub deadline: Option<f64>,
+    pub reset_at: Option<f64>,
+    pub observed_at: Option<i64>,
+    pub created_at: Option<i64>,
+    pub recorded_at: Option<i64>,
+    pub last_reported_at: Option<i64>,
+    pub cooldown_until: Option<f64>,
+    pub quota_exhausted_until: Option<f64>,
+    pub reason: Option<String>,
+    pub code: Option<String>,
+    pub wall_class: Option<String>,
+    pub wall_unscoped: bool,
+    pub scope_error: Option<String>,
+    pub inherited_from_provider: bool,
+    pub meta: Meta,
 }
 
-#[test]
-fn migration_keeps_hidden_route_deadlines_and_removes_quarantined_providers() {
-    let scratch = cortexkit_test_support::ScratchDir::new("block-hidden-route");
-    let store = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "block-hidden-route",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
-    )
-    .unwrap();
-    let now = crate::now_ms();
-    store.with_writer_for_test(|conn| {
-        conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_unscoped,last_error,updated_at) VALUES ('inherit',?1,?2,1,'capacity',?2)",rusqlite::params![now+2000,now-1])?;
-        conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,wall_unscoped,last_error,updated_at) VALUES ('inherit/old','inherit/old','inherit','old',?1,?2,1,'capacity',?2)",rusqlite::params![now+1000,now-1])?;
-        conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,wall_class,last_error,updated_at) VALUES ('quarantined',?1,?2,'quota','{\"provider_code\":\"quota_exhausted\",\"account_ref\":\"account\"}',?2)",rusqlite::params![now+9000,now-1])?;
-        crate::fence_rechecks::sync_at(conn,now)?;
-        let old=crate::fence_rechecks::read_effective_at(conn,now)?;
-        assert!(!old.iter().any(|b|b.kind=="route" && b.provider=="inherit"));
-        let mixed_before=conn.query_row("SELECT cooldown_until,wall_observed_at,wall_unscoped,last_error FROM model_route_state WHERE route_key='inherit/old'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,bool>(2)?,r.get::<_,String>(3)?)))?;
-        install_migration_function(conn)?;
-        conn.execute_batch(MIGRATION)?;
-        let rows=read(conn)?;
-        assert!(!rows.iter().any(|r|r.block.scope.provider=="quarantined"));
-        let route=rows.iter().find(|r|r.block.kind=="route").unwrap();
-        assert_eq!(route.cooldown_until,Some((now+1000) as f64));
-        assert!(route.inherited_from_provider);
-        assert_eq!(effective(&rows,now)?.blocks.iter().filter(|b|b.scope.provider=="inherit").map(|b|b.kind.as_str()).collect::<Vec<_>>(),vec!["provider"]);
-        let mixed_after=conn.query_row("SELECT cooldown_until,wall_observed_at,wall_unscoped,last_error FROM model_route_state WHERE route_key='inherit/old'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,bool>(2)?,r.get::<_,String>(3)?)))?;
-        assert_eq!(mixed_after,mixed_before,"the migration does not rewrite mixed-table evidence");
-        conn.execute("INSERT INTO model_facts(route_key,capacity_key,provider_id,model_id,scores_json,confidence,updated_at) VALUES ('inherit/new','inherit/new','inherit','new','{}','curated',?1)",[now])?;
-        let fresh=conn.query_row("SELECT cooldown_until,quota_exhausted_until,failure_backoff_until,failure_backoff_reason,wall_class,wall_unscoped FROM model_route_state WHERE route_key='inherit/new'",[],|r|Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,Option<String>>(4)?,r.get::<_,bool>(5)?)))?;
-        assert_eq!(fresh,(None,None,None,None,None,false));
-        assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='trigger' AND name='model_route_state_inherit_fence_scope'",[],|r|r.get::<_,i64>(0))?,0);
-        Ok(())
-    }).unwrap();
+pub(crate) fn select() -> String {
+    format!("SELECT rowid,{CLOCK_COLUMNS},cleared_by,cleared_reason,source_present,managed,source_order,observation_id,pool_key_json,deadline,reset_at,observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,reason,code,wall_class,wall_unscoped,scope_error,inherited_from_provider,cleared_models,meta FROM block")
 }
 
-#[test]
-fn migration_new_evidence_keeps_the_prior_claim_time_without_its_authorization() {
-    let scratch = cortexkit_test_support::ScratchDir::new("block-new-evidence");
-    let store = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "block-new-evidence",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
-    )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store.with_writer_for_test(|conn| {
-        conn.execute("UPDATE account_route_fence SET until_ms=?1,last_reported_at=?2 WHERE provider='cpu-provider-0'",rusqlite::params![now+50,now-10])?;
-        conn.execute("UPDATE fence_recheck SET claim_owner='older-owner',claim_generation=41,last_claimed_at=?1,next_recheck_at=?2 WHERE kind='account_route'",rusqlite::params![now,now+990000])?;
-        let before=crate::fence_rechecks::read_effective_at(conn,now)?.into_iter().find(|b|b.kind=="account_route").unwrap();
-        install_migration_function(conn)?;
-        conn.execute_batch(MIGRATION)?;
-        let rows=read(conn)?;
-        let after=effective(&rows,now)?.blocks.into_iter().find(|b|b.kind=="account_route").unwrap();
-        assert_eq!(crate::fence_rechecks::FenceRecheck::from(&after),before);
-        assert_eq!(after.last_claimed_at,Some(now));
-        assert_eq!(after.next_recheck_at,now+990000);
-        assert_eq!(after.claim_owner,None);
-        assert_eq!(after.claim_generation,0);
-        Ok(())
-    }).unwrap();
+fn json_error(column: usize, error: serde_json::Error) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(column, rusqlite::types::Type::Text, Box::new(error))
 }
 
-#[test]
-fn successor_tables_are_rowid_tables_and_retirement_enforces_only_its_exact_evidence() {
-    let scratch = cortexkit_test_support::ScratchDir::new("block-retirement");
-    let store = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(
-            "block-retirement",
-            scratch.path().join("state.db").to_string_lossy(),
-        ),
-        93,
+pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
+    let (mut block, cleared_at) = crate::fence_rechecks::clock_row(row, 1)?;
+    let clears: String = row.get("cleared_models")?;
+    block.cleared_models = serde_json::from_str(&clears).map_err(|e| json_error(41, e))?;
+    let meta: String = row.get("meta")?;
+    let source_present: bool = row.get("source_present")?;
+    let meta = Meta::decode(
+        if !source_present && meta == "{}" {
+            ""
+        } else {
+            &block.kind
+        },
+        &meta,
     )
-    .unwrap();
-    let now = crate::now_ms();
-    store.seed_block_parity_fixture_for_test(now);
-    store
-        .with_writer_for_test(|conn| {
-            install_migration_function(conn)?;
-            conn.execute_batch(MIGRATION)?;
-            for table in [
-                "block",
-                "probe_authorization",
-                "success_proof",
-                "retirement_tombstone",
-            ] {
-                conn.prepare(&format!("SELECT rowid FROM {table}"))?;
-                let unique = conn
-                    .prepare(&format!("PRAGMA index_list({table})"))?
-                    .query_map([], |r| Ok((r.get::<_, bool>(2)?, r.get::<_, String>(3)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                assert_eq!(
-                    unique
-                        .into_iter()
-                        .filter(|(unique, _)| *unique)
-                        .map(|(_, origin)| origin)
-                        .collect::<Vec<_>>(),
-                    vec!["pk"],
-                    "{table}"
-                );
-            }
-            let before = read(conn)?
-                .into_iter()
-                .find(|r| r.block.kind == "credential" && r.source_present)
-                .unwrap();
-            conn.execute(
-                "INSERT INTO retirement_tombstone VALUES (?1,?2,'another generation',?3,?4)",
-                rusqlite::params![before.block.kind, before.block.origin_key, now - 10, now],
-            )?;
-            assert!(read(conn)?.iter().any(|r| r.block.kind == before.block.kind
-                && r.block.origin_key == before.block.origin_key
-                && r.cleared_at.is_none()));
-            conn.execute(
-                "INSERT INTO retirement_tombstone VALUES (?1,?2,?3,?4,?5)",
-                rusqlite::params![
-                    before.block.kind,
-                    before.block.origin_key,
-                    before.block.evidence,
-                    before.block.evidence_at,
-                    now
-                ],
-            )?;
-            let after = read(conn)?
-                .into_iter()
-                .find(|r| {
-                    r.block.kind == before.block.kind
-                        && r.block.origin_key == before.block.origin_key
-                })
-                .unwrap();
-            assert_eq!(after.cleared_at, Some(now));
-            assert_eq!(after.cleared_by.as_deref(), Some("retired"));
-            assert!(!after.held());
-            assert!(conn
-                .execute("UPDATE block SET meta='not json'", [])
-                .is_err());
-            Ok(())
-        })
-        .unwrap();
+    .map_err(|e| json_error(42, e))?;
+    Ok(StoredBlock {
+        rowid: row.get(0)?,
+        block,
+        cleared_at,
+        cleared_by: row.get("cleared_by")?,
+        cleared_reason: row.get("cleared_reason")?,
+        source_present,
+        managed: row.get("managed")?,
+        source_order: row.get("source_order")?,
+        observation_id: row.get("observation_id")?,
+        pool_key_json: row.get("pool_key_json")?,
+        deadline: row.get("deadline")?,
+        reset_at: row.get("reset_at")?,
+        observed_at: row.get("observed_at")?,
+        created_at: row.get("created_at")?,
+        recorded_at: row.get("recorded_at")?,
+        last_reported_at: row.get("last_reported_at")?,
+        cooldown_until: row.get("cooldown_until")?,
+        quota_exhausted_until: row.get("quota_exhausted_until")?,
+        reason: row.get("reason")?,
+        code: row.get("code")?,
+        wall_class: row.get("wall_class")?,
+        wall_unscoped: row.get("wall_unscoped")?,
+        scope_error: row.get("scope_error")?,
+        inherited_from_provider: row.get("inherited_from_provider")?,
+        meta,
+    })
 }
+
+pub(crate) fn read(conn: &Connection) -> rusqlite::Result<Vec<StoredBlock>> {
+    conn.prepare(&format!(
+        "{} {}",
+        crate::block_state::MAINTENANCE_READ,
+        select()
+    ))?
+    .query_map([], decode)?
+    .collect()
+}
+
+impl StoredBlock {
+    /// A tombstone with removed evidence is kept on disk for audit, not in the
+    /// routing snapshot. Observation clocks alone survive their source's prune.
+    pub(crate) fn held(&self) -> bool {
+        !matches!(self.cleared_by.as_deref(), Some("removed" | "retired"))
+            && (self.source_present || self.block.kind == "observation")
+    }
+
+    fn origin(&self) -> crate::fence_rechecks::ViewOrigin {
+        let scope = &self.block.scope;
+        crate::fence_rechecks::ViewOrigin {
+            kind: self.block.kind.clone(),
+            origin_key: self.block.origin_key.clone(),
+            provider: scope.provider.clone(),
+            account_id: scope.account_id.clone(),
+            credential_id: scope.credential_id.clone(),
+            model: scope.model.clone(),
+            size_class: scope.size_class,
+            principal: scope.principal.clone(),
+            admission_id: scope.admission_id.clone(),
+            evidence: self.block.evidence.clone(),
+            evidence_at: self.block.evidence_at,
+            quota: Some(self.block.lifetime == striatum_core::blocks::LifetimeClass::Quota),
+            deadline: self.deadline,
+            reset_at: self.reset_at,
+        }
+    }
+}
+
+/// Derive the effective set without SQL. A hidden route is still stored, so
+/// the route-state snapshot can schedule its own cooldown deadline, but it
+/// does not become a second effective origin while matching provider-wide
+/// refusal evidence already covers it.
+pub(crate) fn effective(
+    rows: &[StoredBlock],
+    now: i64,
+) -> rusqlite::Result<crate::fence_rechecks::LoadedBlocks> {
+    let mut clocks = crate::fence_rechecks::Clocks::new();
+    let mut origins = Vec::new();
+    for row in rows.iter().filter(|r| r.held()) {
+        if row.managed
+            || row.block.lifetime == striatum_core::blocks::LifetimeClass::Quota
+            || row.deadline.is_none_or(|at| at >= now as f64)
+        {
+            clocks.insert(
+                (row.block.kind.clone(), row.block.origin_key.clone()),
+                (row.block.clone(), row.cleared_at),
+            );
+        }
+        if !row.source_present {
+            continue;
+        }
+        if row.block.kind == "account_route" && row.wall_class.as_deref() != Some("quota") {
+            continue;
+        }
+        if row.block.kind == "route"
+            && rows.iter().any(|p| {
+                p.block.kind == "provider"
+                    && p.source_present
+                    && p.held()
+                    && p.block.scope.provider == row.block.scope.provider
+                    && p.scope_error == row.scope_error
+                    && p.block.evidence_at == row.block.evidence_at
+                    && p.cooldown_until.unwrap_or(0.0) >= row.cooldown_until.unwrap_or(0.0)
+                    && p.quota_exhausted_until.unwrap_or(0.0)
+                        >= row.quota_exhausted_until.unwrap_or(0.0)
+            })
+        {
+            continue;
+        }
+        origins.push(row.origin());
+    }
+    let mut loaded = crate::fence_rechecks::derive_blocks(clocks, &[], origins, now)?;
+    loaded
+        .blocks
+        .sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
+    loaded
+        .cleared_evidence
+        .sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
+    Ok(loaded)
+}
+
+#[cfg(test)]
+#[path = "migration/tests.rs"]
+mod tests;

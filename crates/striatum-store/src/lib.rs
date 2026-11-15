@@ -62,6 +62,7 @@ mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
 mod block_state;
 #[cfg(test)]
+#[path = "block_storage/tests.rs"]
 mod block_storage;
 mod engine_measurements;
 mod fence_rechecks;
