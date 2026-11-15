@@ -40,6 +40,10 @@ use crate::fence_rechecks::{self, Clocks, FenceRecheck, LoadedBlocks, RouteClear
 mod dry_run;
 pub use dry_run::DryRunRepair;
 
+#[cfg(test)]
+#[path = "block_storage/state/tests.rs"]
+mod consolidated;
+
 /// Every table whose rows the block state holds. The writer connection's
 /// update hook and delete authorizer watch exactly these.
 pub const BLOCK_TABLES: [&str; 16] = [

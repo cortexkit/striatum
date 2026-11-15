@@ -100,6 +100,7 @@ pub(crate) const CLOCK_COLUMNS: &str = "kind,origin_key,provider,account_id,cred
 pub(crate) struct StoredBlock {
     pub rowid: i64,
     pub block: Block,
+    pub cleared_models: Vec<String>,
     pub cleared_at: Option<i64>,
     pub cleared_by: Option<String>,
     pub cleared_reason: Option<String>,
@@ -134,9 +135,9 @@ fn json_error(column: usize, error: serde_json::Error) -> rusqlite::Error {
 }
 
 pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
-    let (mut block, cleared_at) = crate::fence_rechecks::clock_row(row, 1)?;
+    let (block, cleared_at) = crate::fence_rechecks::clock_row(row, 1)?;
     let clears: String = row.get("cleared_models")?;
-    block.cleared_models = serde_json::from_str(&clears).map_err(|e| json_error(41, e))?;
+    let cleared_models = serde_json::from_str(&clears).map_err(|e| json_error(41, e))?;
     let meta: String = row.get("meta")?;
     let source_present: bool = row.get("source_present")?;
     let meta = Meta::decode(
@@ -151,6 +152,7 @@ pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
     Ok(StoredBlock {
         rowid: row.get(0)?,
         block,
+        cleared_models,
         cleared_at,
         cleared_by: row.get("cleared_by")?,
         cleared_reason: row.get("cleared_reason")?,
@@ -195,7 +197,7 @@ impl StoredBlock {
             && (self.source_present || self.block.kind == "observation")
     }
 
-    fn origin(&self) -> crate::fence_rechecks::ViewOrigin {
+    pub(crate) fn origin(&self) -> crate::fence_rechecks::ViewOrigin {
         let scope = &self.block.scope;
         crate::fence_rechecks::ViewOrigin {
             kind: self.block.kind.clone(),
@@ -231,9 +233,12 @@ pub(crate) fn effective(
             || row.block.lifetime == striatum_core::blocks::LifetimeClass::Quota
             || row.deadline.is_none_or(|at| at >= now as f64)
         {
+            let mut block = row.block.clone();
+            block.cleared_models = row.cleared_models.clone();
+            block.cleared_models.sort();
             clocks.insert(
                 (row.block.kind.clone(), row.block.origin_key.clone()),
-                (row.block.clone(), row.cleared_at),
+                (block, row.cleared_at),
             );
         }
         if !row.source_present {

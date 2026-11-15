@@ -47,16 +47,16 @@ pub(crate) use provider_cooldown_columns;
 pub(crate) struct RouteStateRow {
     pub(crate) route_key: String,
     pub(crate) capacity_key: String,
-    cooldown_until: Option<f64>,
-    quota_exhausted_until: Option<f64>,
+    pub(crate) cooldown_until: Option<f64>,
+    pub(crate) quota_exhausted_until: Option<f64>,
     pub(crate) quota_pressure: Option<f64>,
     pub(crate) latency_ema_ms: Option<f64>,
     pub(crate) success_ema: Option<f64>,
-    failure_backoff_until: Option<f64>,
-    failure_backoff_reason: Option<String>,
+    pub(crate) failure_backoff_until: Option<f64>,
+    pub(crate) failure_backoff_reason: Option<String>,
     pub(crate) last_error: Option<String>,
-    wall_class: Option<String>,
-    wall_unscoped: bool,
+    pub(crate) wall_class: Option<String>,
+    pub(crate) wall_unscoped: bool,
 }
 
 /// Decode [`route_state_columns`] and then `wall_unscoped`, from column `at`.
@@ -80,12 +80,12 @@ pub(crate) fn route_row_at(r: &Row<'_>, at: usize) -> rusqlite::Result<RouteStat
 /// One `provider_cooldown_state` row as `get_provider_cooldown` reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ProviderCooldownRow {
-    provider_key: String,
-    cooldown_until: Option<f64>,
-    quota_exhausted_until: Option<f64>,
-    quota_pressure: Option<f64>,
-    wall_class: Option<String>,
-    last_error: Option<String>,
+    pub(crate) provider_key: String,
+    pub(crate) cooldown_until: Option<f64>,
+    pub(crate) quota_exhausted_until: Option<f64>,
+    pub(crate) quota_pressure: Option<f64>,
+    pub(crate) wall_class: Option<String>,
+    pub(crate) last_error: Option<String>,
 }
 
 impl ProviderCooldownRow {

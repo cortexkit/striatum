@@ -254,6 +254,30 @@ BEGIN
   WHERE kind=NEW.kind AND origin_key=NEW.origin_key AND evidence=NEW.evidence;
 END;
 
+-- A retirement remains effective if delayed evidence re-creates its source.
+-- The tombstone covers only its exact (kind, origin_key, evidence) signature;
+-- new evidence for the same origin is not retired by that tombstone.
+CREATE TRIGGER block_retirement_insert AFTER INSERT ON block
+WHEN EXISTS (SELECT 1 FROM retirement_tombstone t
+  WHERE t.kind=NEW.kind AND t.origin_key=NEW.origin_key AND t.evidence=NEW.evidence)
+BEGIN
+  UPDATE block SET
+    cleared_at=(SELECT retired_at FROM retirement_tombstone
+      WHERE kind=NEW.kind AND origin_key=NEW.origin_key AND evidence=NEW.evidence),
+    cleared_by='retired',source_present=0,claim_owner=NULL
+  WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
+END;
+CREATE TRIGGER block_retirement_update AFTER UPDATE OF kind,origin_key,evidence ON block
+WHEN EXISTS (SELECT 1 FROM retirement_tombstone t
+  WHERE t.kind=NEW.kind AND t.origin_key=NEW.origin_key AND t.evidence=NEW.evidence)
+BEGIN
+  UPDATE block SET
+    cleared_at=(SELECT retired_at FROM retirement_tombstone
+      WHERE kind=NEW.kind AND origin_key=NEW.origin_key AND evidence=NEW.evidence),
+    cleared_by='retired',source_present=0,claim_owner=NULL
+  WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
+END;
+
 DROP TRIGGER fence_retire_enforcement;
 DROP TRIGGER model_route_state_inherit_fence_scope;
 DROP TRIGGER model_facts_inherit_provider_cooldown;

@@ -64,7 +64,10 @@ fn migration_preserves_each_kind_metadata_and_claimed_generation() {
                         r.block.kind == expected.kind && r.block.origin_key == expected.origin_key
                     })
                     .unwrap();
-                assert_eq!(&actual.block, expected);
+                let mut block = actual.block.clone();
+                block.cleared_models = actual.cleared_models.clone();
+                block.cleared_models.sort();
+                assert_eq!(&block, expected);
                 assert!(actual.cleared_at.is_none());
             }
             assert!(rows
@@ -73,7 +76,7 @@ fn migration_preserves_each_kind_metadata_and_claimed_generation() {
             assert!(rows
                 .iter()
                 .any(|r| r.block.kind == "credential" && r.block.classified));
-            assert!(rows.iter().any(|r| !r.block.cleared_models.is_empty()));
+            assert!(rows.iter().any(|r| !r.cleared_models.is_empty()));
             for (at, expected) in times.iter().zip(&expected) {
                 assert_eq!(
                     &effective(&rows, *at)?.blocks,
@@ -281,4 +284,34 @@ fn successor_tables_are_rowid_tables_and_retirement_enforces_only_its_exact_evid
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn retirement_prevents_reinserted_evidence_from_reblocking() {
+    let scratch = cortexkit_test_support::ScratchDir::new("block-retired-reinsert");
+    let store = SqliteRouteStateStore::open_at_version_for_test(
+        &crate::dev_descriptor(
+            "block-retired-reinsert",
+            scratch.path().join("state.db").to_string_lossy(),
+        ),
+        93,
+    )
+    .unwrap();
+    let now = crate::now_ms();
+    store.seed_block_parity_fixture_for_test(now);
+    store.with_writer_for_test(|conn| {
+        install_migration_function(conn)?;
+        conn.execute_batch(MIGRATION)?;
+        conn.execute_batch("CREATE TEMP TABLE delayed_block AS SELECT * FROM block WHERE kind='credential' AND source_present=1;
+            INSERT INTO retirement_tombstone SELECT kind,origin_key,evidence,evidence_at,evidence_at+1 FROM delayed_block;
+            DELETE FROM block WHERE kind='credential';
+            INSERT INTO block SELECT * FROM delayed_block;")?;
+        let rows = read(conn)?;
+        assert!(!rows.iter().any(|row| row.block.kind == "credential" && row.held()));
+        conn.execute("UPDATE block SET evidence='different generation',cleared_at=NULL,cleared_by=NULL,source_present=1 WHERE kind='credential'",[])?;
+        assert!(read(conn)?.iter().any(|row| row.block.kind == "credential" && row.held()));
+        conn.execute("UPDATE block SET (evidence,source_present)=(SELECT evidence,1 FROM delayed_block d WHERE d.kind=block.kind AND d.origin_key=block.origin_key) WHERE kind='credential'",[])?;
+        assert!(!read(conn)?.iter().any(|row| row.block.kind == "credential" && row.held()));
+        Ok(())
+    }).unwrap();
 }
