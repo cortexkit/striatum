@@ -2,8 +2,10 @@
 
 These synthetic Plexus fixtures are captured from striatum's real frame handler,
 using `cortexkit-role-routing` 0.7.32 and `cortexkit-role-routing-conformance`
-0.10.36. Final verification uses `cortexkit-role-routing-conformance` 0.10.37,
-whose declared-search placement case follows the search selection contract.
+0.10.36. Final verification uses conformance 0.10.37. Its `placement_consumer_declarations`
+case declares a search route through the `search-provider/v1` slot, sends a
+`kind: "search"` select with `privacy`, and requires the answer's `engine` to be
+that declared route (contract §16.4.2). 0.10.36 sent no `kind` or `privacy`.
 No daemon or provider is contacted.
 The nonce-verified `plexus` module declares consumer `plexus.web_search` with
 selector `plexus`, plus three `search-provider/v1` routes. Search credentials
