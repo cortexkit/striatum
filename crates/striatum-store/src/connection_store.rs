@@ -313,11 +313,14 @@ impl ConnectionStore {
         Self::new(Backend::Projection(conn))
     }
 
+    #[track_caller]
     pub fn with_conn<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, cortexkit_store::StoreError> {
+        let caller = std::panic::Location::caller();
         let queued = std::time::Instant::now();
+        let held = std::cell::Cell::new(std::time::Duration::ZERO);
         let measured = |conn: &Connection| {
             let queue = queued.elapsed().as_nanos() as u64;
             self.metrics.acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -327,7 +330,9 @@ impl ConnectionStore {
             let result = f(conn);
             finish_commit_timing();
             let commit = COMMIT_NS.with(|n| n.get()) - commit_before;
-            let sql = (start.elapsed().as_nanos() as u64).saturating_sub(commit);
+            let elapsed = start.elapsed();
+            held.set(elapsed);
+            let sql = (elapsed.as_nanos() as u64).saturating_sub(commit);
             self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
             self.metrics.commit_ns.fetch_add(commit, Ordering::Relaxed);
             self.metrics.commits.fetch_add(
@@ -341,14 +346,17 @@ impl ConnectionStore {
             });
             result
         };
-        match &self.backend {
+        let result = match &self.backend {
             Backend::Live(store) => store.with_conn(measured),
             #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(connection) => {
                 measured(&connection.lock().unwrap_or_else(|error| error.into_inner()))
                     .map_err(|error| cortexkit_store::StoreError::Backend(error.to_string()))
             }
-        }
+        };
+        // Release the writer before formatting or printing a slow-holder line.
+        crate::job_timing::writer_held(held.get(), caller);
+        result
     }
 
     pub fn with_read<T>(

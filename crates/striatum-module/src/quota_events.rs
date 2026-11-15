@@ -175,7 +175,7 @@ impl LiveQuota {
         let live = self.clone();
         #[cfg(test)]
         let test_thread = crate::TestThreadState::capture();
-        let committed = tokio::task::spawn_blocking(move || {
+        let committed = crate::stage_timing::spawn_job_blocking(move || {
             #[cfg(test)]
             let _test_thread = test_thread.install();
             live.commit_body(&body, incremental)
@@ -532,122 +532,128 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
     let Some(delivery) = delivery else {
         return Ok(());
     };
-    let message = delivery.message;
-    if message.subject != subject {
-        // Only Insula's quota samples are read here. Another subject in this
-        // durable's filter will never become readable by redelivery, so it is
-        // acknowledged and skipped; NAKing it would redeliver it forever and fill
-        // the ack-pending window ahead of quota samples.
-        if state.skipped_subjects.insert(message.subject.clone()) {
-            eprintln!(
-                "[striatum] quota consumer skipped unread event subject {}",
-                message.subject
-            );
-        }
-        return cursor
-            .ack()
-            .await
-            .map_err(|e| ConsumeError::Bus(e.to_string()));
-    }
-    let far_behind = live
-        .cache
-        .lock()
-        .ok()
-        .and_then(|cache| cache.consumer.lag)
-        .is_some_and(|lag| lag > CATCH_UP_LAG);
-    let retired_epoch = message
-        .headers
-        .get("epoch")
-        .is_some_and(|epoch| state.retired.contains(epoch));
-    if retired_epoch {
-        // The newer epoch's own snapshot already replaced this sample's reading.
-        return cursor
-            .ack()
-            .await
-            .map_err(|e| ConsumeError::Bus(e.to_string()));
-    }
-    if far_behind {
-        state.owe_snapshot = true;
-        catch_up_snapshot(source, live, state).await;
-        return cursor
-            .ack()
-            .await
-            .map_err(|e| ConsumeError::Bus(e.to_string()));
-    }
-    catch_up_snapshot(source, live, state).await;
-    let result = async {
-        let bytes = match source.fetch(&message.id).await {
-            Ok(bytes) => bytes,
-            Err(error) if error.contains("event_not_found") => {
-                state.owe_snapshot = true;
-                catch_up_snapshot(source, live, state).await;
-                return Ok(());
-            }
-            Err(error) => return Err(error),
-        };
-        // A refusal is final for this event: retrying returns the same answer,
-        // so acknowledge it. An expired body is replaced by one snapshot.
-        if let Some(code) = insula_error_code(&bytes) {
-            if code == "event_not_found" {
-                state.owe_snapshot = true;
-                catch_up_snapshot(source, live, state).await;
-            } else {
+    striatum_store::job_timing::run("quota_feed", async {
+        let message = delivery.message;
+        if message.subject != subject {
+            // Only Insula's quota samples are read here. Another subject in this
+            // durable's filter will never become readable by redelivery, so it is
+            // acknowledged and skipped; NAKing it would redeliver it forever and fill
+            // the ack-pending window ahead of quota samples.
+            if state.skipped_subjects.insert(message.subject.clone()) {
                 eprintln!(
-                    "[striatum] insula refused quota event {}: {code}",
-                    message.id
+                    "[striatum] quota consumer skipped unread event subject {}",
+                    message.subject
                 );
             }
-            return Ok(());
+            return cursor
+                .ack()
+                .await
+                .map_err(|e| ConsumeError::Bus(e.to_string()));
         }
-        let (sample, body) = verify(&message, &bytes)?;
-        if !state.stale(&sample) {
-            let covered = live.covered_by_snapshot(&body)?;
-            if state.needs_snapshot(&sample) || covered == Some(false) {
-                cursor.in_progress().await.map_err(|e| e.to_string())?;
-                // A snapshot read after this event includes at least its observation;
-                // applying the earlier body afterwards could roll that snapshot back.
-                live.store_body(source.snapshot().await?, false).await?;
-                if live.covered_by_snapshot(&body)?.is_none() {
+        let far_behind = live
+            .cache
+            .lock()
+            .ok()
+            .and_then(|cache| cache.consumer.lag)
+            .is_some_and(|lag| lag > CATCH_UP_LAG);
+        let retired_epoch = message
+            .headers
+            .get("epoch")
+            .is_some_and(|epoch| state.retired.contains(epoch));
+        if retired_epoch {
+            // The newer epoch's own snapshot already replaced this sample's reading.
+            return cursor
+                .ack()
+                .await
+                .map_err(|e| ConsumeError::Bus(e.to_string()));
+        }
+        if far_behind {
+            state.owe_snapshot = true;
+            catch_up_snapshot(source, live, state).await;
+            return cursor
+                .ack()
+                .await
+                .map_err(|e| ConsumeError::Bus(e.to_string()));
+        }
+        catch_up_snapshot(source, live, state).await;
+        let result = async {
+            let bytes = match source.fetch(&message.id).await {
+                Ok(bytes) => bytes,
+                Err(error) if error.contains("event_not_found") => {
+                    state.owe_snapshot = true;
+                    catch_up_snapshot(source, live, state).await;
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            // A refusal is final for this event: retrying returns the same answer,
+            // so acknowledge it. An expired body is replaced by one snapshot.
+            if let Some(code) = insula_error_code(&bytes) {
+                if code == "event_not_found" {
+                    state.owe_snapshot = true;
+                    catch_up_snapshot(source, live, state).await;
+                } else {
+                    eprintln!(
+                        "[striatum] insula refused quota event {}: {code}",
+                        message.id
+                    );
+                }
+                return Ok(());
+            }
+            let (sample, body) = verify(&message, &bytes)?;
+            if !state.stale(&sample) {
+                let covered = live.covered_by_snapshot(&body)?;
+                if state.needs_snapshot(&sample) || covered == Some(false) {
+                    cursor.in_progress().await.map_err(|e| e.to_string())?;
+                    // A snapshot read after this event includes at least its observation;
+                    // applying the earlier body afterwards could roll that snapshot back.
+                    live.store_body(source.snapshot().await?, false).await?;
+                    if live.covered_by_snapshot(&body)?.is_none() {
+                        live.store_body(live.sample_body(body)?, true).await?;
+                    }
+                } else if covered.is_none() {
                     live.store_body(live.sample_body(body)?, true).await?;
                 }
-            } else if covered.is_none() {
-                live.store_body(live.sample_body(body)?, true).await?;
+                state.commit(sample);
             }
-            state.commit(sample);
+            Ok::<_, String>(())
         }
-        Ok::<_, String>(())
-    }
-    .await;
-    if let Err(error) = result {
-        // NAK releases the cursor without acknowledging processing; the durable retries it.
+        .await;
+        if let Err(error) = result {
+            // NAK releases the cursor without acknowledging processing; the durable retries it.
+            cursor
+                .nak(REDELIVERY_DELAY)
+                .await
+                .map_err(|e| ConsumeError::Bus(e.to_string()))?;
+            return Err(ConsumeError::Rejected(error));
+        }
         cursor
-            .nak(REDELIVERY_DELAY)
+            .ack()
             .await
-            .map_err(|e| ConsumeError::Bus(e.to_string()))?;
-        return Err(ConsumeError::Rejected(error));
-    }
-    cursor
-        .ack()
-        .await
-        .map_err(|e| ConsumeError::Bus(e.to_string()))
+            .map_err(|e| ConsumeError::Bus(e.to_string()))
+    })
+    .await
 }
 
 async fn snapshot<S: SampleSource>(source: &mut S, live: &LiveQuota) -> bool {
-    let result = match source.snapshot().await {
-        Ok(body) => live.store_body(body, false).await,
-        Err(error) => Err(error),
-    };
-    if let Err(error) = result {
-        if let Ok(mut guard) = live.cache.lock() {
-            crate::record_quota_refresh_failure(&mut guard, "usage.get", &error);
+    striatum_store::job_timing::run("quota_snapshot_poll", async {
+        let result = match source.snapshot().await {
+            Ok(body) => live.store_body(body, false).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            if let Ok(mut guard) = live.cache.lock() {
+                crate::record_quota_refresh_failure(&mut guard, "usage.get", &error);
+            }
+            if let Ok(mut guard) = live.accounts.lock() {
+                guard.last_insula_error = Some(error);
+            }
+            false
+        } else {
+            true
         }
-        if let Ok(mut guard) = live.accounts.lock() {
-            guard.last_insula_error = Some(error);
-        }
-        false
-    } else {
-        true
-    }
+    })
+    .await
 }
 
 async fn poll_if_due<S: SampleSource>(
@@ -710,7 +716,7 @@ async fn write_pending_snapshot(
     snapshot: PendingSnapshot,
     store: SharedStore,
 ) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
+    crate::stage_timing::spawn_job_blocking(move || {
         // A timer's blocking job can outlive its task. Serialize only flushes,
         // skipping an old capture if a newer final flush has already succeeded.
         // Neither the cache lock nor any lock taken by request readers is held.
@@ -734,7 +740,12 @@ async fn flush_snapshot_loop(cache: SharedQuotaCache, store: SharedStore, interv
         // Sleep after each completed attempt: even a slow flush cannot make the
         // next attempt issue another snapshot commit less than a minute later.
         tokio::time::sleep(interval).await;
-        if let Err(error) = flush_snapshot(Arc::clone(&cache), Arc::clone(&store)).await {
+        if let Err(error) = striatum_store::job_timing::run(
+            "quota_snapshot_flush",
+            flush_snapshot(Arc::clone(&cache), Arc::clone(&store)),
+        )
+        .await
+        {
             tracing::warn!(error, "quota snapshot not persisted; will retry");
         }
     }
@@ -783,7 +794,12 @@ async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota, project_root:
     live.attached(false, Some("connecting to quota durable".into()));
     loop {
         if bus.is_none() && Instant::now() >= next_attach {
-            match quota_bus::attach(connection_file.clone()).await {
+            match striatum_store::job_timing::run(
+                "quota_feed_attach",
+                quota_bus::attach(connection_file.clone()),
+            )
+            .await
+            {
                 Ok(attached) => {
                     bus = Some(attached);
                     live.attached(true, None);
@@ -807,7 +823,9 @@ async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota, project_root:
         } else if crate::now_ms() >= attached.renew_at_ms {
             down = Some("refreshing quota bus credential".into());
         } else if Instant::now() >= next_lag {
-            if let Err(error) = update_lag(attached, &live).await {
+            if let Err(error) =
+                striatum_store::job_timing::run("quota_feed_lag", update_lag(attached, &live)).await
+            {
                 down = Some(error);
             }
             next_lag = Instant::now() + Duration::from_secs(10);

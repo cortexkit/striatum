@@ -1002,85 +1002,88 @@ pub(crate) async fn refresh_loop(
         .runner_catalog_wake
         .clone();
     loop {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
-                .await
-                .map_err(|error| error.to_string())?;
-            let catalog = consumer
-                .catalog_list()
-                .await
-                .map_err(|error| error.to_string())?;
-            let modules =
-                serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
-            Ok::<_, String>((consumer, modules))
+        striatum_store::job_timing::run("runner_declarations", async {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let catalog = consumer
+                    .catalog_list()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let modules =
+                    serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
+                Ok::<_, String>((consumer, modules))
+            })
+            .await;
+            if let Ok(Ok((consumer, modules))) = result {
+                super::consumers::replace_catalog(&modules);
+                let policies = crate::config_overrides::live_config(&config_path).v1_runners();
+                let tier_modules = if let Ok(mut credentials) = credentials.lock() {
+                    let tiers = cache.catalog(
+                        &modules,
+                        &policies,
+                        &mut credentials,
+                        crate::now_ms() as i64,
+                    );
+                    placements::declarations_changed(&credentials.runner_declarations);
+                    tiers
+                } else {
+                    BTreeSet::new()
+                };
+                let classifier_modules = credentials
+                    .lock()
+                    .map(|mut credentials| {
+                        classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
+                    })
+                    .unwrap_or_default();
+                for module in classifier_modules {
+                    let result = super::classifier::fetch_describe(
+                        &consumer,
+                        &connection_file,
+                        &module,
+                        &policies,
+                        &credentials,
+                    )
+                    .await;
+                    if let Ok(mut credentials) = credentials.lock() {
+                        if matches!(result, Ok(None)) {
+                            classifiers.revoke(&module, &mut credentials);
+                        }
+                        classifiers.reply(
+                            &module,
+                            result.as_ref().ok().and_then(Option::as_ref),
+                            &mut credentials,
+                            crate::now_ms() as i64,
+                        );
+                    }
+                }
+                // The routing declaration describes reach, not tier application.
+                // Only the runner's own role.describe can establish tier support.
+                for module in tier_modules {
+                    let describe = fetch_describe(
+                        &consumer,
+                        &connection_file,
+                        &module,
+                        &policies,
+                        &credentials,
+                    )
+                    .await;
+                    if let Ok(mut credentials) = credentials.lock() {
+                        cache.reply(
+                            &module,
+                            describe.as_ref(),
+                            &mut credentials,
+                            crate::now_ms() as i64,
+                        );
+                    }
+                }
+            } else if let Ok(mut credentials) = credentials.lock() {
+                cache.missed_all(&mut credentials, crate::now_ms() as i64);
+                classifiers.expire(&mut credentials, crate::now_ms() as i64);
+            }
         })
         .await;
-        if let Ok(Ok((consumer, modules))) = result {
-            super::consumers::replace_catalog(&modules);
-            let policies = crate::config_overrides::live_config(&config_path).v1_runners();
-            let tier_modules = if let Ok(mut credentials) = credentials.lock() {
-                let tiers = cache.catalog(
-                    &modules,
-                    &policies,
-                    &mut credentials,
-                    crate::now_ms() as i64,
-                );
-                placements::declarations_changed(&credentials.runner_declarations);
-                tiers
-            } else {
-                BTreeSet::new()
-            };
-            let classifier_modules = credentials
-                .lock()
-                .map(|mut credentials| {
-                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
-                })
-                .unwrap_or_default();
-            for module in classifier_modules {
-                let result = super::classifier::fetch_describe(
-                    &consumer,
-                    &connection_file,
-                    &module,
-                    &policies,
-                    &credentials,
-                )
-                .await;
-                if let Ok(mut credentials) = credentials.lock() {
-                    if matches!(result, Ok(None)) {
-                        classifiers.revoke(&module, &mut credentials);
-                    }
-                    classifiers.reply(
-                        &module,
-                        result.as_ref().ok().and_then(Option::as_ref),
-                        &mut credentials,
-                        crate::now_ms() as i64,
-                    );
-                }
-            }
-            // The routing declaration describes reach, not tier application.
-            // Only the runner's own role.describe can establish tier support.
-            for module in tier_modules {
-                let describe = fetch_describe(
-                    &consumer,
-                    &connection_file,
-                    &module,
-                    &policies,
-                    &credentials,
-                )
-                .await;
-                if let Ok(mut credentials) = credentials.lock() {
-                    cache.reply(
-                        &module,
-                        describe.as_ref(),
-                        &mut credentials,
-                        crate::now_ms() as i64,
-                    );
-                }
-            }
-        } else if let Ok(mut credentials) = credentials.lock() {
-            cache.missed_all(&mut credentials, crate::now_ms() as i64);
-            classifiers.expire(&mut credentials, crate::now_ms() as i64);
-        }
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
             _ = wake.notified() => {},

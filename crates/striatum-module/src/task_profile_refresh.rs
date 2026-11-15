@@ -289,15 +289,18 @@ pub(crate) async fn refresh_loop(
         let path = path.clone();
         let credentials = Arc::clone(&credentials);
         // SQLite reads and statistics never occupy the async request workers.
-        let next = tokio::task::spawn_blocking(move || {
-            refresh_cache(
-                cache(),
-                &store,
-                &path,
-                crate::now_ms() as i64,
-                Some(&credentials),
-            )
-        })
+        let next = striatum_store::job_timing::run(
+            "task_profile_refresh",
+            crate::stage_timing::spawn_job_blocking(move || {
+                refresh_cache(
+                    cache(),
+                    &store,
+                    &path,
+                    crate::now_ms() as i64,
+                    Some(&credentials),
+                )
+            }),
+        )
         .await;
         match next {
             Ok(Ok(())) => {}

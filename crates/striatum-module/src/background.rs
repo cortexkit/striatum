@@ -279,37 +279,40 @@ async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
     let mut bypasses = 0;
     loop {
         ticks.tick().await;
-        // Production writes block tables only through account commands. A
-        // write outside one makes the writer reload its whole state; report
-        // the running count each time it grows, so the live log shows it.
-        let outside = store.block_writes_outside_command();
-        if outside > bypasses {
-            bypasses = outside;
-            tracing::warn!(
-                block_writes_outside_command = outside,
-                tables = ?store.block_tables_written_outside_command(),
-                "block tables were written outside an account command"
-            );
-        }
-        // Tick waits on a thread until the account writer commits it, which can
-        // take as long as every batch queued ahead of it. This task is woken by
-        // its own timer, so it runs on the worker that was driving Tokio's IO and
-        // timers; blocking that worker would freeze every socket read and timer
-        // in the routing runtime until the writer answered. Wait on the blocking
-        // pool instead.
-        let store = Arc::clone(&store);
-        let outcome = tokio::task::spawn_blocking(move || {
-            crate::account_writer::tick(&store, crate::now_ms() as i64)
+        striatum_store::job_timing::run("account_maintenance", async {
+            // Production writes block tables only through account commands. A
+            // write outside one makes the writer reload its whole state; report
+            // the running count each time it grows, so the live log shows it.
+            let outside = store.block_writes_outside_command();
+            if outside > bypasses {
+                bypasses = outside;
+                tracing::warn!(
+                    block_writes_outside_command = outside,
+                    tables = ?store.block_tables_written_outside_command(),
+                    "block tables were written outside an account command"
+                );
+            }
+            // Tick waits on a thread until the account writer commits it, which can
+            // take as long as every batch queued ahead of it. This task is woken by
+            // its own timer, so it runs on the worker that was driving Tokio's IO and
+            // timers; blocking that worker would freeze every socket read and timer
+            // in the routing runtime until the writer answered. Wait on the blocking
+            // pool instead.
+            let store = Arc::clone(&store);
+            let outcome = crate::stage_timing::spawn_job_blocking(move || {
+                crate::account_writer::tick(&store, crate::now_ms() as i64)
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::warn!(%error, "account maintenance failed"),
+                // A panic in the maintenance pass still stops this loop, so the
+                // serving loop reports it and the module restarts.
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => tracing::warn!(%error, "account maintenance worker failed"),
+            }
         })
         .await;
-        match outcome {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!(%error, "account maintenance failed"),
-            // A panic still stops this loop, so the serving loop reports it
-            // and the module restarts, as when Tick ran on this task.
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => tracing::warn!(%error, "account maintenance worker failed"),
-        }
     }
 }
 
@@ -319,7 +322,12 @@ async fn checkpoint_loop(store: SharedStore, period: std::time::Duration) {
     loop {
         ticks.tick().await;
         let store = Arc::clone(&store);
-        match tokio::task::spawn_blocking(move || store.checkpoint_wal()).await {
+        match striatum_store::job_timing::run(
+            "wal_checkpoint",
+            crate::stage_timing::spawn_job_blocking(move || store.checkpoint_wal()),
+        )
+        .await
+        {
             Ok(Ok(())) => {}
             Ok(Err(error)) => tracing::warn!(%error, "WAL checkpoint failed; retrying next tick"),
             Err(error) => tracing::warn!(%error, "WAL checkpoint worker failed"),
@@ -332,7 +340,11 @@ async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration)
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         ticks.tick().await;
-        flush_call_counts(Arc::clone(&store)).await;
+        striatum_store::job_timing::run(
+            "routing_call_counts",
+            flush_call_counts(Arc::clone(&store)),
+        )
+        .await;
     }
 }
 
@@ -634,7 +646,15 @@ mod tests {
 }
 
 pub(super) async fn flush_call_counts(store: SharedStore) {
-    match tokio::task::spawn_blocking(move || store.flush_routing_calls()).await {
+    match crate::stage_timing::spawn_job_blocking(move || {
+        let result = store.flush_routing_calls();
+        if let Ok(rows) = &result {
+            striatum_store::job_timing::rows(*rows as u64);
+        }
+        result
+    })
+    .await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => {
             tracing::warn!(%error, "routing call count flush failed; the next tick will retry")

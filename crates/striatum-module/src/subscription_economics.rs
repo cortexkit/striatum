@@ -493,22 +493,27 @@ pub(crate) async fn refresh(
         }
         prices
     };
-    let (prices, report) = tokio::join!(prices, report);
-    let credential_ids = if let Ok(credentials) = credentials.lock() {
-        credentials.api_key_credentials_by_provider(now as u64)
-    } else {
-        BTreeMap::new()
-    };
-    let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
-        return;
-    };
-    let mut next = build_with_credentials(&snapshot, &report, &prices, now, &credential_ids);
-    if let Some(listing) = listing {
-        next.unpriced_tiers = unpriced_tiers(listing, &prices);
-    }
-    if let Ok(mut guard) = cache().lock() {
-        *guard = next;
-    }
+    let (prices, report) = tokio::join!(
+        striatum_store::job_timing::run("plan_price_refresh", prices),
+        striatum_store::job_timing::run("spend_report_refresh", report)
+    );
+    striatum_store::job_timing::sync("subscription_economics", || {
+        let credential_ids = if let Ok(credentials) = credentials.lock() {
+            credentials.api_key_credentials_by_provider(now as u64)
+        } else {
+            BTreeMap::new()
+        };
+        let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
+            return;
+        };
+        let mut next = build_with_credentials(&snapshot, &report, &prices, now, &credential_ids);
+        if let Some(listing) = listing {
+            next.unpriced_tiers = unpriced_tiers(listing, &prices);
+        }
+        if let Ok(mut guard) = cache().lock() {
+            *guard = next;
+        }
+    });
 }
 
 fn unpriced_tiers(
