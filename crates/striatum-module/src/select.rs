@@ -2222,7 +2222,9 @@ async fn handle_select_request_attempt(
     .map_err(|error| ModuleError::Message(error.to_string()))?;
     let head_request = crate::select_concurrency::head(&operator_config, &target_agent);
     let enforce_concurrency = live_config.concurrency_caps().enforcement_enabled;
+    let policy_memo = config_overrides::SelectionPolicyMemo::default();
     let pass = select_policy::SelectionPass {
+        policy_memo: &policy_memo,
         concurrency: enforce_concurrency.then_some(&ledger),
         consumer: consumer_id,
         target_agent: &target_agent,

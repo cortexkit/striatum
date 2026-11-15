@@ -38,6 +38,7 @@ pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
 mod contract_tests;
 mod dormant_models;
 mod new_shape;
+pub(crate) use new_shape::SelectionPolicyMemo;
 #[cfg(test)]
 mod new_shape_tests;
 
@@ -55,6 +56,7 @@ pub struct LiveConfig {
 
 #[derive(Debug)]
 struct CompiledPolicy {
+    entities: new_shape::EntityPolicyIndex,
     routing: striatum_core::launch_policy::CompiledRoutingPolicy,
     allocator_default: Arc<striatum_core::accounts::AllocatorPolicy>,
     allocators: BTreeMap<String, Arc<striatum_core::accounts::AllocatorPolicy>>,
@@ -80,6 +82,7 @@ impl CompiledPolicy {
             Arc::new(policy)
         };
         Self {
+            entities: new_shape::EntityPolicyIndex::compile(config),
             routing: striatum_core::launch_policy::CompiledRoutingPolicy::compile(
                 ModelRoutingPolicyInput {
                     exclude: clean_spec_entries(config.model_routing.exclude.all.clone()),

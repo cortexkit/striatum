@@ -34,6 +34,7 @@ pub(crate) struct SelectionPass<'a> {
     pub prefer_prompt_cache: bool,
     pub providers_without_prompt_cache: &'a [String],
     pub operator_config: &'a crate::config_overrides::LiveConfig,
+    pub policy_memo: &'a crate::config_overrides::SelectionPolicyMemo,
 }
 
 impl<'a> SelectionPass<'a> {
@@ -71,10 +72,9 @@ impl<'a> SelectionPass<'a> {
         // so exclusions other than pin_only and pin_only_for still apply.
         let mut operator_exclude_keys = if pinned { Vec::new() } else { self.operator_exclude.to_vec() };
         if !self.classifier {
-            operator_exclude_keys.extend(
-                self.operator_config
-                    .selection_exclusions(self.consumer, self.facts, pinned),
-            );
+            operator_exclude_keys.extend(self.policy_memo.exclusions(
+                self.operator_config, self.consumer, self.facts, pinned,
+            ));
         }
         SelectModelRouteInput {
             target_agent: self.target_agent.to_owned(),

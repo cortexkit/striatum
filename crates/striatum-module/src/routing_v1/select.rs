@@ -640,6 +640,7 @@ pub(super) struct RequestInputs {
     pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
     facts: Vec<ModelFact>,
     pub(super) catalog_targets: std::collections::BTreeMap<String, String>,
+    policy_memo: std::sync::Arc<config_overrides::SelectionPolicyMemo>,
 }
 
 impl RequestInputs {
@@ -683,6 +684,7 @@ impl RequestInputs {
             catalog_snapshot,
             facts,
             catalog_targets,
+            policy_memo: Default::default(),
         })
     }
 
@@ -761,6 +763,15 @@ impl RequestInputs {
 #[cfg(test)]
 static INPUT_BUILDS: std::sync::Mutex<std::collections::BTreeMap<usize, [usize; 3]>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+static EVIDENCE_PASSES: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, usize>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(test)]
+pub(super) fn evidence_passes(path: &std::path::Path) -> usize {
+    *EVIDENCE_PASSES.lock().unwrap().get(path).unwrap_or(&0)
+}
 
 #[cfg(test)]
 fn count_input_build(config: &std::sync::Arc<config_overrides::LiveConfig>, stage: usize) {
@@ -1661,6 +1672,7 @@ async fn select_at_tier_attempt(
     .map_err(store_refusal)?;
     let use_concurrency = std::cell::Cell::new(!concurrency.full_routes.is_empty());
     let selection = Selection {
+        policy_memo: &shared.policy_memo,
         concurrency: &concurrency,
         use_concurrency: &use_concurrency,
         eligible_routes: request.eligible_routes.as_deref(),
@@ -1700,7 +1712,10 @@ async fn select_at_tier_attempt(
         conversation_key: request.affinity.as_deref().unwrap_or("select"),
     };
 
-    if let Some(view) = evaluation {
+    // route.select_panel pins each member to an already ranked route; it never
+    // reads the quality bar, adequate routes, or exclusions from this scorer.
+    // Ordinary route.what_if model previews still return all three diagnostics.
+    if let Some(view) = evaluation.filter(|_| !panel_seat) {
         let mut evidence = view.evidence.lock().unwrap();
         let _ = selection.score_candidates_evaluated(&usable, consumer_policy.operator_ladder(), None, None, Some(&mut evidence));
     }
@@ -2463,6 +2478,7 @@ fn concurrency_rejected_routes(refusal: &Refusal) -> Vec<String> {
 
 /// Everything one select's automatic and pinned attempts share.
 struct Selection<'a> {
+    policy_memo: &'a config_overrides::SelectionPolicyMemo,
     concurrency: &'a striatum_core::concurrency_availability::ConcurrencyAvailability,
     use_concurrency: &'a std::cell::Cell<bool>,
     eligible_routes: Option<&'a [RouteRef]>,
@@ -2645,6 +2661,14 @@ impl<'a> Selection<'a> {
         recovery_key: Option<&str>,
         evaluation: Option<&mut striatum_core::model_router::RouteEvaluation>,
     ) -> Result<SelectedModelRoute, NoRouteError> {
+        #[cfg(test)]
+        if evaluation.is_some() {
+            *EVIDENCE_PASSES
+                .lock()
+                .unwrap()
+                .entry(self.sources.operator_config_path.to_path_buf())
+                .or_default() += 1;
+        }
         let allowed = available
             .iter()
             .filter(|route| {
@@ -2831,6 +2855,7 @@ impl<'a> Selection<'a> {
             slots: self.slots,
             concurrency: self.use_concurrency.get().then_some(self.concurrency),
             operator_config: self.sources.operator_config,
+            policy_memo: self.policy_memo,
         }
     }
 
