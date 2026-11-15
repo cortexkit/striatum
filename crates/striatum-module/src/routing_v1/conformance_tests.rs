@@ -17,6 +17,9 @@
 //! subscription accounts to the account allocator's vault roster and quota
 //! readings.
 
+#[path = "conformance_tests/whole_writer/tests.rs"]
+mod whole_writer;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

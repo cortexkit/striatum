@@ -355,6 +355,20 @@ pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<Ac
         .map_err(|_| RouteStateStoreError("account state publisher has the wrong type".into()))
 }
 
+#[cfg(test)]
+pub(crate) fn assert_fresh_load_for_test(store: &SqliteRouteStateStore, now: i64, context: &str) {
+    // Capture memory first: loading SQL must not repair the value being checked.
+    let mut memory = (*snapshot(store).unwrap()).clone();
+    memory.generation = 0;
+    let loaded = store
+        .account_transaction(|tx| AccountState::load_at(tx, now))
+        .unwrap();
+    assert_eq!(
+        memory, loaded,
+        "{context}: published account state differs from a fresh load"
+    );
+}
+
 /// A module command computes on typed working state, then persists its effects
 /// through the store transaction. Only private SQL projections omit the state.
 pub(crate) struct AccountCommand<'a> {

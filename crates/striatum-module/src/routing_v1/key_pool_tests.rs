@@ -269,7 +269,7 @@ fn model(route_key: &str, iq: u8) -> CatalogModel {
 
 /// The catalog's rows: the catalog provider's own, and the row the key pool
 /// borrows from `POOL_VENDOR`.
-fn catalog_models() -> Vec<CatalogModel> {
+pub(super) fn catalog_models() -> Vec<CatalogModel> {
     // The key pool's route is both the ablest and (by the pricing below) the
     // cheapest, so it wins wherever it is allowed to decide and is the only
     // route a high demand can use.

@@ -337,7 +337,9 @@ fn a_store_restored_without_its_history_passes_the_foreign_key_check_and_keeps_s
     assert_eq!(rig.count("account_decision"), 0);
     assert_eq!(rig.count("account_observation"), 0);
     assert_eq!(rig.count("account_admission"), 1);
-    assert_eq!(rig.count("account_fence"), 1);
+    assert_eq!(rig.connection().query_row(
+        "SELECT count(*) FROM block WHERE kind='account' AND is_origin=1 AND json_type(meta,'$.fence_json')='text'",
+        [],|row|row.get::<_,i64>(0)).unwrap(),1);
     assert_eq!(rig.foreign_key_violations(), Vec::<String>::new());
 
     let store = rig.open();

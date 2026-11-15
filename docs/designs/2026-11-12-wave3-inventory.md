@@ -666,3 +666,11 @@ class-vector cache takes no writer checkout.
 The routing-service campaign owner accepted this coverage mapping. Before
 merge, whole-response SQL comparisons must also cover a pool wall on a key-pool
 route and an unused open continuation offer.
+
+## Native block storage: representation-only assertion ports
+
+Owner approval permits physical table/column/query ports inside existing assertions only when their expected values, comparisons and policy predicates are unchanged. A count must retain the old logical source-row meaning, not merely count every row in the consolidated table. Any different expected value or policy claim needs separate approval. Each port is checked by a named deliberate defect: that defect must make the ported assertion fail without changing its expected value.
+
+| Test / location | Old expression | New physical expression | Equivalence and unchanged claim | Failure-control evidence |
+|---|---|---|---|---|
+| `backup_exclusion::a_store_restored_without_its_history_passes_the_foreign_key_check_and_keeps_serving`, `crates/striatum-store/tests/it/backup_exclusion.rs` | `assert_eq!(rig.count("account_fence"), 1)` | `assert_eq!(SELECT count(*) FROM block WHERE kind='account' AND is_origin=1 AND json_type(meta,'$.fence_json')='text', 1)` (executed through the test connection) | The old table held account-fence source records, including cleared records. Account source payloads retain `fence_json`; source-less imported clock rows do not. The physical count therefore includes cleared source audit rows, excludes principal and other origins and excludes orphan clocks. The expected count remains exactly **1**: restoring without excludable history must not lose the backed-up fence. | `block_marked_excludable` moves `block` from required to excludable backup tables. The filtered test failed exactly at this assertion with `left: 0`, `right: 1`; the unmodified test passed. Evidence: `.cortexkit/internal-docs/research/s7b-activation/backup-control/{backup-proof.json,block_marked_excludable.log}`; runner `.cortexkit/scripts/red-control-s7b-backup.py`. |
