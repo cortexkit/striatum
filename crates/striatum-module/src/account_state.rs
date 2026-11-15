@@ -408,6 +408,8 @@ impl<'a> AccountCommand<'a> {
         now: i64,
         fresh: impl FnOnce() -> String,
     ) -> RouteStateResult<String> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter("account_command::salt");
         let Some(state) = self.state.as_deref_mut() else {
             return self.sql.salt(now, fresh);
         };
@@ -435,6 +437,9 @@ impl AccountCommand<'_> {
         model: &str,
         now: i64,
     ) -> usize {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::inflight_count_for_model");
         let state = self
             .state
             .as_deref_mut()
@@ -506,6 +511,9 @@ impl AccountCommand<'_> {
         counts: Vec<CapCount>,
         now: i64,
     ) {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::record_waiter");
         if let Some(state) = self.state.as_deref_mut() {
             state
                 .waiters
@@ -520,6 +528,9 @@ impl AccountCommand<'_> {
         retry_at_ms: i64,
         now: i64,
     ) {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::retime_waiter");
         if let Some(state) = self.state.as_deref_mut() {
             state.waiters.retime(conversation, retry_at_ms, now);
         }
@@ -527,6 +538,8 @@ impl AccountCommand<'_> {
 
     /// The conversation took a slot on `count`, which ends a wait on it.
     pub(crate) fn took_slot(&mut self, conversation: &waiters::Conversation, count: &CapCount) {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter("account_command::took_slot");
         if let Some(state) = self.state.as_deref_mut() {
             state.waiters.took(conversation, count);
         }
@@ -555,6 +568,9 @@ impl AccountCommand<'_> {
         scope: InflightScope<'_>,
         now: i64,
     ) -> usize {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::inflight_count");
         let state = self
             .state
             .as_deref_mut()
@@ -899,6 +915,9 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn insert_admission(&mut self, row: &AccountAdmissionRow) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::insert_admission");
         self.sql.insert_admission(row)?;
         let rowid = self.sql.last_insert_rowid();
         self.mirror(|state| state.insert_admission(row, rowid));
@@ -915,6 +934,10 @@ impl AccountCommand<'_> {
         size: u32,
         decision: Option<&str>,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter(
+            "account_command::record_admission_probe_scope",
+        );
         if self
             .sql
             .record_admission_probe_scope(principal, id, size, decision)?
@@ -929,6 +952,9 @@ impl AccountCommand<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::mark_admission_expired");
         let changed = self.sql.mark_admission_expired(principal, admission_id)?;
         self.mirror_checked(changed, "mark_admission_expired", |state| {
             state.expire(principal, admission_id)
@@ -944,6 +970,9 @@ impl AccountCommand<'_> {
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::mark_admission_started");
         let changed = self
             .sql
             .mark_admission_started(principal, admission_id, run_id, at, late)?;
@@ -958,6 +987,9 @@ impl AccountCommand<'_> {
         row: &AccountAdmissionRow,
         at: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::observe_admission");
         self.visit_account(&row.provider, &row.account_id);
         if self.state.is_none() {
             return self.sql.observe_admission(row, at);
@@ -971,6 +1003,9 @@ impl AccountCommand<'_> {
         admission_id: &str,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::mark_admission_released");
         let changed = self
             .sql
             .mark_admission_released(principal, admission_id, at)?;
@@ -986,6 +1021,9 @@ impl AccountCommand<'_> {
         admission_id: &str,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::mark_admission_finished");
         let changed = self
             .sql
             .mark_admission_finished(principal, admission_id, at)?;
@@ -1000,6 +1038,9 @@ impl AccountCommand<'_> {
         row: &AccountAffinityRow,
         expected: Option<(&str, u64)>,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::put_affinity");
         self.visit_account(&row.provider, &row.account_id);
         let changed = self.sql.put_affinity(row, expected)?;
         self.mirror_checked(changed, "put_affinity", |state| {
@@ -1019,6 +1060,9 @@ impl AccountCommand<'_> {
         expires_at: i64,
         lease_valid_until: Option<i64>,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::touch_affinity");
         let changed = self.sql.touch_affinity(
             principal,
             conversation_hash,
@@ -1043,6 +1087,8 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn end_lease(&mut self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter("account_command::end_lease");
         let changed = self.sql.end_lease(pin_id, at)?;
         self.mirror_checked(changed, "end_lease", |state| state.end_lease(pin_id, at))?;
         Ok(changed)
@@ -1059,6 +1105,9 @@ impl AccountCommand<'_> {
         previous: &str,
         offer: Option<(&str, &str, i64)>,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::record_continuation");
         self.sql.record_continuation(
             principal, selection, record, run, admission, previous, offer,
         )?;
@@ -1102,6 +1151,10 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn release_expired_continuations(&mut self, now: i64) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter(
+            "account_command::release_expired_continuations",
+        );
         if self.state.is_none() {
             return self.sql.release_expired_continuations(now);
         }
@@ -1109,6 +1162,9 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn use_continuation(&mut self, decision: &str, now: i64) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::use_continuation");
         // Report delivery runs directly on the store writer. Evaluate windows
         // at the report's received time, just as the durable start does, rather
         // than sampling another clock after the report has waited in the queue.
@@ -1128,6 +1184,9 @@ impl AccountCommand<'_> {
         credential: Option<&str>,
         now: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::use_observed_continuation");
         let Some(state) = self.admission_state() else {
             return self
                 .sql
@@ -1149,6 +1208,9 @@ impl AccountCommand<'_> {
         run: &str,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::finish_continuations");
         if self.state.is_none() {
             return self
                 .sql
@@ -1161,6 +1223,10 @@ impl AccountCommand<'_> {
     /// decides which name expired unstarted admissions; SQL releases those
     /// probes and expires the admissions.
     pub(crate) fn release_expired_admission_probes(&mut self, now: i64) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter(
+            "account_command::release_expired_admission_probes",
+        );
         let Some(state) = self.admission_state() else {
             self.sql.release_expired_admission_probes(now)?;
             return Ok(());
@@ -1201,6 +1267,9 @@ impl AccountCommand<'_> {
     /// calls this first. A command without a working state (a projection)
     /// releases nothing here; it writes nothing when nothing expired.
     pub(crate) fn release_expired(&mut self, now: i64) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::release_expired");
         let Some(state) = self.state.as_deref() else {
             return Ok(());
         };
@@ -1224,6 +1293,8 @@ impl AccountCommand<'_> {
     }
 
     pub(crate) fn tick(&mut self, now_ms: i64) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter("account_command::tick");
         // A cheap check that the block state still matches SQL; a mismatch
         // reloads the state and runs the tick again.
         self.sql.reconcile_block_state()?;
@@ -1238,6 +1309,9 @@ impl AccountCommand<'_> {
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::prune_account_admissions");
         let deleted = self
             .sql
             .prune_account_admissions_returning(before, limit, now_ms)?;
@@ -1273,6 +1347,9 @@ impl AccountCommand<'_> {
         before: i64,
         lease_before: i64,
     ) -> RouteStateResult<AffinityRetentionBatch> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::prune_account_affinities");
         let (batch, deleted) =
             self.sql
                 .delete_account_affinities_returning(keys, before, lease_before)?;
@@ -1288,6 +1365,10 @@ impl AccountCommand<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(test)]
+        let _writer_entry = striatum_store::writer_entry_trace::enter(
+            "account_command::prune_account_continuations",
+        );
         let deleted = self
             .sql
             .prune_account_continuations_returning(before, limit)?;

@@ -321,6 +321,9 @@ impl crate::AccountTx<'_> {
     /// reloads the state and runs the batch again. A command without a
     /// state has nothing to compare.
     pub fn reconcile_block_state(&self) -> striatum_core::RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::reconcile_block_state");
         let Some(blocks) = self.working_blocks()? else {
             return Ok(());
         };
@@ -372,6 +375,9 @@ impl crate::AccountTx<'_> {
     /// decided, and there is nothing to
     /// check.
     pub fn check_decision_inputs(&self, providers: &[&str]) -> striatum_core::RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::check_decision_inputs");
         let Some(state) = self.working_blocks()? else {
             return Ok(());
         };
@@ -391,6 +397,9 @@ impl crate::AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> striatum_core::RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::check_admission_exclusions");
         let Some(state) = self.working_blocks()? else {
             return Ok(());
         };
@@ -401,6 +410,9 @@ impl crate::AccountTx<'_> {
 
     /// The block tables, read in the state loader's transaction.
     pub fn load_block_state(&self) -> striatum_core::RouteStateResult<BlockState> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::load_block_state");
         BlockState::load(self.conn).map_err(crate::err)
     }
 
@@ -410,6 +422,9 @@ impl crate::AccountTx<'_> {
     /// back again when the command ends, so a row changed again later is
     /// not missed.
     pub fn pending_block_rows(&self) -> striatum_core::RouteStateResult<BlockRows> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::pending_block_rows");
         let captured = CAPTURE.with(|capture| capture.borrow().clone().unwrap_or_default());
         if captured.is_empty() {
             return Ok(BlockRows::default());
@@ -428,6 +443,9 @@ impl crate::AccountTx<'_> {
     pub fn working_blocks(
         &self,
     ) -> striatum_core::RouteStateResult<Option<std::borrow::Cow<'_, BlockState>>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::block_state::working_blocks");
         use std::borrow::Cow;
         let Some(base) = self.blocks.filter(|blocks| blocks.enabled()) else {
             return Ok(None);

@@ -1026,6 +1026,7 @@ struct TestThreadState {
     warnings: OperatorWarnings,
     infos: OperatorWarnings,
     replay: Option<striatum_store::replay::Inputs>,
+    writer_trace: Option<striatum_store::writer_entry_trace::Trace>,
 }
 
 #[cfg(test)]
@@ -1036,6 +1037,7 @@ impl TestThreadState {
             warnings: OPERATOR_WARNINGS.with(|sink| Arc::clone(&sink.borrow())),
             infos: OPERATOR_INFOS.with(|sink| Arc::clone(&sink.borrow())),
             replay: striatum_store::replay::current(),
+            writer_trace: striatum_store::writer_entry_trace::current(),
         }
     }
 
@@ -1044,14 +1046,17 @@ impl TestThreadState {
     /// so a handler's state must not outlive it.
     fn install(self) -> InstalledTestThreadState {
         let replay = self.replay.as_ref().map(|inputs| inputs.install());
+        let writer_trace = self.writer_trace.as_ref().map(|trace| trace.install());
         InstalledTestThreadState {
             previous: Some(TestThreadState {
                 now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
                 warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
                 infos: OPERATOR_INFOS.with(|sink| sink.replace(self.infos)),
                 replay: None,
+                writer_trace: None,
             }),
             _replay: replay,
+            _writer_trace: writer_trace,
         }
     }
 }
@@ -1061,6 +1066,7 @@ impl TestThreadState {
 struct InstalledTestThreadState {
     previous: Option<TestThreadState>,
     _replay: Option<striatum_store::replay::Guard>,
+    _writer_trace: Option<striatum_store::writer_entry_trace::Installed>,
 }
 
 #[cfg(test)]

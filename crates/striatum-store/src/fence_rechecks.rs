@@ -1304,6 +1304,10 @@ impl AccountTx<'_> {
         account: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::arm_observe_retest_for_test",
+        );
         sync_on(self, crate::now_ms()).map_err(err)?;
         self.conn
             .execute(
@@ -1327,6 +1331,9 @@ impl AccountTx<'_> {
         credential: &str,
         now: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::bind_decision_probe");
         if origins.is_empty() {
             return Ok(true);
         }
@@ -1362,6 +1369,9 @@ impl AccountTx<'_> {
         credential: Option<&str>,
         preserve: bool,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::probe_report_matches");
         if !enabled(self.conn).map_err(err)? {
             return Ok(true);
         }
@@ -1663,6 +1673,10 @@ impl AccountTx<'_> {
     /// whose run ended: keyed by the working state's rows when the command
     /// has one.
     pub fn retire_probe_authorizations(&self, owner: &str) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::retire_probe_authorizations",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -1746,6 +1760,9 @@ impl AccountTx<'_> {
         now: i64,
         inconclusive: bool,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::fail_authorized_probe");
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -1825,6 +1842,10 @@ impl AccountTx<'_> {
     /// are expired unstarted admissions, then passes them to
     /// [`Self::release_admission_probes`].
     pub fn probe_authorization_owners(&self) -> RouteStateResult<Vec<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::probe_authorization_owners",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(Vec::new());
         }
@@ -1840,6 +1861,10 @@ impl AccountTx<'_> {
     /// Preview cleanup without acquiring a writer. The write path checks again
     /// because a runner may start the admission after this snapshot is read.
     pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::has_expired_admission_probes",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(false);
         }
@@ -1861,6 +1886,10 @@ impl AccountTx<'_> {
         &self,
         now: i64,
     ) -> RouteStateResult<Vec<(String, String)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::release_expired_admission_probes",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(Vec::new());
         }
@@ -1889,6 +1918,10 @@ impl AccountTx<'_> {
         expired: Vec<(String, String, String)>,
         now: i64,
     ) -> RouteStateResult<ReleasedAdmissionProbes> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::release_admission_probes",
+        );
         let mut released = ReleasedAdmissionProbes::default();
         if expired.is_empty() {
             return Ok(released);
@@ -1970,6 +2003,10 @@ impl AccountTx<'_> {
         credential: &str,
         model: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::probe_authorization_names_credential",
+        );
         sync_on(self, crate::now_ms()).map_err(err)?;
         if let Some(blocks) = self.working_blocks()? {
             // The answer decides whether the report may heal the probe.
@@ -2004,6 +2041,10 @@ impl AccountTx<'_> {
     }
 
     pub fn transfer_probe_authorization(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::transfer_probe_authorization",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -2045,6 +2086,10 @@ impl AccountTx<'_> {
         model: &str,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::release_inconclusive_probe",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -2132,6 +2177,9 @@ impl AccountTx<'_> {
         model: &str,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::heal_authorized_probe");
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
         }
@@ -2349,6 +2397,10 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::claim_fence_rechecks_for_admission",
+        );
         self.claim_owned(origins, now, owner, None, owner)
     }
     pub fn claim_fence_rechecks_for_authorized_admission(
@@ -2358,6 +2410,10 @@ impl AccountTx<'_> {
         owner: Option<&str>,
         admission: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::claim_fence_rechecks_for_authorized_admission",
+        );
         self.claim_owned(origins, now, owner, None, Some(admission))
     }
     pub fn grant_fence_rechecks(
@@ -2366,6 +2422,9 @@ impl AccountTx<'_> {
         now: i64,
         owner: Option<&str>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::grant_fence_rechecks");
         self.claim_owned(origins, now, owner, owner, owner)
     }
     /// Success can heal only evidence older than this request's admission. A
@@ -2381,6 +2440,9 @@ impl AccountTx<'_> {
         admitted_at: i64,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::heal_serving_fences");
         self.heal_serving_fences_in_scope(
             provider,
             account,
@@ -2405,6 +2467,10 @@ impl AccountTx<'_> {
         now: i64,
         scope: Option<&QuotaSuccessScope>,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::heal_serving_fences_in_scope",
+        );
         let origins = self.fence_rechecks()?;
         let origins: Vec<_> = origins
             .into_iter()
@@ -2804,6 +2870,10 @@ impl AccountTx<'_> {
         credential: &str,
         proposed: bool,
     ) -> RouteStateResult<(bool, bool)> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::credential_quota_classification",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok((proposed, false));
         }
@@ -2826,6 +2896,10 @@ impl AccountTx<'_> {
         credential: &str,
         quota: bool,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::fence_rechecks::classify_credential_quota",
+        );
         if !enabled(self.conn).map_err(err)? {
             return Ok(quota);
         }
@@ -2873,6 +2947,9 @@ impl AccountTx<'_> {
     /// reads them: from the command's working state when it has one, which
     /// evaluates expiry at the same wall clock, else from SQL.
     pub fn fence_rechecks(&self) -> RouteStateResult<Vec<FenceRecheck>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::fence_rechecks");
         match self.working_blocks()? {
             Some(blocks) => blocks.fence_rechecks(crate::now_ms()),
             None => read_effective(self.conn).map_err(err),
@@ -2884,6 +2961,9 @@ impl AccountTx<'_> {
         origins: &[FenceRecheck],
         now: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::claim_fence_rechecks");
         self.claim_owned(origins, now, None, None, None)
     }
 }
@@ -5187,6 +5267,9 @@ mod tests {
 
 impl crate::AccountTx<'_> {
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::fence_rechecks::bind_fence_probe_owner");
         self.command_scope(|tx| {
             tx.transfer_probe_authorization(from, to)?;
             tx.conn

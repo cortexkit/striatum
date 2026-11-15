@@ -548,6 +548,8 @@ impl crate::AccountTx<'_> {
         reason: &str,
         now_ms: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::key_pool::pool_wall");
         let until_ms = until_ms
             .min(now_ms.saturating_add(striatum_core::fence_lifetimes::NON_QUOTA_FENCE_MAX_MS));
         let (origin, observed) = match kind {
@@ -692,6 +694,8 @@ mod wall_generation_tests {
 
 impl crate::AccountTx<'_> {
     pub fn pool_acquire(&self, request: &PoolAcquire<'_>) -> RouteStateResult<PoolAcquireOutcome> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::key_pool::pool_acquire");
         self.pool_acquire_for_route(request, &[request.provider], "", &[], &BTreeMap::new())
     }
 
@@ -703,6 +707,9 @@ impl crate::AccountTx<'_> {
         recovered: &[RecoveredOrigin],
         accounts: &BTreeMap<String, String>,
     ) -> RouteStateResult<PoolAcquireOutcome> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::key_pool::pool_acquire_for_route");
         self.pool_sql(|conn| {
             let now = request.now_ms;
             let existing: Option<(String, String, String)> = conn
@@ -831,6 +838,8 @@ impl crate::AccountTx<'_> {
         now_ms: i64,
         lease_ms: i64,
     ) -> RouteStateResult<Option<i64>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::key_pool::pool_renew");
         self.pool_sql(|conn| {
             let valid_until = now_ms.saturating_add(lease_ms);
             let released: Option<Option<i64>> = conn
@@ -891,6 +900,8 @@ impl crate::AccountTx<'_> {
         end_session: bool,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::key_pool::pool_release");
         self.pool_sql(|conn| {
             let released = conn.execute(
                 "UPDATE pool_key_lease SET released_at = ?4

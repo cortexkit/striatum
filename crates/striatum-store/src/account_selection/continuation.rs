@@ -9,6 +9,10 @@ impl AccountTx<'_> {
         admission: &str,
         run: &str,
     ) -> RouteStateResult<Vec<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::signed_out_credentials",
+        );
         let mut statement = self
             .conn
             .prepare(
@@ -33,6 +37,10 @@ impl AccountTx<'_> {
         fence: &striatum_core::route_state_store::CredentialEntitlementFence,
         fingerprint: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::update_signed_out_fingerprint",
+        );
         self.conn
             .execute(
                 "UPDATE block SET listing_fingerprint=?1
@@ -51,6 +59,10 @@ impl AccountTx<'_> {
     }
 
     pub fn has_expired_continuations(&self, now: i64) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::has_expired_continuations",
+        );
         let exists=self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_continue')", [], |row|row.get::<_,bool>(0)).map_err(err)?;
         if !exists {
             return Ok(false);
@@ -63,6 +75,10 @@ impl AccountTx<'_> {
         principal: &str,
         selection: &str,
     ) -> RouteStateResult<Option<V1Recorded>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::continuation",
+        );
         self.conn.query_row(
             "SELECT request_json, answer_json FROM account_continue WHERE principal=?1 AND selection_id=?2",
             params![principal, selection],
@@ -78,6 +94,10 @@ impl AccountTx<'_> {
         run: &str,
         decision: &str,
     ) -> RouteStateResult<Option<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::continued_reservation",
+        );
         self.conn.query_row(
             "SELECT reservation_id FROM account_continue WHERE principal=?1 AND admission_id=?2 AND run_id=?3 AND decision_id=?4 AND released_at_ms IS NULL",
             params![principal, admission, run, decision], |row| row.get(0),
@@ -91,6 +111,10 @@ impl AccountTx<'_> {
         run: &str,
         decision: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::continuation_has_used_successor",
+        );
         self.conn.query_row("SELECT EXISTS(SELECT 1 FROM account_continue WHERE principal=?1 AND admission_id=?2 AND run_id=?3 AND previous_decision_id=?4 AND used_at_ms IS NOT NULL)",
             params![principal,admission,run,decision],|row|row.get(0)).map_err(err)
     }
@@ -106,6 +130,10 @@ impl AccountTx<'_> {
         previous: &str,
         offer: Option<(&str, &str, i64)>,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::record_continuation",
+        );
         self.conn.execute(
             "INSERT INTO account_continue (principal,selection_id,request_json,answer_json,run_id,admission_id,previous_decision_id,decision_id,reservation_id,valid_until_ms) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![principal,selection,record.body_json,record.answer_json,run,admission,previous,
@@ -115,6 +143,10 @@ impl AccountTx<'_> {
 
     /// Unused offers stop consuming admission demand at the deadline, even if never retried.
     pub fn release_expired_continuations(&self, now: i64) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::release_expired_continuations",
+        );
         if !self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_continue')", [], |row|row.get::<_,bool>(0)).map_err(err)? {
             return Ok(());
         }
@@ -131,6 +163,10 @@ impl AccountTx<'_> {
     }
 
     pub fn use_continuation(&self, decision: &str, now: i64) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::use_continuation",
+        );
         self.release_expired_continuations(now)?;
         self.conn.execute(
             "UPDATE account_admission SET state='started', started_at=?2, last_observed_at=MAX(COALESCE(last_observed_at, ?2), ?2), run_id=(SELECT run_id FROM account_continue WHERE decision_id=?1) WHERE state='reserved' AND (principal,admission_id) IN (SELECT principal,reservation_id FROM account_continue WHERE decision_id=?1 AND used_at_ms IS NULL AND released_at_ms IS NULL)", params![decision,now],
@@ -164,6 +200,10 @@ impl AccountTx<'_> {
         credential: Option<&str>,
         now: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::use_observed_continuation",
+        );
         let decision: Option<String> = self.conn.query_row(
             "SELECT c.decision_id FROM account_continue c
              JOIN account_admission original ON original.principal=c.principal AND original.admission_id=c.admission_id
@@ -191,6 +231,10 @@ impl AccountTx<'_> {
         principal: &str,
         admission: &str,
     ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::latest_used_continuation",
+        );
         let reservation: Option<String> = self
             .conn
             .query_row(
@@ -239,6 +283,10 @@ impl AccountTx<'_> {
         run: &str,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::finish_continuations",
+        );
         let reservations: Vec<(String, bool)> = self
             .conn
             .prepare(
@@ -271,6 +319,10 @@ impl AccountTx<'_> {
         decision: &str,
         admission: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::bind_continued_account_decision",
+        );
         self.conn
             .execute(
                 "UPDATE account_decision SET admission_id=?2 WHERE decision_id=?1",
@@ -288,6 +340,10 @@ impl AccountTx<'_> {
         now: i64,
         until: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::continuation::link_continued_decision",
+        );
         // Copy every selection column so later pricing/profile additions follow switches too.
         let columns: Vec<String> = self
             .conn

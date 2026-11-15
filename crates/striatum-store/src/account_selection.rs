@@ -630,6 +630,10 @@ impl AccountTx<'_> {
     pub fn route_fence_latest_reports(
         &self,
     ) -> RouteStateResult<std::collections::BTreeMap<String, i64>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::route_fence_latest_reports",
+        );
         Ok(self.current_blocks()?.route_fence_latest_reports())
     }
 
@@ -641,6 +645,10 @@ impl AccountTx<'_> {
         credential: &str,
         reading_at: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::clear_account_route_fences_before",
+        );
         self.conn
             .execute(
                 "UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?4),cleared_by='removed',claim_owner=NULL
@@ -657,6 +665,10 @@ impl AccountTx<'_> {
         size: u32,
         decision: Option<&str>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_admission_probe_scope",
+        );
         // Returns whether the scope was stored: stores without the
         // fence-recheck schema have no scope columns.
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
@@ -672,6 +684,10 @@ impl AccountTx<'_> {
         credential: &str,
         model: &str,
     ) -> RouteStateResult<Option<(u32, i64)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::size_admission_for_model_decision",
+        );
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(None);
         }
@@ -685,12 +701,18 @@ impl AccountTx<'_> {
     }
 
     pub fn admission_size_class(&self, principal: &str, id: &str) -> RouteStateResult<Option<u32>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::admission_size_class");
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(None);
         }
         self.conn.query_row("SELECT input_size_class FROM account_admission WHERE principal=?1 AND admission_id=?2",params![principal,id],|row|row.get::<_,Option<u32>>(0)).optional().map(Option::flatten).map_err(err)
     }
     pub fn decision_context(&self, decision_id: &str) -> RouteStateResult<Option<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::decision_context");
         self.conn
             .query_row(
                 "SELECT context_json FROM account_decision WHERE decision_id = ?1",
@@ -708,6 +730,10 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::admission_reported_failure",
+        );
         self.conn
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM account_observation
@@ -725,6 +751,10 @@ impl AccountTx<'_> {
         credential: &str,
     ) -> RouteStateResult<Option<striatum_core::route_state_store::CredentialEntitlementFence>>
     {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::credential_entitlement_fence",
+        );
         Ok(self
             .current_blocks()?
             .entitlement_fence(provider, credential))
@@ -735,6 +765,9 @@ impl AccountTx<'_> {
     /// and a restart preserve the same deadline without another write.
     /// Returns `(provider, account_id, retry_at_ms)` for each blocked account.
     pub fn observation_backoffs(&self, now: i64) -> RouteStateResult<Vec<(String, String, i64)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::observation_backoffs");
         let mut statement = self.conn.prepare(OBSERVATION_BACKOFFS_SQL).map_err(err)?;
         let rows = statement
             .query_map(params![now, now.saturating_sub(24 * 60 * 60_000)], |row| {
@@ -750,6 +783,10 @@ impl AccountTx<'_> {
         requested: Option<&str>,
         chosen: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_account_service_tier",
+        );
         self.conn.execute(
             "UPDATE account_decision SET service_tier_requested=?2, service_tier_chosen=?3 WHERE decision_id=?1",
             params![decision_id, requested, chosen],
@@ -766,6 +803,10 @@ impl AccountTx<'_> {
         before: i64,
         at: i64,
     ) -> RouteStateResult<CredentialProbeClaim> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::claim_credential_probe",
+        );
         crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)?;
         let changed=self.conn.execute("UPDATE block SET last_claimed_at=?4,
             next_recheck_at=?4+CASE WHEN quota=1 THEN ?5 ELSE ?6 END,reset_check_at=NULL,claim_owner=NULL
@@ -797,6 +838,9 @@ impl AccountTx<'_> {
         account: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::bind_model_account");
         let identity = serde_json::to_string(&striatum_core::route_state_store::ProviderOutcome {
             account_ref: account.into(),
             credential_id: Some(credential.into()),
@@ -809,6 +853,9 @@ impl AccountTx<'_> {
     }
 
     pub fn record_eligibility(&self, fact: &AccountEligibilityFact) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::record_eligibility");
         self.conn.execute(
                 "INSERT INTO account_eligibility VALUES (?1,?2,?3,?4,?5,?6) \
                  ON CONFLICT (provider,credential_id,model) DO UPDATE SET \
@@ -827,6 +874,9 @@ impl AccountTx<'_> {
         provider: &str,
         now_ms: i64,
     ) -> RouteStateResult<Option<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::parent_used_account");
         self.conn
             .query_row(
                 "SELECT a.account_id FROM (
@@ -848,6 +898,9 @@ impl AccountTx<'_> {
     /// A reserved first send has no prompt cache yet. A started admission on
     /// this pin establishes account affinity even after that run has finished.
     pub fn pin_has_started(&self, affinity: &AccountAffinityRow) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::pin_has_started");
         self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM account_admission WHERE principal=?1 AND conversation_hash=?2 AND provider=?3 AND pin_id=?4 AND pin_generation=?5 AND started_at IS NOT NULL)",
             params![affinity.principal, affinity.conversation_hash, affinity.provider, affinity.pin_id, affinity.pin_generation],
@@ -1502,6 +1555,8 @@ impl AccountTx<'_> {
     /// The installation-local salt for hashing conversation keys, created with
     /// `fresh` the first time it is needed and never changed afterwards.
     pub fn salt(&self, now: i64, fresh: impl FnOnce() -> String) -> RouteStateResult<String> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::account_selection::salt");
         let existing = self.existing_salt()?;
         if let Some(salt) = existing {
             return Ok(salt);
@@ -1514,6 +1569,10 @@ impl AccountTx<'_> {
     /// Persist the module's first salt. The owning command decides whether it
     /// is absent; this writer never reads the module's working state.
     pub fn insert_selection_salt(&self, salt: &str, now: i64) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::insert_selection_salt",
+        );
         self.conn
             .execute(
                 "INSERT INTO account_selection_salt (singleton, salt, created_at) VALUES (1, ?1, ?2)",
@@ -1524,6 +1583,9 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_decision(&self, row: &AccountDecisionRecord) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_decision");
         self.conn
             .execute(
                 &format!(
@@ -1559,6 +1621,9 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::admission");
         self.conn
             .query_row(
                 &format!(
@@ -1573,6 +1638,9 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_admission(&self, row: &AccountAdmissionRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_admission");
         self.conn
             .execute(
                 &format!(
@@ -1620,6 +1688,10 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::mark_admission_expired",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'expired' \
@@ -1641,6 +1713,10 @@ impl AccountTx<'_> {
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::mark_admission_started",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'started', run_id = ?3, started_at = ?4, \
@@ -1660,6 +1736,10 @@ impl AccountTx<'_> {
         admission_id: &str,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::mark_admission_released",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'released', released_at = ?3 \
@@ -1678,6 +1758,10 @@ impl AccountTx<'_> {
         admission_id: &str,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::mark_admission_finished",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET state = 'finished', finished_at = ?3 \
@@ -1699,6 +1783,9 @@ impl AccountTx<'_> {
         account_id: &str,
         committed_after: Option<i64>,
     ) -> RouteStateResult<Vec<AccountDemandRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::demand");
         let mut statement = self.conn.prepare(ACCOUNT_DEMAND_SQL).map_err(err)?;
         let rows = statement
             .query_map(
@@ -1722,6 +1809,9 @@ impl AccountTx<'_> {
         conversation_hash: &str,
         provider: &str,
     ) -> RouteStateResult<Option<AccountAffinityRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::affinity");
         self.conn
             .query_row(
                 &format!(
@@ -1744,6 +1834,9 @@ impl AccountTx<'_> {
         row: &AccountAffinityRow,
         expected: Option<(&str, u64)>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::put_affinity");
         let changed = match expected {
             None => self.conn.execute(
                 &format!(
@@ -1814,6 +1907,9 @@ impl AccountTx<'_> {
         expires_at: i64,
         lease_valid_until: Option<i64>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::touch_affinity");
         self.conn
             .execute(
                 "UPDATE account_affinity SET last_used_at = ?6, expires_at = ?7, \
@@ -1838,6 +1934,9 @@ impl AccountTx<'_> {
     /// End the lease of the pin `pin_id` names, if it is still the
     /// conversation's current pin. Affinity itself stays.
     pub fn end_lease(&self, pin_id: &str, at: i64) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::end_lease");
         self.conn
             .execute(END_LEASE_SQL, params![pin_id, at])
             .map(|changed| changed >= 1)
@@ -1845,6 +1944,9 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_pin(&self, row: &AccountPinRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_pin");
         self.conn
             .execute(
                 "INSERT INTO account_pin (pin_id, principal, conversation_hash, provider, \
@@ -1871,6 +1973,9 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_hold(&self, row: &AccountHoldRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_hold");
         self.conn
             .execute(
                 "INSERT INTO account_hold (decision_id, principal, conversation_hash, provider, \
@@ -1898,10 +2003,16 @@ impl AccountTx<'_> {
 
     /// Every standing quota hold on this provider, from the current block rows.
     pub fn active_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountFenceRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::active_fences");
         Ok(self.current_blocks()?.active_fences(provider))
     }
 
     pub fn insert_fence(&self, row: &AccountFenceRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_fence");
         let pool_key = serde_json::from_str::<FenceScope>(&row.scope_json)
             .ok()
             .map(PoolKey::from);
@@ -1914,6 +2025,9 @@ impl AccountTx<'_> {
 
     /// Store the recovery set with the same stable fence id as its evidence.
     pub fn insert_pool_fence(&self, fence: &AccountPoolFenceRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_pool_fence");
         let row = crate::block_storage::account_source(self.conn, fence).map_err(err)?;
         let changed = crate::block_storage::write_source(self.conn, &row).map_err(err)?;
         if changed == 0 {
@@ -1926,12 +2040,18 @@ impl AccountTx<'_> {
     }
 
     pub fn active_pool_fences(&self, provider: &str) -> RouteStateResult<Vec<AccountPoolFenceRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::active_pool_fences");
         self.current_blocks()?.active_pool_fences(provider)
     }
 
     /// Mark a standing block ended, recording when and why. Returns whether
     /// the block was still standing.
     pub fn clear_fence(&self, fence_id: &str, at: i64, reason: &str) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::clear_fence");
         self.conn
             .execute(
                 "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='kept',cleared_reason=?3,claim_owner=NULL
@@ -1951,6 +2071,9 @@ impl AccountTx<'_> {
         at: i64,
         reason: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::clear_held_fence");
         let changed = self
             .conn
             .execute(
@@ -2024,6 +2147,10 @@ impl AccountTx<'_> {
         fence_id: &str,
         recovery_set: &[PoolKey],
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::set_fence_recovery_set",
+        );
         let recovery_set = serde_json::to_string(recovery_set).map_err(err)?;
         self.conn
             .execute(
@@ -2037,6 +2164,10 @@ impl AccountTx<'_> {
 
     /// Every provider with at least one standing quota hold.
     pub fn active_fence_providers(&self) -> RouteStateResult<Vec<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::active_fence_providers",
+        );
         Ok(self.current_blocks()?.active_fence_providers())
     }
 
@@ -2046,6 +2177,9 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Vec<AccountExclusionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::admission_exclusions");
         Ok(self
             .current_blocks()?
             .admission_exclusions(principal, admission_id))
@@ -2053,6 +2187,9 @@ impl AccountTx<'_> {
 
     /// Record a scoped not-found only once for this admission and credential.
     pub fn insert_exclusion(&self, exclusion: &AccountExclusionRow) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_exclusion");
         let row = crate::block_storage::principal_source(self.conn, exclusion).map_err(err)?;
         let changed = crate::block_storage::write_source(self.conn, &row).map_err(err)?;
         if changed == 1 {
@@ -2067,6 +2204,10 @@ impl AccountTx<'_> {
         row: &AccountExclusionRow,
         after_ms: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::insert_exclusion_with_recheck",
+        );
         let inserted = self.insert_exclusion(row)?;
         if inserted && crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             self.conn
@@ -2089,6 +2230,9 @@ impl AccountTx<'_> {
 
     /// Count admissions with a standing scoped refusal for this principal and credential.
     pub fn exclusion_count(&self, principal: &str, credential_id: &str) -> RouteStateResult<i64> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::exclusion_count");
         Ok(self
             .current_blocks()?
             .exclusion_count(principal, credential_id))
@@ -2108,6 +2252,9 @@ impl AccountTx<'_> {
         runner: &str,
         event_id: &str,
     ) -> RouteStateResult<Option<AccountObservationRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::observation_by_event");
         let logged = self
             .conn
             .query_row(
@@ -2155,6 +2302,10 @@ impl AccountTx<'_> {
         principal: &str,
         event_id: &str,
     ) -> RouteStateResult<Option<AccountObservationRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::observation_by_principal_event",
+        );
         let runner: Option<String> = self.conn.query_row(
             "SELECT runner FROM account_observation WHERE principal=?1 AND event_id=?2 \
              UNION ALL SELECT runner FROM account_observation_event WHERE principal=?1 AND event_id=?2 LIMIT 1",
@@ -2173,6 +2324,10 @@ impl AccountTx<'_> {
         bound: bool,
         effects_json: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::set_observation_effects",
+        );
         self.conn
             .execute(
                 "UPDATE account_observation SET bound = ?2, effects_json = ?3 \
@@ -2268,6 +2423,9 @@ impl AccountTx<'_> {
     /// The salt if one was ever created. A read-only caller uses this: with no
     /// salt no conversation can have affinity yet.
     pub fn existing_salt(&self) -> RouteStateResult<Option<String>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::existing_salt");
         self.conn
             .query_row(
                 "SELECT salt FROM account_selection_salt WHERE singleton = 1",
@@ -2279,6 +2437,9 @@ impl AccountTx<'_> {
     }
 
     pub fn insert_observation(&self, row: &AccountObservationRow) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_selection::insert_observation");
         self.conn
             .execute(
                 &format!(
@@ -2627,6 +2788,10 @@ impl crate::AccountTx<'_> {
         &self,
         fact: &AccountEligibilityFact,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_account_eligibility",
+        );
         self.command_scope(|tx| tx.record_eligibility(fact))
     }
 
@@ -2634,6 +2799,10 @@ impl crate::AccountTx<'_> {
         &self,
         listings: &[(String, String)],
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::reconcile_account_eligibility",
+        );
         let mut fingerprints = std::collections::HashMap::with_capacity(listings.len());
         for (credential, fingerprint) in listings {
             fingerprints
@@ -2706,6 +2875,10 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn record_account_size_refusal(&self, fact: &AccountSizeRefusal) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_account_size_refusal",
+        );
         let row = crate::block_storage::size_source(fact, true).map_err(err)?;
         let blocks = self.current_blocks()?;
         blocks
@@ -2731,6 +2904,10 @@ impl crate::AccountTx<'_> {
         size_class: u32,
         observed_at: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::clear_account_size_refusal",
+        );
         self.command_sql(|conn: &Connection| {
             conn.execute("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?6),cleared_by='removed',claim_owner=NULL
                 WHERE kind='size' AND source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3 AND size_class=?4 AND COALESCE(observed_at,evidence_at)<?5",
@@ -2739,6 +2916,10 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn record_account_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_account_route_fence",
+        );
         self.record_classified_account_route_fence(fence, "quota")
     }
 
@@ -2746,6 +2927,10 @@ impl crate::AccountTx<'_> {
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_transient_account_route_fence",
+        );
         self.command_scope(|tx| tx.record_account_route_backoff(fence, "transient"))
     }
 
@@ -2753,6 +2938,10 @@ impl crate::AccountTx<'_> {
         &self,
         fence: &AccountRouteFence,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::record_billing_account_route_fence",
+        );
         self.command_scope(|tx| tx.record_non_quota_route_fence(fence))
     }
 
@@ -2814,6 +3003,10 @@ impl crate::AccountTx<'_> {
         until_ms: i64,
         last_reported_at: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::reconcile_account_route_fence",
+        );
         let key = serde_json::json!([fence.provider, fence.credential_id, fence.model]).to_string();
         let blocks = self.current_blocks()?;
         blocks
@@ -2848,6 +3041,10 @@ impl crate::AccountTx<'_> {
         &self,
         credential_id: &str,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::clear_all_account_route_fences_for_credential",
+        );
         let cleared=self.conn.execute("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
             WHERE credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')",params![credential_id,crate::now_ms()]).map_err(err)?;
         self.conn.execute("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0

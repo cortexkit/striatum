@@ -600,6 +600,9 @@ fn admission_due_by_values(a: &str) -> String {
 
 impl crate::AccountTx<'_> {
     pub fn prune_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_account_pins");
         self.retention_write(|tx| {
             tx.execute(
                 "DELETE FROM account_pin WHERE rowid IN ( \
@@ -622,6 +625,9 @@ impl crate::AccountTx<'_> {
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_account_admissions");
         self.prune_account_admissions_returning(before, limit, now_ms)
             .map(|deleted| deleted.len())
     }
@@ -634,6 +640,10 @@ impl crate::AccountTx<'_> {
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::retention::prune_account_admissions_returning",
+        );
         self.command_sql(|conn: &Connection| {
             // Read reservation values, not the delete candidate set: two idle
             // reservations must not keep each other forever. Source evidence
@@ -708,6 +718,10 @@ impl crate::AccountTx<'_> {
         before: i64,
         lease_before: i64,
     ) -> RouteStateResult<(AffinityRetentionBatch, Vec<AffinityRetentionKey>)> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::retention::delete_account_affinities_returning",
+        );
         self.command_sql(|tx: &Connection| {
             let mut eligible = tx.prepare(&format!(
                 "SELECT EXISTS(SELECT 1 FROM account_affinity f \
@@ -740,6 +754,9 @@ impl crate::AccountTx<'_> {
         received_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_account_observations");
         self.command_sql(|conn: &Connection| {
                 conn.execute(
                     "DELETE FROM account_observation WHERE rowid IN ( \
@@ -771,6 +788,9 @@ impl crate::AccountTx<'_> {
         received_before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_observation_events");
         self.command_sql(|conn: &Connection| {
             conn.execute(
                 "DELETE FROM account_observation_event WHERE rowid IN ( \
@@ -801,6 +821,9 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<V1DecisionRetentionBatch> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_v1_decisions");
         if limit == 0 {
             return Ok(V1DecisionRetentionBatch::default());
         }
@@ -839,6 +862,9 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn prune_v1_admissions(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_v1_admissions");
         self.retention_write(|tx| {
             tx.execute(
                 &format!(
@@ -861,6 +887,9 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn prune_v1_affinities(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_v1_affinities");
         self.retention_write(|tx| {
             tx.execute(
                 "DELETE FROM routing_v1_affinity WHERE rowid IN ( \
@@ -876,6 +905,9 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_account_continuations");
         self.prune_account_continuations_returning(before, limit)
             .map(|deleted| deleted.len())
     }
@@ -887,6 +919,10 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<Vec<crate::PrunedContinuation>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::retention::prune_account_continuations_returning",
+        );
         self.retention_write(|tx| {
             let mut statement = tx.prepare(&format!(
                 "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
@@ -937,6 +973,9 @@ impl crate::AccountTx<'_> {
         before: i64,
         limit: usize,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::prune_retired_fence_origins");
         self.retention_write(|tx| {
             tx.execute("DELETE FROM block WHERE rowid IN (
                 SELECT rowid FROM block INDEXED BY block_retired_time

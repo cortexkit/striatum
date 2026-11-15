@@ -10,10 +10,14 @@ pub(crate) fn repair<T: Send + 'static>(
     store: &SqliteRouteStateStore,
     command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::repair");
     execute(store, AccountCommandKind::Repair, command)
 }
 
 pub(crate) fn tick(store: &SqliteRouteStateStore, now_ms: i64) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::tick");
     execute(store, AccountCommandKind::Tick, move |tx| tx.tick(now_ms))
 }
 
@@ -26,6 +30,8 @@ pub(crate) fn pool_wall(
     reason: &str,
     now_ms: i64,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::pool_wall");
     store.pool_wall(provider, credential, kind, until_ms, reason, now_ms)
 }
 
@@ -34,6 +40,9 @@ pub(crate) fn pool_key_states(
     provider: &str,
     now_ms: i64,
 ) -> RouteStateResult<BTreeMap<String, striatum_core::key_pool::PoolKeyState>> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::pool_key_states");
     let published = crate::account_state::published(store, now_ms)?;
     store.pool_key_states_from(provider, now_ms, published.block_state())
 }
@@ -41,6 +50,9 @@ pub(crate) fn pool_key_states(
 pub(crate) fn prune_unserved_unpicked_facts(
     store: &SqliteRouteStateStore,
 ) -> RouteStateResult<Vec<String>> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_unserved_unpicked_facts");
     store.prune_unserved_unpicked_facts()
 }
 
@@ -53,6 +65,8 @@ pub(crate) fn execute<T: Send + 'static>(
     kind: AccountCommandKind,
     command: impl FnMut(&mut AccountCommand<'_>) -> RouteStateResult<T> + Send + 'static,
 ) -> RouteStateResult<T> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::execute");
     execute_with_error(store, kind, command)
 }
 
@@ -61,6 +75,9 @@ pub(crate) fn execute_with_error<T: Send + 'static, E: striatum_store::AccountCo
     kind: AccountCommandKind,
     mut command: impl FnMut(&mut AccountCommand<'_>) -> Result<T, E> + Send + 'static,
 ) -> Result<T, E> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::execute_with_error");
     if !store.is_private_account_copy() {
         crate::account_state::initialize(store)?;
     }
@@ -90,6 +107,9 @@ pub(crate) fn clear_route_cooldowns(
     store: &SqliteRouteStateStore,
     requested: &str,
 ) -> RouteStateResult<Option<ClearedRouteCooldowns>> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::clear_route_cooldowns");
     store.clear_route_cooldowns(requested)
 }
 
@@ -100,6 +120,10 @@ pub(crate) fn apply_fusiform_catalog_snapshot_for_providers(
     mapped_providers: &HashSet<String>,
     retained: &HashSet<(String, String)>,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::apply_fusiform_catalog_snapshot_for_providers",
+    );
     store.apply_fusiform_catalog_snapshot_for_providers(facts, cursor, mapped_providers, retained)
 }
 
@@ -107,6 +131,9 @@ pub(crate) fn put_account_vault_roster(
     store: &SqliteRouteStateStore,
     roster: &PersistedVaultRoster,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::put_account_vault_roster");
     store.put_account_vault_roster(roster)
 }
 
@@ -116,6 +143,10 @@ pub(crate) fn record_credential_entitlement_fence(
     listing_fingerprint: Option<&str>,
     observed_at_ms: i64,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::record_credential_entitlement_fence",
+    );
     store.record_credential_entitlement_fence(refusal, listing_fingerprint, observed_at_ms)
 }
 
@@ -123,6 +154,10 @@ pub(crate) fn clear_credential_entitlement_fences_for_credential(
     store: &SqliteRouteStateStore,
     credential_id: &str,
 ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::clear_credential_entitlement_fences_for_credential",
+    );
     store.clear_credential_entitlement_fences_for_credential(credential_id)
 }
 
@@ -131,6 +166,8 @@ pub(crate) fn upsert_fact<S: RouteStateStore>(
     fact: &ModelFact,
     source: FactSource,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::upsert_fact");
     store.upsert_fact(fact, source)
 }
 
@@ -141,6 +178,9 @@ pub(crate) fn record_provider_cooldown(
     capacity_key: &str,
     update: &RouteStateUpdate,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::record_provider_cooldown");
     store.record_provider_cooldown(provider_key, route_key, capacity_key, update)
 }
 
@@ -150,6 +190,9 @@ pub(crate) fn update_route_state(
     capacity_key: &str,
     update: &RouteStateUpdate,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::update_route_state");
     store.update_route_state(route_key, capacity_key, update)
 }
 
@@ -157,6 +200,9 @@ pub(crate) fn clear_failure_backoff(
     store: &SqliteRouteStateStore,
     route_key: &str,
 ) -> RouteStateResult<Option<FailureBackoffState>> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::clear_failure_backoff");
     store.clear_failure_backoff(route_key)
 }
 
@@ -168,6 +214,9 @@ pub(crate) fn clear_account_size_refusal(
     size_class: u32,
     observed_at: i64,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::clear_account_size_refusal");
     store.clear_account_size_refusal(provider, credential, model, size_class, observed_at)
 }
 
@@ -175,6 +224,9 @@ pub(crate) fn record_account_route_fence(
     store: &SqliteRouteStateStore,
     fence: &AccountRouteFence,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::record_account_route_fence");
     store.record_account_route_fence(fence)
 }
 
@@ -182,6 +234,10 @@ pub(crate) fn record_transient_account_route_fence(
     store: &SqliteRouteStateStore,
     fence: &AccountRouteFence,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::record_transient_account_route_fence",
+    );
     store.record_transient_account_route_fence(fence)
 }
 
@@ -189,6 +245,10 @@ pub(crate) fn record_billing_account_route_fence(
     store: &SqliteRouteStateStore,
     fence: &AccountRouteFence,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::record_billing_account_route_fence",
+    );
     store.record_billing_account_route_fence(fence)
 }
 
@@ -198,6 +258,9 @@ pub(crate) fn reconcile_account_route_fence(
     until_ms: i64,
     last_reported_at: i64,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::reconcile_account_route_fence");
     store.reconcile_account_route_fence(fence, until_ms, last_reported_at)
 }
 
@@ -205,6 +268,10 @@ pub(crate) fn clear_all_account_route_fences_for_credential(
     store: &SqliteRouteStateStore,
     credential_id: &str,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter(
+        "module_adapter::clear_all_account_route_fences_for_credential",
+    );
     store.clear_all_account_route_fences_for_credential(credential_id)
 }
 
@@ -216,6 +283,9 @@ pub(crate) fn pool_acquire_for_route(
     recovered: &[striatum_store::RecoveredOrigin],
     accounts: &BTreeMap<String, String>,
 ) -> RouteStateResult<PoolAcquireOutcome> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::pool_acquire_for_route");
     // A module command, so expired probes are released before the lease is
     // decided, as the readers' view already shows them.
     let provider = request.provider.to_owned();
@@ -256,6 +326,8 @@ pub(crate) fn pool_renew(
     now_ms: i64,
     lease_ms: i64,
 ) -> RouteStateResult<Option<i64>> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::pool_renew");
     let (provider, session_id, lease_id) = (
         provider.to_owned(),
         session_id.to_owned(),
@@ -283,6 +355,8 @@ pub(crate) fn pool_release(
     end_session: bool,
     now_ms: i64,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry = striatum_store::writer_entry_trace::enter("module_adapter::pool_release");
     store.pool_release(provider, session_id, lease_id, end_session, now_ms)
 }
 
@@ -291,6 +365,9 @@ pub(crate) fn v1_record_selection(
     decision: &V1Decision,
     selection_json: Option<&str>,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::v1_record_selection");
     store.v1_record_selection(decision, selection_json)
 }
 
@@ -299,6 +376,9 @@ pub(crate) fn bind_fence_probe_owner(
     from: &str,
     to: &str,
 ) -> RouteStateResult<()> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::bind_fence_probe_owner");
     store.bind_fence_probe_owner(from, to)
 }
 
@@ -308,6 +388,9 @@ pub(crate) fn prune_account_admissions(
     limit: usize,
     now_ms: i64,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_account_admissions");
     // Pruning is a writer command so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
         tx.prune_account_admissions(before, limit, now_ms)
@@ -319,6 +402,9 @@ pub(crate) fn prune_account_pins(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_account_pins");
     execute(store, AccountCommandKind::Maintenance, move |tx| {
         tx.prune_account_pins(before, limit)
     })
@@ -330,6 +416,9 @@ pub(crate) fn prune_account_affinities(
     before: i64,
     lease_before: i64,
 ) -> RouteStateResult<AffinityRetentionBatch> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_account_affinities");
     // Pruning is a writer command so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
         tx.prune_account_affinities(&keys, before, lease_before)
@@ -341,6 +430,9 @@ pub(crate) fn prune_account_observations(
     received_before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_account_observations");
     store.prune_account_observations(received_before, limit)
 }
 
@@ -349,6 +441,9 @@ pub(crate) fn prune_observation_events(
     received_before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_observation_events");
     store.prune_observation_events(received_before, limit)
 }
 
@@ -357,6 +452,9 @@ pub(crate) fn prune_v1_decisions(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<V1DecisionRetentionBatch> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_v1_decisions");
     store.prune_v1_decisions(before, limit)
 }
 
@@ -365,6 +463,9 @@ pub(crate) fn prune_v1_admissions(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_v1_admissions");
     store.prune_v1_admissions(before, limit)
 }
 
@@ -373,6 +474,9 @@ pub(crate) fn prune_v1_affinities(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_v1_affinities");
     store.prune_v1_affinities(before, limit)
 }
 
@@ -381,6 +485,9 @@ pub(crate) fn prune_account_continuations(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_account_continuations");
     // Pruning is a writer command so the admission state drops the same rows.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
         tx.prune_account_continuations(before, limit)
@@ -392,6 +499,9 @@ pub(crate) fn prune_retired_fence_origins(
     before: i64,
     limit: usize,
 ) -> RouteStateResult<usize> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::prune_retired_fence_origins");
     store.prune_retired_fence_origins(before, limit)
 }
 
@@ -401,6 +511,9 @@ pub(crate) fn apply_block_repair(
     repair: DryRunRepair,
     now: i64,
 ) -> RouteStateResult<bool> {
+    #[cfg(test)]
+    let _writer_entry =
+        striatum_store::writer_entry_trace::enter("module_adapter::apply_block_repair");
     match repair {
         DryRunRepair::ClearFence(id, reason) => {
             tx.clear_fence(&id, now, &reason)?;

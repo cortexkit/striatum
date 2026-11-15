@@ -4,6 +4,9 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "metadata/tests.rs"]
+mod metadata;
+
 const START: u64 = 1_800_000_000_000;
 const POOL_PROVIDER: &str = "pool-provider";
 const POOL_MODEL: &str = "model-pool";
@@ -17,6 +20,7 @@ enum Caller {
 
 struct World {
     harness: Arc<Harness>,
+    catalog: Catalog,
     consumer: String,
     owner: Route,
     runner: Route,
@@ -26,6 +30,8 @@ struct World {
     frozen: striatum_store::FrozenBlockData,
     outside: u64,
     commands: BTreeSet<String>,
+    trace: striatum_store::writer_entry_trace::Trace,
+    _trace_install: striatum_store::writer_entry_trace::Installed,
 }
 
 impl World {
@@ -82,11 +88,14 @@ impl World {
         let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
         let operator = harness.bind(json!({"kind":"direct"}), None).await;
         let store = harness.store();
+        let trace = striatum_store::writer_entry_trace::Trace::default();
+        let trace_install = trace.install();
         crate::account_state::initialize_at(&store, START as i64).unwrap();
         let frozen = store.frozen_block_data_for_test().unwrap();
         let outside = store.outside_account_writer_count_for_test();
         let world = Self {
             harness,
+            catalog,
             consumer,
             owner,
             runner,
@@ -96,6 +105,8 @@ impl World {
             frozen,
             outside,
             commands: BTreeSet::new(),
+            trace,
+            _trace_install: trace_install,
         };
         world.compare("seed");
         world
@@ -172,6 +183,93 @@ impl World {
         let now = self.now as i64;
         self.command("reload", move |tx| tx.tick(now));
     }
+
+    fn publish_catalog(&mut self) {
+        let _clock = crate::InjectedClock::set(self.now);
+        install_catalog(&self.harness, &self.catalog);
+        self.sequence += 1;
+        self.commands
+            .insert("catalogue/listing/quota publication".into());
+        self.compare("catalogue/listing/quota publication");
+    }
+
+    async fn request_group(&mut self, draw: u8, nonce: u64) {
+        let key = format!("generated-{nonce}-{}", self.sequence);
+        let subscription = format!("{}/model-c", fixture::SUBSCRIPTION_PROVIDER);
+        match draw {
+            0 => {
+                self.ok(
+                    Caller::Operator,
+                    "route.clear_cooldown",
+                    json!({"routeKey":subscription}),
+                )
+                .await;
+                let request = json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":key,"admission_id":key});
+                let admitted = self
+                    .ok(Caller::Runner, "route.account_for", request.clone())
+                    .await;
+                assert_eq!(
+                    self.ok(Caller::Runner, "route.account_for", request).await,
+                    admitted,
+                    "a repeated admission changed its reply"
+                );
+                self.ok(Caller::Runner,"route.account_observe",json!({"kind":"admission_started","event_id":format!("start-{key}"),"admission_id":key,"run_id":key})).await;
+                self.ok(Caller::Runner,"route.account_observe",json!({"kind":"run_finished","event_id":format!("finish-{key}"),"admission_id":key,"run_id":key})).await;
+            }
+            1 | 2 => {
+                self.ok(
+                    Caller::Operator,
+                    "route.clear_cooldown",
+                    json!({"routeKey":subscription}),
+                )
+                .await;
+                let selected = self.request(Caller::Owner,"route.select",json!({"consumer":self.consumer,"requirements":{"iq":30},"pin":subscription,"affinity":key})).await;
+                if selected.0 == FrameType::Error {
+                    assert_eq!(
+                        selected.1["code"], "no_route",
+                        "unexpected generated select error: {}",
+                        selected.1
+                    );
+                    return;
+                }
+                let selected = selected.1["result"].clone();
+                let report = json!({"decision_id":selected["decision_id"],"outcome":if draw==1 {"completed"} else {"failed"},"usage":{"run_id":key,"output_tokens":nonce%17}});
+                let recorded = self.ok(Caller::Owner, "route.report", report.clone()).await;
+                assert_eq!(
+                    self.ok(Caller::Owner, "route.report", report).await,
+                    recorded,
+                    "a report replay changed its answer"
+                );
+            }
+            3 => {
+                let lease = self
+                    .ok(
+                        Caller::Operator,
+                        "route.pool_acquire",
+                        json!({"provider":POOL_PROVIDER,"model":POOL_MODEL,"session":key}),
+                    )
+                    .await;
+                self.ok(Caller::Operator,"route.pool_renew",json!({"provider":POOL_PROVIDER,"session":key,"leaseId":lease["leaseId"],"credentialId":lease["credentialId"]})).await;
+                self.ok(Caller::Operator,"route.pool_release",json!({"provider":POOL_PROVIDER,"session":key,"leaseId":lease["leaseId"],"endSession":true})).await;
+            }
+            4 | 5 => {
+                self.ok(Caller::Operator,"route.record_cooldown",json!({"routeKey":subscription,"capacityKey":subscription,"cooldownUntil":self.now+1_000+nonce%100,"providerWide":draw==5,"lastError":"HTTP 503 provider maintenance"})).await;
+                self.ok(
+                    Caller::Operator,
+                    "route.clear_cooldown",
+                    json!({"routeKey":subscription}),
+                )
+                .await;
+            }
+            6 => {
+                self.advance([1, 60_001, 900_001][nonce as usize % 3]);
+                self.publish_catalog();
+            }
+            7 => self.reload(),
+            8 => self.publish_catalog(),
+            _ => panic!("unrecognised request group: {draw}"),
+        }
+    }
 }
 
 #[tokio::test]
@@ -212,4 +310,138 @@ async fn whole_writer_shared_seed_drives_real_requests_and_matches_a_fresh_load(
     world.ok(Caller::Operator,"route.pool_release",json!({"provider":POOL_PROVIDER,"session":"whole-writer-pool","leaseId":lease["leaseId"],"endSession":true})).await;
     world.advance(60_001);
     world.reload();
+    assert_trace_is_declared(&world.trace);
+    let entries = world.trace.entries();
+    for name in [
+        "module_adapter::pool_acquire_for_route",
+        "module_adapter::pool_renew",
+        "module_adapter::pool_release",
+    ] {
+        assert!(
+            entries.iter().any(|entry| entry.name == name
+                && entry.account_rows_written.is_some_and(|rows| rows > 0)),
+            "real producer was not traced across the handler/writer threads: {name}"
+        );
+    }
+}
+
+fn declared_adapters() -> BTreeSet<String> {
+    public_headers(include_str!("../../../account_writer.rs"))
+        .into_keys()
+        .map(|name| format!("module_adapter::{name}"))
+        .collect()
+}
+
+fn assert_trace_is_declared(trace: &striatum_store::writer_entry_trace::Trace) {
+    let mut declared = declared_adapters();
+    declared.extend(declared_mutable_commands());
+    declared.extend(metadata::native_declarations());
+    assert!(
+        !declared.is_empty(),
+        "the production producer declarations were not read"
+    );
+    for (name, reason) in TRANSIENT_COMMANDS {
+        assert!(
+            declared.contains(*name),
+            "stale transient-command exclusion: {name}: {reason}"
+        );
+    }
+    for entry in trace.entries() {
+        assert!(
+            declared.contains(entry.name),
+            "traced producer has no production declaration: {}",
+            entry.name
+        );
+        let rows = entry
+            .account_rows_written
+            .expect("a producer scope did not finish before its reply");
+        if let Some((_, reason)) = TRANSIENT_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == entry.name)
+        {
+            assert_eq!(
+                rows, 0,
+                "excluded transient helper wrote durable account state: {}: {reason}",
+                entry.name
+            );
+        }
+    }
+}
+
+fn public_headers(source: &str) -> std::collections::BTreeMap<String, String> {
+    let mut declarations = std::collections::BTreeMap::new();
+    for (start, _) in source.match_indices(" fn ") {
+        let line_start = source[..start].rfind('\n').map_or(0, |offset| offset + 1);
+        if !source[line_start..start].trim_start().starts_with("pub")
+            || source[..line_start].trim_end().ends_with("#[cfg(test)]")
+        {
+            continue;
+        }
+        let tail = &source[start + 4..];
+        let name: String = tail
+            .chars()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect();
+        let end = tail
+            .find('{')
+            .expect("production function declaration has no body");
+        assert!(
+            declarations
+                .insert(name.clone(), tail[..end].to_owned())
+                .is_none(),
+            "duplicate public producer declaration: {name}"
+        );
+    }
+    declarations
+}
+
+fn declared_mutable_commands() -> BTreeSet<String> {
+    public_headers(include_str!("../../../account_state.rs"))
+        .into_iter()
+        .filter(|(_, header)| header.contains("mut self"))
+        .map(|(name, _)| format!("account_command::{name}"))
+        .collect()
+}
+
+// These methods update only the process-local concurrency queue, not durable
+// account state. They remain traced so adding a durable account-state write is detected.
+const TRANSIENT_COMMANDS: &[(&str, &str)] = &[
+    (
+        "account_command::record_waiter",
+        "records a conversation in the in-memory waiter queue",
+    ),
+    (
+        "account_command::retime_waiter",
+        "retimes the in-memory waiter queue",
+    ),
+    (
+        "account_command::took_slot",
+        "removes an in-memory waiter after it takes a concurrency slot",
+    ),
+];
+
+fn shuffled_request_groups(seed: u64) -> Vec<(u8, u64)> {
+    let mut random = seed;
+    let mut next = || {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        random >> 32
+    };
+    let mut plan: Vec<_> = (0..9u8).map(|group| (group, next())).collect();
+    for index in (1..plan.len()).rev() {
+        plan.swap(index, next() as usize % (index + 1));
+    }
+    plan.extend((0..24).map(|_| ((next() % 9) as u8, next())));
+    plan
+}
+
+#[tokio::test]
+async fn generated_request_groups_compare_all_state_after_every_real_step() {
+    let _clock = crate::InjectedClock::set(START);
+    for seed in 1..=6 {
+        let mut world = World::new(&format!("whole-writer-requests-{seed}")).await;
+        for (draw, nonce) in shuffled_request_groups(seed) {
+            world.request_group(draw, nonce).await;
+        }
+        assert_trace_is_declared(&world.trace);
+    }
 }

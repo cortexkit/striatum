@@ -259,6 +259,7 @@ impl ConnectionStore {
                     }
                     #[cfg(any(test, feature = "test-support"))]
                     if ACCOUNT_TABLES.contains(&table) {
+                        crate::writer_entry_trace::account_row_written();
                         if IN_ACCOUNT_BATCH.with(|inside| inside.get()) {
                             ACCOUNT_ROWS_CHANGED.with(|rows| rows.set(rows.get() + 1));
                         } else {

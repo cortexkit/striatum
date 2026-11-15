@@ -204,6 +204,9 @@ impl AccountTx<'_> {
         scope: Option<&crate::QuotaSuccessScope>,
         now: i64,
     ) -> RouteStateResult<Vec<crate::FenceRecheck>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::report_delivery::heal_admission_success");
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(Vec::new());
         }
@@ -415,6 +418,10 @@ impl AccountTx<'_> {
         fact: &AccountSizeRefusal,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::record_non_quota_size_refusal",
+        );
         let mut capped = fact.clone();
         capped.expires_at = capped.expires_at.min(now.saturating_add(3_600_000));
         let row = crate::block_storage::size_source(&capped, false).map_err(err)?;
@@ -438,6 +445,10 @@ impl AccountTx<'_> {
             .map_err(err)
     }
     pub fn record_non_quota_route_fence(&self, fence: &AccountRouteFence) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::record_non_quota_route_fence",
+        );
         self.record_account_route_backoff(fence, "billing")
     }
     pub(crate) fn record_account_route_backoff(
@@ -485,6 +496,10 @@ impl AccountTx<'_> {
         fingerprint: Option<&str>,
         now: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::record_credential_refusal",
+        );
         let effects = V1ReportEffects {
             credential_refusal: Some((refusal.clone(), fingerprint.map(str::to_owned))),
             ..Default::default()
@@ -497,6 +512,10 @@ impl AccountTx<'_> {
         provider: &str,
         credential: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::clear_credential_entitlement_fence",
+        );
         crate::block_storage::remove_source(
             self.conn,
             "credential",
@@ -515,6 +534,10 @@ impl AccountTx<'_> {
         &self,
         fence: &striatum_core::route_state_store::CredentialEntitlementFence,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::clear_held_entitlement_fence",
+        );
         let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?6,cleared_by='removed',claim_owner=NULL
             WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2
             AND code=?3 AND listing_fingerprint IS ?4 AND observed_at=?5",
@@ -533,10 +556,17 @@ impl AccountTx<'_> {
     pub fn report_credential_refusals(
         &self,
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::report_delivery::report_credential_refusals",
+        );
         Ok(self.current_blocks()?.entitlement_fences())
     }
 
     pub fn report_route_fences(&self, _now: i64) -> RouteStateResult<Vec<AccountRouteFence>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::report_delivery::report_route_fences");
         Ok(self.current_blocks()?.route_fences("quota"))
     }
 }

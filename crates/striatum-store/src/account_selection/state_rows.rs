@@ -215,12 +215,20 @@ impl AccountTx<'_> {
     /// Rowid of the row the previous INSERT on this connection created. The
     /// admission and continuation indexes order by it exactly as SQL does.
     pub fn last_insert_rowid(&self) -> i64 {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::last_insert_rowid",
+        );
         self.conn.last_insert_rowid()
     }
 
     /// Load the admission group's rows for the module's state. Must run in
     /// the writer's read-only load transaction.
     pub fn load_admission_group(&self) -> RouteStateResult<AdmissionGroupRows> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::load_admission_group",
+        );
         if continuations_exist(self.conn).map_err(err)? {
             let partial: Option<(i64, String, String)> = self
                 .conn
@@ -370,6 +378,10 @@ impl AccountTx<'_> {
         conversation_hash: &str,
         provider: &str,
     ) -> RouteStateResult<Option<LatestAdmissionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::latest_admission_for_conversation",
+        );
         self.conn
             .query_row(
                 &latest_admission_for_conversation_sql(),
@@ -388,6 +400,10 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Option<(i64, String)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::latest_used_continuation_row",
+        );
         self.conn
             .query_row(
                 LATEST_USED_CONTINUATION_SQL,
@@ -494,6 +510,10 @@ impl AccountTx<'_> {
         principal: &str,
         admission_id: &str,
     ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::admission_by_key",
+        );
         self.conn
             .query_row(
                 &format!(
@@ -514,6 +534,10 @@ impl AccountTx<'_> {
         principal: &str,
         selection: &str,
     ) -> RouteStateResult<Option<crate::V1Recorded>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::continuation_by_key",
+        );
         self.conn
             .query_row(
                 &format!(
@@ -540,6 +564,10 @@ impl AccountTx<'_> {
         row: &AccountAdmissionRow,
         from_state: &str,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::set_admission_lifecycle",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET state = ?3, run_id = ?4, started_at = ?5, \
@@ -570,6 +598,10 @@ impl AccountTx<'_> {
         previous: Option<i64>,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::set_admission_last_observed",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET last_observed_at = ?3 \
@@ -584,6 +616,10 @@ impl AccountTx<'_> {
     /// for commands without module state. Live commands compute those rows on
     /// their in-memory continuation chain and write by key.
     pub fn observe_admission(&self, row: &AccountAdmissionRow, at: i64) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::observe_admission",
+        );
         self.conn
             .execute(
                 "UPDATE account_admission SET last_observed_at = \
@@ -607,6 +643,10 @@ impl AccountTx<'_> {
         previous: Option<i64>,
         at: i64,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::set_affinity_lease_end",
+        );
         self.conn
             .execute(
                 "UPDATE account_affinity SET lease_valid_until = ?4 \
@@ -633,6 +673,10 @@ impl AccountTx<'_> {
         principal: &str,
         id: &str,
     ) -> RouteStateResult<Option<AdmissionStateRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::admission_success_by_key",
+        );
         let scope = if crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             "input_size_class,model_decision_id"
         } else {
@@ -671,6 +715,10 @@ impl AccountTx<'_> {
         decision: &str,
         run: Option<&str>,
     ) -> RouteStateResult<Vec<(AccountAdmissionRow, Option<u32>)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::admissions_for_run",
+        );
         note_keyed_exception();
         collect(
             self.conn,
@@ -700,6 +748,10 @@ impl AccountTx<'_> {
         admission_id: &str,
         states: &[String],
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::admission_in_states",
+        );
         let list = states.iter().map(|_| "?").collect::<Vec<_>>().join(",");
         let mut values: Vec<&dyn rusqlite::ToSql> = vec![&principal, &admission_id];
         values.extend(states.iter().map(|state| state as &dyn rusqlite::ToSql));
@@ -724,6 +776,10 @@ impl AccountTx<'_> {
         used_at: Option<i64>,
         released_at: Option<i64>,
     ) -> RouteStateResult<bool> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::settle_continuation_offer",
+        );
         self.conn
             .execute(
                 "UPDATE account_continue SET used_at_ms = COALESCE(?3, used_at_ms), \

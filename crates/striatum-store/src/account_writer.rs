@@ -47,6 +47,8 @@ impl AccountTx<'_> {
     }
 
     pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::account_writer::tick");
         self.reconcile_block_state()?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
@@ -56,6 +58,9 @@ impl AccountTx<'_> {
     /// The part of a Tick that synchronizes fence rechecks, for a caller that
     /// applies the admission and continuation expiries itself.
     pub fn sync_fence_rechecks(&self) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::account_writer::sync_fence_rechecks");
         crate::fence_rechecks::sync_on(self, crate::now_ms()).map_err(err)
     }
 }
@@ -644,10 +649,14 @@ impl SqliteRouteStateStore {
         #[cfg(any(test, feature = "test-support"))]
         let inputs = crate::replay::current();
         #[cfg(any(test, feature = "test-support"))]
+        let writer_trace = crate::writer_entry_trace::current();
+        #[cfg(any(test, feature = "test-support"))]
         let command_changes = writer.command_changes.clone();
         let reply = writer.enqueue(move |tx, state| {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
+            #[cfg(any(test, feature = "test-support"))]
+            let _writer_trace = writer_trace.as_ref().map(|trace| trace.install());
             #[cfg(any(test, feature = "test-support"))]
             let before = connection_store::account_rows_changed();
             let result = f(tx, state);

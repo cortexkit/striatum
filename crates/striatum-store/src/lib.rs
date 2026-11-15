@@ -70,6 +70,9 @@ mod frozen_block_data;
 mod route_snapshot;
 mod sql_real;
 #[cfg(any(test, feature = "test-support"))]
+#[path = "writer_entry_trace/tests.rs"]
+pub mod writer_entry_trace;
+#[cfg(any(test, feature = "test-support"))]
 pub use block_state::reviewed_exempt_reads;
 pub use block_state::{
     block_read_backs, block_reconcile_reloads, BlockRows, BlockState, DryRunRepair,
@@ -7054,6 +7057,9 @@ impl crate::AccountTx<'_> {
         &self,
         requested: &str,
     ) -> RouteStateResult<Option<ClearedRouteCooldowns>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::clear_route_cooldowns");
         self.command_sql(|conn: &Connection| {
             let tx = conn;
             let known = |key: &str| -> rusqlite::Result<bool> {
@@ -7100,6 +7106,9 @@ impl crate::AccountTx<'_> {
         facts: &[FusiformFactUpdate],
         cursor: FusiformCatalogCursor,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::apply_fusiform_catalog");
         self.apply_fusiform_catalog_for_providers(facts, cursor, &HashSet::new())
     }
 
@@ -7109,6 +7118,10 @@ impl crate::AccountTx<'_> {
         cursor: FusiformCatalogCursor,
         mapped_providers: &HashSet<String>,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::apply_fusiform_catalog_for_providers",
+        );
         self.apply_fusiform_catalog_for_providers_inner(
             facts,
             cursor,
@@ -7125,6 +7138,10 @@ impl crate::AccountTx<'_> {
         mapped_providers: &HashSet<String>,
         retained: &HashSet<(String, String)>,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::apply_fusiform_catalog_snapshot_for_providers",
+        );
         self.apply_fusiform_catalog_for_providers_inner(
             facts,
             cursor,
@@ -7380,6 +7397,9 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn put_account_vault_roster(&self, roster: &PersistedVaultRoster) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::put_account_vault_roster");
         self.command_sql(|c: &Connection| {
             c.execute(
                 "INSERT INTO account_vault_roster (singleton, view, roster_json, fetched_at)
@@ -7401,6 +7421,10 @@ impl crate::AccountTx<'_> {
         listing_fingerprint: Option<&str>,
         observed_at_ms: i64,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::record_credential_entitlement_fence",
+        );
         if refusal.provider_id.trim().is_empty() || refusal.credential_id.trim().is_empty() {
             return Ok(());
         }
@@ -7415,6 +7439,9 @@ impl crate::AccountTx<'_> {
         credential_id: &str,
         observed_at_ms: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::touch_credential_entitlement_fence");
         self.command_sql(|c: &Connection| {
             let tx = c;
             let state = self
@@ -7449,6 +7476,10 @@ impl crate::AccountTx<'_> {
         provider_id: &str,
         credential_id: &str,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::clear_credential_entitlement_fence_count",
+        );
         self.command_sql(|c: &Connection| {
             c.execute(
                 "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
@@ -7463,6 +7494,10 @@ impl crate::AccountTx<'_> {
         &self,
         credential_id: &str,
     ) -> RouteStateResult<Vec<striatum_core::route_state_store::CredentialEntitlementFence>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::clear_credential_entitlement_fences_for_credential",
+        );
         self.command_sql(|c: &Connection| {
             let lifted=self.current_blocks().map_err(fence_rechecks::command_error)?.entitlement_fences().into_iter().filter(|row|row.credential_id==credential_id).collect();
             c.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
@@ -7477,6 +7512,10 @@ impl crate::AccountTx<'_> {
         credential_id: &str,
         fingerprint: Option<&str>,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::clear_credential_entitlement_fences",
+        );
         self.command_sql(|c: &Connection| {
             c.execute(
                 "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
@@ -7492,6 +7531,10 @@ impl crate::AccountTx<'_> {
         credential_id: &str,
         fingerprint: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::lib::adopt_credential_entitlement_fingerprint",
+        );
         self.command_sql(|c: &Connection| {
             c.execute(
                 "UPDATE block SET listing_fingerprint=?2
@@ -7504,6 +7547,8 @@ impl crate::AccountTx<'_> {
     }
 
     pub fn upsert_fact(&self, fact: &ModelFact, source: FactSource) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::lib::upsert_fact");
         let route = fact_to_route(fact);
         derive_provider_key(&fact.provider_id)
             .ok_or_else(|| err("model fact has no canonical provider key"))?;
@@ -7648,6 +7693,9 @@ impl crate::AccountTx<'_> {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::record_provider_cooldown");
         let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
         let mut bounded = update.clone();
         {
@@ -7818,6 +7866,8 @@ impl crate::AccountTx<'_> {
         capacity_key: &str,
         update: &RouteStateUpdate,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter("account_tx::lib::update_route_state");
         let observed_at = update.observed_at_ms.unwrap_or_else(now_ms);
         let mut bounded = update.clone();
         {
@@ -7977,6 +8027,9 @@ impl crate::AccountTx<'_> {
         decision_id: &str,
         update: &DecisionOutcomeUpdate,
     ) -> RouteStateResult<()> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::set_decision_outcome");
         // Retain the full error in the audit, but treat an explicitly account-
         // scoped failure as neutral model-health evidence. This closes both the
         // route-global quota writer and the terminal-failure backoff writer. The
@@ -8193,6 +8246,9 @@ impl crate::AccountTx<'_> {
         &self,
         route_key: &str,
     ) -> RouteStateResult<Option<FailureBackoffState>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::lib::clear_failure_backoff");
         self.command_sql(|c: &Connection| {
             let tx = c;
             let prior = tx
