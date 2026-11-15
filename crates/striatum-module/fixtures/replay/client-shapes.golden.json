@@ -149,6 +149,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -920,6 +956,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -1372,6 +1444,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -1810,6 +1918,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -2278,6 +2422,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -2786,6 +2966,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -3229,6 +3445,42 @@
                 "admission_id": "run-sid-EXAMPLEadmission0000000",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": "claude-opus-5",
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": {
+                      "accounts": [
+                        {
+                          "account_id": "acct-example-a",
+                          "credential_id": "oauth:anthropic:example-a"
+                        },
+                        {
+                          "account_id": "acct-example-b",
+                          "credential_id": "oauth:anthropic:example-b"
+                        }
+                      ],
+                      "view_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+                    },
+                    "harness": "broca",
+                    "initial_input_bytes": 12345,
+                    "initial_input_estimated": true,
+                    "model": "claude-opus-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:broca",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -3667,6 +3919,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": "dec_synthetic",
+                    "owner_scope": {
+                      "harness": "thalamus-harness",
+                      "owner": "reserved:prefrontal-core",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -4238,6 +4514,30 @@
                 "admission_id": "bd426dc6-43e0-4f83-bb46-1d2d1fb74850",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "gpt-6-luna",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-harness",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "openai",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "openai"
@@ -4655,6 +4955,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-harness",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -5109,6 +5433,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-harness",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -5562,6 +5910,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-harness",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -6062,6 +6434,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-harness",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-harness",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -6535,6 +6931,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": "dec_synthetic",
+                    "owner_scope": {
+                      "harness": "thalamus-pi",
+                      "owner": "reserved:prefrontal-core",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -7106,6 +7526,30 @@
                 "admission_id": "bd426dc6-43e0-4f83-bb46-1d2d1fb74850",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "gpt-6-luna",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-pi",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "openai",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "openai"
@@ -7523,6 +7967,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-pi",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -7977,6 +8445,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-pi",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -8430,6 +8922,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-pi",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
@@ -8930,6 +9446,30 @@
                 "admission_id": "dbd4b9e2-cd19-4a07-af0c-162739afdbd1",
                 "code": "cold_scored",
                 "context_json": {
+                  "continuation_input": {
+                    "affinity_model": null,
+                    "allowed_account_class": "not_pay_per_token",
+                    "auth_method": "oauth",
+                    "candidates": null,
+                    "harness": "thalamus-pi",
+                    "initial_input_bytes": 0,
+                    "initial_input_estimated": false,
+                    "model": "claude-opus-5-5",
+                    "model_decision_id": null,
+                    "owner_scope": {
+                      "harness": null,
+                      "owner": "reserved:thalamus-pi",
+                      "project_id": null,
+                      "workdir": null
+                    },
+                    "parent_conversation_key": null,
+                    "provider": "anthropic",
+                    "request_input_tokens": null,
+                    "requested_account": null,
+                    "service_tier": null,
+                    "subscription": true,
+                    "version": 1
+                  },
                   "roster": {
                     "account_classes": true,
                     "provider": "anthropic"
