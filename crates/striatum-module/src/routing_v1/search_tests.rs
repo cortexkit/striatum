@@ -215,6 +215,8 @@ async fn omitted_kind_uses_declared_search_and_otherwise_keeps_chat_decoding() {
     let (ty, reply) = route.call("route.select", &params).await;
     assert_eq!(ty, FrameType::Response, "{reply}");
     assert_eq!(reply["result"]["engine"]["model"], "allowance");
+    params.as_object_mut().unwrap().remove("privacy");
+    refused(&route, &params, "invalid_request", Some("privacy")).await;
     let mut entries = declarations();
     entries[0]["role_declarations"]["routing/v1"]["consumers"]
         .as_array_mut()

@@ -257,23 +257,26 @@ async fn declared_placement_inherits_only_same_owner_and_nearest_member() {
 }
 
 #[tokio::test]
-async fn production_declared_search_kind_is_invalid_even_when_inherited() {
-    super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
-        let h = harness();
-        placement_catalog(
-            &h,
-            json!([
-                {"name":"basal.task", "kind":"llm"},
-                {"name":"basal.task.child", "kind":"search"}
-            ]),
-        );
-        let route = h.bind(reserved("basal"), None).await;
-        let (frame, reply) = route
-            .call("route.select", &select("basal.task.child.unlisted"))
-            .await;
-        assert_eq!(frame, FrameType::Error, "{reply}");
-        assert_eq!(reply["code"], "invalid_request", "{reply}");
-        assert_eq!(reply["detail"]["field"], "kind", "{reply}");
+async fn media_only_declared_search_kind_is_invalid_even_when_inherited() {
+    super::describe::without_capability("select_search", async {
+        super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
+            let h = harness();
+            placement_catalog(
+                &h,
+                json!([
+                    {"name":"basal.task", "kind":"llm"},
+                    {"name":"basal.task.child", "kind":"search"}
+                ]),
+            );
+            let route = h.bind(reserved("basal"), None).await;
+            let (frame, reply) = route
+                .call("route.select", &select("basal.task.child.unlisted"))
+                .await;
+            assert_eq!(frame, FrameType::Error, "{reply}");
+            assert_eq!(reply["code"], "invalid_request", "{reply}");
+            assert_eq!(reply["detail"]["field"], "kind", "{reply}");
+        })
+        .await;
     })
     .await;
 }
