@@ -12,7 +12,6 @@ RUST = runpy.run_path(str(ROOT / "scripts/rust-include-boundary.py"))
 HELPER = "crates/striatum-store/src/transactions.rs"
 ALLOWLIST = ROOT / "scripts/read-only-transactions.allow"
 ACCOUNT_ENTRIES = ROOT / "scripts/account-writer-entry-points.txt"
-PROJECTION = "crates/striatum-store/src/evaluation_snapshot.rs::projection_command"
 OPENING = re.compile(
     r"\b(?:unchecked_transaction|transaction|transaction_with_behavior)\s*\("
     r"|\bTransaction\s*::\s*(?:new|new_unchecked)\s*\("
@@ -57,18 +56,13 @@ def read_allowlist(path: Path) -> dict[str, str]:
 
 def read_account_entries(path: Path) -> set[str]:
     entries = set()
-    projections = []
     for line in path.read_text().splitlines():
         if not line or line.startswith("#"):
             continue
-        if line.startswith("@projection "):
-            projections.append(line.removeprefix("@projection "))
-        elif not re.fullmatch(r"\w+", line) or line in entries:
+        if not re.fullmatch(r"\w+", line) or line in entries:
             raise ValueError(f"invalid account writer entry: {line}")
         else:
             entries.add(line)
-    if projections != [PROJECTION]:
-        raise ValueError("exactly the private SQL projection allowance is required")
     return entries
 
 
@@ -76,9 +70,6 @@ def account_writer_violations(root: Path, entries: set[str]) -> list[str]:
     """Distinguish store entry points from methods on a command's AccountTx."""
     source_root = root / "crates/striatum-module/src"
     files = sorted(source_root.rglob("*.rs"))
-    projection_file = root / PROJECTION.split("::")[0]
-    if projection_file.exists():
-        files.append(projection_file)
     declarations = {}
     test_files = set()
     globals_ = MODULES["declarations_in"].__globals__
@@ -156,8 +147,6 @@ def account_writer_violations(root: Path, entries: set[str]) -> list[str]:
             if receiver and any(start <= call.start() < end and receiver[1] == name for start, end, name in tx_scopes):
                 continue
             owner = next((name for start, end, name in reversed(functions) if start <= call.start() < end), "<outside-function>")
-            if f"{relative}::{owner}" == PROJECTION:
-                continue
             line = source.count("\n", 0, call.start()) + 1
             errors.append(f"{relative}:{line}: {call[1]} must be submitted from account_writer.rs")
     return errors

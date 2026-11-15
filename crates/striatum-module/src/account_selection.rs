@@ -44,7 +44,7 @@ use sha2::{Digest, Sha256};
 
 use crate::account_quota::{self, AccountEntry, AccountQuotaState, SharedAccountQuota};
 use crate::account_refusal_log::{because, checking};
-use crate::account_state::{writer, AccountCommand, BlockReads};
+use crate::account_state::{AccountCommand, BlockReads};
 use crate::config_overrides::AccountSelectionFlags;
 
 /// Choose the account for one admission, renewal or reassignment.
@@ -1134,41 +1134,84 @@ impl ClassContext {
         credentials: &crate::broca_credentials::SharedBrocaCredentials,
         config: std::sync::Arc<crate::config_overrides::LiveConfig>,
         accounts: Option<&SharedAccountQuota>,
-        mut facts: Vec<striatum_core::ModelFact>,
+        facts: Vec<striatum_core::ModelFact>,
         catalog_snapshot: &striatum_store::CatalogFactsSnapshot,
         now_ms: i64,
     ) -> Result<Self, String> {
+        Self::read_for_sweep(
+            store,
+            credentials,
+            config,
+            accounts,
+            facts,
+            catalog_snapshot,
+            now_ms,
+            None,
+        )
+    }
+
+    pub(crate) fn read_for_sweep(
+        store: &SqliteRouteStateStore,
+        credentials: &crate::broca_credentials::SharedBrocaCredentials,
+        config: std::sync::Arc<crate::config_overrides::LiveConfig>,
+        accounts: Option<&SharedAccountQuota>,
+        mut facts: Vec<striatum_core::ModelFact>,
+        catalog_snapshot: &striatum_store::CatalogFactsSnapshot,
+        now_ms: i64,
+        sweep: Option<&dry_run::Sweep>,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        if let Some(oracle) = sweep.and_then(|sweep| sweep.oracle.as_ref()) {
+            return Self::read_with_catalog(
+                oracle,
+                credentials,
+                config,
+                accounts,
+                facts,
+                catalog_snapshot,
+                now_ms,
+            );
+        }
         #[cfg(test)]
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
-        if crate::account_state::has_expired_admission_probes(store, now_ms)
-            .map_err(|error| error.to_string())?
+        if let Some(sweep) = sweep {
+            sweep.expire(now_ms);
+        }
+        if sweep.is_none()
+            && crate::account_state::has_expired_admission_probes(store, now_ms)
+                .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
                 tx.release_expired_admission_probes(now_ms)
             })
             .map_err(|error| error.to_string())?;
         }
-        if crate::account_state::has_expired_continuations(store, now_ms)
-            .map_err(|error| error.to_string())?
+        if sweep.is_none()
+            && crate::account_state::has_expired_continuations(store, now_ms)
+                .map_err(|error| error.to_string())?
         {
             crate::account_writer::repair(store, move |tx| {
                 tx.release_expired_continuations(now_ms)
             })
             .map_err(|error| error.to_string())?;
         }
-        let refusals = crate::credential_fences::live_with_eligibility(store, credentials, true)?;
+        let refusals = match sweep {
+            Some(sweep) => sweep.listing(credentials, now_ms)?,
+            None => crate::credential_fences::live_with_eligibility(store, credentials, true)?,
+        };
         let probe_scope = std::sync::Arc::downgrade(credentials);
         let credentials = credentials
             .lock()
             .map_err(|error| error.to_string())?
             .snapshot();
-        let eligibility = crate::account_state::published(store)
+        let eligibility = dry_run::published(store, sweep)
             .and_then(|blocks| blocks.account_eligibility())
             .map_err(|error| error.to_string())?;
-        let mut size_refusals = crate::account_state::published(store)
+        let mut size_refusals = dry_run::published(store, sweep)
             .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
-        let mut catalog: crate::broca_credentials::AuthCatalog = catalog_snapshot.facts.iter().collect();
+        let mut catalog: crate::broca_credentials::AuthCatalog =
+            catalog_snapshot.facts.iter().collect();
         catalog.providers = catalog_snapshot.providers.clone();
         let identity_facts: Vec<_> = facts
             .iter()
@@ -1193,7 +1236,10 @@ impl ClassContext {
             .chain(media_providers.iter())
             .collect::<BTreeSet<_>>()
         {
-            let read_states = || crate::account_writer::pool_key_states(store, provider, now_ms);
+            let read_states = || match sweep {
+                Some(sweep) => sweep.pool_states(provider, now_ms),
+                None => crate::account_writer::pool_key_states(store, provider, now_ms),
+            };
             #[cfg(test)]
             let read_states = || {
                 if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
@@ -1215,7 +1261,7 @@ impl ClassContext {
             .and_then(|accounts| accounts.lock().ok().map(|state| state.clone()))
             .unwrap_or_default();
         let account_ids = credentials.quota_account_ids(&quota);
-        let size_clocks = crate::account_state::published(store)
+        let size_clocks = dry_run::published(store, sweep)
             .and_then(|blocks| blocks.fence_rechecks())
             .map_err(|error| error.to_string())?;
         for fact in &size_refusals {
@@ -1243,23 +1289,27 @@ impl ClassContext {
             if recovered {
                 // Compare evidence time so a concurrently reported refusal is
                 // never erased by the older recovery snapshot.
-                crate::account_writer::clear_account_size_refusal(
-                    store,
-                    &fact.provider,
-                    &fact.credential_id,
-                    &fact.model,
-                    fact.size_class,
-                    fact.observed_at.saturating_add(1),
-                )
-                .map_err(|error| error.to_string())?;
+                if let Some(sweep) = sweep {
+                    sweep.clear_size(fact);
+                } else {
+                    crate::account_writer::clear_account_size_refusal(
+                        store,
+                        &fact.provider,
+                        &fact.credential_id,
+                        &fact.model,
+                        fact.size_class,
+                        fact.observed_at.saturating_add(1),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
             }
         }
         // Each read below takes the state published after the commands
         // above, so it sees what they changed.
-        size_refusals = crate::account_state::published(store)
+        size_refusals = dry_run::published(store, sweep)
             .and_then(|blocks| blocks.account_size_refusals(now_ms))
             .map_err(|error| error.to_string())?;
-        let blocks = crate::account_state::published(store).map_err(|error| error.to_string())?;
+        let blocks = dry_run::published(store, sweep).map_err(|error| error.to_string())?;
         let mut route_fences = blocks
             .account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
@@ -1271,8 +1321,17 @@ impl ClassContext {
             .transient_account_route_fences(now_ms)
             .map_err(|error| error.to_string())?;
         drop(blocks);
-        repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
-        route_fences = crate::account_state::published(store)
+        if let Some(sweep) = sweep {
+            for (provider, credential, at) in
+                route_fence_recoveries(sweep, &account_ids, &quota, &config, now_ms)
+                    .map_err(|e| e.to_string())?
+            {
+                sweep.clear_routes(&provider, &credential, at);
+            }
+        } else {
+            repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
+        }
+        route_fences = dry_run::published(store, sweep)
             .and_then(|blocks| blocks.account_route_fences(now_ms))
             .map_err(|error| error.to_string())?;
         for fence in &mut route_fences {
@@ -1301,27 +1360,46 @@ impl ClassContext {
                     reset.max(fence.until_ms)
                 };
                 if until != fence.until_ms {
-                    crate::account_writer::reconcile_account_route_fence(
-                        store,
-                        fence,
-                        until,
-                        latest_reports[&fence.credential_id],
-                    )
-                    .map_err(|error| error.to_string())?;
+                    if let Some(sweep) = sweep {
+                        sweep.reconcile_route(fence, until);
+                    } else {
+                        crate::account_writer::reconcile_account_route_fence(
+                            store,
+                            fence,
+                            until,
+                            latest_reports[&fence.credential_id],
+                        )
+                        .map_err(|error| error.to_string())?;
+                    }
                     fence.until_ms = until;
                 }
             }
         }
-        let refusals = refresh_credential_quota_holds(
-            store,
-            &account_ids,
-            &quota,
-            &config,
-            refusals,
-            &recorded_route_fences,
-            now_ms,
-        )?;
-        let blocks = crate::account_state::published(store).map_err(|error| error.to_string())?;
+        let refusals = if let Some(sweep) = sweep {
+            reconcile_credential_quota_holds(
+                sweep,
+                &account_ids,
+                &quota,
+                &config,
+                refusals,
+                &recorded_route_fences,
+                now_ms,
+                true,
+                &mut false,
+            )
+            .map_err(|e| e.to_string())?
+        } else {
+            refresh_credential_quota_holds(
+                store,
+                &account_ids,
+                &quota,
+                &config,
+                refusals,
+                &recorded_route_fences,
+                now_ms,
+            )?
+        };
+        let blocks = dry_run::published(store, sweep).map_err(|error| error.to_string())?;
         let fences = facts
             .iter()
             .map(|fact| fact.provider_id.clone())
@@ -1331,9 +1409,7 @@ impl ClassContext {
             .map(|provider| Ok((provider.clone(), load_fences(&blocks, &provider)?)))
             .collect::<RouteStateResult<_>>()
             .map_err(|error| error.to_string())?;
-        let rechecks = blocks
-            .fence_rechecks()
-            .map_err(|error| error.to_string())?;
+        let rechecks = blocks.fence_rechecks().map_err(|error| error.to_string())?;
         drop(blocks);
         let mut context = Self {
             serving_index: crate::serving_index::ServingIndex::get(
@@ -1384,20 +1460,39 @@ impl ClassContext {
             .collect();
         if !recovered.is_empty() {
             let fences = context.fences.clone();
-            let fences = crate::account_writer::repair(store, move |tx| {
+            let fences = if let Some(sweep) = sweep {
                 for id in &recovered {
-                    tx.clear_fence(id, now_ms, "fresh_headroom")?;
+                    sweep
+                        .repair(
+                            striatum_store::DryRunRepair::ClearFence(
+                                id.clone(),
+                                "fresh_headroom".into(),
+                            ),
+                            now_ms,
+                        )
+                        .map_err(|e| e.to_string())?;
                 }
-                let mut fences = fences.clone();
+                let mut fences = fences;
                 for (provider, fences) in &mut fences {
-                    *fences = load_fences(&*tx, provider)?;
+                    *fences = load_fences(sweep, provider).map_err(|e| e.to_string())?;
                 }
-                Ok(fences)
-            })
-            .map_err(|error| error.to_string())?;
+                fences
+            } else {
+                crate::account_writer::repair(store, move |tx| {
+                    for id in &recovered {
+                        tx.clear_fence(id, now_ms, "fresh_headroom")?;
+                    }
+                    let mut fences = fences.clone();
+                    for (provider, fences) in &mut fences {
+                        *fences = load_fences(&*tx, provider)?;
+                    }
+                    Ok(fences)
+                })
+                .map_err(|error| error.to_string())?
+            };
             context.replace_fences(fences);
             context.replace_rechecks(
-                crate::account_state::published(store)
+                dry_run::published(store, sweep)
                     .and_then(|blocks| blocks.fence_rechecks())
                     .map_err(|error| error.to_string())?,
             );
@@ -4132,14 +4227,6 @@ pub(crate) fn refresh_credential_quota_holds_in(
     reconcile_credential_quota_holds(tx, credentials, quota, config, refusals, route_fences, now, true, &mut false)
 }
 
-/// End a credential refusal that fresh quota evidence has lifted.
-fn clear_lifted_refusal(
-    tx: &AccountTx<'_>,
-    refusal: &striatum_core::route_state_store::CredentialEntitlementFence,
-) -> RouteStateResult<()> {
-    tx.clear_credential_entitlement_fence(&refusal.provider_id, &refusal.credential_id)
-}
-
 fn reconcile_credential_quota_holds(
     tx: &(impl BlockReads + ?Sized),
     credentials: &crate::broca_credentials::CredentialAccounts,
@@ -4162,7 +4249,15 @@ fn reconcile_credential_quota_holds(
             for block in tx.active_pool_fences(&refusal.provider_id)? {
                 if block.evidence.fence_id.starts_with(&prefix) {
                     *changed = true;
-                    if write { writer(tx)?.clear_held_fence(&block.evidence, now, "entitlement_not_quota")?; }
+                    if write {
+                        tx.repair(
+                            striatum_store::DryRunRepair::ClearHeld(
+                                block.evidence.clone(),
+                                "entitlement_not_quota".into(),
+                            ),
+                            now,
+                        )?;
+                    }
                 }
             }
             kept.push(refusal);
@@ -4181,7 +4276,11 @@ fn reconcile_credential_quota_holds(
             .iter()
             .any(|block| block.evidence.fence_id.starts_with(&prefix));
         let headroom = crate::credential_fences::fresh_headroom_after_for_account(
-            quota, &account, i64::MIN, now, &policy,
+            quota,
+            &account,
+            i64::MIN,
+            now,
+            &policy,
         );
         let reading_at = crate::credential_fences::latest_reading_for_account(quota, &account)
             .and_then(|reading| reading.entry.get("fetchedAt").and_then(Value::as_str))
@@ -4205,7 +4304,8 @@ fn reconcile_credential_quota_holds(
                 || (crate::credential_fences::has_quota_signal_for_account(quota, &account)
                     && !headroom));
         let prior_classified = prior_clocks.iter().find(|origin| {
-            origin.kind == "credential" && origin.classified
+            origin.kind == "credential"
+                && origin.classified
                 && origin.provider == refusal.provider_id
                 && origin.credential_id.as_deref() == Some(&refusal.credential_id)
                 && origin.evidence_at == refusal.observed_at_ms
@@ -4213,12 +4313,25 @@ fn reconcile_credential_quota_holds(
         let (classified, needs_write) = if let Some(origin) = prior_classified {
             (origin.quota, false)
         } else {
-            tx.credential_quota_classification(&refusal.provider_id, &refusal.credential_id, quota_interpretation)?
+            tx.credential_quota_classification(
+                &refusal.provider_id,
+                &refusal.credential_id,
+                quota_interpretation,
+            )?
         };
         *changed |= needs_write;
         let classified = if write && needs_write {
-            writer(tx)?.classify_credential_quota(&refusal.provider_id, &refusal.credential_id, quota_interpretation)?
-        } else { classified };
+            tx.repair(
+                striatum_store::DryRunRepair::Classify(
+                    refusal.provider_id.clone(),
+                    refusal.credential_id.clone(),
+                    quota_interpretation,
+                ),
+                now,
+            )?
+        } else {
+            classified
+        };
         if !classified {
             kept.push(refusal);
             continue;
@@ -4277,7 +4390,15 @@ fn reconcile_credential_quota_holds(
             if all_recovered {
                 for block in &blocks {
                     *changed = true;
-                    if write { writer(tx)?.clear_fence(&block.evidence.fence_id, now, "fresh_headroom")?; }
+                    if write {
+                        tx.repair(
+                            striatum_store::DryRunRepair::ClearFence(
+                                block.evidence.fence_id.clone(),
+                                "fresh_headroom".into(),
+                            ),
+                            now,
+                        )?;
+                    }
                 }
                 return Ok(true);
             }
@@ -4332,7 +4453,15 @@ fn reconcile_credential_quota_holds(
             if let Some(end) = block_end(&fence, reading.as_ref(), now, &policy) {
                 for block in &blocks {
                     *changed = true;
-                    if write { writer(tx)?.clear_fence(&block.evidence.fence_id, now, &wire_str(&end))?; }
+                    if write {
+                        tx.repair(
+                            striatum_store::DryRunRepair::ClearFence(
+                                block.evidence.fence_id.clone(),
+                                wire_str(&end),
+                            ),
+                            now,
+                        )?;
+                    }
                 }
                 return Ok(true);
             }
@@ -4344,36 +4473,52 @@ fn reconcile_credential_quota_holds(
             }) {
                 *changed = true;
                 if write {
-                let tx = writer(tx)?;
-                for block in &blocks {
-                    tx.clear_fence(&block.evidence.fence_id, now, "quota_evidence_updated")?;
-                }
-                tx.insert_pool_fence(&AccountPoolFenceRow {
-                    evidence: AccountFenceRow {
-                        fence_id: format!("{prefix}{}", new_id("hold")),
-                        provider: refusal.provider_id.clone(),
-                        account_id: account.clone(),
-                        scope_json: wire(&fence.pool).to_string(),
-                        fence_json: wire(&fence).to_string(),
-                        source: wire_str(&fence.source),
-                        observed_at: refusal.observed_at_ms,
-                        principal: "routing".into(),
-                        admission_id: None,
-                        observation_id: None,
-                        created_at: now,
-                        cleared_at: None,
-                        cleared_reason: None,
-                    },
-                    pool_key: None,
-                    recovery_set: fence.recovery_set,
-                })?;
+                    for block in &blocks {
+                        tx.repair(
+                            striatum_store::DryRunRepair::ClearFence(
+                                block.evidence.fence_id.clone(),
+                                "quota_evidence_updated".into(),
+                            ),
+                            now,
+                        )?;
+                    }
+                    tx.repair(
+                        striatum_store::DryRunRepair::InsertFence(AccountPoolFenceRow {
+                            evidence: AccountFenceRow {
+                                fence_id: format!("{prefix}{}", new_id("hold")),
+                                provider: refusal.provider_id.clone(),
+                                account_id: account.clone(),
+                                scope_json: wire(&fence.pool).to_string(),
+                                fence_json: wire(&fence).to_string(),
+                                source: wire_str(&fence.source),
+                                observed_at: refusal.observed_at_ms,
+                                principal: "routing".into(),
+                                admission_id: None,
+                                observation_id: None,
+                                created_at: now,
+                                cleared_at: None,
+                                cleared_reason: None,
+                            },
+                            pool_key: None,
+                            recovery_set: fence.recovery_set,
+                        }),
+                        now,
+                    )?;
                 }
             }
             Ok(false)
         })()?;
         if lifted {
             *changed = true;
-            if write { clear_lifted_refusal(writer(tx)?, &refusal)?; }
+            if write {
+                tx.repair(
+                    striatum_store::DryRunRepair::ClearCredential(
+                        refusal.provider_id.clone(),
+                        refusal.credential_id.clone(),
+                    ),
+                    now,
+                )?;
+            }
         } else {
             kept.push(refusal);
         }
@@ -6519,7 +6664,7 @@ pub(crate) fn preflight_model_for_class_with_reset(
         });
     // Demand comes from the published account state; a private projection
     // has none and reads SQL.
-    let state = if ctx.store.is_account_evaluation_projection() {
+    let state = if ctx.store.is_private_account_copy() {
         None
     } else {
         Some(
@@ -12868,3 +13013,6 @@ mod tests {
         }
     }
 }
+
+mod dry_run;
+pub(crate) use dry_run::Sweep;

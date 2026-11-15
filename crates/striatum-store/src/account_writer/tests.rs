@@ -71,7 +71,7 @@ fn outside_writer_counter_detects_each_account_table_bypass() {
             Ok(())
         })
         .unwrap();
-    for table in evaluation_snapshot::ACCOUNT_TABLES {
+    for table in connection_store::ACCOUNT_TABLES {
         let before = store.outside_account_writer_count_for_test();
         store
             .store
@@ -131,7 +131,7 @@ fn batch_scope_is_not_counted_and_projection_never_starts_a_writer() {
         Ok(())
     }).unwrap();
     assert_eq!(store.outside_account_writer_count_for_test(), before);
-    let projection = store.account_evaluation_snapshot(1).unwrap();
+    let projection = store.private_account_copy_for_test(1).unwrap();
     projection
         .account_command(AccountCommandKind::Tick, |tx| tx.tick(1))
         .unwrap();

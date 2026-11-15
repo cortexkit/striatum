@@ -319,7 +319,7 @@ async fn signed_out_is_never_reoffered_to_reporting_run_after_global_recovery() 
     let snapshot = subject
         .harness()
         .store()
-        .account_evaluation_snapshot(account_selection::now_ms())
+        .private_account_copy_for_test(account_selection::now_ms())
         .unwrap();
     let excluded = snapshot
         .account_read(|tx| tx.signed_out_credentials("reserved:runner-one", "admission", "run"))

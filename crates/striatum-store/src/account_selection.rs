@@ -2436,7 +2436,7 @@ impl SqliteRouteStateStore {
                 let result = f(&AccountTx::sql(conn));
                 if result.is_ok() {
                     if let Some(tx) = tx {
-                        crate::evaluation_snapshot::timed_commit(tx)?;
+                        crate::connection_store::timed_commit(tx)?;
                     }
                 }
                 Ok(result)
@@ -2485,7 +2485,7 @@ impl SqliteRouteStateStore {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx::sql(&tx));
                 if result.is_ok() {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    crate::connection_store::timed_commit(tx)?;
                     wrote = conn.total_changes() != before;
                 }
                 Ok(result)
@@ -2513,7 +2513,7 @@ impl SqliteRouteStateStore {
                 let tx = self.begin_account_write(conn)?;
                 let result = f(&AccountTx::sql(&tx));
                 if matches!(result, Ok(true)) {
-                    crate::evaluation_snapshot::timed_commit(tx)?;
+                    crate::connection_store::timed_commit(tx)?;
                 }
                 Ok(result)
             })

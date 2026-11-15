@@ -13,10 +13,10 @@ use striatum_core::panel::{ClassPanelPolicy, PanelExtraOrder};
 
 use super::{operator_config, provider_refusal, select, store_refusal, Caller, Deps};
 
-#[path = "media_preview.rs"]
-mod media;
 #[path = "concurrency_snapshot.rs"]
 mod concurrency;
+#[path = "media_preview.rs"]
+mod media;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -180,15 +180,17 @@ pub(super) async fn what_if_with_profile_lookup(
         .as_ref()
         .map(|request| super::reads::head_choices_with_config(request, &deps, &operator))
         .transpose()?;
-    // Account loading heals stale evidence. Heal only a disposable projection,
-    // copied once for the whole sweep; no decision or usage history is copied.
-    let account_store = Arc::new(
-        deps.store
-            .account_evaluation_snapshot(super::now_ms() as i64)
-            .map_err(store_refusal)?,
-    );
-    let concurrency =
-        concurrency::Snapshot::capture(&deps, &live, &account_store, super::now_ms() as i64)?;
+    // Retain repairs in a private account-state copy for the whole sweep.
+    // Never publish preview classification or healing into the live state.
+    let accounts = crate::account_selection::Sweep::capture(deps.store).map_err(store_refusal)?;
+    let inputs = select::RequestInputs::read_with_config(&deps, live.clone(), operator.clone())?;
+    let concurrency = concurrency::Snapshot::from_snapshot(
+        &deps,
+        &live,
+        accounts.initial.clone(),
+        &inputs.catalog_snapshot.facts,
+        super::now_ms() as i64,
+    )?;
     let snapshot_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut results = Vec::with_capacity(iqs.as_ref().map_or(0, Vec::len));
     let pinned_ladder = operator.consumer_policy(&params.consumer, &Default::default(), &Default::default()).operator_ladder();
@@ -204,7 +206,8 @@ pub(super) async fn what_if_with_profile_lookup(
         let view = select::Evaluation {
             live_config: live.clone(),
             operator_config: operator.clone(),
-            account_store: &account_store,
+            accounts: &accounts,
+            inputs: &inputs,
             iq,
             eq: params.eq,
             evidence: Mutex::new(Default::default()),
@@ -230,15 +233,16 @@ pub(super) async fn what_if_with_profile_lookup(
             }
         }
         results.push(row);
+        accounts.after_evaluation(deps.routing_config_path, false, results.len());
     }
-    let mut result =
-        json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms,
+    let mut result = json!({"consumer": params.consumer, "results": results, "snapshot_ms": snapshot_ms,
             "anchor_version": live.scoring_anchor_version(), "concurrency":concurrency.report()});
     if !panels.is_empty() {
         let dry = super::panels::DryRun {
             live_config: live.clone(),
             operator_config: operator.clone(),
-            account_store: &account_store,
+            accounts: &accounts,
+            inputs: &inputs,
             profile_lookup,
         };
         let mut rows = Vec::with_capacity(panels.len());

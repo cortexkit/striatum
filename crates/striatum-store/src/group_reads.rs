@@ -181,8 +181,22 @@ impl SqliteRouteStateStore {
     /// Trace block-table reads, telling the writer's from the pooled
     /// readers'. Each reader is checked out at once, so none can escape the
     /// trace.
+    pub fn trace_account_reads_for_test(&self) -> RouteStateResult<&'static BlockReadTrace> {
+        self.trace_block_reads_kind(true)
+    }
+
     pub fn trace_block_reads_for_test(&self) -> RouteStateResult<&'static BlockReadTrace> {
-        let trace: &'static BlockReadTrace = Box::leak(Box::default());
+        self.trace_block_reads_kind(false)
+    }
+
+    fn trace_block_reads_kind(
+        &self,
+        all_account: bool,
+    ) -> RouteStateResult<&'static BlockReadTrace> {
+        let trace: &'static BlockReadTrace = Box::leak(Box::new(BlockReadTrace {
+            all_account,
+            ..Default::default()
+        }));
         let writer: &'static BlockTap = Box::leak(Box::new(BlockTap {
             trace,
             writer: true,
@@ -226,6 +240,7 @@ impl SqliteRouteStateStore {
 /// Block-table reads seen since the last [`BlockReadTrace::take`].
 #[derive(Default)]
 pub struct BlockReadTrace {
+    all_account: bool,
     reader: Mutex<Vec<String>>,
     writer: Mutex<Vec<String>>,
     exempt: Mutex<Vec<(&'static str, String)>>,
@@ -297,7 +312,12 @@ unsafe extern "C" fn on_block_statement(
     // SAFETY: as in `on_statement`; `context` is a leaked `BlockTap`.
     let text = unsafe { CStr::from_ptr(sql as *const std::ffi::c_char) }.to_string_lossy();
     let tap = unsafe { &*(context as *const BlockTap) };
-    if text.starts_with("--") || !reads_block_tables(&text) {
+    let reads = if tap.trace.all_account {
+        reads_tables(&text, crate::connection_store::ACCOUNT_TABLES)
+    } else {
+        reads_block_tables(&text)
+    };
+    if text.starts_with("--") || !reads {
         return 0;
     }
     if text.contains(crate::block_state::MAINTENANCE_READ) {

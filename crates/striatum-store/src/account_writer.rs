@@ -84,7 +84,7 @@ fn write_batch(
         return Ok(BatchOutcome::Barrier);
     }
     #[cfg(any(test, feature = "test-support"))]
-    let _batch = evaluation_snapshot::AccountBatchGuard::enter();
+    let _batch = connection_store::AccountBatchGuard::enter();
     #[cfg(test)]
     before_begin_for_test(conn);
     let transaction = crate::write_transaction(conn)?;
@@ -152,7 +152,7 @@ fn write_batch(
     }
     #[cfg(any(test, feature = "test-support"))]
     crash_for_test("before_commit");
-    evaluation_snapshot::timed_commit(transaction).map(|()| BatchOutcome::Committed)
+    connection_store::timed_commit(transaction).map(|()| BatchOutcome::Committed)
 }
 
 /// Run a batch on a state loaded for it. If a command finds the state
@@ -332,7 +332,7 @@ impl<T> AccountReply<T> {
     pub(crate) fn wait_load(self, bound: std::time::Duration) -> RouteStateResult<T> {
         match self.0.recv_timeout(bound) {
             Ok(result) => {
-                evaluation_snapshot::record_stage_timing(*self.1.lock().unwrap());
+                connection_store::record_stage_timing(*self.1.lock().unwrap());
                 result
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(err(format!(
@@ -351,7 +351,7 @@ impl<T, E: AccountCommandError> AccountReply<T, E> {
         let result = self.0.recv().unwrap_or_else(|_| Err(stopped().into()));
         // The connection work ran on the writer, but belongs in this caller's
         // timing scope too. Store-wide burst counters still count the batch once.
-        evaluation_snapshot::record_stage_timing(*self.1.lock().unwrap());
+        connection_store::record_stage_timing(*self.1.lock().unwrap());
         result
     }
 }
@@ -370,7 +370,7 @@ pub(crate) struct AccountWriter {
 
 impl AccountWriter {
     fn start(
-        store: Arc<evaluation_snapshot::ConnectionStore>,
+        store: Arc<connection_store::ConnectionStore>,
         bridge: Arc<std::sync::OnceLock<Arc<dyn crate::AccountStateBridge>>>,
         #[cfg(any(test, feature = "test-support"))] transactions: Arc<AtomicU64>,
         exit: Arc<dyn Fn() + Send + Sync>,
@@ -631,13 +631,13 @@ impl SqliteRouteStateStore {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
             #[cfg(any(test, feature = "test-support"))]
-            let before = evaluation_snapshot::account_rows_changed();
+            let before = connection_store::account_rows_changed();
             let result = f(tx, state);
             #[cfg(any(test, feature = "test-support"))]
             command_changes
                 .lock()
                 .unwrap()
-                .push((kind, evaluation_snapshot::account_rows_changed() - before));
+                .push((kind, connection_store::account_rows_changed() - before));
             result
         })?;
         #[cfg(any(test, feature = "test-support"))]
@@ -652,6 +652,7 @@ impl SqliteRouteStateStore {
         kind: AccountCommandKind,
         f: impl FnMut(&AccountTx<'_>) -> RouteStateResult<T> + Send + 'static,
     ) -> RouteStateResult<T> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.store.is_projection() {
             return self.projection_command(f);
         }
@@ -663,6 +664,7 @@ impl SqliteRouteStateStore {
         kind: AccountCommandKind,
         mut f: impl FnMut(&AccountTx<'_>) -> Result<T, E> + Send + 'static,
     ) -> Result<T, E> {
+        #[cfg(any(test, feature = "test-support"))]
         if self.store.is_projection() {
             return self.direct_account_transaction_with_error(f);
         }

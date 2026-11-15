@@ -648,13 +648,26 @@ pub(super) fn prepare_selection_inputs(
     pricing: &RoutePricing,
     model_pools: &[striatum_core::quota_extract::ModelPool],
 ) -> Result<PreparedSelectionInputs, String> {
+    prepare_selection_inputs_for_sweep(quota_cache, store, pricing, model_pools, None)
+}
+
+pub(super) fn prepare_selection_inputs_for_sweep(
+    quota_cache: &SharedQuotaCache,
+    store: &SharedStore,
+    pricing: &RoutePricing,
+    model_pools: &[striatum_core::quota_extract::ModelPool],
+    sweep: Option<&account_selection::Sweep>,
+) -> Result<PreparedSelectionInputs, String> {
     let now = now_ms() as f64;
     let (catalog_snapshot, facts) = store
         .get_facts_with_observed_speed_and_generation(now, pricing)
         .map_err(|e| format!("reading facts from route-state store: {e}"))?;
-    let mut snapshot = crate::account_state::published(store)
-        .and_then(|blocks| blocks.route_state_snapshot(now))
-        .map_err(|e| format!("building route-state snapshot: {e}"))?;
+    let mut snapshot = match sweep {
+        Some(sweep) => sweep.route_snapshot(store, now),
+        None => crate::account_state::published(store)
+            .and_then(|blocks| blocks.route_state_snapshot(now)),
+    }
+    .map_err(|e| format!("building route-state snapshot: {e}"))?;
     // Retain cached windows through a transient quota outage: dropping
     // last-known pressure the moment one refresh fails would make every blip
     // look optimistically free. Past the staleness bound, though, the windows
@@ -773,8 +786,8 @@ pub(super) fn price_selection_inputs(
 ///
 /// `catalog_snapshot` is the catalog view the facts were read from, so the
 /// account indexes are keyed to that same view; `None` reads a fresh one.
-/// Evaluation passes an isolated account store and `reserve_probes: false`:
-/// it never holds a credential's next retry of a previous provider refusal.
+/// Evaluations pass private sweep accounts and `reserve_probes: false`:
+/// they never claim a credential's next retry after a provider refusal.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn price_selection_inputs_with_catalog(
     facts: &mut Vec<ModelFact>,
@@ -787,6 +800,33 @@ pub(super) fn price_selection_inputs_with_catalog(
     priced_per_token: bool,
     reserve_probes: bool,
 ) -> Result<PricedSelection, ModuleError> {
+    price_selection_inputs_for_sweep(
+        facts,
+        quota_signal_json,
+        sources,
+        catalog_snapshot,
+        store,
+        broca_credentials,
+        credentialed,
+        priced_per_token,
+        reserve_probes,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn price_selection_inputs_for_sweep(
+    facts: &mut Vec<ModelFact>,
+    quota_signal_json: String,
+    sources: &SelectionPolicySources<'_>,
+    catalog_snapshot: Option<&striatum_store::CatalogFactsSnapshot>,
+    store: &SharedStore,
+    broca_credentials: &SharedBrocaCredentials,
+    credentialed: bool,
+    priced_per_token: bool,
+    reserve_probes: bool,
+    sweep: Option<&account_selection::Sweep>,
+) -> Result<PricedSelection, ModuleError> {
     let mut classes = if credentialed {
         let snapshot;
         let catalog_snapshot = if let Some(snapshot) = catalog_snapshot {
@@ -798,7 +838,7 @@ pub(super) fn price_selection_inputs_with_catalog(
             &snapshot
         };
         Some(
-            account_selection::ClassContext::read_with_catalog(
+            account_selection::ClassContext::read_for_sweep(
                 store,
                 broca_credentials,
                 Arc::clone(sources.operator_config),
@@ -806,6 +846,7 @@ pub(super) fn price_selection_inputs_with_catalog(
                 facts.clone(),
                 catalog_snapshot,
                 now_ms() as i64,
+                sweep,
             )
             .map_err(ModuleError::Message)?,
         )
@@ -821,7 +862,11 @@ pub(super) fn price_selection_inputs_with_catalog(
     let provenance = DecisionProvenance {
         quota_signal_json,
         policy_revision: outcome.policy_revision,
-        anchor_version: outcome.routing_config.overqualification.mode.anchor_version(),
+        anchor_version: outcome
+            .routing_config
+            .overqualification
+            .mode
+            .anchor_version(),
     };
     // Borrowed rows are added after the live overlays so they carry the target's
     // current quality data, and before pricing so they get their own plane.
