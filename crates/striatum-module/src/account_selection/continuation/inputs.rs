@@ -10,10 +10,11 @@ use striatum_core::accounts::AllowedAccountClass;
 /// offered set. `model_decision_id` retains selection provenance. `harness` names
 /// the runner from that decision, or the daemon-authenticated route principal for
 /// a select-less run, never the request body's caller. `owner_scope` records who
-/// owns the run and the decision's selected harness, project and workdir; a switch
-/// must not change that ownership or scope. Daemon session and run provenance are
-/// not persisted on selections today, so continuation does not check them; its
-/// run binding comes from the admission's own `run_id`.
+/// owns the run and its project, using the already-loaded selection. The selected
+/// harness and workdir remain on the model decision and are preserved by the
+/// continuation's decision link, rather than duplicated here. Daemon session and
+/// run provenance are not persisted on selections today, so continuation does not
+/// check them; its run binding comes from the admission's own `run_id`.
 /// `parent_conversation_key` retains placement preference.
 /// `initial_input_bytes`, `initial_input_estimated` and `request_input_tokens`
 /// retain the demand/size estimate. No token, secret or raw conversation key is
@@ -44,24 +45,11 @@ impl Inputs {
     pub(crate) fn prepare(
         params: &AccountForParams,
         principal: &str,
-        ctx: &Ctx<'_>,
+        classes: Option<&ClassContext>,
         class: AllowedAccountClass,
-    ) -> Result<Self, OpReply> {
-        let selection = params
-            .model_decision_id
-            .as_deref()
-            .map(|id| ctx.store.v1_decision(id))
-            .transpose()
-            .map_err(store_error)?
-            .flatten();
-        let model = params
-            .model_decision_id
-            .as_deref()
-            .map(|id| ctx.store.get_decision_by_id(id))
-            .transpose()
-            .map_err(store_error)?
-            .flatten();
-        let subscription = ctx.classes.as_ref().and_then(|classes| {
+        selection: Option<&V1Decision>,
+    ) -> Self {
+        let subscription = classes.and_then(|classes| {
             classes
                 .facts
                 .iter()
@@ -75,7 +63,7 @@ impl Inputs {
                         .subscription
                 })
         });
-        Ok(Self {
+        Self {
             version: 1,
             provider: params.provider.clone(),
             model: params.model.clone(),
@@ -87,7 +75,7 @@ impl Inputs {
             requested_account: params.requested_account.clone(),
             candidates: params.candidates.clone(),
             model_decision_id: params.model_decision_id.clone(),
-            harness: selection.as_ref().map_or_else(
+            harness: selection.map_or_else(
                 || {
                     principal
                         .strip_prefix("reserved:")
@@ -97,16 +85,14 @@ impl Inputs {
                 |s| s.runner_module.clone(),
             ),
             owner_scope: json!({
-                "owner":selection.as_ref().map_or(principal, |s| s.principal.as_str()),
-                "harness":model.as_ref().and_then(|m|m.selected_harness.as_deref().or(m.harness.as_deref())),
-                "project_id":model.as_ref().and_then(|m|m.project_id.as_deref()),
-                "workdir":model.as_ref().and_then(|m|m.workdir.as_deref()),
+                "owner":selection.map_or(principal, |s| s.principal.as_str()),
+                "project_id":selection.and_then(|s|s.project_id.as_deref()),
             }),
             parent_conversation_key: params.parent_conversation_key.clone(),
             initial_input_bytes: params.initial_input_bytes,
             initial_input_estimated: params.initial_input_estimated,
             request_input_tokens: params.request_input_tokens,
-        })
+        }
     }
 
     pub(super) fn body(&self, request: &ContinueRequest, runner: &str) -> Option<Value> {

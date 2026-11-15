@@ -172,10 +172,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -979,10 +977,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -1467,10 +1463,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -1941,10 +1935,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -2445,10 +2437,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -2989,10 +2979,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -3468,10 +3456,8 @@
                     "model": "claude-opus-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:broca",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -3930,10 +3916,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": "dec_synthetic",
                     "owner_scope": {
-                      "harness": "thalamus-harness",
                       "owner": "reserved:prefrontal-core",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -4525,10 +4509,8 @@
                     "model": "gpt-6-luna",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-harness",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "openai",
@@ -4966,10 +4948,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-harness",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -5444,10 +5424,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-harness",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -5921,10 +5899,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-harness",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -6445,10 +6421,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-harness",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -6942,10 +6916,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": "dec_synthetic",
                     "owner_scope": {
-                      "harness": "thalamus-pi",
                       "owner": "reserved:prefrontal-core",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -7537,10 +7509,8 @@
                     "model": "gpt-6-luna",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-pi",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "openai",
@@ -7978,10 +7948,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-pi",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -8456,10 +8424,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-pi",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -8933,10 +8899,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-pi",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",
@@ -9457,10 +9421,8 @@
                     "model": "claude-opus-5-5",
                     "model_decision_id": null,
                     "owner_scope": {
-                      "harness": null,
                       "owner": "reserved:thalamus-pi",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "anthropic",

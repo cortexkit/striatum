@@ -4712,10 +4712,8 @@
                     "model": "model-c",
                     "model_decision_id": "dec_000000000000",
                     "owner_scope": {
-                      "harness": "runner-one",
                       "owner": "reserved:example-consumer",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "example-subscription",
@@ -5296,10 +5294,8 @@
                     "model": "model-c",
                     "model_decision_id": "dec_000000000000",
                     "owner_scope": {
-                      "harness": "runner-one",
                       "owner": "reserved:example-consumer",
-                      "project_id": null,
-                      "workdir": null
+                      "project_id": null
                     },
                     "parent_conversation_key": null,
                     "provider": "example-subscription",
