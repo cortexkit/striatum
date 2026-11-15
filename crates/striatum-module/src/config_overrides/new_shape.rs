@@ -9,6 +9,238 @@ enum PinOnlyScope {
     Model,
 }
 
+/// Exact slash-delimited model prefixes, owned by one validated settings snapshot.
+#[derive(Debug)]
+pub(super) struct EntityPolicyIndex(BTreeMap<String, EntityPolicy>);
+
+impl EntityPolicyIndex {
+    pub(super) fn compile(config: &RoutingConfigFile) -> Self {
+        Self(
+            config
+                .model_routing
+                .models
+                .iter()
+                .map(|(key, model)| (key.clone(), model.rules.clone()))
+                .collect(),
+        )
+    }
+
+    fn matching<'a>(&'a self, route: &'a str) -> impl Iterator<Item = (&'a str, &'a EntityPolicy)> {
+        // Every matching key is either the whole route or ends at a slash.
+        // Visit shortest first so each explicitly set field replaces its parent.
+        route
+            .match_indices('/')
+            .map(|(end, _)| &route[..end])
+            .chain(std::iter::once(route))
+            .filter_map(|key| {
+                self.0
+                    .get_key_value(key)
+                    .map(|(key, rules)| (key.as_str(), rules))
+            })
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SelectionPolicyMemo(std::sync::Mutex<Vec<ExclusionMemoEntry>>);
+
+struct ExclusionMemoEntry {
+    settings: Arc<CompiledPolicy>,
+    consumer: String,
+    pinned: bool,
+    // Only entity-policy inputs belong here, never account or availability data.
+    routes: Vec<(String, bool)>,
+    exclusions: Vec<String>,
+}
+
+impl SelectionPolicyMemo {
+    pub(crate) fn exclusions(
+        &self,
+        config: &LiveConfig,
+        consumer: &str,
+        facts: &[ModelFact],
+        pinned: bool,
+    ) -> Vec<String> {
+        let routes: Vec<_> = facts
+            .iter()
+            .map(|fact| {
+                (
+                    striatum_core::fact_to_route(fact).route_key,
+                    default_pin_only(fact.billing_plane.as_ref()),
+                )
+            })
+            .collect();
+        let mut entries = self.0.lock().unwrap();
+        if let Some(entry) = entries.iter().find(|entry| {
+            Arc::ptr_eq(&entry.settings, &config.compiled)
+                && entry.consumer == consumer
+                && entry.pinned == pinned
+                && entry.routes == routes
+        }) {
+            return entry.exclusions.clone();
+        }
+        let exclusions = config.selection_exclusions(consumer, facts, pinned);
+        entries.push(ExclusionMemoEntry {
+            settings: config.compiled.clone(),
+            consumer: consumer.into(),
+            pinned,
+            routes,
+            exclusions: exclusions.clone(),
+        });
+        exclusions
+    }
+}
+
+fn default_pin_only(plane: Option<&striatum_core::billing::BillingPlane>) -> bool {
+    plane.is_some_and(|plane| {
+        striatum_core::billing::is_api_metered_auth_method(&plane.auth_method)
+            && plane.kind != "quota_proxy"
+    })
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn panel_policy_memo_matches_uncached_verdicts() {
+    use crate::routing_v1::request_cpu_bench::{production_fixture, FIXTURE_NOW};
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let fixture = production_fixture();
+    let original = fixture.operator_config();
+    let mut facts = fixture.store().get_facts().unwrap();
+    assert_eq!(facts.len(), 800);
+    let mut consumers: Vec<_> = crate::select_policy::Consumer::ALL
+        .iter()
+        .filter_map(|consumer| crate::variant_policy::consumer_group(Some(*consumer)))
+        .map(str::to_owned)
+        .collect();
+    consumers.extend(original.config.consumers.keys().cloned());
+    consumers.extend(crate::routing_v1::consumers::effective(&original).names());
+    consumers.extend(
+        [
+            "mc.dream",
+            "mc.dream.curate",
+            "mcx",
+            "mason.review",
+            "unknown.child",
+        ]
+        .map(str::to_owned),
+    );
+    consumers.sort();
+    consumers.dedup();
+    let memo = SelectionPolicyMemo::default();
+    let check = |config: &LiveConfig, facts: &[ModelFact]| {
+        for consumer in &consumers {
+            for pinned in [false, true] {
+                let expected: Vec<_> = facts
+                    .iter()
+                    .filter_map(|fact| {
+                        let route = striatum_core::fact_to_route(fact).route_key;
+                        config
+                            .config
+                            .uncached_refusal(
+                                consumer,
+                                &route,
+                                pinned,
+                                default_pin_only(fact.billing_plane.as_ref()),
+                                PinOnlyScope::ProviderAndModel,
+                            )
+                            .is_some()
+                            .then_some(route)
+                    })
+                    .collect();
+                assert_eq!(
+                    memo.exclusions(config, consumer, facts, pinned),
+                    expected,
+                    "{consumer} pinned={pinned}"
+                );
+                let entries = memo.0.lock().unwrap().len();
+                assert_eq!(memo.exclusions(config, consumer, facts, pinned), expected);
+                assert_eq!(
+                    memo.0.lock().unwrap().len(),
+                    entries,
+                    "identical inputs must hit the memo"
+                );
+                for fact in facts {
+                    let route = striatum_core::fact_to_route(fact).route_key;
+                    for metered in [false, true] {
+                        for scope in [PinOnlyScope::ProviderAndModel, PinOnlyScope::Model] {
+                            assert_eq!(
+                                config.entity_refusal(consumer, &route, pinned, metered, scope),
+                                config
+                                    .config
+                                    .uncached_refusal(consumer, &route, pinned, metered, scope),
+                                "{consumer} {route} pinned={pinned} metered={metered}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    };
+    check(&original, &facts);
+    fixture.edit_config(|config| {
+        config["providers"]["cpu-provider-0"] = serde_json::json!({
+            "only_for":["mc", "mason"], "not_for":["mc"], "pin_only":true,
+            "models":["model-0", "model-1"]
+        });
+        config["models"]["cpu-provider-0/model-0"] = serde_json::json!({
+            "only_for":["mc.dream"], "not_for":[], "pin_only":false,
+            "subscription":false, "pin_only_for":["mc.dream"]
+        });
+        config["models"]["cpu-provider-0/model-0/nested"] = serde_json::json!({
+            "only_for":["mason"], "not_for":["mason.review"], "pin_only_for":[], "subscription":true
+        });
+    });
+    let reloaded = fixture.operator_config();
+    assert!(!Arc::ptr_eq(&original.compiled, &reloaded.compiled));
+    // Reuse one memo across snapshots, routes and billing-plane changes to
+    // prove that none of those inputs can inherit an earlier exclusion vector.
+    check(&reloaded, &facts);
+    let mut nested = facts[0].clone();
+    nested.provider_id = "cpu-provider-0".into();
+    nested.model_id = "model-0/nested/deep".into();
+    facts = vec![nested];
+    check(&reloaded, &facts);
+    for (auth_method, kind) in [
+        ("apikey", "api"),
+        ("apikey", "quota_proxy"),
+        ("oauth", "subscription"),
+    ] {
+        facts[0].billing_plane = Some(striatum_core::billing::BillingPlane {
+            provider_id: "cpu-provider-0".into(),
+            auth_method: auth_method.into(),
+            kind: kind.into(),
+            selection_reason: "policy differential".into(),
+            rates: BTreeMap::new(),
+        });
+        check(&reloaded, &facts);
+    }
+    // A route without an explicit subscription or pin-only mark must follow
+    // its billing plane, even when the same request memo saw another plane.
+    facts[0].provider_id = "cpu-provider-9".into();
+    facts[0].model_id = "unconfigured".into();
+    for (auth_method, kind) in [
+        ("apikey", "api"),
+        ("apikey", "quota_proxy"),
+        ("oauth", "subscription"),
+    ] {
+        facts[0].billing_plane.as_mut().unwrap().auth_method = auth_method.into();
+        facts[0].billing_plane.as_mut().unwrap().kind = kind.into();
+        check(&reloaded, &facts);
+    }
+    facts[0].provider_id = "cpu-provider-0".into();
+    facts[0].model_id = "model-0/nested/deep".into();
+    let patched = reloaded
+        .with_model_policy_patch(&BTreeMap::from([(
+            "cpu-provider-0/model-0/nested".into(),
+            super::ModelPolicyPatch {
+                not_for: Some(vec!["mc".into()]),
+                ..Default::default()
+            },
+        )]))
+        .unwrap();
+    check(&patched, &facts);
+    check(&original, &facts);
+}
+
 impl RoutingConfigFile {
     /// Materialize the temporary interfaces used by the existing selection pass.
     /// Only the entity-shaped fields are read from disk; the grouped views are
@@ -294,15 +526,27 @@ impl LiveConfig {
                 rules.only_for = Some(value.clone());
             }
         }
-        Ok(patched)
+        Ok(Self::new(patched.config, patched.document))
     }
 
     pub(crate) fn route_policy_refusal(&self, consumer: &str, route: &str) -> Option<String> {
         self.route_policy_refusal_with_pin(consumer, route, false)
     }
 
-    pub(crate) fn route_policy_refusal_with_pin(&self, consumer: &str, route: &str, pinned: bool) -> Option<String> {
-        self.config.route_refusal(consumer, route, pinned)
+    pub(crate) fn route_policy_refusal_with_pin(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+    ) -> Option<String> {
+        self.entity_refusal(
+            consumer,
+            route,
+            pinned,
+            false,
+            PinOnlyScope::ProviderAndModel,
+        )
+        .map(|(detail, _)| detail)
     }
 
     /// Resolve entity restrictions from this snapshot for the full request name.
@@ -315,9 +559,14 @@ impl LiveConfig {
     }
 
     pub fn dotted_rule_refusal(&self, consumer: &str, route: &str) -> Option<String> {
-        self.config
-            .route_refusal_detail(consumer, route, false)
-            .and_then(|(detail, dotted)| dotted.then_some(detail))
+        self.entity_refusal(
+            consumer,
+            route,
+            false,
+            false,
+            PinOnlyScope::ProviderAndModel,
+        )
+        .and_then(|(detail, dotted)| dotted.then_some(detail))
     }
 
     /// Contract slot names look up an operator-configured pin, not a caller's
@@ -354,21 +603,21 @@ impl LiveConfig {
     /// Explicit pins bypass `pin_only` and `pin_only_for`, but never a
     /// provider/model `only_for` or `not_for` restriction.
     pub fn route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
-        self.config.route_refusal(consumer, route, pinned).is_none()
+        self.entity_refusal(
+            consumer,
+            route,
+            pinned,
+            false,
+            PinOnlyScope::ProviderAndModel,
+        )
+        .is_none()
     }
 
     /// Media engines have no subscription alternative, so chat provider pin-only
     /// rules must not disable automatic media choice. Model pin-only rules still
     /// bind; the built-in rule requiring metered chat routes to be pinned does not.
     pub(crate) fn media_route_allowed(&self, consumer: &str, route: &str, pinned: bool) -> bool {
-        self.config
-            .route_refusal_detail_with_pin_scope(
-                consumer,
-                route,
-                pinned,
-                false,
-                PinOnlyScope::Model,
-            )
+        self.entity_refusal(consumer, route, pinned, false, PinOnlyScope::Model)
             .is_none()
     }
 
@@ -382,10 +631,7 @@ impl LiveConfig {
         pinned: bool,
         plane: Option<&striatum_core::billing::BillingPlane>,
     ) -> bool {
-        let metered = plane.is_some_and(|plane| {
-            striatum_core::billing::is_api_metered_auth_method(&plane.auth_method)
-                && plane.kind != "quota_proxy"
-        });
+        let metered = default_pin_only(plane);
         self.route_allowed_with_default(consumer, route, pinned, metered)
     }
 
@@ -396,9 +642,32 @@ impl LiveConfig {
         pinned: bool,
         metered: bool,
     ) -> bool {
-        self.config
-            .route_refusal_detail_with_default(consumer, route, pinned, metered)
-            .is_none()
+        self.entity_refusal(
+            consumer,
+            route,
+            pinned,
+            metered,
+            PinOnlyScope::ProviderAndModel,
+        )
+        .is_none()
+    }
+
+    fn entity_refusal(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        default_pin_only: bool,
+        scope: PinOnlyScope,
+    ) -> Option<(String, bool)> {
+        self.config.refusal_with_models(
+            consumer,
+            route,
+            pinned,
+            default_pin_only,
+            scope,
+            self.compiled.entities.matching(route),
+        )
     }
 
     pub(crate) fn selection_exclusions(&self, consumer: &str, facts: &[ModelFact], pinned: bool) -> Vec<String> {
@@ -505,6 +774,55 @@ impl RoutingConfigFile {
         default_pin_only: bool,
         pin_only_scope: PinOnlyScope,
     ) -> Option<(String, bool)> {
+        let index = EntityPolicyIndex::compile(self);
+        self.refusal_with_models(
+            consumer,
+            route,
+            pinned,
+            default_pin_only,
+            pin_only_scope,
+            index.matching(route),
+        )
+    }
+
+    #[cfg(test)]
+    fn uncached_refusal(
+        &self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        default_pin_only: bool,
+        pin_only_scope: PinOnlyScope,
+    ) -> Option<(String, bool)> {
+        // Preserve the original full-map scan as an independent matching oracle.
+        let mut models: Vec<_> = self
+            .model_routing
+            .models
+            .iter()
+            .filter(|(key, _)| route == key.as_str() || route.starts_with(&format!("{key}/")))
+            .collect();
+        models.sort_by_key(|(key, _)| key.len());
+        self.refusal_with_models(
+            consumer,
+            route,
+            pinned,
+            default_pin_only,
+            pin_only_scope,
+            models
+                .into_iter()
+                .map(|(key, model)| (key.as_str(), &model.rules)),
+        )
+    }
+
+    fn refusal_with_models<'a>(
+        &'a self,
+        consumer: &str,
+        route: &str,
+        pinned: bool,
+        default_pin_only: bool,
+        pin_only_scope: PinOnlyScope,
+        models: impl Iterator<Item = (&'a str, &'a EntityPolicy)>,
+    ) -> Option<(String, bool)> {
         let provider = route.split('/').next().unwrap_or(route);
         let provider_rules = self.providers.get(provider).map(|policy| &policy.rules);
         let provider_pin_rules =
@@ -523,28 +841,21 @@ impl RoutingConfigFile {
         let mut pin_only_for = provider_pin_rules
             .and_then(|rules| rules.pin_only_for.as_ref())
             .map(|names| (provider_source("pin_only_for"), names));
-        let mut models: Vec<_> = self
-            .model_routing
-            .models
-            .iter()
-            .filter(|(key, _)| route == key.as_str() || route.starts_with(&format!("{key}/")))
-            .collect();
-        models.sort_by_key(|(key, _)| key.len());
-        for (key, model) in models {
+        for (key, rules) in models {
             let model_source = |field: &str| format!("models[{key:?}].{field}");
-            if let Some(names) = &model.rules.only_for {
+            if let Some(names) = &rules.only_for {
                 only_for = Some((model_source("only_for"), names));
             }
-            if let Some(names) = &model.rules.not_for {
+            if let Some(names) = &rules.not_for {
                 not_for = Some((model_source("not_for"), names));
             }
-            if let Some(value) = model.rules.pin_only {
+            if let Some(value) = rules.pin_only {
                 pin_only = Some((model_source("pin_only"), value));
             }
-            if let Some(value) = model.rules.subscription {
+            if let Some(value) = rules.subscription {
                 subscription = Some(value);
             }
-            if let Some(names) = &model.rules.pin_only_for {
+            if let Some(names) = &rules.pin_only_for {
                 pin_only_for = Some((model_source("pin_only_for"), names));
             }
         }

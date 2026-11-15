@@ -790,6 +790,45 @@ fn live_seats(answer: &cortexkit_role_routing::panel::SelectPanelAnswer) -> Vec<
 }
 
 #[tokio::test]
+async fn panel_seats_skip_evidence_but_what_if_keeps_full_evidence() {
+    let (harness, owner, _) = panel_harness().await;
+    let operator = operator(&harness).await;
+    let config = harness.config_path_for_test();
+    let before = super::select::evidence_passes(&config);
+    for estimate in [true, false] {
+        let (ty, answer) = owner.call("route.select_panel", &json!({
+            "consumer":fixture::SUMMARY, "class":"audit", "seed":"evidence", "estimate":estimate
+        })).await;
+        assert_eq!(ty, FrameType::Response, "{answer}");
+        assert_eq!(
+            answer["result"]["seats"].as_array().unwrap().len(),
+            3,
+            "{answer}"
+        );
+        assert_eq!(
+            super::select::evidence_passes(&config),
+            before,
+            "panel estimate={estimate}"
+        );
+    }
+    let panel = dry_panels(
+        &operator,
+        json!({"class":"audit", "seed":"evidence"}),
+        json!({}),
+    )
+    .await;
+    assert_eq!(panel["panels"][0]["seats"].as_array().unwrap().len(), 3);
+    assert_eq!(super::select::evidence_passes(&config), before);
+    let answer = evaluate(&operator, json!({})).await;
+    assert_eq!(super::select::evidence_passes(&config) - before, 3);
+    for row in answer["results"].as_array().unwrap() {
+        assert!(row["bar"]["elo"].is_number(), "{row}");
+        assert!(!row["adequate"].as_array().unwrap().is_empty(), "{row}");
+        assert!(!row["excluded"].as_array().unwrap().is_empty(), "{row}");
+    }
+}
+
+#[tokio::test]
 async fn what_if_panel_seats_what_select_panel_seats_for_the_same_seed() {
     let (harness, owner, _) = panel_harness().await;
     let operator = operator(&harness).await;
