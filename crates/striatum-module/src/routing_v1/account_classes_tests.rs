@@ -5861,9 +5861,11 @@ async fn s4b_what_if_fresh_headroom_repairs_only_its_snapshot() {
         "fresh headroom must actually recover the preview's account: {}",
         answer.1
     );
-    // Only the catalog-change key takes a writer checkout. Catalog facts and
-    // observed speed aggregates use a reader; the warm class-vector cache and
-    // account snapshot take no writer checkout, and the dry run sends no repair command.
+    // Only reading the catalog-change key takes a writer checkout: the writer's
+    // count of model-fact writes, which says whether cached facts are current.
+    // Catalog facts and observed speed aggregates use a reader; the warm
+    // class-vector cache and account snapshot take no writer checkout, and the
+    // dry run sends no repair command.
     assert_eq!(
         harness.store().writer_acquisition_count_for_test() - acquisitions,
         1

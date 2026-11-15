@@ -1628,8 +1628,9 @@ impl SqliteRouteStateStore {
         let rows = self
             .store
             .with_read(|connection| {
-                // Pooled readers already own a read transaction; projections
-                // use a bare connection and need a snapshot opened here.
+                // A pooled reader arrives inside its own read transaction. The
+                // private single-connection store behind what-if previews hands
+                // over a bare connection, so open the snapshot here.
                 let tx = if connection.is_autocommit() {
                     Some(connection.unchecked_transaction()?)
                 } else {

@@ -1022,7 +1022,8 @@ impl CredentialData {
     ) {
         let inputs = ServingRefreshInputs::read(self, state, catalog.generation);
         if self.serving_refresh_inputs.as_ref() == Some(&inputs) {
-            // Admission caps consume live quota values even when auth joins do not.
+            // Which credentials and accounts can serve each model is unchanged,
+            // but concurrency caps read live quota values, so republish them.
             self.concurrency_caps.publish_roster(state);
             return;
         }
