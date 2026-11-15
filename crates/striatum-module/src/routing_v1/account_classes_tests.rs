@@ -5949,10 +5949,19 @@ fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
             .filter(|clock| clock.claim_owner.is_some())
             .collect();
         assert!(claimed.is_empty(), "{step} claimed past the new block: {claimed:?} ({answer})");
-        assert!(
-            !answer.starts_with("Ok(Bound") && !answer.starts_with("Ok(\""),
-            "{step} went ahead past the new block: {answer}"
-        );
+        // Each step waits for the new block's probe: the time its clock
+        // falls due. A launch claim answers `Result<Option<String>, _>`,
+        // `Ok(Some(credential))` to pin and `Ok(None)` to go ahead unpinned,
+        // so neither may appear here; a non-pinning runner gets the same
+        // timed wait, not the untimed `no_eligible_account` refusal that is
+        // only for a due probe.
+        let clocks = harness.store().fence_rechecks().unwrap();
+        let [block] = clocks.as_slice() else {
+            panic!("{step}: one clock, the new block's: {clocks:?}");
+        };
+        let wait = format!("Lost {{ retry_at: {} }}", block.due_at());
+        let expected = if step == "bind" { format!("Ok({wait})") } else { format!("Err({wait})") };
+        assert_eq!(answer, expected, "{step} must wait for the new block");
     }
 }
 
@@ -6006,4 +6015,261 @@ fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
             .collect();
         assert!(claimed.is_empty(), "{step} claimed a clock the clear lifted: {claimed:?} ({answer})");
     }
+}
+
+/// An account fence on `account` for `synthetic` until `reset_at_ms`,
+/// recorded through the account writer as a broca limit.
+fn fence_account_until(harness: &Harness, account: &str, reset_at_ms: i64) {
+    let scope = FenceScope::General(GeneralWindow::FiveHour);
+    let fence = Fence {
+        account_id: account.into(),
+        pool: Some(scope.into()),
+        recovery_set: Vec::new(),
+        observed_at_ms: NOW as i64,
+        reset: ResetTime::At(reset_at_ms),
+        retry_hint_ms: None,
+        source: ConfirmationSource::BrocaAccountLimit,
+    };
+    harness
+        .store()
+        .account_transaction(|tx| {
+            tx.insert_fence(&AccountFenceRow {
+                fence_id: format!("class-fence-{account}-{reset_at_ms}"),
+                provider: "synthetic".into(),
+                account_id: account.into(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+                fence_json: serde_json::to_string(&fence).unwrap(),
+                source: "broca_limit_exhausted".into(),
+                observed_at: NOW as i64,
+                principal: "test".into(),
+                admission_id: None,
+                observation_id: None,
+                created_at: NOW as i64,
+                cleared_at: None,
+                cleared_reason: None,
+            })
+        })
+        .unwrap();
+}
+
+/// A provider-capacity block on `synthetic` that is already due: its
+/// observation is two hours old, although the raw cooldown runs another
+/// hour. Its clock is not account-scoped, so a launch whose published read
+/// sees only it takes the route-only branch.
+fn due_provider_block(harness: &Harness) {
+    striatum_core::RouteStateStore::record_provider_cooldown(
+        harness.store().as_ref(),
+        "synthetic",
+        "synthetic/model",
+        "synthetic/model",
+        &striatum_core::route_state_store::RouteStateUpdate {
+            observed_at_ms: Some(NOW as i64 - 2 * 3_600_000),
+            cooldown_until: Some((NOW + 3_600_000) as f64),
+            last_error: Some("provider capacity".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    harness
+        .store()
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+}
+
+/// The selection context every test below starts from: read before any
+/// block, with its probes reserved (none is due, so it holds none).
+fn selection_read(harness: &Harness) -> crate::account_selection::ClassContext {
+    let mut context = s4b_load(harness, NOW as i64);
+    context
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    assert_eq!(
+        context
+            .probe("synthetic", "model", false, false, None, "chosen")
+            .admission()
+            .map(|admission| admission.credential_id.clone())
+            .as_deref(),
+        Some("oauth:test"),
+        "the selection launches on the oauth login"
+    );
+    context
+}
+
+/// The selection chose the oauth login and read no block, so it needed no
+/// credential pin. A block on the other login then lands before the Broca
+/// launch claim. The claim decides on the current state, where an account
+/// block now exists on the provider, so the launch target must pin the
+/// login the claim returned: an unpinned target could be sent on the
+/// blocked login.
+#[test]
+fn a_block_on_another_login_after_the_selection_read_keeps_the_launch_pinned() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let context = selection_read(&harness);
+    fence_account_until(&harness, "apikey-account", NOW as i64 + 600_000);
+    let launched = crate::select::runner_for_route(
+        &Default::default(),
+        &harness.credentials(),
+        harness.store(),
+        "session",
+        "synthetic",
+        "model",
+        None,
+        Some(&context),
+        false,
+        None,
+    );
+    let (runner, grant) = match launched {
+        Ok(launched) => launched,
+        Err(refusal) => panic!("the launch was refused: {refusal:?}"),
+    };
+    assert!(grant.is_none());
+    assert_eq!(
+        runner.pinned_credential_id().as_deref(),
+        Some("oauth:test"),
+        "the launch target pins the claimed login: {runner:?}"
+    );
+}
+
+/// The selection held no probe reservation, because nothing was due when it
+/// read. A block that is already due (a provider-capacity observation two
+/// hours old) lands before the bind. A legacy Broca send makes no later
+/// claim, so the bind must claim that probe for its decision; returning
+/// Bound with the probe unclaimed would let another request take the
+/// recovery slot while this send goes ahead.
+#[test]
+fn a_due_block_recorded_after_the_selection_read_is_claimed_by_its_bind() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let context = selection_read(&harness);
+    due_provider_block(&harness);
+    let clocks = harness.store().fence_rechecks().unwrap();
+    assert!(
+        clocks.iter().any(|clock| clock.kind == "provider" && clock.due_at() <= NOW as i64),
+        "the new block is due: {clocks:?}"
+    );
+    let answer = selection_step(&context, &harness, "bind");
+    let owners: Vec<_> = harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .into_iter()
+        .map(|clock| (clock.kind, clock.claim_owner))
+        .collect();
+    assert_eq!(answer, "Ok(Bound)");
+    assert_eq!(owners, vec![("provider".to_owned(), Some("decision".to_owned()))]);
+}
+
+/// A launch by a runner that cannot pin its credential, with an account
+/// block on the other login committed between the launch's read of the
+/// published state and its command. The due provider block makes that read
+/// choose the route-only branch, whose command sees the new block. That block does not apply to the login
+/// this launch uses, so the launch goes ahead; it must not wait for an
+/// unrelated account's probe.
+#[test]
+fn another_logins_block_after_the_launch_read_does_not_stop_a_non_pinning_launch() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let context = selection_read(&harness);
+    due_provider_block(&harness);
+    let shared = harness.clone();
+    crate::account_selection::before_launch_command(&harness.credentials(), move |_| {
+        fence_account_until(&shared, "apikey-account", NOW as i64 + 3_600_000);
+    });
+    let answer = selection_step(&context, &harness, "launch without one");
+    assert!(
+        harness
+            .store()
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .any(|clock| clock.account_id.as_deref() == Some("apikey-account")),
+        "the block landed"
+    );
+    assert_eq!(answer, "Ok(None)");
+}
+
+/// A block on the login a non-pinning launch uses that is not due yet gives
+/// the same timed wait whichever side of the launch's published read it
+/// lands on: the untimed `no_eligible_account` answer is only for a due
+/// probe, which this runner could never take. Before the read, the launch
+/// takes the credential branch; after it, the route-only branch (the due
+/// provider block is all the read sees) finds the block in its command.
+#[test]
+fn a_block_on_the_launch_login_gives_a_non_pinning_launch_one_timed_wait_either_side_of_its_read() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let reset = NOW as i64 + 3_600_000;
+    let mut answers = Vec::new();
+    for before_read in [true, false] {
+        let (harness, _) = setup("synthetic", false);
+        let context = selection_read(&harness);
+        due_provider_block(&harness);
+        if before_read {
+            fence_account_until(&harness, "oauth-account", reset);
+        } else {
+            let shared = harness.clone();
+            crate::account_selection::before_launch_command(&harness.credentials(), move |_| {
+                fence_account_until(&shared, "oauth-account", reset);
+            });
+        }
+        let answer = selection_step(&context, &harness, "launch without one");
+        // The wait is the block's own probe time: its quota clock's next check.
+        let clocks = harness.store().fence_rechecks().unwrap();
+        let block = clocks
+            .iter()
+            .find(|clock| clock.account_id.as_deref() == Some("oauth-account"))
+            .expect("the block has a clock");
+        assert!(block.quota && block.next_recheck_at > NOW as i64, "{block:?}");
+        assert_eq!(
+            answer,
+            format!("Err(Lost {{ retry_at: {} }})", block.next_recheck_at),
+            "block recorded before the launch's read: {before_read}"
+        );
+        answers.push(answer);
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
+/// A transient retry block the selection read is let pass to admission
+/// (`transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_account_pool`).
+/// One recorded after the selection read is a timed wait at the bind,
+/// until the retry time, and nothing more: no account is walled, and a
+/// selection that reads it afterwards binds.
+#[test]
+fn a_transient_block_recorded_after_the_selection_read_is_a_timed_wait_not_a_pool_wall() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    let context = selection_read(&harness);
+    crate::record_cooldown_update(
+        harness.store(),
+        &serde_json::from_value(json!({
+            "routeKey":"synthetic/model", "capacityKey":"synthetic/model",
+            "credentialId":"oauth:test", "wallClass":"transient", "cooldownUntil":NOW + 5_000,
+            "lastError":"{\"class\":\"transient\",\"provider_code\":\"server_is_overloaded\"}"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        selection_step(&context, &harness, "bind"),
+        format!("Ok(Lost {{ retry_at: {} }})", NOW + 5_000)
+    );
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let walls: i64 = conn
+        .query_row("SELECT count(*) FROM account_fence WHERE cleared_at IS NULL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(walls, 0, "no account is walled");
+    let claimed: Vec<_> = harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .into_iter()
+        .filter(|clock| clock.claim_owner.is_some())
+        .collect();
+    assert!(claimed.is_empty(), "{claimed:?}");
+    let mut later = s4b_load(&harness, NOW as i64);
+    later
+        .reserve_selection_probes(harness.store(), &harness.credentials())
+        .unwrap();
+    assert_eq!(selection_step(&later, &harness, "bind"), "Ok(Bound)");
 }

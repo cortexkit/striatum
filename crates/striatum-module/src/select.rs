@@ -3349,7 +3349,7 @@ pub(crate) fn needs_runner_pin(
 /// resolved through its credentials' `serves` vendor) it leases a key for
 /// `session` from the pool and returns the target that pins it, with the grant;
 /// a pool that cannot be resolved or has no admissible key refuses by name.
-fn runner_for_route(
+pub(crate) fn runner_for_route(
     catalog_targets: &std::collections::BTreeMap<String, String>,
     credentials: &SharedBrocaCredentials,
     store: &SqliteRouteStateStore,
@@ -3369,7 +3369,10 @@ fn runner_for_route(
 > {
     if !needs_runner_pin(catalog_targets, provider) {
         if let Some(classes) = classes {
-            let id = classes.claim_launch_credential(
+            // The claim answers whether the launch must pin its credential,
+            // decided on the state it claimed on; a required pin is never
+            // dropped for an unpinned target.
+            let pin = classes.claim_launch_credential(
                 store,
                 provider,
                 model,
@@ -3377,12 +3380,15 @@ fn runner_for_route(
                 true,
                 owner,
             )?;
-            if classes.needs_credential_pin(provider, model) {
-                if let Some(runner) =
-                    striatum_core::runner::RunnerModel::pinned(&id, model, variant)
-                {
-                    return Ok((runner, None));
-                }
+            if let Some(id) = pin {
+                return striatum_core::runner::RunnerModel::pinned(&id, model, variant)
+                    .map(|runner| (runner, None))
+                    .ok_or_else(|| account_selection::LaunchRefusal::Refused {
+                        code: "no_eligible_account".into(),
+                        message: format!(
+                            "{provider}/{model}: the launch must pin credential {id}, which names no pin"
+                        ),
+                    });
             }
         }
         return Ok((
