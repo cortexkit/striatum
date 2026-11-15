@@ -1,4 +1,4 @@
-//! Count Rust allocations, not SQLite's C allocator, on the request thread.
+//! Count Rust allocations, not SQLite's C allocator, on the measured thread.
 
 use super::*;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -72,12 +72,43 @@ fn warmed_request_writer_telemetry_adds_no_allocations() {
         failure_backoff: Default::default(),
     };
     let request_op = || store.set_decision_outcome(&id, &update).unwrap();
-    // Both modes see the same prepared statements and warmed pages.
+    // Warm the real request before installing a probe on its writer thread.
     request_op();
-    WRITER_TELEMETRY.with(|enabled| enabled.set(false));
-    let baseline = count(request_op);
-    WRITER_TELEMETRY.with(|enabled| enabled.set(true));
-    let measured = count(request_op);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let probe: WriterProbe = Box::new(move |held, caller| {
+        // Exercise only the fast path, even if CPU scheduling made the actual
+        // writer hold slow. Slow-log allocations are covered by logging tests.
+        let held = held.min(SLOW_WRITER);
+        WRITER_TELEMETRY.with(|enabled| enabled.set(false));
+        let baseline = count(|| writer_held(held, caller));
+        WRITER_TELEMETRY.with(|enabled| enabled.set(true));
+        let measured = count(|| writer_held(held, caller));
+        sender.send((baseline, measured)).unwrap();
+    });
+    let mut probe = Some(probe);
+    store
+        .account_command(crate::AccountCommandKind::Maintenance, move |_| {
+            // Finish the probe-installation command normally, then intercept
+            // the next request's writer_held on this store's writer thread.
+            if let Some(probe) = probe.take() {
+                WRITER_PROBE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |held, caller| {
+                        writer_held(held, caller);
+                        WRITER_PROBE.with(|slot| *slot.borrow_mut() = Some(probe));
+                    }));
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+    // Counting/toggling on the caller was vacuous: writer_held runs on the
+    // account writer. It also counted std's reply-channel waker allocation,
+    // which occurs only when the caller parks before the writer replies.
+    // Measure both modes at the same real writer call, excluding channel waits.
+    request_op();
+    let (baseline, measured) = receiver
+        .try_recv()
+        .expect("request must run the writer probe before replying");
     assert_eq!(
         measured, baseline,
         "writer telemetry allocated on a fast request"
