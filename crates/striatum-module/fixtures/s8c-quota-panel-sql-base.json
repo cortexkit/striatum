@@ -381,14 +381,14 @@
                 "code": "pin_unavailable",
                 "detail": {
                   "pin": "example-subscription/model-d",
-                  "reason": "quota_exhausted",
-                  "reset_at_ms": 1800000900000
+                  "reason": "credential_billing_exhausted",
+                  "reset_at_ms": 1800003600000
                 },
                 "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."
               },
               "model": "example-subscription/model-d",
               "reason": "pin_unavailable",
-              "reset_at_ms": 1800000900000
+              "reset_at_ms": 1800003600000
             }
           ],
           "message": "Final runner or credential admission seated only 1 of 2 requested slots; see candidate causes."
