@@ -654,7 +654,7 @@ async fn admission_burst(
     before.finish_with_wall_times(fixture.store(), samples, wall_times);
 }
 
-async fn measure(fixture: RequestFixture, batches: usize) {
+async fn measure(fixture: RequestFixture, batches: usize) -> RequestFixture {
     let harness = &fixture.harness;
     let history_rows: usize = std::env::var("STRIATUM_CPU_OBSERVATION_HISTORY")
         .map(|n| n.parse().expect("observation history must be a row count"))
@@ -915,6 +915,24 @@ async fn measure(fixture: RequestFixture, batches: usize) {
             });
         }
     }
+    fixture
+}
+
+#[tokio::test]
+#[ignore = "release expiry-walk report with STRIATUM_CPU_REPRESENTATIVE supplying the live fixture counts"]
+async fn inflight_tick_expiry_cpu_on_representative_request_mix() {
+    let _clock = crate::InjectedClock::set(FIXTURE_NOW);
+    let parameters = std::env::var("STRIATUM_CPU_REPRESENTATIVE")
+        .expect("supply the five representative fixture counts");
+    let counts = FixtureCounts::parse(&parameters).unwrap();
+    println!("inflight_tick_expiry_fixture {counts:?}");
+    let fixture = measure(representative_fixture(counts), 1).await;
+    crate::account_writer::tick(fixture.store(), FIXTURE_NOW as i64).unwrap();
+    crate::account_state::report_inflight_expiry_cost_for_test(
+        fixture.store(),
+        FIXTURE_NOW as i64,
+        1_000,
+    );
 }
 
 #[test]

@@ -139,6 +139,39 @@ impl InflightLedger {
         }
     }
 
+    /// Sweep only cached runs, not admission history. Collect expired keys in
+    /// one walk so a Tick copies and changes only affected account shards.
+    pub(crate) fn expire_lapsed(&mut self, now: i64) -> usize {
+        let expired: Vec<_> = self
+            .accounts
+            .iter()
+            .filter_map(|(account, entries)| {
+                let keys: Vec<_> = entries
+                    .iter()
+                    .filter(|(_, entry)| now >= entry.until_ms)
+                    .map(|(key, _)| key.clone())
+                    .collect();
+                (!keys.is_empty()).then(|| (account.clone(), keys))
+            })
+            .collect();
+        let mut removed = 0;
+        for (account, keys) in expired {
+            removed += keys.len();
+            let entries = Arc::make_mut(
+                self.accounts
+                    .get_mut(&account)
+                    .expect("collected account still exists"),
+            );
+            for key in keys {
+                entries.remove(&key);
+            }
+            if entries.is_empty() {
+                self.accounts.remove(&account);
+            }
+        }
+        removed
+    }
+
     pub(crate) fn remove(&mut self, provider: &str, account: &str, admission: &RowKey, now: i64) {
         self.touch(provider, account, now);
         let key = (provider.to_owned(), account.to_owned());
@@ -428,5 +461,35 @@ impl InflightLedger {
         self.accounts
             .get(&(provider.to_owned(), account.to_owned()))
             .map_or(0, |entries| entries.len())
+    }
+
+    #[cfg(test)]
+    pub(super) fn report_expiry_cost(&self, now: i64, iterations: usize) {
+        assert!(iterations > 0);
+        let accounts = self.accounts.iter().count();
+        let entries = self
+            .accounts
+            .iter()
+            .map(|(_, entries)| entries.len())
+            .sum::<usize>();
+        assert!(
+            entries > 0,
+            "the request mix produced no live entries to measure"
+        );
+        for (case, at, expected) in [("live", now, 0), ("lapsed", i64::MAX, entries)] {
+            let mut elapsed = std::time::Duration::ZERO;
+            for _ in 0..iterations {
+                let mut copy = self.clone();
+                let started = std::time::Instant::now();
+                let removed = std::hint::black_box(copy.expire_lapsed(at));
+                elapsed += started.elapsed();
+                assert_eq!(
+                    removed, expected,
+                    "{case} measurement did not exercise its intended population"
+                );
+                std::hint::black_box(copy);
+            }
+            println!("inflight_tick_expiry case={case} cached_entries={entries} accounts={accounts} iterations={iterations} removed_per_iteration={expected} average_us={:.3}",elapsed.as_secs_f64()*1_000_000.0/iterations as f64);
+        }
     }
 }

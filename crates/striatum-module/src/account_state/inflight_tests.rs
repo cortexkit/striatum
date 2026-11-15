@@ -799,3 +799,121 @@ fn inflight_upgrade_preserves_recent_attempts_without_resetting_the_lapse() {
     assert_restart_count(&store, &owner, T, 1);
     assert_restart_count(&store, &owner, T + 29 * MINUTE, 0);
 }
+
+#[test]
+fn tick_expires_untouched_inflight_accounts_without_changing_durable_rows() {
+    let (_scratch, store, owner) = fixture("inflight-tick-expiry");
+    reserve(&store, row("first", T), T);
+    let mut other = row("other", T);
+    other.account_id = "b".into();
+    other.credential_id = "credential-b".into();
+    reserve(&store, other, T);
+    let mut started = row("started", T);
+    started.account_id = "c".into();
+    started.credential_id = "credential-c".into();
+    reserve(&store, started, T);
+    start(&store, "p", "started", "run", T);
+    let deadline = T + MINUTE;
+    assert_eq!(count(&owner, "a", InflightScope::Account, deadline - 1), 1);
+    assert_eq!(count(&owner, "b", InflightScope::Account, deadline - 1), 1);
+    assert_eq!(count(&owner, "a", InflightScope::Account, deadline), 0);
+    assert_eq!(count(&owner, "b", InflightScope::Account, deadline), 0);
+    assert_eq!(
+        owner
+            .published_snapshot()
+            .unwrap()
+            .inflight
+            .entry_count("provider", "a"),
+        1
+    );
+    assert_eq!(
+        owner
+            .published_snapshot()
+            .unwrap()
+            .inflight
+            .entry_count("provider", "b"),
+        1
+    );
+    let loads = owner.loads.load(Ordering::Relaxed);
+    let trace = striatum_store::writer_entry_trace::Trace::default();
+    let _trace = trace.install();
+    run(&store, deadline, move |tx| tx.tick(deadline)).unwrap();
+    let state = owner.published_snapshot().unwrap();
+    assert_eq!(state.inflight.entry_count("provider", "a"), 0);
+    assert_eq!(state.inflight.entry_count("provider", "b"), 0);
+    assert_eq!(state.inflight.entry_count("provider", "c"), 1);
+    assert_eq!(
+        state
+            .admissions
+            .open_admission("p", "first")
+            .unwrap()
+            .row
+            .state,
+        "reserved"
+    );
+    assert_eq!(
+        state
+            .admissions
+            .open_admission("p", "other")
+            .unwrap()
+            .row
+            .state,
+        "reserved"
+    );
+    crate::account_state::assert_fresh_load_for_test(
+        &store,
+        deadline,
+        "Tick expired both untouched accounts",
+    );
+    run(&store, deadline, move |tx| tx.tick(deadline)).unwrap();
+    let started_deadline = T + 30 * MINUTE;
+    assert_eq!(
+        count(&owner, "c", InflightScope::Account, started_deadline),
+        0
+    );
+    run(&store, started_deadline, move |tx| {
+        tx.tick(started_deadline)
+    })
+    .unwrap();
+    assert_eq!(
+        owner
+            .published_snapshot()
+            .unwrap()
+            .inflight
+            .entry_count("provider", "c"),
+        0
+    );
+    assert_eq!(
+        owner
+            .published_snapshot()
+            .unwrap()
+            .admissions
+            .open_admission("p", "started")
+            .unwrap()
+            .row
+            .state,
+        "started"
+    );
+    crate::account_state::assert_fresh_load_for_test(
+        &store,
+        started_deadline,
+        "Tick expired the unobserved started run",
+    );
+    assert_eq!(
+        owner.loads.load(Ordering::Relaxed),
+        loads,
+        "a reload hid an expiry mirror"
+    );
+    assert!(
+        !trace.entries().is_empty(),
+        "the writer trace did not observe the ticks"
+    );
+    assert!(
+        trace
+            .entries()
+            .iter()
+            .all(|entry| entry.account_rows_written == Some(0)),
+        "cache expiry wrote durable account rows: {:?}",
+        trace.entries()
+    );
+}

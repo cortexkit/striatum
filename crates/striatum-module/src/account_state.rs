@@ -220,7 +220,7 @@ struct StateOwner {
     ready: (Mutex<Option<Result<(), String>>>, Condvar),
     reload: AtomicBool,
     #[cfg(test)]
-    loads: std::sync::atomic::AtomicU64,
+    loads: Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     load_hook: Mutex<Option<Box<dyn Fn() -> RouteStateResult<()> + Send>>>,
     #[cfg(test)]
@@ -1300,6 +1300,9 @@ impl AccountCommand<'_> {
         self.sql.reconcile_block_state()?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
+        if let Some(state) = self.state.as_deref_mut() {
+            state.inflight.expire_lapsed(now_ms);
+        }
         self.sql.sync_fence_rechecks()
     }
 
@@ -1430,12 +1433,35 @@ pub(crate) fn initialize(store: &SqliteRouteStateStore) -> RouteStateResult<()> 
 
 #[cfg(test)]
 pub(crate) fn initialize_at(store: &SqliteRouteStateStore, now_ms: i64) -> RouteStateResult<()> {
+    initialize_counted_at(store, now_ms).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn initialize_counted_at(
+    store: &SqliteRouteStateStore,
+    now_ms: i64,
+) -> RouteStateResult<Arc<std::sync::atomic::AtomicU64>> {
     // The loader runs on the writer thread, where a test's thread-local clock
     // is not installed. Pin its clock before starting that thread's load.
+    let loads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     store.install_account_state_bridge(Arc::new(StateOwner {
         load_now_ms: Some(now_ms),
+        loads: loads.clone(),
         ..StateOwner::default()
-    }))
+    }))?;
+    Ok(loads)
+}
+
+#[cfg(test)]
+pub(crate) fn report_inflight_expiry_cost_for_test(
+    store: &SqliteRouteStateStore,
+    now: i64,
+    iterations: usize,
+) {
+    snapshot(store)
+        .unwrap()
+        .inflight
+        .report_expiry_cost(now, iterations);
 }
 
 /// After a request mix: the published admission state must equal a fresh
