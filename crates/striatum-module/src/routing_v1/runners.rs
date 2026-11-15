@@ -23,6 +23,9 @@ mod harness_facts_tests;
 pub(crate) mod placements;
 #[cfg(test)]
 mod placements_tests;
+#[cfg(test)]
+#[path = "runners/watch_tests.rs"]
+mod watch_tests;
 pub(crate) use admission::{fetch_describe, refresh_admission_tiers, tier_view_unknown};
 pub(crate) use describe_cache::DescribeCache;
 pub(crate) use harness_facts::RunnerDeclaration;
@@ -1001,92 +1004,223 @@ pub(crate) async fn refresh_loop(
         .expect("credentials lock")
         .runner_catalog_wake
         .clone();
+    let mut backoff = WATCH_RETRY_MIN;
     loop {
-        striatum_store::job_timing::run("runner_declarations", async {
-            let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                let consumer = SubcConsumer::connect(&connection_file, ConsumerOptions::default())
+        let connected = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            SubcConsumer::connect(&connection_file, ConsumerOptions::default()),
+        )
+        .await;
+        if let Ok(Ok(consumer)) = connected {
+            let (updates, mut changes) = tokio::sync::watch::channel(CatalogWatchState::default());
+            let watch = watch_catalog(&consumer, &updates);
+            let refresh = async {
+                loop {
+                    let revision = changes.borrow_and_update().revision;
+                    if !refresh_pass(
+                        &consumer,
+                        &connection_file,
+                        &credentials,
+                        &config_path,
+                        &mut cache,
+                        &mut classifiers,
+                    )
                     .await
-                    .map_err(|error| error.to_string())?;
-                let catalog = consumer
-                    .catalog_list()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let modules =
-                    serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
-                Ok::<_, String>((consumer, modules))
-            })
-            .await;
-            if let Ok(Ok((consumer, modules))) = result {
-                super::consumers::replace_catalog(&modules);
-                let policies = crate::config_overrides::live_config(&config_path).v1_runners();
-                let tier_modules = if let Ok(mut credentials) = credentials.lock() {
-                    let tiers = cache.catalog(
-                        &modules,
-                        &policies,
+                    {
+                        break;
+                    }
+                    if !wait_for_catalog_refresh(&mut changes, revision, &wake).await {
+                        break;
+                    }
+                }
+            };
+            tokio::pin!(watch, refresh);
+            tokio::select! {
+                // A failed pass rebuilds the consumer, including its watch.
+                _ = &mut refresh => {},
+                // Finish publication before replacing a closed watch's consumer.
+                _ = &mut watch => refresh.await,
+            }
+            if updates.borrow().revision != 0 {
+                backoff = WATCH_RETRY_MIN;
+            }
+        } else if let Ok(mut credentials) = credentials.lock() {
+            cache.missed_all(&mut credentials, crate::now_ms() as i64);
+            classifiers.expire(&mut credentials, crate::now_ms() as i64);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {},
+            _ = wake.notified() => {},
+        }
+        backoff = (backoff * 2).min(WATCH_RETRY_MAX);
+    }
+}
+
+const WATCH_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const WATCH_FALLBACK: std::time::Duration = std::time::Duration::from_secs(30);
+const WATCH_RETRY_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const WATCH_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[derive(Clone, Copy, Default)]
+struct CatalogWatchState {
+    revision: u64,
+    healthy: bool,
+    rebuild: bool,
+}
+
+async fn watch_catalog(
+    consumer: &subc_client_rs::SubcConsumer,
+    updates: &tokio::sync::watch::Sender<CatalogWatchState>,
+) {
+    let mut backoff = WATCH_RETRY_MIN;
+    loop {
+        if let Ok(mut subscription) = consumer.catalog_watch().await {
+            let mut generation = None;
+            while let Ok(Some(event)) = subscription.next().await {
+                if generation != Some(event.generation) {
+                    generation = Some(event.generation);
+                    backoff = WATCH_RETRY_MIN;
+                    updates.send_modify(|state| {
+                        state.healthy = true;
+                        state.revision = state.revision.wrapping_add(1);
+                    });
+                }
+            }
+            // Once a feed has worked, its termination may mean the daemon
+            // restarted. Replace the connection and re-read before trusting it.
+            if generation.is_some() {
+                updates.send_modify(|state| {
+                    state.healthy = false;
+                    state.rebuild = true;
+                });
+                return;
+            }
+        }
+        updates.send_modify(|state| state.healthy = false);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(WATCH_RETRY_MAX);
+    }
+}
+
+async fn wait_for_catalog_refresh(
+    changes: &mut tokio::sync::watch::Receiver<CatalogWatchState>,
+    revision: u64,
+    wake: &tokio::sync::Notify,
+) -> bool {
+    let mut deadline = tokio::time::Instant::now() + WATCH_BACKSTOP;
+    loop {
+        let state = *changes.borrow_and_update();
+        if state.rebuild {
+            return false;
+        }
+        // Only one latest revision is retained while a pass runs. Mark it seen
+        // at the start of the next pass, never at the end of the current one.
+        if state.revision != revision {
+            return true;
+        }
+        if !state.healthy {
+            deadline = deadline.min(tokio::time::Instant::now() + WATCH_FALLBACK);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return true,
+            _ = wake.notified() => return true,
+            result = changes.changed() => if result.is_err() { return false; },
+        }
+    }
+}
+
+async fn refresh_pass(
+    consumer: &subc_client_rs::SubcConsumer,
+    connection_file: &std::path::Path,
+    credentials: &crate::SharedBrocaCredentials,
+    config_path: &std::path::Path,
+    cache: &mut DescribeCache,
+    classifiers: &mut super::classifier::DescribeCache,
+) -> bool {
+    striatum_store::job_timing::run("runner_declarations", async {
+        let result = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let catalog = consumer
+                .catalog_list()
+                .await
+                .map_err(|error| error.to_string())?;
+            let modules =
+                serde_json::to_value(catalog.modules).map_err(|error| error.to_string())?;
+            Ok::<_, String>(modules)
+        })
+        .await;
+        if let Ok(Ok(modules)) = result {
+            let mut complete = true;
+            super::consumers::replace_catalog(&modules);
+            let policies = crate::config_overrides::live_config(&config_path).v1_runners();
+            let tier_modules = if let Ok(mut credentials) = credentials.lock() {
+                let tiers = cache.catalog(
+                    &modules,
+                    &policies,
+                    &mut credentials,
+                    crate::now_ms() as i64,
+                );
+                placements::declarations_changed(&credentials.runner_declarations);
+                tiers
+            } else {
+                BTreeSet::new()
+            };
+            let classifier_modules = credentials
+                .lock()
+                .map(|mut credentials| {
+                    classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
+                })
+                .unwrap_or_default();
+            for module in classifier_modules {
+                let result = super::classifier::fetch_describe(
+                    &consumer,
+                    &connection_file,
+                    &module,
+                    &policies,
+                    &credentials,
+                )
+                .await;
+                complete &= result.is_ok();
+                if let Ok(mut credentials) = credentials.lock() {
+                    if matches!(result, Ok(None)) {
+                        classifiers.revoke(&module, &mut credentials);
+                    }
+                    classifiers.reply(
+                        &module,
+                        result.as_ref().ok().and_then(Option::as_ref),
                         &mut credentials,
                         crate::now_ms() as i64,
                     );
-                    placements::declarations_changed(&credentials.runner_declarations);
-                    tiers
-                } else {
-                    BTreeSet::new()
-                };
-                let classifier_modules = credentials
-                    .lock()
-                    .map(|mut credentials| {
-                        classifiers.catalog(&modules, &mut credentials, crate::now_ms() as i64)
-                    })
-                    .unwrap_or_default();
-                for module in classifier_modules {
-                    let result = super::classifier::fetch_describe(
-                        &consumer,
-                        &connection_file,
-                        &module,
-                        &policies,
-                        &credentials,
-                    )
-                    .await;
-                    if let Ok(mut credentials) = credentials.lock() {
-                        if matches!(result, Ok(None)) {
-                            classifiers.revoke(&module, &mut credentials);
-                        }
-                        classifiers.reply(
-                            &module,
-                            result.as_ref().ok().and_then(Option::as_ref),
-                            &mut credentials,
-                            crate::now_ms() as i64,
-                        );
-                    }
                 }
-                // The routing declaration describes reach, not tier application.
-                // Only the runner's own role.describe can establish tier support.
-                for module in tier_modules {
-                    let describe = fetch_describe(
-                        &consumer,
-                        &connection_file,
-                        &module,
-                        &policies,
-                        &credentials,
-                    )
-                    .await;
-                    if let Ok(mut credentials) = credentials.lock() {
-                        cache.reply(
-                            &module,
-                            describe.as_ref(),
-                            &mut credentials,
-                            crate::now_ms() as i64,
-                        );
-                    }
-                }
-            } else if let Ok(mut credentials) = credentials.lock() {
-                cache.missed_all(&mut credentials, crate::now_ms() as i64);
-                classifiers.expire(&mut credentials, crate::now_ms() as i64);
             }
-        })
-        .await;
-        tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {},
-            _ = wake.notified() => {},
+            // The routing declaration names routes a runner can serve, not tier support.
+            // Only the runner's own role.describe can establish tier support.
+            for module in tier_modules {
+                let describe = fetch_describe(
+                    &consumer,
+                    &connection_file,
+                    &module,
+                    &policies,
+                    &credentials,
+                )
+                .await;
+                complete &= describe.is_some();
+                if let Ok(mut credentials) = credentials.lock() {
+                    cache.reply(
+                        &module,
+                        describe.as_ref(),
+                        &mut credentials,
+                        crate::now_ms() as i64,
+                    );
+                }
+            }
+            complete
+        } else if let Ok(mut credentials) = credentials.lock() {
+            cache.missed_all(&mut credentials, crate::now_ms() as i64);
+            classifiers.expire(&mut credentials, crate::now_ms() as i64);
+            false
+        } else {
+            false
         }
-    }
+    })
+    .await
 }
