@@ -5957,10 +5957,12 @@ fn a_block_recorded_after_the_selection_read_stops_its_bind_and_launches() {
 }
 
 /// The bind and both launch claims decide which clocks apply from the
-/// command's working state, and the claim names only those. Each checks the
-/// rows that chose them first: when SQL holds a route clear the state lacks
-/// (written where neither the capture nor a reload sees it), the command
-/// runs again on a fresh load and claims nothing the clear lifted.
+/// command's working state, and the claim names only those. Each first
+/// checks the rows that chose them against SQL. Here a route clear is
+/// written straight to SQL behind the account writer's back
+/// (`write_unseen_for_test`), so the working state lacks it: the check finds
+/// the difference, the command runs again on a fresh load, and it claims
+/// nothing the clear lifted.
 #[test]
 fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
     let _clock = crate::InjectedClock::set(NOW);

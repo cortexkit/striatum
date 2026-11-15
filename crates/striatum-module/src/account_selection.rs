@@ -1182,8 +1182,8 @@ impl ClassContext {
         CONTEXT_LOADS.with(|loads| loads.set(loads.get() + 1));
         // Expired admission probes and continuation offers read as released
         // through the published state's `as_of` view; the next command
-        // releases them durably, so this read sends none. A sweep's private
-        // copy applies the same releases to itself.
+        // releases them durably, so this read sends no release command. A
+        // sweep's private copy applies the same releases to itself.
         if let Some(sweep) = sweep {
             sweep.expire(now_ms);
         }
