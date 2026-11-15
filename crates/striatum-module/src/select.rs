@@ -500,7 +500,7 @@ fn resolve_select_request_with_catalog_targets(
 }
 
 pub(super) struct PreparedSelectionInputs {
-    pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
+    pub(super) catalog_snapshot: Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) now: f64,
     pub(super) facts: Vec<ModelFact>,
     pub(super) snapshot: ModelRouteStateSnapshot,

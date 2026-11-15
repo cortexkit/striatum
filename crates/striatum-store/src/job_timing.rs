@@ -156,6 +156,16 @@ impl Drop for BatchScope {
 /// (including commit) returns. Queue wait is deliberately not part of the hold.
 pub(crate) fn writer_held(held: Duration, caller: &'static Location<'static>) {
     #[cfg(test)]
+    {
+        // Take the probe before calling it so it can measure this same entry
+        // point with telemetry enabled and bypassed, without recursing.
+        let probe = WRITER_PROBE.with(|probe| probe.borrow_mut().take());
+        if let Some(probe) = probe {
+            probe(held, caller);
+            return;
+        }
+    }
+    #[cfg(test)]
     if !WRITER_TELEMETRY.with(Cell::get) {
         return;
     }
@@ -248,9 +258,13 @@ pub(crate) fn thread_cpu_ns() -> u64 {
 }
 
 #[cfg(test)]
+type WriterProbe = Box<dyn FnOnce(Duration, &'static Location<'static>) + Send>;
+
+#[cfg(test)]
 thread_local! {
     static LOG_LINES: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
     static WRITER_TELEMETRY: Cell<bool> = const { Cell::new(true) };
+    static WRITER_PROBE: std::cell::RefCell<Option<WriterProbe>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]

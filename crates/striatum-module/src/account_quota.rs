@@ -1779,11 +1779,10 @@ pub(crate) fn refresh_serving_methods(
     broca_credentials: &crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: &std::path::Path,
 ) {
-    use striatum_core::RouteStateStore as _;
     let accounts = state.lock().ok().map(|guard| guard.clone());
     #[cfg(test)]
     after_join_snapshot_for_test();
-    if let (Some(accounts), Ok(facts)) = (accounts, store.get_facts()) {
+    if let (Some(accounts), Ok(catalog)) = (accounts, store.get_selection_catalog()) {
         // The join resolves providers missing their own catalog rows from the
         // cached vault listing and catalog facts, then uses the listed login's
         // authentication method to choose the billing plane.
@@ -1793,7 +1792,12 @@ pub(crate) fn refresh_serving_methods(
             credentials
                 .concurrency_caps
                 .publish_settings(config.concurrency_caps());
-            credentials.refresh_serving_methods(&accounts, &facts, now_ms(), &model_pools);
+            credentials.refresh_serving_methods_if_changed(
+                &accounts,
+                &catalog,
+                now_ms(),
+                &model_pools,
+            );
         }
     }
 }
