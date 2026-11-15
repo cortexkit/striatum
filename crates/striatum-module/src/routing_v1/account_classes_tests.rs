@@ -2673,7 +2673,7 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
         )
         .await;
     // The only subscription account sits within its reserve; the public
-    // refusal retains the allocator's known reset and retry delay.
+    // refusal schedules a quota recheck before the distant provider reset.
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(
         reply.1["code"], "account_pool_reserve_limited",
@@ -2682,7 +2682,7 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
     );
     assert_eq!(
         reply.1["detail"]["reset_at_ms"],
-        NOW + 3_600_000,
+        NOW + 900_000,
         "{}",
         reply.1
     );
@@ -2784,10 +2784,18 @@ fn oauth_weekly_reading_at(used_percent: f64, reset_ms: i64, fetched_ms: i64) {
 }
 
 #[tokio::test]
-async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset() {
+async fn pin_reserve_retry_by_recheck_and_keep_near_reset() {
+    for (weekly_reset, expected_retry) in [
+        (NOW + 60_000, NOW + 60_000),
+        (NOW + 86_400_000, NOW + 900_000),
+    ] {
+        pin_availability_reserve_case(weekly_reset, expected_retry).await;
+    }
+}
+
+async fn pin_availability_reserve_case(weekly_reset: u64, expected_retry: u64) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
-    let weekly_reset = NOW + 86_400_000;
     harness.edit_config(|config| {
         config["model_routing"]["keep_free_percent"] = json!({"synthetic":20});
     });
@@ -2836,7 +2844,7 @@ async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset()
             serde_json::from_value(reply.1).unwrap();
         assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
         assert_eq!(refusal.detail["reason"], "quota_exhausted", "{refusal:?}");
-        assert_eq!(refusal.wait_until_ms(), Some(weekly_reset), "{refusal:?}");
+        assert_eq!(refusal.wait_until_ms(), Some(expected_retry), "{refusal:?}");
         assert!(
             refusal.message.contains("subscription_reserve"),
             "{refusal:?}"
@@ -4286,7 +4294,7 @@ async fn codex_reserve_limited_refusal_carries_earliest_reset() {
     );
     assert_eq!(
         reply.1["detail"]["reset_at_ms"],
-        NOW + 86_400_000,
+        NOW + 900_000,
         "{}",
         reply.1
     );

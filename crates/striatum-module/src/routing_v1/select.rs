@@ -2072,7 +2072,10 @@ async fn select_at_tier_attempt(
             if !blocked.is_empty() {
                 let mut refusal = Refusal::no_route(
                     NoRouteReason::parse("accounts_blocked"),
-                    no_route.earliest_reset.map(|reset| reset as u64),
+                    super::quota_retry_hint(
+                        no_route.earliest_reset.map(|reset| reset as u64),
+                        now as u64,
+                    ),
                 );
                 if no_route.earliest_reset.is_some() {
                     refusal.message =
@@ -2393,7 +2396,7 @@ async fn select_at_tier_attempt(
                     Basis::ProjectPin => project_pin.as_deref(),
                     _ => None,
                 };
-                pool_select_refusal(refusal, pin)
+                pool_select_refusal(refusal, pin, now as u64)
             })?;
             runner_ref.model.provider = grant.runner.provider;
             runner_ref.model.model = grant.runner.model;
@@ -2953,6 +2956,9 @@ impl<'a> Selection<'a> {
                     reason = PinUnavailableReason::QuotaExhausted;
                 }
             }
+            if reason == PinUnavailableReason::QuotaExhausted {
+                reset = super::quota_retry_hint(reset, self.now as u64);
+            }
             let mut refusal = Refusal::pin_unavailable(pin, reason, reset);
             if provider_limited {
                 // A declared provider limit has no recovery time. Keep the
@@ -3237,7 +3243,16 @@ impl<'a> Selection<'a> {
                     | "account_pool_exhausted"
                     | "account_pool_reserve_limited"
             ) {
-                account_limit_refusal(None, refusal.reset_at_ms)
+                account_limit_refusal(
+                    None,
+                    super::quota_retry_hint(
+                        refusal
+                            .reset_at_ms
+                            .and_then(|reset| u64::try_from(reset).ok()),
+                        self.now as u64,
+                    )
+                    .map(|reset| reset as i64),
+                )
             } else {
                 provider_refusal(&refusal.code, refusal.message)
             }
@@ -3279,19 +3294,23 @@ fn account_limit_refusal(pin: Option<&str>, reset: Option<i64>) -> Refusal {
         None => Refusal::no_route(NoRouteReason::parse("accounts_blocked"), reset),
     };
     refusal.message = "Every account that can serve this route has reached its limit. \
-        The detail gives the time an account frees up, when routing knows it."
+        The detail gives the next time to check for account headroom, when routing knows it."
         .into();
     refusal
 }
 
-fn pool_select_refusal(refusal: key_pool::PoolRefusal, pin: Option<&str>) -> Refusal {
+fn pool_select_refusal(refusal: key_pool::PoolRefusal, pin: Option<&str>, now: u64) -> Refusal {
     if refusal.code == striatum_core::key_pool::EXPLICIT_PROVIDER_POOL_EXHAUSTED {
         account_limit_refusal(
             pin,
-            refusal
-                .detail
-                .as_ref()
-                .and_then(|detail| detail["earliestResetAtMs"].as_i64()),
+            super::quota_retry_hint(
+                refusal
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail["earliestResetAtMs"].as_u64()),
+                now,
+            )
+            .map(|reset| reset as i64),
         )
     } else {
         provider_refusal(&refusal.code, refusal.message)
@@ -3376,13 +3395,24 @@ fn no_route_refusal(no_route: &NoRouteError, now: f64) -> Refusal {
         | RouteFailureReason::AllRoutesInadequate
         | RouteFailureReason::InvalidRequirements => NoRouteReason::AllInadequate,
     };
-    let reset = no_route
+    let mut reset = no_route
         .earliest_reset
         .filter(|reset| *reset > now)
         .map(|reset| reset as u64);
+    if no_route.reason != RouteFailureReason::ConcurrencyFull
+        && no_route.rejected.iter().any(|route| {
+            Some(&route.route_key) == no_route.earliest_reset_route.as_ref()
+                && matches!(
+                    route.reason.as_str(),
+                    "quota_exhausted" | "subscription_reserve" | "no_eligible_account"
+                )
+        })
+    {
+        reset = super::quota_retry_hint(reset, now as u64);
+    }
     let mut refusal = Refusal::no_route(reason, reset);
     let mut diagnostic = no_route.clone();
-    diagnostic.earliest_reset = reset.map(|reset| reset as f64);
+    diagnostic.earliest_reset = no_route.earliest_reset.filter(|reset| *reset > now);
     refusal.message = format!("{}: {}", refusal.message, diagnostic.refusal_message());
     refusal
         .detail
@@ -3414,6 +3444,7 @@ fn clamp_sentence(sentence: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod quota_retry_tests;
     use super::super::{
         conformance_tests::{install_catalog, reserved, Harness},
         dispatch_tests::configured,
@@ -4147,6 +4178,7 @@ mod tests {
                         detail: Some(json!({"earliestResetAtMs":reset})),
                     },
                     pin,
+                    1_800_000_000_000,
                 );
                 assert_eq!(refusal.wait_until_ms(), reset.map(|reset| reset as u64));
                 let expected = match pin {

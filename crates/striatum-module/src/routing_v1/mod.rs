@@ -56,6 +56,14 @@ mod what_if;
 #[cfg(test)]
 mod what_if_tests;
 
+/// Quota headroom can return before a provider reset. A known reset schedules
+/// an extra check, but must not postpone the regular quota recheck.
+fn quota_retry_hint(reset: Option<u64>, now: u64) -> Option<u64> {
+    reset.map(|reset| {
+        reset.min(now.saturating_add(striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS as u64))
+    })
+}
+
 #[cfg(test)]
 mod account_classes_tests;
 #[cfg(test)]
