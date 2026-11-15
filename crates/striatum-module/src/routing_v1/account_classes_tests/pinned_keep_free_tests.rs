@@ -324,6 +324,125 @@ async fn failed_pins_do_not_exempt_automatic_fallback() {
     );
 }
 
+const SYNTHESIZER: &str = "prefrontal-core.athena.synthesizer";
+const SYNTHESIZER_PIN: &str = "synthetic/model:medium";
+
+fn synthesizer_fixture(policy: Value) -> (Arc<Harness>, impl Drop) {
+    let (harness, pools) = fixture(Origin::Request, 85.0);
+    harness.edit_config(|config| {
+        config["consumers"]["prefrontal-core.athena"] = policy;
+        config["consumers"]["prefrontal-core.athena"]["owner"] = json!(OWNER);
+    });
+    harness.attach_reasoning_catalog(striatum_store::ReasoningCatalog {
+        models: [(
+            MODEL.into(),
+            striatum_store::PublishedEfforts::Published(vec!["medium".into(), "high".into()]),
+        )]
+        .into_iter()
+        .collect(),
+    });
+    (harness, pools)
+}
+
+async fn assert_synthesizer_reask_below_margin(policy: Value) {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = synthesizer_fixture(policy);
+    let caller = harness.bind(reserved(OWNER), None).await;
+    let mut request = selection_request(Origin::Request, SYNTHESIZER);
+    request["pin"] = json!(SYNTHESIZER_PIN);
+    let reply = caller.call("route.select", &request).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(
+        reply.1["result"]["route"]["provider"], "synthetic",
+        "{reply:?}"
+    );
+    assert_eq!(reply.1["result"]["route"]["model"], "model", "{reply:?}");
+    assert_eq!(reply.1["result"]["route"]["variant"], "medium", "{reply:?}");
+    let id = reply.1["result"]["decision_id"].as_str().unwrap();
+    let decision = harness.store().get_decision_by_id(id).unwrap().unwrap();
+    assert!(decision
+        .explanation_json
+        .as_deref()
+        .unwrap()
+        .contains(EXEMPT));
+    assert!(
+        reply.1.to_string().contains("keep-free margin 0.0%"),
+        "{reply:?}"
+    );
+    assert_eq!(
+        reply.1["result"]["detail"]["score"]["objective"]["subscriptionPricing"]["availablePoints"],
+        15.0,
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn synthesizer_request_pin_matching_inherited_settings_pin_spends_below_keep_free() {
+    assert_synthesizer_reask_below_margin(json!({
+        "pin":{"model":MODEL,"variant":"medium"}
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn synthesizer_request_pin_matching_inherited_settings_ladder_spends_below_keep_free() {
+    assert_synthesizer_reask_below_margin(json!({
+        "mode":"ladder","ladder":["absent/model", SYNTHESIZER_PIN]
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn synthesizer_request_pin_different_from_settings_keeps_the_reserve() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for settings_route in [
+        "other/model:medium",
+        "synthetic/other:medium",
+        "synthetic/model:high",
+        MODEL,
+    ] {
+        for policy in [
+            json!({"pin":{"model":settings_route}}),
+            json!({"mode":"ladder","ladder":[settings_route]}),
+        ] {
+            let (harness, _pools) = synthesizer_fixture(policy.clone());
+            let caller = harness.bind(reserved(OWNER), None).await;
+            let mut request = selection_request(Origin::Request, SYNTHESIZER);
+            request["pin"] = json!(SYNTHESIZER_PIN);
+            let reply = caller.call("route.select", &request).await;
+            assert_eq!(reply.0, FrameType::Error, "{policy}: {reply:?}");
+            assert!(
+                reply.1.to_string().contains("subscription_reserve"),
+                "{policy}: {reply:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn request_pin_matching_module_declared_ladder_keeps_the_reserve() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _pools) = fixture(Origin::Request, 85.0);
+    let consumer = format!("{OWNER}.module");
+    let caller = harness.bind(reserved(OWNER), None).await;
+    super::super::describe::with_candidate_capabilities(&["consumer_declarations"], async {
+        super::super::consumers::replace_catalog(&json!([{
+            "module_id":OWNER,"nonce_verified":true,
+            "role_declarations":{"routing/v1":{"consumers":[
+                {"name":consumer,"ladder":[MODEL]}
+            ]}}
+        }]));
+        let request = selection_request(Origin::Request, &consumer);
+        let reply = caller.call("route.select", &request).await;
+        assert_eq!(reply.0, FrameType::Error, "{reply:?}");
+        assert!(
+            reply.1.to_string().contains("subscription_reserve"),
+            "{reply:?}"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn exempt_pins_still_obey_settings_exclusions() {
     let _clock = crate::InjectedClock::set(NOW);

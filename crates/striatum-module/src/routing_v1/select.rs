@@ -1761,7 +1761,7 @@ async fn select_at_tier_attempt(
     let choose = || {
         let request_pin_exempt = inputs.consumer_pinned
             || (request.pin.is_none() && request.pin_slot.is_some())
-            || request_pin_is_keep_free_exempt(&consumer);
+            || request_pin_is_keep_free_exempt(&consumer, request.pin.as_deref(), &consumer_policy);
         let mut request_pin = request.pin.clone().or_else(|| {
             request
                 .pin_slot
@@ -3312,11 +3312,36 @@ impl<'a> Selection<'a> {
 
 const PINNED_KEEP_FREE_EXPLANATION: &str = "pinned: keep-free margin not applied";
 
-fn request_pin_is_keep_free_exempt(consumer: &str) -> bool {
+fn request_pin_is_keep_free_exempt(
+    consumer: &str,
+    pin: Option<&str>,
+    policy: &crate::config_policy::ConsumerPolicy,
+) -> bool {
     // Temporary until core adds a marker distinguishing a user's model choice
-    // from core-generated requests that repeat a prior model, such as replacement
-    // seats. Only mason and its dotted launch/retry children identify user pins.
-    consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.")
+    // from core-generated requests that repeat a prior model. Only mason and its
+    // dotted launch/retry children identify raw user pins.
+    if consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.") {
+        return true;
+    }
+    let Some(requested) = pin.and_then(RouteRef::parse_pin) else {
+        return false;
+    };
+    // Repeating the consumer's inherited settings choice is still an operator
+    // pin. Match the whole route so a different model or effort keeps its reserve.
+    let matches = |configured: &str| {
+        RouteRef::parse_pin(configured).is_some_and(|configured| {
+            requested.provider == configured.provider
+                && requested.model == configured.model
+                && requested.variant == configured.variant
+        })
+    };
+    // Module-declared ladders do not express an operator's model choice.
+    policy.pin.as_ref().is_some_and(|pin| {
+        matches(&pin.variant.as_ref().map_or_else(
+            || pin.model.clone(),
+            |variant| format!("{}:{variant}", pin.model),
+        ))
+    }) || (policy.operator_ladder() && policy.ladder.iter().flatten().any(|step| matches(step)))
 }
 
 fn exempt_pinned_keep_free(snapshot: &mut ModelRouteStateSnapshot, capacity: &str) -> bool {
