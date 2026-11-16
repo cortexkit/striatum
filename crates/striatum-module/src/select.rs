@@ -920,62 +920,16 @@ async fn handle_select_request_attempt(
                 store,
             )
         });
-        let reply = crate::account_refusal_log::record(
+        let reply = answer_legacy_account(
             &envelope.method,
-            &principal,
+            &frame.body,
             &request["params"],
-            || {
-                if envelope.method == account_selection::ACCOUNT_FOR_OP
-                    && live_config.account_flags().enabled
-                    && !crate::broca_credentials::wait_for_first_listing(broca_credentials)
-                {
-                    return crate::broca_credentials::listing_not_ready(&request["params"]);
-                }
-                let policy = striatum_core::accounts::AllocatorPolicy {
-                    model_pools: live_config.quota_model_pools_ref().to_vec(),
-                    ..Default::default()
-                };
-                // The contract has no `store_error` or `internal_error` for
-                // `route.account_for`; a context that cannot load is transient
-                // unavailability, not a transport failure.
-                let classes = match account_selection::ClassContext::load(
-                    store,
-                    broca_credentials,
-                    config_overrides::live_config(operator_config_path),
-                    ACCOUNT_QUOTA.get(),
-                    account_selection::now_ms(),
-                ) {
-                    Ok(classes) => classes,
-                    Err(error) => {
-                        let reply = account_selection::OpReply::Error {
-                            code: "account_selection_unavailable".to_string(),
-                            message: format!("routing could not load account context: {error}"),
-                            detail: Some(json!({
-                                "code": "account_selection_unavailable",
-                                "retry_after_s": null,
-                                "decision_id": null,
-                                "exclusions": [],
-                            })),
-                        };
-                        return reply;
-                    }
-                };
-                let ctx = account_selection::Ctx {
-                    store: store.as_ref(),
-                    accounts: ACCOUNT_QUOTA.get(),
-                    flags: live_config.account_flags(),
-                    policy: &policy,
-                    now_ms: account_selection::now_ms(),
-                    classes: Some(classes),
-                };
-                account_selection::handle_with_call(
-                    &envelope.method,
-                    &frame.body,
-                    &principal,
-                    &ctx,
-                    call.clone(),
-                )
-            },
+            &principal,
+            store,
+            broca_credentials,
+            operator_config_path,
+            &live_config,
+            call.clone(),
         );
         if let Some(call) = call {
             call.finish();
@@ -2235,4 +2189,77 @@ pub(super) fn decision_input_for(
             }
         }
     }
+}
+
+// Both the route and EVENT reader enter here, so legacy caller authorization
+// and account-context construction cannot drift between delivery paths.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn answer_legacy_account(
+    method: &str,
+    body: &[u8],
+    params: &serde_json::Value,
+    principal: &str,
+    store: &SharedStore,
+    broca_credentials: &SharedBrocaCredentials,
+    operator_config_path: &std::path::Path,
+    live_config: &config_overrides::LiveConfig,
+    call: Option<account_selection::call_log::AccountCall>,
+) -> account_selection::OpReply {
+    if method == account_selection::ACCOUNT_OBSERVE_OP
+        && params["caller"]["runner"].as_str().is_some_and(|runner| {
+            principal != format!("reserved:{}", runner.trim().to_ascii_lowercase())
+        })
+    {
+        return account_selection::OpReply::Error {
+            code: "account_not_authorized".into(),
+            message: "observation caller.runner must match the authenticated module".into(),
+            detail: None,
+        };
+    }
+    crate::account_refusal_log::record(method, principal, params, || {
+        if method == account_selection::ACCOUNT_FOR_OP
+            && live_config.account_flags().enabled
+            && !crate::broca_credentials::wait_for_first_listing(broca_credentials)
+        {
+            return crate::broca_credentials::listing_not_ready(params);
+        }
+        let policy = striatum_core::accounts::AllocatorPolicy {
+            model_pools: live_config.quota_model_pools_ref().to_vec(),
+            ..Default::default()
+        };
+        // The contract has no `store_error` or `internal_error` for
+        // `route.account_for`; a context that cannot load is transient
+        // unavailability, not a transport failure.
+        let classes = match account_selection::ClassContext::load(
+            store,
+            broca_credentials,
+            config_overrides::live_config(operator_config_path),
+            ACCOUNT_QUOTA.get(),
+            account_selection::now_ms(),
+        ) {
+            Ok(classes) => classes,
+            Err(error) => {
+                let reply = account_selection::OpReply::Error {
+                    code: "account_selection_unavailable".to_string(),
+                    message: format!("routing could not load account context: {error}"),
+                    detail: Some(json!({
+                        "code": "account_selection_unavailable",
+                        "retry_after_s": null,
+                        "decision_id": null,
+                        "exclusions": [],
+                    })),
+                };
+                return reply;
+            }
+        };
+        let ctx = account_selection::Ctx {
+            store: store.as_ref(),
+            accounts: ACCOUNT_QUOTA.get(),
+            flags: live_config.account_flags(),
+            policy: &policy,
+            now_ms: account_selection::now_ms(),
+            classes: Some(classes),
+        };
+        account_selection::handle_with_call(method, body, principal, &ctx, call)
+    })
 }

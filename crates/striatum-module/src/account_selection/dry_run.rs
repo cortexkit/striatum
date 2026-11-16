@@ -161,6 +161,13 @@ impl Sweep {
             .blocks
             .dry_run_clear_routes(provider, credential, at);
     }
+    pub(super) fn clear_route(&self, provider: &str, credential: &str, model: &str, at: i64) {
+        self.state
+            .lock()
+            .unwrap()
+            .blocks
+            .dry_run_clear_route(provider, credential, model, at);
+    }
     pub(super) fn reconcile_route(&self, fence: &striatum_store::AccountRouteFence, until: i64) {
         self.state
             .lock()

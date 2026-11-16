@@ -434,7 +434,7 @@ async fn mixed_account_markers_never_reach_a_permissive_legacy_decoder() {
         ),
         (
             "route.account_observe",
-            json!({"caller":{"runner":fixture::RUNNER_ONE},"event_id":"mixed","kind":"attempt","retry_at_ms":1}),
+            json!({"caller":{"runner":fixture::RUNNER_ONE},"event_id":"mixed","kind":"attempt","decision_id":"dec_mixed"}),
         ),
     ] {
         assert_eq!(
@@ -445,4 +445,28 @@ async fn mixed_account_markers_never_reach_a_permissive_legacy_decoder() {
     let markerless = owner.call("route.select", &json!({})).await;
     assert_eq!(markerless.0, FrameType::Error);
     assert_eq!(markerless.1["code"], "invalid_request");
+}
+
+// `retry_at_ms` and `provider_code` belong to the legacy observation as well:
+// A runner's caller-shaped `transient_backoff` and `credential_refused` reports
+// carry them, so they must reach the legacy handler rather than be refused as
+// a mixed body.
+#[tokio::test]
+async fn legacy_observations_keep_their_own_retry_and_provider_code_members() {
+    let (harness, _owner) = configured().await;
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    for (kind, member, value) in [
+        ("transient_backoff", "retry_at_ms", json!(1)),
+        (
+            "credential_refused",
+            "provider_code",
+            json!("billing_exhausted"),
+        ),
+    ] {
+        let mut body = json!({"caller":{"runner":fixture::RUNNER_ONE},
+            "event_id":format!("legacy-{kind}"),"kind":kind});
+        body[member] = value;
+        let reply = runner.call("route.account_observe", &body).await;
+        assert_eq!(reply.0, FrameType::Response, "{kind}: {reply:?}");
+    }
 }

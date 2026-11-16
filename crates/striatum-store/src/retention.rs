@@ -323,8 +323,11 @@ impl SqliteRouteStateStore {
     /// `received_before` (Unix milliseconds), oldest first. An observation a
     /// fence or exclusion still names is kept, as is a bound backoff whose
     /// deadline is later than the cutoff (even with a zero-day log window).
-    /// Bound sign-in evidence stays for the life of its run: a cleared global
-    /// fence must not let that run be offered the same credential again.
+    /// Bound sign-in evidence stays while its admission is open: a cleared
+    /// global fence must not let that run be offered the same credential
+    /// again, and the module's account state holds every such row of an open
+    /// admission as the run's sign-in exclusions, so it must stay in SQL for
+    /// that state to keep equalling a fresh load.
     pub fn prune_account_observations(
         &self,
         received_before: i64,
@@ -832,8 +835,7 @@ impl crate::AccountTx<'_> {
                             SELECT 1 FROM account_admission a \
                             WHERE a.principal=account_observation.principal \
                               AND a.admission_id=account_observation.admission_id \
-                              AND a.run_id=json_extract(account_observation.observation_json,'$.run_id') \
-                              AND a.state='started')) \
+                              AND a.state IN ('reserved','started','expired'))) \
                           AND NOT EXISTS (SELECT 1 FROM json_each(CASE WHEN kind='transient_backoff' \
                             AND bound=1 AND json_valid(effects_json) THEN effects_json ELSE '[]' END) e \
                             WHERE json_extract(e.value,'$.effect')='transient_backoff' \

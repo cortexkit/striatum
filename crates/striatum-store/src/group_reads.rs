@@ -666,6 +666,79 @@ fn attach_block_tap(conn: &Connection, tap: &'static BlockTap) {
     }
 }
 
+/// Every statement the writer connection finished since the last
+/// [`StatementProfile::take`], with the nanoseconds SQLite reports it ran
+/// (`SQLITE_TRACE_PROFILE`). A statement's triggers run inside it, so their
+/// time is part of its own. Test support only: production keeps no
+/// per-statement trace.
+#[derive(Default)]
+pub struct StatementProfile {
+    runs: Mutex<Vec<(String, u64)>>,
+}
+
+impl StatementProfile {
+    /// (statement text, nanoseconds) in the order the statements finished,
+    /// clearing the list.
+    pub fn take(&self) -> Vec<(String, u64)> {
+        std::mem::take(&mut self.runs.lock().unwrap())
+    }
+}
+
+unsafe extern "C" fn on_profile(
+    _mask: c_uint,
+    context: *mut c_void,
+    statement: *mut c_void,
+    elapsed: *mut c_void,
+) -> c_int {
+    if statement.is_null() || elapsed.is_null() {
+        return 0;
+    }
+    // SAFETY: for SQLITE_TRACE_PROFILE, SQLite passes the finished statement
+    // and a pointer to its run time in nanoseconds; `context` is the leaked
+    // `StatementProfile` below, which lives for the rest of the process.
+    let ns = unsafe { *(elapsed as *const i64) };
+    let own = unsafe { ffi::sqlite3_sql(statement as *mut ffi::sqlite3_stmt) };
+    let text = if own.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(own) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let profile = unsafe { &*(context as *const StatementProfile) };
+    profile
+        .runs
+        .lock()
+        .unwrap()
+        .push((text, u64::try_from(ns).unwrap_or(0)));
+    0
+}
+
+impl SqliteRouteStateStore {
+    /// Time every statement the writer connection runs, which the account
+    /// writer's commands use. Replaces any other trace on that connection.
+    pub fn profile_writer_statements_for_test(
+        &self,
+    ) -> RouteStateResult<&'static StatementProfile> {
+        let profile: &'static StatementProfile = Box::leak(Box::default());
+        self.store
+            .with_conn(|conn| {
+                // SAFETY: as in `attach`; `profile` is 'static.
+                unsafe {
+                    ffi::sqlite3_trace_v2(
+                        conn.handle(),
+                        ffi::SQLITE_TRACE_PROFILE as c_uint,
+                        Some(on_profile),
+                        profile as *const StatementProfile as *mut c_void,
+                    );
+                }
+                Ok(())
+            })
+            .map_err(err)?;
+        Ok(profile)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::reads_admission_group;

@@ -6,7 +6,7 @@ use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use striatum_core::blocks::Block;
 
-pub(crate) const MIGRATION: &str = include_str!("../migrations/095_block_storage.sql");
+pub(crate) const MIGRATION: &str = include_str!("../migrations/096_block_storage.sql");
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) const CLOCK_NORMALIZATION_BODY: &str =

@@ -611,6 +611,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "select_kind",
                                 "select_media",
                                 "select_search",
+                                "route_fact_stream",
                             ][..],
                         ),
                         (

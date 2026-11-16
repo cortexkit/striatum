@@ -234,6 +234,15 @@ impl Harness {
         self.broca_credentials.lock().unwrap().clone()
     }
 
+    pub(super) fn fact_handler(&self) -> crate::route_facts::Handler {
+        crate::route_facts::Handler {
+            quota_cache: Arc::clone(&self.quota_cache),
+            store: Arc::clone(&self.store),
+            credentials: self.credentials(),
+            config_path: self.config_path_for_test(),
+        }
+    }
+
     pub(super) fn observe_runner_describe(&self, module: &str, describe: &Value) {
         let credentials = self.broca_credentials.lock().unwrap();
         super::runners::DescribeCache::default().reply(
@@ -1981,15 +1990,26 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         .iter()
         .copied()
         .collect();
+    // Reader readiness is checked at runtime, not in the static serving list.
+    let stream = cortexkit_role_routing::capabilities::ROUTE_FACT_STREAM;
+    assert!(
+        known.contains(stream),
+        "the bus capability must be a known role group"
+    );
+    assert!(
+        !advertised.contains(stream),
+        "the bus capability must never be advertised statically"
+    );
     let expected: std::collections::BTreeSet<_> = known
         .iter()
         .copied()
+        .filter(|group| *group != stream)
         .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
         .chain(ROUTING_EXTENSIONS.iter().copied())
         .collect();
     assert_eq!(
         advertised, expected,
-        "only the named pending readers may be unadvertised"
+        "only the named pending readers and runtime-gated bus capability may be absent from the static list"
     );
     for group in ROUTING_EXTENSIONS {
         assert!(

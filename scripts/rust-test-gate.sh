@@ -5,6 +5,9 @@ cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
 
+python3 -m unittest scripts/tests/test_bus_credential_identity.py
+python3 scripts/bus-credential-identity.py
+
 python3 -m unittest scripts/tests/test_unreachable_modules.py
 python3 scripts/unreachable-modules.py
 python3 -m unittest scripts/tests/test_test_binary_fold.py

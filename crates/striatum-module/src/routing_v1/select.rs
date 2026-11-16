@@ -1768,7 +1768,7 @@ async fn select_at_tier_attempt(
         let request_pin_exempt = inputs.consumer_pinned
             || (request.pin.is_none() && request.pin_slot.is_some())
             || request.pin_origin == Some(PinOrigin::User)
-            || request_pin_is_keep_free_exempt(&consumer, request.pin.as_deref(), &consumer_policy);
+            || request_pin_is_keep_free_exempt(request.pin.as_deref(), &consumer_policy);
         let mut request_pin = request.pin.clone().or_else(|| {
             request
                 .pin_slot
@@ -3446,16 +3446,9 @@ impl<'a> Selection<'a> {
 const PINNED_KEEP_FREE_EXPLANATION: &str = "pinned: keep-free margin not applied";
 
 fn request_pin_is_keep_free_exempt(
-    consumer: &str,
     pin: Option<&str>,
     policy: &crate::config_policy::ConsumerPolicy,
 ) -> bool {
-    // Keep raw mason pins exempt until core sends pin_origin for user choices.
-    // Remove this compatibility rule once core's marker is live; other raw
-    // request pins still need the marker or an operator-settings match.
-    if consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.") {
-        return true;
-    }
     let Some(requested) = pin.and_then(RouteRef::parse_pin) else {
         return false;
     };
@@ -4020,6 +4013,85 @@ mod tests {
             next.1["result"]["seats"].as_array().unwrap().len(),
             1,
             "{next:?}"
+        );
+    }
+
+    /// A quota route fence whose recheck has been overdue for days, with no
+    /// reading to contradict it, is claimed by the panel seat that serves its
+    /// route: the seat's decision owns the recovery probe, so a runner that
+    /// sends without account admission still sends it exactly once.
+    #[tokio::test]
+    async fn panel_seat_claims_an_overdue_never_claimed_route_fence_recheck() {
+        use super::super::conformance_tests::install_panel_families;
+        let _clock = crate::InjectedClock::set(RECOVERY_NOW);
+        let harness = Harness::new("panel-route-fence-probe");
+        let mut catalog = fixture::catalog();
+        catalog
+            .models
+            .retain(|model| model.provider == fixture::SUBSCRIPTION_PROVIDER);
+        for (i, model) in catalog.models.iter_mut().enumerate() {
+            model.family = Some(format!("family-{i}"));
+        }
+        catalog.accounts.truncate(1);
+        install_catalog(&harness, &catalog);
+        install_panel_families(&harness, &catalog);
+        harness.edit_config(|config| {
+            config["panels"]["audit"] = json!({"topK":2,"by":"iq","extra":0,"floor":0});
+            config["consumers"][fixture::SUMMARY] = json!({"owner":"prefrontal-core"});
+        });
+        *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = Default::default();
+        let fenced = &catalog.models[0];
+        let reported = RECOVERY_NOW as i64 - 3 * 86_400_000;
+        harness
+            .store()
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: fenced.provider.clone(),
+                credential_id: catalog.accounts[0].credential_id.clone(),
+                model: fenced.model.clone(),
+                until_ms: RECOVERY_NOW as i64 + 2 * 86_400_000,
+                decision_id: "quota-report".into(),
+                recorded_at: reported,
+            })
+            .unwrap();
+        let route = harness.bind(reserved("prefrontal-core"), None).await;
+        let routes: Vec<_> = catalog
+            .models
+            .iter()
+            .map(|model| model.route_key())
+            .collect();
+        let panel = route
+            .call(
+                "route.select_panel",
+                &json!({"class":"audit","consumer":fixture::SUMMARY,"seed":"fixed","available_routes":routes}),
+            )
+            .await;
+        assert_eq!(panel.0, subc_protocol::FrameType::Response, "{panel:?}");
+        let seat = panel.1["result"]["seats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|seat| {
+                let route = &seat["answer"]["route"];
+                *route == fenced.route_key().as_str() || route["model"] == fenced.model.as_str()
+            })
+            .unwrap_or_else(|| panic!("the fenced route is seated as its probe: {panel:?}"));
+        let decision = seat["answer"]["decision_id"].as_str().unwrap();
+        let recheck = harness
+            .store()
+            .fence_rechecks()
+            .unwrap()
+            .into_iter()
+            .find(|origin| origin.kind == "account_route")
+            .expect("the route fence keeps its recheck clock");
+        assert_eq!(
+            recheck.claim_owner.as_deref(),
+            Some(decision),
+            "{recheck:?}"
+        );
+        assert_eq!(
+            recheck.last_claimed_at,
+            Some(RECOVERY_NOW as i64),
+            "{recheck:?}"
         );
     }
 

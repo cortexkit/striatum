@@ -33,6 +33,15 @@ pub struct V1ReportUsage {
     pub cost: Option<f64>,
 }
 
+/// The committed answer and whether the delivery already existed. The
+/// duplicate flag is decided inside the transaction that stores the delivery:
+/// if a `(decision_id, delivery_key)` row already stands, its stored answer is
+/// returned as a duplicate; otherwise the delivery is inserted as new.
+pub struct V1ReportOutcome {
+    pub recorded: V1Recorded,
+    pub duplicate: bool,
+}
+
 impl SqliteRouteStateStore {
     /// `None` is a conflict. Run-attributed retries return the standing answer
     /// regardless of their new body; the other identities compare canonical bodies.
@@ -67,6 +76,7 @@ impl SqliteRouteStateStore {
             |account, _, decision_id, now| account.use_continuation(decision_id, now),
             now,
         )
+        .map(|outcome| outcome.map(|outcome| outcome.recorded))
     }
 
     /// As [`Self::v1_commit_report`], with the first accepted report's
@@ -96,7 +106,7 @@ impl SqliteRouteStateStore {
             + Send
             + 'static,
         now: i64,
-    ) -> RouteStateResult<Option<V1Recorded>> {
+    ) -> RouteStateResult<Option<V1ReportOutcome>> {
         let decision_id = decision_id.to_owned();
         let delivery_key = delivery_key.to_owned();
         let report_id = report_id.to_owned();
@@ -114,7 +124,7 @@ impl SqliteRouteStateStore {
                 let effects = &effects;
                 let usage = usage.as_ref();
                 let tx = account.conn;
-                (|| -> rusqlite::Result<(Option<V1Recorded>, bool)> {
+                (|| -> rusqlite::Result<(Option<V1ReportOutcome>, bool)> {
             let standing = tx.query_row(
                 "SELECT body_json, answer_json FROM routing_v1_report_delivery
                  WHERE decision_id=?1 AND delivery_key=?2",
@@ -123,7 +133,7 @@ impl SqliteRouteStateStore {
             ).optional()?;
             if let Some(standing) = standing {
                 return Ok((if delivery_key.starts_with("run:") || standing.body_json == recorded.body_json {
-                    Some(standing)
+                     Some(V1ReportOutcome { recorded: standing, duplicate: true })
                 } else { None }, false));
             }
             let incompatible: bool = if delivery_key == "usage" || delivery_key == "outcome" || delivery_key.starts_with("run:") {
@@ -178,7 +188,7 @@ impl SqliteRouteStateStore {
             if let Some(usage) = usage { insert_usage(&tx, decision_id, usage)?; }
             #[cfg(test)]
             report_crash("before_commit");
-            Ok((Some(recorded.clone()), usage.is_some()))
+             Ok((Some(V1ReportOutcome { recorded: recorded.clone(), duplicate: false }), usage.is_some()))
             })().map_err(err)
             };
         let result = if self.is_private_account_copy() {

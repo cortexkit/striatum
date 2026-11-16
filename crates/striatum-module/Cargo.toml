@@ -17,6 +17,7 @@ sha2 = { workspace = true }
 async-nats = { workspace = true, default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 async-trait = { workspace = true }
 base64 = { workspace = true }
+cortexkit-bus-client = { workspace = true }
 cortexkit-bus-naming = { workspace = true }
 cortexkit-bus-nats = { workspace = true }
 cortexkit-bus-trait = { workspace = true }
@@ -50,4 +51,4 @@ cortexkit-test-support = "=0.1.13"
 rusqlite = { workspace = true, features = ["bundled"] }
 # The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
 # this package's graph turns on tokio's process feature any more.
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "test-util"] }

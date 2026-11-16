@@ -45,6 +45,7 @@ mod quota_bus;
 mod quota_consumer;
 mod quota_events;
 mod retention;
+mod route_facts;
 mod routing_v1;
 mod runtime_lag;
 mod select;
@@ -1270,7 +1271,8 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 
     // Quota delivery runs off the selection hot path. Bus notices fetch bodies
     // over independent outbound insula connections; route.select only reads the
-    // cache. A bus outage switches delivery to usage.get snapshots.
+    // cache. An unbound reader switches delivery to 60-second usage.get snapshots,
+    // even when the SDK waits for a replacement connection without returning an error.
     let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
     let catalog_health: SharedCatalogHealth = Arc::new(Mutex::new(CatalogReachHealth::new(
         config_overrides::DEFAULT_CATALOG_POLL_MS,
@@ -1748,9 +1750,10 @@ async fn answer_route_request<F, Fut>(
 ///
 /// A panic in the handler is resumed here, so it ends this task just as it did
 /// when the handler ran on the task itself.
-async fn run_route_handler_off_async_workers<F>(handler: F) -> Result<(), ModuleError>
+async fn run_route_handler_off_async_workers<F, T>(handler: F) -> Result<T, ModuleError>
 where
-    F: std::future::Future<Output = Result<(), ModuleError>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, ModuleError>> + Send + 'static,
+    T: Send + 'static,
 {
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]

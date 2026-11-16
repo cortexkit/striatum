@@ -168,6 +168,12 @@ pub(super) async fn start(
             Arc::clone(&quota_cache),
             Arc::clone(&account_state),
             Arc::clone(&store),
+            crate::route_facts::Handler {
+                quota_cache: Arc::clone(quota_cache),
+                store: Arc::clone(store),
+                credentials: Arc::clone(&broca_credentials),
+                config_path: config_overrides::config_path(),
+            },
         ),
     );
     loops.spawn(
@@ -352,16 +358,22 @@ async fn flush_call_counts_loop(store: SharedStore, period: std::time::Duration)
 mod tests {
     use super::*;
 
-    /// While a slow account writer batch (one and a half seconds of sleep
-    /// inside a command) is in progress, start `waiter`, a background loop that
-    /// will queue a command behind it. Once that command is queued, the routing
-    /// runtime must still answer an unrelated socket request and fire an
-    /// unrelated timer within 50 ms.
+    /// While a slow account writer batch is in progress, start `waiter`, a
+    /// background loop that will queue a command behind it. Once that command
+    /// is queued, the routing runtime must still answer an unrelated socket
+    /// request and fire an unrelated timer before the writer lets go.
     ///
     /// Each loop is woken by a timer, so it runs on the worker that was driving
     /// Tokio's IO and timer events. If that worker blocks its thread while the
     /// command waits, no other worker takes the driver over, and every socket
     /// read and timer in the runtime waits for the writer too.
+    ///
+    /// The check is about order, not speed: the slow batch holds the writer
+    /// until the test releases it, and the test releases it only after the echo
+    /// and the timer have both been served. A runtime that waits for the writer
+    /// can serve neither, so the batch falls back to its safety cap, and the
+    /// test fails on that. No wall-clock bound is asserted, so a loaded build
+    /// machine can't fail it.
     fn assert_runtime_serves_while_writer_is_busy(
         name: &str,
         queued: striatum_store::AccountCommandKind,
@@ -374,8 +386,10 @@ mod tests {
         use striatum_store::AccountCommandKind;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        const WRITER_HOLD: std::time::Duration = std::time::Duration::from_millis(1500);
-        const SERVED_WITHIN: std::time::Duration = std::time::Duration::from_millis(50);
+        // How long the slow batch holds the writer if the test never releases
+        // it. Reaching this cap is the failure signal, so it only needs to be
+        // far longer than serving one echo and one timer takes.
+        const WRITER_SAFETY_CAP: std::time::Duration = std::time::Duration::from_secs(5);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)
             .enable_all()
@@ -407,8 +421,10 @@ mod tests {
             }
         });
         let mut client = std::net::TcpStream::connect(address).unwrap();
+        // Longer than the writer's safety cap, so a stalled runtime shows up as
+        // the cap being reached rather than as a read timeout.
         client
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(20)))
             .unwrap();
         let mut round_trip = || {
             let started = std::time::Instant::now();
@@ -419,43 +435,53 @@ mod tests {
         };
         round_trip();
 
-        // A timer that falls due while the loop's command is waiting.
-        let timer_due = std::time::Instant::now() + std::time::Duration::from_millis(400);
-        let timer = runtime.spawn(async move {
-            tokio::time::sleep_until(tokio::time::Instant::from_std(timer_due)).await;
-            std::time::Instant::now().saturating_duration_since(timer_due)
-        });
-
         let (held, holding) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released_by_test = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_flag = Arc::clone(&released_by_test);
         let slow = store
             .enqueue_account_command(AccountCommandKind::Maintenance, move |_| {
-                held.send(()).unwrap();
-                std::thread::sleep(WRITER_HOLD);
+                let _ = held.send(());
+                // The writer can run a command body again when it replays a
+                // batch; only the first run holds the writer for the test.
+                if released_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Ok(());
+                }
+                let by_test = released.recv_timeout(WRITER_SAFETY_CAP).is_ok();
+                released_flag.store(by_test, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
             })
             .unwrap();
         holding.recv().unwrap();
         let background = runtime.spawn(waiter(Arc::clone(&store)));
+        // A timer that falls due while the loop's command is waiting behind the
+        // slow batch. The loop ticks every few milliseconds, so it is already
+        // waiting on the writer long before the timer is due.
+        let (fired, timer_fired) = std::sync::mpsc::channel();
+        runtime.spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            let _ = fired.send(());
+        });
+        let timer = timer_fired.recv_timeout(std::time::Duration::from_secs(20));
+        let echo = round_trip();
+        let _ = release.send(());
+        slow.wait().unwrap();
+        // The loop really did queue its command behind the slow batch.
         while store.account_command_count_for_test(queued) == 0 {
             assert!(!background.is_finished(), "{name}: loop stopped early");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        // Let the worker that runs the loop settle into its wait.
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let echo = round_trip();
-        let timer_late = runtime.block_on(timer).unwrap();
-        slow.wait().unwrap();
         background.abort();
         runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-        eprintln!("{name}: echo round trip {echo:?}; timer fired {timer_late:?} late");
-        assert!(
-            echo < SERVED_WITHIN,
-            "{name}: echo took {echo:?} while a command waited on a busy account writer"
+        eprintln!(
+            "{name}: echo round trip {echo:?}; timer served: {}",
+            timer.is_ok()
         );
+        assert!(timer.is_ok(), "{name}: the timer never fired");
         assert!(
-            timer_late < SERVED_WITHIN,
-            "{name}: timer fired {timer_late:?} late while a command waited on a busy account writer"
+            released_by_test.load(std::sync::atomic::Ordering::SeqCst),
+            "{name}: the echo and timer were served only after the writer reached its \
+             safety cap, so the runtime waited for a busy account writer"
         );
     }
 

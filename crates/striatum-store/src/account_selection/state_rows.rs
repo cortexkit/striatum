@@ -117,6 +117,25 @@ pub struct PrunedContinuation {
     pub used: bool,
 }
 
+/// A bound `signed_out` observation: a run reported that one of its
+/// credentials lost its sign-in. The state keeps the rows of open admissions;
+/// the module reads the run and credential out of `observation_json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedOutObservationRow {
+    pub principal: String,
+    pub admission_id: String,
+    pub observation_json: String,
+}
+
+/// Every bound `signed_out` observation that names an admission. The inner
+/// select repeats the predicate of the partial index
+/// `account_observation_signed_out` and needs only columns the index holds,
+/// so SQLite answers it from that index alone; the outer select then reads
+/// just those rows by rowid. The load never reads the other observations.
+pub const SIGNED_OUT_OBSERVATIONS_SQL: &str = "SELECT principal, admission_id, observation_json \
+     FROM account_observation WHERE rowid IN (SELECT rowid FROM account_observation \
+       WHERE kind = 'signed_out' AND bound = 1 AND admission_id IS NOT NULL)";
+
 /// Everything the admission group's state loads, in loader order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdmissionGroupRows {
@@ -129,6 +148,8 @@ pub struct AdmissionGroupRows {
     /// Every offer row whose original admission is still open, in rowid order.
     pub chains: Vec<ContinuationStateRow>,
     pub continuation_sources: Vec<ContinuationSourceRow>,
+    /// Every bound `signed_out` observation that names an admission.
+    pub signed_out: Vec<SignedOutObservationRow>,
 }
 
 const OPEN_STATES: &str = "('reserved', 'started', 'expired')";
@@ -358,6 +379,13 @@ impl AccountTx<'_> {
             } else {
                 (Vec::new(), Vec::new(), Vec::new())
             };
+            let signed_out = collect(conn, SIGNED_OUT_OBSERVATIONS_SQL, [], |row| {
+                Ok(SignedOutObservationRow {
+                    principal: row.get(0)?,
+                    admission_id: row.get(1)?,
+                    observation_json: row.get(2)?,
+                })
+            })?;
             Ok(AdmissionGroupRows {
                 open,
                 admissions,
@@ -365,6 +393,7 @@ impl AccountTx<'_> {
                 offers,
                 chains,
                 continuation_sources,
+                signed_out,
             })
         })()
         .map_err(err)

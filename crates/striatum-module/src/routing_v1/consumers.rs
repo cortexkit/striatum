@@ -495,7 +495,7 @@ impl Registry {
         let Some(owners) = self.owners_for(consumer) else {
             return Err(Refusal::unknown_consumer(consumer));
         };
-        if !caller.binding_is_current() {
+        if !caller.module_identity_is_current() {
             return Err(Refusal::consumer_not_owned(consumer));
         }
         // A config-only name without an owner adds no ownership restriction.

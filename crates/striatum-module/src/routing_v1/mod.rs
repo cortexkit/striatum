@@ -44,7 +44,7 @@ mod panels_estimate_tests;
 #[cfg(test)]
 mod panels_tests;
 mod reads;
-mod report;
+pub(crate) mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
@@ -118,6 +118,8 @@ pub(crate) fn exercise_normal_traffic_for_logging() {
 #[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
+mod route_fence_pool_tests;
+#[cfg(test)]
 mod runners_tests;
 #[cfg(test)]
 mod scope_attribution_tests;
@@ -131,6 +133,9 @@ mod select_options_tests;
 mod task_ref_tests;
 #[cfg(test)]
 mod wire_pair_tests;
+
+#[cfg(test)]
+mod route_fact_tests;
 
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
@@ -182,6 +187,8 @@ pub(crate) struct Caller {
     pub scope: Option<crate::DecisionScope>,
     /// Authority from the daemon's scope stamp, independent of ledger metadata.
     pub scope_authority: Option<ScopeAuthority>,
+    /// A module authenticated by the bus's publisher subject permissions.
+    event_module: Option<String>,
 }
 
 /// Retain daemon-stamped authorization for consumer admission even when routing
@@ -208,7 +215,26 @@ impl Caller {
             principal: crate::route_principal(channel, epoch),
             scope: crate::route_scope(channel, epoch),
             scope_authority: crate::route_scope_authority(channel, epoch),
+            event_module: None,
         }
+    }
+
+    pub(crate) fn for_event(module: &str) -> Self {
+        Self {
+            binding: None,
+            principal: format!("reserved:{module}"),
+            scope: None,
+            scope_authority: None,
+            event_module: Some(module.to_owned()),
+        }
+    }
+
+    fn module_identity_is_current(&self) -> bool {
+        self.binding_is_current()
+            || self
+                .event_module
+                .as_ref()
+                .is_some_and(|module| self.principal == format!("reserved:{module}"))
     }
 
     pub(crate) fn binding_is_current(&self) -> bool {
@@ -411,7 +437,7 @@ pub(crate) fn record_call(
     Ok(())
 }
 
-async fn answer(
+pub(crate) async fn answer(
     method: &str,
     params: &Value,
     caller: &Caller,
@@ -424,7 +450,7 @@ async fn answer(
         ops::ROUTE_SELECT_ENGINE => engines::select(params, caller, deps),
         ops::ROUTE_ENGINE_REPORT => engines::report(params, caller, deps),
         ops::ROUTE_ENGINE_EVAL => engines::evaluate(params, caller, deps),
-        ops::ROUTE_REPORT => report::report(params, caller, deps),
+        ops::ROUTE_REPORT => report::report(params, caller, deps).map(|(answer, _)| answer),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),
         ops::ROUTE_SELECT_PANEL => panels::select_panel(params, caller, deps).await,

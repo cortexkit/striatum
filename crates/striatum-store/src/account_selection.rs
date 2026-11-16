@@ -129,6 +129,77 @@ mod account_fact_tests {
         assert!(remaining.iter().any(|row| row.provider == "other"));
     }
 
+    /// The account state loader finds bound `signed_out` observations through
+    /// their partial index alone: it scans that index and reads the matched
+    /// rows by rowid, never the table itself or the principal index, so a
+    /// load does not read the hundreds of thousands of other observations.
+    #[test]
+    fn signed_out_observations_load_through_their_partial_index() {
+        let scratch = cortexkit_test_support::ScratchDir::new("signed-out-observations");
+        let descriptor = crate::dev_descriptor(
+            "signed-out-observations",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let connection = Connection::open(scratch.path().join("store.db")).unwrap();
+        let plan: Vec<String> = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SIGNED_OUT_OBSERVATIONS_SQL}"))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step.contains(
+                "SCAN account_observation USING COVERING INDEX account_observation_signed_out"
+            )),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .filter(|step| step.contains("account_observation"))
+                .all(|step| step.contains("account_observation_signed_out")
+                    || step.contains("INTEGER PRIMARY KEY (rowid=?)")),
+            "{plan:?}"
+        );
+        store
+            .account_transaction(|tx| {
+                for (id, kind, bound, admission) in [
+                    ("kept", "signed_out", true, Some("admission")),
+                    ("unbound", "signed_out", false, Some("admission")),
+                    ("other-kind", "attempt", true, Some("admission")),
+                    ("no-admission", "signed_out", true, None),
+                ] {
+                    tx.insert_observation(&AccountObservationRow {
+                        observation_id: id.into(),
+                        principal: "owner".into(),
+                        runner: "runner".into(),
+                        event_id: id.into(),
+                        kind: kind.into(),
+                        admission_id: admission.map(Into::into),
+                        bound,
+                        observation_json: format!(r#"{{"run_id":"{id}"}}"#),
+                        effects_json: "[]".into(),
+                        received_at: 100,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let loaded = store
+            .account_read(|tx| tx.load_admission_group())
+            .unwrap()
+            .signed_out;
+        assert_eq!(
+            loaded,
+            vec![SignedOutObservationRow {
+                principal: "owner".into(),
+                admission_id: "admission".into(),
+                observation_json: r#"{"run_id":"kept"}"#.into(),
+            }]
+        );
+    }
+
     #[test]
     fn observation_backoffs_use_only_committed_bound_effects_and_expire() {
         let scratch = cortexkit_test_support::ScratchDir::new("observation-backoffs");
@@ -661,6 +732,26 @@ impl AccountTx<'_> {
                 "UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?4),cleared_by='removed',claim_owner=NULL
                     WHERE kind='account_route' AND source_present=1 AND provider=?1 AND credential_id=?2 AND COALESCE(last_reported_at,recorded_at)<?3",
                 params![provider, credential, reading_at,crate::now_ms()],
+            )
+            .map_err(err)
+    }
+
+    /// Clear one route's older evidence after a reading proved the pools that
+    /// route draws on recovered. The credential's other routes may draw on
+    /// other pools, so they stay.
+    pub fn clear_account_route_fence_before(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        reading_at: i64,
+    ) -> RouteStateResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM account_route_fence
+            WHERE provider=?1 AND credential_id=?2 AND model=?3
+            AND COALESCE(last_reported_at,recorded_at)<?4",
+                params![provider, credential, model, reading_at],
             )
             .map_err(err)
     }
@@ -1711,7 +1802,8 @@ impl AccountTx<'_> {
 
     /// The runner started the admitted run. A start after the reservation
     /// expired is still accepted, and marked late, because the run's freeze
-    /// wins. Returns whether the row changed.
+    /// wins. Returns whether the lifecycle transitioned to started; a finished
+    /// row can still gain missing start evidence without making that transition.
     pub fn mark_admission_started(
         &self,
         principal: &str,
@@ -1724,15 +1816,27 @@ impl AccountTx<'_> {
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::account_selection::mark_admission_started",
         );
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "UPDATE account_admission SET state = 'started', run_id = ?3, started_at = ?4, \
                  started_late = ?5, last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
                  WHERE principal = ?1 AND admission_id = ?2 AND state IN ('reserved', 'expired')",
                 params![principal, admission_id, run_id, at, i64::from(late)],
             )
-            .map(|changed| changed == 1)
-            .map_err(err)
+            .map_err(err)?
+            == 1;
+        if !changed {
+            // Redelivery can put the start after the finish. Retain the run's
+            // evidence without reopening the admission or its concurrency slot.
+            self.conn.execute(
+                "UPDATE account_admission SET run_id = ?3, started_at = ?4, started_late = ?5, \
+                 last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
+                 WHERE principal = ?1 AND admission_id = ?2 AND state = 'finished' AND run_id IS NULL",
+                params![principal, admission_id, run_id, at, i64::from(late)],
+            ).map_err(err)?;
+        }
+        Ok(changed)
     }
 
     /// Release an admission that never started, removing its demand. A second

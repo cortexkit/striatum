@@ -48,7 +48,7 @@ pub use decision_detail::{
 mod report_delivery;
 #[cfg(test)]
 mod test_exe;
-pub use report_delivery::{V1ReportEffects, V1ReportUsage};
+pub use report_delivery::{V1ReportEffects, V1ReportOutcome, V1ReportUsage};
 #[cfg(test)]
 mod speed_sample_tests;
 // The backup table classification is a test oracle: the store's integration
@@ -130,8 +130,9 @@ pub use account_selection::{
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, AccountPoolFenceRow,
     AccountRouteFence, AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionScanRow,
     AdmissionStateRow, ContinuationStateRow, CredentialProbeClaim, LatestAdmissionRow,
-    PrunedAdmission, PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
-    KEYED_EXCEPTION, OBSERVATION_BACKOFFS_SQL,
+    PrunedAdmission, PrunedContinuation, ReservationRef, SignedOutObservationRow,
+    ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, KEYED_EXCEPTION, OBSERVATION_BACKOFFS_SQL,
+    SIGNED_OUT_OBSERVATIONS_SQL,
 };
 
 pub struct ClearedRouteCooldowns {
@@ -733,13 +734,17 @@ fn route_state_migrations() -> [Migration; 94] {
         },
         Migration {
             version: 95,
+            statements: include_str!("../migrations/095_observation_signed_out_index.sql"),
+        },
+        Migration {
+            version: 96,
             statements: block_storage::MIGRATION,
         },
     ]
 }
 
 fn migrate_route_state(store: &SqliteStore, migrations: &[Migration]) -> RouteStateResult<()> {
-    let block_storage = migrations.iter().any(|migration| migration.version == 95);
+    let block_storage = migrations.iter().any(|migration| migration.version == 96);
     if block_storage {
         store
             .with_conn(block_storage::install_migration_function)

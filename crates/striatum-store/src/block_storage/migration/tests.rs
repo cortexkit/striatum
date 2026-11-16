@@ -23,12 +23,12 @@ fn migration_function_is_absent(conn: &Connection) {
 fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
     assert_eq!(
         crate::SqliteRouteStateStore::latest_migration_version_for_test(),
-        95
+        96
     );
     let versions = std::iter::once(0).chain(
         crate::route_state_migrations()
             .into_iter()
-            .filter(|migration| migration.version < 95)
+            .filter(|migration| migration.version < 96)
             .map(|migration| migration.version),
     );
     for version in versions {
@@ -57,7 +57,7 @@ fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_functio
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"), "{error}");
-        assert!(error.to_string().contains("95"), "{error}");
+        assert!(error.to_string().contains("96"), "{error}");
         assert!(error.to_string().contains("93"), "{error}");
     }
 }

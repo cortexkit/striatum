@@ -392,7 +392,7 @@ fn idle_expiry_invalidates_unless_a_lease_is_active() {
 }
 
 #[test]
-fn fresh_full_band_reading_at_100_on_seven_day_moves_without_a_fence() {
+fn fresh_full_band_reading_at_100_on_seven_day_retains_without_a_fence() {
     let mut full = reading(10.0, 100.0);
     full.observed_at_ms = Some(NOW - MINUTE);
     let mut st = state(vec![
@@ -401,14 +401,19 @@ fn fresh_full_band_reading_at_100_on_seven_day_moves_without_a_fence() {
     ]);
     st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
     let decision = decide(&request(), &st, NOW);
-    assert_eq!(admitted(&decision), "acct-b");
+    assert_eq!(admitted(&decision), "acct-a");
+    assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
     assert_eq!(
-        invalidated(&decision),
-        InvalidationReason::FreshFullReading {
-            window: ApplicableWindow::SevenDay
+        decision.admission().unwrap().affinity,
+        AffinityOutcome::Retained {
+            pin_id: "pin-acct-a".into(),
+            pin_generation: 3
         }
     );
-    // It is not a fence: for cold work the account is only zero-weighted.
+    // Cold work still sees no headroom on the same account.
+    st.affinity = None;
+    let decision = decide(&request(), &st, NOW);
+    assert_eq!(admitted(&decision), "acct-b");
     assert!(matches!(
         exclusions(&decision, "acct-a"),
         [ExclusionReason::BelowReserve { .. }]
@@ -470,9 +475,9 @@ fn confirmed_short_hold_returns_account_hold_within_the_callers_wait() {
 fn blocked_affinity_uses_runner_wait_cap_and_provider_ceiling() {
     use striatum_core::accounts::{decide_with_context, AccountStrategy, AllocationContext};
 
-    for proactive in [false, true] {
+    for full_reading in [false, true] {
         let mut quota = reading(10.0, 10.0);
-        if proactive {
+        if full_reading {
             quota.five_hour.as_mut().unwrap().used_percent = 100.0;
             quota.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 40 * MINUTE);
         }
@@ -481,10 +486,8 @@ fn blocked_affinity_uses_runner_wait_cap_and_provider_ceiling() {
             account("acct-b", Some(reading(10.0, 10.0))),
         ]);
         st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
-        if !proactive {
-            st.fences
-                .push(five_hour_fence("acct-a", ResetTime::At(NOW + 40 * MINUTE)));
-        }
+        st.fences
+            .push(five_hour_fence("acct-a", ResetTime::At(NOW + 40 * MINUTE)));
         assert_eq!(st.policy.max_hold_s, 3600);
         let mut req = request();
         for (cap, holds) in [(3000, true), (900, false), (0, false)] {
@@ -546,11 +549,10 @@ fn unknown_blocking_reset_outranks_known_resets_whatever_the_wait_cap() {
     }
 }
 
-/// A full-band 5h reading at 100% (not confirmation) holds softly with the
-/// same exact bounds as a confirmed fence; anything else about the reading or
-/// its reset moves the conversation or keeps it, never holds it.
+/// A quota reading alone neither holds nor moves an established session,
+/// regardless of its reset or the caller's willingness to wait.
 #[test]
-fn soft_proactive_hold_bounds_and_reevaluation() {
+fn full_readings_retain_regardless_of_reset_and_wait_cap() {
     let pool = |five: striatum_core::accounts::QuotaReading| {
         let mut st = state(vec![
             account("acct-a", Some(five)),
@@ -564,43 +566,22 @@ fn soft_proactive_hold_bounds_and_reevaluation() {
         r.five_hour.as_mut().unwrap().resets_at = reset;
         r
     };
-    // At +15 min the jittered Retry-After is 906 s, so the caller must be
-    // willing to wait that long.
-    let mut patient = request();
-    patient.hold_wait_max_s = 906;
-    let hold = decide(
-        &patient,
-        &pool(full_100(ResetTime::At(NOW + 15 * MINUTE))),
-        NOW,
-    );
-    let hold = hold.hold().expect("+15 min holds");
-    assert_eq!((hold.base_retry_after_s, hold.retry_after_s), (900, 906));
-
-    patient.hold_wait_max_s = 907;
-    let hold = decide(
-        &patient,
-        &pool(full_100(ResetTime::At(NOW + 15 * MINUTE + 1))),
-        NOW,
-    );
-    assert_eq!(hold.hold().expect("caller permits wait").retry_after_s, 907);
-
     for reset in [
+        ResetTime::At(NOW + 14 * MINUTE),
+        ResetTime::At(NOW + 15 * MINUTE + 1),
+        ResetTime::At(NOW + 2 * HOUR),
         ResetTime::At(NOW),
         ResetTime::At(NOW - MINUTE),
         ResetTime::Unparsable,
         ResetTime::Missing,
     ] {
-        // Even a caller willing to wait migrates: the reset rules out a hold.
-        patient.hold_wait_max_s = 3600;
-        let decision = decide(&patient, &pool(full_100(reset)), NOW);
-        assert_eq!(admitted(&decision), "acct-b", "{reset:?}");
-        assert_eq!(
-            invalidated(&decision),
-            InvalidationReason::FreshFullReading {
-                window: ApplicableWindow::FiveHour
-            },
-            "{reset:?}"
-        );
+        for cap in [0, 845, 906, 907, 3600] {
+            let mut req = request();
+            req.hold_wait_max_s = cap;
+            let decision = decide(&req, &pool(full_100(reset)), NOW);
+            assert_eq!(admitted(&decision), "acct-a", "{reset:?}, cap={cap}");
+            assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
+        }
     }
 
     // A stale reading never justifies it: the conversation stays.
@@ -609,32 +590,23 @@ fn soft_proactive_hold_bounds_and_reevaluation() {
     let decision = decide(&request(), &pool(stale), NOW);
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
 
-    // Re-evaluated each admission: a newer reading below 100 removes it.
+    // A newer reading below 100 also retains the session.
     let decision = decide(&request(), &pool(reading(60.0, 10.0)), NOW);
     assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
-
-    // The caller's wait bounds it like a confirmed hold.
-    let mut req = request();
-    req.hold_wait_max_s = 845;
-    let decision = decide(&req, &pool(full_100(ResetTime::At(NOW + 14 * MINUTE))), NOW);
-    assert_eq!(
-        invalidated(&decision),
-        InvalidationReason::HoldExceedsWait { retry_after_s: 846 }
-    );
 }
 
-/// A full-band family-scope or 7d reading at 100% outranks both a confirmed
-/// and a soft 5h short hold.
+/// Full family-scope and seven-day readings do not create blockers or extend
+/// the hold of an independently confirmed five-hour refusal.
 #[test]
-fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
+fn full_scope_or_seven_day_readings_do_not_override_confirmed_hold() {
     let mut fable_full = reading(100.0, 10.0);
     fable_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
     fable_full.scoped = ScopedList::Listed(vec![fable_window(100.0)]);
     let mut seven_full = reading(100.0, 100.0);
     seven_full.five_hour.as_mut().unwrap().resets_at = ResetTime::At(NOW + 14 * MINUTE);
-    for (model, quota, window) in [
-        ("claude-fable-5", fable_full, ApplicableWindow::FamilyScope),
-        ("claude-sonnet-5", seven_full, ApplicableWindow::SevenDay),
+    for (model, quota) in [
+        ("claude-fable-5", fable_full),
+        ("claude-sonnet-5", seven_full),
     ] {
         let mut healthy = reading(10.0, 10.0);
         healthy.scoped = ScopedList::Listed(vec![fable_window(10.0)]);
@@ -643,31 +615,24 @@ fn fresh_scope_or_seven_day_100_outranks_any_five_hour_hold() {
             account("acct-b", Some(healthy)),
         ]);
         st.affinity = Some(affinity("acct-a", model, 3));
-        // Soft 5h hold candidate only.
+        // Readings alone cannot hold the session.
         let decision = decide(&with_model(request(), model), &st, NOW);
-        assert_eq!(
-            invalidated(&decision),
-            InvalidationReason::FreshFullReading { window }
-        );
-        assert_eq!(admitted(&decision), "acct-b");
+        assert_eq!(decision.admission().unwrap().reason, AdmitReason::StickyHit);
+        assert_eq!(admitted(&decision), "acct-a");
         // Plus a confirmed 5h fence 14 minutes from reset.
         st.fences
             .push(five_hour_fence("acct-a", ResetTime::At(NOW + 14 * MINUTE)));
         let decision = decide(&with_model(request(), model), &st, NOW);
-        assert_eq!(
-            invalidated(&decision),
-            InvalidationReason::FreshFullReading { window }
-        );
-        assert_eq!(admitted(&decision), "acct-b");
+        let hold = decision.hold().expect("confirmed five-hour hold");
+        assert_eq!(hold.basis, HoldBasis::ConfirmedFence);
+        assert_eq!(hold.reset_at_ms, NOW + 14 * MINUTE);
+        assert_eq!(hold.retry_after_s, 846);
     }
 }
 
-/// A move justified only by a fresh (unconfirmed) 100% reading, with no
-/// sibling to take the conversation, refuses as reserve-limited, not
-/// exhausted, and issues no pin: the old pin stays in the explanation as the
-/// conversation's historical identity, generation unchanged.
+/// A full reading cannot strand a sticky session when no sibling is available.
 #[test]
-fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
+fn full_readings_without_a_sibling_retain_the_existing_pin() {
     let mut seven = reading(10.0, 100.0);
     seven.observed_at_ms = Some(NOW - MINUTE);
     let mut five_no_reset = reading(100.0, 10.0);
@@ -682,26 +647,21 @@ fn fresh_only_move_without_a_sibling_is_reserve_limited_with_no_new_pin() {
         let mut st = state(vec![account("acct-a", Some(quota))]);
         st.affinity = Some(affinity("acct-a", model, 3));
         let decision = decide(&with_model(request(), model), &st, NOW);
-        assert_eq!(refused(&decision), RefusalCode::AccountPoolReserveLimited);
-        assert!(decision.admission().is_none());
+        assert_eq!(admitted(&decision), "acct-a");
         assert_eq!(
-            decision.explanation.previous_pin,
-            Some(PreviousPin {
+            decision.admission().unwrap().affinity,
+            AffinityOutcome::Retained {
                 pin_id: "pin-acct-a".into(),
-                account_id: "acct-a".into(),
-                credential_id: credential_id("acct-a"),
                 pin_generation: 3,
-            })
+            }
         );
     }
 }
 
-/// With a confirmed 5h block and a fresh 5h 100% reading disagreeing on the
-/// reset, the account frees only at the later of the two, so the later reset
-/// decides the hold. This replaces the rule that the confirmed fence governs:
-/// whatever window blocks continuation decides.
+/// A full reading is not an independent blocker: the confirmed refusal alone
+/// determines whether to hold or move, even when the reading's reset is later.
 #[test]
-fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
+fn confirmed_block_decides_the_hold_regardless_of_full_reading_reset() {
     let pool = |fence_reset, reading_reset| {
         let mut fresh = reading(100.0, 10.0);
         fresh.five_hour.as_mut().unwrap().resets_at = reading_reset;
@@ -713,7 +673,7 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
         st.fences.push(five_hour_fence("acct-a", fence_reset));
         st
     };
-    // Block resets in 2 h, reading says 14 min: move, no soft hold.
+    // Block resets in 2 h, reading says 14 min: move.
     let st = pool(
         ResetTime::At(NOW + 2 * HOUR),
         ResetTime::At(NOW + 14 * MINUTE),
@@ -726,20 +686,16 @@ fn the_latest_blocking_reset_decides_between_a_block_and_a_fresh_reading() {
             pool: Some(PoolKey::general(GeneralWindow::FiveHour))
         }
     );
-    // Block resets in 14 min, reading says 2 h: the reading's window still
-    // blocks after the block ends, so the conversation moves.
+    // Block resets in 14 min, reading says 2 h: hold on the confirmed block.
     let st = pool(
         ResetTime::At(NOW + 14 * MINUTE),
         ResetTime::At(NOW + 2 * HOUR),
     );
     let decision = decide(&request(), &st, NOW);
-    assert_eq!(admitted(&decision), "acct-b");
-    assert_eq!(
-        invalidated(&decision),
-        InvalidationReason::FreshFullReading {
-            window: ApplicableWindow::FiveHour
-        }
-    );
+    let hold = decision.hold().expect("confirmed hold");
+    assert_eq!(hold.basis, HoldBasis::ConfirmedFence);
+    assert_eq!(hold.reset_at_ms, NOW + 14 * MINUTE);
+    assert_eq!(hold.retry_after_s, 846);
     // Both 14 min away: a hold, on the confirmed block.
     let st = pool(
         ResetTime::At(NOW + 14 * MINUTE),
@@ -1175,7 +1131,7 @@ fn family_scope_excludes_only_its_family_and_absent_scope_passes() {
 }
 
 #[test]
-fn model_id_scopes_gate_cold_and_sticky_picks_and_all_matching_windows_apply() {
+fn model_id_scopes_gate_cold_but_retain_sticky_and_all_matching_windows_apply() {
     let model = "claude-nova-8[1m]";
     let mut r = reading(10.0, 10.0);
     r.scoped = ScopedList::Listed(vec![
@@ -1200,7 +1156,8 @@ fn model_id_scopes_gate_cold_and_sticky_picks_and_all_matching_windows_apply() {
         .any(|reason| matches!(reason, ExclusionReason::ScopeExhausted { .. })));
     st.affinity = Some(affinity("acct-a", model, 1));
     let sticky = decide(&req, &st, NOW);
-    assert!(sticky.hold().is_some(), "{sticky:?}");
+    assert_eq!(admitted(&sticky), "acct-a");
+    assert_eq!(sticky.admission().unwrap().reason, AdmitReason::StickyHit);
 
     if let ScopedList::Listed(windows) = &mut r.scoped {
         windows[1].used_percent = 50.0;

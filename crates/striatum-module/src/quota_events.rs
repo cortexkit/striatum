@@ -25,6 +25,7 @@ pub(super) struct ConsumerHealth {
     pub lag: Option<u64>,
     pub ack_pending: Option<usize>,
     pub last_error: Option<String>,
+    pub route_facts: crate::route_facts::Health,
 }
 
 struct SnapshotSchedule {
@@ -42,8 +43,26 @@ impl SnapshotSchedule {
     fn set_attached(&mut self, attached: bool, now: Instant) {
         if self.attached != attached {
             self.attached = attached;
+            // A lost binding may follow a long event-only period. Recover a
+            // fresh snapshot now rather than retaining the ten-minute deadline.
             self.next = now;
+            crate::info_operator(format!(
+                "[striatum] quota source={}",
+                if attached {
+                    "insula events (10m snapshot backstop)"
+                } else {
+                    "usage.get fallback (60s)"
+                }
+            ));
         }
+    }
+    fn observe_binding(
+        &mut self,
+        cache: &SharedQuotaCache,
+        reconnect: &mut quota_bus::reconnect::Backoff,
+        now: Instant,
+    ) {
+        self.set_attached(observe_binding(cache, reconnect, now), now);
     }
     fn due(&self, now: Instant) -> bool {
         now >= self.next
@@ -254,6 +273,7 @@ impl LiveQuota {
             if !attached {
                 cache.consumer.lag = None;
                 cache.consumer.ack_pending = None;
+                cache.consumer.route_facts.filters_ready = false;
             }
         }
     }
@@ -576,6 +596,7 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 .map_err(|e| ConsumeError::Bus(e.to_string()));
         }
         catch_up_snapshot(source, live, state).await;
+        let mut permanent = false;
         let result = async {
             let bytes = match source.fetch(&message.id).await {
                 Ok(bytes) => bytes,
@@ -600,7 +621,10 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
                 }
                 return Ok(());
             }
-            let (sample, body) = verify(&message, &bytes)?;
+            let (sample, body) = verify(&message, &bytes).map_err(|error| {
+                permanent = true;
+                error
+            })?;
             if !state.stale(&sample) {
                 let covered = live.covered_by_snapshot(&body)?;
                 if state.needs_snapshot(&sample) || covered == Some(false) {
@@ -620,11 +644,18 @@ async fn consume_one<C: StreamCursor, S: SampleSource>(
         }
         .await;
         if let Err(error) = result {
-            // NAK releases the cursor without acknowledging processing; the durable retries it.
-            cursor
-                .nak(REDELIVERY_DELAY)
-                .await
-                .map_err(|e| ConsumeError::Bus(e.to_string()))?;
+            if permanent {
+                tracing::warn!(id = message.id, error, "quota notice terminated");
+                cursor
+                    .term(Some("invalid_quota_notice"))
+                    .await
+                    .map_err(|e| ConsumeError::Bus(e.to_string()))?;
+            } else {
+                cursor
+                    .nak(REDELIVERY_DELAY)
+                    .await
+                    .map_err(|e| ConsumeError::Bus(e.to_string()))?;
+            }
             return Err(ConsumeError::Rejected(error));
         }
         cursor
@@ -666,23 +697,6 @@ async fn poll_if_due<S: SampleSource>(
         let success = snapshot(source, live).await;
         schedule.completed(now, success);
     }
-}
-
-async fn update_lag(bus: &quota_bus::AttachedBus, live: &LiveQuota) -> Result<(), String> {
-    let context = async_nats::jetstream::new(bus.connection.client());
-    let consumer = context
-        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
-            format!("m_{}", crate::DEFAULT_MODULE_ID),
-            &bus.stream,
-        )
-        .await
-        .map_err(|e| format!("quota consumer info unavailable: {e}"))?;
-    let info = consumer.cached_info();
-    if let Ok(mut cache) = live.cache.lock() {
-        cache.consumer.lag = Some(info.num_pending);
-        cache.consumer.ack_pending = Some(info.num_ack_pending);
-    }
-    Ok(())
 }
 
 const SNAPSHOT_FLUSH_INTERVAL: Duration = Duration::from_secs(60);
@@ -766,6 +780,7 @@ pub(super) async fn run(
     cache: SharedQuotaCache,
     accounts: account_quota::SharedAccountQuota,
     store: SharedStore,
+    handler: crate::route_facts::Handler,
 ) {
     let live = LiveQuota {
         cache,
@@ -780,78 +795,213 @@ pub(super) async fn run(
     // usage.get reply. Neither side cancels an in-flight delivery at each tick.
     tokio::select! {
         _ = flush_snapshot_loop(Arc::clone(&live.cache), Arc::clone(&live.store), SNAPSHOT_FLUSH_INTERVAL) => {},
-        _ = delivery_loop(connection_file, &live, project_root) => {},
+        _ = delivery_loop(connection_file, &live, project_root, handler) => {},
     }
 }
 
-async fn delivery_loop(connection_file: PathBuf, live: &LiveQuota, project_root: PathBuf) {
+async fn delivery_loop(
+    connection_file: PathBuf,
+    live: &LiveQuota,
+    project_root: PathBuf,
+    handler: crate::route_facts::Handler,
+) {
     let mut source = Insula::new(connection_file.clone(), project_root);
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
     let mut schedule = SnapshotSchedule::new(Instant::now());
-    let mut next_attach = Instant::now();
-    let mut next_lag = Instant::now();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(
+        Instant::now(),
+        crate::now_ms() ^ u64::from(std::process::id()),
+    );
+    let mut unbound_since = Some(Instant::now());
     live.attached(false, Some("connecting to quota durable".into()));
     loop {
-        if bus.is_none() && Instant::now() >= next_attach {
-            match striatum_store::job_timing::run(
-                "quota_feed_attach",
-                quota_bus::attach(connection_file.clone()),
-            )
-            .await
+        if bus.is_none() {
+            if let Some(result) = reconnect
+                .attempt(
+                    Instant::now(),
+                    striatum_store::job_timing::run(
+                        "quota_feed_attach",
+                        quota_bus::attach(connection_file.clone(), handler.clone()),
+                    ),
+                )
+                .await
             {
-                Ok(attached) => {
-                    bus = Some(attached);
-                    live.attached(true, None);
-                    schedule.set_attached(true, Instant::now());
-                    next_lag = Instant::now();
+                match result {
+                    Ok(attached) => {
+                        bus = Some(attached);
+                        unbound_since = None;
+                    }
+                    Err(error) => {
+                        quota_bus::unbound(&handler, &error);
+                    }
                 }
-                Err(error) => live.attached(false, Some(error)),
             }
-            next_attach = Instant::now() + crate::QUOTA_RETRY_INTERVAL;
         }
+        schedule.observe_binding(&live.cache, &mut reconnect, Instant::now());
         poll_if_due(&mut source, &live, &mut schedule, Instant::now()).await;
         let Some(attached) = bus.as_mut() else {
-            tokio::time::sleep_until(next_attach.into()).await;
+            let error = live
+                .cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.consumer.last_error.clone());
+            if unbound_since.is_some_and(|since| since.elapsed() > Duration::from_secs(60))
+                && !error.as_deref().is_some_and(quota_bus::no_durable)
+            {
+                tracing::warn!(error, "event reader unbound for more than 60 seconds");
+            }
+            tokio::time::sleep_until(reconnect.deadline().min(schedule.next).into()).await;
             continue;
         };
         let mut down = None;
-        if attached.connection.client().connection_state()
-            != async_nats::connection::State::Connected
-        {
-            down = Some("quota bus disconnected".into());
-        } else if crate::now_ms() >= attached.renew_at_ms {
-            down = Some("refreshing quota bus credential".into());
-        } else if Instant::now() >= next_lag {
-            if let Err(error) =
-                striatum_store::job_timing::run("quota_feed_lag", update_lag(attached, &live)).await
-            {
+        let received = tokio::select! {
+            result = attached.deliveries.recv() => result,
+            _ = tokio::time::sleep(Duration::from_secs(1)) => { continue; }
+        };
+        if let Some(Ok(event)) = received {
+            let payload = quota_bus::payload(&attached.names, &event);
+            let payload = match payload {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(error, id = event.msg_id, "malformed event terminated");
+                    if let Err(error) = event.term().await {
+                        down = Some(error.to_string());
+                    } else {
+                        handler.refused_publisher(
+                            &event.subject.module,
+                            &event.subject.event,
+                            event.subject.version,
+                        );
+                    }
+                    if down.is_none() {
+                        continue;
+                    }
+                    // A settlement failure must reconnect rather than silently losing a notice.
+                    bus = None;
+                    quota_bus::unbound(
+                        &handler,
+                        down.as_deref().unwrap_or("event settlement failed"),
+                    );
+                    reconnect.failed(Instant::now());
+                    unbound_since.get_or_insert_with(Instant::now);
+                    continue;
+                }
+            };
+            let mut cursor = quota_bus::Cursor {
+                event: &event,
+                acknowledged: false,
+                notice: Some(cortexkit_bus_trait::StreamDelivery {
+                    stream_seq: event.stream_sequence,
+                    delivery_count: payload.delivery_count,
+                    message: payload.message.clone(),
+                }),
+            };
+            let handled = handler
+                .consume(&mut cursor, &attached.names, &payload)
+                .await;
+            if handled == Ok(true) {
+                if cursor.acknowledged {
+                    reconnect.healthy();
+                }
+                continue;
+            }
+            if let Err(error) = handled {
                 down = Some(error);
+            } else if payload.body.len() > 4096 || payload.message.subject != attached.subject {
+                tracing::warn!(
+                    subject = payload.message.subject,
+                    "unknown event terminated"
+                );
+                if let Err(error) = event.term().await {
+                    down = Some(error.to_string());
+                }
+            } else {
+                let before_generation = live
+                    .cache
+                    .lock()
+                    .ok()
+                    .map(|cache| cache.snapshot_persistence.publication_generation);
+                match consume_one(
+                    &mut cursor,
+                    &mut source,
+                    &live,
+                    &mut state,
+                    &attached.subject,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        reset_after_quota_ack(
+                            &live,
+                            before_generation,
+                            cursor.acknowledged,
+                            &mut reconnect,
+                        );
+                    }
+                    Err(ConsumeError::Rejected(error)) => {
+                        tracing::warn!(error, "quota event refused")
+                    }
+                    Err(ConsumeError::Bus(error)) => down = Some(error),
+                }
             }
-            next_lag = Instant::now() + Duration::from_secs(10);
-        }
-        if down.is_none() {
-            match consume_one(
-                &mut attached.cursor,
-                &mut source,
-                &live,
-                &mut state,
-                &attached.subject,
-            )
-            .await
-            {
-                Ok(()) => live.attached(true, None),
-                Err(ConsumeError::Rejected(error)) => live.attached(true, Some(error)),
-                Err(ConsumeError::Bus(error)) => down = Some(error),
-            }
+        } else {
+            down = Some(
+                received
+                    .and_then(Result::err)
+                    .unwrap_or_else(|| "event reader stopped".into()),
+            );
         }
         if let Some(error) = down {
             bus = None;
-            live.attached(false, Some(error));
-            schedule.set_attached(false, Instant::now());
-            next_attach = Instant::now() + crate::QUOTA_RETRY_INTERVAL;
+            quota_bus::unbound(&handler, &error);
+            unbound_since.get_or_insert_with(Instant::now);
+            reconnect.failed(Instant::now());
         }
     }
+}
+
+fn reset_after_quota_ack(
+    live: &LiveQuota,
+    before_generation: Option<u64>,
+    acknowledged: bool,
+    reconnect: &mut quota_bus::reconnect::Backoff,
+) {
+    // Expired quota notices can be ACKed while snapshot recovery is still owed.
+    // Only a published reading/snapshot plus its ACK proves application progress.
+    let after_generation = live
+        .cache
+        .lock()
+        .ok()
+        .map(|cache| cache.snapshot_persistence.publication_generation);
+    if acknowledged
+        && before_generation
+            .zip(after_generation)
+            .is_some_and(|(before, after)| after > before)
+    {
+        reconnect.healthy();
+    }
+}
+
+pub(crate) fn observe_binding(
+    cache: &SharedQuotaCache,
+    reconnect: &mut quota_bus::reconnect::Backoff,
+    now: Instant,
+) -> bool {
+    let bound_since = cache.lock().ok().and_then(|mut cache| {
+        if cache
+            .consumer
+            .route_facts
+            .reader_bound(cache.consumer.attached)
+        {
+            Some(*cache.consumer.route_facts.bound_since.get_or_insert(now))
+        } else {
+            cache.consumer.route_facts.bound_since = None;
+            None
+        }
+    });
+    reconnect.observe_bound(now, bound_since);
+    bound_since.is_some()
 }
 
 #[cfg(test)]

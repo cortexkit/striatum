@@ -150,6 +150,22 @@ impl BlockState {
         });
     }
 
+    /// [`Self::dry_run_clear_routes`] for one model's route only.
+    pub fn dry_run_clear_route(
+        &mut self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        before: i64,
+    ) {
+        self.edit_rows(ROUTE_FENCE_TABLE, |held| {
+            !matches!(held,
+            Held::Source { raw: Raw::RouteFence { row, last_reported_at, .. }, .. }
+            if row.provider == provider && row.credential_id == credential && row.model == model
+            && last_reported_at.unwrap_or(row.recorded_at) < before)
+        });
+    }
+
     pub fn dry_run_reconcile_route(&mut self, fence: &crate::AccountRouteFence, until: i64) {
         self.edit_rows(ROUTE_FENCE_TABLE, |held| {
             if let Held::Source {

@@ -615,5 +615,6 @@ fn stateless() -> crate::account_state::WriterAccountState {
     crate::account_state::WriterAccountState::new(
         Arc::new(std::sync::OnceLock::new()),
         Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        Arc::default(),
     )
 }

@@ -9,8 +9,313 @@ use std::sync::{
 use striatum_core::RouteStateStore as _;
 use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
+#[tokio::test(start_paused = true)]
+async fn metadata_timeouts_keep_insula_and_catalog_deliveries_alive_without_reconnect() {
+    struct Timeouts {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Timeouts {
+        async fn read(&mut self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = crate::route_facts::Handler {
+        quota_cache: live.cache.clone(),
+        store: live.store.clone(),
+        credentials: Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        )),
+        config_path: PathBuf::new(),
+    };
+    let wake = handler.credentials.lock().unwrap().catalog_wake.clone();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(Instant::now(), 31);
+    let mut connects = 0;
+    reconnect
+        .attempt(Instant::now(), async {
+            connects += 1;
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+    }
+    let bus = bus();
+    let sample = body("epoch-z", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let catalog = br#"{"catalog_version":1}"#;
+    let _ = bus
+        .publish(
+            "ck.box_test.event.fusiform.catalog_changed.v1",
+            "catalog",
+            ContentDigest::of_bytes(catalog),
+            Headers::new(),
+        )
+        .await
+        .unwrap();
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut metadata = Timeouts {
+        calls: calls.clone(),
+    };
+    quota_bus::metadata::with_metadata(&mut metadata, &handler, async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        consume_one(
+            &mut cursor,
+            &mut source,
+            &live,
+            &mut SequenceState::default(),
+            SUBJECT,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        let event = cursor.next().await.unwrap().unwrap();
+        handler
+            .consume(
+                &mut cursor,
+                &cortexkit_bus_naming::AccountNames::derive("box_test").unwrap(),
+                &crate::route_facts::Delivery {
+                    message: event.message,
+                    body: catalog.to_vec(),
+                    published_at_ms: Some(crate::now_ms()),
+                    delivery_count: event.delivery_count,
+                },
+            )
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("metadata failure must not tear down the reader session");
+    assert_eq!(connects, 1);
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (2, 0, 0));
+    assert_eq!(used(&live), 10.0);
+    assert!(tokio::time::timeout(Duration::ZERO, wake.notified())
+        .await
+        .is_ok());
+    let cache = live.cache.lock().unwrap();
+    assert!(cache.consumer.attached, "metadata is not reader liveness");
+    assert!(!cache.consumer.route_facts.ready(cache.consumer.attached));
+}
+
 const SUBJECT: &str = "ck.box_test.event.insula.quota_sampled.v1";
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
+
+fn catalog_handler(live: &LiveQuota) -> crate::route_facts::Handler {
+    crate::route_facts::Handler {
+        quota_cache: live.cache.clone(),
+        store: live.store.clone(),
+        credentials: Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        )),
+        config_path: PathBuf::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_metadata_does_not_delay_delivery_work() {
+    struct Pending;
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Pending {
+        async fn read(&mut self) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    let start = tokio::time::Instant::now();
+    quota_bus::metadata::with_metadata(&mut Pending, &handler, async {
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start,
+            "delivery must not wait for the metadata timeout"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_errors_back_off_thirty_seconds_to_ten_minutes() {
+    struct Refused {
+        attempts: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    }
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Refused {
+        async fn read(&mut self) -> Result<(), String> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            Err("consumer-info permission denied".into())
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    live.cache.lock().unwrap().consumer.attached = true;
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let start = tokio::time::Instant::now();
+    quota_bus::metadata::with_metadata(
+        &mut Refused {
+            attempts: attempts.clone(),
+        },
+        &handler,
+        async {
+            tokio::time::sleep(Duration::from_secs(2000)).await;
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|at| at.duration_since(start).as_secs())
+            .collect::<Vec<_>>(),
+        [0, 30, 90, 210, 450, 930, 1530]
+    );
+    assert!(live.cache.lock().unwrap().consumer.attached);
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_consumer_not_found_becomes_no_durable_binding_state() {
+    struct Absent;
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Absent {
+        async fn read(&mut self) -> Result<(), String> {
+            Err("consumer not found (10014)".into())
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+    }
+    let error = quota_bus::metadata::with_metadata(
+        &mut Absent,
+        &handler,
+        std::future::pending::<Result<(), String>>(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        quota_bus::unbound(&handler, &error),
+        "first missing-durable state logs its cause"
+    );
+    assert!(
+        !quota_bus::unbound(&handler, "consumer not found on another retry (10014)"),
+        "unchanged missing-durable state must not log again"
+    );
+    {
+        let cache = live.cache.lock().unwrap();
+        assert!(!cache.consumer.attached);
+        assert!(!cache.consumer.route_facts.ready(cache.consumer.attached));
+        assert_eq!(
+            cache.consumer.last_error.as_deref(),
+            Some("no durable yet (consumer not found)")
+        );
+    }
+    assert!(
+        quota_bus::unbound(&handler, "NATS connection closed"),
+        "a different unbound cause is visible"
+    );
+    assert!(
+        quota_bus::unbound(&handler, &error),
+        "returning to a missing durable is a new state"
+    );
+    let now = Instant::now();
+    let mut schedule = SnapshotSchedule::new(now);
+    schedule.completed(now, true);
+    assert_eq!(schedule.next.duration_since(now), Duration::from_secs(60));
+}
+
+#[test]
+fn insula_only_consumer_filters_never_enable_route_fact_stream() {
+    let names = cortexkit_bus_naming::AccountNames::derive("box_test").unwrap();
+    let filters = vec![names.event_subject("insula", "quota_sampled", 1).unwrap()];
+    assert!(!crate::route_facts::filters_ready(
+        &names,
+        Some("m_striatum"),
+        &filters
+    ));
+}
+
+#[tokio::test]
+async fn expired_quota_ack_without_publication_does_not_reset_bind_backoff() {
+    let (_scratch, live) = fixture();
+    live.store_sample(serde_json::from_str(&body("epoch-z", 1, 10)).unwrap())
+        .unwrap();
+    let before = Some(
+        live.cache
+            .lock()
+            .unwrap()
+            .snapshot_persistence
+            .publication_generation,
+    );
+    let bus = bus();
+    let sample = body("epoch-z", 2, 20);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        fetch_error: Some("event_not_found".into()),
+        snapshot_error: Some("usage unavailable".into()),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    // Expired notices can be ACKed even if the recovery snapshot fails.
+    cursor.verify_publication = false;
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (1, 0, 0));
+    assert_eq!(
+        Some(
+            live.cache
+                .lock()
+                .unwrap()
+                .snapshot_persistence
+                .publication_generation
+        ),
+        before
+    );
+    let now = Instant::now();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(now, 47);
+    for _ in 0..8 {
+        reconnect.failed(now);
+    }
+    reset_after_quota_ack(&live, before, true, &mut reconnect);
+    reconnect.failed(now);
+    assert!(
+        reconnect.deadline().duration_since(now) >= Duration::from_secs(48),
+        "ACK of an expired notice without a successful snapshot is not application progress"
+    );
+    live.store_sample(serde_json::from_str(&sample).unwrap())
+        .unwrap();
+    reset_after_quota_ack(&live, before, true, &mut reconnect);
+    reconnect.failed(now);
+    assert!(reconnect.deadline().duration_since(now) <= Duration::from_millis(1200));
+}
 
 fn fixture() -> (ScratchDir, LiveQuota) {
     let scratch = ScratchDir::new("routing-quota-events");
@@ -155,6 +460,9 @@ struct Cursor {
     live: LiveQuota,
     acks: usize,
     naks: usize,
+    terms: usize,
+    adapter_message: Option<Message>,
+    verify_publication: bool,
     deliveries: Vec<u64>,
 }
 
@@ -165,6 +473,9 @@ impl Cursor {
             live: live.clone(),
             acks: 0,
             naks: 0,
+            terms: 0,
+            adapter_message: None,
+            verify_publication: true,
             deliveries: vec![],
         }
     }
@@ -173,29 +484,34 @@ impl Cursor {
 #[async_trait::async_trait]
 impl StreamCursor for Cursor {
     async fn next(&mut self) -> BusResult<Option<StreamDelivery>> {
-        let delivery = self.inner.next().await?;
+        let mut delivery = self.inner.next().await?;
+        if let (Some(delivery), Some(message)) = (&mut delivery, self.adapter_message.take()) {
+            delivery.message = message;
+        }
         if let Some(delivery) = &delivery {
             self.deliveries.push(delivery.delivery_count);
         }
         Ok(delivery)
     }
     async fn ack(&mut self) -> BusResult<()> {
-        assert!(
-            !self.live.store.account_quota_readings().unwrap().is_empty(),
-            "ack precedes the write-through account poll"
-        );
-        assert!(
-            self.live.cache.lock().unwrap().available,
-            "ack precedes cache publication"
-        );
-        assert!(!self
-            .live
-            .accounts
-            .lock()
-            .unwrap()
-            .readings
-            .readings
-            .is_empty());
+        if self.verify_publication {
+            assert!(
+                !self.live.store.account_quota_readings().unwrap().is_empty(),
+                "ack precedes the write-through account poll"
+            );
+            assert!(
+                self.live.cache.lock().unwrap().available,
+                "ack precedes cache publication"
+            );
+            assert!(!self
+                .live
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .is_empty());
+        }
         self.inner.ack().await?;
         self.acks += 1;
         Ok(())
@@ -207,6 +523,7 @@ impl StreamCursor for Cursor {
         self.inner.nak(Duration::ZERO).await
     }
     async fn term(&mut self, reason: Option<&str>) -> BusResult<()> {
+        self.terms += 1;
         self.inner.term(reason).await
     }
     async fn in_progress(&mut self) -> BusResult<()> {
@@ -862,9 +1179,53 @@ async fn digest_mismatch_refused_and_not_acked() {
     assert_eq!(cursor.acks, 0);
     assert!(live.store.quota_snapshot().unwrap().is_none());
     assert!(live.cache.lock().unwrap().windows.is_empty());
-    let retry = cursor.inner.next().await.unwrap().unwrap();
-    assert_eq!(retry.message.id, key);
-    assert_eq!(retry.delivery_count, 2);
+    assert_eq!(cursor.terms, 1);
+    assert_eq!(cursor.naks, 0);
+    assert!(cursor.inner.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sdk_notice_tampered_digest_termed_without_applying() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let sample = body("epoch-z", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    let key = publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let original = cursor.inner.next().await.unwrap().unwrap();
+    cursor.inner.nak(Duration::ZERO).await.unwrap();
+    let mut headers = original.message.headers;
+    let tampered = ContentDigest::of_bytes(b"tampered").to_string();
+    headers.insert("Ck-Content-Digest".into(), tampered.clone());
+    let payload = quota_bus::message(
+        SUBJECT.into(),
+        key,
+        b"",
+        headers,
+        Some(&tampered),
+        Some(crate::now_ms()),
+        1,
+    )
+    .unwrap();
+    cursor.adapter_message = Some(payload.message);
+    assert!(matches!(
+        consume_one(
+            &mut cursor,
+            &mut source,
+            &live,
+            &mut SequenceState::default(),
+            SUBJECT
+        )
+        .await,
+        Err(ConsumeError::Rejected(_))
+    ));
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (0, 0, 1));
+    assert!(live.cache.lock().unwrap().windows.is_empty());
+    assert!(live.store.account_quota_readings().unwrap().is_empty());
+    assert!(cursor.inner.next().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -1160,6 +1521,233 @@ async fn poll_fallback_engages_when_down_and_stops_when_attached() {
     let (_, metrics) = crate::quota_health(&live.cache.lock().unwrap(), crate::now_ms());
     assert_eq!(metrics["consumer"]["attached"], false);
     assert_eq!(metrics["consumer"]["lag"], Value::Null);
+}
+
+async fn serve_nats_connection(
+    listener: &tokio::net::TcpListener,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (stream, _) = listener.accept().await.unwrap();
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(b"INFO {\"server_id\":\"quota-test\",\"version\":\"2.10.0\",\"proto\":1,\"max_payload\":1048576}\r\n")
+        .await
+        .unwrap();
+    let mut read = BufReader::new(read);
+    let mut line = String::new();
+    tokio::pin!(stop);
+    loop {
+        line.clear();
+        tokio::select! {
+            _ = &mut stop => return,
+            read = read.read_line(&mut line) => {
+                if read.unwrap() == 0 {
+                    return;
+                }
+                if line == "PING\r\n" {
+                    write.write_all(b"PONG\r\n").await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+async fn fact_stream_advertised(live: &LiveQuota) -> bool {
+    let handler = catalog_handler(live);
+    let deps = crate::routing_v1::Deps {
+        quota_cache: &live.cache,
+        store: &live.store,
+        routing_config_path: &handler.config_path,
+        operator_config_path: &handler.config_path,
+        broca_credentials: &handler.credentials,
+    };
+    crate::routing_v1::answer(
+        "role.describe",
+        &json!({}),
+        &crate::routing_v1::Caller::for_event("broca"),
+        &deps,
+    )
+    .await
+    .unwrap()["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("route_fact_stream"))
+}
+
+#[tokio::test]
+async fn silent_disconnect_switches_snapshot_schedule_and_source_until_reconnected() {
+    use async_nats::{connection::State, Event};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (disconnect, stop) = tokio::sync::oneshot::channel();
+    let (resume, restart) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_nats_connection(&listener, async { stop.await.unwrap() }).await;
+        restart.await.unwrap();
+        serve_nats_connection(&listener, std::future::pending()).await;
+    });
+    let (events, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    let connection = async_nats::ConnectOptions::new()
+        .event_callback(move |event| {
+            let events = events.clone();
+            async move {
+                let _ = events.send(event);
+            }
+        })
+        .connect(address.to_string())
+        .await
+        .unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Connected) {}
+    let (_scratch, live) = fixture();
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+        cache.consumer.route_facts.connection = Some(connection.clone());
+    }
+    assert!(fact_stream_advertised(&live).await);
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut reconnect = quota_bus::reconnect::Backoff::new(start, 31);
+    let mut source = Source {
+        snapshot: snapshot_body(&body("epoch-z", 1, 10)),
+        ..Default::default()
+    };
+    crate::take_operator_infos();
+    schedule.observe_binding(&live.cache, &mut reconnect, start);
+    poll_if_due(&mut source, &live, &mut schedule, start).await;
+    assert_eq!(schedule.next, start + Duration::from_secs(600));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
+
+    disconnect.send(()).unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Disconnected) {}
+    assert_eq!(connection.connection_state(), State::Disconnected);
+    assert!(!fact_stream_advertised(&live).await);
+    let down = start + Duration::from_secs(1);
+    schedule.observe_binding(&live.cache, &mut reconnect, down);
+    assert!(
+        schedule.due(down),
+        "a silent outage must not retain the ten-minute deadline"
+    );
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=usage.get fallback (60s)"]
+    );
+    {
+        let cache = live.cache.lock().unwrap();
+        assert!(
+            cache.consumer.attached,
+            "the SDK reader has not returned an error"
+        );
+        assert_eq!(cache.consumer.last_error, None);
+        assert_eq!(cache.consumer.route_facts.bound_since, None);
+    }
+    poll_if_due(&mut source, &live, &mut schedule, down).await;
+    assert_eq!(source.snapshots, 2);
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    schedule.observe_binding(&live.cache, &mut reconnect, down + Duration::from_secs(59));
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        down + Duration::from_secs(59),
+    )
+    .await;
+    assert_eq!(source.snapshots, 2);
+    assert!(
+        crate::take_operator_infos().is_empty(),
+        "unchanged source stays quiet"
+    );
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        down + Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(source.snapshots, 3, "fallback continues once per minute");
+
+    resume.send(()).unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Connected) {}
+    assert_eq!(connection.connection_state(), State::Connected);
+    assert!(fact_stream_advertised(&live).await);
+    let rebound = down + Duration::from_secs(61);
+    schedule.observe_binding(&live.cache, &mut reconnect, rebound);
+    poll_if_due(&mut source, &live, &mut schedule, rebound).await;
+    assert_eq!(schedule.next, rebound + Duration::from_secs(600));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        rebound + Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(source.snapshots, 4, "reconnecting stops minute polling");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn revision_change_keeps_fallback_until_reader_rebinds() {
+    let (_scratch, live) = fixture();
+    let (revision, changes) = tokio::sync::watch::channel(0);
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.revisions = Some(changes);
+    }
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut reconnect = quota_bus::reconnect::Backoff::new(start, 31);
+    crate::take_operator_infos();
+    schedule.observe_binding(&live.cache, &mut reconnect, start);
+    schedule.completed(start, true);
+    assert_eq!(schedule.next, start + Duration::from_secs(600));
+    crate::take_operator_infos();
+
+    revision.send_replace(1);
+    let down = start + Duration::from_secs(1);
+    schedule.observe_binding(&live.cache, &mut reconnect, down);
+    assert!(schedule.due(down));
+    schedule.completed(down, true);
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=usage.get fallback (60s)"]
+    );
+    schedule.observe_binding(&live.cache, &mut reconnect, down + Duration::from_secs(30));
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    assert!(crate::take_operator_infos().is_empty());
+
+    live.cache
+        .lock()
+        .unwrap()
+        .consumer
+        .route_facts
+        .revisions
+        .as_mut()
+        .unwrap()
+        .borrow_and_update();
+    let rebound = down + Duration::from_secs(31);
+    schedule.observe_binding(&live.cache, &mut reconnect, rebound);
+    schedule.completed(rebound, true);
+    assert_eq!(schedule.next, rebound + Duration::from_secs(600));
+    assert_eq!(
+        live.cache.lock().unwrap().consumer.route_facts.bound_since,
+        Some(rebound)
+    );
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
 }
 
 #[tokio::test]

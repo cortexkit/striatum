@@ -328,6 +328,20 @@ pub(crate) fn published_at(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_load_equivalent(store: &SqliteRouteStateStore, now: i64) {
+    let published = snapshot(store).unwrap();
+    let mut loaded = store
+        .account_read(|tx| AccountState::load_at(tx, now))
+        .unwrap();
+    // Publication generations count commits and are not stored in SQL.
+    loaded.generation = published.generation;
+    assert_eq!(
+        *published, loaded,
+        "published account state differs from a fresh SQL load"
+    );
+}
+
+#[cfg(test)]
 pub(crate) static SNAPSHOT_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -379,6 +393,10 @@ pub(crate) struct AccountCommand<'a> {
     state: Option<&'a mut AccountState>,
     now_ms: i64,
     visited_accounts: RefCell<BTreeSet<(String, String)>>,
+    /// `signed_out` observations this command inserted unbound, by id, with
+    /// their (principal, admission id, body): binding one later in the same
+    /// command adds it to the state without reading the row back.
+    unbound_signed_out: std::collections::BTreeMap<String, (String, String, String)>,
 }
 
 impl<'a> AccountCommand<'a> {
@@ -390,6 +408,7 @@ impl<'a> AccountCommand<'a> {
             sql,
             now_ms: crate::account_selection::now_ms(),
             visited_accounts: RefCell::default(),
+            unbound_signed_out: Default::default(),
             state: state.map(|state| {
                 state
                     .as_any_mut()
@@ -769,6 +788,24 @@ impl AccountCommand<'_> {
         }
     }
 
+    /// The credentials a run reported signed out, from the state. The SQL
+    /// form reads `account_observation`, which has no index for it.
+    pub(crate) fn signed_out_credentials(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+    ) -> RouteStateResult<Vec<String>> {
+        match self.admission_state() {
+            Some(state) => state
+                .signed_out_credentials(principal, admission_id, run_id)
+                .map_err(RouteStateStoreError),
+            None => self
+                .sql
+                .signed_out_credentials(principal, admission_id, run_id),
+        }
+    }
+
     /// The reservation admission of the original's newest used offer. The
     /// chain names it; an open reservation comes from the state and a closed
     /// one costs one keyed exception.
@@ -797,6 +834,60 @@ impl AccountCommand<'_> {
 impl AccountCommand<'_> {
     fn admissions(&mut self) -> Option<&mut AdmissionState> {
         self.state.as_deref_mut().map(|state| &mut state.admissions)
+    }
+
+    /// Store an observation. A bound `signed_out` one also joins its open
+    /// admission's sign-in exclusions in the state; an unbound one is kept
+    /// aside until [`Self::set_observation_effects`] binds it.
+    pub(crate) fn insert_observation(
+        &mut self,
+        row: &striatum_store::AccountObservationRow,
+    ) -> RouteStateResult<()> {
+        self.sql.insert_observation(row)?;
+        if row.kind != striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
+            return Ok(());
+        }
+        let Some(admission) = &row.admission_id else {
+            return Ok(());
+        };
+        if row.bound {
+            if let Some(state) = self.admissions() {
+                state.record_signed_out(&row.principal, admission, &row.observation_json);
+            }
+        } else if self.state.is_some() {
+            self.unbound_signed_out.insert(
+                row.observation_id.clone(),
+                (
+                    row.principal.clone(),
+                    admission.clone(),
+                    row.observation_json.clone(),
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    /// Record an observation's effects. Binding a `signed_out` observation
+    /// this command inserted adds it to the state as [`Self::insert_observation`]
+    /// does for one inserted bound.
+    pub(crate) fn set_observation_effects(
+        &mut self,
+        observation_id: &str,
+        bound: bool,
+        effects_json: &str,
+    ) -> RouteStateResult<()> {
+        self.sql
+            .set_observation_effects(observation_id, bound, effects_json)?;
+        if bound {
+            if let Some((principal, admission, body)) =
+                self.unbound_signed_out.remove(observation_id)
+            {
+                if let Some(state) = self.admissions() {
+                    state.record_signed_out(&principal, &admission, &body);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Apply a change SQL has already made to the state.
@@ -976,12 +1067,25 @@ impl AccountCommand<'_> {
         #[cfg(test)]
         let _writer_entry =
             striatum_store::writer_entry_trace::enter("account_command::mark_admission_started");
+        let terminal_start = if self
+            .admission_state()
+            .is_some_and(|state| state.open_admission(principal, admission_id).is_none())
+        {
+            self.admission(principal, admission_id)?.filter(|row| {
+                row.state == "finished" && row.run_id.is_none() && row.started_at.is_none()
+            })
+        } else {
+            None
+        };
         let changed = self
             .sql
             .mark_admission_started(principal, admission_id, run_id, at, late)?;
         self.mirror_checked(changed, "mark_admission_started", |state| {
             state.start(principal, admission_id, run_id, at, late)
         })?;
+        if let Some(row) = terminal_start {
+            self.mirror(|state| state.record_terminal_start(&row));
+        }
         Ok(changed)
     }
 
@@ -1465,6 +1569,19 @@ pub(crate) fn report_inflight_expiry_cost_for_test(
         .unwrap()
         .inflight
         .report_expiry_cost(now, iterations);
+}
+
+/// The published block and admission state must equal a fresh load of the
+/// store's rows; `step` names the point a failing test reached.
+#[cfg(test)]
+pub(crate) fn assert_published_equals_fresh_load(store: &SqliteRouteStateStore, step: &str) {
+    let published = snapshot(store).unwrap();
+    let loaded = store.account_transaction(AccountState::load).unwrap();
+    assert_eq!(loaded.blocks, published.blocks, "{step}: block state");
+    assert_eq!(
+        loaded.admissions, published.admissions,
+        "{step}: admission state"
+    );
 }
 
 /// After a request mix: the published admission state must equal a fresh

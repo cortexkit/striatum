@@ -188,33 +188,62 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
-name = "cortexkit-bus-inmemory"
-version = "0.3.0"
+name = "cortexkit-bus-client"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "61fc01c2c813b7c6cc6e94873f176777167c84e49594b649ad6a467dd7947951"
+checksum = "5f49f294985b669e4440c01ba3b31e0897adc107f0dd3b50454808f8ab833c0e"
+dependencies = [
+ "async-nats",
+ "async-trait",
+ "base64",
+ "bytes",
+ "cortexkit-bus-naming 0.4.1",
+ "cortexkit-bus-nats",
+ "cortexkit-bus-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "subc-client-rs",
+ "subc-protocol 0.37.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "cortexkit-bus-inmemory"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c563d7235caba742d198c5a6ba9b1fe27869d6494f13a5757ec28e00522eb4f"
 dependencies = [
  "async-trait",
- "cortexkit-bus-naming",
+ "cortexkit-bus-naming 0.3.4",
  "cortexkit-bus-trait",
  "tokio",
 ]
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.2.7"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "696b59aebd321f2a7deb0cc1423aeeccb0e18f774f4144d755edddef062b593d"
+checksum = "059309f7503eba557d5c1bcf1dfcf59f8fa978516ed0827cf79ecb62ff7fc07a"
+
+[[package]]
+name = "cortexkit-bus-naming"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3a24f2395a05513dd72156f57957fd80de801f32af20552cbc1fe4b40d86dc6"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "60c584e3abd14eabddb785074d43b50947975e8485922753c3e1db1105771a96"
+checksum = "d321fc4091746e63c719f722f7658a26c40fdc20b41f0bf9cde0e78b6cea2234"
 dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "cortexkit-bus-naming",
+ "cortexkit-bus-naming 0.4.1",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
@@ -222,9 +251,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-trait"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12bf09b0c0f60249cd95cbcf9f3e4babb3b5c1322fc90a220744a8d8e85231c2"
+checksum = "99d5304c25fbd474819881cb0c6da816880318d9932fe7824f071390a81a54d7"
 dependencies = [
  "async-trait",
  "sha2",
@@ -328,9 +357,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing"
-version = "0.7.34"
+version = "0.7.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fbc3af841acec3329d06b4c1db8d0f1d8e7f72f88850aa2fff47d530437412f"
+checksum = "1b19bef482fc8de79e14bf738e38e452e4cab649294b7bd174d72ff3c34a00bc"
 dependencies = [
  "cortexkit-role-media",
  "serde",
@@ -339,15 +368,15 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-routing-conformance"
-version = "0.10.39"
+version = "0.10.40"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c62402382894bb94aecd942815e86318212c893ec2ecd959b7df84c84e812f70"
+checksum = "fb5e728cd86998aeeaac34e6eb1362893c5047e8d7d7182a9766efd2b922bb5a"
 dependencies = [
  "async-trait",
  "cortexkit-role-routing",
  "serde",
  "serde_json",
- "subc-protocol 0.34.1",
+ "subc-protocol 0.37.0",
 ]
 
 [[package]]
@@ -1525,8 +1554,9 @@ dependencies = [
  "async-nats",
  "async-trait",
  "base64",
+ "cortexkit-bus-client",
  "cortexkit-bus-inmemory",
- "cortexkit-bus-naming",
+ "cortexkit-bus-naming 0.4.1",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-claustrum-client",

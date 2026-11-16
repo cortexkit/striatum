@@ -2190,7 +2190,7 @@ async fn poll_cycle<C: CatalogWire>(
     })
     .await?;
     let should_get = cursor
-        .map(|cursor| status.catalog_version > cursor.catalog_version)
+        .map(|cursor| status.catalog_version != cursor.catalog_version)
         .unwrap_or(true);
     let get_calls = if should_get {
         let snapshot = client.catalog_get().await?;
@@ -2247,10 +2247,13 @@ pub async fn catalog_refresh_loop(
     let mut bootstrapped = false;
     let mut last_logged_error: Option<String> = None;
     let config_path = crate::config_overrides::config_path();
-    let wake = {
+    let (wake, rebind_wake) = {
         let mut guard = credentials.lock().unwrap();
         guard.connection_file_path = Some(connection_file_path.clone());
-        Arc::clone(&guard.catalog_wake)
+        (
+            Arc::clone(&guard.catalog_wake),
+            Arc::clone(&guard.catalog_rebind_wake),
+        )
     };
     loop {
         let result = striatum_store::job_timing::run("catalog_poll", async {
@@ -2288,9 +2291,9 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.set_poll_ms(cadence);
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_millis(cadence)) => {},
-                    _ = wake.notified() => { bootstrapped = false; },
+                if wait_for_catalog_cycle(&wake, &rebind_wake, Duration::from_millis(cadence)).await
+                {
+                    bootstrapped = false;
                 }
             }
             Err(reason) => {
@@ -2304,13 +2307,35 @@ pub async fn catalog_refresh_loop(
                 if let Ok(mut health) = health.lock() {
                     health.note_error(reason);
                 }
-                tokio::select! {
-                    _ = tokio::time::sleep(RETRY_INTERVAL) => {},
-                    _ = wake.notified() => { bootstrapped = false; },
+                if wait_for_catalog_cycle(&wake, &rebind_wake, RETRY_INTERVAL).await {
+                    bootstrapped = false;
                 }
             }
         }
     }
+}
+
+async fn wait_for_catalog_cycle(
+    wake: &tokio::sync::Notify,
+    rebind_wake: &tokio::sync::Notify,
+    delay: Duration,
+) -> bool {
+    let forced = tokio::select! {
+        biased;
+        _ = wake.notified() => true,
+        _ = rebind_wake.notified() => false,
+        _ = tokio::time::sleep(delay) => return false,
+    };
+    // A short fixed window collapses a publication burst without postponing
+    // refresh indefinitely under a continuous stream of catalog changes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let also_forced = tokio::time::timeout(Duration::ZERO, wake.notified())
+        .await
+        .is_ok();
+    let _ = tokio::time::timeout(Duration::ZERO, rebind_wake.notified()).await;
+    // A reader rebind only checks the version; an event or config change still
+    // forces a snapshot, including when both kinds of wake arrive together.
+    forced || also_forced
 }
 
 #[cfg(test)]
@@ -2318,6 +2343,7 @@ mod tests {
     include!("fusiform_catalog_login_methods_tests.rs");
     include!("operator_quality_tests.rs");
     include!("fusiform_catalog_paging_tests.rs");
+    include!("fusiform_catalog_rebind_tests.rs");
     include!("billing_readiness_tests.rs");
     include!("lineage_tests.rs");
     use super::*;

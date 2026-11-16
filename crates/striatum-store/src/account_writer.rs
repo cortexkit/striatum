@@ -444,6 +444,7 @@ impl AccountWriter {
                         let mut state = crate::account_state::WriterAccountState::new(
                             bridge,
                             store.block_reload_flag(),
+                            store.state_load_counter(),
                         );
                         while let Ok(first) = receiver.recv() {
                             let mut batch = vec![first];

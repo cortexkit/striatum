@@ -7,7 +7,7 @@
 //! | explain | decisionID, decisionId, sendID, sendId, send_id | decision_id | v1 |
 //! | account_status | none (same provider/account_id request) | same request; additive answer | v1 |
 //! | account_for | caller | mode: continue; otherwise the legacy members overlap | v1 |
-//! | account_observe | caller | decision_id, retry_at_ms, provider_code | v1 |
+//! | account_observe | caller | decision_id (the legacy kinds also carry retry_at_ms and provider_code) | v1 |
 //!
 //! Legacy-only bodies retain the old handler. Contract-only and mixed bodies
 //! go to v1, whose closed-record checks refuse the legacy member by name.
@@ -96,10 +96,7 @@ pub(super) fn census_shape(method: &str, params: &Value) -> &'static str {
         ops::ROUTE_SELECT_PANEL => (has(params, PANEL_LEGACY), has(params, PANEL_CONTRACT)),
         ops::ROUTE_EXPLAIN => (has(params, EXPLAIN_LEGACY), has(params, &["decision_id"])),
         ops::ROUTE_ACCOUNT_FOR => (has(params, &["caller"]), params["mode"] == "continue"),
-        ops::ROUTE_ACCOUNT_OBSERVE => (
-            has(params, &["caller"]),
-            has(params, &["decision_id", "retry_at_ms", "provider_code"]),
-        ),
+        ops::ROUTE_ACCOUNT_OBSERVE => (has(params, &["caller"]), has(params, &["decision_id"])),
         ops::ROUTE_SELECT_ENGINE
         | ops::ROUTE_ENGINE_REPORT
         | ops::ROUTE_ENGINE_EVAL
@@ -134,10 +131,7 @@ pub(super) fn claims(method: &str, params: &Value) -> bool {
         ops::ROUTE_SELECT_PANEL => !has(params, PANEL_LEGACY) || has(params, PANEL_CONTRACT),
         ops::ROUTE_EXPLAIN => !has(params, EXPLAIN_LEGACY) || has(params, &["decision_id"]),
         ops::ROUTE_ACCOUNT_FOR => !has(params, &["caller"]) || params["mode"] == "continue",
-        ops::ROUTE_ACCOUNT_OBSERVE => {
-            !has(params, &["caller"])
-                || has(params, &["decision_id", "retry_at_ms", "provider_code"])
-        }
+        ops::ROUTE_ACCOUNT_OBSERVE => !has(params, &["caller"]) || has(params, &["decision_id"]),
         _ => false,
     }
 }

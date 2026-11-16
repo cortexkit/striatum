@@ -1,254 +1,375 @@
-//! Authenticate as routing and bind the EVENT durable provisioned by ck-bus.
+//! One SDK reader for routing facts, catalog changes and Insula notices.
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use cortexkit_bus_client::{BusClient, BusClientOptions, EventDelivery, EventItem};
 use cortexkit_bus_naming::AccountNames;
-use cortexkit_bus_nats::{ConnectConfig, NatsConnection, NatsStreamCursor};
-use cortexkit_bus_trait::{DurableOwner, Stream};
-use serde::Deserialize;
-use serde_json::{json, Value};
-use subc_client_rs::{CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
-use subc_protocol::{BindIdentity, RouteTarget};
+use cortexkit_bus_trait::{
+    BusError, BusResult, ContentDigest, Message, StreamCursor, StreamDelivery,
+};
+use subc_client_rs::{ConsumerOptions, SubcConsumer};
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+use crate::route_facts::{Delivery, Handler};
 
-struct CredentialRoute {
-    consumer: SubcConsumer,
-    identity: BindIdentity,
-    principal: ConsumerIdentity,
+const DURABLE: &str = "m_striatum";
+
+pub(crate) mod metadata;
+pub(crate) mod reconnect;
+
+pub(super) struct AttachedBus {
+    pub names: AccountNames,
+    pub subject: String,
+    pub deliveries: tokio::sync::mpsc::Receiver<Result<EventDelivery, String>>,
+    task: tokio::task::JoinHandle<()>,
 }
 
-impl CredentialRoute {
-    async fn call(&self, method: &str, params: Value) -> Result<Value, String> {
-        let reply = self
-            .consumer
-            .call(
-                RouteTarget::ManagementSurface {
-                    module_id: "ckbus".into(),
-                },
-                self.identity.clone(),
-                serde_json::to_vec(&json!({"method": method, "params": params}))
-                    .map_err(|e| e.to_string())?,
-                CallOptions {
-                    timeout: TIMEOUT,
-                    consumer_identity: Some(self.principal.clone()),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|_| "ckbus credential operation unavailable".to_owned())?;
-        let value: Value = serde_json::from_slice(&reply).map_err(|_| "invalid ckbus response")?;
-        value
-            .get("result")
-            .cloned()
-            .ok_or_else(|| "ckbus response lacks result".into())
+impl Drop for AttachedBus {
+    fn drop(&mut self) {
+        self.task.abort();
     }
 }
 
-#[derive(Deserialize)]
-struct Credential {
-    jwt: String,
-    exp: i64,
-    acct: String,
-    inbox_prefix: String,
-    server_url: String,
-    credential_public: String,
-    spawn_generation: u64,
-    credential_epoch: u64,
+pub(super) async fn attach(path: PathBuf, handler: Handler) -> Result<AttachedBus, String> {
+    tokio::time::timeout(Duration::from_secs(15), attach_inner(path, handler))
+        .await
+        .map_err(|_| "bus attach timeout".to_owned())?
 }
 
-#[derive(Deserialize)]
-struct Renewal {
-    jwt: String,
-    exp: i64,
-    credential_public: String,
-    spawn_generation: u64,
-    credential_epoch: u64,
+async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, String> {
+    let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = BusClient::connect(
+        Arc::new(consumer),
+        BusClientOptions::new(crate::DEFAULT_MODULE_ID).map_err(|e| e.to_string())?,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let names = AccountNames::derive(client.acct()).map_err(|e| e.to_string())?;
+    let mut changes = client.connection_changes();
+    let bound_revision = *changes.borrow_and_update();
+    let reader = client
+        .event_reader(DURABLE)
+        .await
+        .map_err(|e| e.to_string())?;
+    mark_bound(&client, &handler, bound_revision);
+    handler.wake_catalog_rebind()?;
+    let subject = names
+        .event_subject("insula", "quota_sampled", 1)
+        .map_err(|e| e.to_string())?;
+    let (tx, deliveries) = tokio::sync::mpsc::channel(1);
+    let task_names = names.clone();
+    let task = tokio::spawn(async move {
+        let result = read_events(
+            client,
+            task_names,
+            &handler,
+            reader,
+            changes,
+            bound_revision,
+            &tx,
+        )
+        .await;
+        unbound(
+            &handler,
+            result
+                .as_ref()
+                .err()
+                .map(String::as_str)
+                .unwrap_or("event reader stopped"),
+        );
+        let _ = tx
+            .send(result.and(Err("event reader stopped".into())))
+            .await;
+    });
+    Ok(AttachedBus {
+        names,
+        subject,
+        deliveries,
+        task,
+    })
 }
 
-impl Credential {
-    fn apply_renewal(&mut self, renewal: Renewal) -> Result<(), String> {
-        if renewal.credential_public != self.credential_public
-            || renewal.spawn_generation != self.spawn_generation
-            || renewal.credential_epoch != self.credential_epoch
-            || renewal.exp <= self.exp
-        {
-            return Err("ckbus renewal identity or expiry mismatch".into());
+async fn read_events(
+    client: BusClient,
+    names: AccountNames,
+    handler: &Handler,
+    mut reader: cortexkit_bus_client::EventReader,
+    mut changes: tokio::sync::watch::Receiver<u64>,
+    mut bound_revision: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<EventDelivery, String>>,
+) -> Result<(), String> {
+    loop {
+        let mut source = metadata::SdkSource {
+            client: &client,
+            names: &names,
+            handler,
+            bound_revision,
+        };
+        metadata::with_metadata(
+            &mut source,
+            handler,
+            read_session(&mut reader, &mut changes, &names, handler, tx),
+        )
+        .await?;
+        bound_revision = *changes.borrow();
+        reader = client
+            .event_reader(DURABLE)
+            .await
+            .map_err(|e| e.to_string())?;
+        mark_bound(&client, handler, bound_revision);
+        handler.wake_catalog_rebind()?;
+    }
+}
+
+async fn read_session(
+    reader: &mut cortexkit_bus_client::EventReader,
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+    names: &AccountNames,
+    handler: &Handler,
+    tx: &tokio::sync::mpsc::Sender<Result<EventDelivery, String>>,
+) -> Result<(), String> {
+    loop {
+        let item = {
+            // A transport outage can leave next() waiting for the SDK's
+            // replacement connection. Quota fallback observes reader_bound;
+            // actual reader errors still end this session and unbind it.
+            let next = reader.next();
+            tokio::pin!(next);
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = changes.changed() => {
+                        unbound(handler, "event reader credential rebind");
+                        changed.map_err(|_| "bus credential maintenance stopped".to_owned())?;
+                        // End the old pull before checking a replacement binding. The SDK
+                        // also watches this revision and rebinds its own next pull.
+                        break None;
+                    }
+                    result = &mut next => { break Some(result.map_err(|e| e.to_string())?); }
+                }
+            }
+        };
+        match item {
+            None => {
+                return Ok(());
+            }
+            Some(EventItem::Delivery(delivery)) => {
+                tx.send(Ok(delivery))
+                    .await
+                    .map_err(|_| "bus receiver closed".to_owned())?;
+            }
+            Some(EventItem::Malformed(delivery)) => {
+                tracing::warn!(subject = delivery.raw_subject, reason = ?delivery.reason, "malformed event terminated");
+                let subject = delivery.raw_subject.clone();
+                delivery.term().await.map_err(|e| e.to_string())?;
+                handler.refused_subject(names, &subject);
+            }
+            Some(_) => return Err("unsupported SDK event item".to_owned()),
         }
-        self.jwt = renewal.jwt;
-        self.exp = renewal.exp;
+    }
+}
+
+fn mark_bound(client: &BusClient, handler: &Handler, bound_revision: u64) {
+    let mut revisions = client.connection_changes();
+    let matches = *revisions.borrow_and_update() == bound_revision;
+    if let Ok(mut cache) = handler.quota_cache.lock() {
+        cache.consumer.attached = matches;
+        if matches {
+            cache.consumer.last_error = None;
+        }
+        cache.consumer.route_facts.filters_ready = false;
+        cache.consumer.route_facts.bound_since = matches.then(std::time::Instant::now);
+        cache.consumer.route_facts.connection = Some(client.connection().client());
+        cache.consumer.route_facts.revisions = Some(revisions);
+    }
+}
+
+pub(crate) fn no_durable(error: &str) -> bool {
+    // The SDK exposes NATS errors as text. Recognize both its missing-consumer
+    // code and description as the same absent durable.
+    let error = error.to_ascii_lowercase();
+    error.contains("consumer not found")
+        || error.contains("consumer_not_found")
+        || error.contains("10014")
+}
+
+pub(crate) fn unbound(handler: &Handler, error: &str) -> bool {
+    let error = if no_durable(error) {
+        "no durable yet (consumer not found)"
+    } else {
+        error
+    };
+    if let Ok(mut cache) = handler.quota_cache.lock() {
+        let changed =
+            cache.consumer.attached || cache.consumer.last_error.as_deref() != Some(error);
+        cache.consumer.attached = false;
+        cache.consumer.route_facts.filters_ready = false;
+        cache.consumer.route_facts.bound_since = None;
+        cache.consumer.last_error = Some(error.to_owned());
+        if changed {
+            tracing::warn!(error, "event reader unbound");
+        }
+        return changed;
+    }
+    false
+}
+
+async fn confirm(
+    client: &BusClient,
+    names: &AccountNames,
+    handler: &Handler,
+    bound_revision: u64,
+) -> Result<(), String> {
+    let mut revisions = client.connection_changes();
+    if *revisions.borrow_and_update() != bound_revision {
+        return Err("event reader awaiting rebind".into());
+    }
+    let connection = client.connection().client();
+    if connection.connection_state() != async_nats::connection::State::Connected {
+        return Err("event reader disconnected".into());
+    }
+    let context = async_nats::jetstream::new(connection.clone());
+    let consumer = context
+        .get_consumer_from_stream::<async_nats::jetstream::consumer::pull::Config, _, _>(
+            DURABLE,
+            &names.streams().event,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let info = consumer.cached_info();
+    let mut filters = info.config.filter_subjects.clone();
+    if !info.config.filter_subject.is_empty() {
+        filters.push(info.config.filter_subject.clone());
+    }
+    let last_delivery_at_ms = info
+        .delivered
+        .last_active
+        .map(|at| (at.unix_timestamp_nanos() / 1_000_000).max(0) as u64);
+    let last_ack_at_ms = info
+        .ack_floor
+        .last_active
+        .map(|at| (at.unix_timestamp_nanos() / 1_000_000).max(0) as u64);
+    let last_progress = last_delivery_at_ms.into_iter().chain(last_ack_at_ms).max();
+    if (info.num_ack_pending > 0 || info.num_pending > 0)
+        && last_progress.is_some_and(|at| crate::now_ms().saturating_sub(at) > 30_000)
+    {
+        tracing::warn!(pending = info.num_pending, unacked = info.num_ack_pending,
+            delivered_sequence = info.delivered.stream_sequence, ack_floor = info.ack_floor.stream_sequence,
+            last_activity_age_ms = ?last_progress.map(|at| crate::now_ms().saturating_sub(at)),
+            "event durable has backlog without recent delivery or acknowledgement activity");
+    }
+    if !matches!(revisions.has_changed(), Ok(false)) {
+        return Err("event connection changed during filter confirmation".into());
+    }
+    if let Ok(mut cache) = handler.quota_cache.lock() {
+        cache.consumer.lag = Some(info.num_pending);
+        cache.consumer.ack_pending = Some(info.num_ack_pending);
+        let health = &mut cache.consumer.route_facts;
+        health.ack_wait_ms = Some(info.config.ack_wait.as_millis().min(u64::MAX as u128) as u64);
+        health.filters_ready = crate::route_facts::filters_ready(names, Some(&info.name), &filters);
+        health.connection = Some(connection);
+        health.revisions = Some(revisions);
+        health.oldest_unapplied_at_ms = None;
+        health.last_delivery_at_ms = last_delivery_at_ms;
+        health.last_ack_at_ms = last_ack_at_ms;
+        health.delivered_sequence = Some(info.delivered.stream_sequence);
+    }
+    tracing::debug!(
+        ack_wait_ms = info.config.ack_wait.as_millis(),
+        "event durable confirmed"
+    );
+    Ok(())
+}
+
+pub(super) fn payload(names: &AccountNames, event: &EventDelivery) -> Result<Delivery, String> {
+    let subject = match &event.subject.reader {
+        Some(reader) => names.event_subject_with_reader(
+            &event.subject.module,
+            &event.subject.event,
+            event.subject.version,
+            reader,
+        ),
+        None => names.event_subject(
+            &event.subject.module,
+            &event.subject.event,
+            event.subject.version,
+        ),
+    };
+    let subject = subject.map_err(|e| e.to_string())?;
+    message(
+        subject,
+        event.msg_id.clone(),
+        &event.body,
+        event.headers().clone(),
+        event.header("Ck-Content-Digest"),
+        None,
+        event.delivered_count.max(1) as u64,
+    )
+}
+
+pub(super) fn message(
+    subject: String,
+    id: String,
+    body: &[u8],
+    headers: cortexkit_bus_trait::Headers,
+    digest: Option<&str>,
+    published_at_ms: Option<u64>,
+    delivery_count: u64,
+) -> Result<Delivery, String> {
+    let insula = subject.contains(".event.insula.quota_sampled.v1");
+    let digest = if insula {
+        digest
+            .ok_or("quota notice lacks Ck-Content-Digest")?
+            .parse::<ContentDigest>()
+            .map_err(str::to_owned)?
+    } else {
+        ContentDigest::of_bytes(body)
+    };
+    Ok(Delivery {
+        message: Message {
+            subject,
+            id,
+            digest,
+            headers,
+        },
+        body: body.to_vec(),
+        published_at_ms,
+        delivery_count,
+    })
+}
+
+/// A fetched SDK delivery is settled through the same cursor contract as tests.
+pub(super) struct Cursor<'a> {
+    pub event: &'a EventDelivery,
+    pub notice: Option<StreamDelivery>,
+    /// Only a server-confirmed handler ACK proves progress for reconnect reset.
+    pub acknowledged: bool,
+}
+fn bus_error(error: cortexkit_bus_client::Error) -> BusError {
+    BusError::unavailable(error.to_string())
+}
+#[async_trait::async_trait]
+impl StreamCursor for Cursor<'_> {
+    async fn next(&mut self) -> BusResult<Option<StreamDelivery>> {
+        Ok(self.notice.take())
+    }
+    async fn ack(&mut self) -> BusResult<()> {
+        self.event.ack().await.map_err(bus_error)?;
+        self.acknowledged = true;
+        Ok(())
+    }
+    async fn nak(&mut self, delay: Duration) -> BusResult<()> {
+        self.event.nak(delay).await.map_err(bus_error)
+    }
+    async fn term(&mut self, _: Option<&str>) -> BusResult<()> {
+        self.event.term().await.map_err(bus_error)
+    }
+    // Snapshot reads do not settle the notice; the SDK has no progress ACK.
+    async fn in_progress(&mut self) -> BusResult<()> {
         Ok(())
     }
 }
 
-pub(super) struct AttachedBus {
-    pub connection: NatsConnection,
-    pub cursor: NatsStreamCursor,
-    pub subject: String,
-    pub stream: String,
-    pub renew_at_ms: u64,
-}
-
-pub(super) async fn attach(path: PathBuf) -> Result<AttachedBus, String> {
-    tokio::time::timeout(TIMEOUT, attach_inner(path))
-        .await
-        .map_err(|_| "quota bus attach timeout".to_owned())?
-}
-
-async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
-    let nonce = subc_client_rs::launch_nonce()
-        .map_err(|_| "launch nonce unreadable")?
-        .ok_or("routing launch nonce absent")?;
-    let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
-        .await
-        .map_err(|_| "ckbus route unavailable")?;
-    let route = Arc::new(CredentialRoute {
-        consumer,
-        identity: BindIdentity::new(super::DEFAULT_MODULE_ID, "bus"),
-        principal: ConsumerIdentity {
-            module_id: super::DEFAULT_MODULE_ID.into(),
-            launch_nonce: nonce.value().to_owned(),
-        },
-    });
-    let mut credential: Credential =
-        serde_json::from_value(route.call("ckbus.credential", json!({})).await?)
-            .map_err(|_| "invalid ckbus credential")?;
-    let names = AccountNames::derive(&credential.acct).map_err(|e| e.to_string())?;
-    let config = ConnectConfig::new(&credential.credential_public).map_err(|e| e.to_string())?;
-    // The local signer must never send a bearer JWT to an untrusted remote listener.
-    let port = credential
-        .server_url
-        .strip_prefix("nats://127.0.0.1:")
-        .and_then(|p| p.parse::<u16>().ok())
-        .filter(|p| *p != 0);
-    if port.is_none() || config.inbox_prefix() != credential.inbox_prefix {
-        return Err("invalid ckbus endpoint, inbox, or credential expiry".into());
-    }
-    // `ckbus.credential` always mints a fresh login (and supersedes routing's
-    // previous one), so this renewal is only a guard against a reply that is
-    // already close to expiry; nothing here relies on getting an existing login back.
-    if credential.exp <= (super::now_ms() / 1000) as i64 + 300 {
-        let renewal = route
-            .call(
-                "ckbus.credential_renew",
-                json!({
-                    "credential_public": credential.credential_public,
-                }),
-            )
-            .await?;
-        credential
-            .apply_renewal(serde_json::from_value(renewal).map_err(|_| "invalid ckbus renewal")?)?;
-    }
-    if credential.exp <= (super::now_ms() / 1000) as i64 + 60 {
-        return Err("ckbus credential expires too soon".into());
-    }
-    let key = credential.credential_public;
-    let jwt = credential.jwt;
-    let options = async_nats::ConnectOptions::with_auth_callback(move |nonce| {
-        let route = Arc::clone(&route);
-        let key = key.clone();
-        let jwt = jwt.clone();
-        async move {
-            // NATS requires a Sync callback future; the SDK reconnect future is
-            // only Send. A task handle preserves that bound without sharing it.
-            let reply = tokio::spawn(async move {
-                route
-                    .call(
-                        "ckbus.nonce_sign",
-                        json!({
-                            "credential_public": key, "nonce_b64": STANDARD.encode(nonce),
-                        }),
-                    )
-                    .await
-            })
-            .await
-            .map_err(|_| async_nats::AuthError::new("ckbus signing task failed"))?
-            .map_err(async_nats::AuthError::new)?;
-            let signature = reply["signature_b64"]
-                .as_str()
-                .ok_or_else(|| async_nats::AuthError::new("ckbus signature absent"))?;
-            let signature = STANDARD
-                .decode(signature)
-                .map_err(|_| async_nats::AuthError::new("invalid ckbus signature"))?;
-            if signature.len() != 64 {
-                return Err(async_nats::AuthError::new("invalid ckbus signature length"));
-            }
-            let mut auth = async_nats::Auth::new();
-            auth.jwt = Some(jwt);
-            auth.signature = Some(signature);
-            Ok(auth)
-        }
-    })
-    .max_reconnects(0)
-    .connection_timeout(TIMEOUT);
-    let connection = NatsConnection::connect(&credential.server_url, options, config)
-        .await
-        .map_err(|_| "quota bus connection unavailable")?;
-    let stream = names.streams().event.clone();
-    // Stream::consumer reads CONSUMER.INFO; it does not create or reconfigure a durable.
-    let cursor = connection
-        .stream(&stream)
-        .consumer(DurableOwner::Module(super::DEFAULT_MODULE_ID))
-        .await
-        .map_err(|e| format!("quota durable attach: {e}"))?;
-    Ok(AttachedBus {
-        connection,
-        cursor,
-        subject: names
-            .event_subject("insula", "quota_sampled", 1)
-            .map_err(|e| e.to_string())?,
-        stream,
-        // Reconnect through issuance/renewal before the authenticated JWT expires.
-        renew_at_ms: (credential.exp as u64 - 60) * 1000,
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn credential() -> Credential {
-        serde_json::from_value(json!({
-            "jwt": "old", "exp": 2000000000_i64, "acct": "box_test",
-            "inbox_prefix": "_INBOX.UFIXTURE", "server_url": "nats://127.0.0.1:4222",
-            "credential_public": "UFIXTURE", "spawn_generation": 7, "credential_epoch": 0,
-        }))
-        .unwrap()
-    }
-
-    fn renewal() -> Value {
-        json!({"jwt": "renewed", "exp": 2000003600_i64, "credential_public": "UFIXTURE",
-            "spawn_generation": 7, "credential_epoch": 0})
-    }
-
-    #[test]
-    fn renewal_keeps_identity_and_advances_jwt_expiry() {
-        let mut credential = credential();
-        credential
-            .apply_renewal(serde_json::from_value(renewal()).unwrap())
-            .unwrap();
-        assert_eq!(credential.jwt, "renewed");
-        assert_eq!(credential.exp, 2000003600);
-    }
-
-    #[test]
-    fn renewal_rejects_changed_identity_and_nonadvancing_expiry() {
-        for (field, value) in [
-            ("credential_public", json!("OTHER")),
-            ("spawn_generation", json!(8)),
-            ("credential_epoch", json!(1)),
-            ("exp", json!(2000000000)),
-        ] {
-            let mut credential = credential();
-            let mut changed = renewal();
-            changed[field] = value;
-            assert!(
-                credential
-                    .apply_renewal(serde_json::from_value(changed).unwrap())
-                    .is_err(),
-                "{field}"
-            );
-            assert_eq!(credential.jwt, "old");
-        }
-    }
-}
+#[path = "quota_bus_tests.rs"]
+mod tests;

@@ -1,5 +1,10 @@
-//! October 11/17 subscription captures exercised through route.select. The
-//! live-only selector case retains its explicit no-banked-resets precondition.
+//! Regression tests on two captured Claude subscription states (11 and 17
+//! October 2026), run through `route.select`. They pin the 30% keep-free
+//! margin: heads keep access below it, unpinned workers stop at it, an IQ-85
+//! worker may use all quota above it, and the paid API plane stays metered.
+//! The all-accounts-at-margin refusal is checked at selector level, with saved
+//! resets switched off as in the original capture, and a separate test pins
+//! today's answer, which spends one saved reset instead.
 
 use std::{collections::BTreeMap, sync::Arc};
 

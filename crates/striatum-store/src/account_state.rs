@@ -55,12 +55,15 @@ pub(crate) struct WriterAccountState {
     /// Set by the update hook when a block table changed outside an account
     /// command, which no captured row reports.
     block_reload: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Counts every full load, for `account_state_loads`.
+    loads: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WriterAccountState {
     pub(crate) fn new(
         bridge: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn AccountStateBridge>>>,
         block_reload: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        loads: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             bridge,
@@ -68,6 +71,7 @@ impl WriterAccountState {
             data_version: None,
             generation: 0,
             block_reload,
+            loads,
         }
     }
 
@@ -90,15 +94,31 @@ impl WriterAccountState {
             if !reload && self.working.is_some() && self.data_version == Some(version) {
                 return Ok(None);
             }
-            tracing::info!(
-                requested,
-                block_write_outside_command = outside,
-                missing_state = self.working.is_none(),
-                generation = self.generation,
-                previous_data_version = ?self.data_version,
-                data_version = version,
-                "reloading account state before batch"
-            );
+            // A full load takes seconds at live size and holds the writer.
+            // The first one, at startup, is expected; every later one is worth
+            // an operator's attention, so it is logged at the default level.
+            if self.data_version.is_none() {
+                tracing::info!(
+                    requested,
+                    block_write_outside_command = outside,
+                    missing_state = self.working.is_none(),
+                    generation = self.generation,
+                    data_version = version,
+                    "loading account state before the first batch"
+                );
+            } else {
+                tracing::warn!(
+                    requested,
+                    block_write_outside_command = outside,
+                    missing_state = self.working.is_none(),
+                    generation = self.generation,
+                    previous_data_version = ?self.data_version,
+                    data_version = version,
+                    "reloading account state before batch"
+                );
+            }
+            self.loads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tx =
                 rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)
                     .map_err(crate::err)?;
@@ -141,11 +161,13 @@ impl WriterAccountState {
         if self.data_version == Some(version) {
             return Ok(());
         }
-        tracing::info!(
+        tracing::warn!(
             previous_data_version = ?self.data_version,
             data_version = version,
             "reloading account state after data_version changed inside transaction"
         );
+        self.loads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match bridge.load(&AccountTx::sql(conn)) {
             Ok(state) => {
                 self.working = Some(state);
