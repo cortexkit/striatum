@@ -34,12 +34,17 @@ fn pool_states_unchanged_do_not_acquire_writer() {
 #[test]
 fn pool_repair_rechecks_newer_writer_without_repeating_row_changes() {
     let (_dir, store) = store("read-first-pool-race");
-    // The inserted pool_key_state row needs a durable retry clock.
+    // The inserted refusal has not registered its probe clock yet, so the read
+    // must try a repair before the competing reporter replaces the refusal.
     store
         .with_writer_for_test(|conn| {
             conn.execute_batch(
-                "INSERT INTO pool_key_state(provider,credential_id,cooldown_until,updated_at)
-         VALUES ('p','c',9223372036854775807,100)",
+                "INSERT INTO pool_key_state(provider,credential_id,updated_at)
+                 VALUES ('p','c',100);
+                 INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,
+                   quota,deadline,observed_at,next_recheck_at)
+                 VALUES ('pool_rate',json_array('p','c'),'p','c',
+                   json_array(9223372036854775807,NULL,100),100,0,9223372036854775807,100,3600100)",
             )
         })
         .unwrap();
@@ -89,8 +94,11 @@ fn pool_sync_repairs_expired_unmanaged_wall_once() {
     store
         .with_writer_for_test(|conn| {
             conn.execute_batch(
-                "INSERT INTO pool_key_state(provider,credential_id,cooldown_until,updated_at)
-         VALUES ('p','c',1,0)",
+                "INSERT INTO pool_key_state(provider,credential_id,updated_at)
+                 VALUES ('p','c',0);
+                 INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,
+                   quota,deadline,observed_at,next_recheck_at)
+                 VALUES ('pool_rate',json_array('p','c'),'p','c',json_array(1,NULL,0),0,0,1,0,1)",
             )
         })
         .unwrap();

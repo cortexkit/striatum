@@ -4695,7 +4695,21 @@ mod tests {
             scratch.path().join("store.db").to_string_lossy(),
         ))
         .unwrap();
-        store.store.with_conn(|conn|conn.execute("INSERT INTO credential_entitlement_fences VALUES ('p','c','billing_exhausted',NULL,0)",[])).unwrap();
+        store
+            .store
+            .with_conn(|conn| {
+                let row = crate::block_storage::credential_source(
+                    &striatum_core::route_state_store::CredentialEntitlementFence {
+                        provider_id: "p".into(),
+                        credential_id: "c".into(),
+                        code: "billing_exhausted".into(),
+                        listing_fingerprint: None,
+                        observed_at_ms: 0,
+                    },
+                )?;
+                crate::block_storage::write_source(conn, &row)
+            })
+            .unwrap();
         let result = store.account_transaction(|tx| tx.classify_credential_quota("p", "c", true));
         assert_eq!(
             result.unwrap(),
@@ -4704,7 +4718,13 @@ mod tests {
         );
         store
             .store
-            .with_conn(|conn| conn.execute("DELETE FROM credential_entitlement_fences", []))
+            .with_conn(|conn| {
+                conn.execute(
+                    "UPDATE block SET source_present=0
+                     WHERE kind='credential' AND origin_key=json_array('p','c')",
+                    [],
+                )
+            })
             .unwrap();
         assert!(
             !store
@@ -5261,12 +5281,53 @@ mod tests {
                     )
                     .unwrap();
             }
-            store.store.with_conn(|conn| {
-            if case!="credential" {conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at)
-                VALUES ('f','p','a','null','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',0,'test',0)",[])?;}
-            if case=="combined" {conn.execute("INSERT INTO account_route_fence VALUES ('p','c','m',0,'d',0,0,'quota')",[])?;}
-            Ok(())
-        }).unwrap();
+            store
+                .store
+                .with_conn(|conn| {
+                    if case != "credential" {
+                        let row = crate::block_storage::account_source(
+                            conn,
+                            &crate::AccountPoolFenceRow {
+                                evidence: crate::AccountFenceRow {
+                                    fence_id: "f".into(),
+                                    provider: "p".into(),
+                                    account_id: "a".into(),
+                                    scope_json: "null".into(),
+                                    fence_json: "{\"reset\":{\"kind\":\"missing\"}}".into(),
+                                    source: "broca_account_limit".into(),
+                                    observed_at: 0,
+                                    principal: "test".into(),
+                                    admission_id: None,
+                                    observation_id: None,
+                                    created_at: 0,
+                                    cleared_at: None,
+                                    cleared_reason: None,
+                                },
+                                pool_key: None,
+                                recovery_set: Vec::new(),
+                            },
+                        )?;
+                        crate::block_storage::write_source(conn, &row)?;
+                    }
+                    if case == "combined" {
+                        let row = crate::block_storage::account_route_source(
+                            &crate::AccountRouteFence {
+                                provider: "p".into(),
+                                credential_id: "c".into(),
+                                model: "m".into(),
+                                until_ms: 0,
+                                decision_id: "d".into(),
+                                recorded_at: 0,
+                            },
+                            "account_route",
+                            "quota",
+                            Some(0),
+                        )?;
+                        crate::block_storage::write_source(conn, &row)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
             let origins = store.fence_rechecks().unwrap();
             assert_eq!(
                 origins.len(),
