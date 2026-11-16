@@ -2835,13 +2835,13 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     let now = NOW;
     let reloads = block_reconcile_reloads();
     let mut ran = Vec::new();
-    let mut read_backs = block_read_backs();
+    let read_backs = std::cell::Cell::new(block_read_backs());
     let mut step = |name: &'static str, rig: &Rig| {
         // The writer read back the block rows the step changed: the step
         // really wrote, inside a command.
         let now_read_backs = block_read_backs();
-        ran.push((name, now_read_backs - read_backs));
-        read_backs = now_read_backs;
+        ran.push((name, now_read_backs - read_backs.get()));
+        read_backs.set(now_read_backs);
         assert_eq!(
             rig.store.block_writes_outside_command(),
             0,
@@ -2985,11 +2985,17 @@ fn every_production_block_writer_writes_inside_an_account_command() {
         .clear_credential_entitlement_fences_for_credential("c0")
         .unwrap();
     step("clear_credential_entitlement_fences_for_credential", &rig);
-    // The cleared fence's clock is stale now; the tick's sync deletes it.
+    // Source removal now drops the credential clock in the same write, so it
+    // leaves no orphan for Tick. Real route/provider writers instead leave a
+    // route clock whose identical provider wall hides its origin from sync's
+    // live set. Tick must drop that clock, without dropping either source.
+    prepare_covered_route_tick(&rig, now);
+    read_backs.set(block_read_backs());
     rig.store
         .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now + 1))
         .unwrap();
     step("tick (expiry releases, sync, retirement)", &rig);
+    let after_covered_tick = rig.published();
     let keys = [
         PoolKey::new("k0", None, "active"),
         PoolKey::new("k1", None, "active"),
@@ -3082,6 +3088,61 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     assert!(
         silent.is_empty(),
         "steps that changed no block row: {silent:?}"
+    );
+    assert_covered_route_tick(&after_covered_tick);
+}
+
+fn prepare_covered_route_tick(rig: &Rig, now: i64) {
+    let route = "writer-tick/model";
+    let update = RouteStateUpdate {
+        observed_at_ms: Some(now),
+        cooldown_until: Some((now + 60_000) as f64),
+        last_error: Some("provider capacity".into()),
+        ..Default::default()
+    };
+    rig.store
+        .upsert_fact(&fact("writer-tick", "model"), FactSource::Seed)
+        .unwrap();
+    rig.store.update_route_state(route, route, &update).unwrap();
+    rig.store
+        .record_provider_cooldown("writer-tick", route, route, &update)
+        .unwrap();
+    let state = rig.published();
+    assert!(
+        state
+            .clock("route", &serde_json::json!([route]).to_string())
+            .is_some(),
+        "the real route write left a held clock"
+    );
+    assert!(
+        !state
+            .view_origins()
+            .iter()
+            .any(|origin| origin.kind == "route" && origin.provider == "writer-tick"),
+        "the later matching provider wall hides that origin"
+    );
+    assert!(state
+        .clock("provider", &serde_json::json!(["writer-tick"]).to_string())
+        .is_some());
+}
+
+fn assert_covered_route_tick(state: &BlockState) {
+    let key = serde_json::json!(["writer-tick/model"]).to_string();
+    assert!(
+        state.clock("route", &key).is_none(),
+        "Tick dropped the covered route clock"
+    );
+    assert!(
+        state
+            .block("route", &key)
+            .is_some_and(|row| row.source_present),
+        "the covered route source survives"
+    );
+    assert!(
+        state
+            .clock("provider", &serde_json::json!(["writer-tick"]).to_string())
+            .is_some(),
+        "the covering provider clock survives"
     );
 }
 
