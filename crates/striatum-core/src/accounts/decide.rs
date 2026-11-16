@@ -64,6 +64,7 @@ pub fn decide_with_context(
             .collect(),
     });
     let explanation = Explanation {
+        fork_of: None,
         credential_fence_probe: None,
         policy_version: policy.policy_version,
         provider: provider.clone(),
@@ -90,7 +91,7 @@ pub fn decide_with_context(
         .flat_map(|roster| roster.accounts.iter())
         .filter(|view| view.routing_provider == provider)
         .collect();
-    if state.roster.is_some() && views.is_empty() {
+    if context.fork_parent.is_none() && state.roster.is_some() && views.is_empty() {
         return refuse(explanation, RefusalCode::AccountSelectionUnsupported, None);
     }
     Allocator {
@@ -206,6 +207,9 @@ impl<'a> Allocator<'a> {
     // the operator override; then existing affinity; then a one-time import;
     // then `requested_account`; then scoring.
     fn run(mut self) -> Decision {
+        if let Some(parent) = &self.context.fork_parent {
+            return self.fork(parent);
+        }
         let all_exhausted =
             !self.views.is_empty() && self.views.iter().all(|view| self.free_exhausted(view));
         // Routing's reserve stops new work a few points short of a plan's
@@ -263,6 +267,87 @@ impl<'a> Allocator<'a> {
             }
         }
         self.cold(previous)
+    }
+
+    fn fork(mut self, parent: &super::policy::ForkParent) -> Decision {
+        let view = self.views.iter().copied().find(|view| {
+            view.account_id == parent.account_id
+                && view
+                    .credentials
+                    .iter()
+                    .any(|record| record.credential_id == parent.credential_id)
+        });
+        let credential = view.and_then(|view| {
+            view.credentials
+                .iter()
+                .find(|record| record.credential_id == parent.credential_id)
+        });
+        let credential_unavailable = credential.is_none_or(|record| record.needs_reauth);
+        let fences = self.fences_for(&parent.account_id);
+        if credential_unavailable || !fences.is_empty() || parent.blocked_until_ms.is_some() {
+            let recheck_ceiling = self.now.saturating_add(15 * 60 * 1_000);
+            let until = fences
+                .iter()
+                .map(|fence| {
+                    fence
+                        .retry_hint_ms
+                        .or_else(|| fence.reset.at_ms())
+                        .unwrap_or(recheck_ceiling)
+                })
+                .chain(parent.blocked_until_ms)
+                .max()
+                .unwrap_or(recheck_ceiling)
+                .clamp(self.now, recheck_ceiling);
+            self.explanation.fork_of = Some(super::decision::ForkNote::Refused {
+                admission_id: parent.admission_id.clone(),
+                reason: if credential_unavailable {
+                    "credential_unavailable"
+                } else {
+                    "refusal_backed_block"
+                }
+                .into(),
+            });
+            let seconds = (until.saturating_sub(self.now).max(0) as u64).div_ceil(1_000);
+            return Decision {
+                outcome: Outcome::Hold(Hold {
+                    account_id: parent.account_id.clone(),
+                    credential_id: parent.credential_id.clone(),
+                    pin_id: parent.pin_id.clone(),
+                    pin_generation: parent.pin_generation,
+                    reset_at_ms: until,
+                    base_retry_after_s: seconds,
+                    retry_after_s: seconds,
+                    basis: HoldBasis::ForkParentUnavailable,
+                }),
+                explanation: self.explanation,
+            };
+        }
+        self.explanation.fork_of = Some(super::decision::ForkNote::Honoured {
+            admission_id: parent.admission_id.clone(),
+        });
+        let previous = self.state.affinity.as_ref().map(previous_pin);
+        let affinity = match self.state.affinity.as_ref() {
+            Some(affinity)
+                if affinity.account_id == parent.account_id
+                    && affinity.credential_id == parent.credential_id =>
+            {
+                AffinityOutcome::Retained {
+                    pin_id: affinity.pin_id.clone(),
+                    pin_generation: affinity.pin_generation,
+                }
+            }
+            _ => AffinityOutcome::New {
+                pin_generation: previous.as_ref().map_or(1, |pin| pin.pin_generation + 1),
+                previous,
+            },
+        };
+        self.admit(
+            &parent.account_id,
+            &parent.credential_id,
+            AdmitReason::ForkParent,
+            affinity,
+            view.and_then(|view| view.quota.as_ref()),
+        )
     }
 
     // ---- lookups -------------------------------------------------------

@@ -43,6 +43,7 @@ fn internal_unavailable(error: impl std::fmt::Display) -> Refusal {
 }
 
 const FOR_MEMBERS: &[&str] = &[
+    "fork_of",
     "provider",
     "model",
     "affinity_model",
@@ -265,6 +266,29 @@ fn account_for_inner(
     call: &account_selection::call_log::AccountCall,
 ) -> Result<Value, Refusal> {
     let authority = account_caller(caller, deps)?;
+    if params.get("fork_of").is_some_and(|fork| !fork.is_null())
+        && [
+            "requested_account",
+            "warm_credential",
+            "parent_conversation_key",
+            "candidates",
+        ]
+        .iter()
+        .any(|field| params.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(Refusal::invalid_request(
+            "fork_of",
+            "fork_of cannot be combined with account placement hints",
+        ));
+    }
+    if params.get("fork_of").is_some()
+        && params["mode"].as_str().is_some_and(|mode| mode != "admit")
+    {
+        return Err(Refusal::invalid_request(
+            "fork_of",
+            "fork_of is valid only in admit mode",
+        ));
+    }
     if params["mode"] == "continue" {
         if super::consumers::is_media_provider(authority.module) {
             return Err(Refusal::invalid_request(
@@ -411,6 +435,7 @@ fn account_for_inner(
             params,
         )
         .map_err(op_refusal)?;
+        parsed.scope_fork_parent(|id| authority.admission_key(id));
         parsed.call = Some(call.clone());
         let flags = config_overrides::live_config(deps.routing_config_path).account_flags();
         let policy = config_overrides::live_config(deps.routing_config_path)
@@ -845,7 +870,16 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
             .map(|seconds| now_ms() + seconds * 1000)
     };
     let mut refusal = match code {
-        "account_hold" => Refusal::account_hold(wait_until().unwrap_or_else(now_ms)),
+        "account_hold" => {
+            let mut refusal = Refusal::account_hold(wait_until().unwrap_or_else(now_ms));
+            if let Some(reason) = detail
+                .and_then(|detail| detail.get("reason"))
+                .and_then(Value::as_str)
+            {
+                refusal.detail.insert("reason".into(), json!(reason));
+            }
+            refusal
+        }
         // The allocator's own instant, unconverted: a time derived from
         // `retry_after_s` would round it to seconds from a later clock read.
         "concurrency_full" => Refusal::no_route(

@@ -308,9 +308,13 @@ pub(crate) fn prune_account_admissions(
     limit: usize,
     now_ms: i64,
 ) -> RouteStateResult<usize> {
-    // Pruning is a writer command so the admission state drops the same rows.
+    let keys = store.plan_account_admissions(before, limit, now_ms)?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    // Planning stays off the writer; keyed rechecks and state updates are atomic.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_admissions(before, limit, now_ms)
+        tx.delete_account_admissions(before, &keys, now_ms)
     })
 }
 

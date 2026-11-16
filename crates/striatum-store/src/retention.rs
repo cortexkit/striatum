@@ -111,6 +111,33 @@ pub struct V1DecisionRetentionBatch {
 }
 
 impl SqliteRouteStateStore {
+    /// Plan history deletion on a pooled reader; the writer rechecks only
+    /// these row identities, including any affinity extended since planning.
+    pub fn plan_account_admissions(
+        &self,
+        before: i64,
+        limit: usize,
+        now_ms: i64,
+    ) -> RouteStateResult<Vec<i64>> {
+        self.store
+            .with_read(|conn| {
+                let mut statement = conn.prepare(&format!(
+                    "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) {}",
+                    admission_candidates(false)
+                ))?;
+                let rows = statement.query_map(
+                    params![
+                        before,
+                        limit_param(limit),
+                        now_ms,
+                        now_ms.saturating_sub(30 * 60 * 1_000)
+                    ],
+                    |row| row.get(0),
+                )?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(err)
+    }
     /// Plan at most `scan_limit` expiry-index entries on a pooled reader, not
     /// the writer. The caller keeps `last` across passes so protected entries
     /// are examined only once per sweep. A plan never authorizes a delete:
@@ -245,8 +272,13 @@ impl SqliteRouteStateStore {
         now_ms: i64,
     ) -> RouteStateResult<usize> {
         self.refuse_state_blind_admission_write("prune_account_admissions")?;
+        let keys = self.plan_account_admissions(before, limit, now_ms)?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
         self.account_command(crate::AccountCommandKind::Maintenance, move |tx| {
-            tx.prune_account_admissions(before, limit, now_ms)
+            tx.delete_account_admissions_returning(before, &keys, now_ms)
+                .map(|rows| rows.len())
         })
     }
 
@@ -645,6 +677,116 @@ fn admission_due_by_values(a: &str) -> String {
     )
 }
 
+// Pins are retained by admissions, so pin existence cannot protect an
+// admission without creating a retention cycle. The pin's conversation
+// deadline, including the one-hour near-boundary grace, keeps the parent
+// resolvable for forks that reuse its cached conversation.
+fn admission_candidates(keyed: bool) -> String {
+    let due = admission_due_by_values("a");
+    let reservation_due = admission_due_by_values("r");
+    let source = if keyed {
+        "WHERE a.rowid IN (SELECT value FROM json_each(?5)) AND"
+    } else {
+        "INDEXED BY account_admission_by_committed WHERE"
+    };
+    format!("SELECT a.rowid FROM account_admission a {source} {due}
+        AND NOT EXISTS (SELECT 1 FROM account_pin p
+            JOIN account_affinity f ON f.principal=p.principal
+             AND f.conversation_hash=p.conversation_hash AND f.provider=p.provider
+            WHERE p.pin_id=a.pin_id
+              AND MAX(f.expires_at,COALESCE(f.lease_valid_until,0)) >= ?3 - 3600000)
+        AND NOT EXISTS (SELECT 1 FROM account_continue used
+            JOIN account_admission parent ON parent.principal=used.principal
+             AND parent.admission_id=used.admission_id
+            WHERE used.decision_id=a.model_decision_id AND used.reservation_id=a.admission_id
+              AND used.principal=a.principal AND used.used_at_ms IS NOT NULL
+              AND parent.state IN ('reserved','started','finished','released'))
+        AND NOT EXISTS (SELECT 1 FROM account_continue c
+            JOIN account_admission r ON r.principal=c.principal AND r.admission_id=c.reservation_id
+            WHERE c.principal=a.principal AND c.admission_id=a.admission_id
+              AND c.run_id=a.run_id AND r.state IN ('reserved','started')
+              AND NOT ({reservation_due}))
+        AND NOT EXISTS (SELECT 1 FROM sources u
+            JOIN account_admission s ON s.principal=u.principal AND s.run_id=u.run_id
+             AND s.provider=u.provider AND s.account_id=u.account_id
+            WHERE u.principal=a.principal AND u.left_id=a.admission_id AND s.state='started'
+              AND (s.admission_id=u.left_id OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms))
+              AND NOT EXISTS (SELECT 1 FROM sources x
+                WHERE x.principal=s.principal AND x.left_id=s.admission_id))
+        ORDER BY a.committed_at LIMIT ?2")
+}
+
+#[cfg(test)]
+mod fork_retention_tests {
+    use super::*;
+
+    #[test]
+    fn fork_parent_prune_plan_uses_keyed_pin_and_affinity_lookups() {
+        let scratch = cortexkit_test_support::ScratchDir::new("fork-prune-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "fork-prune-plan",
+            scratch.path().join("state.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .store
+            .with_read(|conn| {
+                for keyed in [false, true] {
+                    let sql = format!(
+                        "EXPLAIN QUERY PLAN WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) {}",
+                        admission_candidates(keyed)
+                    );
+                    let mut statement = conn.prepare(&sql)?;
+                    let values = if keyed {
+                        vec![
+                            0.into(),
+                            8.into(),
+                            0.into(),
+                            0.into(),
+                            rusqlite::types::Value::Text("[]".into()),
+                        ]
+                    } else {
+                        vec![0.into(), 8.into(), 0.into(), 0.into()]
+                    };
+                    let plan = statement
+                        .query_map(rusqlite::params_from_iter(values), |row| {
+                            row.get::<_, String>(3)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.starts_with("SEARCH p USING INDEX")
+                                && line.contains("pin_id=?")),
+                        "{plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .any(|line| line.starts_with("SEARCH f USING INDEX")
+                                && line.contains(
+                                    "principal=? AND conversation_hash=? AND provider=?"
+                                )),
+                        "{plan:?}"
+                    );
+                    assert!(
+                        !plan
+                            .iter()
+                            .any(|line| line.starts_with("SCAN f") || line.starts_with("SCAN p")),
+                        "{plan:?}"
+                    );
+                    if keyed {
+                        assert!(
+                            plan.iter()
+                                .any(|line| line.starts_with("SEARCH a USING INTEGER PRIMARY KEY")),
+                            "{plan:?}"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
 impl crate::AccountTx<'_> {
     /// Delete only planned identities that are still old and unreferenced.
     pub fn delete_account_pins(&self, before: i64, keys: &[String]) -> RouteStateResult<usize> {
@@ -696,64 +838,64 @@ impl crate::AccountTx<'_> {
         limit: usize,
         now_ms: i64,
     ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
+        self.prune_admission_rows(before, limit, now_ms, None)
+    }
+
+    pub fn delete_account_admissions_returning(
+        &self,
+        before: i64,
+        keys: &[i64],
+        now_ms: i64,
+    ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
+        self.prune_admission_rows(before, keys.len(), now_ms, Some(keys))
+    }
+
+    fn prune_admission_rows(
+        &self,
+        before: i64,
+        limit: usize,
+        now_ms: i64,
+        keys: Option<&[i64]>,
+    ) -> RouteStateResult<Vec<crate::PrunedAdmission>> {
+        let keys_json = keys.map(serde_json::to_string).transpose().map_err(err)?;
         self.command_sql(|conn: &Connection| {
             // Read reservation values, not the delete candidate set: two idle
             // reservations must not keep each other forever. Source evidence
             // goes only after the other started rows it succeeds have gone,
             // even when a batch limit leaves those rows for the next pass.
-            let due = admission_due_by_values("a");
-            let reservation_due = admission_due_by_values("r");
+            let candidates = admission_candidates(keys.is_some());
             let mut statement = conn.prepare(&format!(
                 "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
-                 DELETE FROM account_admission WHERE rowid IN ( \
-                       SELECT a.rowid FROM account_admission a \
-                         INDEXED BY account_admission_by_committed \
-                       WHERE {due} \
-                         AND NOT EXISTS (SELECT 1 FROM account_continue c \
-                           JOIN account_admission r \
-                             ON r.principal=c.principal AND r.admission_id=c.reservation_id \
-                           WHERE c.principal=a.principal AND c.admission_id=a.admission_id \
-                             AND c.run_id=a.run_id AND r.state IN ('reserved','started') \
-                             AND NOT ({reservation_due})) \
-                         AND NOT EXISTS (SELECT 1 FROM sources u \
-                           JOIN account_admission s \
-                             ON s.principal=u.principal AND s.run_id=u.run_id \
-                            AND s.provider=u.provider AND s.account_id=u.account_id \
-                           WHERE u.principal=a.principal AND u.left_id=a.admission_id \
-                             AND s.state='started' \
-                             AND (s.admission_id=u.left_id \
-                               OR (s.request_mode!='renew' AND s.started_at<u.used_at_ms)) \
-                             AND NOT EXISTS (SELECT 1 FROM sources x \
-                               WHERE x.principal=s.principal AND x.left_id=s.admission_id)) \
-                       ORDER BY a.committed_at LIMIT ?2) \
+                 DELETE FROM account_admission WHERE rowid IN ({candidates}) \
                   RETURNING rowid, principal, admission_id, conversation_hash, provider, \
                     account_id, pin_id, pin_generation, state, charged, committed_at, \
                     started_at IS NOT NULL"
             ))?;
-            let rows = statement.query_map(
-                params![
-                    before,
-                    limit_param(limit),
-                    now_ms,
-                    now_ms.saturating_sub(30 * 60 * 1_000)
-                ],
-                |row| {
-                    Ok(crate::PrunedAdmission {
-                        rowid: row.get(0)?,
-                        principal: row.get(1)?,
-                        admission_id: row.get(2)?,
-                        conversation_hash: row.get(3)?,
-                        provider: row.get(4)?,
-                        account_id: row.get(5)?,
-                        pin_id: row.get(6)?,
-                        pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
-                        state: row.get(8)?,
-                        charged: row.get::<_, i64>(9)? == 1,
-                        committed_at: row.get(10)?,
-                        started: row.get(11)?,
-                    })
-                },
-            )?;
+            let mut values = vec![
+                rusqlite::types::Value::Integer(before),
+                rusqlite::types::Value::Integer(limit_param(limit)),
+                rusqlite::types::Value::Integer(now_ms),
+                rusqlite::types::Value::Integer(now_ms.saturating_sub(30 * 60 * 1_000)),
+            ];
+            if let Some(keys) = keys_json {
+                values.push(rusqlite::types::Value::Text(keys));
+            }
+            let rows = statement.query_map(rusqlite::params_from_iter(values), |row| {
+                Ok(crate::PrunedAdmission {
+                    rowid: row.get(0)?,
+                    principal: row.get(1)?,
+                    admission_id: row.get(2)?,
+                    conversation_hash: row.get(3)?,
+                    provider: row.get(4)?,
+                    account_id: row.get(5)?,
+                    pin_id: row.get(6)?,
+                    pin_generation: u64::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    state: row.get(8)?,
+                    charged: row.get::<_, i64>(9)? == 1,
+                    committed_at: row.get(10)?,
+                    started: row.get(11)?,
+                })
+            })?;
             rows.collect::<rusqlite::Result<Vec<_>>>()
         })
         .map_err(err)
@@ -954,9 +1096,13 @@ impl crate::AccountTx<'_> {
                 "WITH sources AS MATERIALIZED ({USED_OFFER_SOURCES}) \
                      DELETE FROM account_continue WHERE rowid IN ( \
                        SELECT c.rowid FROM account_continue c \
-                       WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
+                        WHERE COALESCE(c.valid_until_ms, 0) < ?1 \
                          AND COALESCE(c.used_at_ms, 0) < ?1 \
-                         AND COALESCE(c.released_at_ms, 0) < ?1 \
+                          AND COALESCE(c.released_at_ms, 0) < ?1 \
+                          AND NOT (c.used_at_ms IS NOT NULL AND EXISTS ( \
+                            SELECT 1 FROM account_admission parent \
+                            WHERE parent.principal=c.principal AND parent.admission_id=c.admission_id \
+                              AND parent.state IN ('reserved','started','finished','released'))) \
                          AND NOT EXISTS (SELECT 1 FROM account_admission a \
                            WHERE a.principal = c.principal \
                              AND a.admission_id IN (c.admission_id, c.reservation_id) \
