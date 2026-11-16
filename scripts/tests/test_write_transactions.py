@@ -10,6 +10,17 @@ GUARD = runpy.run_path(str(ROOT / "scripts/write-transactions.py"))
 
 
 class WriteTransactionsTests(unittest.TestCase):
+    def test_retained_view_and_removed_trigger_both_remain_frozen_names(self):
+        rules = GUARD["read_frozen_names"](GUARD["FROZEN_NAMES"])
+        self.assertIn("fence_origin", rules[0])
+        self.assertIn("model_route_state_inherit_fence_scope", rules[0])
+        for sql in (
+            "SELECT * FROM fence_origin",
+            "CREATE TRIGGER model_route_state_inherit_fence_scope AFTER INSERT ON model_route_state BEGIN SELECT 1; END",
+        ):
+            with self.subTest(sql=sql):
+                self.assertTrue(GUARD["frozen_sql_names"](sql, rules))
+
     def frozen(self, source):
         rules = GUARD["read_frozen_names"](GUARD["FROZEN_NAMES"])
         return GUARD["frozen_sql_sites"](source, rules)[1]

@@ -1,5 +1,5 @@
--- The old evidence tables are replaced in one transaction. Refusal evidence,
--- the permission to test it, and per-pool success remain separate facts.
+-- Enforcement moves in one transaction; the old evidence remains a frozen
+-- audit copy. Refusals, permission to test them and per-pool success stay separate.
 CREATE TABLE block (
   kind TEXT NOT NULL CHECK (kind IN ('account','credential','account_route',
     'non_quota_route','transient_route','pool_billing','pool_rate','provider',
@@ -289,7 +289,6 @@ BEGIN
   WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
 END;
 
-DROP TRIGGER fence_retire_enforcement;
 DROP TRIGGER model_route_state_inherit_fence_scope;
 DROP TRIGGER model_facts_inherit_provider_cooldown;
 CREATE TRIGGER model_facts_inherit_provider_cooldown AFTER INSERT ON model_facts
@@ -303,19 +302,5 @@ BEGIN
   ON CONFLICT(route_key) DO NOTHING;
 END;
 
-DROP VIEW fence_origin;
-DROP TABLE account_fence;
-DROP TABLE credential_entitlement_fences;
-DROP TABLE account_route_fence;
-DROP TABLE account_non_quota_route_fence;
-DROP TABLE account_size_refusal;
-DROP TABLE account_non_quota_size_refusal;
-DROP TABLE account_principal_exclusion;
-DROP TABLE account_transient_backoff;
-DROP TABLE fence_recheck;
-DROP TABLE fence_probe_authorization;
-DROP TABLE fence_recheck_route_clear;
-DROP TABLE fence_success_pool;
-DROP TABLE fence_retired_origin;
 DROP TABLE block_migration_now;
 DROP TABLE block_migration_quarantine;

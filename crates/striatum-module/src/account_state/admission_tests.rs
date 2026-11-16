@@ -1447,7 +1447,7 @@ fn a_probe_release_leaves_a_started_admission_and_its_authorization_alone() {
     store
         .with_writer_for_test(|conn| {
             conn.execute(
-                "INSERT INTO fence_probe_authorization VALUES (?1, 'kind', 'origin', 'evidence', 1, 1, 1)",
+                "INSERT INTO probe_authorization VALUES (?1, 'kind', 'origin', 'evidence', 1, 1, 1)",
                 [&owner],
             )
         })
@@ -1464,7 +1464,7 @@ fn a_probe_release_leaves_a_started_admission_and_its_authorization_alone() {
     let (authorizations, state): (i64, String) = store
         .with_writer_for_test(|conn| {
             conn.query_row(
-                "SELECT (SELECT count(*) FROM fence_probe_authorization), \
+                "SELECT (SELECT count(*) FROM probe_authorization), \
                    (SELECT state FROM account_admission WHERE admission_id = 'first')",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),

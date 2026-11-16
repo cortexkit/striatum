@@ -161,7 +161,7 @@ def read_frozen_names(path: Path) -> tuple[set[str], dict[str, set[str]]]:
         fields = line.split("#", 1)[0].split()
         if not fields:
             continue
-        if len(fields) == 2 and fields[0] in {"table", "trigger"}:
+        if len(fields) == 2 and fields[0] in {"table", "view", "trigger", "removed_trigger"}:
             relations.add(fields[1])
         elif len(fields) == 3 and fields[0] == "column" and fields[2] in {"null", "0"}:
             table, dot, column = fields[1].partition(".")
