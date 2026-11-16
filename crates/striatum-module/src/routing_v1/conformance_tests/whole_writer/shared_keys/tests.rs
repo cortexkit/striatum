@@ -10,13 +10,32 @@ impl World {
                 let _clock = crate::InjectedClock::set(START);
                 let mut world =
                     World::new(&format!("shared-fence-ids-{seed}-{reload}-{reverse}")).await;
+                world.isolate_shared_account();
                 world.two_fence_ids_witness(reverse, reload).await;
                 let _clock = crate::InjectedClock::set(START);
                 let mut world =
                     World::new(&format!("shared-size-kinds-{seed}-{reload}-{reverse}")).await;
+                world.isolate_shared_account();
                 world.two_size_kinds_witness(reverse, reload).await;
             }
         }
+    }
+
+    fn isolate_shared_account(&mut self) {
+        let target = self
+            .catalog
+            .accounts
+            .iter()
+            .find(|row| row.provider == fixture::SUBSCRIPTION_PROVIDER)
+            .unwrap()
+            .account_id
+            .clone();
+        // Unlist the healthy sibling so the account and size refusals under
+        // test must refuse a new account_for request, not allow a valid fallback.
+        self.catalog.accounts.retain(|row| {
+            row.provider != fixture::SUBSCRIPTION_PROVIDER || row.account_id == target
+        });
+        self.publish_catalog();
     }
 
     fn shared_key_request(&self, id: &str, tokens: u64) -> Value {
