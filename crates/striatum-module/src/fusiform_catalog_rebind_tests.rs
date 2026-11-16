@@ -128,14 +128,16 @@ mod rebind_tests {
                 .event_subject("fusiform", "catalog_changed", 1)
                 .unwrap();
             let bytes = serde_json::to_vec(&json!({"catalog_version":1})).unwrap();
-            bus.publish(
-                &subject,
-                "catalog-new",
-                ContentDigest::of_bytes(&bytes),
-                Headers::new(),
-            )
-            .await
-            .unwrap();
+            let receipt = bus
+                .publish(
+                    &subject,
+                    "catalog-new",
+                    ContentDigest::of_bytes(&bytes),
+                    Headers::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!receipt.duplicate());
             let message = cursor.next().await.unwrap().unwrap().message;
             let delivery = crate::route_facts::Delivery {
                 message,
