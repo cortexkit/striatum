@@ -190,8 +190,10 @@ pub(super) async fn run<F, A>(
         let interval = cadence(health.live);
         health.listing_poll_secs = interval.as_secs();
         if source != Some(health.live) {
-            tracing::info!(
-                "quota source={} listing_poll_secs={} watch_state={}",
+            // An operator line, like the quota and multiplier source lines:
+            // production's log filter drops plain info events.
+            crate::info_operator(format!(
+                "[striatum] quota source={} listing_poll_secs={} watch_state={}",
                 if health.live {
                     "vault-watch"
                 } else {
@@ -199,7 +201,7 @@ pub(super) async fn run<F, A>(
                 },
                 interval.as_secs(),
                 health.state,
-            );
+            ));
             source = Some(health.live);
             next_poll = next_poll.min(Instant::now() + interval);
         }
