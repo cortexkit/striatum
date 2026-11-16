@@ -3092,6 +3092,46 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     assert_covered_route_tick(&after_covered_tick);
 }
 
+/// An authorized probe success clears its credential refusal at the success
+/// report's captured time. The audit row must not sample a second clock.
+#[test]
+fn authorized_credential_heal_keeps_the_captured_report_time() {
+    let rig = rig("credential-heal-event-time");
+    due_credential_refusal(&rig, "event-time-login");
+    let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
+    assert_eq!(origins.len(), 1);
+    assert!(rig
+        .store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.grant_fence_rechecks(&origins, NOW, Some("event-time-owner"))
+        })
+        .unwrap());
+    let report_time = NOW + 456;
+    rig.store
+        .account_command(AccountCommandKind::Report, move |tx| {
+            tx.heal_authorized_probe("event-time-owner", "p0", "m0", report_time)
+        })
+        .unwrap();
+    let row: (Option<i64>, Option<String>, bool, bool) = rig.store.with_reader_for_test(|conn| conn.query_row(
+        "SELECT cleared_at,cleared_by,source_present,managed FROM block WHERE kind='credential' AND origin_key=json_array('p0','event-time-login')",
+        [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+    )).unwrap();
+    assert_eq!(
+        row,
+        (Some(report_time), Some("removed".into()), false, false),
+        "credential audit keeps the captured report time"
+    );
+    assert!(rig
+        .store
+        .account_read(|tx| tx.fence_rechecks())
+        .unwrap()
+        .is_empty());
+    rig.check(
+        &[report_time],
+        "credential healed at the captured report time",
+    );
+}
+
 fn prepare_covered_route_tick(rig: &Rig, now: i64) {
     let route = "writer-tick/model";
     let update = RouteStateUpdate {
