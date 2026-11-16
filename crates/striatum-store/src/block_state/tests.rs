@@ -17,6 +17,9 @@ use striatum_core::RouteStateResult;
 #[path = "native_generator/tests.rs"]
 mod native_generator;
 #[cfg(test)]
+#[path = "native_route_generator/tests.rs"]
+mod native_route_generator;
+#[cfg(test)]
 #[path = "native_sql/tests.rs"]
 mod native_sql;
 
@@ -2568,11 +2571,22 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                     let error = rng.pick(&ROUTE_ERRORS);
                     let unscoped = rng.below(2);
                     let pressure = rng.pick(&["NULL", "0.25", "0.75"]);
-                    rig.sql(format!("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,quota_pressure,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at,failure_backoff_until,failure_backoff_reason,failure_observed_at)
-                        VALUES ('{route}','{p}/{m}','{p}','{m}',{cooldown},{quota},{pressure},{at},{unscoped},{class},{error},{at},{at},{failure},'error',{at})
-                        ON CONFLICT(route_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,quota_exhausted_until=excluded.quota_exhausted_until,quota_pressure=excluded.quota_pressure,
-                        wall_observed_at=excluded.wall_observed_at,wall_unscoped=excluded.wall_unscoped,wall_class=excluded.wall_class,last_error=excluded.last_error,
-                        failure_backoff_until=excluded.failure_backoff_until,failure_observed_at=excluded.failure_observed_at;"));
+                    quarantined |= native_route_generator::route(
+                        &rig,
+                        native_route_generator::Input {
+                            route: route.clone(),
+                            provider: p.into(),
+                            model: m.into(),
+                            cooldown,
+                            quota,
+                            failure,
+                            pressure: pressure.into(),
+                            class: class.into(),
+                            error: error.into(),
+                            unscoped: unscoped != 0,
+                            at,
+                        },
+                    );
                     "write a route row"
                 }
                 1 => {
@@ -2583,10 +2597,22 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                     let class = rng.pick(&["NULL", "'quota'", "'billing'"]);
                     let error = rng.pick(&ROUTE_ERRORS);
                     let unscoped = rng.below(2);
-                    rig.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,quota_exhausted_until,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at)
-                        VALUES ('{p}',{cooldown},{quota},{at},{unscoped},{class},{error},{at},{at})
-                        ON CONFLICT(provider_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,quota_exhausted_until=excluded.quota_exhausted_until,
-                        wall_observed_at=excluded.wall_observed_at,wall_unscoped=excluded.wall_unscoped,wall_class=excluded.wall_class,last_error=excluded.last_error;"));
+                    quarantined |= native_route_generator::provider(
+                        &rig,
+                        native_route_generator::Input {
+                            route: route.clone(),
+                            provider: p.into(),
+                            model: m.into(),
+                            cooldown,
+                            quota,
+                            failure: "NULL".into(),
+                            pressure: "NULL".into(),
+                            class: class.into(),
+                            error: error.into(),
+                            unscoped: unscoped != 0,
+                            at,
+                        },
+                    );
                     "write a provider row"
                 }
                 2 => {
@@ -2611,9 +2637,7 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                     "claim clocks"
                 }
                 4 => {
-                    rig.sql(format!(
-                        "DELETE FROM model_route_state WHERE route_key='{route}';"
-                    ));
+                    native_route_generator::delete_route(&rig, route.clone());
                     "delete a route row"
                 }
                 5 => {
@@ -2653,9 +2677,8 @@ fn the_route_state_snapshot_from_memory_equals_sql_over_generated_route_writes()
                         [],
                         |r| r.get::<_, i64>(0),
                     )? > 0;
-                    quarantined |= !fence_rechecks::quarantined_origins(conn)?.is_empty();
                     let stored: Vec<(String, Option<f64>)> = conn
-                        .prepare("SELECT route_key,cooldown_until FROM model_route_state")?
+                        .prepare("SELECT m.route_key,b.cooldown_until FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.source_present=1")?
                         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
                         .collect::<rusqlite::Result<_>>()?;
                     clock_scheduled |= stored.iter().any(|(route, raw)| {
