@@ -73,8 +73,9 @@ records capture by
 The data is synthetic. The request is the exact compact params body, not a
 method envelope; the hold sample wraps the error body in `error`.
 
-Before import, the supplied manifest was checked against its independently
-provided digest prefix `73031db3`, then both files were verified against it.
+Before import, the manifest's own SHA-256 was checked against the prefix
+`73031db3` that THALAMUS quoted in its handoff message, and then both files
+were verified against the manifest.
 The reader tests send the request bytes unchanged through routing's v1 handler.
 
 | Imported path | SHA-256 |
