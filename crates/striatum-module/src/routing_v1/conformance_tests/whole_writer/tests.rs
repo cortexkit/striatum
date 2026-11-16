@@ -26,6 +26,8 @@ mod ledger;
 mod maintenance;
 #[path = "metadata/tests.rs"]
 mod metadata;
+#[path = "outcomes/tests.rs"]
+mod outcomes;
 #[path = "outside_state/tests.rs"]
 mod outside_state;
 #[path = "paired_charge/tests.rs"]
