@@ -182,3 +182,87 @@ async fn size_and_principal_refusals_each_change_a_real_admit_before_and_after_r
     let mut world = World::new("admit-scope-witness-driver").await;
     world.admit_scope_witnesses(1).await;
 }
+
+#[tokio::test]
+async fn two_admissions_keep_distinct_exclusions_for_the_same_principal_and_credential() {
+    let _clock = crate::InjectedClock::set(START);
+    for reload in [false, true] {
+        let mut world = World::new(&format!("two-principal-exclusions-{reload}")).await;
+        world
+            .ok(
+                Caller::Runner,
+                "route.account_for",
+                World::scoped_request("two-exclusions-unblocked", 4_096),
+            )
+            .await;
+        let principal = format!("reserved:{}", fixture::RUNNER_ONE);
+        let roster = world
+            .harness
+            .credentials()
+            .lock()
+            .unwrap()
+            .listing_version()
+            .unwrap()
+            .0
+            .to_owned();
+        let credentials = world
+            .catalog
+            .accounts
+            .iter()
+            .filter(|row| row.provider == fixture::SUBSCRIPTION_PROVIDER)
+            .map(|row| row.credential_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert!(!credentials.is_empty());
+        let now = world.now as i64;
+        for admission in ["first-excluded-admission", "second-excluded-admission"] {
+            for credential in &credentials {
+                let row = AccountExclusionRow {
+                    principal: principal.clone(),
+                    admission_id: admission.into(),
+                    credential_id: credential.clone(),
+                    runner_view_digest: "two-exclusions-runner".into(),
+                    roster_view_digest: roster.clone(),
+                    observation_id: None,
+                    recorded_at: now,
+                };
+                assert!(
+                    world.command("principal/two independent scoped refusals", move |tx| {
+                        tx.insert_exclusion_with_recheck(&row, 60_000)
+                    })
+                );
+            }
+        }
+        if reload {
+            world.reload();
+        }
+        for credential in credentials {
+            let p = principal.clone();
+            world.command("principal/exact repeated exclusion identity", move |tx| {
+                assert_eq!(tx.exclusion_count(&p, &credential)?, 2,
+                    "two distinct admissions must retain two exclusions for one principal and credential");
+                for admission in ["first-excluded-admission", "second-excluded-admission"] {
+                    let rows = tx.admission_exclusions(&p, admission)?;
+                    assert_eq!(rows.iter().filter(|row| row.credential_id == credential).count(), 1,
+                        "an exclusion was stored under the wrong admission");
+                }
+                Ok(())
+            });
+        }
+        for admission in ["first-excluded-admission", "second-excluded-admission"] {
+            let refused = world
+                .request(
+                    Caller::Runner,
+                    "route.account_for",
+                    World::scoped_request(admission, 4_096),
+                )
+                .await;
+            assert_eq!(
+                refused.0,
+                FrameType::Error,
+                "a scoped refusal was bypassed: {}",
+                refused.1
+            );
+            assert_eq!(refused.1["code"], "account_not_authorized", "{}", refused.1);
+        }
+    }
+}

@@ -2,6 +2,8 @@ use super::*;
 
 #[path = "healing/tests.rs"]
 mod healing;
+#[path = "state_flags/tests.rs"]
+mod state_flags;
 
 impl World {
     /// Snapshot all native durable block columns, including dropped audit rows.
