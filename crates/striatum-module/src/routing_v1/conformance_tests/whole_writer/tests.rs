@@ -24,6 +24,8 @@ mod ledger;
 mod maintenance;
 #[path = "metadata/tests.rs"]
 mod metadata;
+#[path = "paired_charge/tests.rs"]
+mod paired_charge;
 #[path = "probes/tests.rs"]
 mod probes;
 #[path = "quota/tests.rs"]
@@ -58,6 +60,7 @@ struct World {
     _trace_install: striatum_store::writer_entry_trace::Installed,
     bridge_loads: Arc<std::sync::atomic::AtomicU64>,
     expected_bridge_loads: u64,
+    replay: Option<striatum_store::replay::Inputs>,
 }
 
 impl World {
@@ -151,6 +154,7 @@ impl World {
             _trace_install: trace_install,
             bridge_loads,
             expected_bridge_loads,
+            replay: None,
         };
         world.compare("seed");
         world
@@ -176,7 +180,17 @@ impl World {
         );
     }
 
+    fn install_replay_inputs(&self) -> Option<striatum_store::replay::Guard> {
+        self.replay.as_ref().map(|inputs| {
+            let mut step = inputs.clone();
+            step.now_ms = self.now as i64;
+            step.install()
+        })
+    }
+
     async fn request(&mut self, caller: Caller, method: &str, params: Value) -> (FrameType, Value) {
+        let _inputs = self.install_replay_inputs();
+        let _trace = self.trace.install();
         let _clock = crate::InjectedClock::set(self.now);
         let reply = match caller {
             Caller::Owner => self.owner.call(method, &params).await,
@@ -204,6 +218,8 @@ impl World {
             + Send
             + 'static,
     ) -> T {
+        let _inputs = self.install_replay_inputs();
+        let _trace = self.trace.install();
         let _clock = crate::InjectedClock::set(self.now);
         let value = crate::account_writer::execute(
             &self.harness.store(),
@@ -235,6 +251,8 @@ impl World {
     }
 
     fn publish_catalog(&mut self) {
+        let _inputs = self.install_replay_inputs();
+        let _trace = self.trace.install();
         let _clock = crate::InjectedClock::set(self.now);
         install_catalog(&self.harness, &self.catalog);
         self.sequence += 1;
@@ -250,6 +268,8 @@ impl World {
             &striatum_store::SqliteRouteStateStore,
         ) -> striatum_core::route_state_store::RouteStateResult<T>,
     ) -> T {
+        let _inputs = self.install_replay_inputs();
+        let _trace = self.trace.install();
         let _clock = crate::InjectedClock::set(self.now);
         let result =
             operation(self.harness.store()).unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -559,6 +579,7 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
         for (draw, nonce) in shuffled_request_groups(seed) {
             world.request_group(draw, nonce).await;
         }
+        world.finished_charge_witnesses(seed).await;
         assert_trace_is_declared(&world.trace);
         assert_all_producers_driven(&world.trace);
     }

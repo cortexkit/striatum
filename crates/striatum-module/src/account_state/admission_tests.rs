@@ -963,6 +963,31 @@ fn admission(
     }
 }
 
+/// Borrow the indexed-admission fixture for a real catalogue route. Keep the
+/// byte count fixed when a caller varies `charged`, so the charge is one bit.
+pub(crate) fn pinned_admission_for_route(
+    principal: &str,
+    id: &str,
+    provider: &str,
+    model: &str,
+    account: &str,
+    credential: &str,
+    at: i64,
+) -> (AccountPinRow, AccountAdmissionRow) {
+    let mut input = admission(principal, id, &format!("pin-{id}"), 1, at, 120_000);
+    input.hash = format!("history-{id}");
+    input.account = account.into();
+    input.credential = credential.into();
+    input.bytes = 1_000_000;
+    let mut row = input.row();
+    row.provider = provider.into();
+    row.model = model.into();
+    let mut pin = input.pin_row();
+    pin.provider = provider.into();
+    pin.affinity_model = model.into();
+    (pin, row)
+}
+
 fn prune_everything_before(store: &SqliteRouteStateStore, before: i64) {
     crate::account_writer::prune_account_admissions(store, before, 100, before + 30 * 60_000)
         .unwrap();

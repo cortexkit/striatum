@@ -1562,6 +1562,8 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
 #[cfg(test)]
 mod admission_tests;
 #[cfg(test)]
+pub(crate) use admission_tests::pinned_admission_for_route;
+#[cfg(test)]
 mod inflight_tests;
 #[cfg(test)]
 mod tests;
