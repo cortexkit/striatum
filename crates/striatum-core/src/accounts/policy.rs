@@ -43,11 +43,24 @@ pub struct SpendReading {
 /// are left absent; in particular no report fabricates a credit balance.
 #[derive(Debug, Clone, Default)]
 pub struct AllocationContext {
+    pub fork_parent: Option<ForkParent>,
     pub credential_probe_notes: BTreeMap<String, String>,
     pub hold_ok: Option<bool>,
     pub parent_account_id: Option<String>,
     pub credits: BTreeMap<String, CreditReading>,
     pub spend: BTreeMap<String, SpendReading>,
+}
+
+/// A granted parent resolved by the router under the requesting principal.
+#[derive(Debug, Clone)]
+pub struct ForkParent {
+    pub admission_id: String,
+    pub account_id: String,
+    pub credential_id: String,
+    pub pin_id: String,
+    pub pin_generation: u64,
+    /// A refusal-backed route or credential block outside the account fences.
+    pub blocked_until_ms: Option<EpochMs>,
 }
 
 /// Input-size bands are powers of two in tokens. A refusal at 169k tokens

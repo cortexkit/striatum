@@ -3661,6 +3661,8 @@ fn conversation_hash(salt: &str, principal: &str, conversation_key: &str) -> Str
 fn fingerprint(params: &AccountForParams) -> String {
     #[derive(Serialize)]
     struct AdmissionIdentity<'a> {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fork_of: Option<&'a ForkParams>,
         provider: String,
         model: String,
         affinity_model: String,
@@ -3682,6 +3684,7 @@ fn fingerprint(params: &AccountForParams) -> String {
         head_turn: bool,
     }
     let identity = AdmissionIdentity {
+        fork_of: params.fork_of.as_ref(),
         provider: normalize(&params.provider),
         model: normalize(&params.model),
         affinity_model: normalize(params.affinity_model()),
@@ -5482,6 +5485,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(default)]
+    fork_of: Option<ForkParams>,
     #[serde(skip)]
     continuation_input: Option<continuation::Inputs>,
     #[serde(default)]
@@ -5547,7 +5552,18 @@ pub(crate) struct AccountForParams {
     pool: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ForkParams {
+    admission_id: String,
+}
+
 impl AccountForParams {
+    pub(crate) fn scope_fork_parent(&mut self, key: impl FnOnce(&str) -> String) {
+        if let Some(parent) = &mut self.fork_of {
+            parent.admission_id = key(&parent.admission_id);
+        }
+    }
     pub(crate) fn from_v1(
         request: &cortexkit_role_routing::account::AccountForRequest,
         admission_key: String,
@@ -5559,6 +5575,8 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            fork_of: serde_json::from_value(optional("fork_of"))
+                .map_err(|e| invalid(e.to_string()))?,
             continuation_input: None,
             head_turn: request.head_turn,
             call: None,
@@ -5622,6 +5640,17 @@ impl AccountForParams {
     }
 
     fn validate(&self) -> Result<(), OpReply> {
+        if let Some(parent) = &self.fork_of {
+            if self.mode != RequestMode::Admit
+                || parent.admission_id.trim().is_empty()
+                || self.requested_account.is_some()
+                || self.warm_credential.is_some()
+                || self.parent_conversation_key.is_some()
+                || self.candidates.is_some()
+            {
+                return Err(fork_invalid());
+            }
+        }
         if self.admission_id.trim().is_empty() {
             return Err(because(
                 "admission_id_required",
@@ -6032,6 +6061,15 @@ pub(crate) use continuation::continue_account_with_call;
 pub(crate) use continuation::inject_continuation_preparation_failure;
 pub(crate) mod call_log;
 mod concurrency_gate;
+mod fork;
+
+fn fork_invalid() -> OpReply {
+    OpReply::typed(
+        "invalid_request",
+        "fork_of must name an earlier granted admission for this principal and provider",
+        json!({"field":"fork_of"}),
+    )
+}
 
 fn account_for(
     params: &Value,
@@ -6166,6 +6204,16 @@ fn prepare_and_admit(
     request_fingerprint: String,
     finish: &mut Option<crate::routing_v1::accounts::AdmissionRecord>,
 ) -> Result<OpReply, OpReply> {
+    if parsed.fork_of.is_some() {
+        return fork::prepare_and_admit(
+            parsed,
+            principal,
+            ctx,
+            provider,
+            request_fingerprint,
+            finish,
+        );
+    }
     checking("roster_prepare");
     let bound_tier = match parsed.model_decision_id.as_deref() {
         Some(id) => match ctx.store.decision_service_tier(id) {
@@ -7608,6 +7656,10 @@ fn serve(
     let salt = tx.salt(now, fresh_salt)?;
     let hash = conversation_hash(&salt, principal, &params.conversation_key);
     let affinity_row = tx.affinity(principal, &hash, provider)?;
+    let fork_parent = fork::resolve(tx, principal, params, provider)?;
+    if params.fork_of.is_some() && fork_parent.is_none() {
+        return Ok(fork_invalid());
+    }
     // The tier-filtered roster must still contain the conversation's exact
     // credential. A healthy sibling cannot replace a bound session's pin.
     if params.service_tier_bound
@@ -7632,7 +7684,7 @@ fn serve(
     let mut roster = roster.clone();
     // Explicit candidates already bound the choice. Keep their blocked
     // credentials until the atomic probe check can preserve the refusal cause.
-    if !established && params.candidates.is_none() {
+    if !established && params.candidates.is_none() && params.fork_of.is_none() {
         if let Some(classes) = &ctx.classes {
             classes.avoid_transient_accounts(&mut roster, provider, &params.model);
         }
@@ -7667,17 +7719,22 @@ fn serve(
             classes.allocation_context(provider, &params.model)
         });
     inputs.hold_ok = params.hold_ok;
+    inputs.fork_parent = fork_parent;
     if let Some(parent) = &params.parent_conversation_key {
         let hash = conversation_hash(&salt, principal, parent);
         inputs.parent_account_id = tx.parent_used_account(principal, &hash, provider, now)?;
     }
-    let admissions = demand_with(
-        |provider, account, floor| tx.demand(provider, account, floor),
-        provider,
-        roster.roster.as_ref(),
-        &policy,
-        &inputs,
-    )?;
+    let admissions = if params.fork_of.is_some() {
+        Vec::new()
+    } else {
+        demand_with(
+            |provider, account, floor| tx.demand(provider, account, floor),
+            provider,
+            roster.roster.as_ref(),
+            &policy,
+            &inputs,
+        )?
+    };
     let blocks = load_blocks(tx, provider)?;
     let bound_pool = request_pool(params.pool.as_deref(), provider, &params.model);
     let origins: Vec<_> = tx
@@ -7790,13 +7847,15 @@ fn serve(
     }
     let mut fences = load_fences(tx, provider)?;
     fences.retain(|fence| {
-        !origins.iter().any(|origin| {
-            origin.kind == "account"
-                && origin.account_id.as_deref() == Some(&fence.account_id)
-                && origin.evidence_at == fence.observed_at_ms
-                && quota_due(&fence.account_id, "")
-                && !binding_reading(origin, &fence.account_id)
-        })
+        params.fork_of.is_some() || {
+            !origins.iter().any(|origin| {
+                origin.kind == "account"
+                    && origin.account_id.as_deref() == Some(&fence.account_id)
+                    && origin.evidence_at == fence.observed_at_ms
+                    && quota_due(&fence.account_id, "")
+                    && !binding_reading(origin, &fence.account_id)
+            })
+        }
     });
     let mut state = AllocatorState {
         roster: probe_roster,
@@ -7823,6 +7882,12 @@ fn serve(
             break decision;
         };
         let credential = admission.credential_id.clone();
+        if params.fork_of.is_some() {
+            gate.check(
+                tx, ctx, params, principal, &hash, provider, admission, &mut state,
+            );
+            break decision;
+        }
         let applicable: Vec<_> = origins
             .iter()
             .filter(|origin| {
@@ -8198,22 +8263,25 @@ fn serve(
                     "account {} is in a short hold; retry after {} s",
                     hold.account_id, hold.retry_after_s
                 ),
-                json!({
-                    "code": "account_hold",
-                    "retry_after_s": hold.retry_after_s,
-                    "decision_id": decision_id,
-                    "account": {
-                        "provider": provider,
-                        "account_id": hold.account_id,
-                        "credential_id": hold.credential_id,
-                        "refresh_adapter": refresh_adapter,
-                        "method": ctx.classes.as_ref().map_or("oauth", |classes| classes.method(&hold.credential_id)),
-                    },
-                    "pin": { "id": hold.pin_id, "generation": hold.pin_generation },
-                    "reset_at": rfc3339(hold.reset_at_ms),
-                    "basis": wire(&hold.basis),
-                    "exclusions": wire_exclusions(&decision),
-                }),
+                fork::hold_detail(
+                    params,
+                    json!({
+                        "code": "account_hold",
+                        "retry_after_s": hold.retry_after_s,
+                        "decision_id": decision_id,
+                        "account": {
+                            "provider": provider,
+                            "account_id": hold.account_id,
+                            "credential_id": hold.credential_id,
+                            "refresh_adapter": refresh_adapter,
+                            "method": ctx.classes.as_ref().map_or("oauth", |classes| classes.method(&hold.credential_id)),
+                        },
+                        "pin": { "id": hold.pin_id, "generation": hold.pin_generation },
+                        "reset_at": rfc3339(hold.reset_at_ms),
+                        "basis": wire(&hold.basis),
+                        "exclusions": wire_exclusions(&decision),
+                    }),
+                ),
             ))
         }
         Outcome::Refuse(refusal) => {

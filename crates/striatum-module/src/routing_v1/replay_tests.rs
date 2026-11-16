@@ -607,6 +607,7 @@ fn project_additive_shape_members(value: &mut Value) {
                                 "report_attempt_outcomes",
                                 "account_observe_success",
                                 "account_head_turn",
+                                "account_fork_of",
                                 "decision_harness",
                                 "select_kind",
                                 "select_media",

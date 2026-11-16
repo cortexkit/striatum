@@ -55,6 +55,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::ACCOUNT_CONTINUE_SIGNED_OUT,
     cortexkit_role_routing::capabilities::ACCOUNT_WARM_CREDENTIAL,
     cortexkit_role_routing::capabilities::ACCOUNT_HEAD_TURN,
+    cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF,
     ACCOUNT_CONTINUE_RESUME,
 ];
 
