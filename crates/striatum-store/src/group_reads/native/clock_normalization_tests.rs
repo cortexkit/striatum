@@ -133,7 +133,9 @@ fn becoming_record_only_drops_the_clock_but_observation_source_removal_keeps_its
         reads.reader.is_empty() && reads.writer.is_empty(),
         "{reads:#?}"
     );
-    assert!(rig.published().fence_rechecks(now).unwrap().is_empty());
+    let remaining = rig.published().fence_rechecks(now).unwrap();
+    assert!(!remaining.iter().any(|origin|origin.kind=="account_route" && origin.origin_key==key),
+        "the record-only tuple must not remain an origin; independent sources are unaffected: {remaining:?}");
     let row = AccountObservationRow {
         observation_id: "clock-drop-observation".into(),
         principal: "normalization".into(),
