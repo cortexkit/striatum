@@ -448,7 +448,7 @@ async fn mixed_account_markers_never_reach_a_permissive_legacy_decoder() {
 }
 
 // `retry_at_ms` and `provider_code` belong to the legacy observation as well:
-// Broca's caller-shaped `transient_backoff` and `credential_refused` reports
+// A runner's caller-shaped `transient_backoff` and `credential_refused` reports
 // carry them, so they must reach the legacy handler rather than be refused as
 // a mixed body.
 #[tokio::test]
