@@ -472,12 +472,86 @@ fn block_tables_are_rowid_tables_keyed_by_their_primary_key() {
 #[test]
 fn memory_matches_the_view_and_the_adapter_on_the_parity_fixture() {
     let rig = rig("block-state-parity");
-    rig.run(|conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW));
-    rig.store.assert_block_parity_fixture_coverage_for_test(NOW);
-    let times = rig.store.block_parity_times(NOW).unwrap();
+    let times = seed_captured_native_parity_fixture(&rig, NOW);
     assert!(times.len() > 3);
     rig.check(&times, "parity fixture");
     assert!(block_read_backs() > 0);
+}
+
+/// Upgrade the legacy dataset, then insert its stored rows through one account
+/// command on an initially empty destination. Writer hooks record the inserted
+/// row ids and read those rows into working memory before publication. Loading
+/// the populated source alone would not exercise that path. Coverage and
+/// boundary times are still checked on the original legacy fixture.
+fn seed_captured_native_parity_fixture(destination: &Rig, now: i64) -> Vec<i64> {
+    let source = legacy_sync_rig("captured-parity-source");
+    source.run(move |conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, now));
+    source
+        .store
+        .assert_block_parity_fixture_coverage_for_test(now);
+    let times = source.store.block_parity_times(now).unwrap();
+    let source = upgrade_sync_rig(source, "captured-parity-source");
+    let tables = source
+        .store
+        .with_reader_for_test(|conn| {
+            let mut tables = Vec::new();
+            for table in BLOCK_TABLES {
+                let mut columns = conn
+                    .prepare("SELECT name FROM pragma_table_xinfo(?1) WHERE hidden=0 ORDER BY cid")?
+                    .query_map([table], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                columns.insert(0, "rowid".into());
+                let mut statement = conn.prepare(&format!(
+                    "SELECT {} FROM {table} ORDER BY rowid",
+                    columns.join(",")
+                ))?;
+                let rows = statement
+                    .query_map([], |row| {
+                        (0..columns.len())
+                            .map(|column| row.get::<_, Value>(column))
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                tables.push((table.to_owned(), columns, rows));
+            }
+            Ok(tables)
+        })
+        .unwrap();
+    destination.run(move |conn| {
+        for (table, columns, rows) in &tables {
+            let placeholders = (1..=columns.len())
+                .map(|index| format!("?{index}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut insert = conn.prepare(&format!(
+                "INSERT OR REPLACE INTO {table}({}) VALUES ({placeholders})",
+                columns.join(",")
+            ))?;
+            for row in rows {
+                insert.execute(rusqlite::params_from_iter(row.iter()))?;
+            }
+        }
+        Ok(())
+    });
+    destination
+        .store
+        .with_reader_for_test(|conn| {
+            let kinds = conn
+                .prepare("SELECT DISTINCT kind FROM block WHERE source_present=1 AND is_origin=1")?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
+            assert_eq!(
+                kinds,
+                striatum_core::blocks::SOURCE_KINDS
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "the captured dataset retains every source kind"
+            );
+            Ok(())
+        })
+        .unwrap();
+    times
 }
 
 #[test]
