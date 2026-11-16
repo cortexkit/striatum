@@ -151,32 +151,30 @@ pub(crate) fn exhausted_quota_reset_for_account(
     resets.into_iter().max()
 }
 
-/// [`exhausted_quota_reset_for_account`] limited to the windows of the pools
-/// one routed capacity draws on. A spent pool the model does not draw on (for
-/// example Antigravity's Claude and GPT pool for a Gemini model) gives no reset.
-pub(crate) fn exhausted_route_reset_for_account(
+/// The windows of `account_id`'s latest fresh reading that meter one routed
+/// capacity, with the time the reading was fetched. On a pooled reading these
+/// are only the pools the capacity draws on (for an Antigravity Gemini model,
+/// `gemini-5h` and `gemini-weekly`, never the Claude and GPT `3p` pool).
+pub(crate) fn fresh_route_windows(
     quota: &crate::account_quota::AccountQuotaState,
     account_id: &str,
     capacity_key: &str,
     model_pools: &[striatum_core::quota_extract::ModelPool],
     now_ms: i64,
-    policy: &striatum_core::accounts::AllocatorPolicy,
-) -> Option<i64> {
+) -> Option<(i64, Vec<striatum_core::quota::RateWindow>)> {
     let entry = latest_fresh_entry(quota, account_id, now_ms)?;
+    let fetched = entry
+        .fetched_at
+        .as_deref()
+        .and_then(crate::account_quota::parse_rfc3339_ms)?;
     let usage = entry.usage.as_ref()?;
-    striatum_core::quota_extract::account_rate_windows(usage, Some(capacity_key), model_pools)
-        .into_iter()
-        .filter(|(_, window)| {
-            window.used_percent.is_finite() && !window_has_headroom(window, policy)
-        })
-        .filter_map(|(_, window)| {
-            window
-                .resets_at
-                .as_deref()
-                .and_then(crate::account_quota::parse_rfc3339_ms)
-                .filter(|reset| *reset > now_ms)
-        })
-        .max()
+    Some((
+        fetched,
+        striatum_core::quota_extract::account_rate_windows(usage, Some(capacity_key), model_pools)
+            .into_iter()
+            .map(|(_, window)| window)
+            .collect(),
+    ))
 }
 
 /// Whether a fresh reading with headroom arrived after `fence_observed_ms`

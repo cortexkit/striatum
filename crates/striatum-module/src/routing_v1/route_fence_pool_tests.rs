@@ -85,25 +85,37 @@ fn window(id: &str, used: f64, minutes: i64, reset: i64) -> Value {
         "resetsAt": crate::account_selection::rfc3339(reset)}})
 }
 
-/// Insula's latest readings of both accounts, fetched at `fetched_at`. The
-/// state is the test's own, so tests running in parallel cannot replace it.
-fn read_accounts(fetched_at: i64) -> crate::account_quota::SharedAccountQuota {
+/// The open account's windows as Insula reads them, with its Gemini weekly
+/// pool at `gemini_weekly` percent used, resetting at `gemini_reset`.
+fn open_windows(gemini_weekly: f64, gemini_reset: i64) -> Vec<Value> {
+    vec![
+        window("gemini-weekly", gemini_weekly, 10080, gemini_reset),
+        window("gemini-5h", 2.79, 300, NOW + 16_600_000),
+        window("3p-weekly", 100.0, 10080, THIRD_PARTY_RESET),
+    ]
+}
+
+fn spent_windows() -> Vec<Value> {
+    vec![
+        window("gemini-weekly", 100.0, 10080, SPENT_GEMINI_RESET),
+        window("3p-weekly", 100.0, 10080, 1_795_176_704_000),
+    ]
+}
+
+/// Readings of both accounts, fetched at `fetched_at`. The state is the
+/// test's own, so tests running in parallel cannot replace it.
+fn readings(
+    fetched_at: i64,
+    open: Vec<Value>,
+    spent: Vec<Value>,
+) -> crate::account_quota::SharedAccountQuota {
     let entry = |account: &str, windows: Vec<Value>| {
         json!({"provider": "antigravity", "apiProvider": "google", "account": account,
             "source": "oauth", "fetchedAt": crate::account_selection::rfc3339(fetched_at),
             "usage": {"extraRateWindows": windows}})
     };
-    let body = json!({"result": [
-        entry(OPEN_ACCOUNT, vec![
-            window("gemini-weekly", 12.23, 10080, OPEN_GEMINI_RESET),
-            window("gemini-5h", 2.79, 300, NOW + 16_600_000),
-            window("3p-weekly", 100.0, 10080, THIRD_PARTY_RESET),
-        ]),
-        entry(SPENT_ACCOUNT, vec![
-            window("gemini-weekly", 100.0, 10080, SPENT_GEMINI_RESET),
-            window("3p-weekly", 100.0, 10080, 1_795_176_704_000),
-        ]),
-    ], "completeProviders": ["antigravity"]});
+    let body = json!({"result": [entry(OPEN_ACCOUNT, open), entry(SPENT_ACCOUNT, spent)],
+        "completeProviders": ["antigravity"]});
     let mut state = crate::account_quota::AccountQuotaState::default();
     crate::account_quota::apply_provider_reply(
         &mut state,
@@ -113,6 +125,17 @@ fn read_accounts(fetched_at: i64) -> crate::account_quota::SharedAccountQuota {
     )
     .unwrap();
     Arc::new(std::sync::Mutex::new(state))
+}
+
+/// Insula's latest readings of both accounts as exported, fetched at
+/// `fetched_at`: the open account's Gemini pool at 12.23% and its third-party
+/// pool spent; the other account's Gemini and third-party pools both spent.
+fn read_accounts(fetched_at: i64) -> crate::account_quota::SharedAccountQuota {
+    readings(
+        fetched_at,
+        open_windows(12.23, OPEN_GEMINI_RESET),
+        spent_windows(),
+    )
 }
 
 /// A Carbon quota refusal on `credential`, first recorded at `first` and
@@ -175,37 +198,111 @@ fn assert_memory_matches_store(harness: &Harness, step: &str) {
     crate::account_state::assert_published_equals_fresh_load(harness.store(), step);
 }
 
+/// Rule: any fresh reading under 100% on the hold's own pool clears it at
+/// once, whatever its provider reset says and however full other pools are.
 #[test]
 fn gemini_headroom_clears_a_carbon_fence_that_a_spent_third_party_pool_never_held() {
     let _clock = crate::InjectedClock::set(NOW as u64);
+    for gemini_weekly in [12.23, 99.5] {
+        let harness = setup();
+        // The live rows: the open account's fence was last reported three
+        // days ago; the spent account's fence was reported this morning.
+        fence_carbon(
+            &harness,
+            OPEN,
+            1_794_459_863_824,
+            1_794_579_994_214,
+            THIRD_PARTY_RESET,
+        );
+        fence_carbon(
+            &harness,
+            SPENT,
+            1_794_819_352_720,
+            1_794_819_352_720,
+            SPENT_GEMINI_RESET,
+        );
+        let quota = readings(
+            NOW - 5_000,
+            open_windows(gemini_weekly, OPEN_GEMINI_RESET),
+            spent_windows(),
+        );
+        assert_memory_matches_store(&harness, "seeded");
+        let context = load(&harness, &quota, NOW);
+        assert_memory_matches_store(&harness, "after the reading was applied");
+        assert_eq!(
+            fenced_credentials(&harness, NOW),
+            vec![SPENT.to_owned()],
+            "Gemini at {gemini_weekly}%: the reading clears the open account's Carbon \
+             fence long before its stored reset; the spent Gemini pool keeps the other"
+        );
+        if gemini_weekly < 50.0 {
+            assert_eq!(carbon_account(&context).as_deref(), Some(OPEN_ACCOUNT));
+        }
+    }
+}
+
+/// Whether the open account's Carbon recheck has come due at `NOW`. Its fence
+/// was reported 20 minutes ago, so one recheck interval has passed. The other
+/// account's Carbon fence was reported a minute ago and is not due, so a due
+/// recheck admits the open account as the probe, and a held one leaves
+/// Carbon with no account.
+fn open_recheck_due(gemini_weekly: f64, gemini_reset: i64, fetched_at: i64) -> bool {
     let harness = setup();
-    // The live rows: the open account's fence was last reported three days
-    // ago; the spent account's fence was reported this morning.
-    fence_carbon(
-        &harness,
-        OPEN,
-        1_794_459_863_824,
-        1_794_579_994_214,
-        THIRD_PARTY_RESET,
-    );
+    let reported = NOW - 20 * 60_000;
+    fence_carbon(&harness, OPEN, reported, reported, THIRD_PARTY_RESET);
     fence_carbon(
         &harness,
         SPENT,
-        1_794_819_352_720,
-        1_794_819_352_720,
+        NOW - 60_000,
+        NOW - 60_000,
         SPENT_GEMINI_RESET,
     );
-    let quota = read_accounts(NOW - 5_000);
-    assert_memory_matches_store(&harness, "seeded");
+    let quota = readings(
+        fetched_at,
+        open_windows(gemini_weekly, gemini_reset),
+        spent_windows(),
+    );
     let context = load(&harness, &quota, NOW);
-    assert_memory_matches_store(&harness, "after the reading was applied");
+    assert_memory_matches_store(&harness, "after the recheck was judged");
     assert_eq!(
         fenced_credentials(&harness, NOW),
-        vec![SPENT.to_owned()],
-        "fresh Gemini headroom clears the open account's Carbon fence; the spent \
-         Gemini pool keeps the other"
+        vec![OPEN.to_owned(), SPENT.to_owned()],
+        "a spent own pool never clears a fence"
     );
-    assert_eq!(carbon_account(&context).as_deref(), Some(OPEN_ACCOUNT));
+    carbon_account(&context).as_deref() == Some(OPEN_ACCOUNT)
+}
+
+/// A current reading showing the fence's own pool spent is evidence the pool
+/// is still spent, so it holds the 15-minute probe back.
+#[test]
+fn a_current_spent_own_pool_reading_holds_the_probe_back() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    assert!(!open_recheck_due(
+        100.0,
+        OPEN_GEMINI_RESET,
+        NOW - 5 * 60_000
+    ));
+}
+
+/// A reading that stopped arriving never holds the probe: once the spent
+/// reading is no longer fresh (older than routing's 20-minute band), the
+/// probe is due again.
+#[test]
+fn a_spent_own_pool_reading_no_longer_fresh_lets_the_probe_run() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    assert!(open_recheck_due(
+        100.0,
+        OPEN_GEMINI_RESET,
+        NOW - 21 * 60_000
+    ));
+}
+
+/// A spent reading whose own reset has passed says nothing about the pool
+/// now: the probe is due without waiting for the next reading.
+#[test]
+fn a_spent_own_pool_reading_past_its_reset_lets_the_probe_run() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    assert!(open_recheck_due(100.0, NOW - 60_000, NOW - 5 * 60_000));
 }
 
 #[test]
@@ -249,8 +346,9 @@ fn a_spent_third_party_pool_never_postpones_the_carbon_recheck() {
 /// Runners may send without account admission, so the selected decision must
 /// own the recovery probe: selecting Carbon claims the open account's overdue
 /// recheck for that decision, and the spent account's recheck stays unclaimed.
+/// The probe's success then clears the fence, long before its stored reset.
 #[tokio::test]
-async fn selecting_carbon_claims_the_due_recheck_for_its_decision() {
+async fn selecting_carbon_claims_the_due_recheck_and_its_success_clears_the_fence() {
     let _clock = crate::InjectedClock::set(NOW as u64);
     let harness = setup();
     let reported = NOW - QUOTA_FENCE_RECHECK_MS - 60_000;
@@ -287,4 +385,22 @@ async fn selecting_carbon_claims_the_due_recheck_for_its_decision() {
     };
     assert_eq!(claim(OPEN), (Some(decision.to_owned()), Some(NOW)));
     assert_eq!(claim(SPENT), (None, None));
+    let reported = caller
+        .call(
+            "route.report",
+            &json!({"decision_id":decision,"outcome":"completed"}),
+        )
+        .await;
+    assert_eq!(
+        reported.0,
+        subc_protocol::FrameType::Response,
+        "{}",
+        reported.1
+    );
+    assert_memory_matches_store(&harness, "after the probe succeeded");
+    assert_eq!(
+        fenced_credentials(&harness, NOW),
+        vec![SPENT.to_owned()],
+        "the successful probe clears its own fence and no other"
+    );
 }

@@ -2158,6 +2158,27 @@ impl ClassContext {
         origin: &striatum_store::FenceRecheck,
         account: &str,
     ) -> bool {
+        // A quota route fence on a pooled reading is held back only by its
+        // own pools: a spent pool the model never draws on must not stop its
+        // recheck.
+        if let Some(model) = origin
+            .model
+            .as_deref()
+            .filter(|_| origin.kind == "account_route")
+        {
+            let usage = crate::credential_fences::latest_reading_for_account(&self.quota, account)
+                .and_then(|reading| reading_usage(&reading.entry));
+            if route_is_pooled(usage.as_ref(), &origin.provider, model) {
+                return route_pool_spent(
+                    &self.quota,
+                    account,
+                    &origin.provider,
+                    model,
+                    self.config.quota_model_pools_ref(),
+                    self.now_ms,
+                );
+            }
+        }
         let policy = self.config.allocator_policy(&origin.provider);
         if !crate::credential_fences::current_quota_reading(
             &self.quota,
@@ -2167,55 +2188,12 @@ impl ClassContext {
         ) {
             return false;
         }
-        let latest = crate::credential_fences::latest_reading_for_account(&self.quota, account);
-        let reading =
-            latest.and_then(|reading| quota_reading_for_model(&reading.entry, account, None, &[]));
-        let fences = self
-            .fences
-            .get(&origin.provider)
-            .map_or(&[][..], Vec::as_slice);
-        // A quota route fence is held only by the pools its model draws on,
-        // and by standing blocks that restrict that model. A spent pool the
-        // model never draws on must not stop its recheck.
-        if let Some(model) = origin
-            .model
-            .as_deref()
-            .filter(|_| origin.kind == "account_route")
-        {
-            let usage = latest.and_then(|reading| reading_usage(&reading.entry));
-            if let Some(keys) = route_pool_keys(
-                usage.as_ref(),
-                &origin.provider,
-                model,
-                self.config.quota_model_pools_ref(),
-            ) {
-                let family = self
-                    .config
-                    .allocator_policy_ref(&origin.provider)
-                    .family_for_model(model);
-                let pool = request_pool(None, &origin.provider, model);
-                let mut relevant = route_pool_blocks(account, keys, origin.evidence_at);
-                relevant.extend(
-                    fences
-                        .iter()
-                        .filter(|fence| {
-                            fence.account_id == account
-                                && fence.applies_to(model, family, pool.as_deref())
-                        })
-                        .cloned(),
-                );
-                return reading_binds(
-                    &relevant.iter().collect::<Vec<_>>(),
-                    reading.as_ref(),
-                    self.now_ms,
-                    &policy,
-                );
-            }
-        }
+        let reading = crate::credential_fences::latest_reading_for_account(&self.quota, account)
+            .and_then(|reading| quota_reading_for_model(&reading.entry, account, None, &[]));
         quota_reading_binds_origin(
             origin,
             account,
-            fences,
+            self.fences.get(&origin.provider).map_or(&[], Vec::as_slice),
             reading.as_ref(),
             self.now_ms,
             &policy,
@@ -4236,24 +4214,12 @@ fn quota_reading_binds_origin(
     } else {
         relevant
     };
-    reading_binds(&relevant, reading, now, policy)
-}
-
-/// Whether a reading keeps these blocks' probe from being due: current pressure
-/// on one of their pools, or recovery of all of them (which the next load
-/// turns into a clear instead of a probe). No blocks bind nothing.
-fn reading_binds(
-    relevant: &[&Fence],
-    reading: Option<&QuotaReading>,
-    now: i64,
-    policy: &AllocatorPolicy,
-) -> bool {
-    !relevant.is_empty()
-        && (relevant.iter().any(|fence| {
-            striatum_core::accounts::pools::binding_pressure(fence, reading, now, policy)
-        }) || relevant
+    relevant
+        .iter()
+        .any(|fence| striatum_core::accounts::pools::binding_pressure(fence, reading, now, policy))
+        || relevant
             .iter()
-            .all(|fence| block_end(fence, reading, now, policy).is_some()))
+            .all(|fence| block_end(fence, reading, now, policy).is_some())
 }
 
 /// Bring the standing blocks on `provider` up to date with the accounts'
@@ -4314,52 +4280,22 @@ pub(crate) fn refresh_all_blocks(
     })
 }
 
-/// The pools whose windows speak for one quota route fence, as block keys.
-///
-/// `None` when the account's reading meters the account as a whole: it has no
-/// Antigravity pool windows and the route needs none, so every window speaks
-/// for every route. Otherwise the list holds the pools of the reading that
-/// this route's model draws on: its family pool (`gemini` for an Antigravity
-/// Gemini model) and any model-specific pool from `quota_model_pools`. An
-/// empty list means routing cannot tell which reported pool the model draws
-/// on; no reading may then hold or clear the fence, and its quota recheck
-/// (every 15 minutes) decides instead.
-fn route_pool_keys(
+/// Whether one route is judged by its own quota pools rather than by the
+/// whole account: the account's reading has Antigravity pool windows, or the
+/// route is one that needs a pool. Readings that meter the whole account
+/// (aggregate windows only) keep the whole-account rules.
+fn route_is_pooled(
     usage: Option<&striatum_core::quota::Usage>,
     provider: &str,
     model: &str,
-    model_pools: &[striatum_core::quota_extract::ModelPool],
-) -> Option<Vec<striatum_core::accounts::PoolKey>> {
-    let capacity = format!("{provider}/{model}");
-    let windows = usage
-        .map(striatum_core::quota_extract::named_account_windows)
-        .unwrap_or_default();
-    if !windows.iter().any(|(pool, _)| pool.is_some())
-        && !striatum_core::quota_extract::requires_account_pool(&capacity)
-    {
-        return None;
-    }
-    let names: BTreeSet<&str> = windows
-        .iter()
-        .filter_map(|(pool, _)| *pool)
-        .filter(|pool| {
-            striatum_core::quota_extract::antigravity_capacity_draws_on_pool(
-                &capacity,
-                pool,
-                model_pools,
-            )
-        })
-        .collect();
-    Some(
-        names
-            .into_iter()
-            .map(|name| striatum_core::accounts::PoolKey {
-                window_minutes: None,
-                scope: striatum_core::accounts::PoolScope::EveryModel,
-                name: Some(name.into()),
-            })
-            .collect(),
-    )
+) -> bool {
+    usage.is_some_and(|usage| {
+        usage
+            .extra_rate_windows
+            .iter()
+            .flatten()
+            .any(striatum_core::quota_extract::is_account_pool_window)
+    }) || striatum_core::quota_extract::requires_account_pool(&format!("{provider}/{model}"))
 }
 
 /// The decoded usage of a stored reading, if it decodes.
@@ -4369,29 +4305,56 @@ fn reading_usage(entry: &Value) -> Option<striatum_core::quota::Usage> {
         .and_then(|entry| entry.usage)
 }
 
-/// One block per pool a route draws on, observed at `observed_at_ms`, so the
-/// ordinary block rules decide whether a reading holds or lifts the route.
-fn route_pool_blocks(
+/// A pool window under 100% used: evidence its pool can serve again.
+fn pool_window_open(window: &RateWindow) -> bool {
+    window.used_percent.is_finite() && (0.0..100.0).contains(&window.used_percent)
+}
+
+/// A pool window at or above 100% used whose reset has not yet passed.
+fn pool_window_spent(window: &RateWindow, now_ms: i64) -> bool {
+    window.used_percent.is_finite()
+        && window.used_percent >= 100.0
+        && window
+            .resets_at
+            .as_deref()
+            .and_then(account_quota::parse_rfc3339_ms)
+            .is_none_or(|reset| reset > now_ms)
+}
+
+/// Whether current evidence shows one pooled route's own pool spent, which
+/// keeps its quota recheck from coming due. The reading must be the account's
+/// latest and fresh (routing's one freshness band, `EXCLUDED_BAND_MS`), and
+/// the spent window's own reset must not have passed. Once the reading ages
+/// out of that band, or the reset passes with no newer reading, the 15-minute
+/// recheck runs again: a quota hold never waits on readings that stopped
+/// arriving. When routing reads no pool for the model, nothing holds the
+/// recheck back.
+fn route_pool_spent(
+    quota: &AccountQuotaState,
     account: &str,
-    keys: Vec<striatum_core::accounts::PoolKey>,
-    observed_at_ms: i64,
-) -> Vec<Fence> {
-    keys.into_iter()
-        .map(|key| Fence {
-            account_id: account.into(),
-            pool: Some(key),
-            recovery_set: Vec::new(),
-            observed_at_ms,
-            reset: ResetTime::Missing,
-            retry_hint_ms: None,
-            source: ConfirmationSource::BrocaAccountLimit,
-        })
-        .collect()
+    provider: &str,
+    model: &str,
+    model_pools: &[striatum_core::quota_extract::ModelPool],
+    now_ms: i64,
+) -> bool {
+    crate::credential_fences::fresh_route_windows(
+        quota,
+        account,
+        &format!("{provider}/{model}"),
+        model_pools,
+        now_ms,
+    )
+    .is_some_and(|(_, windows)| {
+        windows
+            .iter()
+            .any(|window| pool_window_spent(window, now_ms))
+    })
 }
 
 /// The latest reset of a fresh exhausted window that speaks for one quota
-/// route fence. A route drawing on named pools takes only those pools' resets;
-/// a spent pool the model does not draw on never moves its check time.
+/// route fence. A pooled route takes only its own pools' resets; a spent pool
+/// the model does not draw on never moves its check time. A reset only
+/// schedules an extra check; it never holds the fence.
 fn route_exhausted_reset(
     quota: &AccountQuotaState,
     account_ids: &crate::broca_credentials::CredentialAccounts,
@@ -4404,20 +4367,28 @@ fn route_exhausted_reset(
     let policy = config.allocator_policy(&fence.provider);
     let usage = crate::credential_fences::latest_fresh_entry(quota, &account, now_ms)
         .and_then(|entry| entry.usage);
-    let model_pools = config.quota_model_pools_ref();
-    if route_pool_keys(usage.as_ref(), &fence.provider, &fence.model, model_pools).is_none() {
+    if !route_is_pooled(usage.as_ref(), &fence.provider, &fence.model) {
         return crate::credential_fences::exhausted_quota_reset_for_account(
             quota, &account, now_ms, &policy,
         );
     }
-    crate::credential_fences::exhausted_route_reset_for_account(
+    let (_, windows) = crate::credential_fences::fresh_route_windows(
         quota,
         &account,
         &format!("{}/{}", fence.provider, fence.model),
-        model_pools,
+        config.quota_model_pools_ref(),
         now_ms,
-        &policy,
-    )
+    )?;
+    windows
+        .iter()
+        .filter(|window| pool_window_spent(window, now_ms))
+        .filter_map(|window| {
+            window
+                .resets_at
+                .as_deref()
+                .and_then(account_quota::parse_rfc3339_ms)
+        })
+        .max()
 }
 
 /// What a newer reading proves about one quota route fence.
@@ -4447,66 +4418,57 @@ fn route_fence_recovery(
     config: &crate::config_overrides::LiveConfig,
     now_ms: i64,
 ) -> RouteRecovery {
-    let reading = quota_reading_for_model(&latest.entry, account, None, &[]);
     let policy = config.allocator_policy(&fence.provider);
-    let stored_block = |block: &AccountPoolFenceRow| {
-        serde_json::from_str::<Fence>(&block.evidence.fence_json)
-            .ok()
-            .map(|mut evidence| {
-                evidence.pool = block.pool_key.clone();
-                evidence.recovery_set = block.recovery_set.clone();
-                evidence.observed_at_ms = evidence.observed_at_ms.max(newest_report);
-                evidence
-            })
-    };
-    let lifted = |block: &Fence| block_end(block, reading.as_ref(), now_ms, &policy).is_some();
-    let usage = reading_usage(&latest.entry);
-    let Some(keys) = route_pool_keys(
-        usage.as_ref(),
+    if route_is_pooled(
+        reading_usage(&latest.entry).as_ref(),
         &fence.provider,
         &fence.model,
-        config.quota_model_pools_ref(),
-    ) else {
-        // A credential-wide clear requires newer evidence than every report
-        // and recovery of every retained pool, not just the route being scored.
-        let recovered = if blocks.is_empty() {
-            crate::credential_fences::fresh_headroom_after_for_account(
-                quota,
-                account,
-                newest_report,
-                now_ms,
-                &policy,
-            )
-        } else {
-            blocks
-                .iter()
-                .all(|block| stored_block(block).is_some_and(|block| lifted(&block)))
-        };
+    ) {
+        // A pooled route clears as soon as a fresh reading taken after the
+        // refusal shows every pool its model draws on under 100% used. Pools
+        // the model never draws on neither hold nor clear it, and when the
+        // reading names no pool for the model nothing clears by reading: the
+        // 15-minute recheck decides. Standing account blocks keep their own
+        // rules and still restrict admission on their own.
+        let recovered = crate::credential_fences::fresh_route_windows(
+            quota,
+            account,
+            &format!("{}/{}", fence.provider, fence.model),
+            config.quota_model_pools_ref(),
+            now_ms,
+        )
+        .is_some_and(|(fetched, windows)| {
+            fetched > newest_report && !windows.is_empty() && windows.iter().all(pool_window_open)
+        });
         return if recovered {
-            RouteRecovery::Account
+            RouteRecovery::Route
         } else {
             RouteRecovery::Unproven
         };
+    }
+    // A credential-wide clear requires newer evidence than every report and
+    // recovery of every retained pool, not just the route being scored.
+    let reading = quota_reading_for_model(&latest.entry, account, None, &[]);
+    let recovered = if blocks.is_empty() {
+        crate::credential_fences::fresh_headroom_after_for_account(
+            quota,
+            account,
+            newest_report,
+            now_ms,
+            &policy,
+        )
+    } else {
+        blocks.iter().all(|block| {
+            serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(|mut evidence| {
+                evidence.pool = block.pool_key.clone();
+                evidence.recovery_set = block.recovery_set.clone();
+                evidence.observed_at_ms = evidence.observed_at_ms.max(newest_report);
+                block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
+            })
+        })
     };
-    // A pooled route recovers when every pool it draws on reads above reserve
-    // and every standing block that restricts this model has lifted. Pools the
-    // model never draws on neither hold nor clear it.
-    let family = config
-        .allocator_policy_ref(&fence.provider)
-        .family_for_model(&fence.model);
-    let pool = request_pool(None, &fence.provider, &fence.model);
-    let recovered = !keys.is_empty()
-        && route_pool_blocks(account, keys, newest_report)
-            .iter()
-            .all(lifted)
-        && blocks.iter().all(|block| match stored_block(block) {
-            Some(block) => {
-                !block.applies_to(&fence.model, family, pool.as_deref()) || lifted(&block)
-            }
-            None => false,
-        });
     if recovered {
-        RouteRecovery::Route
+        RouteRecovery::Account
     } else {
         RouteRecovery::Unproven
     }
