@@ -182,6 +182,12 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
     for origin in &retiring {
         state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
         state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
+    }
+    // Validate the whole captured plan before retirement triggers remove any
+    // source. Otherwise retiring a provider makes a later route's dependency
+    // check mistake this command's own write for external staleness. The
+    // writer transaction excludes outside changes between checks and writes.
+    for origin in &retiring {
         tx.conn.execute(
             "INSERT INTO retirement_tombstone VALUES (?1,?2,?3,?4,?5)
              ON CONFLICT(kind,origin_key,evidence) DO NOTHING",

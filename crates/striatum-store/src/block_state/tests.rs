@@ -3394,6 +3394,116 @@ fn sync_retires_provider_and_independent_route_without_invalidating_its_own_stat
     rig.check(&[deadline + 1], "after retiring both independent sources");
 }
 
+/// Give the tick an externally superseded snapshot to exercise its keyed
+/// guards independently of the writer's earlier data-version refresh. A
+/// nontransactional counter also catches attempted tombstones rolled back
+/// later: checking only final SQL would miss those writes.
+#[test]
+fn retirement_preflight_rejects_each_stale_input_before_any_tombstone() {
+    let observed = crate::now_ms();
+    let deadline = observed + 5_000;
+    let mut cases = Vec::new();
+    for (input, stale_index) in ["source", "clock"]
+        .into_iter()
+        .flat_map(|input| (0..3).map(move |index| (input, index)))
+    {
+        let name = format!("retirement-preflight-{input}-{stale_index}");
+        let legacy = legacy_sync_rig(&name);
+        for index in 0..3 {
+            legacy.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+                VALUES ('retire-{index}',{deadline},{observed},'provider capacity',{observed},{observed});"));
+        }
+        let rig = upgrade_sync_rig(legacy, &name);
+        let stale = rig.published();
+        let order: Vec<_> = stale
+            .view_origins_in_scan_order()
+            .into_iter()
+            .map(|row| row.origin_key)
+            .collect();
+        assert_eq!(
+            order,
+            (0..3)
+                .map(|index| serde_json::json!([format!("retire-{index}")]).to_string())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(stale.stored_clocks().count(), 0);
+        // The real outside commit changes source or clock data in place. Keep the store's
+        // published state fresh; only the guard-level tick gets the old copy.
+        let conn = Connection::open(rig._scratch.path().join("state.db")).unwrap();
+        let changed = if input == "source" {
+            "evidence=evidence||' '"
+        } else {
+            "managed=1,next_recheck_at=deadline"
+        };
+        conn.execute(
+            &format!(
+                "UPDATE block SET {changed} WHERE kind='provider' AND origin_key=json_array(?1)"
+            ),
+            [format!("retire-{stale_index}")],
+        )
+        .unwrap();
+        drop(conn);
+        rig.reload();
+        assert_eq!(rig.published(), rig.fresh());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = attempts.clone();
+        rig.run(move |conn| {
+            let count = count.clone();
+            conn.create_scalar_function("count_retirement_attempt", 0, rusqlite::functions::FunctionFlags::SQLITE_UTF8, move |_| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Ok(0i64)
+            })?;
+            conn.execute_batch("CREATE TEMP TRIGGER count_retirement_attempt BEFORE INSERT ON main.retirement_tombstone BEGIN SELECT count_retirement_attempt(); END;")
+        });
+        cases.push((rig, stale, attempts, input, stale_index));
+    }
+    assert!(
+        crate::now_ms() < deadline,
+        "all fixtures migrated before expiry"
+    );
+    let remaining = (deadline + 1).saturating_sub(crate::now_ms());
+    if remaining > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(remaining as u64));
+    }
+    for (rig, stale, attempts, input, stale_index) in cases {
+        let before = rig.published();
+        let error = rig
+            .store
+            .account_command(AccountCommandKind::Tick, move |tx| {
+                let tick = crate::AccountTx::with_blocks(tx.conn, Some(&stale));
+                let error = tick
+                    .tick(crate::now_ms())
+                    .expect_err("an external source change must reject the captured plan");
+                Ok(error.to_string())
+            })
+            .unwrap();
+        assert!(error.contains("account state diverged from SQL"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "the {} of provider [\"retire-{stale_index}\"] differs",
+                if input == "source" { "source" } else { "clock" }
+            )),
+            "{error}"
+        );
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            0,
+            "stale {input} {stale_index}: no tombstone was attempted, even before rollback"
+        );
+        let tombstones: i64 = rig
+            .store
+            .with_reader_for_test(|conn| {
+                conn.query_row("SELECT count(*) FROM retirement_tombstone", [], |row| {
+                    row.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(tombstones, 0);
+        assert_eq!(rig.published(), before, "tick left memory unchanged");
+        assert_eq!(rig.fresh(), before, "tick left SQL unchanged");
+    }
+}
+
 fn upgrade_sync_rig(rig: Rig, name: &str) -> Rig {
     let Rig {
         store,
