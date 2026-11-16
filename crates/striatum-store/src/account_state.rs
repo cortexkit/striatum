@@ -95,17 +95,28 @@ impl WriterAccountState {
                 return Ok(None);
             }
             // A full load takes seconds at live size and holds the writer.
-            // Outside the first load at startup, each one is worth an
-            // operator's attention, so it is logged at the default level.
-            tracing::warn!(
-                requested,
-                block_write_outside_command = outside,
-                missing_state = self.working.is_none(),
-                generation = self.generation,
-                previous_data_version = ?self.data_version,
-                data_version = version,
-                "reloading account state before batch"
-            );
+            // The first one, at startup, is expected; every later one is worth
+            // an operator's attention, so it is logged at the default level.
+            if self.data_version.is_none() {
+                tracing::info!(
+                    requested,
+                    block_write_outside_command = outside,
+                    missing_state = self.working.is_none(),
+                    generation = self.generation,
+                    data_version = version,
+                    "loading account state before the first batch"
+                );
+            } else {
+                tracing::warn!(
+                    requested,
+                    block_write_outside_command = outside,
+                    missing_state = self.working.is_none(),
+                    generation = self.generation,
+                    previous_data_version = ?self.data_version,
+                    data_version = version,
+                    "reloading account state before batch"
+                );
+            }
             self.loads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tx =
