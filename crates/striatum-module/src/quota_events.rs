@@ -43,8 +43,26 @@ impl SnapshotSchedule {
     fn set_attached(&mut self, attached: bool, now: Instant) {
         if self.attached != attached {
             self.attached = attached;
+            // A lost binding may follow a long event-only period. Recover a
+            // fresh snapshot now rather than retaining the ten-minute deadline.
             self.next = now;
+            crate::info_operator(format!(
+                "[striatum] quota source={}",
+                if attached {
+                    "insula events (10m snapshot backstop)"
+                } else {
+                    "usage.get fallback (60s)"
+                }
+            ));
         }
+    }
+    fn observe_binding(
+        &mut self,
+        cache: &SharedQuotaCache,
+        reconnect: &mut quota_bus::reconnect::Backoff,
+        now: Instant,
+    ) {
+        self.set_attached(observe_binding(cache, reconnect, now), now);
     }
     fn due(&self, now: Instant) -> bool {
         now >= self.next
@@ -812,8 +830,6 @@ async fn delivery_loop(
                 match result {
                     Ok(attached) => {
                         bus = Some(attached);
-                        live.attached(true, None);
-                        schedule.set_attached(true, Instant::now());
                         unbound_since = None;
                     }
                     Err(error) => {
@@ -822,7 +838,7 @@ async fn delivery_loop(
                 }
             }
         }
-        observe_binding(&live.cache, &mut reconnect, Instant::now());
+        schedule.observe_binding(&live.cache, &mut reconnect, Instant::now());
         poll_if_due(&mut source, &live, &mut schedule, Instant::now()).await;
         let Some(attached) = bus.as_mut() else {
             let error = live
@@ -869,7 +885,6 @@ async fn delivery_loop(
                     );
                     reconnect.failed(Instant::now());
                     unbound_since.get_or_insert_with(Instant::now);
-                    schedule.set_attached(false, Instant::now());
                     continue;
                 }
             };
@@ -941,7 +956,6 @@ async fn delivery_loop(
             bus = None;
             quota_bus::unbound(&handler, &error);
             unbound_since.get_or_insert_with(Instant::now);
-            schedule.set_attached(false, Instant::now());
             reconnect.failed(Instant::now());
         }
     }
@@ -973,7 +987,7 @@ pub(crate) fn observe_binding(
     cache: &SharedQuotaCache,
     reconnect: &mut quota_bus::reconnect::Backoff,
     now: Instant,
-) {
+) -> bool {
     let bound_since = cache.lock().ok().and_then(|mut cache| {
         if cache
             .consumer
@@ -987,6 +1001,7 @@ pub(crate) fn observe_binding(
         }
     });
     reconnect.observe_bound(now, bound_since);
+    bound_since.is_some()
 }
 
 #[cfg(test)]
