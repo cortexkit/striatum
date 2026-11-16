@@ -142,6 +142,52 @@ fn context(fixture: &bench::RequestFixture) -> ClassContext {
     .unwrap()
 }
 
+struct ParityIdentity<'a> {
+    account: &'a str,
+    row: &'a cortexkit_claustrum_client::ListedCredential,
+    fact: &'a striatum_core::ModelFact,
+    source: bool,
+}
+
+fn compare_identity(
+    new: &ClassContext,
+    old: &ClassContext,
+    reference_origins: &[usize],
+    identity: &ParityIdentity<'_>,
+) {
+    let ParityIdentity {
+        account,
+        row,
+        fact,
+        source,
+    } = identity;
+    let provider = &fact.provider_id;
+    let credential = &row.id;
+    let model = &fact.model_id;
+    let at = new.now_ms;
+    let owner = &new.probe_owner;
+    let continuation = new.continuation_credential.is_some();
+    let media = new.media_route;
+    for (origin, &reference_index) in new.rechecks.iter().zip(reference_origins) {
+        let reference_origin = &old.rechecks[reference_index];
+        assert_eq!(
+            new.origin_applies(origin, provider, account, credential, model),
+            old_applies(old, reference_origin, provider, account, credential, model),
+            "origin_applies source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media} origin={origin:?}"
+        );
+    }
+    assert_eq!(
+        new.probe_eligible(provider, model, credential),
+        old_probe(old, provider, model, credential),
+        "probe source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media}"
+    );
+    assert_eq!(
+        new.eligible(row, fact),
+        old_eligible(old, row, fact),
+        "eligible source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media}"
+    );
+}
+
 fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
     let now = bench::FIXTURE_NOW as i64;
     let report = fixture.store().block_parity(now).unwrap();
@@ -158,78 +204,103 @@ fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
     current.replace_rechecks(loaded.blocks.iter().map(FenceRecheck::from).collect());
     let times = fixture.store().block_parity_times(now).unwrap();
     let source_identities = fixture.store().block_parity_identities().unwrap();
-    let mut comparisons = 0_u64;
-    for at in times {
-        for owner in [None, Some("parity-owner"), Some("parity-other-owner")] {
-            for continuation in [false, true] {
-                for media in [false, true] {
-                    let mut new = current.clone();
-                    let mut old = reference.clone();
-                    for c in [&mut new, &mut old] {
-                        c.now_ms = at;
-                        c.probe_owner = owner.map(String::from);
-                        c.continuation_credential =
-                            continuation.then(|| c.credentials.listed_credentials()[0].id.clone());
-                        c.media_route = media;
-                    }
-                    for [provider, account, credential, model] in &source_identities {
-                        for origin in &new.rechecks {
-                            let reference_origin = old
-                                .rechecks
-                                .iter()
-                                .find(|r| {
-                                    r.kind == origin.kind && r.origin_key == origin.origin_key
-                                })
-                                .unwrap();
-                            assert_eq!(
-                                new.origin_applies(origin, provider, account, credential, model),
-                                old_applies(
-                                    &old,
-                                    reference_origin,
-                                    provider,
-                                    account,
-                                    credential,
-                                    model
-                                ),
-                                "source identity {provider}/{account}/{credential}/{model} at {at}"
-                            );
-                        }
-                        assert_eq!(
-                            new.probe_eligible(provider, model, credential),
-                            old_probe(&old, provider, model, credential)
-                        );
-                        let mut row = new.credentials.listed_credentials()[0].clone();
-                        row.id = credential.clone();
-                        let mut fact = new.facts[0].clone();
-                        fact.provider_id = provider.clone();
-                        fact.model_id = model.clone();
-                        assert_eq!(new.eligible(&row, &fact), old_eligible(&old, &row, &fact));
-                        comparisons += 1;
-                    }
-                    for row in new.credentials.listed_credentials() {
-                        for fact in &new.facts {
-                            let account = new.account_id(row);
-                            for origin in &new.rechecks {
-                                let reference_origin = old
-                                    .rechecks
-                                    .iter()
-                                    .find(|r| {
-                                        r.kind == origin.kind && r.origin_key == origin.origin_key
-                                    })
-                                    .unwrap();
-                                assert_eq!(new.origin_applies(origin,&fact.provider_id,account,&row.id,&fact.model_id),old_applies(&old,reference_origin,&fact.provider_id,account,&row.id,&fact.model_id),"origin_applies now={at} owner={owner:?} continuation={continuation} media={media} origin={origin:?}");
+    // The reference lookup and synthetic rows depend only on the fixture, not
+    // on the time or policy inputs. Keep them out of the comparison loop.
+    let reference_origins: Vec<_> = current
+        .rechecks
+        .iter()
+        .map(|origin| {
+            reference
+                .rechecks
+                .iter()
+                .position(|r| r.kind == origin.kind && r.origin_key == origin.origin_key)
+                .unwrap()
+        })
+        .collect();
+    let source_rows: Vec<_> = source_identities
+        .iter()
+        .map(|[provider, _, credential, model]| {
+            let mut row = current.credentials.listed_credentials()[0].clone();
+            row.id = credential.clone();
+            let mut fact = current.facts[0].clone();
+            fact.provider_id = provider.clone();
+            fact.model_id = model.clone();
+            (row, fact)
+        })
+        .collect();
+    let mut identities: Vec<_> = source_identities
+        .iter()
+        .zip(&source_rows)
+        .map(|([_, account, _, _], (row, fact))| ParityIdentity {
+            account,
+            row,
+            fact,
+            source: true,
+        })
+        .collect();
+    for row in current.credentials.listed_credentials() {
+        for fact in &current.facts {
+            identities.push(ParityIdentity {
+                account: current.account_id(row),
+                row,
+                fact,
+                source: false,
+            });
+        }
+    }
+    let expected = times.len() as u64 * 3 * 2 * 2 * identities.len() as u64;
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(8);
+    let chunk_size = identities.len().div_ceil(workers).max(1);
+    let comparisons: u64 = std::thread::scope(|scope| {
+        let mut threads = Vec::new();
+        for chunk in identities.chunks(chunk_size) {
+            // ClassContext has worker-local lazy indexes. Share immutable
+            // identities, but retain a separate context pair for each worker.
+            let current = current.clone();
+            let reference = reference.clone();
+            let times = &times;
+            let reference_origins = &reference_origins;
+            threads.push(scope.spawn(move || {
+                let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+                let mut comparisons = 0_u64;
+                for &at in times {
+                    for owner in [None, Some("parity-owner"), Some("parity-other-owner")] {
+                        for continuation in [false, true] {
+                            for media in [false, true] {
+                                let mut new = current.clone();
+                                let mut old = reference.clone();
+                                for c in [&mut new, &mut old] {
+                                    c.now_ms = at;
+                                    c.probe_owner = owner.map(String::from);
+                                    c.continuation_credential = continuation
+                                        .then(|| c.credentials.listed_credentials()[0].id.clone());
+                                    c.media_route = media;
+                                }
+                                for identity in chunk {
+                                    compare_identity(&new, &old, reference_origins, identity);
+                                    comparisons += 1;
+                                }
                             }
-                            assert_eq!(new.probe_eligible(&fact.provider_id,&fact.model_id,&row.id),old_probe(&old,&fact.provider_id,&fact.model_id,&row.id),"probe now={at} owner={owner:?} continuation={continuation} media={media} credential={} model={}",row.id,fact.model_id);
-                            assert_eq!(new.eligible(row,fact),old_eligible(&old,row,fact),"eligible now={at} owner={owner:?} continuation={continuation} media={media} credential={} model={}",row.id,fact.model_id);
-                            comparisons += 1;
                         }
                     }
                 }
-            }
+                comparisons
+            }));
         }
-    }
+        threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .sum()
+    });
+    assert_eq!(comparisons, expected);
     assert!(comparisons > 0);
-    println!("full ClassContext parity: {comparisons} identity/context combinations");
+    println!(
+        "full ClassContext parity: {comparisons} identity/context combinations, {} predicate comparisons, {} workers",
+        comparisons * (reference_origins.len() as u64 + 2),
+        identities.len().div_ceil(chunk_size)
+    );
 }
 
 fn smoke() -> bench::FixtureCounts {
