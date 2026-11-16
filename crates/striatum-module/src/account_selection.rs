@@ -13503,10 +13503,14 @@ mod tests {
         })
     }
 
+    /// A refusal that names no pool on a pooled (Antigravity) account blocks
+    /// the pool the refused model draws on. A spent pool the model never draws
+    /// on neither holds nor lifts that block; a fresh reading of its own pool
+    /// with headroom lifts it.
     #[test]
-    fn a_no_pool_block_lifts_only_on_a_reading_reporting_every_recorded_pool() {
+    fn a_no_pool_refusal_on_a_pooled_account_blocks_and_lifts_by_the_refused_models_pool() {
         let both = [("gemini-5h", 10.0, 300), ("3p-weekly", 20.0, 10080)];
-        let mut rig = provider_fixture(
+        let rig = provider_fixture(
             "recovery-set",
             "antigravity",
             vec![pooled_entry(ACCOUNT_A, "2026-09-29T11:59:00Z", &both)],
@@ -13526,11 +13530,14 @@ mod tests {
             Value::Null,
         );
         let fence = &observed["observation"]["effects"][0]["fence"];
-        assert_eq!(fence["pool"], Value::Null);
         assert_eq!(
-            fence["recovery_set"].as_array().map(Vec::len),
-            Some(2),
-            "both pools of the latest fresh reading: {fence}"
+            fence["pool"],
+            json!({"window_minutes": null, "scope": {"kind": "every_model"}, "name": "gemini"}),
+            "the refused model's pool: {fence}"
+        );
+        assert!(
+            fence["recovery_set"].as_array().is_none_or(Vec::is_empty),
+            "{fence}"
         );
         let read = |rig: &Fixture, fetched_at: &str, windows: &[(&str, f64, i64)]| {
             let body = json!({"result": [pooled_entry(ACCOUNT_A, fetched_at, windows)]});
@@ -13553,29 +13560,26 @@ mod tests {
             });
             rig.call(&rig.ctx(true, now), ACCOUNT_FOR_OP, BROCA, retry)
         };
-        let gemini_only = [("gemini-5h", 10.0, 300)];
-        // A newer fresh reading with headroom in one pool, omitting the other.
-        read(&rig, "2026-09-29T12:02:00Z", &gemini_only);
-        assert!(admit(&rig, NOW + 3 * 60_000, "pool-2").code().is_some());
-        // The same partial reading again, after a restart.
-        rig.reopen();
-        read(&rig, "2026-09-29T12:04:00Z", &gemini_only);
-        assert!(admit(&rig, NOW + 5 * 60_000, "pool-3").code().is_some());
-        // Headroom in one pool but not the other.
+        // The refused model's own pool is still spent.
         read(
             &rig,
-            "2026-09-29T12:06:00Z",
+            "2026-09-29T12:02:00Z",
+            &[("gemini-5h", 100.0, 300), ("3p-weekly", 20.0, 10080)],
+        );
+        assert!(admit(&rig, NOW + 3 * 60_000, "pool-2").code().is_some());
+        // Its own pool has headroom while the other pool is spent: the block
+        // lifts.
+        read(
+            &rig,
+            "2026-09-29T12:04:00Z",
             &[("gemini-5h", 10.0, 300), ("3p-weekly", 100.0, 10080)],
         );
-        assert!(admit(&rig, NOW + 7 * 60_000, "pool-4").code().is_some());
-        // Both pools above reserve: the block lifts.
-        read(&rig, "2026-09-29T12:08:00Z", &both);
-        let lifted = result(admit(&rig, NOW + 9 * 60_000, "pool-5"));
+        let lifted = result(admit(&rig, NOW + 5 * 60_000, "pool-3"));
         assert_eq!(lifted["account"]["account_id"], ACCOUNT_A);
     }
 
     #[test]
-    fn missing_recovery_pool_headroom_does_not_suppress_the_quota_probe() {
+    fn a_spent_pool_reading_out_of_the_freshness_band_does_not_suppress_its_probe() {
         let rig = provider_fixture(
             "partial-reading-probe",
             "antigravity",
@@ -13598,10 +13602,13 @@ mod tests {
             Value::Null,
             Value::Null,
         );
+        // A newer reading shows the block's own pool spent. Once that reading
+        // ages out of the freshness band it no longer holds the due probe:
+        // a hold never waits on readings that stopped arriving.
         let partial = pooled_entry(
             ACCOUNT_A,
             "2026-09-29T12:15:00Z",
-            &[("gemini-5h", 10.0, 300)],
+            &[("gemini-5h", 100.0, 300), ("3p-weekly", 20.0, 10080)],
         );
         account_quota::apply_usage_reply(
             &mut rig.accounts.lock().unwrap(),
@@ -13613,19 +13620,19 @@ mod tests {
         params["candidates"] = json!({"view_digest":"runner-view","accounts":[{
             "account_id":first["account"]["account_id"],"credential_id":first["account"]["credential_id"]}]});
         let probe = rig.call(
-            &rig.ctx(true, NOW + 16 * 60_000),
+            &rig.ctx(true, NOW + 36 * 60_000),
             ACCOUNT_FOR_OP,
             BROCA,
             params.clone(),
         );
         assert!(
             probe.code().is_none(),
-            "a partial healthy reading must not disable the due probe: {probe:?}"
+            "a spent reading out of the freshness band must not disable the due probe: {probe:?}"
         );
         params["admission_id"] = json!("partial-second");
         assert!(rig
             .call(
-                &rig.ctx(true, NOW + 16 * 60_000),
+                &rig.ctx(true, NOW + 36 * 60_000),
                 ACCOUNT_FOR_OP,
                 BROCA,
                 params
