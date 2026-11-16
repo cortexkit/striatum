@@ -3981,7 +3981,7 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
 /// SQLite's plan for it searches the watched tables by an index or primary
 /// key and never scans one.
 #[test]
-fn every_exempt_read_is_keyed() {
+fn every_native_exempt_read_is_keyed() {
     let rig = rig("block-state-exempt-reads-keyed");
     let scans = rig
         .store
@@ -4015,7 +4015,7 @@ fn every_exempt_read_is_keyed() {
         "exempt reads that scan:\n{}",
         scans.join("\n")
     );
-    assert!(reviewed_exempt_reads().len() >= 30);
+    assert_eq!(reviewed_exempt_reads().len(), 23);
 }
 
 /// A new clock's schedule computed on the state equals SQLite's, up to the

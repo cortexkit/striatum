@@ -435,24 +435,7 @@ pub fn reviewed_exempt_reads() -> Vec<String> {
     reads.push(exclusions_check_sql());
     reads.push(success_pools_check_sql());
     reads.push(by_origin_check_sql(CLOCK_TABLE));
-    reads.push(fence_rechecks::authorization_check_sql());
-    reads.push(fence_rechecks::probe_clock_check_sql());
-    reads.push(fence_rechecks::no_authorized_clock_check_sql(false));
-    reads.push(fence_rechecks::no_authorized_clock_check_sql(true));
-    reads.push(fence_rechecks::unstarted_admission_check_sql());
-    reads.extend(
-        [
-            crate::ROUTE_READ_PROVIDER_PRIOR_OBSERVED,
-            crate::ROUTE_READ_PROVIDER_INHERITED_ROUTES,
-            crate::ROUTE_READ_PROVIDER_EXISTING,
-            crate::ROUTE_READ_ROUTE_PRIOR_OBSERVED,
-            crate::ROUTE_READ_ROUTE_EXISTING,
-            crate::ROUTE_READ_ROUTE_PROVIDER_ROW,
-            crate::ROUTE_READ_OUTCOME_FAILURE_STATE,
-            crate::ROUTE_READ_CLEAR_FAILURE_STATE,
-        ]
-        .map(str::to_owned),
-    );
+    reads.extend(keyed_sql::reads());
     reads
 }
 
@@ -2354,3 +2337,10 @@ pub(crate) fn expect_changes(
 #[path = "empty_provider/tests.rs"]
 #[cfg(test)]
 mod empty_provider;
+
+#[path = "keyed_reads/tests.rs"]
+#[cfg(test)]
+mod keyed_reads;
+
+#[path = "keyed_sql/tests.rs"]
+mod keyed_sql;

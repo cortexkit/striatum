@@ -688,29 +688,30 @@ mod tests {
                 conn.execute_batch(
                     "CREATE TABLE trace_scratch(x); CREATE TABLE trace_log(n);
                      CREATE TRIGGER trace_scratch_reads AFTER INSERT ON trace_scratch
-                     BEGIN INSERT INTO trace_log SELECT count(*) FROM fence_recheck; END;
-                     CREATE VIEW trace_keys AS SELECT credential_id FROM pool_key_state;",
+                     BEGIN INSERT INTO trace_log SELECT count(*) FROM block; END;
+                     CREATE VIEW trace_keys AS SELECT credential_id FROM pool_key_state;
+                     CREATE VIEW trace_blocks AS SELECT origin_key FROM block;",
                 )
             })
             .unwrap();
         let trace = store.trace_block_reads_for_test().unwrap();
         let reads = [
-            "SELECT count(*) FROM sqlite_master, \"fence_recheck\"",
+            "SELECT count(*) FROM sqlite_master, \"block\"",
             "SELECT count(*) FROM main.pool_key_state",
-            "SELECT count(*) FROM fence_origin",
-            "UPDATE trace_log SET n=1 WHERE n IN (SELECT walled_until FROM pool_key_state)",
+            "SELECT count(*) FROM trace_blocks",
+            "UPDATE trace_log SET n=1 WHERE n IN (SELECT last_used_at FROM pool_key_state)",
             "INSERT INTO pool_key_state(provider,credential_id,updated_at) SELECT provider,credential_id||'x',updated_at FROM pool_key_state WHERE 0",
             "INSERT INTO trace_scratch VALUES (1)",
-            "-- a statement that starts with a comment\nSELECT count(*) FROM fence_recheck",
-            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM \"pool_key_state\")",
-            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM main.pool_key_state)",
-            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT n FROM trace_log , pool_key_state)",
+            "-- a statement that starts with a comment\nSELECT count(*) FROM block",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE credential_id IN (SELECT credential_id FROM \"pool_key_state\")",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE credential_id IN (SELECT credential_id FROM main.pool_key_state)",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE credential_id IN (SELECT n FROM trace_log , pool_key_state)",
             // A write reading other rows of its own target, spelled so no
             // text match finds the target after `FROM`: a comment between,
             // a parenthesised table, and a view over the target.
-            "UPDATE pool_key_state SET walled_until=(SELECT max(walled_until) FROM/*x*/pool_key_state)",
-            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM (pool_key_state))",
-            "UPDATE pool_key_state SET walled_until=1 WHERE credential_id IN (SELECT credential_id FROM trace_keys)",
+            "UPDATE pool_key_state SET last_used_at=(SELECT max(last_used_at) FROM/*x*/pool_key_state)",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE credential_id IN (SELECT credential_id FROM (pool_key_state))",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE credential_id IN (SELECT credential_id FROM trace_keys)",
         ];
         for sql in reads {
             store
@@ -719,7 +720,7 @@ mod tests {
             assert_eq!(trace.take().writer.len(), 1, "a read: {sql}");
         }
         for sql in [
-            "UPDATE pool_key_state SET walled_until=1 WHERE provider='p' AND credential_id='c'",
+            "UPDATE pool_key_state SET last_used_at=1 WHERE provider='p' AND credential_id='c'",
             "INSERT INTO pool_key_state(provider,credential_id,updated_at) VALUES ('p','c',1)
                ON CONFLICT(provider,credential_id) DO UPDATE SET updated_at=excluded.updated_at
                WHERE excluded.updated_at>=pool_key_state.updated_at",

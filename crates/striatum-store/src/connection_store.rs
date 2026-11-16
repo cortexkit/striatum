@@ -4,6 +4,18 @@
 use super::*;
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
+const ACCOUNT_COPY_BLOCK_TABLES: [&str; 8] = [
+    "block",
+    "probe_authorization",
+    "success_proof",
+    "retirement_tombstone",
+    "pool_key_state",
+    "provider_cooldown_state",
+    "model_route_state",
+    "account_eligibility",
+];
+
 // Durable stores keep the shared library's lease and pooled reads unchanged.
 // A projection needs neither a lease file nor a migration/seed pass.
 enum Backend {
@@ -475,25 +487,12 @@ impl SqliteRouteStateStore {
     /// The pooled, read-only transaction ends before constructing the copy.
     #[cfg(any(test, feature = "test-support"))]
     pub fn private_account_copy_for_test(&self, now_ms: i64) -> RouteStateResult<Self> {
-        let tables = [
+        let mut tables = ACCOUNT_COPY_BLOCK_TABLES
+            .map(|table| (table, "1".to_string()))
+            .to_vec();
+        tables.extend([
             ("model_facts", "1".to_string()),
             ("routing_operator_decommissioned", "1".to_string()),
-            ("fence_recheck", "1".to_string()),
-            ("fence_recheck_route_clear", "1".to_string()),
-            ("fence_success_pool", "1".to_string()),
-            ("fence_probe_authorization", "1".to_string()),
-            ("fence_retired_origin", "1".to_string()),
-            ("account_non_quota_route_fence", "1".to_string()),
-            ("account_non_quota_size_refusal", "1".to_string()),
-            ("account_transient_backoff", "1".to_string()),
-            ("account_principal_exclusion", "1".to_string()),
-            ("model_route_state", "1".to_string()),
-            ("provider_cooldown_state", "1".to_string()),
-            ("credential_entitlement_fences", "1".to_string()),
-            ("account_eligibility", "1".to_string()),
-            ("account_size_refusal", "1".to_string()),
-            ("account_route_fence", "1".to_string()),
-            ("account_fence", "cleared_at IS NULL".to_string()),
             (
                 "account_admission",
                 "state IN ('reserved','started')".to_string(),
@@ -510,16 +509,16 @@ impl SqliteRouteStateStore {
                     now_ms.saturating_sub(24 * 60 * 60_000)
                 ),
             ),
-            ("pool_key_state", "1".to_string()),
             (
                 "pool_key_lease",
                 format!("released_at IS NULL AND valid_until>{now_ms}"),
             ),
-        ];
-        let (copied, origin_view, fence_triggers) = self
+        ]);
+        let (copied, indexes, fence_triggers) = self
             .store
             .with_read(|source| {
                 let mut copied = Vec::new();
+                let mut indexes = Vec::new();
                 for (table, predicate) in &tables {
                     let schema = source.query_row(
                         "SELECT sql FROM sqlite_master WHERE type='table' AND name=?1",
@@ -531,8 +530,17 @@ impl SqliteRouteStateStore {
                         Err(rusqlite::Error::QueryReturnedNoRows) => continue,
                         Err(error) => return Err(error),
                     };
-                    let mut query =
-                        source.prepare(&format!("SELECT * FROM {table} WHERE {predicate}"))?;
+                    let mut info = source.prepare(&format!("PRAGMA table_xinfo({table})"))?;
+                    let writable = info.query_map([], |row| {
+                        Ok((row.get::<_,String>(1)?,row.get::<_,i64>(6)?))
+                    })?.filter_map(|row| match row {
+                        Ok((name,0)) => Some(Ok(format!("\"{}\"",name.replace('"',"\"\"")))),
+                        Ok(_) => None,
+                        Err(error) => Some(Err(error)),
+                    }).collect::<rusqlite::Result<Vec<_>>>()?.join(",");
+                    let mut query = source.prepare(&format!(
+                        "SELECT {writable} FROM {table} WHERE {predicate}"
+                    ))?;
                     let columns = query.column_count();
                     let rows = query
                         .query_map([], |row| {
@@ -541,26 +549,23 @@ impl SqliteRouteStateStore {
                                 .collect::<rusqlite::Result<Vec<_>>>()
                         })?
                         .collect::<rusqlite::Result<Vec<_>>>()?;
-                    copied.push((*table, schema, columns, rows));
+                    copied.push((*table, schema, writable, columns, rows));
+                    let mut statement = source.prepare(
+                        "SELECT sql FROM sqlite_schema WHERE type='index' AND tbl_name=?1 AND sql IS NOT NULL ORDER BY name"
+                    )?;
+                    indexes.extend(statement.query_map([table], |row| row.get::<_,String>(0))?
+                        .collect::<rusqlite::Result<Vec<_>>>()?);
                 }
-                let origin_view = source
-                    .query_row(
-                        "SELECT sql FROM sqlite_schema WHERE type='view' AND name='fence_origin'",
-                        [],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?;
-                // Fence writers rely on these triggers to retire enforcement and
-                // keep route provenance; without them the copy diverges from the
-                // live outcome. Both reference only tables copied above.
+                // Copy enforcement only after restoring rows, so restoration cannot retire evidence.
                 let mut statement = source.prepare(
                     "SELECT sql FROM sqlite_schema WHERE type='trigger' AND name IN
-                     ('fence_retire_enforcement','model_route_state_inherit_fence_scope')",
+                     ('model_facts_inherit_provider_cooldown','retirement_tombstone_enforce',
+                      'block_retirement_insert','block_retirement_update','block_clock_drop') ORDER BY name",
                 )?;
                 let fence_triggers = statement
                     .query_map([], |row| row.get::<_, String>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok((copied, origin_view, fence_triggers))
+                Ok((copied, indexes, fence_triggers))
             })
             .map_err(err)?;
         let store =
@@ -569,17 +574,18 @@ impl SqliteRouteStateStore {
             .with_conn(|destination| {
                 destination.pragma_update(None, "foreign_keys", false)?;
                 let tx = crate::write_transaction(destination)?;
-                for (table, schema, columns, rows) in copied {
+                for (table, schema, writable, columns, rows) in copied {
                     tx.execute_batch(&schema)?;
                     let placeholders = (0..columns).map(|_| "?").collect::<Vec<_>>().join(",");
-                    let mut insert =
-                        tx.prepare(&format!("INSERT INTO {table} VALUES ({placeholders})"))?;
+                    let mut insert = tx.prepare(&format!(
+                        "INSERT INTO {table} ({writable}) VALUES ({placeholders})"
+                    ))?;
                     for row in rows {
                         insert.execute(rusqlite::params_from_iter(row))?;
                     }
                 }
-                if let Some(view) = origin_view {
-                    tx.execute_batch(&view)?;
+                for index in indexes {
+                    tx.execute_batch(&index)?;
                 }
                 for trigger in fence_triggers {
                     tx.execute_batch(&trigger)?;
@@ -607,6 +613,14 @@ mod tests {
     /// the enforcement row. A missing table or trigger fails selection outright.
     #[test]
     fn snapshot_carries_fence_archive_authorizations_and_triggers() {
+        let mut copied_tables = ACCOUNT_COPY_BLOCK_TABLES.to_vec();
+        let mut native_tables = crate::block_state::BLOCK_TABLES.to_vec();
+        copied_tables.sort();
+        native_tables.sort();
+        assert_eq!(
+            copied_tables, native_tables,
+            "the disposable copy must cover every native block table"
+        );
         let scratch = cortexkit_test_support::ScratchDir::new("evaluation-snapshot-fences");
         let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
             "evaluation-snapshot-fences",
@@ -618,20 +632,21 @@ mod tests {
             .store
             .with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at,wall_observed_at)
-                     VALUES ('legacy',?1,100,100)",
+                    "INSERT INTO block(kind,origin_key,provider,evidence,evidence_at,deadline,cooldown_until,observed_at,next_recheck_at)
+                     VALUES ('provider',json_array('legacy'),'legacy',json_array(?1,NULL,100),100,?1,?1,100,?1)",
                     [now - 10_000],
                 )?;
                 conn.execute(
-                    "INSERT INTO fence_probe_authorization VALUES ('owner','provider','[\"other\"]','e',1,2,3)",
+                    "INSERT INTO probe_authorization VALUES ('owner','provider','[\"other\"]','e',1,2,3)",
                     [],
                 )
             })
             .unwrap();
 
         let snapshot = store.private_account_copy_for_test(now).unwrap();
+        assert_eq!(count(&snapshot,"SELECT count(*) FROM sqlite_schema WHERE name IN ('account_fence','credential_entitlement_fences','account_route_fence','account_non_quota_route_fence','account_size_refusal','account_non_quota_size_refusal','account_principal_exclusion','account_transient_backoff','fence_recheck','fence_probe_authorization','fence_recheck_route_clear','fence_success_pool','fence_retired_origin','fence_origin','fence_retire_enforcement','model_route_state_inherit_fence_scope')"),0,"the disposable copy has no frozen compatibility relations or legacy enforcement triggers");
         assert_eq!(
-            count(&snapshot, "SELECT COUNT(*) FROM fence_probe_authorization"),
+            count(&snapshot, "SELECT COUNT(*) FROM probe_authorization"),
             1
         );
         snapshot
@@ -641,13 +656,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            count(&snapshot, "SELECT COUNT(*) FROM fence_retired_origin"),
+            count(&snapshot, "SELECT COUNT(*) FROM retirement_tombstone"),
             1
         );
         assert_eq!(
             count(
                 &snapshot,
-                "SELECT COUNT(*) FROM provider_cooldown_state WHERE cooldown_until IS NOT NULL"
+                "SELECT COUNT(*) FROM block WHERE kind='provider' AND source_present=1 AND cooldown_until IS NOT NULL"
             ),
             0,
             "the retirement trigger lifts the copied enforcement row"
@@ -655,10 +670,26 @@ mod tests {
         assert_eq!(
             count(
                 &store,
-                "SELECT COUNT(*) FROM provider_cooldown_state WHERE cooldown_until IS NOT NULL"
+                "SELECT COUNT(*) FROM block WHERE kind='provider' AND source_present=1 AND cooldown_until IS NOT NULL"
             ),
             1,
             "the source store is untouched"
+        );
+        let indexes = |store: &SqliteRouteStateStore| {
+            store.with_reader_for_test(|conn| {
+                conn.prepare("SELECT name,sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL AND tbl_name IN ('block','probe_authorization','success_proof','retirement_tombstone','pool_key_state','provider_cooldown_state','model_route_state','account_eligibility') ORDER BY name")?
+                    .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            }).unwrap()
+        };
+        let source_indexes = indexes(&store);
+        assert!(source_indexes
+            .iter()
+            .any(|(name, _)| name == "observation_retirement_guard"));
+        assert_eq!(
+            indexes(&snapshot),
+            source_indexes,
+            "owned native indexes survive the disposable copy"
         );
     }
 }
