@@ -1987,15 +1987,26 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         .iter()
         .copied()
         .collect();
+    // Reader readiness is checked at runtime, not in the static serving list.
+    let stream = cortexkit_role_routing::capabilities::ROUTE_FACT_STREAM;
+    assert!(
+        known.contains(stream),
+        "the bus capability must be a known role group"
+    );
+    assert!(
+        !advertised.contains(stream),
+        "the bus capability must never be advertised statically"
+    );
     let expected: std::collections::BTreeSet<_> = known
         .iter()
         .copied()
+        .filter(|group| *group != stream)
         .filter(|group| !PENDING_READERS.iter().any(|(pending, _)| pending == group))
         .chain(ROUTING_EXTENSIONS.iter().copied())
         .collect();
     assert_eq!(
         advertised, expected,
-        "only the named pending readers may be unadvertised"
+        "only the named pending readers and runtime-gated bus capability may be absent from the static list"
     );
     for group in ROUTING_EXTENSIONS {
         assert!(
