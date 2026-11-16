@@ -1214,11 +1214,20 @@ fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission(
 /// A refusal of credential `c` on provider `p0`, two hours old, whose
 /// one-hour probe is due at `NOW`, with its clock stored.
 fn due_credential_refusal(rig: &Rig, credential: &str) {
-    rig.sql(format!(
-        "INSERT INTO credential_entitlement_fences VALUES ('p0','{credential}','billing_exhausted',NULL,{});",
-        NOW - 2 * 3_600_000
-    ));
-    rig.run(fence_rechecks::sync);
+    rig.store
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "p0".into(),
+                credential_id: credential.into(),
+                code: "billing_exhausted".into(),
+            },
+            None,
+            NOW - 2 * 3_600_000,
+        )
+        .unwrap();
+    rig.store
+        .account_transaction(|tx| fence_rechecks::sync_on(tx, NOW).map_err(err))
+        .unwrap();
 }
 
 impl Rig {
@@ -1294,7 +1303,9 @@ fn a_probe_answer_on_a_clock_whose_owner_changed_unseen_runs_again() {
         .unwrap());
     UNSEEN.with(|unseen| unseen.set(true));
     rig.store
-        .bypass_account_writer_for_test("UPDATE fence_recheck SET claim_owner='another';")
+        .bypass_account_writer_for_test(
+            "UPDATE block SET claim_owner='another' WHERE managed=1 AND is_origin=1;",
+        )
         .unwrap();
     UNSEEN.with(|unseen| unseen.set(false));
     let loads = rig.decide_next_on(rig.published());
@@ -1343,19 +1354,19 @@ fn an_admission_release_the_state_calls_superseded_runs_again_on_a_fresh_load() 
     // A state whose clock is one generation past the admission's, while
     // SQL keeps the admission's generation.
     rig.sql(
-        "UPDATE fence_recheck SET claim_generation=claim_generation+1 WHERE kind='credential';"
+        "UPDATE block SET claim_generation=claim_generation+1 WHERE kind='credential' AND managed=1 AND is_origin=1;"
             .into(),
     );
     let superseded = rig.published();
     rig.sql(
-        "UPDATE fence_recheck SET claim_generation=claim_generation-1 WHERE kind='credential';"
+        "UPDATE block SET claim_generation=claim_generation-1 WHERE kind='credential' AND managed=1 AND is_origin=1;"
             .into(),
     );
     let generation = |rig: &Rig| {
         rig.store
             .with_reader_for_test(|conn| {
                 conn.query_row(
-                    "SELECT claim_generation,claim_owner FROM fence_recheck WHERE kind='credential'",
+                    "SELECT claim_generation,claim_owner FROM block WHERE kind='credential' AND managed=1 AND is_origin=1",
                     [],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
@@ -1400,7 +1411,7 @@ fn a_rebind_leaves_no_clock_claimed_by_the_old_owner() {
         .unwrap());
     let before_the_second = rig.published();
     rig.sql(format!(
-        "UPDATE fence_recheck SET claim_owner='selection' WHERE kind='credential' AND origin_key='{}';",
+        "UPDATE block SET claim_owner='selection' WHERE kind='credential' AND origin_key='{}' AND managed=1 AND is_origin=1;",
         origins[1].origin_key
     ));
     let claimed = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
@@ -1415,9 +1426,11 @@ fn a_rebind_leaves_no_clock_claimed_by_the_old_owner() {
     let owners = rig
         .store
         .with_reader_for_test(|conn| {
-            conn.prepare("SELECT claim_owner FROM fence_recheck ORDER BY origin_key")?
-                .query_map([], |r| r.get::<_, Option<String>>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()
+            conn.prepare(
+                "SELECT claim_owner FROM block WHERE managed=1 AND is_origin=1 ORDER BY origin_key",
+            )?
+            .query_map([], |r| r.get::<_, Option<String>>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()
         })
         .unwrap();
     assert_eq!(
@@ -4209,11 +4222,21 @@ fn the_route_state_writers_read_only_their_own_rows_through_reviewed_statements(
 fn an_exclusion_check_on_a_stale_state_runs_again_on_a_fresh_load() {
     let rig = rig("block-state-stale-exclusion");
     let stale = rig.published();
-    rig.sql(
-        "INSERT INTO account_principal_exclusion(principal,admission_id,credential_id,runner_view_digest,roster_view_digest,observation_id,recorded_at)
-         VALUES ('principal','admission','credential','runner','roster',NULL,1);"
-            .into(),
-    );
+    rig.run(|conn| {
+        let row = crate::block_storage::principal_source(
+            conn,
+            &crate::AccountExclusionRow {
+                principal: "principal".into(),
+                admission_id: "admission".into(),
+                credential_id: "credential".into(),
+                runner_view_digest: "runner".into(),
+                roster_view_digest: "roster".into(),
+                observation_id: None,
+                recorded_at: 1,
+            },
+        )?;
+        crate::block_storage::write_source(conn, &row).map(|_| ())
+    });
     let loads = rig.decide_next_on(stale);
     rig.store
         .account_command(AccountCommandKind::Maintenance, |tx| {
