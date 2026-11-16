@@ -130,6 +130,9 @@ async fn read_session(
 ) -> Result<(), String> {
     loop {
         let item = {
+            // A transport outage can leave next() waiting for the SDK's
+            // replacement connection. Quota fallback observes reader_bound;
+            // actual reader errors still end this session and unbind it.
             let next = reader.next();
             tokio::pin!(next);
             loop {
@@ -170,12 +173,6 @@ fn mark_bound(client: &BusClient, handler: &Handler, bound_revision: u64) {
     let mut revisions = client.connection_changes();
     let matches = *revisions.borrow_and_update() == bound_revision;
     if let Ok(mut cache) = handler.quota_cache.lock() {
-        // The source line is the operator's signal that quota readings come
-        // from Insula's events; `attached()` stays silent here because this
-        // has already flipped the flag it compares against.
-        if matches && !cache.consumer.attached {
-            eprintln!("[striatum] quota source=insula events (10m snapshot backstop)");
-        }
         cache.consumer.attached = matches;
         if matches {
             cache.consumer.last_error = None;
@@ -367,7 +364,7 @@ impl StreamCursor for Cursor<'_> {
     async fn term(&mut self, _: Option<&str>) -> BusResult<()> {
         self.event.term().await.map_err(bus_error)
     }
-    // Snapshot reads do not settle the notice; SDK 0.1.1 has no progress ACK.
+    // Snapshot reads do not settle the notice; the SDK has no progress ACK.
     async fn in_progress(&mut self) -> BusResult<()> {
         Ok(())
     }

@@ -1265,7 +1265,8 @@ async fn run(config: ModuleConfig) -> Result<(), ModuleError> {
 
     // Quota delivery runs off the selection hot path. Bus notices fetch bodies
     // over independent outbound insula connections; route.select only reads the
-    // cache. A bus outage switches delivery to usage.get snapshots.
+    // cache. An unbound reader switches delivery to 60-second usage.get snapshots,
+    // even when the SDK waits for a replacement connection without returning an error.
     let quota_cache: SharedQuotaCache = Arc::new(Mutex::new(QuotaCache::default()));
     let catalog_health: SharedCatalogHealth = Arc::new(Mutex::new(CatalogReachHealth::new(
         config_overrides::DEFAULT_CATALOG_POLL_MS,

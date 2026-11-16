@@ -1523,6 +1523,233 @@ async fn poll_fallback_engages_when_down_and_stops_when_attached() {
     assert_eq!(metrics["consumer"]["lag"], Value::Null);
 }
 
+async fn serve_nats_connection(
+    listener: &tokio::net::TcpListener,
+    stop: impl std::future::Future<Output = ()>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let (stream, _) = listener.accept().await.unwrap();
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(b"INFO {\"server_id\":\"quota-test\",\"version\":\"2.10.0\",\"proto\":1,\"max_payload\":1048576}\r\n")
+        .await
+        .unwrap();
+    let mut read = BufReader::new(read);
+    let mut line = String::new();
+    tokio::pin!(stop);
+    loop {
+        line.clear();
+        tokio::select! {
+            _ = &mut stop => return,
+            read = read.read_line(&mut line) => {
+                if read.unwrap() == 0 {
+                    return;
+                }
+                if line == "PING\r\n" {
+                    write.write_all(b"PONG\r\n").await.unwrap();
+                }
+            }
+        }
+    }
+}
+
+async fn fact_stream_advertised(live: &LiveQuota) -> bool {
+    let handler = catalog_handler(live);
+    let deps = crate::routing_v1::Deps {
+        quota_cache: &live.cache,
+        store: &live.store,
+        routing_config_path: &handler.config_path,
+        operator_config_path: &handler.config_path,
+        broca_credentials: &handler.credentials,
+    };
+    crate::routing_v1::answer(
+        "role.describe",
+        &json!({}),
+        &crate::routing_v1::Caller::for_event("broca"),
+        &deps,
+    )
+    .await
+    .unwrap()["capabilities"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("route_fact_stream"))
+}
+
+#[tokio::test]
+async fn silent_disconnect_switches_snapshot_schedule_and_source_until_reconnected() {
+    use async_nats::{connection::State, Event};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (disconnect, stop) = tokio::sync::oneshot::channel();
+    let (resume, restart) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_nats_connection(&listener, async { stop.await.unwrap() }).await;
+        restart.await.unwrap();
+        serve_nats_connection(&listener, std::future::pending()).await;
+    });
+    let (events, mut changes) = tokio::sync::mpsc::unbounded_channel();
+    let connection = async_nats::ConnectOptions::new()
+        .event_callback(move |event| {
+            let events = events.clone();
+            async move {
+                let _ = events.send(event);
+            }
+        })
+        .connect(address.to_string())
+        .await
+        .unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Connected) {}
+    let (_scratch, live) = fixture();
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+        cache.consumer.route_facts.connection = Some(connection.clone());
+    }
+    assert!(fact_stream_advertised(&live).await);
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut reconnect = quota_bus::reconnect::Backoff::new(start, 31);
+    let mut source = Source {
+        snapshot: snapshot_body(&body("epoch-z", 1, 10)),
+        ..Default::default()
+    };
+    crate::take_operator_infos();
+    schedule.observe_binding(&live.cache, &mut reconnect, start);
+    poll_if_due(&mut source, &live, &mut schedule, start).await;
+    assert_eq!(schedule.next, start + Duration::from_secs(600));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
+
+    disconnect.send(()).unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Disconnected) {}
+    assert_eq!(connection.connection_state(), State::Disconnected);
+    assert!(!fact_stream_advertised(&live).await);
+    let down = start + Duration::from_secs(1);
+    schedule.observe_binding(&live.cache, &mut reconnect, down);
+    assert!(
+        schedule.due(down),
+        "a silent outage must not retain the ten-minute deadline"
+    );
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=usage.get fallback (60s)"]
+    );
+    {
+        let cache = live.cache.lock().unwrap();
+        assert!(
+            cache.consumer.attached,
+            "the SDK reader has not returned an error"
+        );
+        assert_eq!(cache.consumer.last_error, None);
+        assert_eq!(cache.consumer.route_facts.bound_since, None);
+    }
+    poll_if_due(&mut source, &live, &mut schedule, down).await;
+    assert_eq!(source.snapshots, 2);
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    schedule.observe_binding(&live.cache, &mut reconnect, down + Duration::from_secs(59));
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        down + Duration::from_secs(59),
+    )
+    .await;
+    assert_eq!(source.snapshots, 2);
+    assert!(
+        crate::take_operator_infos().is_empty(),
+        "unchanged source stays quiet"
+    );
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        down + Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(source.snapshots, 3, "fallback continues once per minute");
+
+    resume.send(()).unwrap();
+    while !matches!(changes.recv().await.unwrap(), Event::Connected) {}
+    assert_eq!(connection.connection_state(), State::Connected);
+    assert!(fact_stream_advertised(&live).await);
+    let rebound = down + Duration::from_secs(61);
+    schedule.observe_binding(&live.cache, &mut reconnect, rebound);
+    poll_if_due(&mut source, &live, &mut schedule, rebound).await;
+    assert_eq!(schedule.next, rebound + Duration::from_secs(600));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
+    poll_if_due(
+        &mut source,
+        &live,
+        &mut schedule,
+        rebound + Duration::from_secs(60),
+    )
+    .await;
+    assert_eq!(source.snapshots, 4, "reconnecting stops minute polling");
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[test]
+fn revision_change_keeps_fallback_until_reader_rebinds() {
+    let (_scratch, live) = fixture();
+    let (revision, changes) = tokio::sync::watch::channel(0);
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.revisions = Some(changes);
+    }
+    let start = Instant::now();
+    let mut schedule = SnapshotSchedule::new(start);
+    let mut reconnect = quota_bus::reconnect::Backoff::new(start, 31);
+    crate::take_operator_infos();
+    schedule.observe_binding(&live.cache, &mut reconnect, start);
+    schedule.completed(start, true);
+    assert_eq!(schedule.next, start + Duration::from_secs(600));
+    crate::take_operator_infos();
+
+    revision.send_replace(1);
+    let down = start + Duration::from_secs(1);
+    schedule.observe_binding(&live.cache, &mut reconnect, down);
+    assert!(schedule.due(down));
+    schedule.completed(down, true);
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=usage.get fallback (60s)"]
+    );
+    schedule.observe_binding(&live.cache, &mut reconnect, down + Duration::from_secs(30));
+    assert_eq!(schedule.next, down + Duration::from_secs(60));
+    assert!(crate::take_operator_infos().is_empty());
+
+    live.cache
+        .lock()
+        .unwrap()
+        .consumer
+        .route_facts
+        .revisions
+        .as_mut()
+        .unwrap()
+        .borrow_and_update();
+    let rebound = down + Duration::from_secs(31);
+    schedule.observe_binding(&live.cache, &mut reconnect, rebound);
+    schedule.completed(rebound, true);
+    assert_eq!(schedule.next, rebound + Duration::from_secs(600));
+    assert_eq!(
+        live.cache.lock().unwrap().consumer.route_facts.bound_since,
+        Some(rebound)
+    );
+    assert_eq!(
+        crate::take_operator_infos(),
+        ["[striatum] quota source=insula events (10m snapshot backstop)"]
+    );
+}
+
 #[tokio::test]
 async fn incremental_event_keeps_restored_siblings_and_account_metadata() {
     let (_scratch, live) = fixture();
