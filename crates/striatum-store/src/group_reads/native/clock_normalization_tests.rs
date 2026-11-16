@@ -170,16 +170,19 @@ fn becoming_record_only_drops_the_clock_but_observation_source_removal_keeps_its
     trace.take();
     let key = "[\"observation-provider\",\"observation-account\"]";
     let prior = rig.published().clock("observation", key).unwrap().0.clone();
+    // Remove only source presence, not cleared_at/cleared_by, which mean
+    // the refusal was cleared. The observation's clock and claim metadata
+    // must survive a missing source.
     rig.store
         .account_command(AccountCommandKind::Repair, move |tx| {
-            crate::block_storage::remove_source(
-                tx.conn,
-                "observation",
-                key,
-                now,
-                "sparse source removed",
-            )
-            .map_err(crate::err)?;
+            let changed = tx
+                .conn
+                .execute(
+                    "UPDATE block SET source_present=0 WHERE kind='observation' AND origin_key=?1",
+                    [key],
+                )
+                .map_err(crate::err)?;
+            assert_eq!(changed, 1);
             Ok(())
         })
         .unwrap();
@@ -197,6 +200,7 @@ fn becoming_record_only_drops_the_clock_but_observation_source_removal_keeps_its
     let clock = state.clock("observation", key).unwrap().0;
     assert_eq!(clock.last_claimed_at, prior.last_claimed_at);
     assert_eq!(clock.claim_generation, prior.claim_generation);
+    assert_eq!(clock.claim_owner, prior.claim_owner);
 }
 
 #[test]
