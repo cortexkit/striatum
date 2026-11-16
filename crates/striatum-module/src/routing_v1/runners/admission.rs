@@ -126,7 +126,6 @@ async fn refresh_account_inputs(credentials: &crate::SharedBrocaCredentials) {
                     if needed {
                         let resolver = cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
                             path.clone(),
-                            std::env::current_dir().unwrap_or_else(|_| ".".into()),
                             "striatum",
                         );
                         if let Ok(listing) = resolver.list_scoped().await {

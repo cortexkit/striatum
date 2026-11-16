@@ -204,9 +204,6 @@ pub(super) async fn start(
         let roster_resolver: Arc<dyn cortexkit_claustrum_client::CredentialResolver> = Arc::new(
             cortexkit_claustrum_client::ClaustrumCredentialResolver::new(
                 config.connection_file_path.clone(),
-                std::env::current_dir().map_err(|error| {
-                    ModuleError::Message(format!("resolve routing roster project root: {error}"))
-                })?,
                 DEFAULT_MODULE_ID,
             ),
         );

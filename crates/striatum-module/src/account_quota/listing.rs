@@ -77,3 +77,54 @@ pub(crate) fn restore_credential_listing(
         _ => tracing::warn!("persisted credential listing invalid; awaiting a live listing"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_upgrade_preserves_listing_wire_bytes() {
+        // These are the persisted metadata fields read by routing before it serves
+        // requests. A client upgrade must not silently discard or normalize them.
+        let wire = json!({
+            "view": "c2NvcGVkLXZpZXc=",
+            "credentials": [{
+                "id": "claude-login", "categories": ["llm-provider", "llm-gateway"],
+                "type": "oauth", "serves": ["bearer"], "provider_ids": ["anthropic"],
+                "auth_method": "subscription", "refresh_adapter": "claude",
+                "state": "needs_reauth", "record_version": 42,
+                "operations": ["get", "list"], "account_id": "account-1",
+                "email": "person@example.test", "org_name": "Example",
+                "plan_tier": "max", "plan_tier_source": "provider"
+            }, {
+                "id": "gateway-key", "categories": ["llm-gateway"],
+                "type": "api_key", "serves": ["api_key"], "provider_ids": ["company"],
+                "auth_method": null, "refresh_adapter": null,
+                "state": "active", "record_version": 1, "operations": ["get"],
+                "account_id": null, "email": null, "org_name": null,
+                "plan_tier": null, "plan_tier_source": null
+            }],
+            "grant_tuples": [{"selector_kind": "category", "selector": "llm-provider", "operation": "list"},
+                {"selector_kind": "category", "selector": "llm-gateway", "operation": "list"}],
+            "undecodable_credentials": [], "undecodable_grants": []
+        });
+        let decoded = decode_list_scoped_reply(json!({"result": wire})).unwrap();
+        assert!(
+            decoded.undecodable_credentials.is_empty(),
+            "client rejected stored credential metadata: {:?}",
+            decoded.undecodable_credentials
+        );
+        assert!(
+            decoded.undecodable_grants.is_empty(),
+            "client rejected stored grants: {:?}",
+            decoded.undecodable_grants
+        );
+        assert_eq!(
+            serde_json::to_vec(&encode(&decoded)).unwrap(),
+            serde_json::to_vec(&wire).unwrap(),
+            "claustrum client changed routing's persisted list_scoped bytes"
+        );
+        let restored = decode_list_scoped_reply(json!({"result": encode(&decoded)})).unwrap();
+        assert_eq!(encode(&restored), wire);
+    }
+}
