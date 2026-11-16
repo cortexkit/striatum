@@ -141,6 +141,23 @@ impl Rig {
         self.run(move |conn| conn.execute_batch(&sql));
     }
 
+    /// Native structural parity does not compare against the frozen legacy
+    /// view: it checks every held row and its physical rowid fingerprint.
+    fn check_native(&self, context: &str) {
+        let memory = self.published();
+        assert_eq!(
+            memory,
+            self.fresh(),
+            "memory equals a fresh load: {context}"
+        );
+        let stored = self.store.with_reader_for_test(sql_fingerprints).unwrap();
+        assert_eq!(
+            memory.fingerprints(),
+            stored,
+            "held native counts and rowids: {context}"
+        );
+    }
+
     /// Memory equals a fresh load, its view rows equal SQLite's view, and its
     /// blocks equal the SQL adapter's at each time.
     fn check(&self, times: &[i64], context: &str) {
@@ -456,74 +473,74 @@ fn memory_matches_the_view_and_the_adapter_on_the_parity_fixture() {
 #[test]
 fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     let rig = rig("block-state-replace");
-    rig.sql(format!(
-        "INSERT INTO credential_entitlement_fences VALUES ('p','c','billing_exhausted',NULL,{NOW});"
-    ));
-    let before: i64 = rig
-        .store
-        .with_reader_for_test(|conn| {
-            conn.query_row("SELECT rowid FROM credential_entitlement_fences", [], |r| {
-                r.get(0)
+    let credential = |replace: &str, code: &str, recorded: i64| {
+        format!(
+            "INSERT {replace} INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,
+              quota,next_recheck_at,recorded_at,code)
+             VALUES ('credential',json_array('p','c'),'p','c',json_array('{code}',NULL,{recorded}),
+               {recorded},0,{recorded}+900000,{recorded},'{code}');"
+        )
+    };
+    rig.sql(credential("", "billing_exhausted", NOW));
+    let rowid = || {
+        rig.store
+            .with_reader_for_test(|conn| {
+                conn.query_row("SELECT rowid FROM block WHERE kind='credential'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
             })
-        })
-        .unwrap();
-    // The hook reports the insert of the new row but not the delete of the
-    // row it replaced.
-    rig.sql(format!(
-        "INSERT OR REPLACE INTO credential_entitlement_fences VALUES ('p','c','model_unsupported',NULL,{});",
-        NOW + 1
-    ));
-    let after: i64 = rig
-        .store
-        .with_reader_for_test(|conn| {
-            conn.query_row("SELECT rowid FROM credential_entitlement_fences", [], |r| {
-                r.get(0)
-            })
-        })
-        .unwrap();
+            .unwrap()
+    };
+    let before = rowid();
+    // SQLite reports the replacement insert, not the old row's deletion.
+    rig.sql(credential("OR REPLACE", "model_unsupported", NOW + 1));
+    let after = rowid();
     assert_ne!(before, after, "REPLACE gave the key a new rowid");
-    assert_eq!(
-        rig.published().table_sizes()[1],
-        ("credential_entitlement_fences", 1)
-    );
-    rig.check(&[NOW], "credential replaced");
-    // A replacement the view does not select must still evict the old row.
-    // (Every account route fence, pool key row and route row is held for its
-    // raw reader, so an account fence, held only while it is active, stands
-    // in: a cleared fence replaces it.)
+    assert_eq!(rig.published().entitlement_fences().len(), 1);
+    rig.check_native("credential replaced");
+    // An absent account source is not held, even when a replacement leaves
+    // its cleared audit row in durable storage.
     let fence = |cleared: &str| {
         format!(
-            "INSERT OR REPLACE INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at)
-             VALUES ('f','p','a','{{}}','{{}}','broca_account_limit',{NOW},'x',{NOW},NULL,'[]',{cleared});"
+            "INSERT OR REPLACE INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,
+              quota,next_recheck_at,observed_at,created_at,cleared_at,cleared_by,source_present,meta)
+             VALUES ('account',json_array('f'),'p','a','account-evidence',{NOW},1,{NOW}+900000,
+               {NOW},{NOW},{cleared},CASE WHEN {cleared} IS NULL THEN NULL ELSE 'removed' END,
+               {cleared} IS NULL,
+               '{{\"scope_json\":\"{{}}\",\"fence_json\":\"{{}}\",\"source\":\"broca_account_limit\",\"principal\":\"x\",\"admission_id\":null}}');"
         )
     };
     rig.sql(fence("NULL"));
-    assert_eq!(rig.published().table_sizes()[0], ("account_fence", 1));
+    assert_eq!(rig.published().active_fences("p").len(), 1);
     rig.sql(fence(&NOW.to_string()));
-    assert_eq!(rig.published().table_sizes()[0], ("account_fence", 0));
-    rig.check(&[NOW], "active fence replaced by a cleared one");
-    // A route fence outside the quota class is held, though not in the view.
-    rig.sql(format!(
-        "INSERT INTO account_route_fence VALUES ('p','c','m',{},'d',{NOW},{NOW},'quota');",
-        NOW + 60_000
-    ));
-    rig.sql(format!(
-        "INSERT OR REPLACE INTO account_route_fence VALUES ('p','c','m',{},'d',{NOW},{NOW},'transient');",
-        NOW + 60_000
-    ));
-    assert_eq!(rig.published().table_sizes()[2], ("account_route_fence", 1));
-    rig.check(&[NOW], "route fence replaced by a transient row");
+    assert_eq!(rig.published().active_fences("p").len(), 0);
+    rig.check_native("active fence replaced by a cleared one");
+    // A non-quota account-route source remains a held record, not an origin.
+    let route = |replace: &str, class: &str| {
+        format!(
+            "INSERT {replace} INTO block(kind,origin_key,provider,credential_id,model,evidence,
+              evidence_at,quota,next_recheck_at,deadline,recorded_at,last_reported_at,wall_class,meta)
+             VALUES ('account_route',json_array('p','c','m'),'p','c','m','route-evidence',
+               {NOW},1,{NOW}+60000,{NOW}+60000,{NOW},{NOW},'{class}','{{\"decision_id\":\"d\"}}');"
+        )
+    };
+    rig.sql(route("", "quota"));
+    rig.sql(route("OR REPLACE", "transient"));
+    assert_eq!(rig.published().route_fences("transient").len(), 1);
+    rig.check_native("route fence replaced by a transient row");
 }
 
-/// Every pool key row is held, walled or not. A key row replaced under the
-/// same key (a REPLACE gives it a new rowid without reporting the delete of
-/// the old one) is held as exactly one row: the new one, at its new rowid.
+/// Live pool-key metadata is held even without a wall. Replacing it moves
+/// the physical rowid but keeps exactly one held row for the same key.
 #[test]
 fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
     let rig = rig("block-state-pool-replace");
     rig.sql(format!(
-        "INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,updated_at) VALUES ('p','c',{},'billing',{NOW});",
-        NOW + 60_000
+        "INSERT INTO pool_key_state(provider,credential_id,updated_at) VALUES ('p','c',{NOW});
+         INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,quota,
+           next_recheck_at,deadline,reason,observed_at)
+         VALUES ('pool_billing',json_array('p','c'),'p','c','billing-evidence',{NOW},0,
+           {NOW}+60000,{NOW}+60000,'billing',{NOW});"
     ));
     let rowid = |rig: &Rig| -> i64 {
         rig.store
@@ -534,7 +551,9 @@ fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
     };
     let before = rowid(&rig);
     rig.sql(format!(
-        "INSERT OR REPLACE INTO pool_key_state(provider,credential_id,last_used_at,updated_at) VALUES ('p','c',{NOW},{NOW});"
+        "INSERT OR REPLACE INTO pool_key_state(provider,credential_id,last_used_at,updated_at) VALUES ('p','c',{NOW},{NOW});
+         UPDATE block SET source_present=0,cleared_at={NOW},cleared_by='removed'
+           WHERE kind='pool_billing' AND origin_key=json_array('p','c');"
     ));
     let after = rowid(&rig);
     assert_ne!(before, after, "REPLACE gave the key a new rowid");
@@ -549,7 +568,7 @@ fn a_replaced_pool_key_row_is_held_once_at_its_new_rowid() {
         state.fingerprints()[4] == (1, Some(after)),
         "held at its new rowid"
     );
-    rig.check(&[NOW], "pool key replaced");
+    rig.check_native("pool key replaced");
 }
 
 /// The update hook reports a REPLACE's insert but not the delete of the row
