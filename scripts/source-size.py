@@ -5,7 +5,10 @@ import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 LIMIT = 5000
-GENERATED_MARKERS = ("@generated", "automatically generated", "auto-generated", "do not edit")
+# Only the standard `@generated` header marks a file as generated. Looser phrases
+# such as "do not edit" also appear in hand-written comments and would let a
+# large hand-written file slip past the limit.
+GENERATED_MARKERS = ("@generated",)
 
 
 def exempt(path, source):

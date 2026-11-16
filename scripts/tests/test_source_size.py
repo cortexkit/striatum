@@ -9,7 +9,7 @@ GATE = runpy.run_path(str(ROOT / "scripts/source-size.py"))
 
 class SourceSizeGateTests(unittest.TestCase):
     def setUp(self):
-        scratch = Path(tempfile.gettempdir()) / "prefrontal-tests"
+        scratch = Path(tempfile.gettempdir()) / "striatum-tests"
         scratch.mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(prefix="source-size-", dir=scratch)
         self.addCleanup(self.directory.cleanup)
@@ -80,6 +80,12 @@ class SourceSizeGateTests(unittest.TestCase):
             self.source(name, 5001)
         self.source("crates/a/src/generated.rs", 5001, "// @generated\n")
         self.assertEqual(self.check(), ([], []))
+
+    def test_do_not_edit_comment_does_not_exempt(self):
+        self.source("crates/a/src/handwritten.rs", 5001, "// Do not edit this table by hand.\n")
+        errors, _ = self.check()
+        self.assertEqual(len(errors), 1)
+        self.assertIn("crates/a/src/handwritten.rs: 5001 lines", errors[0])
 
     def test_unterminated_last_line_counts(self):
         path = self.root / "crates/a.rs"
