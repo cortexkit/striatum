@@ -4,6 +4,10 @@ use striatum_core::route_state_store::CredentialRefusal;
 
 impl World {
     pub(super) async fn claims_group(&mut self, nonce: u64) {
+        self.claims_group_at_reload(nonce, false).await;
+    }
+
+    async fn claims_group_at_reload(&mut self, nonce: u64, reload: bool) {
         for mode in 0..5 {
             let originals = self
                 .catalog
@@ -55,6 +59,7 @@ impl World {
             });
             assert_eq!(origins.len(), 1);
             let owner = json!(["account_admission", principal, id]).to_string();
+            let claimed = origins.clone();
             match mode {
                 0 => {
                     let (p, c) = (admission.provider.clone(), admission.credential_id.clone());
@@ -90,6 +95,37 @@ impl World {
                     }));
                 }
                 _ => unreachable!(),
+            }
+            if reload {
+                self.reload();
+            }
+            match mode {
+                1 => assert!(
+                    !self.command("claim/not-due unowned origin is refused", move |tx| {
+                        striatum_store::AccountTx::claim_fence_rechecks(tx, &claimed, now)
+                    }),
+                    "a plain claim reused its newly renewed quota clock, reload={reload}"
+                ),
+                2 => assert!(
+                    !self.command("claim/not-due admission origin is refused", move |tx| {
+                        striatum_store::AccountTx::claim_fence_rechecks_for_admission(
+                            tx, &claimed, now, None,
+                        )
+                    }),
+                    "an unowned admission claim reused its newly renewed quota clock, reload={reload}"
+                ),
+                3 | 4 => {
+                    let authorized = owner.clone();
+                    assert!(
+                        !self.command("claim/not-due authorized admission is refused", move |tx| {
+                            striatum_store::AccountTx::claim_fence_rechecks_for_authorized_admission(
+                                tx, &claimed, now, None, &authorized,
+                            )
+                        }),
+                        "an unowned authorized claim reused its newly renewed quota clock, reload={reload}"
+                    );
+                }
+                _ => {}
             }
             if mode == 3 {
                 let (o, p) = (owner.clone(), admission.provider.clone());
@@ -134,5 +170,31 @@ impl World {
             }
             self.publish_catalog();
         }
+    }
+}
+
+#[tokio::test]
+async fn native_claim_decisions_refuse_a_second_unowned_claim_before_its_deadline() {
+    let _clock = crate::InjectedClock::set(START);
+    for reload in [false, true] {
+        let mut world = World::new(&format!("native-claim-outcomes-reload-{reload}")).await;
+        world.claims_group_at_reload(7, reload).await;
+        for name in [
+            "account_tx::fence_rechecks::claim_fence_rechecks",
+            "account_tx::fence_rechecks::claim_fence_rechecks_for_admission",
+            "account_tx::fence_rechecks::claim_fence_rechecks_for_authorized_admission",
+        ] {
+            assert!(
+                world
+                    .trace
+                    .entries()
+                    .iter()
+                    .filter(|entry| entry.name == name)
+                    .count()
+                    >= 2,
+                "both outcomes must call the real native claim producer: {name}, reload={reload}"
+            );
+        }
+        world.compare("all native claim outcomes checked");
     }
 }
