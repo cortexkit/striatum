@@ -534,24 +534,18 @@ mod account_fact_tests {
             "route-fence-preupgrade",
             scratch.path().join("store.db").to_string_lossy(),
         );
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
-        store
-            .record_account_route_fence(&AccountRouteFence {
-                provider: "p".into(),
-                credential_id: "c".into(),
-                model: "m".into(),
-                until_ms: 101,
-                recorded_at: 1,
-                decision_id: "preupgrade".into(),
-            })
-            .unwrap();
-        assert_eq!(store.account_route_fences(100).unwrap().len(), 1);
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 93).unwrap();
         store
             .store
-            .with_conn(|conn: &Connection| conn.execute_batch("DROP TABLE block"))
+            .with_conn(|conn: &Connection| {
+                assert!(!conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?);
+                conn.execute_batch("DROP TABLE account_route_fence")
+            })
             .unwrap();
-        drop(store);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         assert!(store.account_route_fences(100).unwrap().is_empty());
         assert!(store
             .account_route_fence_latest_reports()

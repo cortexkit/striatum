@@ -250,13 +250,17 @@ fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
         c.execute_batch("CREATE TABLE IF NOT EXISTS report_transition(kind TEXT NOT NULL);
             CREATE TRIGGER IF NOT EXISTS report_audit_outcome AFTER UPDATE OF outcome ON model_route_decisions BEGIN INSERT INTO report_transition VALUES ('outcome'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_continuation AFTER UPDATE OF used_at_ms ON account_continue BEGIN INSERT INTO report_transition VALUES ('continuation'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_route_insert AFTER INSERT ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE OF meta ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_credential_insert AFTER INSERT ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE OF meta ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_affinity AFTER UPDATE OF ended_at_ms ON routing_v1_affinity BEGIN INSERT INTO report_transition VALUES ('affinity'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_pool AFTER INSERT ON block WHEN NEW.kind='account' BEGIN INSERT INTO report_transition VALUES ('pool'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_usage AFTER INSERT ON model_route_usage BEGIN INSERT INTO report_transition VALUES ('usage'); END;")?;
+        // Schema-77 report-migration fixtures reuse this decision setup but
+        // predate block and never inspect the source-transition audit.
+        if c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')", [], |row|row.get::<_,bool>(0))? {
+            c.execute_batch("CREATE TRIGGER IF NOT EXISTS report_audit_route_insert AFTER INSERT ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE OF meta ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_credential_insert AFTER INSERT ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE OF meta ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_pool AFTER INSERT ON block WHEN NEW.kind='account' BEGIN INSERT INTO report_transition VALUES ('pool'); END;")?;
+        }
         c.execute("INSERT INTO routing_v1_affinity (principal,consumer,affinity,decision_id,updated_at_ms) VALUES (?1,'summary',?2,?2,1)",params![principal,id])?;
         c.execute("INSERT INTO account_continue (principal,selection_id,request_json,answer_json,run_id,admission_id,previous_decision_id,decision_id,valid_until_ms)
             VALUES (?1,?2,'{}','{}','run','admission','previous',?2,1000)",params![principal,id])?;
@@ -477,7 +481,7 @@ fn report_effect_source_updates_are_counted_once_without_their_clock_updates() {
     store
         .record_account_route_fence(&AccountRouteFence {
             provider: "example".into(),
-            credential_id: "key".into(),
+            credential_id: "credential".into(),
             model: "model".into(),
             until_ms: 101,
             recorded_at: 1,
@@ -488,7 +492,7 @@ fn report_effect_source_updates_are_counted_once_without_their_clock_updates() {
         .record_credential_entitlement_fence(
             &striatum_core::route_state_store::CredentialRefusal {
                 provider_id: "example".into(),
-                credential_id: "key".into(),
+                credential_id: "credential".into(),
                 code: "old-refusal".into(),
             },
             None,
