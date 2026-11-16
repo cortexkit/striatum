@@ -158,7 +158,7 @@ async fn consume(handler: &Handler, cursor: &mut Cursor, bytes: &[u8]) {
             &Delivery {
                 message,
                 body: bytes.to_vec(),
-                published_at_ms: NOW - 10,
+                published_at_ms: Some(NOW - 10),
                 delivery_count: 1,
             }
         )
@@ -208,7 +208,7 @@ async fn fact_duplicate_redelivery_applies_once() {
             &Delivery {
                 message: repeated.message,
                 body: bytes,
-                published_at_ms: NOW,
+                published_at_ms: Some(NOW),
                 delivery_count: repeated.delivery_count,
             },
         )
@@ -335,7 +335,7 @@ async fn fact_transient_redelivery_applies_exactly_once() {
             &Delivery {
                 message: repeated.message,
                 body: bytes.clone(),
-                published_at_ms: NOW,
+                published_at_ms: Some(NOW),
                 delivery_count: repeated.delivery_count,
             },
         )

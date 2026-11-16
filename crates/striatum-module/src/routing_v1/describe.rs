@@ -150,7 +150,9 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .ok()
         .is_some_and(|cache| cache.consumer.route_facts.ready(cache.consumer.attached))
     {
-        capabilities.to_mut().push("route_fact_stream");
+        capabilities
+            .to_mut()
+            .push(cortexkit_role_routing::capabilities::ROUTE_FACT_STREAM);
     }
     let mut describe = capabilities.iter().fold(
         RoleDescribe::new(consumers, true),

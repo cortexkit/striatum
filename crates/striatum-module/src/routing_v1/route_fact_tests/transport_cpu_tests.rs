@@ -16,6 +16,8 @@ async fn fact_transport_cpu_at_live_rate() {
             .await,
     );
     let handler = harness.fact_handler();
+    handler.quota_cache.lock().unwrap().consumer.attached = true;
+    let mut reconnect = crate::quota_bus::reconnect::Backoff::new(std::time::Instant::now(), 43);
     let (bus, mut cursor) = bus(&handler).await;
     let bytes = publish(&bus, "broca", "finish", &finish(false)).await;
     let store = handler.store.clone();
@@ -32,6 +34,7 @@ async fn fact_transport_cpu_at_live_rate() {
     waiting.recv().unwrap();
     let start = std::time::Instant::now();
     consume(&handler, &mut cursor, &bytes).await;
+    reconnect.healthy();
     let contention_ms = start.elapsed().as_secs_f64() * 1000.;
     contention.join().unwrap();
 
@@ -47,6 +50,11 @@ async fn fact_transport_cpu_at_live_rate() {
             _ = health.tick() => {},
             _ = tokio::time::sleep(Duration::from_secs(1)) => {},
         }
+        crate::quota_events::observe_binding(
+            &handler.quota_cache,
+            &mut reconnect,
+            std::time::Instant::now(),
+        );
     }
     let idle_cpu_us = cpu_us() - quiet_start;
     let mut interval = tokio::time::interval(Duration::from_millis(375));
@@ -59,6 +67,12 @@ async fn fact_transport_cpu_at_live_rate() {
         let bytes = publish(&bus, "broca", &format!("live-{number}"), &observation).await;
         let start = std::time::Instant::now();
         consume(&handler, &mut cursor, &bytes).await;
+        crate::quota_events::observe_binding(
+            &handler.quota_cache,
+            &mut reconnect,
+            std::time::Instant::now(),
+        );
+        reconnect.healthy();
         worst_ms = worst_ms.max(start.elapsed().as_secs_f64() * 1000.);
         if number % 8 == 0 {
             let report = json!({"op":"route.report", "params":{"decision_id":selected["decision_id"], "outcome":"completed", "usage":{"run_id":format!("report-{number}"), "output_tokens":20}}});
@@ -71,6 +85,12 @@ async fn fact_transport_cpu_at_live_rate() {
             .await;
             let start = std::time::Instant::now();
             consume(&handler, &mut cursor, &bytes).await;
+            crate::quota_events::observe_binding(
+                &handler.quota_cache,
+                &mut reconnect,
+                std::time::Instant::now(),
+            );
+            reconnect.healthy();
             worst_ms = worst_ms.max(start.elapsed().as_secs_f64() * 1000.);
         }
     }

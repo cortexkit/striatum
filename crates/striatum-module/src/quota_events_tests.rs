@@ -9,8 +9,251 @@ use std::sync::{
 use striatum_core::RouteStateStore as _;
 use striatum_store::{dev_descriptor, SqliteRouteStateStore};
 
+#[tokio::test(start_paused = true)]
+async fn metadata_timeouts_keep_insula_and_catalog_deliveries_alive_without_reconnect() {
+    struct Timeouts {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Timeouts {
+        async fn read(&mut self) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = crate::route_facts::Handler {
+        quota_cache: live.cache.clone(),
+        store: live.store.clone(),
+        credentials: Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        )),
+        config_path: PathBuf::new(),
+    };
+    let wake = handler.credentials.lock().unwrap().catalog_wake.clone();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(Instant::now(), 31);
+    let mut connects = 0;
+    reconnect
+        .attempt(Instant::now(), async {
+            connects += 1;
+            Ok(())
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+    }
+    let bus = bus();
+    let sample = body("epoch-z", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let catalog = br#"{"catalog_version":1}"#;
+    let _ = bus
+        .publish(
+            "ck.box_test.event.fusiform.catalog_changed.v1",
+            "catalog",
+            ContentDigest::of_bytes(catalog),
+            Headers::new(),
+        )
+        .await
+        .unwrap();
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut metadata = Timeouts {
+        calls: calls.clone(),
+    };
+    quota_bus::metadata::with_metadata(&mut metadata, &handler, async {
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        consume_one(
+            &mut cursor,
+            &mut source,
+            &live,
+            &mut SequenceState::default(),
+            SUBJECT,
+        )
+        .await
+        .map_err(|e| format!("{e:?}"))?;
+        let event = cursor.next().await.unwrap().unwrap();
+        handler
+            .consume(
+                &mut cursor,
+                &cortexkit_bus_naming::AccountNames::derive("box_test").unwrap(),
+                &crate::route_facts::Delivery {
+                    message: event.message,
+                    body: catalog.to_vec(),
+                    published_at_ms: Some(crate::now_ms()),
+                    delivery_count: event.delivery_count,
+                },
+            )
+            .await?;
+        Ok(())
+    })
+    .await
+    .expect("metadata failure must not tear down the reader session");
+    assert_eq!(connects, 1);
+    assert!(calls.load(Ordering::SeqCst) >= 1);
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (2, 0, 0));
+    assert_eq!(used(&live), 10.0);
+    assert!(tokio::time::timeout(Duration::ZERO, wake.notified())
+        .await
+        .is_ok());
+    let cache = live.cache.lock().unwrap();
+    assert!(cache.consumer.attached, "metadata is not reader liveness");
+    assert!(!cache.consumer.route_facts.ready(cache.consumer.attached));
+}
+
 const SUBJECT: &str = "ck.box_test.event.insula.quota_sampled.v1";
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
+
+fn catalog_handler(live: &LiveQuota) -> crate::route_facts::Handler {
+    crate::route_facts::Handler {
+        quota_cache: live.cache.clone(),
+        store: live.store.clone(),
+        credentials: Arc::new(Mutex::new(
+            crate::broca_credentials::BrocaCredentials::default(),
+        )),
+        config_path: PathBuf::new(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_metadata_does_not_delay_delivery_work() {
+    struct Pending;
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Pending {
+        async fn read(&mut self) -> Result<(), String> {
+            std::future::pending().await
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    let start = tokio::time::Instant::now();
+    quota_bus::metadata::with_metadata(&mut Pending, &handler, async {
+        assert_eq!(
+            tokio::time::Instant::now(),
+            start,
+            "delivery must not wait for the metadata timeout"
+        );
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_errors_back_off_thirty_seconds_to_ten_minutes() {
+    struct Refused {
+        attempts: Arc<Mutex<Vec<tokio::time::Instant>>>,
+    }
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Refused {
+        async fn read(&mut self) -> Result<(), String> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            Err("consumer-info permission denied".into())
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    live.cache.lock().unwrap().consumer.attached = true;
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let start = tokio::time::Instant::now();
+    quota_bus::metadata::with_metadata(
+        &mut Refused {
+            attempts: attempts.clone(),
+        },
+        &handler,
+        async {
+            tokio::time::sleep(Duration::from_secs(2000)).await;
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|at| at.duration_since(start).as_secs())
+            .collect::<Vec<_>>(),
+        [0, 30, 90, 210, 450, 930, 1530]
+    );
+    assert!(live.cache.lock().unwrap().consumer.attached);
+}
+
+#[tokio::test(start_paused = true)]
+async fn metadata_consumer_not_found_becomes_no_durable_binding_state() {
+    struct Absent;
+    #[async_trait::async_trait]
+    impl quota_bus::metadata::Source for Absent {
+        async fn read(&mut self) -> Result<(), String> {
+            Err("consumer not found (10014)".into())
+        }
+    }
+    let (_scratch, live) = fixture();
+    let handler = catalog_handler(&live);
+    {
+        let mut cache = live.cache.lock().unwrap();
+        cache.consumer.attached = true;
+        cache.consumer.route_facts.filters_ready = true;
+    }
+    let error = quota_bus::metadata::with_metadata(
+        &mut Absent,
+        &handler,
+        std::future::pending::<Result<(), String>>(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        quota_bus::unbound(&handler, &error),
+        "first missing-durable state logs its cause"
+    );
+    assert!(
+        !quota_bus::unbound(&handler, "consumer not found on another retry (10014)"),
+        "unchanged missing-durable state must not log again"
+    );
+    {
+        let cache = live.cache.lock().unwrap();
+        assert!(!cache.consumer.attached);
+        assert!(!cache.consumer.route_facts.ready(cache.consumer.attached));
+        assert_eq!(
+            cache.consumer.last_error.as_deref(),
+            Some("no durable yet (consumer not found)")
+        );
+    }
+    assert!(
+        quota_bus::unbound(&handler, "NATS connection closed"),
+        "a different unbound cause is visible"
+    );
+    assert!(
+        quota_bus::unbound(&handler, &error),
+        "returning to a missing durable is a new state"
+    );
+    let now = Instant::now();
+    let mut schedule = SnapshotSchedule::new(now);
+    schedule.completed(now, true);
+    assert_eq!(schedule.next.duration_since(now), Duration::from_secs(60));
+}
+
+#[test]
+fn insula_only_consumer_filters_never_enable_route_fact_stream() {
+    let names = cortexkit_bus_naming::AccountNames::derive("box_test").unwrap();
+    let filters = vec![names.event_subject("insula", "quota_sampled", 1).unwrap()];
+    assert!(!crate::route_facts::filters_ready(
+        &names,
+        Some("m_striatum"),
+        &filters
+    ));
+}
 
 fn fixture() -> (ScratchDir, LiveQuota) {
     let scratch = ScratchDir::new("routing-quota-events");
@@ -897,7 +1140,7 @@ async fn sdk_notice_tampered_digest_termed_without_applying() {
         b"",
         headers,
         Some(&tampered),
-        crate::now_ms(),
+        Some(crate::now_ms()),
         1,
     )
     .unwrap();

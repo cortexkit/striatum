@@ -51,4 +51,4 @@ cortexkit-test-support = "=0.1.13"
 rusqlite = { workspace = true, features = ["bundled"] }
 # The real-daemon e2e tests spawn the daemon and module binaries; nothing else in
 # this package's graph turns on tokio's process feature any more.
-tokio = { workspace = true, features = ["process"] }
+tokio = { workspace = true, features = ["process", "test-util"] }

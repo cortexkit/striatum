@@ -31,14 +31,17 @@ pub(crate) struct Health {
     pub oldest_unapplied_at_ms: Option<u64>,
     pub retries: u64,
     pub ack_wait_ms: Option<u64>,
+    pub last_delivery_at_ms: Option<u64>,
+    pub last_ack_at_ms: Option<u64>,
+    pub delivered_sequence: Option<u64>,
+    pub bound_since: Option<std::time::Instant>,
     pub connection: Option<async_nats::Client>,
     pub revisions: Option<tokio::sync::watch::Receiver<u64>>,
 }
 
 impl Health {
-    pub(crate) fn ready(&self, bound: bool) -> bool {
-        bound
-            && self.filters_ready
+    pub(crate) fn reader_bound(&self, attached: bool) -> bool {
+        attached
             && self.connection.as_ref().is_none_or(|connection| {
                 connection.connection_state() == async_nats::connection::State::Connected
             })
@@ -47,6 +50,9 @@ impl Health {
                 .as_ref()
                 .is_none_or(|changes| matches!(changes.has_changed(), Ok(false)))
     }
+    pub(crate) fn ready(&self, attached: bool) -> bool {
+        self.filters_ready && self.reader_bound(attached)
+    }
 }
 
 impl Serialize for Health {
@@ -54,6 +60,9 @@ impl Serialize for Health {
         json!({
             "filtersReady":self.filters_ready, "applied":self.applied,
             "ackWaitMs": self.ack_wait_ms,
+            "lastDeliveryAtMs": self.last_delivery_at_ms,
+            "lastAckAtMs": self.last_ack_at_ms,
+            "deliveredSequence": self.delivered_sequence,
             "refused":self.refused, "retries":self.retries,
             "oldestUnappliedAtMs":self.oldest_unapplied_at_ms,
             "oldestUnappliedAgeMs":self.oldest_unapplied_at_ms.map(|at| crate::now_ms().saturating_sub(at)),
@@ -65,7 +74,7 @@ impl Serialize for Health {
 pub(crate) struct Delivery {
     pub message: Message,
     pub body: Vec<u8>,
-    pub published_at_ms: u64,
+    pub published_at_ms: Option<u64>,
     pub delivery_count: u64,
 }
 
@@ -201,7 +210,7 @@ impl Handler {
             return Ok(false);
         }
         if let Ok(mut cache) = self.quota_cache.lock() {
-            cache.consumer.route_facts.oldest_unapplied_at_ms = Some(published_at_ms);
+            cache.consumer.route_facts.oldest_unapplied_at_ms = published_at_ms;
         }
         let started = std::time::Instant::now();
         let result = async {

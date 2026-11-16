@@ -791,33 +791,51 @@ async fn delivery_loop(
     let mut state = SequenceState::default();
     let mut bus = None::<quota_bus::AttachedBus>;
     let mut schedule = SnapshotSchedule::new(Instant::now());
-    let mut next_attach = Instant::now();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(
+        Instant::now(),
+        crate::now_ms() ^ u64::from(std::process::id()),
+    );
     let mut unbound_since = Some(Instant::now());
     live.attached(false, Some("connecting to quota durable".into()));
     loop {
-        if bus.is_none() && Instant::now() >= next_attach {
-            match striatum_store::job_timing::run(
-                "quota_feed_attach",
-                quota_bus::attach(connection_file.clone(), handler.clone()),
-            )
-            .await
+        if bus.is_none() {
+            if let Some(result) = reconnect
+                .attempt(
+                    Instant::now(),
+                    striatum_store::job_timing::run(
+                        "quota_feed_attach",
+                        quota_bus::attach(connection_file.clone(), handler.clone()),
+                    ),
+                )
+                .await
             {
-                Ok(attached) => {
-                    bus = Some(attached);
-                    live.attached(true, None);
-                    schedule.set_attached(true, Instant::now());
-                    unbound_since = None;
+                match result {
+                    Ok(attached) => {
+                        bus = Some(attached);
+                        live.attached(true, None);
+                        schedule.set_attached(true, Instant::now());
+                        unbound_since = None;
+                    }
+                    Err(error) => {
+                        quota_bus::unbound(&handler, &error);
+                    }
                 }
-                Err(error) => live.attached(false, Some(error)),
             }
-            next_attach = Instant::now() + crate::QUOTA_RETRY_INTERVAL;
         }
+        observe_binding(&live.cache, &mut reconnect, Instant::now());
         poll_if_due(&mut source, &live, &mut schedule, Instant::now()).await;
         let Some(attached) = bus.as_mut() else {
-            if unbound_since.is_some_and(|since| since.elapsed() > Duration::from_secs(60)) {
-                tracing::warn!("event reader unbound for more than 60 seconds");
+            let error = live
+                .cache
+                .lock()
+                .ok()
+                .and_then(|cache| cache.consumer.last_error.clone());
+            if unbound_since.is_some_and(|since| since.elapsed() > Duration::from_secs(60))
+                && !error.as_deref().is_some_and(quota_bus::no_durable)
+            {
+                tracing::warn!(error, "event reader unbound for more than 60 seconds");
             }
-            tokio::time::sleep_until(next_attach.into()).await;
+            tokio::time::sleep_until(reconnect.deadline().min(schedule.next).into()).await;
             continue;
         };
         let mut down = None;
@@ -825,8 +843,8 @@ async fn delivery_loop(
             result = attached.deliveries.recv() => result,
             _ = tokio::time::sleep(Duration::from_secs(1)) => { continue; }
         };
-        if let Some(Ok((event, published_at_ms))) = received {
-            let payload = quota_bus::payload(&attached.names, &event, published_at_ms);
+        if let Some(Ok(event)) = received {
+            let payload = quota_bus::payload(&attached.names, &event);
             let payload = match payload {
                 Ok(payload) => payload,
                 Err(error) => {
@@ -839,7 +857,11 @@ async fn delivery_loop(
                     }
                     // A settlement failure must reconnect rather than silently losing a notice.
                     bus = None;
-                    live.attached(false, down);
+                    quota_bus::unbound(
+                        &handler,
+                        down.as_deref().unwrap_or("event settlement failed"),
+                    );
+                    reconnect.failed(Instant::now());
                     unbound_since.get_or_insert_with(Instant::now);
                     schedule.set_attached(false, Instant::now());
                     continue;
@@ -847,6 +869,7 @@ async fn delivery_loop(
             };
             let mut cursor = quota_bus::Cursor {
                 event: &event,
+                acknowledged: false,
                 notice: Some(cortexkit_bus_trait::StreamDelivery {
                     stream_seq: event.stream_sequence,
                     delivery_count: payload.delivery_count,
@@ -857,6 +880,9 @@ async fn delivery_loop(
                 .consume(&mut cursor, &attached.names, &payload)
                 .await;
             if handled == Ok(true) {
+                if cursor.acknowledged {
+                    reconnect.healthy();
+                }
                 continue;
             }
             if let Err(error) = handled {
@@ -879,7 +905,11 @@ async fn delivery_loop(
                 )
                 .await
                 {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if cursor.acknowledged {
+                            reconnect.healthy();
+                        }
+                    }
                     Err(ConsumeError::Rejected(error)) => {
                         tracing::warn!(error, "quota event refused")
                     }
@@ -895,12 +925,32 @@ async fn delivery_loop(
         }
         if let Some(error) = down {
             bus = None;
-            live.attached(false, Some(error));
+            quota_bus::unbound(&handler, &error);
             unbound_since.get_or_insert_with(Instant::now);
             schedule.set_attached(false, Instant::now());
-            next_attach = Instant::now() + crate::QUOTA_RETRY_INTERVAL;
+            reconnect.failed(Instant::now());
         }
     }
+}
+
+pub(crate) fn observe_binding(
+    cache: &SharedQuotaCache,
+    reconnect: &mut quota_bus::reconnect::Backoff,
+    now: Instant,
+) {
+    let bound_since = cache.lock().ok().and_then(|mut cache| {
+        if cache
+            .consumer
+            .route_facts
+            .reader_bound(cache.consumer.attached)
+        {
+            Some(*cache.consumer.route_facts.bound_since.get_or_insert(now))
+        } else {
+            cache.consumer.route_facts.bound_since = None;
+            None
+        }
+    });
+    reconnect.observe_bound(now, bound_since);
 }
 
 #[cfg(test)]
