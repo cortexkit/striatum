@@ -1154,21 +1154,66 @@ fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission(
         name: Some("gemini".into()),
     })
     .unwrap();
-    let fence = |id: &str, account: &str, pool: &str| {
-        format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
-            VALUES ('{id}','p0','{account}','{{}}','{{}}','broca_account_limit',{older},'x',{older},'{pool}','[]');")
-    };
-    rig.sql(format!(
-        "INSERT INTO account_route_fence VALUES ('p0','c0','m0',{until},'d',{older},{older},'quota');
-         INSERT INTO account_route_fence VALUES ('p0','c1','m0',{until},'d',{older},{older},'quota');
-         INSERT INTO account_route_fence VALUES ('p0','c0','m1',{until},'d',{older},{older},'quota');
-         INSERT INTO credential_entitlement_fences VALUES ('p0','c0','billing_exhausted',NULL,{newer});
-         INSERT INTO credential_entitlement_fences VALUES ('p0','c1','billing_exhausted',NULL,{older});
-         {}{}{}",
-        fence("shared", "a0", &shared),
-        fence("named", "a0", &named),
-        fence("other-account", "a1", &shared),
-    ));
+    rig.run(move |conn| {
+        for (credential, model) in [("c0", "m0"), ("c1", "m0"), ("c0", "m1")] {
+            let row = crate::block_storage::account_route_source(
+                &crate::AccountRouteFence {
+                    provider: "p0".into(),
+                    credential_id: credential.into(),
+                    model: model.into(),
+                    until_ms: until,
+                    decision_id: "d".into(),
+                    recorded_at: older,
+                },
+                "account_route",
+                "quota",
+                Some(older),
+            )?;
+            crate::block_storage::write_source(conn, &row)?;
+        }
+        for (credential, observed_at) in [("c0", newer), ("c1", older)] {
+            let row = crate::block_storage::credential_source(
+                &striatum_core::route_state_store::CredentialEntitlementFence {
+                    provider_id: "p0".into(),
+                    credential_id: credential.into(),
+                    code: "billing_exhausted".into(),
+                    listing_fingerprint: None,
+                    observed_at_ms: observed_at,
+                },
+            )?;
+            crate::block_storage::write_source(conn, &row)?;
+        }
+        for (id, account, pool) in [
+            ("shared", "a0", &shared),
+            ("named", "a0", &named),
+            ("other-account", "a1", &shared),
+        ] {
+            let row = crate::block_storage::account_source(
+                conn,
+                &crate::AccountPoolFenceRow {
+                    evidence: crate::AccountFenceRow {
+                        fence_id: id.into(),
+                        provider: "p0".into(),
+                        account_id: account.into(),
+                        scope_json: "{}".into(),
+                        fence_json: "{}".into(),
+                        source: "broca_account_limit".into(),
+                        observed_at: older,
+                        principal: "x".into(),
+                        admission_id: None,
+                        observation_id: None,
+                        created_at: older,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    },
+                    pool_key: Some(serde_json::from_str(pool).unwrap()),
+                    recovery_set: Vec::new(),
+                },
+            )?;
+            crate::block_storage::write_source(conn, &row)?;
+        }
+        Ok(())
+    });
     rig.store
         .account_command(AccountCommandKind::Report, |tx| {
             tx.heal_serving_fences_in_scope(
@@ -1193,9 +1238,9 @@ fn a_success_heals_only_its_serving_login_and_evidence_older_than_its_admission(
                 conn.prepare(sql)?.query_map([], |r| r.get(0))?.collect()
             };
             Ok((
-                list("SELECT credential_id||'/'||model FROM account_route_fence ORDER BY 1")?,
-                list("SELECT credential_id FROM credential_entitlement_fences ORDER BY 1")?,
-                list("SELECT fence_id FROM account_fence WHERE cleared_at IS NULL ORDER BY 1")?,
+                list("SELECT credential_id||'/'||model FROM block WHERE kind='account_route' AND source_present=1 ORDER BY 1")?,
+                list("SELECT credential_id FROM block WHERE kind='credential' AND source_present=1 ORDER BY 1")?,
+                list("SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND source_present=1 AND cleared_at IS NULL ORDER BY 1")?,
             ))
         })
         .unwrap();
@@ -1563,13 +1608,35 @@ fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
         name: Some("gemini".into()),
     })
     .unwrap();
-    rig.sql(format!(
-        "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
-         VALUES ('whole','p0','a0','{{}}','{{}}','broca_account_limit',{older},'x',{older},NULL,'[{covered}]');"
-    ));
+    let recovery_set = vec![serde_json::from_str(&covered).unwrap()];
+    rig.run(move |conn| {
+        let row = crate::block_storage::account_source(
+            conn,
+            &crate::AccountPoolFenceRow {
+                evidence: crate::AccountFenceRow {
+                    fence_id: "whole".into(),
+                    provider: "p0".into(),
+                    account_id: "a0".into(),
+                    scope_json: "{}".into(),
+                    fence_json: "{}".into(),
+                    source: "broca_account_limit".into(),
+                    observed_at: older,
+                    principal: "x".into(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: older,
+                    cleared_at: None,
+                    cleared_reason: None,
+                },
+                pool_key: None,
+                recovery_set,
+            },
+        )?;
+        crate::block_storage::write_source(conn, &row).map(|_| ())
+    });
     let before_it_grew = rig.published();
     rig.sql(format!(
-        "UPDATE account_fence SET recovery_set_json='[{covered},{uncovered}]' WHERE fence_id='whole';"
+        "UPDATE block SET recovery_set_json='[{covered},{uncovered}]' WHERE kind='account' AND origin_key=json_array('whole');"
     ));
     let loads = rig.decide_next_on(before_it_grew);
     rig.store
@@ -1594,7 +1661,7 @@ fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
         .store
         .with_reader_for_test(|conn| {
             conn.query_row(
-                "SELECT count(*) FROM account_fence WHERE cleared_at IS NULL",
+                "SELECT count(*) FROM block WHERE kind='account' AND source_present=1 AND cleared_at IS NULL",
                 [],
                 |r| r.get(0),
             )
@@ -1908,7 +1975,9 @@ fn a_superseded_test_request_heals_nothing_by_any_settling_path() {
                 },
             )
             .unwrap();
-        rig.run(fence_rechecks::sync);
+        rig.store
+            .account_transaction(|tx| fence_rechecks::sync_on(tx, NOW).map_err(err))
+            .unwrap();
         let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
         for (owner, at) in [("first", NOW), ("second", NOW + 2 * 3_600_000)] {
             let origins = origins.clone();
@@ -1962,7 +2031,9 @@ fn a_superseded_test_request_heals_nothing() {
             },
         )
         .unwrap();
-    rig.run(fence_rechecks::sync);
+    rig.store
+        .account_transaction(|tx| fence_rechecks::sync_on(tx, NOW).map_err(err))
+        .unwrap();
     let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
     let claim = |owner: &'static str, at: i64| {
         let origins = origins.clone();
