@@ -28,13 +28,10 @@ use striatum_store::ReasoningCatalog;
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
-// The catalog poll stays at ten minutes until Fusiform's catalog-changed
-// events actually reach routing. Routing reads bus events through its durable
-// NATS consumer (`m_striatum`), and that consumer only receives the
-// catalog-changed subject once ck-bus adds it to the consumer's filter list.
-// Until then no change event arrives, and the poll is the only way a new grade
-// or decommission mark lands.
-pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
+// Fusiform's catalog-changed events reach routing through its durable NATS
+// consumer (`m_striatum`) and trigger an immediate refresh, so this poll is
+// only a backstop for an event lost while the reader was down.
+pub const DEFAULT_CATALOG_POLL_MS: u64 = 30 * 60_000;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);
