@@ -50,7 +50,11 @@ impl World {
             .clone();
         let route = format!("{}/model-c", fixture::SUBSCRIPTION_PROVIDER);
         let mut decisions = Vec::new();
-        for key in ["same-evidence-first", "same-evidence-second"] {
+        for key in [
+            "same-evidence-first",
+            "same-evidence-second",
+            "newer-evidence-third",
+        ] {
             decisions.push(
                 self.ok(
                     Caller::Owner,
@@ -96,6 +100,17 @@ impl World {
             second.classified && !second.quota,
             "new quota input must not reclassify an unchanged refusal report: {second:?}"
         );
+        self.advance(1);
+        self.ok(Caller::Owner, "route.report", refusal(&decisions[2]))
+            .await;
+        let newer = self.held_credential_origin(&credential);
+        assert_ne!(
+            newer.evidence, first.evidence,
+            "the later receipt must create new evidence"
+        );
+        assert!(newer.evidence_at > first.evidence_at);
+        assert!(newer.classified && newer.quota,
+            "a genuinely newer refusal must be interpreted against the replacement exhausted reading: {newer:?}");
     }
 
     async fn fenced_listing_cycle_witness(&mut self, reload: bool) {

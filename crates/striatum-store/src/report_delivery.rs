@@ -618,6 +618,9 @@ fn apply_account_effects(
             &refusal.provider_id,
         )?;
         let prior = state.entitlement_fence(&refusal.provider_id, &refusal.credential_id);
+        let same_evidence = prior
+            .as_ref()
+            .is_some_and(|prior| prior.code == refusal.code && prior.observed_at_ms >= now);
         let changed = if refusal.code == "signed_out"
             && prior.as_ref().is_some_and(|row| row.code != "signed_out")
         {
@@ -649,7 +652,12 @@ fn apply_account_effects(
         };
         // A sign-in report must not replace or postpone an independent refusal.
         if changed != 0 && crate::fence_rechecks::enabled(conn)? {
-            conn.execute("UPDATE block SET claim_owner=NULL,classified=0 WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+            // A matched SQLite upsert is not necessarily new evidence. Keep a
+            // prior interpretation and claim when the code and retained receipt
+            // time are identical, even if quota readings changed in between.
+            if !same_evidence {
+                conn.execute("UPDATE block SET claim_owner=NULL,classified=0 WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2",params![refusal.provider_id,refusal.credential_id])?;
+            }
             crate::fence_rechecks::register_on(
                 tx,
                 "credential",

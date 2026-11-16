@@ -19,7 +19,7 @@ impl World {
                 .ok(
                     Caller::Operator,
                     "route.cooldown_status",
-                    json!({"routeKey":route}),
+                    json!({"routeKey":route,"capacityKey":route,"now":self.now}),
                 )
                 .await;
             assert_eq!(
@@ -45,7 +45,7 @@ impl World {
                 .ok(
                     Caller::Operator,
                     "route.cooldown_status",
-                    json!({"routeKey":route}),
+                    json!({"routeKey":route,"capacityKey":route,"now":self.now}),
                 )
                 .await;
             assert_eq!(
@@ -66,7 +66,7 @@ impl World {
                 .ok(
                     Caller::Operator,
                     "route.cooldown_status",
-                    json!({"routeKey":route}),
+                    json!({"routeKey":route,"capacityKey":route,"now":self.now}),
                 )
                 .await;
             assert_eq!(

@@ -146,7 +146,7 @@ impl World {
             excluded.1
         );
         assert_eq!(
-            excluded.1["code"], "account_pool_exhausted",
+            excluded.1["code"], "account_not_authorized",
             "{}",
             excluded.1
         );
