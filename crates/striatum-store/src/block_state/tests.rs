@@ -3258,7 +3258,7 @@ fn every_production_block_writer_writes_inside_an_account_command() {
 /// freshness checks; the restored live clock must not be dropped by sync.
 #[test]
 fn stale_sync_drop_migration_representability_probe() {
-    fn migrated(source_recreated: bool, at: i64) -> Rig {
+    fn migrated(source_recreated: bool, at: i64, changed_old_evidence: bool) -> Rig {
         let scratch = cortexkit_test_support::ScratchDir::new("stale-sync-drop-migration");
         let descriptor = crate::dev_descriptor(
             "stale-sync-drop-migration",
@@ -3283,6 +3283,9 @@ fn stale_sync_drop_migration_representability_probe() {
                 if source_recreated {
                     insert()?;
                 }
+                if changed_old_evidence {
+                    assert_eq!(conn.execute("UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider'", [])?, 1);
+                }
                 let source: Option<String> = conn
                     .query_row(
                         "SELECT evidence FROM fence_origin WHERE kind='provider'",
@@ -3295,9 +3298,8 @@ fn stale_sync_drop_migration_representability_probe() {
                     [],
                     |r| r.get(0),
                 )?;
-                eprintln!(
-                    "legacy source_recreated={source_recreated}: source={source:?}, clock={clock}"
-                );
+                assert_eq!(clock.ends_with(' '), changed_old_evidence);
+                eprintln!("legacy source_recreated={source_recreated}, changed_old_evidence={changed_old_evidence}: source={source:?}, clock={clock}");
                 Ok(())
             })
             .unwrap();
@@ -3309,7 +3311,8 @@ fn stale_sync_drop_migration_representability_probe() {
                     "SELECT evidence,source_present,managed,cleared_by FROM block WHERE kind='provider'",
                     [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
                 )?;
-                eprintln!("migrated source_recreated={source_recreated}: {native:?}");
+                eprintln!("migrated source_recreated={source_recreated}, changed_old_evidence={changed_old_evidence}: {native:?}");
+                assert_eq!(native.0.ends_with(' '), changed_old_evidence);
                 assert_eq!(native.1, source_recreated);
                 assert_eq!(native.2, source_recreated);
                 Ok(())
@@ -3324,10 +3327,13 @@ fn stale_sync_drop_migration_representability_probe() {
         }
     }
     let at = crate::now_ms();
-    let before = migrated(false, at);
+    let before = migrated(false, at, false);
     assert!(before.published().view_origins().is_empty());
     assert_eq!(before.published().stored_clocks().count(), 0);
-    let after = migrated(true, at);
+    let changed_orphan = migrated(false, at, true);
+    assert_eq!(before.published(), changed_orphan.published(),
+        "stale-sync-drop-evidence: changing the removed audit clock does not create a working clock");
+    let after = migrated(true, at, false);
     assert_eq!(after.published().view_origins().len(), 1);
     assert_eq!(after.published().stored_clocks().count(), 1);
     let path = std::fs::canonicalize(after._scratch.path().join("state.db")).unwrap();
