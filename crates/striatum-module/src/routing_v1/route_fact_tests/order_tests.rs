@@ -12,7 +12,7 @@ fn permutations(items: &mut [usize], at: usize, out: &mut Vec<Vec<usize>>) {
     }
 }
 
-async fn end_state(order: &[usize], legacy: bool) -> Value {
+async fn end_state(order: &[usize], legacy: bool, check_load: bool) -> Value {
     let _ids = striatum_store::replay::Inputs::new(NOW as i64).install();
     let (harness, _) = super::super::account_classes_tests::setup("synthetic", false);
     harness.edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
@@ -77,6 +77,15 @@ async fn end_state(order: &[usize], legacy: bool) -> Value {
                     .await,
             );
         }
+        if check_load {
+            crate::account_state::assert_load_equivalent(harness.store(), NOW as i64);
+        }
+    }
+    if check_load {
+        let mut repeated_start = observations[0].clone();
+        repeated_start["event_id"] = json!("second-start-evidence");
+        result(runner.call("route.account_observe", &repeated_start).await);
+        crate::account_state::assert_load_equivalent(harness.store(), NOW as i64);
     }
     let state = crate::account_state::snapshot(harness.store()).unwrap();
     let admission = harness
@@ -121,14 +130,14 @@ async fn assert_every_order(legacy: bool) {
     let mut orders = Vec::new();
     permutations(&mut [0, 1, 2, 3, 4, 5], 0, &mut orders);
     assert_eq!(orders.len(), 720);
-    let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy).await;
+    let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy, false).await;
     assert_eq!(expected["admission"]["state"], "finished");
     assert_eq!(expected["inflight"], 0);
     assert_eq!(expected["usage"], json!([1, 20]));
     assert!(!expected["blocks"].as_array().unwrap().is_empty());
     for order in &orders {
         assert_eq!(
-            end_state(order, legacy).await,
+            end_state(order, legacy, false).await,
             expected,
             "legacy={legacy} order={order:?}"
         );
@@ -143,4 +152,12 @@ async fn every_admission_fact_order_has_the_in_order_end_state() {
 #[tokio::test]
 async fn every_legacy_admission_fact_order_has_the_in_order_end_state() {
     assert_every_order(true).await;
+}
+
+#[tokio::test]
+async fn finished_then_started_matches_fresh_account_state_in_both_shapes() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for legacy in [false, true] {
+        end_state(&[1, 2, 3, 4, 0, 5], legacy, true).await;
+    }
 }

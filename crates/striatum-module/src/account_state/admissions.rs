@@ -764,6 +764,23 @@ impl AdmissionState {
         }
     }
 
+    /// Closed rows are not retained in `open`, but their start evidence still
+    /// contributes to the current pin's history. Do not reopen the admission
+    /// or add an active started-pin or inflight entry.
+    pub(crate) fn record_terminal_start(&mut self, row: &AccountAdmissionRow) {
+        self.add_pin_started(
+            &Contribution {
+                principal: &row.principal,
+                hash: &row.conversation_hash,
+                provider: &row.provider,
+                pin_id: &row.pin_id,
+                pin_generation: row.pin_generation,
+                started: true,
+            },
+            1,
+        );
+    }
+
     pub(crate) fn set_probe_scope(
         &mut self,
         principal: &str,

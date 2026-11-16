@@ -328,6 +328,20 @@ pub(crate) fn published_at(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_load_equivalent(store: &SqliteRouteStateStore, now: i64) {
+    let published = snapshot(store).unwrap();
+    let mut loaded = store
+        .account_read(|tx| AccountState::load_at(tx, now))
+        .unwrap();
+    // Publication generations count commits and are not stored in SQL.
+    loaded.generation = published.generation;
+    assert_eq!(
+        *published, loaded,
+        "published account state differs from a fresh SQL load"
+    );
+}
+
+#[cfg(test)]
 pub(crate) static SNAPSHOT_COUNT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -930,12 +944,25 @@ impl AccountCommand<'_> {
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {
+        let terminal_start = if self
+            .admission_state()
+            .is_some_and(|state| state.open_admission(principal, admission_id).is_none())
+        {
+            self.admission(principal, admission_id)?.filter(|row| {
+                row.state == "finished" && row.run_id.is_none() && row.started_at.is_none()
+            })
+        } else {
+            None
+        };
         let changed = self
             .sql
             .mark_admission_started(principal, admission_id, run_id, at, late)?;
         self.mirror_checked(changed, "mark_admission_started", |state| {
             state.start(principal, admission_id, run_id, at, late)
         })?;
+        if let Some(row) = terminal_start {
+            self.mirror(|state| state.record_terminal_start(&row));
+        }
         Ok(changed)
     }
 
