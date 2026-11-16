@@ -373,6 +373,71 @@ fn only_principal_blocks_have_the_empty_provider_in_both_scope_indexes() {
 }
 
 #[test]
+fn dry_run_clear_route_preserves_siblings_and_latest_report_boundary() {
+    for (recorded_at, reported_at, clears) in [
+        (1, Some(9), true),
+        (1, Some(10), false),
+        (1, Some(11), false),
+        (9, None, true),
+        (10, None, false),
+    ] {
+        let mut state = BlockState {
+            enabled: true,
+            tables: vec![Table::default(); TABLES.len()],
+        };
+        for (index, (kind, provider, credential, model)) in [
+            ("account_route", "p", "c", "target"),
+            ("account_route", "p", "c", "sibling"),
+            ("account_route", "p", "other", "target"),
+            ("account_route", "other", "c", "target"),
+            ("non_quota_route", "p", "c", "target"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut row = block_storage::account_route_source(
+                &crate::AccountRouteFence {
+                    provider: provider.into(),
+                    credential_id: credential.into(),
+                    model: model.into(),
+                    until_ms: 100,
+                    decision_id: "decision".into(),
+                    recorded_at: if index == 0 { recorded_at } else { 1 },
+                },
+                kind,
+                if kind == "account_route" {
+                    "quota"
+                } else {
+                    "billing"
+                },
+                if index == 0 { reported_at } else { Some(1) },
+            )
+            .unwrap();
+            row.rowid = index as i64 + 1;
+            let key = serde_json::json!([kind, row.block.origin_key]).to_string();
+            state.tables[0].put(row.rowid, key, Some(Arc::new(Record::Block(row))));
+        }
+        state.dry_run_clear_route("p", "c", "target", 10);
+        assert_eq!(
+            state.source_record("account_route", r#"["p","c","target"]"#).is_none(),
+            clears,
+            "recorded={recorded_at}, reported={reported_at:?}: only evidence strictly before 10 clears"
+        );
+        for (kind, key) in [
+            ("account_route", r#"["p","c","sibling"]"#),
+            ("account_route", r#"["p","other","target"]"#),
+            ("account_route", r#"["other","c","target"]"#),
+            ("non_quota_route", r#"["p","c","target"]"#),
+        ] {
+            assert!(
+                state.source_record(kind, key).is_some(),
+                "unrelated {kind} {key} stays"
+            );
+        }
+    }
+}
+
+#[test]
 fn private_sweep_repairs_match_legacy_classification_heals_listing_and_replacement() {
     use crate::block_state::legacy::DryRunRepair as OldRepair;
     let scratch = cortexkit_test_support::ScratchDir::new("block-private-repair-parity");

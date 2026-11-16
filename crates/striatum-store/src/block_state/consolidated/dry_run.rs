@@ -182,6 +182,30 @@ impl BlockState {
         });
     }
 
+    /// Clear only the named model's route evidence whose latest report time
+    /// (or recorded time when unreported) is strictly before the cutoff.
+    pub fn dry_run_clear_route(
+        &mut self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        before: i64,
+    ) {
+        self.edit_blocks(|row| {
+            if row.block.kind == "account_route"
+                && row.block.scope.provider == provider
+                && row.block.scope.credential_id.as_deref() == Some(credential)
+                && row.block.scope.model.as_deref() == Some(model)
+                && row
+                    .last_reported_at
+                    .or(row.recorded_at)
+                    .is_some_and(|at| at < before)
+            {
+                row.source_present = false;
+            }
+        });
+    }
+
     pub fn dry_run_reconcile_route(&mut self, fence: &crate::AccountRouteFence, until: i64) {
         self.edit_blocks(|row| {
             if row.block.kind == "account_route"
