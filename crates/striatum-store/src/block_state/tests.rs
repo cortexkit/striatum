@@ -3394,6 +3394,103 @@ fn stale_sync_drop_migration_representability_probe() {
     after.check(&[at], "stale-sync-drop after the real outside commit");
 }
 
+/// Migration puts new source evidence and its pending retry schedule in one
+/// block row. A replaced clock that was never claimed does not keep separate
+/// evidence or a separate retry time on that row.
+#[test]
+fn stale_sync_renew_guard_migration_representability_probe() {
+    fn migrated(name: &str, drift: Option<&str>, wall: i64) -> (Rig, String, String) {
+        let scratch = cortexkit_test_support::ScratchDir::new(name);
+        let descriptor =
+            crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
+        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
+            .unwrap();
+        let legacy_clock = store.with_writer_for_test(|conn| {
+            conn.execute(
+                "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+                 VALUES ('p0',?1,?2,'provider capacity',?2,?2)",
+                rusqlite::params![wall + 3_600_000, wall],
+            )?;
+            fence_rechecks::sync(conn)?;
+            conn.execute(
+                "UPDATE provider_cooldown_state SET cooldown_until=?1,wall_observed_at=?2,last_error='provider capacity' WHERE provider_key='p0'",
+                rusqlite::params![wall + 7_200_000, wall + 1],
+            )?;
+            if let Some(sql) = drift { conn.execute_batch(sql)?; }
+            let source: String = conn.query_row("SELECT evidence FROM fence_origin WHERE kind='provider'", [], |row| row.get(0))?;
+            let clock: String = conn.query_row(
+                "SELECT json_array(evidence,next_recheck_at,last_claimed_at,claim_generation,claim_owner) FROM fence_recheck WHERE kind='provider'",
+                [], |row| row.get(0),
+            )?;
+            eprintln!("{name}: legacy source={source}, clock={clock}");
+            assert_eq!(source, serde_json::json!([wall + 7_200_000, null, wall + 1]).to_string());
+            Ok(clock)
+        }).unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let native: String = store.with_reader_for_test(|conn| conn.query_row(
+            "SELECT json_array(evidence,next_recheck_at,last_claimed_at,claim_generation,claim_owner,source_present,managed)
+             FROM block WHERE kind='provider' AND origin_key=json_array('p0')",
+            [], |row| row.get(0),
+        )).unwrap();
+        eprintln!("{name}: migrated pending row={native}");
+        let owner = Arc::new(TestOwner::default());
+        store.install_account_state_bridge(owner.clone()).unwrap();
+        (
+            Rig {
+                store,
+                owner,
+                _scratch: scratch,
+            },
+            legacy_clock,
+            native,
+        )
+    }
+    let wall = crate::now_ms();
+    for (name, drift) in [
+        (
+            "stale-sync-renew-evidence",
+            "UPDATE fence_recheck SET evidence=evidence||' ' WHERE kind='provider';",
+        ),
+        (
+            "stale-sync-renew-schedule",
+            "UPDATE fence_recheck SET next_recheck_at=next_recheck_at-1 WHERE kind='provider';",
+        ),
+    ] {
+        let (before, old_clock, native_before) = migrated(&format!("{name}-before"), None, wall);
+        let (after, changed_clock, native_after) =
+            migrated(&format!("{name}-after"), Some(drift), wall);
+        assert_ne!(
+            old_clock, changed_clock,
+            "{name}: the original clock input really changed"
+        );
+        let expected = serde_json::json!([
+            serde_json::json!([wall + 7_200_000, null, wall + 1]).to_string(),
+            wall + 3_600_001,
+            null,
+            0,
+            null,
+            1,
+            0
+        ])
+        .to_string();
+        assert_eq!(
+            native_before, expected,
+            "{name}: the source replaces the old unclaimed clock"
+        );
+        assert_eq!(
+            native_after, expected,
+            "{name}: migration folds the old clock-only change"
+        );
+        assert_eq!(
+            before.published(),
+            after.published(),
+            "{name}: the migrated working inputs are identical"
+        );
+    }
+}
+
 /// One `sync` decision taken on a stale state. `before` runs on two stores;
 /// the state of the first is kept; `change` then runs on both. The first
 /// store's next sync decides on the kept state: the decision checks SQL by
