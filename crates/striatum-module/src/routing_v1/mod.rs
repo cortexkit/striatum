@@ -44,7 +44,7 @@ mod panels_estimate_tests;
 #[cfg(test)]
 mod panels_tests;
 mod reads;
-mod report;
+pub(crate) mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
@@ -448,7 +448,7 @@ pub(crate) async fn answer(
         ops::ROUTE_SELECT_ENGINE => engines::select(params, caller, deps),
         ops::ROUTE_ENGINE_REPORT => engines::report(params, caller, deps),
         ops::ROUTE_ENGINE_EVAL => engines::evaluate(params, caller, deps),
-        ops::ROUTE_REPORT => report::report(params, caller, deps),
+        ops::ROUTE_REPORT => report::report(params, caller, deps).map(|(answer, _)| answer),
         ops::ROUTE_ACCOUNT_FOR => accounts::account_for(params, caller, deps),
         ops::ROUTE_ACCOUNT_OBSERVE => accounts::account_observe(params, caller, deps),
         ops::ROUTE_SELECT_PANEL => panels::select_panel(params, caller, deps).await,

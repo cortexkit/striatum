@@ -851,6 +851,12 @@ async fn delivery_loop(
                     tracing::warn!(error, id = event.msg_id, "malformed event terminated");
                     if let Err(error) = event.term().await {
                         down = Some(error.to_string());
+                    } else {
+                        handler.refused_publisher(
+                            &event.subject.module,
+                            &event.subject.event,
+                            event.subject.version,
+                        );
                     }
                     if down.is_none() {
                         continue;

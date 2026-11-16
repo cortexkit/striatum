@@ -48,7 +48,7 @@ pub use decision_detail::{
 mod report_delivery;
 #[cfg(test)]
 mod test_exe;
-pub use report_delivery::{V1ReportEffects, V1ReportUsage};
+pub use report_delivery::{V1ReportEffects, V1ReportOutcome, V1ReportUsage};
 #[cfg(test)]
 mod speed_sample_tests;
 // The backup table classification is a test oracle: the store's integration

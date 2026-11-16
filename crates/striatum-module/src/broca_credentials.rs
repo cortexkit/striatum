@@ -267,6 +267,7 @@ pub struct CredentialData {
     listing_loaded: Arc<(Mutex<bool>, std::sync::Condvar)>,
     pub(crate) catalog_snapshot: Option<Arc<crate::fusiform_catalog::CatalogSnapshot>>,
     pub(crate) catalog_wake: Arc<tokio::sync::Notify>,
+    pub(crate) catalog_rebind_wake: Arc<tokio::sync::Notify>,
     pub(crate) connection_file_path: Option<std::path::PathBuf>,
     /// One on-demand account-input fetch shared by concurrent admissions.
     pub(crate) admission_inputs: Arc<tokio::sync::Mutex<()>>,

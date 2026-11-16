@@ -52,7 +52,7 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
         .await
         .map_err(|e| e.to_string())?;
     mark_bound(&client, &handler, bound_revision);
-    handler.wake_catalog()?;
+    handler.wake_catalog_rebind()?;
     let subject = names
         .event_subject("insula", "quota_sampled", 1)
         .map_err(|e| e.to_string())?;
@@ -108,7 +108,7 @@ async fn read_events(
         metadata::with_metadata(
             &mut source,
             handler,
-            read_session(&mut reader, &mut changes, handler, tx),
+            read_session(&mut reader, &mut changes, &names, handler, tx),
         )
         .await?;
         bound_revision = *changes.borrow();
@@ -117,13 +117,14 @@ async fn read_events(
             .await
             .map_err(|e| e.to_string())?;
         mark_bound(&client, handler, bound_revision);
-        handler.wake_catalog()?;
+        handler.wake_catalog_rebind()?;
     }
 }
 
 async fn read_session(
     reader: &mut cortexkit_bus_client::EventReader,
     changes: &mut tokio::sync::watch::Receiver<u64>,
+    names: &AccountNames,
     handler: &Handler,
     tx: &tokio::sync::mpsc::Sender<Result<EventDelivery, String>>,
 ) -> Result<(), String> {
@@ -156,7 +157,9 @@ async fn read_session(
             }
             Some(EventItem::Malformed(delivery)) => {
                 tracing::warn!(subject = delivery.raw_subject, reason = ?delivery.reason, "malformed event terminated");
+                let subject = delivery.raw_subject.clone();
                 delivery.term().await.map_err(|e| e.to_string())?;
+                handler.refused_subject(names, &subject);
             }
             Some(_) => return Err("unsupported SDK event item".to_owned()),
         }

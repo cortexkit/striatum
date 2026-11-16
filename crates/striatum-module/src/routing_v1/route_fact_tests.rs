@@ -12,6 +12,7 @@ use subc_protocol::FrameType;
 const NOW: u64 = 1_800_000_000_000;
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
 
+mod health_tests;
 mod order_tests;
 #[path = "route_fact_tests/transport_cpu_tests.rs"]
 mod transport_cpu;
@@ -166,6 +167,33 @@ async fn consume(handler: &Handler, cursor: &mut Cursor, bytes: &[u8]) {
         .unwrap());
 }
 
+fn assert_publisher(handler: &Handler, module: &str, counts: [u64; 4], last_applied: Option<u64>) {
+    let cache = handler.quota_cache.lock().unwrap();
+    let (_, metrics) = crate::quota_health(&cache, NOW);
+    assert_eq!(
+        metrics["consumer"]["routeFacts"]["publishers"][module],
+        json!({"applied":counts[0], "duplicate":counts[1], "refused":counts[2],
+            "retried":counts[3], "lastAppliedAtMs":last_applied})
+    );
+    let health = &cache.consumer.route_facts;
+    assert_eq!(
+        health.applied,
+        health.publishers.values().map(|p| p.applied).sum::<u64>()
+    );
+    assert_eq!(
+        health.duplicate,
+        health.publishers.values().map(|p| p.duplicate).sum::<u64>()
+    );
+    assert_eq!(
+        health.refused,
+        health.publishers.values().map(|p| p.refused).sum::<u64>()
+    );
+    assert_eq!(
+        health.retries,
+        health.publishers.values().map(|p| p.retried).sum::<u64>()
+    );
+}
+
 #[tokio::test]
 async fn fact_apply_and_ack_after_commit_and_publication_in_both_shapes() {
     let _clock = crate::InjectedClock::set(NOW);
@@ -175,6 +203,7 @@ async fn fact_apply_and_ack_after_commit_and_publication_in_both_shapes() {
         let bytes = publish(&bus, "broca", "finish", &finish(legacy)).await;
         consume(&handler, &mut cursor, &bytes).await;
         assert_eq!(cursor.acks, 1);
+        assert_publisher(&handler, "broca", [1, 0, 0, 0], Some(NOW));
         assert_eq!(
             handler
                 .quota_cache
@@ -215,6 +244,7 @@ async fn fact_duplicate_redelivery_applies_once() {
         .await
         .unwrap();
     assert_eq!(cursor.acks, 1);
+    assert_publisher(&handler, "broca", [0, 1, 0, 0], None);
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
     assert_eq!(
         conn.query_row("SELECT count(*) FROM account_observation", [], |r| r
@@ -240,6 +270,12 @@ async fn fact_stream_plus_direct_call_applies_once() {
         if !stream_first {
             consume(&handler, &mut cursor, &bytes).await;
         }
+        assert_publisher(
+            &handler,
+            "broca",
+            [u64::from(stream_first), u64::from(!stream_first), 0, 0],
+            stream_first.then_some(NOW),
+        );
         let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
         assert_eq!(
             conn.query_row("SELECT count(*) FROM account_observation", [], |r| r
@@ -263,6 +299,7 @@ async fn fact_permanent_refusal_terminated_and_counted() {
     cursor.expect_finished = false;
     consume(&handler, &mut cursor, &bytes).await;
     assert_eq!((cursor.acks, cursor.terms), (0, 1));
+    assert_publisher(&handler, "broca", [0, 0, 1, 0], None);
     assert_eq!(
         handler
             .quota_cache
@@ -293,6 +330,7 @@ async fn fact_transient_store_failure_naks_without_applying() {
     .unwrap();
     assert_eq!((cursor.acks, cursor.terms), (0, 0));
     assert_eq!(cursor.delays, vec![Duration::from_secs(1)]);
+    assert_publisher(&handler, "broca", [0, 0, 0, 1], None);
     assert_eq!(
         handler
             .store
@@ -348,6 +386,7 @@ async fn fact_transient_redelivery_applies_exactly_once() {
         .query_row("SELECT count(*) FROM account_observation", [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 1);
+    assert_publisher(&handler, "broca", [1, 0, 0, 1], Some(NOW));
 }
 
 #[tokio::test]
@@ -478,5 +517,34 @@ async fn fact_report_stream_and_direct_delivery_apply_usage_once() {
             .unwrap();
         assert_eq!(usage, (1, 20));
         assert_eq!(cursor.acks, 1);
+        assert_publisher(
+            &handler,
+            "prefrontal-core",
+            [u64::from(stream_first), u64::from(!stream_first), 0, 0],
+            stream_first.then_some(NOW),
+        );
+        let bytes = publish(&bus, "prefrontal-core", "report-again", &body).await;
+        consume(&handler, &mut cursor, &bytes).await;
+        assert_publisher(
+            &handler,
+            "prefrontal-core",
+            [u64::from(stream_first), 1 + u64::from(!stream_first), 0, 0],
+            stream_first.then_some(NOW),
+        );
+        let mut next_run = body.clone();
+        next_run["params"]["usage"]["run_id"] = json!("second-run");
+        let bytes = publish(&bus, "prefrontal-core", "report-next-run", &next_run).await;
+        consume(&handler, &mut cursor, &bytes).await;
+        assert_publisher(
+            &handler,
+            "prefrontal-core",
+            [
+                1 + u64::from(stream_first),
+                1 + u64::from(!stream_first),
+                0,
+                0,
+            ],
+            Some(NOW),
+        );
     }
 }

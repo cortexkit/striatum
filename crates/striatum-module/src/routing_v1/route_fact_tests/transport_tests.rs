@@ -141,6 +141,8 @@ async fn fact_invalid_unknown_publisher_and_oversized_bodies_terminated() {
         consume(&handler, &mut cursor, &body).await;
         assert_eq!((cursor.acks, cursor.terms), (0, 1));
     }
+    assert_publisher(&handler, "broca", [0, 0, 2, 0], None);
+    assert_publisher(&handler, "unknown", [0, 0, 1, 0], None);
 }
 
 #[test]

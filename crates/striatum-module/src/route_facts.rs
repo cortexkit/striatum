@@ -1,5 +1,5 @@
 //! Durable runner facts share the direct-call handlers and their authorization.
-use std::{path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use cortexkit_bus_naming::AccountNames;
 use cortexkit_bus_trait::{Message, StreamCursor};
@@ -27,7 +27,9 @@ pub(crate) fn fact_subjects(names: &AccountNames) -> Vec<String> {
 pub(crate) struct Health {
     pub filters_ready: bool,
     pub applied: u64,
+    pub duplicate: u64,
     pub refused: u64,
+    pub publishers: BTreeMap<String, PublisherHealth>,
     pub oldest_unapplied_at_ms: Option<u64>,
     pub retries: u64,
     pub ack_wait_ms: Option<u64>,
@@ -37,6 +39,16 @@ pub(crate) struct Health {
     pub bound_since: Option<std::time::Instant>,
     pub connection: Option<async_nats::Client>,
     pub revisions: Option<tokio::sync::watch::Receiver<u64>>,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PublisherHealth {
+    pub applied: u64,
+    pub duplicate: u64,
+    pub refused: u64,
+    pub retried: u64,
+    pub last_applied_at_ms: Option<u64>,
 }
 
 impl Health {
@@ -59,6 +71,7 @@ impl Serialize for Health {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         json!({
             "filtersReady":self.filters_ready, "applied":self.applied,
+            "duplicate":self.duplicate, "publishers":self.publishers,
             "ackWaitMs": self.ack_wait_ms,
             "lastDeliveryAtMs": self.last_delivery_at_ms,
             "lastAckAtMs": self.last_ack_at_ms,
@@ -106,7 +119,7 @@ pub(crate) struct Handler {
 }
 
 impl Handler {
-    pub(crate) async fn dispatch(&self, module: &str, body: &[u8]) -> Result<Value, String> {
+    pub(crate) async fn dispatch(&self, module: &str, body: &[u8]) -> Result<bool, String> {
         let fact: Fact = serde_json::from_slice(body).map_err(|_| "invalid_request".to_owned())?;
         if !matches!(fact.op.as_str(), "route.account_observe" | "route.report") {
             return Err("unknown_method".into());
@@ -123,6 +136,11 @@ impl Handler {
             };
             let request = json!({"method":fact.op,"params":fact.params});
             let bytes = serde_json::to_vec(&request).map_err(crate::ModuleError::Json)?;
+            if fact.op == "route.report" {
+                return Ok(routing_v1::report::report(&fact.params, &caller, &deps)
+                    .map(|(_, duplicate)| duplicate)
+                    .map_err(|refusal| refusal.code.as_str().to_owned()));
+            }
             let reply = if routing_v1::claims(&bytes) {
                 routing_v1::answer(&fact.op, &fact.params, &caller, &deps)
                     .await
@@ -143,7 +161,7 @@ impl Handler {
                     crate::account_selection::OpReply::Error { code, .. } => Err(code),
                 }
             };
-            Ok(reply)
+            Ok(reply.map(|answer| answer["observation"]["duplicate"] == true))
         })
         .await
         .map_err(|_| "internal_error".to_owned())?
@@ -179,6 +197,7 @@ impl Handler {
                 .term(Some("body_over_cap"))
                 .await
                 .map_err(|e| e.to_string())?;
+            self.refused_publisher(&subject.module, &subject.event, subject.version);
             return Ok(true);
         }
         if subject.module == "fusiform" && subject.event == "catalog_changed" {
@@ -230,9 +249,6 @@ impl Handler {
         }
         match result {
             Err(code) if transient(&code) => {
-                if let Ok(mut cache) = self.quota_cache.lock() {
-                    cache.consumer.route_facts.retries += 1;
-                }
                 tracing::warn!(
                     module = subject.module,
                     id = message.id,
@@ -243,21 +259,38 @@ impl Handler {
                     .nak(retry_delay(*delivery_count))
                     .await
                     .map_err(|e| e.to_string())?;
+                if let Ok(mut cache) = self.quota_cache.lock() {
+                    let health = &mut cache.consumer.route_facts;
+                    health.retries += 1;
+                    health
+                        .publishers
+                        .entry(subject.module.clone())
+                        .or_default()
+                        .retried += 1;
+                }
                 return Ok(true);
             }
             result => {
                 let refused = result.is_err();
                 if let Ok(mut cache) = self.quota_cache.lock() {
+                    let health = &mut cache.consumer.route_facts;
+                    let publisher = health.publishers.entry(subject.module.clone()).or_default();
                     if let Err(code) = result {
-                        cache.consumer.route_facts.refused += 1;
+                        health.refused += 1;
+                        publisher.refused += 1;
                         tracing::warn!(
                             module = subject.module,
                             id = message.id,
                             code,
                             "route fact terminated"
                         );
+                    } else if result == Ok(true) {
+                        health.duplicate += 1;
+                        publisher.duplicate += 1;
                     } else {
-                        cache.consumer.route_facts.applied += 1;
+                        health.applied += 1;
+                        publisher.applied += 1;
+                        publisher.last_applied_at_ms = Some(crate::now_ms());
                     }
                 }
                 // Handler completion includes the transaction and publication.
@@ -284,6 +317,35 @@ impl Handler {
             .catalog_wake
             .notify_one();
         Ok(())
+    }
+
+    pub(crate) fn wake_catalog_rebind(&self) -> Result<(), String> {
+        self.credentials
+            .lock()
+            .map_err(|_| "catalog credentials poisoned")?
+            .catalog_rebind_wake
+            .notify_one();
+        Ok(())
+    }
+
+    pub(crate) fn refused_subject(&self, names: &AccountNames, raw_subject: &str) {
+        if let Ok(subject) = names.parse_event_subject(raw_subject) {
+            self.refused_publisher(&subject.module, &subject.event, subject.version);
+        }
+    }
+
+    pub(crate) fn refused_publisher(&self, module: &str, event: &str, version: u32) {
+        if event == "route_fact" && version == 1 {
+            if let Ok(mut cache) = self.quota_cache.lock() {
+                let health = &mut cache.consumer.route_facts;
+                health.refused += 1;
+                health
+                    .publishers
+                    .entry(module.to_owned())
+                    .or_default()
+                    .refused += 1;
+            }
+        }
     }
 
     fn log_slow(&self, module: &str, id: &str) {

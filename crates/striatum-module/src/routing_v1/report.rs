@@ -41,7 +41,11 @@ const MEMBERS: &[&str] = &[
     "refusal_class",
 ];
 
-pub(super) fn report(params: &Value, caller: &Caller, deps: &Deps<'_>) -> Result<Value, Refusal> {
+pub(crate) fn report(
+    params: &Value,
+    caller: &Caller,
+    deps: &Deps<'_>,
+) -> Result<(Value, bool), Refusal> {
     report_at(params, caller, deps, now_ms())
 }
 
@@ -50,7 +54,7 @@ pub(super) fn report_at(
     caller: &Caller,
     deps: &Deps<'_>,
     now: u64,
-) -> Result<Value, Refusal> {
+) -> Result<(Value, bool), Refusal> {
     let request = attempt::parse(params)?;
     let decision = deps
         .store
@@ -205,7 +209,8 @@ pub(super) fn report_at(
         )
         .map_err(store_refusal)?;
     match standing {
-        Some(first) => serde_json::from_str(&first.answer_json)
+        Some(first) => serde_json::from_str(&first.recorded.answer_json)
+            .map(|answer| (answer, first.duplicate))
             .map_err(|error| store_refusal(format!("stored report answer undecodable: {error}"))),
         None => Err(Refusal::new(
             RefusalCode::ReportConflict,
