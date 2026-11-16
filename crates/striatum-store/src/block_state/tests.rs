@@ -1075,12 +1075,19 @@ fn a_heal_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
     let until = NOW + 3_600_000;
     let older = NOW - 600_000;
     let newer = NOW + 600_000;
-    rig.sql(format!(
-        "INSERT INTO account_route_fence VALUES ('p0','c0','m0',{until},'d',{older},{older},'quota');"
-    ));
+    rig.store
+        .record_account_route_fence(&crate::AccountRouteFence {
+            provider: "p0".into(),
+            credential_id: "c0".into(),
+            model: "m0".into(),
+            until_ms: until,
+            decision_id: "d".into(),
+            recorded_at: older,
+        })
+        .unwrap();
     let before_the_refusal = rig.published();
     rig.sql(format!(
-        "UPDATE account_route_fence SET last_reported_at={newer} WHERE credential_id='c0';"
+        "UPDATE block SET last_reported_at={newer} WHERE kind='account_route' AND credential_id='c0';"
     ));
     let heal = || {
         rig.store.account_command(AccountCommandKind::Report, |tx| {
@@ -1090,7 +1097,7 @@ fn a_heal_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
     let reported = |rig: &Rig| {
         rig.store
             .with_reader_for_test(|conn| {
-                conn.prepare("SELECT last_reported_at FROM account_route_fence")?
+                conn.prepare("SELECT last_reported_at FROM block WHERE kind='account_route'")?
                     .query_map([], |r| r.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -1426,12 +1433,7 @@ fn a_rebind_leaves_no_clock_claimed_by_the_old_owner() {
 #[test]
 fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
     let rig = rig("block-state-reconcile");
-    let row = |account: &str| {
-        format!(
-            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
-            NOW + 60_000
-        )
-    };
+    let row = observation_source_sql;
     rig.sql(row("seen"));
     UNSEEN.with(|unseen| unseen.set(true));
     rig.store
@@ -1751,10 +1753,7 @@ fn authorized_whole_account_recovery_empty_set_still_clears() {
 #[test]
 fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
     let rig = rig("block-state-full-reconcile");
-    rig.sql(format!(
-        "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');",
-        NOW + 60_000
-    ));
+    rig.sql(observation_source_sql("a"));
     // Its clock is installed first, so no sync below decides about the
     // origin (a decision would check the row and catch the change itself).
     rig.store
@@ -1765,7 +1764,7 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
     UNSEEN.with(|unseen| unseen.set(true));
     rig.store
         .bypass_account_writer_for_test(&format!(
-            "UPDATE account_transient_backoff SET retry_at_ms={} WHERE account_id='a';",
+            "UPDATE block SET deadline={} WHERE kind='observation' AND account_id='a';",
             NOW + 120_000
         ))
         .unwrap();
@@ -3901,7 +3900,7 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
         (
             "a key's wall",
             format!(
-                "UPDATE pool_key_state SET walled_until={} WHERE credential_id='k0';",
+                "UPDATE block SET deadline={} WHERE kind='pool_billing' AND credential_id='k0';",
                 NOW + 900_000
             ),
         ),
@@ -3914,7 +3913,7 @@ fn a_missed_change_in_place_is_found_within_one_full_comparison_interval_per_sto
         ),
         (
             "a clock's evidence",
-            "UPDATE fence_recheck SET evidence=evidence||' ' WHERE provider='p1';".into(),
+            "UPDATE block SET evidence=evidence||' ' WHERE provider='p1' AND is_origin=1 AND managed=1;".into(),
         ),
     ];
     for (name, change) in changes {
