@@ -16,16 +16,16 @@ impl World {
             .await;
         assert_eq!(before["account"]["account_id"], account.account_id);
         let at = self.now as i64;
-        let launched = self
-            .command("shared size/read actual granted admission", move |tx| {
-                tx.admission(
-                    &format!("reserved:{}", fixture::RUNNER_ONE),
-                    "before-shared-size",
-                )
-            })
-            .unwrap();
+        let (launched, size) =
+            self.command("shared size/read actual granted admission", move |tx| {
+                let principal = format!("reserved:{}", fixture::RUNNER_ONE);
+                Ok((
+                    tx.admission(&principal, "before-shared-size")?.unwrap(),
+                    tx.admission_size_class(&principal, "before-shared-size")?,
+                ))
+            });
         assert_eq!(launched.committed_at, at);
-        assert_eq!(launched.input_size_class, Some(17));
+        assert_eq!(size, Some(17));
         let non_quota = AccountSizeRefusal {
             provider: account.provider.clone(),
             credential_id: account.credential_id.clone(),
