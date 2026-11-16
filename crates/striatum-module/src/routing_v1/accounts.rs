@@ -819,7 +819,8 @@ fn admission_answer(result: &Value, request: &AccountForRequest) -> Result<Value
 }
 
 /// The allocator's refusal in v1 shape. A hold and an unavailable quota pool are
-/// timed by the wait the allocator states. Account-selection unavailability
+/// timed by the wait the allocator states, capped at the next quota recheck
+/// when typed exclusions identify quota as the recovery cause. Account-selection unavailability
 /// also preserves candidate exclusions and an optional short retry delay.
 /// Legacy codes the contract does not declare (`store_error`,
 /// `internal_error`, `unscoped_caller`) become the transient
@@ -970,9 +971,54 @@ fn account_refusal(code: &str, message: String, detail: Option<&Value>) -> Refus
                 }
             }
         }
+        if let Some(reset) = refusal.detail.get("reset_at_ms").and_then(Value::as_u64) {
+            if quota_recovery_exclusions(refusal.detail.get("exclusions"), reset) {
+                let now = now_ms();
+                let retry = super::quota_retry_hint(Some(reset), now).unwrap();
+                if retry < reset {
+                    refusal.detail.insert("reset_at_ms".into(), json!(retry));
+                    if refusal.detail.contains_key("retry_after_s") {
+                        refusal.detail.insert(
+                            "retry_after_s".into(),
+                            json!(retry.saturating_sub(now).div_ceil(1000)),
+                        );
+                    }
+                }
+            }
+        }
     }
     refusal.message = message;
     refusal
+}
+
+/// Credential and route fences share the pool refusal code with quota walls.
+/// Only shorten a mixed pool's hint when its dated exclusions identify the
+/// recovery being named; undated allocator exclusions must all be quota causes.
+fn quota_recovery_exclusions(exclusions: Option<&Value>, reset: u64) -> bool {
+    let Some(exclusions) = exclusions
+        .and_then(Value::as_array)
+        .filter(|rows| !rows.is_empty())
+    else {
+        return false;
+    };
+    let quota = |row: &Value| {
+        matches!(
+            row["reason"].as_str(),
+            Some("below_reserve" | "below_broca_floor" | "scope_exhausted" | "confirmed_fence")
+        )
+    };
+    if exclusions
+        .iter()
+        .any(|row| row["reset_at_ms"].as_u64().is_some())
+    {
+        let recovering: Vec<_> = exclusions
+            .iter()
+            .filter(|row| row["reset_at_ms"].as_u64() == Some(reset))
+            .collect();
+        !recovering.is_empty() && recovering.into_iter().all(quota)
+    } else {
+        exclusions.iter().all(quota)
+    }
 }
 
 pub(super) fn account_observe(
@@ -1155,6 +1201,7 @@ pub(crate) fn account_refusal_for_test_detail(
 
 #[cfg(test)]
 mod tests {
+    mod quota_retry_tests;
     use super::*;
     mod unservable_tests;
 

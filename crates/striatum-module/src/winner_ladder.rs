@@ -773,10 +773,13 @@ pub(crate) async fn config_reload_watch_loop(
     loop {
         tokio::time::sleep(CONFIG_WATCH_INTERVAL).await;
         let (check_store, check_sources) = (Arc::clone(&store), Arc::clone(&sources));
-        let checked = tokio::task::spawn_blocking(move || {
-            watch.check(&check_store, &check_sources);
-            watch
-        })
+        let checked = striatum_store::job_timing::run(
+            "winner_ladder_watch",
+            crate::stage_timing::spawn_job_blocking(move || {
+                watch.check(&check_store, &check_sources);
+                watch
+            }),
+        )
         .await;
         watch = match checked {
             Ok(watch) => watch,

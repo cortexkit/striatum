@@ -62,6 +62,57 @@ mod tests {
             &ServingIndex::get(&config, &credentials, &later_snapshot)
         ));
     }
+
+    #[test]
+    fn reader_catalog_commit_between_key_and_facts_cannot_poison_serving_index() {
+        let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
+        let fixture = bench::representative_fixture(bench::FixtureCounts {
+            subscription_rules: 1,
+            exclusion_rules: 1,
+            runner_route_rules: 0,
+            catalog_facts: 3,
+            listed_credentials: 2,
+        });
+        let config = fixture.operator_config();
+        let credentials = fixture.credentials().lock().unwrap().snapshot();
+        let before = fixture.store().get_facts_with_generation().unwrap();
+        let mut fact = before.facts[0].clone();
+        let old = FactKey::from(&fact);
+        fact.auth_methods = Some(vec!["a-method-no-credential-has".into()]);
+        let new = FactKey::from(&fact);
+        let raced_snapshot = fixture.store().selection_catalog_with_key_hook_for_test(|| {
+            fixture.store().with_writer_for_test(|connection| {
+                connection.execute("UPDATE model_facts SET auth_methods_json=?1 WHERE provider_id=?2 AND model_id=?3",
+                    rusqlite::params![serde_json::to_string(&fact.auth_methods).unwrap(), fact.provider_id, fact.model_id])
+            }).unwrap();
+        }).unwrap();
+        let raced = ServingIndex::get(&config, &credentials, &raced_snapshot);
+        let later_snapshot = fixture
+            .store()
+            .selection_catalog_with_key_hook_for_test(|| {})
+            .unwrap();
+        let later = ServingIndex::get(&config, &credentials, &later_snapshot);
+        assert!(
+            !later.facts.contains_key(&old),
+            "new generation must not reuse an old index"
+        );
+        assert!(later.facts[&new].selection.is_empty());
+        assert_eq!(raced_snapshot.generation, before.generation);
+        assert_ne!(raced.generation, later.generation);
+        assert!(!Arc::ptr_eq(&raced, &later));
+        let cached = fixture
+            .store()
+            .selection_catalog_with_key_hook_for_test(|| {})
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&cached, &later_snapshot),
+            "unchanged reads share the fact allocation"
+        );
+        assert!(Arc::ptr_eq(
+            &later,
+            &ServingIndex::get(&config, &credentials, &cached)
+        ));
+    }
 }
 
 impl From<&ModelFact> for FactKey {

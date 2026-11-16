@@ -19,6 +19,7 @@ const RUNNER: &str = "class-runner";
 const OWNER: &str = "class-owner";
 
 mod paid_anthropic_shape_tests;
+mod pinned_keep_free_tests;
 
 fn assert_configured_runner_caller_without_writer(harness: &Harness, frame: &subc_protocol::Frame) {
     let path = harness.store_path().with_extension("caller.jsonc");
@@ -638,7 +639,7 @@ pub(super) fn setup(provider: &str, converted_live: bool) -> (Arc<Harness>, Broc
     setup_at_version(provider, converted_live, None)
 }
 
-fn account_fact(provider: &str) -> striatum_core::ModelFact {
+pub(super) fn account_fact(provider: &str) -> striatum_core::ModelFact {
     let mut fact = crate::tests::fact(provider, "model");
     fact.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
     fact.billing_plane = Some(BillingPlane {
@@ -653,7 +654,7 @@ fn account_fact(provider: &str) -> striatum_core::ModelFact {
     fact
 }
 
-fn setup_at_version(
+pub(super) fn setup_at_version(
     provider: &str,
     converted_live: bool,
     version: Option<u32>,
@@ -785,7 +786,7 @@ async fn decisions_keep_both_wire_classes_after_consumer_edits() {
     let runner = harness.bind(reserved(RUNNER), None).await;
     let mut decisions = Vec::new();
     for consumer in ["mason", "codemode", "flow"] {
-        for legacy in [false, true] {
+        for legacy in [false] {
             let mut request = json!({"consumer":consumer,"requirements":{"iq":30,"eq":0}});
             if legacy {
                 request.as_object_mut().unwrap().remove("consumer");
@@ -2673,7 +2674,7 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
         )
         .await;
     // The only subscription account sits within its reserve; the public
-    // refusal retains the allocator's known reset and retry delay.
+    // refusal schedules a quota recheck before the distant provider reset.
     assert_eq!(reply.0, FrameType::Error, "{}", reply.1);
     assert_eq!(
         reply.1["code"], "account_pool_reserve_limited",
@@ -2682,7 +2683,7 @@ async fn absent_readings_admit_without_fabricated_quota_and_known_headroom_order
     );
     assert_eq!(
         reply.1["detail"]["reset_at_ms"],
-        NOW + 3_600_000,
+        NOW + 900_000,
         "{}",
         reply.1
     );
@@ -2784,10 +2785,18 @@ fn oauth_weekly_reading_at(used_percent: f64, reset_ms: i64, fetched_ms: i64) {
 }
 
 #[tokio::test]
-async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset() {
+async fn pin_reserve_retry_by_recheck_and_keep_near_reset() {
+    for (weekly_reset, expected_retry) in [
+        (NOW + 60_000, NOW + 60_000),
+        (NOW + 86_400_000, NOW + 900_000),
+    ] {
+        pin_availability_reserve_case(weekly_reset, expected_retry).await;
+    }
+}
+
+async fn pin_availability_reserve_case(weekly_reset: u64, expected_retry: u64) {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);
-    let weekly_reset = NOW + 86_400_000;
     harness.edit_config(|config| {
         config["model_routing"]["keep_free_percent"] = json!({"synthetic":20});
     });
@@ -2836,7 +2845,7 @@ async fn pin_availability_reserve_names_the_subscription_accounts_weekly_reset()
             serde_json::from_value(reply.1).unwrap();
         assert_eq!(refusal.code.as_str(), "pin_unavailable", "{refusal:?}");
         assert_eq!(refusal.detail["reason"], "quota_exhausted", "{refusal:?}");
-        assert_eq!(refusal.wait_until_ms(), Some(weekly_reset), "{refusal:?}");
+        assert_eq!(refusal.wait_until_ms(), Some(expected_retry), "{refusal:?}");
         assert!(
             refusal.message.contains("subscription_reserve"),
             "{refusal:?}"
@@ -4237,7 +4246,7 @@ async fn codex_selected_provider(used: [f64; 3], legacy: bool) -> String {
 #[tokio::test]
 async fn codex_three_exhausted_accounts_select_an_adequate_fallback() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 100.0], legacy).await,
             "fallback"
@@ -4251,7 +4260,7 @@ async fn codex_accounts_below_the_broca_floor_keep_luna() {
     // and 96% accounts still have quota above the reserve: sidekicks keep
     // running on them instead of losing the pool.
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 95.0, 96.0], legacy).await,
             "openai"
@@ -4262,7 +4271,7 @@ async fn codex_accounts_below_the_broca_floor_keep_luna() {
 #[tokio::test]
 async fn codex_one_account_with_headroom_keeps_luna() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 10.0], legacy).await,
             "openai"
@@ -4286,7 +4295,7 @@ async fn codex_reserve_limited_refusal_carries_earliest_reset() {
     );
     assert_eq!(
         reply.1["detail"]["reset_at_ms"],
-        NOW + 86_400_000,
+        NOW + 900_000,
         "{}",
         reply.1
     );
@@ -4295,7 +4304,7 @@ async fn codex_reserve_limited_refusal_carries_earliest_reset() {
 #[tokio::test]
 async fn codex_reserve_held_last_account_is_unavailable_to_sidekicks() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 99.0], legacy).await,
             "fallback"
@@ -4304,7 +4313,7 @@ async fn codex_reserve_held_last_account_is_unavailable_to_sidekicks() {
 }
 
 #[tokio::test]
-async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() {
+async fn codex_runtime_wall_on_last_headroom_account_reaches_selection() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = codex_pool([100.0, 100.0, 10.0]);
     harness
@@ -4319,13 +4328,18 @@ async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() 
         })
         .unwrap();
     let caller = harness.bind(reserved(OWNER), None).await;
-    let reply = caller.call("route.select", &json!({
-        "consumer":"sidekick", "targetAgent":"explore", "executor":"broca", "substrate":"broca",
-        "requirements":{"iq":1,"eq":0}
-    })).await;
+    let reply = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"sidekick",
+                "requirements":{"iq":1,"eq":0}
+            }),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     assert_eq!(
-        reply.1["result"]["selected"]["routeKey"], "fallback/adequate",
+        reply.1["result"]["route"]["provider"], "fallback",
         "{}",
         reply.1
     );
@@ -5852,12 +5866,14 @@ async fn s4b_what_if_fresh_headroom_repairs_only_its_snapshot() {
         "fresh headroom must actually recover the preview's account: {}",
         answer.1
     );
-    // One checkout reads catalogue facts/generation; the other reads observed
-    // speed aggregates. The warm class-vector cache and account snapshot take
-    // no writer checkout, and the dry run sends no repair command.
+    // Only reading the catalog-change key takes a writer checkout: the writer's
+    // count of model-fact writes, which says whether cached facts are current.
+    // Catalog facts and observed speed aggregates use a reader; the warm
+    // class-vector cache and account snapshot take no writer checkout, and the
+    // dry run sends no repair command.
     assert_eq!(
         harness.store().writer_acquisition_count_for_test() - acquisitions,
-        2
+        1
     );
     assert_eq!(harness.store().writer_commit_count_for_test(), commits);
     assert_eq!(s4b_repair_rows(&harness), rows);

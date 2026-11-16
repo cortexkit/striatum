@@ -155,20 +155,20 @@ refusal_case!(
 refusal_case!(
     synthesizer_pin_refused_by_model_not_for,
     r#"{"consumers":{"synthesizer":{"pin":{"model":"anthropic/claude-opus-5-5","variant":"medium"}}},
-        "models":{"anthropic/claude-opus-5-5":{"not_for":["athena","lab"]}}}"#,
-    r#"consumers.synthesizer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "athena": models["anthropic/claude-opus-5-5"].not_for lists "athena""#
+        "models":{"anthropic/claude-opus-5-5":{"not_for":["prefrontal-core.athena","prefrontal-core.lab"]}}}"#,
+    r#"consumers.synthesizer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.athena": models["anthropic/claude-opus-5-5"].not_for lists "prefrontal-core.athena""#
 );
 refusal_case!(
     lab_planner_pin_refused_by_provider_not_for,
     r#"{"consumers":{"lab_planner":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
-        "providers":{"anthropic":{"not_for":["lab"]}}}"#,
-    r#"consumers.lab_planner.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "lab": providers.anthropic.not_for lists "lab""#
+        "providers":{"anthropic":{"not_for":["prefrontal-core.lab"]}}}"#,
+    r#"consumers.lab_planner.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.lab": providers.anthropic.not_for lists "prefrontal-core.lab""#
 );
 refusal_case!(
     spec_designer_pin_refused_by_provider_models_list,
     r#"{"consumers":{"spec_designer":{"pin":{"model":"anthropic/claude-opus-5-5"}}},
         "providers":{"anthropic":{"models":["claude-sonnet-5"]}}}"#,
-    r#"consumers.spec_designer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "athena": providers.anthropic.models ["claude-sonnet-5"] does not list the model"#
+    r#"consumers.spec_designer.pin pins anthropic/claude-opus-5-5 but this config refuses route anthropic/claude-opus-5-5 for consumer "prefrontal-core.athena": providers.anthropic.models ["claude-sonnet-5"] does not list the model"#
 );
 refusal_case!(
     project_pin_refused_by_model_only_for,
@@ -493,7 +493,7 @@ fn variant_overrides_are_checked_against_the_catalog_at_load_and_on_reload() {
     attach_reasoning_catalog(&rig.path, catalog).unwrap();
     let held = live_config(&rig.path);
     assert_eq!(
-        held.variant_groups().athena["anthropic/claude-opus-5-5"],
+        held.variant_groups().consumers["athena"]["anthropic/claude-opus-5-5"],
         "xhigh"
     );
 
@@ -683,14 +683,22 @@ fn converted_keys_load_and_camel_case_spellings_are_refused() {
             active.exclude_groups().all,
             ["anthropic", "-anthropic/claude-5", "openai/gpt-6/high"]
         );
-        assert_eq!(
-            active.exclude_groups().mason,
-            ["kimi-code-plan-global/k3", "openai/gpt-6-astra"]
-        );
-        assert_eq!(active.exclude_groups().sidekick, ["xai", "-xai/grok-5"]);
-        assert_eq!(active.exclude_groups().athena, ["local/model"]);
-        assert_eq!(active.exclude_groups().lab, ["google/gemini-4"]);
-        assert_eq!(active.exclude_groups().core, ["deepseek"]);
+        // The explicit converter keeps old consumer keys literally: a rule
+        // for mason does not become a rule for prefrontal-core.mason.
+        for (consumer, route) in [
+            ("mason", "kimi-code-plan-global/k3"),
+            ("mason", "openai/gpt-6-astra"),
+            ("sidekick", "xai/other"),
+            ("athena", "local/model"),
+            ("lab", "google/gemini-4"),
+            ("core", "deepseek/other"),
+        ] {
+            assert!(
+                !active.route_allowed(consumer, route, true),
+                "{consumer}: {route}"
+            );
+        }
+        assert!(active.route_allowed("sidekick", "xai/grok-5", true));
         assert_eq!(
             section.subscription,
             ["ollama-cloud", "openai", "opencode-go", "-openai/metered"]
@@ -752,7 +760,7 @@ fn absent_file_and_missing_groups_are_empty() {
         live_config(&rig.path).exclude_groups(),
         &ExcludeGroups::default()
     );
-    rig.write(r#"{"model_routing":{"exclude":{"mason":["anthropic"]}}}"#);
+    rig.write(r#"{"providers":{"anthropic":{"not_for":["prefrontal-core.mason"]}}}"#);
     let next = settle_live_config(&rig.path);
     assert_eq!(
         next.exclude_groups(),
@@ -867,6 +875,23 @@ fn retired_account_model_families_load_with_named_warnings() {
 }
 
 #[test]
+fn pin_origin_enrollment_defaults_to_the_full_core_principal() {
+    let defaults = LiveConfig::default();
+    assert!(defaults.honours_pin_origin("reserved:prefrontal-core"));
+    for principal in [
+        "prefrontal-core",
+        "reserved:prefrontal-core-other",
+        "reserved:prefrontal-core.child",
+    ] {
+        assert!(!defaults.honours_pin_origin(principal));
+    }
+    let parsed = LiveConfig::new(parse_config("{}").unwrap(), None);
+    assert!(parsed.honours_pin_origin("reserved:prefrontal-core"));
+    let disabled = LiveConfig::new(parse_config(r#"{"pin_origin_callers":[]}"#).unwrap(), None);
+    assert!(!disabled.honours_pin_origin("reserved:prefrontal-core"));
+}
+
+#[test]
 fn generated_schema_is_current_and_closed() {
     let generated = routing_config_schema();
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing-config.schema.json");
@@ -890,7 +915,6 @@ fn generated_schema_is_current_and_closed() {
         "ProviderAccountsPolicy",
         "ModelFactOverride",
         "OverqualificationSection",
-        "SubstrateGroups",
     ] {
         assert_eq!(
             schema["$defs"][name]["additionalProperties"], false,
@@ -898,8 +922,16 @@ fn generated_schema_is_current_and_closed() {
         );
     }
     assert!(schema["$defs"].get("ModelFamilyRules").is_none());
+    assert!(schema["$defs"].get("SubstrateGroups").is_none());
+    assert!(schema["properties"].get("substrates").is_none());
     assert!(schema["properties"].get("model_families").is_none());
     let properties = &schema["properties"];
+    assert_eq!(properties["pin_origin_callers"]["type"], "array");
+    assert_eq!(properties["pin_origin_callers"]["items"]["type"], "string");
+    assert_eq!(
+        properties["pin_origin_callers"]["default"],
+        serde_json::json!(["reserved:prefrontal-core"])
+    );
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     assert!(schema["$defs"].get("AccountModelFamily").is_none());
     assert!(schema["$defs"]["ProviderAccountsPolicy"]["properties"]
@@ -924,188 +956,6 @@ fn generated_schema_is_current_and_closed() {
         .get("consecutiveTerminalFailureThreshold")
         .is_none());
     assert!(properties.get("providersWithoutPromptCache").is_none());
-}
-
-#[test]
-fn substrate_mapping_loads_all_groups_and_matches_own_provider_not_score_alias() {
-    use crate::substrate_policy::{resolve, Harness};
-
-    let mut rig = Rig::new();
-    rig.write(
-        r#"{
-        "model_routing": {
-            "score_alias": {"alias": "vendor"},
-            "substrates": {
-                "all": {"default": "broca", "vendor": "opencode"},
-                "mason": {"vendor/special": "pi"},
-                "sidekick": {}, "athena": {}, "core": {},
-                "lab": {"default": "pi"},
-                "sidekick.explore": {},
-                "sidekick.librarian": {"default": "opencode"},
-                "sidekick.gather": {}, "sidekick.comments": {},
-                "hire": {}, "persona_seat": {}
-            }
-        }
-    }"#,
-    );
-    initialize_config(&rig.path).unwrap();
-    let config = live_config(&rig.path);
-    assert!(config.operator_policy().score_alias.is_empty());
-    assert_eq!(
-        resolve(config.substrate_groups(), "alias/model/high", None, None),
-        Harness::Broca
-    );
-    assert_eq!(
-        resolve(config.substrate_groups(), "vendor/model/high", None, None),
-        Harness::Opencode
-    );
-    assert_eq!(
-        resolve(
-            config.substrate_groups(),
-            "unknown/future-model",
-            Some(crate::select_policy::Consumer::Lab),
-            None,
-        ),
-        Harness::Pi
-    );
-}
-
-#[test]
-fn substrate_mapping_invalid_keys_and_values_refuse_first_load_and_reload() {
-    for (substrates, diagnostic) in [
-        (
-            serde_json::json!({"unknown": {}}),
-            "model_routing.substrates.unknown",
-        ),
-        (
-            serde_json::json!({"lab": []}),
-            "model_routing.substrates.lab",
-        ),
-        (
-            serde_json::json!({"lab": null}),
-            "model_routing.substrates.lab",
-        ),
-        (
-            serde_json::json!({"all": {"vendor/model": "other"}}),
-            "key \"vendor/model\"",
-        ),
-        (
-            serde_json::json!({"all": {"vendor/model": 7}}),
-            "key \"vendor/model\"",
-        ),
-        (
-            serde_json::json!({"all": {"vendor/model": null}}),
-            "key \"vendor/model\"",
-        ),
-        (
-            serde_json::json!({"all": {"-vendor": "broca"}}),
-            "key \"-vendor\"",
-        ),
-        (serde_json::json!({"all": {"": "broca"}}), "key \"\""),
-        (
-            serde_json::json!({"all": {"/model": "broca"}}),
-            "key \"/model\"",
-        ),
-        (
-            serde_json::json!({"all": {"vendor/": "broca"}}),
-            "key \"vendor/\"",
-        ),
-        (
-            serde_json::json!({"all": {" vendor": "broca"}}),
-            "key \" vendor\"",
-        ),
-        (
-            serde_json::json!({"all": {"vendor ": "broca"}}),
-            "key \"vendor \"",
-        ),
-    ] {
-        let document = serde_json::json!({"model_routing": {"substrates": substrates}}).to_string();
-        first_load_refuses(&document, diagnostic);
-        reload_refuses(&document, diagnostic);
-    }
-}
-
-#[test]
-fn retired_sidekick_lead_is_an_unknown_substrate_group() {
-    let document = r#"{"model_routing":{"substrates":{"sidekick.lead":{"default":"broca"}}}}"#;
-    first_load_refuses(document, "model_routing.substrates.sidekick.lead");
-    reload_refuses(document, "model_routing.substrates.sidekick.lead");
-    assert!(
-        serde_json::from_str::<crate::selection_harness::Workload>(r#""sidekick.lead""#).is_err()
-    );
-}
-
-#[test]
-fn absent_substrate_mapping_and_withdrawn_groups_resolve_to_broca() {
-    use crate::substrate_policy::{resolve, Harness};
-
-    let mut rig = Rig::new();
-    initialize_config(&rig.path).unwrap();
-    let absent = live_config(&rig.path);
-    rig.write(r#"{"model_routing":{"substrates":{"all":{"default":"pi"}}}}"#);
-    let configured = settle_live_config(&rig.path);
-    assert_eq!(
-        resolve(configured.substrate_groups(), "vendor/model", None, None),
-        Harness::Pi
-    );
-    rig.write(r#"{"model_routing":{}}"#);
-    let withdrawn = settle_live_config(&rig.path);
-    for config in [absent, withdrawn] {
-        assert_eq!(
-            resolve(config.substrate_groups(), "vendor/model", None, None),
-            Harness::Broca
-        );
-    }
-    assert_eq!(
-        resolve(configured.substrate_groups(), "vendor/model", None, None),
-        Harness::Pi
-    );
-}
-
-#[test]
-fn substrate_schema_closes_groups_harnesses_and_route_key_grammar() {
-    let schema: serde_json::Value = serde_json::from_str(&routing_config_schema()).unwrap();
-    let groups = &schema["$defs"]["SubstrateGroups"];
-    assert_eq!(groups["type"], "object");
-    assert_eq!(groups["additionalProperties"], false);
-    let names = [
-        "all",
-        "mason",
-        "sidekick",
-        "athena",
-        "lab",
-        "core",
-        "codemode",
-        "flow",
-        "sidekick.explore",
-        "sidekick.librarian",
-        "sidekick.gather",
-        "sidekick.comments",
-        "sidekick.planner",
-        "sidekick.reader",
-        "sidekick.map",
-        "sidekick.reviewer",
-        "hire",
-        "persona_seat",
-    ];
-    assert_eq!(groups["properties"].as_object().unwrap().len(), names.len());
-    for name in names {
-        let group = &groups["properties"][name];
-        assert_eq!(group["type"], "object", "{name}");
-        assert_eq!(group["additionalProperties"]["$ref"], "#/$defs/Harness");
-        assert_eq!(
-            group["propertyNames"],
-            serde_json::json!({"allOf": [
-                {"pattern": "^[^/]+(/[\\s\\S]+)?$"},
-                {"not": {"pattern": "^[-\\s]|\\s$"}}
-            ]})
-        );
-    }
-    assert_eq!(schema["$defs"]["Harness"]["type"], "string");
-    assert_eq!(
-        schema["$defs"]["Harness"]["enum"],
-        serde_json::json!(["broca", "opencode", "pi"])
-    );
 }
 
 #[test]
@@ -1164,10 +1014,15 @@ fn conversion_materializes_runner_and_exclusions_follow_the_consumer_group() {
     rig.write(r#"{"model_routing":{"exclude":{"all":["a"],"mason":["b"]}}}"#);
     initialize_config(&rig.path).unwrap();
     let groups = live_config(&rig.path).exclude_groups().clone();
-    assert_eq!(groups.named_group("mason"), ["b"]);
+    assert!(!live_config(&rig.path).route_allowed("mason", "b/model", true));
     // A consumer with no group of its own reads only `all`, which the
     // selection applies separately.
-    for consumer in crate::config_policy::MAGIC_CONTEXT_CONSUMERS {
+    for consumer in [
+        "magic-context.summary",
+        "magic-context.dream",
+        "magic-context.dream.verify",
+        "magic-context.dream.verify-broad",
+    ] {
         assert!(groups.named_group(consumer).is_empty(), "{consumer}");
     }
     assert!(groups.named_group("all").is_empty());

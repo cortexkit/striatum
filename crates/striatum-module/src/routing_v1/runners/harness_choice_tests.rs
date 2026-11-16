@@ -24,7 +24,7 @@ fn install(harness: &crate::routing_v1::conformance_tests::Harness, module: &str
 }
 
 fn request(requirements: Value) -> Value {
-    json!({"consumer":"harness_choice_test", "requirements":requirements})
+    json!({"consumer":"example-consumer.harness_choice_test", "requirements":requirements})
 }
 
 fn setup(harness: &crate::routing_v1::conformance_tests::Harness, runners: Value) {
@@ -38,7 +38,7 @@ fn setup(harness: &crate::routing_v1::conformance_tests::Harness, runners: Value
     prepare_selects(harness);
     harness.edit_config(|config| {
         config["runners"] = runners;
-        config["consumers"]["harness_choice_test"] = json!({});
+        config["consumers"]["example-consumer.harness_choice_test"] = json!({});
     });
 }
 
@@ -249,7 +249,7 @@ async fn decision_harness_panel_seat_binds_the_same_harness_as_select() {
             select["route"]["model"].as_str().unwrap()
         );
         let params = json!({
-            "class":"audit", "consumer":"harness_choice_test",
+            "class":"audit", "consumer":"example-consumer.harness_choice_test",
             "available_routes":[key], "seed":"fixed"
         });
         let before = describe::without_capability(
@@ -304,7 +304,8 @@ async fn harness_refusals_caller_runners_follow_consumer_placements() {
     let mut params = request(json!({"iq":0}));
     params["runners"] = json!(["missing"]);
     harness.edit_config(|config| {
-        config["consumers"]["harness_choice_test"]["runner"] = json!("not-configured");
+        config["consumers"]["example-consumer.harness_choice_test"]["runner"] =
+            json!("not-configured");
     });
     for callers in [None, Some(json!(["missing"]))] {
         let mut missing_placement = request(json!({"iq":0}));
@@ -323,7 +324,7 @@ async fn harness_refusals_caller_runners_follow_consumer_placements() {
     }
     harness.edit_config(|config| {
         config["runners"] = json!([]);
-        config["consumers"]["harness_choice_test"] = json!({});
+        config["consumers"]["example-consumer.harness_choice_test"] = json!({});
     });
     refused(
         route.call("route.select", &params).await,
@@ -771,12 +772,12 @@ async fn harness_choice_output_need_uses_declared_and_operator_defaults() {
         let owner = cortexkit_role_routing_conformance::fixture::CONSUMER.trim_start_matches("reserved:");
         crate::routing_v1::consumers::replace_catalog(&json!([{
             "module_id":owner,"nonce_verified":true,
-            "role_declarations":{"routing/v1":{"consumers":[{"name":"harness_choice_test","max_output_tokens":1}]}}
+            "role_declarations":{"routing/v1":{"consumers":[{"name":"example-consumer.harness_choice_test","max_output_tokens":1}]}}
         }]));
         let declared = selected(route.call("route.select", &request(json!({"iq":0}))).await);
         assert_eq!(declared["runner"]["module"], "legacy", "{declared}");
         crate::routing_v1::consumers::replace_catalog(&json!([]));
-        harness.edit_config(|config| config["consumers"]["harness_choice_test"]["max_output_tokens"] = json!(1));
+        harness.edit_config(|config| config["consumers"]["example-consumer.harness_choice_test"]["max_output_tokens"] = json!(1));
         let operator = selected(route.call("route.select", &request(json!({"iq":0}))).await);
         assert_eq!(operator["runner"]["module"], "legacy", "{operator}");
     }).await;
@@ -825,7 +826,7 @@ async fn harness_choice_what_if_exclusion_filters_only_the_disposable_overlay() 
         let key = format!("{}/{}", live["route"]["provider"].as_str().unwrap(), live["route"]["model"].as_str().unwrap());
         let operator = harness.bind(json!({"kind":"direct"}), None).await;
         let overlay = slot(json!({"primary":{"exclude":[key]},"secondary":{"exclude":[key]},"inherited":{"exclude":[key]}}));
-        let reply = operator.call("route.what_if", &json!({"consumer":"harness_choice_test","iqs":[0],"runner":"broca","runner_declarations":{"broca":overlay}})).await;
+        let reply = operator.call("route.what_if", &json!({"consumer":"example-consumer.harness_choice_test","iqs":[0],"runner":"broca","runner_declarations":{"broca":overlay}})).await;
         assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
         let pick = &reply.1["result"]["results"][0]["pick"]["route"];
         assert!(pick.is_string(), "{}", reply.1);

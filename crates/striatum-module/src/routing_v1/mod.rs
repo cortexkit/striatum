@@ -48,13 +48,25 @@ mod report;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) mod request_cpu_bench;
 pub(crate) mod runners;
+#[cfg(test)]
+mod search_tests;
 mod select;
 #[cfg(test)]
 mod service_tier_tests;
 mod shapes;
+#[cfg(test)]
+mod subscription_incident_tests;
 mod what_if;
 #[cfg(test)]
 mod what_if_tests;
+
+/// Quota headroom can return before a provider reset. A known reset schedules
+/// an extra check, but must not postpone the regular quota recheck.
+fn quota_retry_hint(reset: Option<u64>, now: u64) -> Option<u64> {
+    reset.map(|reset| {
+        reset.min(now.saturating_add(striatum_core::fence_lifetimes::QUOTA_FENCE_RECHECK_MS as u64))
+    })
+}
 
 #[cfg(test)]
 mod account_classes_tests;
@@ -247,7 +259,10 @@ pub(crate) async fn serve(
             #[cfg(test)]
             if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
+                ops::ROUTE_ACCOUNT_FOR
+                    | ops::ROUTE_ACCOUNT_OBSERVE
+                    | ops::ROUTE_SELECT_PANEL
+                    | ops::ROUTE_HEAD_CHOICES
             ) {
                 crate::stage_timing::ACCOUNT_DELAY
                     .with(|delay| std::thread::sleep(delay.replace(std::time::Duration::ZERO)));
@@ -284,7 +299,10 @@ pub(crate) async fn serve(
             // awaiting panel cannot pick up another request's store work.
             let (reply, stages) = if matches!(
                 method.as_str(),
-                ops::ROUTE_ACCOUNT_FOR | ops::ROUTE_ACCOUNT_OBSERVE | ops::ROUTE_SELECT_PANEL
+                ops::ROUTE_ACCOUNT_FOR
+                    | ops::ROUTE_ACCOUNT_OBSERVE
+                    | ops::ROUTE_SELECT_PANEL
+                    | ops::ROUTE_HEAD_CHOICES
             ) {
                 striatum_store::scope_stage_timing(call).await
             } else {
@@ -352,6 +370,8 @@ pub(crate) async fn serve(
             serialization,
             call_stages,
         );
+    } else if operation == ops::ROUTE_HEAD_CHOICES {
+        timing.emit_head_choices(total, serialization, call_stages);
     }
     let reply = Frame::build_with_version(
         ver,

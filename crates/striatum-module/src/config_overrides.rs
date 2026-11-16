@@ -11,7 +11,6 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config_policy::{
     ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy, VariantGroups,
 };
-use crate::substrate_policy::SubstrateGroups;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -499,6 +498,13 @@ fn parse_config_with_reporter(
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
     }
+    if value.get("substrates").is_some()
+        || value
+            .get("model_routing")
+            .is_some_and(|section| section.get("substrates").is_some())
+    {
+        return Err("config_key_removed: substrates; removed along with legacy route.select; delete this key".into());
+    }
     if value.get("model_families").is_some() {
         return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
     }
@@ -690,7 +696,6 @@ fn live_config_at_with_reporter(
     }
     let active = match next {
         Ok(config) => {
-            crate::routing_v1::consumers::settings_loaded(&config);
             crate::routing_v1::runners::placements::settings_loaded(&config);
             Arc::new(config)
         }
@@ -894,10 +899,6 @@ impl LiveConfig {
         &self.config.model_routing.variants
     }
 
-    pub(crate) fn substrate_groups(&self) -> &SubstrateGroups {
-        &self.config.model_routing.substrates
-    }
-
     pub fn panels(&self) -> &PanelPolicies {
         &self.config.model_routing.panels
     }
@@ -953,6 +954,14 @@ impl LiveConfig {
             .filter(|id| !crate::config_policy::is_slot(id))
             .cloned()
             .collect()
+    }
+
+    /// Match the daemon-stamped full principal, never the scope owner or a suffix.
+    pub fn honours_pin_origin(&self, principal: &str) -> bool {
+        self.config
+            .pin_origin_callers
+            .iter()
+            .any(|caller| caller == principal)
     }
 
     /// Operator owners add exact-name claims too, so conflicting owners lock
@@ -1131,17 +1140,19 @@ pub async fn config_refresh_loop(
     }
     loop {
         tokio::time::sleep(CONFIG_POLL_INTERVAL).await;
-        let next = live_config(&path);
-        if !Arc::ptr_eq(&active, &next) {
-            eprintln!("[striatum] routing-config-reloaded: {}", path.display());
-            active = next;
-            if let Ok(mut credentials) = credentials.lock() {
-                credentials
-                    .concurrency_caps
-                    .publish_settings(active.concurrency_caps());
-                credentials.catalog_wake.notify_one();
+        striatum_store::job_timing::sync("config_refresh", || {
+            let next = live_config(&path);
+            if !Arc::ptr_eq(&active, &next) {
+                eprintln!("[striatum] routing-config-reloaded: {}", path.display());
+                active = next;
+                if let Ok(mut credentials) = credentials.lock() {
+                    credentials
+                        .concurrency_caps
+                        .publish_settings(active.concurrency_caps());
+                    credentials.catalog_wake.notify_one();
+                }
             }
-        }
+        });
     }
 }
 
@@ -1259,7 +1270,7 @@ fn prompt_cache_providers_cache() -> &'static Mutex<HashMap<PathBuf, PromptCache
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RoutingConfigFile {
     /// Whole dotted consumer names; the longest matching override wins.
@@ -1277,6 +1288,10 @@ struct RoutingConfigFile {
     consumers: BTreeMap<String, ConsumerPolicy>,
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
+    /// Full caller principals allowed to mark user pins with `pin_origin`.
+    /// Absent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.
+    #[serde(default = "default_pin_origin_callers")]
+    pin_origin_callers: Vec<String>,
     /// How providers spell model ids and which model families the capability
     /// heuristic recognizes; see `ModelNamingConfig`.
     #[serde(default)]
@@ -1296,6 +1311,31 @@ struct RoutingConfigFile {
     retention: RetentionSection,
     #[serde(default)]
     accounts: crate::config_policy::ProviderAccountsPolicy,
+}
+
+fn default_pin_origin_callers() -> Vec<String> {
+    vec!["reserved:prefrontal-core".into()]
+}
+
+impl Default for RoutingConfigFile {
+    fn default() -> Self {
+        Self {
+            consumer_priorities: Default::default(),
+            concurrency: Default::default(),
+            model_routing: Default::default(),
+            providers: Default::default(),
+            default_variants: Default::default(),
+            consumers: Default::default(),
+            runners: Default::default(),
+            pin_origin_callers: default_pin_origin_callers(),
+            model_naming: Default::default(),
+            head_agents: Default::default(),
+            quota_model_pools: Default::default(),
+            catalog: Default::default(),
+            retention: Default::default(),
+            accounts: Default::default(),
+        }
+    }
 }
 
 /// Regenerate with `cargo run -p striatum-module --bin ck-striatum -- --print-config-schema`.
@@ -1673,11 +1713,6 @@ struct ModelRoutingSection {
     /// be an effort the catalog publishes for the matched models.
     #[serde(skip)]
     variants: VariantGroups,
-    /// Route-to-harness mapping. Resolve the workload group, consumer group,
-    /// then `all`, taking each group's longest matching route key or default.
-    /// Routes not covered by any group run on Broca.
-    #[serde(default)]
-    substrates: SubstrateGroups,
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(skip)]

@@ -686,3 +686,18 @@ The block migration now retains all thirteen tables, `fence_origin` and the inac
 | Test | Old storage expression | Native storage expression | Unchanged policy assertion and defect control |
 |---|---|---|---|
 | `account_state::admission_tests::a_probe_release_leaves_a_started_admission_and_its_authorization_alone` | Setup inserts the authorization's seven fields into `fence_probe_authorization`; the scalar count reads that table. | The same seven values are inserted into `probe_authorization`; the same scalar count reads the successor table. The migration copies these seven columns 1:1. | `(authorizations, state.as_str()) == (1, "started")` is byte-for-byte unchanged: an admission that started keeps its probe authorization. Removing the real native unstarted-admission SQL guard in a remote scratch copy makes only this test fail, `(0, "started")` versus `(1, "started")`. This prevents the retained but inactive legacy table from becoming a false oracle. |
+
+### Main integration and observation-success regression ports
+
+The consumer-name migration from main occupies version 094; native block storage is version 095. The registered chain, migration include, version assertions and active control scripts use the new block migration path. Historical control logs retain their actual earlier filenames.
+
+The typed-success observation regressions brought by main retain all of their expectations. Their shared `observation_rows` helper now counts physical `block` sources with `is_origin=1 AND source_present=1`, `retirement_tombstone` rows and `probe_authorization` rows, instead of reading the inactive `fence_origin`, `fence_retired_origin` and `fence_probe_authorization` audit copies. A source-less imported clock or retired source is not an origin of the old view, so the physical-source predicate is essential rather than a relaxed count. No expected zero, one or five, comparison operator, effect assertion or negative-case assertion changes.
+
+| Regression | Preserved claim |
+|---|---|
+| `observe_success_claimed_observation_retires_origin_and_authorizations` | A successful authorized test retires the observation source, records one retirement and spends all five authorizations, including older inconclusive copies. |
+| `observe_success_observation_requires_claim_and_exact_credential` | Unclaimed work, another credential and an ordinary success do not retire the source; the valid claimed success does. |
+| `observe_success_observation_newer_than_admission_survives` | Evidence newer than the admission remains an origin and adds no retirement. |
+| `observe_success_observation_retirement_rejects_old_replay_but_accepts_new_evidence` | Replayed equal or older receipts stay retired; a newer receipt creates a live origin without losing the earlier retirement. |
+
+The source insertion now applies that receipt-time guard against the native retirement archive inside its insert; archive records remain outside the loaded state. Native observation retirement clears the source through `retirement_tombstone_enforce`, the trigger on the native archive, and deletes matching native authorizations. Migration normalization retires matching, already-cleared observation sources left by the older clock-only success path, preserving the earlier clear time and spending their native authorizations without changing the frozen copies. A migration regression seeds one such source and five authorizations and audits the complete legacy copy around normalization. Verification and named controls for this integration remain pending until the merge commit; the pre-merge successes above are not evidence for the newly merged tree.

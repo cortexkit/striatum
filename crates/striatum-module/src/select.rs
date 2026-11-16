@@ -23,108 +23,27 @@ pub(crate) fn task_profiles_for(
     }
 }
 
-/// The full `route.select` body, decoded only after the method is confirmed.
-#[derive(Debug, Deserialize)]
-pub(super) struct SelectBody {
-    pub(super) params: SelectParams,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// Metadata used to build a decision audit row, not a route.select wire body.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub(super) struct SelectParams {
-    #[serde(default, rename = "service_tier")]
-    pub(super) service_tier: Option<cortexkit_role_routing::service_tier::ServiceTier>,
-    #[serde(default, rename = "workspace_root", alias = "workspaceRoot")]
-    pub(super) workspace_root: Option<String>,
-    #[serde(default, rename = "tier_consumer")]
-    pub(super) tier_consumer: Option<String>,
-    #[serde(default)]
     pub(super) consumer: Option<select_policy::Consumer>,
     #[serde(
-        default,
         rename = "allowed_providers",
         alias = "allowedProviders",
         deserialize_with = "select_policy::deserialize_allowed_providers"
     )]
     pub(super) allowed_providers: Option<Vec<String>>,
-    #[serde(default)]
-    pub(super) pin: Option<select_policy::Pin>,
-    #[serde(default, rename = "pin_fallback", alias = "pinFallback")]
-    pub(super) pin_fallback: select_policy::PinFallback,
-    #[serde(default)]
-    pub(super) model_pin: Option<String>,
-    /// Revalidate a retained worker credential without changing its auth method.
-    #[serde(default)]
-    pub(super) continuation_credential_id: Option<String>,
-    #[serde(default = "default_target_agent")]
-    pub(super) target_agent: String,
-    #[serde(default)]
-    pub(super) workload: Option<selection_harness::Workload>,
-    #[serde(default)]
-    pub(super) executor: Option<selection_harness::Executor>,
-    #[serde(default)]
-    pub(super) required_harness: Option<substrate_policy::Harness>,
-    /// Existing module callers may provide an already-resolved demand vector.
-    #[serde(default)]
-    pub(super) requirements: Option<ModelRequirements>,
-    /// Launch callers provide raw optional requirements so the module applies
-    /// clamping, specialist defaults, and Mason's required non-zero demand.
-    #[serde(default)]
-    pub(super) requested_requirements: Option<RequestedModelRequirements>,
-    /// Raw routeKeys/capacityKeys reported by the harness.
-    #[serde(default)]
-    pub(super) available_models: Vec<String>,
-    /// Per-attempt exclusions such as a route that just failed.
-    #[serde(default)]
-    pub(super) exclude_route_keys: Vec<String>,
-    #[serde(default)]
-    pub(super) required_capabilities: Option<RequiredCapabilities>,
-    /// Retained so older callers can still decode; routing ignores these
-    /// caller-policy fields in favor of its routing-owned config.
-    #[serde(default)]
-    pub(super) subscription_keys: Vec<String>,
-    #[serde(default)]
-    pub(super) routing_policy: Option<ModelRoutingPolicyInput>,
-    #[serde(default)]
-    pub(super) provider_auth_types: Option<HashMap<String, String>>,
-    /// Gather seats can request cache-capable providers without changing the
-    /// normal quality and cost ordering for other route selections.
-    #[serde(default)]
-    pub(super) prefer_prompt_cache: bool,
-    /// Audit context for the recorded decision (route.select is now a mutate that
-    /// records the decision server-side and returns its id).
-    #[serde(default)]
     pub(super) task_id: Option<String>,
-    #[serde(default, alias = "parentSessionID")]
+    #[serde(alias = "parentSessionID")]
     pub(super) parent_session_id: Option<String>,
-    /// The project and folder the daemon stamped on the request's scope. This
-    /// is never a request member: it is filled in from the route's bind just
-    /// before the decision is built, so a body cannot name its own project.
     #[serde(skip)]
     pub(super) scope: Option<DecisionScope>,
-    /// For `executor: broca`, `substrate: broca` uses Broca's served routes;
-    /// absent or other values use `availableModels`. Launch selections ignore
-    /// this legacy field and use each route's mapped harness.
-    #[serde(default)]
-    pub(super) substrate: Option<String>,
-    /// The caller's harness, used to match the decision with recorded spend facts when provided.
-    #[serde(default)]
     pub(super) harness: Option<String>,
-    /// The caller's project directory, used to match the decision with recorded spend facts.
-    #[serde(default, alias = "project_root")]
+    #[serde(alias = "project_root")]
     pub(super) project_root: Option<String>,
-    /// The caller may provide a launch attempt id before selection; otherwise it
-    /// remains null because the router never invents a send correlation.
-    #[serde(default, rename = "sendID")]
+    #[serde(rename = "sendID")]
     pub(super) send_id: Option<String>,
-    /// The caller's concurrency slot counts at request time, keyed by
-    /// `provider/model`. A candidate whose slot is full is passed over for this
-    /// decision only; absent (older callers, or a caller whose launch is not
-    /// limited by these slots) leaves the selection unchanged.
-    #[serde(default)]
-    pub(super) concurrency_slots: Option<Vec<ConcurrencySlotState>>,
-    #[serde(default, rename = "preferCapacityKey")]
-    pub(super) preferred_capacity_key: Option<String>,
 }
 
 impl SelectParams {
@@ -132,37 +51,7 @@ impl SelectParams {
     /// audit members (task, session, harness, project root, send id): what a
     /// `routing/v1` decision records them as.
     pub(super) fn for_record() -> Self {
-        serde_json::from_value(json!({})).expect("every select param has a default")
-    }
-
-    /// A host chooses from its own model list. A request explicitly sent to the
-    /// vault substrate instead needs credential and account admission.
-    pub(super) fn is_host_run(&self) -> bool {
-        self.executor.is_none()
-            && self.workload.is_none()
-            && self.required_harness.is_none()
-            && !is_broca_substrate(self.substrate.as_deref())
-    }
-
-    pub(super) fn resolved_workload(&self) -> Option<selection_harness::Workload> {
-        self.workload.or_else(|| {
-            if self.executor.is_none() {
-                selection_harness::Workload::for_agent(&self.target_agent)
-            } else {
-                None
-            }
-        })
-    }
-
-    pub(super) fn executor_workload_line(&self) -> Option<String> {
-        self.executor.as_ref().map(|_| {
-            format!(
-                "workload: {}",
-                self.resolved_workload()
-                    .map(selection_harness::Workload::as_str)
-                    .unwrap_or("none")
-            )
-        })
+        Self::default()
     }
 }
 
@@ -212,16 +101,6 @@ pub(super) struct SelectPanelParams {
     pub(super) send_id: Option<String>,
 }
 
-fn default_target_agent() -> String {
-    "unknown".to_string()
-}
-
-pub(super) struct ResolvedSelectRequest {
-    pub(super) requirements: ModelRequirements,
-    pub(super) required_capabilities: Option<RequiredCapabilities>,
-    pub(super) policy: ResolvedRoutingPolicy,
-}
-
 /// Host auth facts come only from the request. Non-host selection classifies
 /// each serving credential directly from the vault in the shared candidate pass.
 pub(super) fn provider_auth_types(
@@ -238,102 +117,6 @@ pub(super) fn policy_sources_line(operator: &ModelRoutingPolicyInput) -> String 
         config_overrides::operator_policy_revision(operator),
         operator.exclude.len(),
     )
-}
-
-/// How long a head's content-policy refusal keeps that provider off its launches.
-/// Long enough to cover a rephrase-and-relaunch cycle, short enough that a head
-/// working on unrelated material afterwards gets the provider back on its own.
-const HEAD_CONTENT_POLICY_EXCLUSION_MS: i64 = 60 * 60 * 1000;
-
-/// Routes withheld from launches sharing a parent session after one of that
-/// session's workers was refused by the provider's content policy, plus the
-/// explanation lines that say so.
-#[derive(Debug, Default, PartialEq)]
-struct HeadContentPolicyExclusions {
-    route_keys: HashSet<String>,
-    notes: Vec<String>,
-}
-
-/// A content-policy refusal is about the words the head sent, not the route, so it
-/// charges no strike and the route stays at full adequacy for everyone. That is
-/// right for the fleet and wrong for the head that just sent those words: its
-/// relaunch carries the same brief, routes to the same provider, and dies the same
-/// way, and a launch decision is minted before the task exists so nothing keys the
-/// retry to the refusal. Two seats lost two workers each in one day this way, every
-/// one on OpenAI, every relaunch back onto OpenAI (2026-09-20). The head is the
-/// stable key: for a bounded window after such a refusal, every route of the
-/// refusing provider is withheld from that head's launches only.
-fn head_content_policy_exclusions(
-    store: &SqliteRouteStateStore,
-    parent_session_id: Option<&str>,
-    facts: &[ModelFact],
-    now: i64,
-) -> HeadContentPolicyExclusions {
-    let Some(parent_session_id) = parent_session_id.map(str::trim).filter(|id| !id.is_empty())
-    else {
-        return HeadContentPolicyExclusions::default();
-    };
-    let failed = match store.recent_failed_decisions_for_parent(
-        parent_session_id,
-        now - HEAD_CONTENT_POLICY_EXCLUSION_MS,
-    ) {
-        Ok(failed) => failed,
-        Err(error) => {
-            // An unreadable ledger must not silently widen routing: the head keeps
-            // every route and the decision says the read failed.
-            return HeadContentPolicyExclusions {
-                route_keys: HashSet::new(),
-                notes: vec![format!(
-                    "head content-policy history unreadable, no routes withheld: {error}"
-                )],
-            };
-        }
-    };
-    let mut refused_providers: Vec<(String, String, i64)> = Vec::new();
-    for decision in failed {
-        // Typed core refusals carry durable item-scoped exclusions. Withholding
-        // this provider from the whole head would also penalize unrelated items.
-        if decision.outcome_error.contains("provider_policy_refusal") {
-            continue;
-        }
-        let attribution = striatum_core::classify_failure_attribution(
-            RouteOutcome::SessionError,
-            Some(decision.outcome_error.as_str()),
-        );
-        if attribution != striatum_core::FailureAttribution::ContentPolicy {
-            continue;
-        }
-        if refused_providers
-            .iter()
-            .any(|(provider, _, _)| provider == &decision.provider_id)
-        {
-            continue;
-        }
-        refused_providers.push((
-            decision.provider_id,
-            decision.route_key,
-            decision.outcome_at,
-        ));
-    }
-    if refused_providers.is_empty() {
-        return HeadContentPolicyExclusions::default();
-    }
-    let mut exclusions = HeadContentPolicyExclusions::default();
-    for (provider_id, route_key, outcome_at) in refused_providers {
-        for fact in facts.iter().filter(|fact| fact.provider_id == provider_id) {
-            exclusions.route_keys.insert(make_route_key(
-                &fact.provider_id,
-                &fact.model_id,
-                fact.variant.as_deref(),
-            ));
-        }
-        let minutes_ago = (now - outcome_at).max(0) / 60_000;
-        exclusions.notes.push(format!(
-            "withheld provider {provider_id} from this head for {} minutes: its worker on {route_key} was refused by the provider's content policy {minutes_ago}m ago; the refusal is about the request, not the route, so no strike was charged",
-            HEAD_CONTENT_POLICY_EXCLUSION_MS / 60_000
-        ));
-    }
-    exclusions
 }
 
 pub(super) fn claim_ignored_caller_policy_warning(sent: bool, warned: &Once) -> bool {
@@ -354,153 +137,8 @@ pub(super) fn warn_ignored_caller_policy_once(sent: bool) {
     }
 }
 
-fn warn_missing_consumer_once(target_agent: &str) -> bool {
-    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    let Ok(mut warned) = WARNED.get_or_init(|| Mutex::new(HashSet::new())).lock() else {
-        return false;
-    };
-    if !warned.insert(target_agent.to_owned()) {
-        return false;
-    }
-    tracing::warn!(
-        target_agent,
-        "route.select omitted consumer; applying exclude.all only"
-    );
-    true
-}
-
-fn no_route_error(
-    reason: RouteFailureReason,
-    message: String,
-    requirements: ModelRequirements,
-) -> NoRouteError {
-    NoRouteError {
-        candidates: Vec::new(),
-        reason,
-        message,
-        rejected: Vec::new(),
-        requirements: Some(requirements),
-        best_rejected: None,
-        earliest_reset: None,
-        earliest_reset_route: None,
-        adequate_blockers: Default::default(),
-    }
-}
-
-/// [`resolve_select_request_with_catalog_targets`] with no provider resolved
-/// through the vault, for tests that resolve a request without a listing.
-#[cfg(test)]
-pub(super) fn resolve_select_request(
-    params: &SelectParams,
-    operator_policy: &ModelRoutingPolicyInput,
-) -> Result<ResolvedSelectRequest, NoRouteError> {
-    resolve_select_request_with_catalog_targets(
-        params,
-        operator_policy,
-        &std::collections::BTreeMap::new(),
-        false,
-    )
-}
-
-/// Resolve a legacy select's requirements and available-model policy.
-/// `catalog_targets` names the providers with no catalog rows that resolved
-/// through the vault; they are never subscription-covered.
-fn resolve_select_request_with_catalog_targets(
-    params: &SelectParams,
-    operator_policy: &impl select_policy::PolicySource,
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    operator_ladder: bool,
-) -> Result<ResolvedSelectRequest, NoRouteError> {
-    let (requirements, required_capabilities) = if let Some(requirements) = params.requirements {
-        (requirements, params.required_capabilities)
-    } else {
-        match resolve_launch_requirements(
-            &params.target_agent,
-            params.requested_requirements.as_ref(),
-        ) {
-            Ok(resolved) => {
-                let capabilities =
-                    match (resolved.required_capabilities, params.required_capabilities) {
-                        (Some(mut defaults), Some(explicit)) => {
-                            if explicit.vision == Some(true) {
-                                defaults.vision = Some(true);
-                            }
-                            if let Some(min) = explicit.min_context {
-                                defaults.min_context =
-                                    Some(defaults.min_context.map_or(min, |value| value.max(min)));
-                            }
-                            Some(defaults)
-                        }
-                        (defaults, explicit) => explicit.or(defaults),
-                    };
-                (resolved.requirements, capabilities)
-            }
-            Err(error) => {
-                return Err(no_route_error(
-                    RouteFailureReason::InvalidRequirements,
-                    error.message,
-                    ModelRequirements { iq: 0.0, eq: 0.0 },
-                ));
-            }
-        }
-    };
-
-    // A request that names its model (an admission pin or a work run's
-    // `model=`) keeps operator-excluded routes in the available set: `exclude`
-    // keeps a route out of automatic choice only. An admission pin's automatic
-    // fallback still applies the operator's exclusions during admission. An
-    // operator ladder also names its choices, so scoring skips the settings
-    // rules that only forbid automatic choice (`pin_only`, `pin_only_for`) but
-    // still enforces `not_for` and `only_for` on providers, models and consumers.
-    let availability_policy = operator_policy.compiled_policy();
-    let policy = striatum_core::launch_policy::resolve_compiled_routing_policy(
-        params.available_models.iter().cloned(),
-        &availability_policy,
-        &ModelRoutingPolicyInput::default(),
-        &provider_auth_types(params.provider_auth_types.as_ref()),
-        catalog_targets,
-        params.pin.is_none() && params.model_pin.is_none() && !operator_ladder,
-    );
-    let uses_host_availability = (params.executor.is_some() || params.is_host_run())
-        && !is_broca_substrate(params.substrate.as_deref());
-    if uses_host_availability
-        && params.model_pin.is_none()
-        && params.pin.is_none()
-        && policy.connected_model_count == 0
-    {
-        return Err(no_route_error(
-            RouteFailureReason::NoAvailableModel,
-            format!(
-                "No models available to route {} (no connected providers detected).",
-                params.target_agent
-            ),
-            requirements,
-        ));
-    }
-    if uses_host_availability
-        && params.model_pin.is_none()
-        && params.pin.is_none()
-        && policy.available_models.is_empty()
-    {
-        return Err(no_route_error(
-            RouteFailureReason::NoAvailableModel,
-            format!(
-                "No models available to route {}: all {} connected models are excluded by operator policy or per-attempt route exclusions. Loosen model_routing.exclude.",
-                params.target_agent, policy.connected_model_count
-            ),
-            requirements,
-        ));
-    }
-
-    Ok(ResolvedSelectRequest {
-        requirements,
-        required_capabilities,
-        policy,
-    })
-}
-
 pub(super) struct PreparedSelectionInputs {
-    pub(super) catalog_snapshot: striatum_store::CatalogFactsSnapshot,
+    pub(super) catalog_snapshot: Arc<striatum_store::CatalogFactsSnapshot>,
     pub(super) now: f64,
     pub(super) facts: Vec<ModelFact>,
     pub(super) snapshot: ModelRouteStateSnapshot,
@@ -1108,16 +746,8 @@ impl Drop for RouteSelectTimingGuard {
     }
 }
 
-fn lost_probe_wait(until: i64) -> ErrorBody {
-    ErrorBody {
-        code: "no_route".into(),
-        message:
-            "The selected recovery probe is held by another request. Retry after its hold expires."
-                .into(),
-        detail: Some(json!({"reason":"accounts_blocked", "reset_at_ms":until})),
-    }
-}
-
+/// Serve retained legacy panel/account and operator operations. The public
+/// frame dispatcher sends every route.select request to routing_v1 instead.
 pub(super) async fn handle_select_request(
     frame: Frame,
     route_epoch: u32,
@@ -1129,40 +759,18 @@ pub(super) async fn handle_select_request(
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
 ) -> Result<(), ModuleError> {
-    let mut lost_probe_until: Option<i64> = None;
-    let mut lost_probe_routes = HashSet::new();
-    if let Ok(body) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
-        if body["method"] == ROUTE_SELECT_OP {
-            routing_v1::consumers::record_select(
-                "route.select",
-                body["params"]["targetAgent"].as_str(),
-                &config_overrides::live_config(operator_config_path),
-            );
-        }
-    }
-    loop {
-        let mut probe_lost = false;
-        handle_select_request_attempt(
-            frame.clone(),
-            route_epoch,
-            writer,
-            quota_cache,
-            store,
-            min_band,
-            routing_config_path,
-            operator_config_path,
-            broca_credentials,
-            &mut probe_lost,
-            &mut lost_probe_until,
-            &mut lost_probe_routes,
-        )
-        .await?;
-        if !probe_lost {
-            return Ok(());
-        }
-        // Rebuild account evidence after a lost bind, before writing any reply.
-        // The durable claim excludes the credential and supplies its retry time.
-    }
+    handle_select_request_attempt(
+        frame,
+        route_epoch,
+        writer,
+        quota_cache,
+        store,
+        min_band,
+        routing_config_path,
+        operator_config_path,
+        broca_credentials,
+    )
+    .await
 }
 
 async fn handle_select_request_attempt(
@@ -1175,9 +783,6 @@ async fn handle_select_request_attempt(
     routing_config_path: &Path,
     operator_config_path: &Path,
     broca_credentials: &SharedBrocaCredentials,
-    probe_lost: &mut bool,
-    lost_probe_until: &mut Option<i64>,
-    lost_probe_routes: &mut HashSet<String>,
 ) -> Result<(), ModuleError> {
     let timing = RouteSelectTimingGuard::new();
     let live_config_started = Instant::now();
@@ -1221,6 +826,12 @@ async fn handle_select_request_attempt(
             &format!("unknown method '{}'", envelope.method),
         )
         .await;
+    }
+    if envelope.method == ROUTE_SELECT_PANEL_OP {
+        crate::info_operator(format!(
+            "[routing] legacy panel call principal={}",
+            route_principal(channel, epoch)
+        ));
     }
 
     if envelope.method == ROUTE_CATALOG_TARGETS_OP {
@@ -1497,43 +1108,7 @@ async fn handle_select_request_attempt(
         );
         return send_pool_reply(writer, ver, channel, epoch, corr, reply).await;
     }
-    if envelope.method == ROUTE_SELECT_OP {
-        if let Ok(request) = serde_json::from_slice::<serde_json::Value>(&frame.body) {
-            let params = &request["params"];
-            let consumer = routing_v1::consumers::legacy_consumer(params);
-            if !routing_v1::consumers::legacy_core_consumer(consumer) {
-                let operator = config_overrides::live_config(operator_config_path);
-                let consumers = routing_v1::consumers::effective(&operator);
-                // Preserve the legacy decoder's invalid_request for malformed
-                // enum values. A recognized non-core consumer must pass caller
-                // authorization before its legacy enum value is decoded.
-                let invalid_legacy_consumer = params.get("consumer").is_some_and(|value| {
-                    serde_json::from_value::<Option<select_policy::Consumer>>(value.clone())
-                        .is_err()
-                }) && !consumers.knows(consumer);
-                if let Err(refusal) = if invalid_legacy_consumer {
-                    Ok(())
-                } else {
-                    consumers.admit(consumer, &routing_v1::Caller::for_route(channel, epoch))
-                } {
-                    let body = ErrorBody {
-                        code: refusal.code.as_str().to_owned(),
-                        message: refusal.message,
-                        detail: Some(serde_json::Value::Object(refusal.detail)),
-                    };
-                    return send_route_error_body(writer, ver, channel, epoch, corr, body).await;
-                }
-            }
-        }
-    }
-    let host_request = envelope.method == ROUTE_SELECT_OP
-        && serde_json::from_slice::<SelectBody>(&frame.body)
-            .is_ok_and(|body| body.params.is_host_run());
-    let billing_ready = if !host_request
-        && matches!(
-            envelope.method.as_str(),
-            ROUTE_SELECT_OP | ROUTE_SELECT_PANEL_OP
-        ) {
+    let billing_ready = if envelope.method == ROUTE_SELECT_PANEL_OP {
         let billing_started = Instant::now();
         let ready =
             broca_credentials::wait_for_billing_catalog(broca_credentials, Duration::from_secs(3))
@@ -1579,1800 +1154,16 @@ async fn handle_select_request_attempt(
         .await;
     }
 
-    if envelope.method != ROUTE_SELECT_OP {
-        return send_route_error(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "unknown_method",
-            &format!("unknown method '{}'", envelope.method),
-        )
-        .await;
-    }
-
-    let resolve_started = Instant::now();
-    let params: SelectParams = match serde_json::from_slice::<SelectBody>(&frame.body) {
-        Ok(b) => b.params,
-        Err(e) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "invalid_request",
-                &format!("route.select params not decodable: {e}"),
-            )
-            .await;
-        }
-    };
-    // The decision ledger records the project and folder the daemon stamped on
-    // this route's scope, never anything the request body says.
-    let params = SelectParams {
-        scope: route_scope(channel, epoch),
-        ..params
-    };
-    let host_run = params.is_host_run();
-    let selected_workload = params
-        .resolved_workload()
-        .filter(|_| params.executor.is_none() && !host_run)
-        .map(selection_harness::Workload::as_str);
-    let executor_workload = params.executor_workload_line();
-    warn_ignored_caller_policy_once(
-        params.routing_policy.is_some() || !params.subscription_keys.is_empty(),
-    );
-    if params.consumer.is_none() {
-        warn_missing_consumer_once(&params.target_agent);
-    }
-    if params.pin.is_some() && params.model_pin.is_some() {
-        return send_route_error(
-            writer,
-            ver,
-            channel,
-            epoch,
-            corr,
-            "invalid_request",
-            "pin and modelPin are mutually exclusive",
-        )
-        .await;
-    }
-    add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-    // The operator fence is read HERE, on the module side, for every selection.
-    let live_config_started = Instant::now();
-    let operator_config = if operator_config_path == routing_config_path {
-        Arc::clone(&live_config)
-    } else {
-        config_overrides::live_config(operator_config_path)
-    };
-    let operator_policy = operator_config.operator_policy_ref();
-    timing.add_live_config_check(live_config_started.elapsed());
-    let snapshot_started = Instant::now();
-    let stored_facts = match store.get_facts() {
-        Ok(facts) => facts,
-        Err(e) => {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                "store_error",
-                &format!("reading facts from route-state store: {e}"),
-            )
-            .await;
-        }
-    };
-    // Providers with no catalog rows of their own, each resolved to the catalog
-    // provider whose rows it borrows, read once for this selection.
-    let catalog_targets = broca_credentials
-        .lock()
-        .map(|credentials| credentials.catalog_targets(&stored_facts))
-        .unwrap_or_default();
-    timing.add_snapshot_closure(snapshot_started.elapsed());
-    // A host does not choose the substrate of the mason it launches. A host's
-    // mason pin on a provider that needs a per-send credential pin is admitted
-    // provisionally against Broca's routes, without leasing a key; core selects
-    // the pin again with substrate broca before it records the launch.
-    let deferred_runner_pin = host_run
-        && params.substrate.is_none()
-        && params.target_agent == "mason"
-        && params.model_pin.as_deref().is_some_and(|pin| {
-            pin.split_once('/')
-                .is_some_and(|(provider, _)| needs_runner_pin(&catalog_targets, provider))
-        });
-    // The harness a host-run selection is judged on: Broca's served routes when
-    // the caller names substrate broca (or for a deferred runner pin), otherwise
-    // the caller's own list, which has no harness of routing's choosing.
-    let host_run_harness = (host_run
-        && (deferred_runner_pin || is_broca_substrate(params.substrate.as_deref())))
-    .then_some(substrate_policy::Harness::Broca);
-    let snapshot_started = Instant::now();
-    let mut availability = if host_run && !deferred_runner_pin {
-        SelectAvailability::host(params.available_models.clone())
-    } else {
-        let mut facts = stored_facts;
-        live_config.apply(&mut facts);
-        // Resolved providers are reachable through their own credentials, so
-        // their borrowed rows join the served-route join.
-        striatum_core::score_alias::append_alias_rows(&mut facts, &catalog_targets);
-        select_availability(
-            Some(legacy_wire::BROCA),
-            Vec::new(),
-            &facts,
-            broca_credentials,
-        )
-    };
-    timing.add_snapshot_closure(snapshot_started.elapsed());
-    // A host-run selection judged on the caller's own list never consulted
-    // Broca's routes, so its explanation must not describe them.
-    if host_run && host_run_harness.is_none() {
-        availability.note = None;
-    }
-    let resolve_started = Instant::now();
-    let consumer_id = variant_policy::consumer_group(params.consumer).unwrap_or("");
-    let consumer_policy = operator_config.consumer_policy(
-        consumer_id,
-        &config_policy::ConsumerPolicy::default(),
-        &std::collections::BTreeMap::new(),
-    );
-    let mut resolved_request = match resolve_select_request_with_catalog_targets(
-        &params,
-        operator_config.as_ref(),
-        &catalog_targets,
-        consumer_policy.operator_ladder(),
-    ) {
-        Ok(resolved) => {
-            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-            resolved
-        }
-        Err(mut no_route) => {
-            add_stage_ms(&timing.resolve_ms, resolve_started.elapsed());
-            let write_started = Instant::now();
-            if let Some(note) = &availability.note {
-                no_route.message = format!("{} ({note})", no_route.message);
-            }
-            let requirements = no_route
-                .requirements
-                .unwrap_or(ModelRequirements { iq: 0.0, eq: 0.0 });
-            let decision = decision_input_for(
-                &params.target_agent,
-                &requirements,
-                None,
-                Some(&no_route),
-                &params,
-                None,
-                Some(&policy_sources_line(&operator_policy)),
-            );
-            record_failed_selection_decision(store.as_ref(), &decision);
-            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-            return send_no_route(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                &no_route,
-                params.pin.as_ref().map(|_| "invalid_requirements"),
-            )
-            .await;
-        }
-    };
-    let providers_without_prompt_cache = live_config.providers_without_prompt_cache();
-    let snapshot_started = Instant::now();
-    let prepared = prepare_selection_inputs(
-        quota_cache,
-        store,
-        live_config.pricing(),
-        live_config.quota_model_pools_ref(),
-    );
-    timing.add_snapshot_closure(snapshot_started.elapsed());
-    let PreparedSelectionInputs {
-        catalog_snapshot,
-        now,
-        mut facts,
-        mut snapshot,
-        quota_signal_json,
-        quota_note,
-    } = match prepared {
-        Ok(prepared) => prepared,
-        Err(e) => {
-            return send_route_error(writer, ver, channel, epoch, corr, "store_error", &e).await;
-        }
-    };
-    let pricing_started = Instant::now();
-    // Apply the configured payment-class policy even when a legacy caller names
-    // its consumer through targetAgent rather than the consumer member.
-    let payment_consumer = params
-        .consumer
-        .or_else(|| select_policy::Consumer::from_id(&params.target_agent));
-    let payment_policy = operator_config.consumer_policy(
-        variant_policy::consumer_group(payment_consumer).unwrap_or(""),
-        &config_policy::ConsumerPolicy::default(),
-        &std::collections::BTreeMap::new(),
-    );
-    let priced_per_token = select_policy::priced_per_token(&payment_policy, payment_consumer);
-    let PricedSelection {
-        routing_config,
-        provenance,
-        entitlement_fences,
-        subscription_plan_providers,
-        mut classes,
-    } = price_selection_inputs_with_catalog(
-        &mut facts,
-        quota_signal_json,
-        &SelectionPolicySources {
-            live_config: &live_config,
-            operator_config: &operator_config,
-            operator_config_path,
-            catalog_targets: &catalog_targets,
-        },
-        Some(&catalog_snapshot),
-        store,
-        broca_credentials,
-        !host_run,
-        priced_per_token,
-        true,
-    )?;
-    if let Some(credential) = &params.continuation_credential_id {
-        if let Some(classes) = &mut classes {
-            classes.revalidate_credential(credential);
-        }
-    }
-    add_stage_ms(&timing.pricing_ms, pricing_started.elapsed());
-    let policy_started = Instant::now();
-    let host_models: HashSet<String> = resolved_request
-        .policy
-        .available_models
-        .iter()
-        .cloned()
-        .collect();
-    let broca_models: HashSet<String> = availability.models.iter().cloned().collect();
-    let frontier_broca_models = broca_credentials
-        .lock()
-        .map(|credentials| credentials.statically_served_routes(&facts))
-        .unwrap_or_default();
-    let executor_models = if is_broca_substrate(params.substrate.as_deref()) {
-        &broca_models
-    } else {
-        &host_models
-    };
-    let harness_context = selection_harness::SelectionHarness {
-        groups: operator_config.substrate_groups(),
-        consumer: params.consumer,
-        workload: params.resolved_workload(),
-        executor: params.executor.is_some(),
-        required: params.required_harness,
-        caller: params.harness.as_deref(),
-        host_models: &host_models,
-        broca_models: &broca_models,
-        executor_models,
-    };
-    // A host-run selection judged on Broca that carries the head's model list
-    // re-selects a launch the head already routed on that list (core's Broca
-    // step for a routed mason, or a route switch of such a worker). It stays
-    // inside the list: Broca's reach decides which of those models can run,
-    // never which other models may. A pin names its own model and is not
-    // confined.
-    let confine_broca = (host_run_harness.is_some()
-        || (is_broca_substrate(params.substrate.as_deref())
-            && params.executor.is_none()
-            && params.workload.is_none()
-            && params.required_harness.is_none()))
-        && params.pin.is_none()
-        && params.model_pin.is_none()
-        && !params.available_models.is_empty();
-    let confined_broca_models = confine_broca.then(|| {
-        let confined = confine_to_caller_list(&broca_models, &params.available_models, &facts);
-        if let Some(note) = availability.note.as_mut() {
-            note.push_str(&format!(
-                "; confined to the caller's {} listed models: {} reachable",
-                params.available_models.len(),
-                confined.len()
-            ));
-        }
-        confined
-    });
-    let mut mapped_availability = if host_run || confined_broca_models.is_some() {
-        selection_harness::MappedAvailability {
-            models: if host_run_harness.is_some() || !host_run {
-                confined_broca_models.unwrap_or_else(|| broca_models.clone())
-            } else {
-                host_models.clone()
-            },
-            rejected: HashMap::new(),
-        }
-    } else {
-        harness_context.availability(&facts)
-    };
-    let frontier_models = if host_run || confine_broca {
-        if host_run_harness.is_some() || !host_run {
-            if confine_broca {
-                confine_to_caller_list(&frontier_broca_models, &params.available_models, &facts)
-            } else {
-                frontier_broca_models.clone()
-            }
-        } else {
-            host_models.clone()
-        }
-    } else {
-        selection_harness::SelectionHarness {
-            broca_models: &frontier_broca_models,
-            executor_models: if is_broca_substrate(params.substrate.as_deref()) {
-                &frontier_broca_models
-            } else {
-                &host_models
-            },
-            ..harness_context
-        }
-        .availability(&facts)
-        .models
-    };
-    let runner_registry = broca_credentials
-        .lock()
-        .map(|credentials| {
-            routing_v1::runners::Registry::build_for_harness(
-                operator_config.as_ref(),
-                &credentials,
-                &facts,
-                snapshot.now as u64,
-                params.harness.as_deref(),
-            )
-        })
-        .unwrap_or_default();
-    let configured_runners = runner_registry.policies();
-    let tier_settings = crate::tier_settings::Layers::new(
-        params.project_root.as_deref().filter(|_| !host_run),
-        params.workspace_root.as_deref().filter(|_| !host_run),
-    );
-    let configured_tiers = if !host_run {
-        classes
-            .as_mut()
-            .map(|classes| {
-                classes.apply_configured_service_tiers(
-                    &mut facts,
-                    |fact| {
-                        tier_settings.resolve(
-                            &operator_config,
-                            params.tier_consumer.as_deref().unwrap_or(consumer_id),
-                            &fact.provider_id,
-                            &fact.model_id,
-                            params.service_tier,
-                        )
-                    },
-                    &configured_runners,
-                    &runner_registry,
-                    priced_per_token,
-                )
-            })
-            .unwrap_or_default()
-    } else {
-        Default::default()
-    };
-    let host_auth = params.provider_auth_types.clone().unwrap_or_default();
-    if let Some(classes) = &classes {
-        classes.apply_eligibility(
-            &mut snapshot,
-            &facts,
-            priced_per_token,
-            params.pin.is_some() || params.model_pin.is_some(),
-        );
-        classes.apply_legacy_route_fences(
-            &mut snapshot,
-            &facts,
-            priced_per_token,
-            params.pin.is_some() || params.model_pin.is_some(),
-        );
-    }
-    let candidates = select_policy::prepare_candidates(
-        &facts,
-        &mut snapshot,
-        mapped_availability.models,
-        mapped_availability.rejected,
-        if host_run {
-            select_policy::CandidateSource::Host {
-                auth_types: &host_auth,
-            }
-        } else {
-            select_policy::CandidateSource::Vault {
-                credentials: broca_credentials,
-                fences: &entitlement_fences,
-                stale: &[],
-                defer_pool_pin: params.pin.is_some() || params.model_pin.is_some(),
-            }
-        },
-        false,
-        params.consumer,
-        priced_per_token,
-        params.allowed_providers.as_deref(),
-        subscription_plan_providers.as_ref(),
-        operator_config.as_ref(),
-        &catalog_targets,
-        classes.as_ref(),
-    );
-    let subscription_keys = candidates.subscription_keys;
-    let candidate_filters = candidates.filters;
-    resolved_request.policy.subscription_keys = subscription_keys.iter().cloned().collect();
-    resolved_request.policy.subscription_keys.sort();
-    mapped_availability = selection_harness::MappedAvailability {
-        models: candidates.available,
-        rejected: candidates.rejected,
-    };
-    let runner_runs = |runner: &config_policy::RunnerPolicy, key: &str, capacity: &str| {
-        runner_registry.runs(&runner.module, key, capacity)
-            && configured_tiers
-                .get(capacity)
-                .filter(|tier| !tier.is_standard())
-                .is_none_or(|tier| {
-                    classes.as_ref().is_some_and(|classes| {
-                        facts
-                            .iter()
-                            .find(|fact| fact_to_route(fact).capacity_key == capacity)
-                            .is_some_and(|fact| {
-                                runner_registry.get(&runner.module).is_some_and(|runner| {
-                                    classes.tier_runner_serves(runner, fact, tier.as_str())
-                                })
-                            })
-                    })
-                })
-    };
-    if !host_run {
-        let mut no_account = Vec::new();
-        let mut missing_wire_api = Vec::new();
-        mapped_availability.models.retain(|key| {
-            let capacity = facts
-                .iter()
-                .map(fact_to_route)
-                .find(|route| route.route_key == *key)
-                .map(|route| route.capacity_key)
-                .unwrap_or_else(|| key.clone());
-            let runnable = select_policy::choose_runner(
-                &configured_runners,
-                consumer_policy.runner.as_deref(),
-                key,
-                &capacity,
-                &runner_runs,
-            )
-            .is_some();
-            if !runnable
-                && configured_runners
-                    .iter()
-                    .filter(|runner| {
-                        consumer_policy
-                            .runner
-                            .as_deref()
-                            .is_none_or(|module| module == runner.module)
-                    })
-                    .any(|runner| runner_registry.requires_wire_api(&runner.module, key, &capacity))
-            {
-                missing_wire_api.push(key.clone());
-            }
-            if !runnable
-                && configured_runners
-                    .iter()
-                    .filter(|runner| {
-                        consumer_policy
-                            .runner
-                            .as_deref()
-                            .is_none_or(|module| module == runner.module)
-                    })
-                    .any(|runner| runner_registry.no_runner_account(&runner.module, key, &capacity))
-            {
-                no_account.push(key.clone());
-            }
-            runnable
-        });
-        for key in no_account {
-            mapped_availability
-                .rejected
-                .insert(key, "no_runner_account".into());
-        }
-        for key in missing_wire_api {
-            mapped_availability.rejected.insert(
-                key,
-                striatum_core::model_router::REASON_RUNNER_REQUIRES_WIRE_API.into(),
-            );
-        }
-    }
-    for fact in &facts {
-        let route = fact_to_route(fact);
-        if frontier_models.contains(&route.route_key)
-            && (!mapped_availability.models.contains(&route.route_key)
-                || mapped_availability.rejected.contains_key(&route.route_key))
-            && !candidate_filters.contains_key(&route.route_key)
-            && operator_config.route_allowed(
-                consumer_id,
-                &route.route_key,
-                consumer_policy.operator_ladder(),
-            )
-            && select_policy::choose_runner(
-                &configured_runners,
-                consumer_policy.runner.as_deref(),
-                &route.route_key,
-                &route.capacity_key,
-                |runner, key, capacity| runner_registry.can_run(&runner.module, key, capacity),
-            )
-            .is_some()
-        {
-            snapshot
-                .by_route
-                .entry(route.route_key)
-                .or_default()
-                .statically_routable
-                .get_or_insert(true);
-        }
-    }
-    let available = mapped_availability.models.clone();
-    let provenance = provenance.with_account_snapshot(&snapshot);
-    let runner_module = |selected: &SelectedModelRoute| -> Option<String> {
-        if host_run {
-            Some(
-                if deferred_runner_pin {
-                    legacy_wire::BROCA
-                } else {
-                    params
-                        .harness
-                        .as_deref()
-                        .or(params.substrate.as_deref())
-                        .unwrap_or("host")
-                }
-                .to_owned(),
-            )
-        } else {
-            select_policy::choose_runner(
-                &configured_runners,
-                consumer_policy.runner.as_deref(),
-                &selected.route_key,
-                &selected.capacity_key,
-                &runner_runs,
-            )
-            .map(|runner| runner.module.clone())
-        }
-    };
-    // The harness a route selected here runs on, as far as routing knows: the
-    // mapped harness, or for a host-run selection Broca when it was judged on
-    // Broca's routes and unknown otherwise.
-    let run_harness = |route_key: &str| {
-        if host_run {
-            host_run_harness
-        } else {
-            Some(harness_context.mapped(route_key))
-        }
-    };
-    // Record on the winner's harness ladder, keeping other harnesses' routes
-    // out of its availability history. Target agents retain separate histories.
-    //
-    // A request that names its model keeps operator-excluded routes in
-    // `available` (see resolve_select_request). The ladder replays automatic
-    // selection, so it is handed the fenced list an unpinned request would see;
-    // otherwise pinned and unpinned launches of one class would record two lists
-    // and read as an availability change on every switch.
-    let ladder_fence = ExclusionSpecs::parse(ExclusionPolicy {
-        operator: &operator_policy.exclude,
-        caller: &[],
-    });
-    let record_ladder = |harness: Option<substrate_policy::Harness>| {
-        winner_ladder::observed_selections().record(
-            winner_ladder::LadderKey::new(
-                if harness == Some(substrate_policy::Harness::Broca) {
-                    winner_ladder::SUBSTRATE_BROCA
-                } else {
-                    winner_ladder::SUBSTRATE_HOST
-                },
-                &params.target_agent,
-            ),
-            available
-                .iter()
-                .filter(|key| host_run || harness == Some(harness_context.mapped(key)))
-                .filter(|key| !ladder_fence.excludes(key))
-                .cloned(),
-            subscription_keys
-                .iter()
-                .filter(|key| !ladder_fence.excludes(key))
-                .cloned(),
-            snapshot.clone(),
-        )
-    };
-    let mut exclude = params.exclude_route_keys.clone();
-    exclude.extend(lost_probe_routes.iter().cloned());
-    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
-    let head_history_started = Instant::now();
-    let head_refusals = head_content_policy_exclusions(
-        store,
-        params.parent_session_id.as_deref(),
-        &facts,
-        now as i64,
-    );
-    add_stage_ms(&timing.head_history_ms, head_history_started.elapsed());
-    let mut policy_started = Instant::now();
-    exclude.extend(head_refusals.route_keys.iter().cloned());
-    let operator_exclude = operator_policy.exclude.clone();
-    let consumer_exclude = operator_config.consumer_exclusions(consumer_id);
-    let requirements = resolved_request.requirements;
-    let required_capabilities = resolved_request.required_capabilities;
-    let target_agent = params.target_agent.clone();
-    let prefer_prompt_cache = params.prefer_prompt_cache;
-
-    let min_best_effort_adequacy = live_config.min_band();
-    let concurrency_slots =
-        if params.concurrency_slots.is_some() || params.preferred_capacity_key.is_some() {
-            Some(
-                ConcurrencySlots::new(params.concurrency_slots.clone().unwrap_or_default())
-                    .with_preferred_capacity(params.preferred_capacity_key.clone()),
-            )
-        } else {
-            None
-        };
-
-    let admission_pin = params
-        .pin
-        .as_ref()
-        .and_then(|pin| pin.resolve(|slot| operator_config.slot_pin(slot).cloned()));
-    let ledger_pin = params
-        .model_pin
-        .as_deref()
-        .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
-        .filter(|_| params.pin_fallback == select_policy::PinFallback::None)
-        .map(|pin| crate::select_concurrency::pin_capacity(pin, &facts));
-    let ledger = crate::select_concurrency::capture(
-        store.as_ref(),
-        classes.as_ref(),
-        &facts,
-        priced_per_token,
-        now as i64,
-        |fact| crate::select_concurrency::considered(fact, &available, ledger_pin.as_deref()),
+    send_route_error(
+        writer,
+        ver,
+        channel,
+        epoch,
+        corr,
+        "unknown_method",
+        &format!("unknown method '{}'", envelope.method),
     )
-    .map_err(|error| ModuleError::Message(error.to_string()))?;
-    let head_request = crate::select_concurrency::head(&operator_config, &target_agent);
-    let enforce_concurrency = live_config.concurrency_caps().enforcement_enabled;
-    let policy_memo = config_overrides::SelectionPolicyMemo::default();
-    let pass = select_policy::SelectionPass {
-        policy_memo: &policy_memo,
-        concurrency: enforce_concurrency.then_some(&ledger),
-        consumer: consumer_id,
-        target_agent: &target_agent,
-        requirements,
-        required_capabilities,
-        facts: &facts,
-        snapshot: &snapshot,
-        exclude: &exclude,
-        operator_exclude: &operator_exclude,
-        consumer_exclude: &consumer_exclude,
-        subscription_keys: &subscription_keys,
-        priced_per_token,
-        classifier: false,
-        rejections: &mapped_availability.rejected,
-        config: &routing_config,
-        slots: concurrency_slots.as_ref(),
-        min_band: min_best_effort_adequacy,
-        prefer_prompt_cache,
-        providers_without_prompt_cache: &providers_without_prompt_cache,
-        operator_config: &operator_config,
-    };
-
-    let mut pin_rejected = None;
-    if let Some(pin) = params
-        .model_pin
-        .as_deref()
-        .or_else(|| admission_pin.as_ref().map(|pin| pin.model.as_str()))
-    {
-        let variant = admission_pin
-            .as_ref()
-            .and_then(|pin| pin.variant.clone())
-            .or_else(|| work_model_pin::named_variant(pin, &facts));
-        let (pin_key, pin_capacity) = work_model_pin::route_keys(pin, variant.as_deref(), &facts);
-        let pin_snapshot = snapshot.clone();
-        let mut pin_availability = mapped_availability.rejected.clone();
-        // Capture the timed route wall's expiry so a caller forbidden to fall
-        // back can wait until the pinned route becomes admissible again.
-        let pin_wall_until =
-            striatum_core::model_router::route_wall_until(&pin_snapshot, &pin_key, &pin_capacity);
-        let mut pin_available = available.clone();
-        let allowed = operator_config.route_allowed(consumer_id, &pin_key, true)
-            && operator_config.route_allowed(consumer_id, &pin_capacity, true);
-        if !allowed {
-            pin_availability.insert(pin_key.clone(), format!("not_for excludes {consumer_id}"));
-        }
-        // A host-run pin is judged on the same list as the host's automatic
-        // selections; it is not added to that list.
-        if !host_run && allowed {
-            if let Some(detail) = harness_context.rejection(&pin_key, &pin_capacity) {
-                pin_availability.insert(pin_key.clone(), detail);
-            } else {
-                pin_available.insert(pin_key.clone());
-            }
-        }
-        if let Some(detail) = candidate_filters
-            .get(&pin_key)
-            .or_else(|| candidate_filters.get(&pin_capacity))
-        {
-            pin_availability.insert(pin_key.clone(), detail.clone());
-        }
-        let pin_harness = run_harness(&pin_key);
-        let runner_pin_refusal = if host_run {
-            host_runner_pin_refusal(
-                &catalog_targets,
-                if deferred_runner_pin {
-                    Some(legacy_wire::BROCA)
-                } else {
-                    params.substrate.as_deref()
-                },
-                "this request names substrate",
-                [pin],
-            )
-        } else {
-            let mapped = harness_context.mapped(&pin_key);
-            host_runner_pin_refusal(
-                &catalog_targets,
-                Some(mapped.as_str()),
-                "this route maps to harness",
-                [pin],
-            )
-            .filter(|_| {
-                params.executor.is_none()
-                    && params
-                        .required_harness
-                        .is_none_or(|required| required == mapped)
-            })
-        };
-        if let Some(refusal) = runner_pin_refusal {
-            return send_route_error(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                PROVIDER_REQUIRES_RUNNER_PIN,
-                &refusal,
-            )
-            .await;
-        }
-        add_stage_ms(&timing.policy_ms, policy_started.elapsed());
-        let selection_started = Instant::now();
-        let pin_credential_refusal = pin_snapshot
-            .by_capacity
-            .get(&pin_capacity)
-            .and_then(|state| state.credential_refusal.clone());
-        let selection = {
-            let input = select_policy::SelectionPass {
-                prefer_prompt_cache: false,
-                ..pass
-            }
-            .input(&pin_available, pin_snapshot);
-            let mut input = Some(input);
-            pass.select(&pin_available, Some(pin), None, None, |_| {
-                let input = input.take().expect("a terminal pin is admitted once");
-                if let Some(pin) = &admission_pin {
-                    select_policy::select_pin_with_availability(
-                        pin,
-                        input,
-                        &routing_config,
-                        concurrency_slots.as_ref(),
-                        &pin_availability,
-                    )
-                    .map_err(|code| work_model_pin::Refusal {
-                        message: code.clone(),
-                        code,
-                        retry_at: None,
-                    })
-                } else {
-                    work_model_pin::select_with_availability(
-                        pin,
-                        input,
-                        &routing_config,
-                        concurrency_slots.as_ref(),
-                        config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                        &catalog_targets,
-                        &pin_availability,
-                    )
-                }
-            })
-            .map(|(selected, _, _)| selected)
-            .map_err(|error| match error {
-                select_policy::OrderFailure::Pin(refusal) => refusal,
-                select_policy::OrderFailure::Score(_) => unreachable!("a request pin is terminal"),
-            })
-        };
-        if let Ok(selected) = &selection {
-            if ledger.accounts(&selected.route_key).is_some() {
-                let no_route = ledger.refusal(&[selected.route_key.clone()]);
-                crate::select_concurrency::record(
-                    "route.select",
-                    &target_agent,
-                    &operator_config,
-                    &no_route,
-                );
-                if enforce_concurrency && !head_request {
-                    let decision = decision_input_for(
-                        &target_agent,
-                        &requirements,
-                        None,
-                        Some(&no_route),
-                        &params,
-                        Some(&provenance),
-                        Some(&policy_sources_line(&operator_policy)),
-                    );
-                    record_failed_selection_decision(store.as_ref(), &decision);
-                    return send_no_route(writer, ver, channel, epoch, corr, &no_route, None).await;
-                }
-            }
-        }
-        let selection = selection.map(|mut selected| {
-            let explicit = admission_pin.as_ref().map_or_else(
-                || work_model_pin::named_variant(pin, &facts),
-                |pin| pin.variant.clone(),
-            );
-            let choice = apply_variant_policy(
-                &mut selected,
-                &operator_config,
-                operator_config_path,
-                &catalog_targets,
-                variant_policy::consumer_group(params.consumer),
-                explicit.as_deref(),
-            );
-            (selected, choice)
-        });
-        let selection = selection.and_then(|(selected, variant_choice)| {
-            let policy = striatum_core::accounts::AllocatorPolicy {
-                model_pools: live_config.quota_model_pools_ref().to_vec(),
-                ..Default::default()
-            };
-            let ctx = account_selection::Ctx {
-                store: store.as_ref(),
-                accounts: ACCOUNT_QUOTA.get(),
-                flags: live_config.account_flags(),
-                policy: &policy,
-                now_ms: now as i64,
-                classes: classes.clone(),
-            };
-            // Explicit catalog-less providers lease API keys through key_pool;
-            // its own admission must preserve the pool's typed refusal.
-            if !host_run && !catalog_targets.contains_key(&selected.model.provider_id) {
-                account_selection::preflight_model_for_class(
-                    &ctx,
-                    &selected.model.provider_id,
-                    &selected.model.model_id,
-                    priced_per_token,
-                )
-                .map_err(|(code, message)| work_model_pin::Refusal {
-                    code,
-                    message,
-                    retry_at: None,
-                })?;
-            }
-            // Resolve the Broca launch target and its credential mapping
-            // before recording a decision; an unusable mapping rejects the pin.
-            // A deferred runner pin leases nothing until core completes it.
-            let runner = if pin_harness == Some(substrate_policy::Harness::Broca)
-                && !deferred_runner_pin
-            {
-                let session = pool_session(
-                    params.task_id.as_deref(),
-                    params.send_id.as_deref(),
-                    &format!("route.select:{}", now as i64),
-                );
-                Some(
-                    runner_for_route(
-                        &catalog_targets,
-                        broca_credentials,
-                        store.as_ref(),
-                        &session,
-                        &selected.model.provider_id,
-                        &selected.model.model_id,
-                        selected.prompt_params.variant.as_deref(),
-                        classes.as_ref(),
-                        priced_per_token,
-                        None,
-                    )
-                    .map_err(|refusal| match refusal {
-                        account_selection::LaunchRefusal::Lost { retry_at } => {
-                            work_model_pin::Refusal {
-                                code: "no_route".into(),
-                                message: "the selected recovery probe is held by another request"
-                                    .into(),
-                                retry_at: Some(retry_at),
-                            }
-                        }
-                        account_selection::LaunchRefusal::Refused { code, message } => {
-                            work_model_pin::Refusal {
-                                code,
-                                message,
-                                retry_at: None,
-                            }
-                        }
-                    })?,
-                )
-            } else {
-                None
-            };
-            Ok((selected, runner, variant_choice))
-        });
-        timing.record_selection(selection_started.elapsed());
-        policy_started = Instant::now();
-        match selection {
-            Ok((mut selected, runner, variant_choice)) => {
-                let Some(module) = runner_module(&selected) else {
-                    return send_route_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "no_route",
-                        "no configured runner can run the pinned route",
-                    )
-                    .await;
-                };
-                let ladder_started = Instant::now();
-                record_ladder(pin_harness);
-                add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
-                if let Some(line) = &executor_workload {
-                    selected.explanation.push(line.clone());
-                }
-                let write_started = Instant::now();
-                let mut decision = decision_input_for(
-                    &target_agent,
-                    &requirements,
-                    Some(&selected),
-                    None,
-                    &params,
-                    Some(&provenance),
-                    Some(&policy_sources_line(&operator_policy)),
-                );
-                decision.allowed_account_class =
-                    striatum_core::accounts::AllowedAccountClass::from_pay_per_token(
-                        priced_per_token,
-                    );
-                if !host_run {
-                    crate::tier_settings::record_requested(
-                        &mut decision.requirements_json,
-                        tier_settings.resolve(
-                            &operator_config,
-                            params.tier_consumer.as_deref().unwrap_or(consumer_id),
-                            &selected.model.provider_id,
-                            &selected.model.model_id,
-                            params.service_tier,
-                        ),
-                    );
-                }
-                let decision_id = store
-                    .record_decision_with_selection(
-                        &decision,
-                        if host_run {
-                            pin_harness.map(substrate_policy::Harness::as_str)
-                        } else {
-                            Some(&module)
-                        },
-                        selected_workload,
-                    )
-                    .map_err(|error| ModuleError::Message(error.to_string()))?;
-                if pin_harness == Some(substrate_policy::Harness::Broca) {
-                    remember_provider_identity(store, &decision_id, &selected, broca_credentials)?;
-                }
-                if let Some(classes) = &classes {
-                    let binding = classes
-                        .bind_selected_probe(
-                            store,
-                            &selected.model.provider_id,
-                            &selected.model.model_id,
-                            priced_per_token,
-                            &decision_id,
-                        )
-                        .map_err(|error| ModuleError::Message(error.to_string()))?;
-                    if let account_selection::ProbeBinding::Lost { retry_at } = binding {
-                        *probe_lost = true;
-                        lost_probe_routes.insert(selected.route_key.clone());
-                        *lost_probe_until =
-                            Some(lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)));
-                        return Ok(());
-                    }
-                }
-                add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-                let finish_started = Instant::now();
-                let mut result = json!({
-                    "selected": selected, "decisionID": decision_id,
-                    "resolvedInput": {"requirements": requirements, "availableModels": resolved_request.policy.available_models, "subscriptionKeys": resolved_request.policy.subscription_keys, "requiredCapabilities": required_capabilities},
-                    "variantSelection": variant_choice,
-                });
-                if let Some(harness) = pin_harness {
-                    result["selected"]["harness"] = json!(harness);
-                }
-                if params.pin.is_some() {
-                    result["pin_rejected"] = serde_json::Value::Null;
-                }
-                if deferred_runner_pin {
-                    result["requiredSubstrate"] = json!(legacy_wire::BROCA);
-                }
-                if let Some((runner, grant)) = runner {
-                    result["runner"] = json!(runner);
-                    if let Some(grant) = grant {
-                        crate::account_writer::bind_fence_probe_owner(
-                            store,
-                            &grant.lease_id,
-                            &decision_id,
-                        )
-                        .map_err(|error| ModuleError::Message(error.to_string()))?;
-                        result["poolLease"] = grant.lease_json();
-                    }
-                }
-                if host_run && !deferred_runner_pin {
-                    result["runner"] = host_runner(&params, &selected);
-                }
-                if !deferred_runner_pin {
-                    if pin_harness != Some(substrate_policy::Harness::Broca) {
-                        if let Some(classes) = classes.as_ref() {
-                            match classes.claim_launch_credential(
-                                store,
-                                &selected.model.provider_id,
-                                &selected.model.model_id,
-                                priced_per_token,
-                                false,
-                                Some(&decision_id),
-                            ) {
-                                Ok(_) => {}
-                                // As a lost decision-probe binding: try
-                                // another route, else answer the wait.
-                                Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
-                                    *probe_lost = true;
-                                    lost_probe_routes.insert(selected.route_key.clone());
-                                    *lost_probe_until = Some(
-                                        lost_probe_until
-                                            .map_or(retry_at, |prior| prior.min(retry_at)),
-                                    );
-                                    return Ok(());
-                                }
-                                Err(account_selection::LaunchRefusal::Refused {
-                                    code,
-                                    message,
-                                }) => {
-                                    return send_route_error(
-                                        writer, ver, channel, epoch, corr, &code, &message,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                    complete_legacy_selection(&mut result, &selected, &facts, &module);
-                    record_legacy_tier(
-                        &mut result,
-                        &selected,
-                        &configured_tiers,
-                        classes.as_ref(),
-                        store,
-                    )?;
-                }
-                let body =
-                    serde_json::to_vec(&json!({"result": result})).map_err(ModuleError::Json)?;
-                let response = Frame::build_with_version(
-                    ver,
-                    FrameType::Response,
-                    Flags::new(false, Priority::Interactive, false),
-                    channel,
-                    epoch,
-                    corr,
-                    body,
-                )
-                .map_err(|error| ModuleError::Message(error.to_string()))?;
-                add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-                let reply_started = Instant::now();
-                let reply = send(writer, response).await;
-                timing.record_reply(reply_started.elapsed());
-                return reply;
-            }
-            Err(mut refusal) => {
-                if refusal.code == "decommissioned" {
-                    let refusal = cortexkit_role_routing::errors::Refusal::pin_unavailable(
-                        pin,
-                        cortexkit_role_routing::errors::PinUnavailableReason::parse(
-                            "decommissioned",
-                        ),
-                        None,
-                    );
-                    return send_route_error_body(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        ErrorBody {
-                            code: refusal.code.as_str().into(),
-                            message: refusal.message,
-                            detail: Some(serde_json::Value::Object(refusal.detail)),
-                        },
-                    )
-                    .await;
-                }
-                // A store failure is answered as such, even after an earlier
-                // route lost its probe: the wait would hide it.
-                let lost = [*lost_probe_until, refusal.retry_at]
-                    .into_iter()
-                    .flatten()
-                    .min();
-                if let Some(until) = lost.filter(|_| refusal.code != "store_error") {
-                    return send_route_error_body(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        lost_probe_wait(until),
-                    )
-                    .await;
-                }
-                if let Some(detail) = pin_availability.get(&pin_key) {
-                    if !refusal.message.contains(detail) {
-                        refusal.message = format!("{} ({detail})", refusal.message);
-                    }
-                }
-                if params.pin.is_some() {
-                    let timed = matches!(
-                        refusal.code.as_str(),
-                        "cooldown_active" | "quota_exhausted" | "backoff_active"
-                    );
-                    pin_rejected = Some(refusal.code);
-                    if params.pin_fallback == select_policy::PinFallback::None {
-                        let mut result = json!({
-                            "selected": null, "decisionID": null, "pin_rejected": pin_rejected,
-                        });
-                        if let Some(until) = pin_wall_until.filter(|_| timed) {
-                            result["pin_rejected_until_ms"] = json!(until as i64);
-                        }
-                        let body = serde_json::to_vec(&json!({ "result": result }))
-                            .map_err(ModuleError::Json)?;
-                        let response = Frame::build_with_version(
-                            ver,
-                            FrameType::Response,
-                            Flags::new(false, Priority::Interactive, false),
-                            channel,
-                            epoch,
-                            corr,
-                            body,
-                        )
-                        .map_err(|error| ModuleError::Message(error.to_string()))?;
-                        return send(writer, response).await;
-                    }
-                } else {
-                    let detail = pin_credential_refusal.as_ref()
-                        .filter(|mark| mark.reason == refusal.code)
-                        .map(|mark| json!({"reason": mark.reason, "credentialIds": mark.credential_ids}));
-                    if !host_run
-                        && matches!(
-                            refusal.code.as_str(),
-                            "not_available" | "no_eligible_account"
-                        )
-                    {
-                        refusal.code = "pinned_route_refused".into();
-                    }
-                    return send_route_error_body(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        ErrorBody {
-                            code: refusal.code,
-                            message: refusal.message,
-                            detail,
-                        },
-                    )
-                    .await;
-                }
-            }
-        }
-    }
-
-    // A project pin is a one-entry ladder and beats the consumer mode. Legacy
-    // bodies carry no affinity, so each one is fresh. A request pin was already
-    // admitted above.
-    let project_pin = route_scope(channel, epoch).and_then(|scope| {
-        scope
-            .project_id
-            .as_deref()
-            .and_then(|project| operator_config.project_pin(project, consumer_id))
-            .map(str::to_owned)
-    });
-    let attempt_with_concurrency =
-        |snap: ModelRouteStateSnapshot,
-         concurrency|
-         -> Result<(SelectedModelRoute, Option<String>), NoRouteError> {
-            let pass = select_policy::SelectionPass {
-                snapshot: &snap,
-                concurrency,
-                ..pass
-            };
-            pass.select(&available, None, project_pin.as_deref(), None, |pin| {
-                let allowed = available
-                    .iter()
-                    .filter(|key| operator_config.route_allowed(consumer_id, key, true))
-                    .cloned()
-                    .collect();
-                let selected = work_model_pin::select_with_availability(
-                    pin,
-                    pass.input(&allowed, snap.clone()),
-                    &routing_config,
-                    concurrency_slots.as_ref(),
-                    config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                    &catalog_targets,
-                    &mapped_availability.rejected,
-                )
-                .map_err(|refusal| {
-                    let mut error = pass.score(&HashSet::new()).unwrap_err();
-                    error.message = refusal.message;
-                    error
-                })?;
-                if let Some(ledger) = concurrency {
-                    if ledger.accounts(&selected.route_key).is_some() {
-                        return Err(ledger.refusal(&[selected.route_key.clone()]));
-                    }
-                }
-                Ok(selected)
-            })
-            .map(|(selected, _, variant)| (selected, variant))
-            .map_err(|error| match error {
-                select_policy::OrderFailure::Pin(error)
-                | select_policy::OrderFailure::Score(error) => error,
-            })
-        };
-    let attempt = |snap: ModelRouteStateSnapshot| {
-        if !enforce_concurrency {
-            if ledger.full_routes.is_empty() {
-                return attempt_with_concurrency(snap, None);
-            }
-            if let Err(error) = attempt_with_concurrency(snap.clone(), Some(&ledger)) {
-                crate::select_concurrency::record(
-                    "route.select",
-                    &target_agent,
-                    &operator_config,
-                    &error,
-                );
-            }
-            return attempt_with_concurrency(snap, None);
-        }
-        match attempt_with_concurrency(snap.clone(), Some(&ledger)) {
-            Err(error) if head_request && error.reason == RouteFailureReason::ConcurrencyFull => {
-                attempt_with_concurrency(snap, None)
-            }
-            result => result,
-        }
-    };
-
-    // First attempt against the live snapshot.
-    add_stage_ms(&timing.policy_ms, policy_started.elapsed());
-    let selection_started = Instant::now();
-    let selection = match attempt(snapshot.clone()) {
-        Ok(selected) => Ok(selected),
-        Err(no_route)
-            if no_route.reason == RouteFailureReason::QuotaOrCooldownExhausted
-                && !consumer_policy.operator_ladder() =>
-        {
-            // Break-glass: in a subscription environment "all routes exhausted" is a
-            // common steady state and stalls the orchestrator. Retry ONCE against a
-            // snapshot that clears the single earliest-reset route.
-            let hard_rejected_keys: HashSet<&str> = no_route
-                .rejected
-                .iter()
-                .filter(|rejected| {
-                    matches!(
-                        rejected.reason.as_str(),
-                        "quota_exhausted" | "cooldown_active"
-                    )
-                })
-                .map(|rejected| rejected.route_key.as_str())
-                .collect();
-            let rejected_candidates: Vec<BreakGlassCandidate> = facts
-                .iter()
-                .map(fact_to_route)
-                .filter(|route| hard_rejected_keys.contains(route.route_key.as_str()))
-                // Do not select a rejected pin by temporarily clearing its quota
-                // wall during the fallback retry.
-                .filter(|route| {
-                    !admission_pin.as_ref().is_some_and(|pin| {
-                        pin_rejected.is_some() && route.capacity_key == pin.model
-                    })
-                })
-                .map(|route| BreakGlassCandidate {
-                    route_key: route.route_key,
-                    capacity_key: route.capacity_key,
-                })
-                .collect();
-            match relax_earliest_reset(&snapshot, &rejected_candidates) {
-                Some(relaxed) => match attempt(relaxed.snapshot) {
-                    Ok((mut selected, variant)) => {
-                        let reset_label = relaxed.resets_at.map_or_else(
-                            || "unknown".to_string(),
-                            |resets_at| (resets_at as i64).to_string(),
-                        );
-                        selected.explanation.insert(
-                            0,
-                            format!(
-                                "break-glass: all routes quota-exhausted; relaxed earliest-reset route {} (resets {})",
-                                relaxed.route_key, reset_label
-                            ),
-                        );
-                        Ok((selected, variant))
-                    }
-                    Err(_) => Err(no_route),
-                },
-                None => Err(no_route),
-            }
-        }
-        Err(no_route) => Err(no_route),
-    };
-    timing.record_selection(selection_started.elapsed());
-    let finish_started = Instant::now();
-
-    // Record the decision, then respond. The decisionID is returned ONLY after
-    // record_decision commits (it is a single store txn that either commits or
-    // errors), so a returned id always maps to a committed row; never an id whose
-    // write then failed (the contract requirement). A failed selection records a
-    // no-selection row and surfaces the typed routing failure.
-    let policy_sources = policy_sources_line(&operator_policy);
-    match selection {
-        Ok((mut selected, ladder_variant)) => {
-            let Some(module) = runner_module(&selected) else {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    "no_route",
-                    "no configured runner can run the selected route",
-                )
-                .await;
-            };
-            let selected_harness = run_harness(&selected.route_key);
-            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-            let ladder_started = Instant::now();
-            record_ladder(selected_harness);
-            add_stage_ms(&timing.ladder_ms, ladder_started.elapsed());
-            let finish_started = Instant::now();
-            if let Err(refusal) = work_model_pin::validate_variant(
-                &selected.route_key,
-                &selected.model.provider_id,
-                &selected.model.model_id,
-                ladder_variant.as_deref(),
-                config_overrides::reasoning_catalog_for(operator_config_path).as_ref(),
-                &catalog_targets,
-            ) {
-                return send_route_error(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    &refusal.code,
-                    &refusal.message,
-                )
-                .await;
-            }
-            let variant_choice = apply_variant_policy(
-                &mut selected,
-                &operator_config,
-                operator_config_path,
-                &catalog_targets,
-                variant_policy::consumer_group(params.consumer),
-                project_pin
-                    .as_deref()
-                    .and_then(|pin| cortexkit_role_routing::select::RouteRef::parse_pin(pin))
-                    .and_then(|pin| pin.variant)
-                    .as_deref()
-                    .or(ladder_variant.as_deref()),
-            );
-            selected.explanation.push(policy_sources.clone());
-            if let Some(line) = &executor_workload {
-                selected.explanation.push(line.clone());
-            }
-            if let Some(note) = &quota_note {
-                selected.explanation.push(note.clone());
-            }
-            if let Some(note) = availability.note.as_ref().filter(|_| {
-                selected_harness == Some(substrate_policy::Harness::Broca)
-                    && (params.executor.is_none()
-                        || is_broca_substrate(params.substrate.as_deref()))
-            }) {
-                selected.explanation.push(note.clone());
-            }
-            selected
-                .explanation
-                .extend(head_refusals.notes.iter().cloned());
-            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-            let write_started = Instant::now();
-            let mut decision = decision_input_for(
-                &target_agent,
-                &requirements,
-                Some(&selected),
-                None,
-                &params,
-                Some(&provenance),
-                Some(&policy_sources),
-            );
-            decision.allowed_account_class =
-                striatum_core::accounts::AllowedAccountClass::from_pay_per_token(priced_per_token);
-            if !host_run {
-                crate::tier_settings::record_requested(
-                    &mut decision.requirements_json,
-                    tier_settings.resolve(
-                        &operator_config,
-                        params.tier_consumer.as_deref().unwrap_or(consumer_id),
-                        &selected.model.provider_id,
-                        &selected.model.model_id,
-                        params.service_tier,
-                    ),
-                );
-            }
-            let recorded = store.record_decision_with_selection(
-                &decision,
-                if host_run {
-                    selected_harness.map(substrate_policy::Harness::as_str)
-                } else {
-                    Some(&module)
-                },
-                selected_workload,
-            );
-            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-            match recorded {
-                Ok(decision_id) => {
-                    if let Some(classes) = &classes {
-                        let binding = classes
-                            .bind_selected_probe(
-                                store,
-                                &selected.model.provider_id,
-                                &selected.model.model_id,
-                                priced_per_token,
-                                &decision_id,
-                            )
-                            .map_err(|error| ModuleError::Message(error.to_string()))?;
-                        if let account_selection::ProbeBinding::Lost { retry_at } = binding {
-                            *probe_lost = true;
-                            lost_probe_routes.insert(selected.route_key.clone());
-                            *lost_probe_until = Some(
-                                lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)),
-                            );
-                            return Ok(());
-                        }
-                    }
-                    if selected_harness == Some(substrate_policy::Harness::Broca) {
-                        // The decision row has committed, so the selection stands
-                        // without the identity. Failing the call here would make
-                        // the caller retry and record a second decision for one
-                        // launch. Without the identity, the outcome for this
-                        // decision is recorded the same way as for a route with
-                        // several serving credentials, where none is remembered.
-                        if let Err(error) = remember_provider_identity(
-                            store,
-                            &decision_id,
-                            &selected,
-                            broca_credentials,
-                        ) {
-                            warn_operator(format!(
-                                "[striatum] WARN: decision {decision_id} for {} has no remembered serving identity: {error}",
-                                selected.route_key
-                            ));
-                        }
-                    }
-                    let finish_started = Instant::now();
-                    let mut resolved_input = json!({
-                        "requirements": requirements,
-                        "availableModels": &resolved_request.policy.available_models,
-                        "subscriptionKeys": &resolved_request.policy.subscription_keys,
-                    });
-                    if let Some(required_capabilities) = required_capabilities {
-                        resolved_input["requiredCapabilities"] = json!(required_capabilities);
-                    }
-                    let mut result = json!({
-                        "selected": selected,
-                        "decisionID": decision_id,
-                        "resolvedInput": resolved_input,
-                        "variantSelection": variant_choice,
-                        "billingPlanes": facts.iter().filter(|fact| {
-                            let route = fact_to_route(fact);
-                            available.contains(&route.route_key) || available.contains(&route.capacity_key)
-                        }).filter_map(|fact| fact.billing_plane.as_ref().map(|plane| json!({
-                            "providerID": fact.provider_id,
-                            "modelID": fact.model_id,
-                            "authMethod": plane.auth_method,
-                            "kind": plane.kind,
-                            "servingMethod": plane.selection_reason,
-                            "dimensionRates": striatum_core::BasketDimension::ALL.into_iter().map(|dimension| {
-                                (dimension.fact_key().to_string(), fact.basket_rate(dimension))
-                            }).collect::<std::collections::BTreeMap<_, _>>(),
-                        }))).collect::<Vec<_>>(),
-                    });
-                    if let Some(harness) = selected_harness {
-                        result["selected"]["harness"] = json!(harness);
-                    }
-                    if params.pin.is_some() {
-                        result["pin_rejected"] = json!(pin_rejected);
-                    }
-                    if host_run {
-                        result["runner"] = host_runner(&params, &selected);
-                    }
-                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-                    let runner_started = Instant::now();
-                    if selected_harness == Some(substrate_policy::Harness::Broca) {
-                        // An automatically chosen key-pool provider leases its key
-                        // here; any other provider resolves to the ordinary
-                        // translation. Going through runner_for_route keeps one
-                        // rule for every launch target.
-                        let session = pool_session(
-                            params.task_id.as_deref(),
-                            params.send_id.as_deref(),
-                            &decision_id,
-                        );
-                        match runner_for_route(
-                            &catalog_targets,
-                            broca_credentials,
-                            store.as_ref(),
-                            &session,
-                            &selected.model.provider_id,
-                            &selected.model.model_id,
-                            selected.prompt_params.variant.as_deref(),
-                            classes.as_ref(),
-                            priced_per_token,
-                            Some(&decision_id),
-                        ) {
-                            Ok((runner, _)) => result["runner"] = json!(runner),
-                            Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
-                                *probe_lost = true;
-                                lost_probe_routes.insert(selected.route_key.clone());
-                                *lost_probe_until = Some(
-                                    lost_probe_until.map_or(retry_at, |prior| prior.min(retry_at)),
-                                );
-                                return Ok(());
-                            }
-                            Err(account_selection::LaunchRefusal::Refused { code, message }) => {
-                                return send_route_error(
-                                    writer, ver, channel, epoch, corr, &code, &message,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                    add_stage_ms(&timing.runner_ms, runner_started.elapsed());
-                    if selected_harness != Some(substrate_policy::Harness::Broca) {
-                        if let Some(classes) = classes.as_ref() {
-                            match classes.claim_launch_credential(
-                                store,
-                                &selected.model.provider_id,
-                                &selected.model.model_id,
-                                priced_per_token,
-                                false,
-                                Some(&decision_id),
-                            ) {
-                                Ok(_) => {}
-                                // As a lost decision-probe binding: try
-                                // another route, else answer the wait.
-                                Err(account_selection::LaunchRefusal::Lost { retry_at }) => {
-                                    *probe_lost = true;
-                                    lost_probe_routes.insert(selected.route_key.clone());
-                                    *lost_probe_until = Some(
-                                        lost_probe_until
-                                            .map_or(retry_at, |prior| prior.min(retry_at)),
-                                    );
-                                    return Ok(());
-                                }
-                                Err(account_selection::LaunchRefusal::Refused {
-                                    code,
-                                    message,
-                                }) => {
-                                    return send_route_error(
-                                        writer, ver, channel, epoch, corr, &code, &message,
-                                    )
-                                    .await;
-                                }
-                            }
-                        }
-                    }
-                    complete_legacy_selection(&mut result, &selected, &facts, &module);
-                    record_legacy_tier(
-                        &mut result,
-                        &selected,
-                        &configured_tiers,
-                        classes.as_ref(),
-                        store,
-                    )?;
-                    let finish_started = Instant::now();
-                    let body = serde_json::to_vec(&json!({ "result": result }))
-                        .map_err(ModuleError::Json)?;
-                    let response = Frame::build_with_version(
-                        ver,
-                        FrameType::Response,
-                        Flags::new(false, Priority::Interactive, false),
-                        channel,
-                        epoch,
-                        corr,
-                        body,
-                    )
-                    .map_err(|e| ModuleError::Message(e.to_string()))?;
-                    add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-                    let reply_started = Instant::now();
-                    let reply = send(writer, response).await;
-                    timing.record_reply(reply_started.elapsed());
-                    reply
-                }
-                Err(e) => {
-                    send_route_error(
-                        writer,
-                        ver,
-                        channel,
-                        epoch,
-                        corr,
-                        "store_error",
-                        &format!("recording decision: {e}"),
-                    )
-                    .await
-                }
-            }
-        }
-        Err(mut no_route) => {
-            crate::select_concurrency::record(
-                "route.select",
-                &target_agent,
-                &operator_config,
-                &no_route,
-            );
-            if let Some(until) = *lost_probe_until {
-                return send_route_error_body(
-                    writer,
-                    ver,
-                    channel,
-                    epoch,
-                    corr,
-                    lost_probe_wait(until),
-                )
-                .await;
-            }
-            // Head-specific exclusions and non-relaxable billing walls explain the
-            // same no-route result. Keep them on one message path so callers receive
-            // the full reason rather than a second, competing error surface.
-            let rejected_keys: HashSet<&str> = no_route
-                .rejected
-                .iter()
-                .filter(|rejected| {
-                    matches!(
-                        rejected.reason.as_str(),
-                        "quota_exhausted" | "cooldown_active"
-                    )
-                })
-                .map(|rejected| rejected.route_key.as_str())
-                .collect();
-            let mut no_route_notes = head_refusals.notes.clone();
-            if no_route
-                .rejected
-                .iter()
-                .any(|route| route.reason == "excluded_by_operator")
-            {
-                no_route_notes.push("routes excluded by operator policy".into());
-            }
-            no_route_notes.extend(availability.note.iter().cloned());
-            no_route_notes.extend(facts.iter().filter_map(|fact| {
-                let route = fact_to_route(fact);
-                if !rejected_keys.contains(route.route_key.as_str()) {
-                    return None;
-                }
-                let candidate = BreakGlassCandidate {
-                    route_key: route.route_key.clone(),
-                    capacity_key: route.capacity_key,
-                };
-                live_billing_wall_error(&snapshot, &candidate).map(|error| {
-                    format!(
-                        "billing wall on route {} (provider {}): {}",
-                        route.route_key, fact.provider_id, error
-                    )
-                })
-            }));
-            if !no_route_notes.is_empty() {
-                no_route.message = format!("{} ({})", no_route.message, no_route_notes.join("; "));
-            }
-            add_stage_ms(&timing.finish_ms, finish_started.elapsed());
-            let write_started = Instant::now();
-            // Best-effort failed-decision audit row: a store error is logged, and
-            // the routing failure is still the reply.
-            let decision = decision_input_for(
-                &target_agent,
-                &requirements,
-                None,
-                Some(&no_route),
-                &params,
-                Some(&provenance),
-                Some(&policy_sources),
-            );
-            record_failed_selection_decision(store.as_ref(), &decision);
-            add_stage_ms(&timing.decision_write_ms, write_started.elapsed());
-            let reply_started = Instant::now();
-            let reply = send_no_route(
-                writer,
-                ver,
-                channel,
-                epoch,
-                corr,
-                &no_route,
-                pin_rejected.as_deref(),
-            )
-            .await;
-            timing.record_reply(reply_started.elapsed());
-            reply
-        }
-    }
-}
-
-fn host_runner(params: &SelectParams, selected: &SelectedModelRoute) -> serde_json::Value {
-    let module = params
-        .harness
-        .as_deref()
-        .or(params.substrate.as_deref())
-        .unwrap_or("host");
-    json!(cortexkit_role_routing::select::RunnerRef::new(
-        module,
-        cortexkit_role_routing::select::RouteRef {
-            provider: selected.model.provider_id.clone(),
-            model: selected.model.model_id.clone(),
-            variant: selected.prompt_params.variant.clone(),
-        },
-    ))
-}
-
-fn record_legacy_tier(
-    result: &mut serde_json::Value,
-    selected: &SelectedModelRoute,
-    tiers: &std::collections::BTreeMap<String, cortexkit_role_routing::service_tier::ServiceTier>,
-    classes: Option<&account_selection::ClassContext>,
-    store: &SharedStore,
-) -> Result<(), ModuleError> {
-    let Some(tier) = tiers.get(&format!(
-        "{}/{}",
-        selected.model.provider_id, selected.model.model_id
-    )) else {
-        return Ok(());
-    };
-    result["selected"]["promptParams"]["service_tier_chosen"] = json!(tier);
-    result["service_tier_chosen"] = json!(tier);
-    let accounts = classes
-        .map(|classes| {
-            classes.service_tier_accounts(&selected.model.provider_id, &selected.model.model_id)
-        })
-        .unwrap_or_default();
-    store
-        .record_service_tier(
-            result["decisionID"].as_str().unwrap(),
-            tier.as_str(),
-            &accounts,
-        )
-        .map_err(|err| ModuleError::Message(err.to_string()))
-}
-
-/// Add the common decision envelope without removing legacy launch fields
-/// (notably credential pins and pool leases) that existing callers consume.
-fn complete_legacy_selection(
-    result: &mut serde_json::Value,
-    selected: &SelectedModelRoute,
-    facts: &[ModelFact],
-    module: &str,
-) {
-    let route = cortexkit_role_routing::select::RouteRef {
-        provider: selected.model.provider_id.clone(),
-        model: selected.model.model_id.clone(),
-        variant: selected.prompt_params.variant.clone(),
-    };
-    let fact = facts
-        .iter()
-        .filter(|fact| fact.provider_id == route.provider && fact.model_id == route.model)
-        .min_by_key(|fact| u8::from(fact.variant != route.variant));
-    if !result["runner"].is_object() {
-        result["runner"] = json!({});
-    }
-    result["runner"]["module"] = json!(module);
-    result["runner"]["route"] = json!(route);
-    result["route"] = json!(route);
-    result["decision_id"] = result["decisionID"].clone();
-    result["context_window"] = json!(fact
-        .and_then(|fact| fact.context_window)
-        .map_or(0, |window| window as u64));
-    result["max_output_tokens"] = json!(fact.and_then(|fact| fact.max_output_tokens).unwrap_or(0));
-    result["expires_at_ms"] = json!(now_ms() + 10 * 60_000);
+    .await
 }
 
 /// Panel legs use the substrate that sends. Claustrum's complete mappings
@@ -3396,10 +1187,6 @@ pub(super) fn panel_availability(
     (substrate, available.into_iter().collect())
 }
 
-/// Refusal code for a pinned route whose provider Broca reaches only through a
-/// per-send credential pin, requested for a substrate that cannot carry one.
-const PROVIDER_REQUIRES_RUNNER_PIN: &str = "provider_requires_runner_pin";
-
 pub(crate) fn needs_runner_pin(
     catalog_targets: &std::collections::BTreeMap<String, String>,
     provider: &str,
@@ -3412,6 +1199,7 @@ pub(crate) fn needs_runner_pin(
 /// resolved through its credentials' `serves` vendor) it leases a key for
 /// `session` from the pool and returns the target that pins it, with the grant;
 /// a pool that cannot be resolved or has no admissible key refuses by name.
+#[cfg(test)]
 pub(crate) fn runner_for_route(
     catalog_targets: &std::collections::BTreeMap<String, String>,
     credentials: &SharedBrocaCredentials,
@@ -3490,32 +1278,8 @@ fn pool_session(task_id: Option<&str>, send_id: Option<&str>, fallback: &str) ->
         .to_string()
 }
 
-/// A pinned route on a provider that needs a per-send credential pin can only
-/// run on Broca: the host plugins send a model with no auth selection, so the
-/// send would silently land on the provider's default logins. Refuse such pins
-/// by name for every other mapped harness.
-fn host_runner_pin_refusal<'a>(
-    catalog_targets: &std::collections::BTreeMap<String, String>,
-    requested_substrate: Option<&str>,
-    substrate_source: &str,
-    pinned_routes: impl IntoIterator<Item = &'a str>,
-) -> Option<String> {
-    if is_broca_substrate(requested_substrate) {
-        return None;
-    }
-    pinned_routes.into_iter().find_map(|route| {
-        let provider = route.split_once('/').map_or(route, |(provider, _)| provider);
-        needs_runner_pin(catalog_targets, provider).then(|| {
-            format!(
-                "{route}: provider {provider} needs a per-send credential pin that only the {} runner carries, but {substrate_source} {}",
-                runner_title(legacy_wire::BROCA),
-                requested_substrate.unwrap_or("none")
-            )
-        })
-    })
-}
-
 /// A runner's name as prose capitalizes it: `broca` reads as `Broca`.
+#[cfg(test)]
 fn runner_title(runner: &str) -> String {
     let mut chars = runner.chars();
     chars
@@ -3526,28 +1290,6 @@ fn runner_title(runner: &str) -> String {
 
 fn is_broca_substrate(requested_substrate: Option<&str>) -> bool {
     requested_substrate.map(str::trim) == Some(legacy_wire::BROCA)
-}
-
-/// The Broca routes a caller's model list admits: a route stays when the list
-/// names its route key or its `provider/model` capacity key, the same match
-/// selection uses for a host's list.
-fn confine_to_caller_list(
-    broca_models: &HashSet<String>,
-    caller: &[String],
-    facts: &[ModelFact],
-) -> HashSet<String> {
-    let caller: HashSet<&str> = caller.iter().map(String::as_str).collect();
-    facts
-        .iter()
-        .filter_map(|fact| {
-            let route_key =
-                make_route_key(&fact.provider_id, &fact.model_id, fact.variant.as_deref());
-            let capacity_key = make_capacity_key(&fact.provider_id, &fact.model_id);
-            (broca_models.contains(&route_key)
-                && (caller.contains(route_key.as_str()) || caller.contains(capacity_key.as_str())))
-            .then_some(route_key)
-        })
-        .collect()
 }
 
 /// Read the cached metadata only; selection never waits on the vault.
@@ -3562,31 +1304,22 @@ fn broca_served_routes(
 }
 
 /// A substrate's served routes and the provenance of that availability list.
+#[cfg(test)]
 pub(super) struct SelectAvailability {
     pub(super) models: Vec<String>,
     pub(super) note: Option<String>,
 }
 
+#[cfg(test)]
 impl SelectAvailability {
     fn host(models: Vec<String>) -> Self {
         Self { models, note: None }
     }
 }
 
-/// Availability for a `route.select` whose caller names the substrate that
-/// will send.
-///
-/// A Broca send is judged against what Broca can reach now, not against the
-/// list a caller carries: callers without a host (core's own classifier,
-/// wake author, and comment reviewer) have no list of their own, and a host's
-/// list describes a different substrate. (A host-run re-selection that carries
-/// the head's list is then confined to it; see `confine_to_caller_list`.) If
-/// the vault listing is unknown or
-/// no credential has a provider mapping, selection proceeds over every route
-/// the catalog still serves. Otherwise it uses only explicitly mapped providers.
-/// It stays closed to routes known to be unserved, because withdrawn catalog
-/// rows never reach `facts`, and operator exclusions, cooldowns, and failure
-/// backoff still apply downstream.
+/// Test probe for caller-list versus Broca-served availability. Production
+/// panel availability reads the same credential mapping through panel_availability.
+#[cfg(test)]
 pub(super) fn select_availability(
     requested_substrate: Option<&str>,
     host_available_models: Vec<String>,
@@ -3724,7 +1457,7 @@ async fn handle_select_panel(
         |fact| {
             tier_settings.resolve(
                 &operator_config,
-                variant_policy::consumer_group(Some(panel_consumer)).unwrap(),
+                panel_consumer.id(),
                 &fact.provider_id,
                 &fact.model_id,
                 params.service_tier,
@@ -3766,18 +1499,28 @@ async fn handle_select_panel(
         &prepared.facts,
         broca_credentials,
     );
-    let mapped_availability = selection_harness::SelectionHarness {
-        groups: operator_config.substrate_groups(),
-        consumer: None,
-        workload: Some(selection_harness::Workload::Athena),
-        executor: true,
-        required: None,
-        caller: params.harness.as_deref(),
-        host_models: &available_models,
-        broca_models: &available_models,
-        executor_models: &available_models,
+    #[derive(Default)]
+    struct PanelAvailability {
+        models: HashSet<String>,
+        rejected: HashMap<String, String>,
     }
-    .availability(&prepared.facts);
+    let mut mapped_availability = PanelAvailability::default();
+    for fact in &prepared.facts {
+        let route = fact_to_route(fact);
+        if available_models.contains(&route.route_key)
+            || available_models.contains(&route.capacity_key)
+        {
+            mapped_availability.models.insert(route.route_key);
+        } else {
+            mapped_availability.rejected.insert(
+                route.route_key,
+                format!(
+                    "harness {} does not serve this route for this request",
+                    legacy_wire::BROCA
+                ),
+            );
+        }
+    }
     if availability_substrate != AvailabilitySubstrate::Host {
         if let Ok(credentials) = broca_credentials.lock() {
             let served = credentials.statically_served_routes(&prepared.facts);
@@ -3787,18 +1530,6 @@ async fn handle_select_panel(
                 &prepared.facts,
                 prepared.now as u64,
             );
-            let frontier = selection_harness::SelectionHarness {
-                groups: operator_config.substrate_groups(),
-                consumer: None,
-                workload: Some(selection_harness::Workload::Athena),
-                executor: true,
-                required: None,
-                caller: params.harness.as_deref(),
-                host_models: &served,
-                broca_models: &served,
-                executor_models: &served,
-            }
-            .availability(&prepared.facts);
             let runners = registry.policies();
             for fact in &prepared.facts {
                 let route = fact_to_route(fact);
@@ -3812,7 +1543,7 @@ async fn handle_select_panel(
                     .or_default();
                 if !served.contains(&route.route_key) || !can_run {
                     state.statically_routable = Some(false);
-                } else if frontier.models.contains(&route.route_key)
+                } else if served.contains(&route.route_key)
                     && (!mapped_availability.models.contains(&route.route_key)
                         || mapped_availability.rejected.contains_key(&route.route_key))
                 {
@@ -3870,12 +1601,12 @@ async fn handle_select_panel(
             .cloned()
             .unwrap_or_default(),
         pins: striatum_core::panel::PanelPins {
-            synthesizer: live_config.slot_pin("synthesizer").map(|pin| {
-                striatum_core::panel::PanelSynthesizerPin {
+            synthesizer: live_config
+                .slot_pin(crate::config_policy::ATHENA_SYNTHESIZER_CONSUMER)
+                .map(|pin| striatum_core::panel::PanelSynthesizerPin {
                     model: pin.model.clone(),
                     variant: pin.variant.clone(),
-                }
-            }),
+                }),
         },
         canonical_ids,
     };
@@ -4088,7 +1819,7 @@ async fn handle_select_panel(
         if let Some(requested) = fact.and_then(|fact| {
             tier_settings.resolve(
                 &operator_config,
-                variant_policy::consumer_group(Some(panel_consumer)).unwrap(),
+                panel_consumer.id(),
                 &fact.provider_id,
                 &fact.model_id,
                 params.service_tier,
@@ -4279,7 +2010,7 @@ pub(super) fn apply_panel_variant_policy(
                 model_id: &model_id,
                 explicit: None,
                 curated: curated.as_deref(),
-                consumer: variant_policy::consumer_group(Some(consumer)),
+                consumer: Some(consumer.id()),
             },
         );
         if choice.variant != curated {
@@ -4494,7 +2225,7 @@ pub(super) fn decision_input_for(
                         "earliestResetRoute": failure.earliest_reset_route,
                         "blockingCauses": failure.blocking_causes(),
                         "policySources": policy_sources,
-                        "workload": params.executor_workload_line(),
+                        "workload": serde_json::Value::Null,
                     }))
                     .unwrap_or_else(|_| "{}".into()),
                 ),

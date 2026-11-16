@@ -765,6 +765,39 @@ async fn billing_uses_account_selection_subscription_settings() {
 }
 
 #[tokio::test]
+async fn tier_choices_use_the_eligible_credentials_plane_when_base_has_no_mode() {
+    let (harness, mut credentials) = fixture();
+    let facts = harness.store().get_facts().unwrap();
+    let model = "openai/a-head";
+    let catalog = fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts)
+        .with_test_catalog(
+            &serde_json::to_vec(&json!({
+                "catalog_version":41, "resolved_at_ms":123, "models":{}
+            }))
+            .unwrap(),
+        )
+        .with_test_plane(
+            &serde_json::to_vec(&json!({
+                "plane":{"provider_id":"openai","auth_method":"oauth","kind":"quota_proxy"},
+                "models":{model:{"rate.output.mode.fast":{"state":"unpriced"}}}
+            }))
+            .unwrap(),
+        )
+        .with_wire_apis(&credentials.wire_apis)
+        .with_wire_api_models(&[model.into()].into());
+    credentials.publish_billing_catalog(catalog);
+    harness.set_credentials(credentials);
+    assert_eq!(
+        query(&harness, RUNNER).await["models"][0]["service_tiers"],
+        json!(["fast", "standard"])
+    );
+    assert_eq!(
+        query(&harness, NO_TIERS).await["models"][0]["service_tiers"],
+        json!(["standard"])
+    );
+}
+
+#[tokio::test]
 async fn tiers_require_model_plan_and_runner_wire_support() {
     let (harness, mut credentials) = fixture();
     assert_eq!(

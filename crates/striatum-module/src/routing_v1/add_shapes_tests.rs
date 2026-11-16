@@ -17,18 +17,36 @@ fn field(reply: &(FrameType, Value)) -> (&str, &str) {
 
 #[tokio::test]
 async fn explain_every_legacy_spelling_and_contract_marker_dispatch() {
-    let (_harness, route) = configured().await;
-    let legacy = route
-        .call(
-            "route.select",
-            &json!({
-                "targetAgent":"mason", "requirements":{"iq":50,"eq":50},
-                "availableModels":["example-provider/model-a"], "sendID":"shapes-send"
-            }),
+    let (harness, route) = configured().await;
+    let id = json!("historical-shapes");
+    harness
+        .store()
+        .seed_preupgrade_decision_for_test(
+            &striatum_store::V1Decision {
+                decision_id: "historical-shapes".into(),
+                principal: "reserved:example-consumer".into(),
+                consumer: "prefrontal-core.mason".into(),
+                allowed_account_class: Default::default(),
+                project_id: None,
+                provider: "example-provider".into(),
+                model: "model-a".into(),
+                variant: None,
+                runner_module: fixture::RUNNER_ONE.into(),
+                affinity: None,
+                created_at_ms: crate::now_ms() as i64,
+                expires_at_ms: crate::now_ms() as i64 + 60_000,
+            },
+            false,
         )
-        .await;
-    assert_eq!(legacy.0, FrameType::Response, "{legacy:?}");
-    let id = &legacy.1["result"]["decisionID"];
+        .unwrap();
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute(
+            "UPDATE model_route_decisions SET send_id='shapes-send' WHERE id='historical-shapes'",
+            [],
+        )
+        .unwrap();
+    let id = &id;
     for spelling in ["decisionID", "decisionId", "sendID", "sendId", "send_id"] {
         let value = if spelling.starts_with("send") {
             json!("shapes-send")

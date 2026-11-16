@@ -7,6 +7,9 @@ use cortexkit_role_routing::errors::{Refusal, RefusalCode as RoutingRefusalCode}
 use cortexkit_role_routing::refusals::{retry_class, RetryClass};
 use striatum_store::{V1Decision, V1Recorded};
 
+mod inputs;
+pub(crate) use inputs::Inputs;
+
 #[cfg(test)]
 mod unservable_tests;
 
@@ -186,29 +189,15 @@ pub(crate) fn continue_account_with_call(
                 selection: None,
             }),
     };
-    let original = ctx
-        .store
-        .v1_admission(principal, &request.admission_id)
-        .map_err(unavailable)?;
-    let original: Option<Value> = match original
-        .map(|record| serde_json::from_str(&record.body_json))
-        .transpose()
-    {
-        Ok(original) => original,
-        Err(_) => return Ok(json!(invalid_stored_state())),
-    };
-    if original.as_ref().is_some_and(|body| !body.is_object()) {
-        return Ok(json!(invalid_stored_state()));
-    }
+    let (original, input) = inputs::original(request, principal, runner, ctx)?;
     let parsed = match original
         .as_ref()
+        .filter(|body| body.is_object())
         .map(|body| {
             let mut body = body.clone();
             body["caller"] = json!({"runner":runner});
-            body["model_decision_id"] = json!(previous
-                .as_ref()
-                .and_then(|previous| previous.selection.as_ref())
-                .map(|selection| &selection.decision_id));
+            body["model_decision_id"] = body["decision_id"].clone();
+            body["head_turn"] = json!(request.head_turn);
             body["mode"] = json!("admit");
             body["expected_pin"] = Value::Null;
             body["admission_id"] = json!(new_id("continue"));
@@ -216,16 +205,24 @@ pub(crate) fn continue_account_with_call(
             serde_json::from_value::<AccountForParams>(body).map(|mut params| {
                 params.admission_id_generated = true;
                 params.call = call.clone();
+                params.continuation_input = input.clone();
+                params.service_tier_chosen = params.service_tier;
                 params
             })
         })
         .transpose()
     {
         Ok(parsed) => parsed,
-        Err(_) => return Ok(json!(invalid_stored_state())),
+        Err(_) => None,
     };
     let prepared = parsed.as_ref().map(|params| {
-        let (mut roster, fenced, class) = prepare_roster(params, ctx)?;
+        let (mut roster, fenced, class, _) = prepare_roster(params, ctx)?;
+        if let (Some(input), Some(classes), Some(roster)) = (&input, &ctx.classes, &mut roster.roster) {
+            for account in &mut roster.accounts {
+                account.credentials.retain(|credential| input.compatible(classes, &credential.credential_id));
+            }
+            roster.accounts.retain(|account| !account.credentials.is_empty());
+        }
         let inputs_pending = ctx.classes.as_ref().is_some_and(|classes| {
             crate::service_tiers::unobserved_account_input(&classes.credentials).is_some()
                 || crate::routing_v1::runners::tier_view_unknown(
@@ -234,7 +231,12 @@ pub(crate) fn continue_account_with_call(
                     ctx.now_ms,
                 )
         });
-        if params.model_decision_id.is_some() && !inputs_pending {
+        if inputs_pending && input.is_some() && params.service_tier.is_some_and(|tier| !tier.is_standard()) {
+            return Err(OpReply::typed("account_selection_unavailable",
+                "routing has not observed the inputs needed to preserve the admission's service tier",
+                json!({})));
+        }
+        if (params.model_decision_id.is_some() || input.is_some()) && !inputs_pending {
             let mut params = params.clone();
             let held_until = fenced
                 .values()
@@ -251,7 +253,10 @@ pub(crate) fn continue_account_with_call(
                 }))
                 .filter(|until| *until > ctx.now_ms)
                 .min();
-            prepare_service_tier(&mut params, ctx, &mut roster, class, held_until)?;
+            let chosen = prepare_service_tier(&mut params, ctx, &mut roster, class, held_until)?;
+            if input.is_some() && chosen != params.service_tier {
+                return Err(bound_service_tier_refusal(&params));
+            }
         }
         if route_fence_refusal(&roster, &fenced, params, ctx.now_ms).is_none()
             && ctx.classes.as_ref().is_some_and(|classes| {
@@ -327,7 +332,7 @@ pub(crate) fn continue_account_with_call(
             };
             prepare_roster(params, &reset_ctx)
                 .ok()
-                .map(|(roster, _, _)| roster)
+                .map(|(roster, _, _, _)| roster)
         }
         _ => None,
     };
@@ -378,9 +383,19 @@ pub(crate) fn continue_account_with_call(
         }
         let mut reservation = None;
         let answer = (|| -> RouteStateResult<ContinueAnswer> {
-            let Some(previous) = &previous else { return Ok(refuse("unknown_decision", "previous decision is unknown")); };
-            let Some(original) = &original else { return Ok(refuse("unknown_decision", "admission is unknown")); };
             let Some(admitted) = tx.admission(principal, &request.admission_id)? else { return Ok(refuse("unknown_decision", "admission is unknown")); };
+            if matches!(admitted.state.as_str(), "finished" | "released") {
+                return Ok(refuse("unknown_decision", &format!("admission is {}; it cannot continue", admitted.state)));
+            }
+            let Some(previous) = &previous else { return Ok(refuse("unknown_decision", "previous decision is unknown")); };
+            let Some(original) = &original else {
+                return Ok(if input.is_some() { invalid_stored_state() } else { refuse("unknown_decision", "admission predates continuation support") });
+            };
+            if !original.is_object() || parsed.is_none() { return Ok(invalid_stored_state()); }
+            if normalize(original["provider"].as_str().unwrap_or("")) != admitted.provider
+                || normalize(original["model"].as_str().unwrap_or("")) != admitted.model {
+                return Ok(invalid_stored_state());
+            }
             if previous.selection.is_none() && original["decision_id"].is_string() {
                 return Ok(refuse("unknown_decision", "previous decision is not the run's selection"));
             }
@@ -431,7 +446,7 @@ pub(crate) fn continue_account_with_call(
             }
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {
-                return Ok(refuse("account_pinned", "the caller pinned an account"));
+                return Ok(ContinueAnswer::Refuse(ContinueRefusal::new("pin_unavailable", json!({"reason":"caller_pinned"}))));
             }
             let Some(classes) = ctx.classes.as_ref() else { return Ok(refuse("unknown_decision", "previous authentication method is unknown")); };
             let Ok(committed) = serde_json::from_str::<Value>(&current.reply_json) else {
@@ -480,7 +495,7 @@ pub(crate) fn continue_account_with_call(
             let candidates=params.request(principal,false).candidates;
             let compatible:Vec<_>=reset_roster.iter().filter_map(|r|r.roster.as_ref()).flat_map(|r|&r.accounts)
                 .filter(|a|a.account_id!=current.account_id).flat_map(|a|a.credentials.iter().map(move|c|(a,c)))
-                .filter(|(a,c)|classes.method(&c.credential_id)==method && !signed_out.contains(&c.credential_id) && candidates.as_ref().is_none_or(|candidates|candidates.contains(&a.account_id,&c.credential_id))).collect();
+                .filter(|(a,c)|classes.method(&c.credential_id)==method && input.as_ref().is_none_or(|input|input.compatible(classes,&c.credential_id)) && !signed_out.contains(&c.credential_id) && candidates.as_ref().is_none_or(|candidates|candidates.contains(&a.account_id,&c.credential_id))).collect();
             let mut until = route_fenced.iter().filter(|(a,_)|compatible.iter().any(|(candidate,_)|candidate.account_id==**a)).map(|(_,at)|*at).filter(|at|*at>ctx.now_ms).min();
             for (account,credential) in compatible {
                 if let Some(at)=classes.quota_hold_reset(provider,&credential.credential_id) {

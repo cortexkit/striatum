@@ -2,7 +2,7 @@
 //!
 //! | Operation | Legacy marker | Contract marker | Markerless |
 //! | --- | --- | --- | --- |
-//! | select | targetAgent; project_root, workspace_root, tier_consumer on v1 | members in [`SELECT_MARKERS`]; never detail | v1 |
+//! | select | none (legacy members are refused) | all bodies | v1 |
 //! | select_panel | panelSpec, selection, roster and camelCase launch members | class, consumer, replace and select's shared contract members | v1 |
 //! | explain | decisionID, decisionId, sendID, sendId, send_id | decision_id | v1 |
 //! | account_status | none (same provider/account_id request) | same request; additive answer | v1 |
@@ -12,8 +12,6 @@
 //! Legacy-only bodies retain the old handler. Contract-only and mixed bodies
 //! go to v1, whose closed-record checks refuse the legacy member by name.
 //! Injected select context remains supported only without a new contract marker.
-//! The legacy select accepts advisory `detail` too, so that member never
-//! overrides `targetAgent` when choosing the request's surface.
 
 use cortexkit_role_routing::{errors::Refusal, ops};
 use serde_json::Value;
@@ -132,7 +130,7 @@ pub(super) fn claims(method: &str, params: &Value) -> bool {
         | ops::ROUTE_ACCOUNT_STATUS
         | ops::ROUTE_HEAD_CHOICES => true,
         ops::ROUTE_CONSUMER_MODELS => true,
-        ops::ROUTE_SELECT => !has(params, &["targetAgent"]) || has(params, SELECT_MARKERS),
+        ops::ROUTE_SELECT => true,
         ops::ROUTE_SELECT_PANEL => !has(params, PANEL_LEGACY) || has(params, PANEL_CONTRACT),
         ops::ROUTE_EXPLAIN => !has(params, EXPLAIN_LEGACY) || has(params, &["decision_id"]),
         ops::ROUTE_ACCOUNT_FOR => !has(params, &["caller"]) || params["mode"] == "continue",

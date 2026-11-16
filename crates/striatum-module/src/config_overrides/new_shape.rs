@@ -263,33 +263,6 @@ impl RoutingConfigFile {
                     .map(|(key, model)| (key.as_str(), &model.rules)),
             )
             .collect();
-        let names: Vec<&str> = self
-            .consumers
-            .keys()
-            .map(String::as_str)
-            .chain(entities.iter().flat_map(|(_, rules)| {
-                rules
-                    .only_for
-                    .iter()
-                    .chain(rules.not_for.iter())
-                    .chain(rules.pin_only_for.iter())
-                    .flatten()
-                    .map(String::as_str)
-            }))
-            .collect();
-        for (old, new) in crate::config_policy::CONSUMER_ALIAS_PAIRS {
-            for name in &names {
-                if let Some(tail) = name.strip_prefix(old) {
-                    let alias = format!("{new}{tail}");
-                    if (tail.is_empty() || tail.starts_with('.')) && names.contains(&alias.as_str())
-                    {
-                        return Err(format!(
-                            "consumer alias pair {name:?} and {alias:?} cannot both be configured"
-                        ));
-                    }
-                }
-            }
-        }
         for (key, rules) in &entities {
             for name in rules.only_for.iter().chain(rules.not_for.iter()).flatten() {
                 if name.split('.').any(str::is_empty) || name.chars().any(char::is_whitespace) {
@@ -319,7 +292,7 @@ impl RoutingConfigFile {
             let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) else {
                 continue;
             };
-            let exclusions = self.consumer_exclusions(id);
+            let exclusions = self.consumer_exclusions(consumer.id());
             exclusion_groups.insert(id.into(), serde_json::json!(exclusions));
         }
         for id in self.consumers.keys().filter(|id| !is_slot(id)) {
@@ -341,7 +314,7 @@ impl RoutingConfigFile {
         for consumer in crate::select_policy::Consumer::ALL {
             if let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) {
                 let policy = resolve_consumer_policy(
-                    id,
+                    consumer.id(),
                     &self.consumers,
                     &ConsumerPolicy::default(),
                     &BTreeMap::new(),
@@ -430,9 +403,11 @@ impl RoutingConfigFile {
         }
         self.model_routing.pins = serde_json::from_value(serde_json::Value::Object(pins))
             .map_err(|error| error.to_string())?;
-        self.model_routing.pins.synthesizer =
-            crate::config_policy::consumer_entry(&self.consumers, "synthesizer")
-                .and_then(|policy| policy.pin.clone());
+        self.model_routing.pins.synthesizer = crate::config_policy::consumer_entry(
+            &self.consumers,
+            crate::config_policy::ATHENA_SYNTHESIZER_CONSUMER,
+        )
+        .and_then(|policy| policy.pin.clone());
         self.model_routing.consumers = Some(
             self.consumers
                 .keys()
@@ -583,13 +558,7 @@ impl LiveConfig {
     }
 
     pub fn slot_pin(&self, slot: &str) -> Option<&crate::config_policy::SynthesizerPin> {
-        is_slot(slot)
-            .then(|| {
-                crate::config_policy::consumer_entry(&self.config.consumers, slot)?
-                    .pin
-                    .as_ref()
-            })
-            .flatten()
+        self.config.consumers.get(slot)?.pin.as_ref()
     }
     pub fn consumer_policy(
         &self,

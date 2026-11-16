@@ -157,7 +157,11 @@ mod class_panel_policy {
         let config = json!({"model_routing": {"variants": {
             "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"}
         }}});
-        let rig = PanelRig::new(config.clone());
+        // The golden keeps its original policy document. Serve the same rules
+        // from the current consumer key without rewriting the archived bytes.
+        let rig = PanelRig::new(json!({"consumers":{"prefrontal-core.athena":{
+            "variants":config["model_routing"]["variants"]["athena"]
+        }}}));
         let mut panels = Vec::new();
         for (name, class) in [("Athena audit", "AUDIT"), ("Spec round zero", "SPEC")] {
             let mut request = rig.params(class);
@@ -199,17 +203,15 @@ mod class_panel_policy {
         }
     }
 
-    /// Athena panels read `variants.athena` for every seat, the extra draw
-    /// included; lab panels read `variants.lab`. Each seat's variant and the
-    /// rule that chose it are recorded beside it in `seatedVariants`.
+    /// Athena and lab panels read their canonical consumers' variants for every
+    /// seat, including the extra draw, and record each rule in `seatedVariants`.
     #[tokio::test]
     async fn panel_seats_run_their_class_consumers_variants_including_the_extra_draw() {
-        let rig = PanelRig::new(json!({"model_routing": {"variants": {
-            "all": {"anthropic": "low"},
-            "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"},
-            "lab": {"openai/gpt-6-astra": "medium"},
-            "mason": {"openai/gpt-6-astra": "max", "anthropic/a": "max"},
-        }}}));
+        let rig = PanelRig::new(json!({"variants":{"anthropic":"low"}, "consumers":{
+            "prefrontal-core.athena":{"variants":{"openai/gpt-6-astra":"xhigh","anthropic/a":"high"}},
+            "prefrontal-core.lab":{"variants":{"openai/gpt-6-astra":"medium"}},
+            "prefrontal-core.mason":{"variants":{"openai/gpt-6-astra":"max","anthropic/a":"max"}}
+        }}));
         let audit = rig.select(rig.params("AUDIT")).await;
         assert_eq!(
             routes(&audit),
@@ -259,7 +261,7 @@ mod class_panel_policy {
     #[tokio::test]
     async fn class_exclusions_follow_lab_or_athena_and_never_mason() {
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
-            "athena": ["openai/gpt-6-astra"], "lab": ["kimi-code-plan-global/k3"]
+            "prefrontal-core.athena": ["openai/gpt-6-astra"], "prefrontal-core.lab": ["kimi-code-plan-global/k3"]
         }}}));
         for class in [
             "AUDIT",
@@ -346,7 +348,7 @@ mod class_panel_policy {
     #[tokio::test]
     async fn last_match_within_a_group_still_allows_a_route_exception() {
         let rig = PanelRig::new(json!({"model_routing": {"exclude": {
-            "athena": ["anthropic", "-anthropic/b"]
+            "prefrontal-core.athena": ["anthropic", "-anthropic/b"]
         }}}));
         let mut params = rig.params("AUDIT");
         params["availableModels"] = json!(["anthropic/a", "anthropic/b"]);
@@ -357,9 +359,8 @@ mod class_panel_policy {
     #[tokio::test]
     async fn live_policy_and_synthesizer_pin_edits_change_the_next_selection_after_debounce() {
         let rig = PanelRig::new(json!({"model_routing": {
-            "panels": {"audit": {"topK": 1, "by": "iq"}},
-            "pins": {"synthesizer": {"model": "synth/old", "variant": "high"}}
-        }}));
+            "panels": {"audit": {"topK": 1, "by": "iq"}}
+        }, "consumers":{"prefrontal-core.athena.synthesizer":{"pin":{"model":"synth/old","variant":"high"}}}}));
         let params = rig.params("AUDIT");
         let before = rig.select(params.clone()).await;
         assert_eq!(routes(&before).len(), 1);
@@ -370,9 +371,8 @@ mod class_panel_policy {
         assert_eq!(before["result"]["policy"]["floor"], serde_json::Value::Null);
         rig.edit(
             json!({"model_routing": {
-                "panels": {"audit": {"topK": 2, "by": "eq"}},
-                "pins": {"synthesizer": {"model": "synth/new"}}
-            }}),
+                "panels": {"audit": {"topK": 2, "by": "eq"}}
+            }, "consumers":{"prefrontal-core.athena.synthesizer":{"pin":{"model":"synth/new"}}}}),
             2_000_000_001,
         );
         let pending = rig.select(params.clone()).await;

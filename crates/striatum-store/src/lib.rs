@@ -16,7 +16,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use striatum_core::canonical_scores::resolve_canonical_scores;
 use striatum_core::model_facts::{
     ClassVector, Confidence, FamilySource, GrandFamily, ModelFact, ModelPromptDefaults,
@@ -57,6 +57,7 @@ mod speed_sample_tests;
 #[cfg(feature = "test-support")]
 pub mod backup;
 mod diagnostics;
+pub mod job_timing;
 mod operator_quality;
 mod prune_facts;
 pub use operator_quality::{OperatorQuality, UnscoredAdmissibleModel};
@@ -728,13 +729,17 @@ fn route_state_migrations() -> [Migration; 93] {
         },
         Migration {
             version: 94,
+            statements: include_str!("../migrations/094_consumer_names.sql"),
+        },
+        Migration {
+            version: 95,
             statements: block_storage::MIGRATION,
         },
     ]
 }
 
 fn migrate_route_state(store: &SqliteStore, migrations: &[Migration]) -> RouteStateResult<()> {
-    let block_storage = migrations.iter().any(|migration| migration.version == 94);
+    let block_storage = migrations.iter().any(|migration| migration.version == 95);
     if block_storage {
         store
             .with_conn(block_storage::install_migration_function)
@@ -784,11 +789,11 @@ fn migrate_route_state(store: &SqliteStore, migrations: &[Migration]) -> RouteSt
     Ok(())
 }
 
-/// Trigger truncation when the allocated WAL exceeds 16 MiB.
+/// Retain at most 16 MiB when the writer reuses a fully checkpointed WAL.
 pub const WAL_SIZE_CAP_BYTES: u64 = 16 * 1024 * 1024;
 /// SQLite negative cache sizes are KiB, allowing up to 8 MiB per pooled reader.
 pub const READER_CACHE_SIZE_KIB: i64 = -8192;
-/// Maximum SQLite busy wait for a truncating checkpoint; retry on the next tick.
+/// Maintenance connection busy-timeout bound; passive checkpoints never wait.
 pub const WAL_TRUNCATE_WAIT_BOUND: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Marks a route-state writer's read of the row it is about to write
@@ -1368,6 +1373,7 @@ pub struct SqliteRouteStateStore {
     /// Resolved capabilities and operator grades share the catalog fingerprint's
     /// write tracking. Unrelated writes on this connection do not invalidate it.
     resolved_facts: Mutex<Option<(CatalogFingerprintKey, Vec<(ModelFact, bool)>)>>,
+    selection_catalog: Mutex<Option<Arc<CatalogFactsSnapshot>>>,
     /// Inventory metadata shares the catalog-change key and keeps withdrawn
     /// rows, but does not apply operator grades used only for selection.
     catalog_facts: Mutex<Option<(CatalogFingerprintKey, Vec<CatalogFact>)>>,
@@ -1651,16 +1657,97 @@ impl SqliteRouteStateStore {
         &self,
         now: f64,
         pricing: &striatum_core::RoutePricing,
-    ) -> RouteStateResult<(CatalogFactsSnapshot, Vec<ModelFact>)> {
-        let snapshot = self.get_facts_with_generation()?;
+    ) -> RouteStateResult<(Arc<CatalogFactsSnapshot>, Vec<ModelFact>)> {
+        let snapshot = self.get_selection_catalog()?;
         let facts = self.overlay_observed_speed(snapshot.facts.clone(), now, pricing)?;
         Ok((snapshot, facts))
     }
 
+    /// Shared committed catalog view for selection and background serving joins.
+    pub fn get_selection_catalog(&self) -> RouteStateResult<Arc<CatalogFactsSnapshot>> {
+        self.read_selection_catalog(|| {})
+    }
+
+    fn read_selection_catalog(
+        &self,
+        after_key: impl FnOnce(),
+    ) -> RouteStateResult<Arc<CatalogFactsSnapshot>> {
+        // Read the writer's TEMP change counter BEFORE opening the reader's
+        // snapshot. Facts can then be as new as the key or newer, never older.
+        // A commit between these reads may cache newer facts under the old key
+        // (one extra rebuild), but cannot cache an old index under the new key.
+        let key = self.catalog_inventory_key()?;
+        let generation = key
+            .map(|mut key| {
+                key.store_identity = self.catalog_cache_identity.load(Ordering::Relaxed);
+                key
+            })
+            .unwrap_or_else(|| CatalogFingerprintKey {
+                store_identity: next_catalog_cache_identity(),
+                facts_writes: 0,
+                data_version: 0,
+            });
+        after_key();
+        if let Some(snapshot) = self
+            .selection_catalog
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|snapshot| snapshot.generation == generation)
+        {
+            return Ok(Arc::clone(snapshot));
+        }
+        let rows = self
+            .store
+            .with_read(|connection| {
+                // A pooled reader arrives inside its own read transaction. The
+                // private single-connection store behind what-if previews hands
+                // over a bare connection, so open the snapshot here.
+                let tx = if connection.is_autocommit() {
+                    Some(connection.unchecked_transaction()?)
+                } else {
+                    None
+                };
+                let rows = self.load_resolved_facts(connection)?;
+                if let Some(tx) = tx {
+                    crate::connection_store::timed_commit(tx)?;
+                }
+                Ok(rows)
+            })
+            .map_err(err)?;
+        let snapshot = Arc::new(CatalogFactsSnapshot {
+            generation,
+            providers: rows
+                .iter()
+                .map(|(fact, _)| fact.provider_id.clone())
+                .collect(),
+            facts: rows
+                .into_iter()
+                .filter_map(|(fact, present)| present.then_some(fact))
+                .collect(),
+        });
+        if key.is_some() {
+            *self
+                .selection_catalog
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(Arc::clone(&snapshot));
+        }
+        Ok(snapshot)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn selection_catalog_with_key_hook_for_test(
+        &self,
+        after_key: impl FnOnce(),
+    ) -> RouteStateResult<Arc<CatalogFactsSnapshot>> {
+        self.read_selection_catalog(after_key)
+    }
+
     /// Facts and the generation of exactly that view, in one writer acquisition.
     /// The generation is meaningful only on the writer connection: it combines
-    /// a TEMP write counter with that connection's `data_version`. Moving facts
-    /// to the read pool must also give this key a new source.
+    /// a TEMP write counter with that connection's `data_version`. Callers that
+    /// need uncommitted-transaction visibility must stay on this writer path;
+    /// selection uses the reader-backed path instead.
     pub fn get_facts_with_generation(&self) -> RouteStateResult<CatalogFactsSnapshot> {
         let (generation, facts) = self.read_resolved_facts()?;
         let generation = generation.ok_or_else(|| err("catalog generation unavailable"))?;
@@ -1691,25 +1778,11 @@ impl SqliteRouteStateStore {
             return Ok(());
         };
         let conn = maintenance.lock().unwrap_or_else(|p| p.into_inner());
-        (|| -> rusqlite::Result<()> {
-            let log: i64 =
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))?;
-            if log < 0 {
-                return Ok(());
-            }
-            let page_size: u64 = conn.pragma_query_value(None, "page_size", |row| row.get(0))?;
-            // A fully backfilled WAL may still occupy its allocated file size.
-            let path = conn.path().unwrap_or_default();
-            let bytes = std::fs::metadata(format!("{path}-wal"))
-                .map(|m| m.len())
-                .unwrap_or_else(|_| (log as u64) * (page_size + 24) + 32);
-            if bytes > WAL_SIZE_CAP_BYTES {
-                let _busy: i64 =
-                    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-            }
-            Ok(())
-        })()
-        .map_err(err)
+        // Resetting the WAL on another connection changes the writer's
+        // data_version even when no account rows changed. Let the writer reset
+        // its own WAL on the next commit instead, using journal_size_limit.
+        conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+            .map_err(err)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -1818,6 +1891,7 @@ impl SqliteRouteStateStore {
         store
             .with_conn(|conn| {
                 conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                conn.pragma_update(None, "journal_size_limit", WAL_SIZE_CAP_BYTES)?;
                 conn.pragma_update(None, "synchronous", "NORMAL")?;
                 // Savepoint statement journals otherwise create and delete a
                 // temp file per account command once they spill out of memory.
@@ -1892,6 +1966,7 @@ impl SqliteRouteStateStore {
             reported_score_conflicts: Mutex::new(HashSet::new()),
             catalog_fingerprint: Mutex::new(None),
             resolved_facts: Mutex::new(None),
+            selection_catalog: Mutex::new(None),
             catalog_facts: Mutex::new(None),
             catalog_cache_identity: AtomicU64::new(next_catalog_cache_identity()),
             #[cfg(any(test, feature = "test-support"))]
@@ -2123,46 +2198,85 @@ impl SqliteRouteStateStore {
     fn read_resolved_facts(
         &self,
     ) -> RouteStateResult<(Option<CatalogFingerprintKey>, Vec<(ModelFact, bool)>)> {
-        self.store.with_conn(|c: &Connection| {
-            loop {
-            // Never reuse or publish a transaction-local view. The TEMP counter
-            // counts model-fact and operator-grade writes, including uncommitted
-            // ones. Rollback restores that count; different later writes could
-            // reach the same count but must not reuse the rolled-back facts.
-            let cacheable = c.is_autocommit();
-            let key = match read_catalog_fingerprint_key(c) {
-                Ok(key) => Some(key),
-                Err(cause) => {
-                    self.reinstall_catalog_change_tracking(c, &cause);
-                    None
+        self.store
+            .with_conn(|c: &Connection| {
+                loop {
+                    // Never reuse or publish a transaction-local view. The TEMP counter
+                    // counts model-fact and operator-grade writes, including uncommitted
+                    // ones. Rollback restores that count; different later writes could
+                    // reach the same count but must not reuse the rolled-back facts.
+                    let cacheable = c.is_autocommit();
+                    let key = match read_catalog_fingerprint_key(c) {
+                        Ok(key) => Some(key),
+                        Err(cause) => {
+                            self.reinstall_catalog_change_tracking(c, &cause);
+                            None
+                        }
+                    };
+                    if cacheable {
+                        let cache = self
+                            .resolved_facts
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        if let Some((_, facts)) =
+                            cache.as_ref().filter(|(cached, _)| Some(*cached) == key)
+                        {
+                            let mut generation = key.unwrap();
+                            generation.store_identity =
+                                self.catalog_cache_identity.load(Ordering::Relaxed);
+                            return Ok((Some(generation), facts.clone()));
+                        }
+                    }
+                    // Keep catalog rows and their operator-grade overlay in one SQLite
+                    // snapshot even when a second connection updates the catalog.
+                    let tx = if cacheable {
+                        Some(c.unchecked_transaction()?)
+                    } else {
+                        None
+                    };
+                    let facts = self.load_resolved_facts(c)?;
+                    if let Some(tx) = tx {
+                        crate::connection_store::timed_commit(tx)?;
+                    }
+                    if cacheable && read_catalog_fingerprint_key(c).ok() != key {
+                        continue;
+                    }
+                    if let Some(key) = key.filter(|_| cacheable) {
+                        *self
+                            .resolved_facts
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
+                    }
+                    let generation = key.map(|mut key| {
+                        key.store_identity = if cacheable {
+                            self.catalog_cache_identity.load(Ordering::Relaxed)
+                        } else {
+                            next_catalog_cache_identity()
+                        };
+                        key
+                    });
+                    return Ok((generation, facts));
                 }
-            };
-            if cacheable {
-                let cache = self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some((_, facts)) = cache.as_ref().filter(|(cached, _)| Some(*cached) == key) {
-                    let mut generation = key.unwrap();
-                    generation.store_identity = self.catalog_cache_identity.load(Ordering::Relaxed);
-                    return Ok((Some(generation), facts.clone()));
-                }
-            }
-            // Keep catalog rows and their operator-grade overlay in one SQLite
-            // snapshot even when a second connection updates the catalog.
-            let tx = if cacheable { Some(c.unchecked_transaction()?) } else { None };
-            let rows = {
-                let mut stmt = c.prepare(
+            })
+            .map_err(err)
+    }
+
+    fn load_resolved_facts(&self, c: &Connection) -> rusqlite::Result<Vec<(ModelFact, bool)>> {
+        let rows = {
+            let mut stmt = c.prepare(
                     "SELECT *,
                             (COALESCE(fusiform_present, 1) = 1 OR source = 'override') AS present_now
                      FROM model_facts",
                 )?;
-                let rows = stmt.query_map([], |row| {
-                    Ok((
-                        row_to_fact(row)?,
-                        row.get::<_, Option<String>>("canonical_id")?,
-                        row.get::<_, bool>("present_now")?,
-                    ))
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row_to_fact(row)?,
+                    row.get::<_, Option<String>>("canonical_id")?,
+                    row.get::<_, bool>("present_now")?,
+                ))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let mut facts = Vec::with_capacity(rows.len());
         let mut canonical_ids = Vec::with_capacity(rows.len());
         let mut present = Vec::with_capacity(rows.len());
@@ -2173,21 +2287,7 @@ impl SqliteRouteStateStore {
         }
         self.share_canonical_scores(&mut facts, &canonical_ids);
         operator_quality::overlay_operator_quality(c, &mut facts, &canonical_ids)?;
-        let facts: Vec<_> = facts.into_iter().zip(present).collect();
-        if let Some(tx) = tx { crate::connection_store::timed_commit(tx)?; }
-        if cacheable && read_catalog_fingerprint_key(c).ok() != key {
-            continue;
-        }
-        if let Some(key) = key.filter(|_| cacheable) {
-            *self.resolved_facts.lock().unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
-        }
-        let generation = key.map(|mut key| {
-            key.store_identity = if cacheable { self.catalog_cache_identity.load(Ordering::Relaxed) } else { next_catalog_cache_identity() };
-            key
-        });
-        return Ok((generation, facts));
-            }
-        }).map_err(err)
+        Ok(facts.into_iter().zip(present).collect())
     }
 
     /// Give routes without an operator score the score of a route serving the
@@ -3113,7 +3213,7 @@ impl SqliteRouteStateStore {
             return Ok(Vec::new());
         }
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;
                 let mut aggregates = Vec::with_capacity(observed_route_keys.len());
                 for route_key in observed_route_keys {
@@ -3366,7 +3466,7 @@ impl SqliteRouteStateStore {
         let window_start = (now - CLASS_VECTOR_TRAILING_WINDOW_MS).floor() as i64;
         let window_end = now.floor() as i64;
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut stmt = c.prepare(WORKLOAD_CLASS_USAGE_SAMPLES_SQL)?;
                 let rows =
                     stmt.query_map(params![workload_class, window_start, window_end], |row| {
@@ -4343,6 +4443,9 @@ fn confidence_str(c: Confidence) -> &'static str {
 }
 
 #[cfg(test)]
+mod consumer_names_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use striatum_core::ScoreProvenance;
@@ -4544,7 +4647,7 @@ mod tests {
         }
         assert_eq!(
             restarted
-                .v1_affinity_decision("owner", "mason", "conversation")
+                .v1_affinity_decision("owner", "prefrontal-core.mason", "conversation")
                 .unwrap()
                 .unwrap()
                 .decision_id,

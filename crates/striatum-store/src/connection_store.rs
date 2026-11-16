@@ -14,6 +14,8 @@ enum Backend {
 
 #[derive(Default)]
 struct WriterMetrics {
+    #[cfg(any(test, feature = "test-support"))]
+    writer_hold_ns: AtomicU64,
     commits: AtomicU64,
     acquisitions: AtomicU64,
     queue_ns: AtomicU64,
@@ -305,11 +307,14 @@ impl ConnectionStore {
         Self::new(Backend::Projection(conn))
     }
 
+    #[track_caller]
     pub fn with_conn<T>(
         &self,
         f: impl FnOnce(&Connection) -> rusqlite::Result<T>,
     ) -> Result<T, cortexkit_store::StoreError> {
+        let caller = std::panic::Location::caller();
         let queued = std::time::Instant::now();
+        let held = std::cell::Cell::new(std::time::Duration::ZERO);
         let measured = |conn: &Connection| {
             let queue = queued.elapsed().as_nanos() as u64;
             self.metrics.acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -319,7 +324,13 @@ impl ConnectionStore {
             let result = f(conn);
             finish_commit_timing();
             let commit = COMMIT_NS.with(|n| n.get()) - commit_before;
-            let sql = (start.elapsed().as_nanos() as u64).saturating_sub(commit);
+            let elapsed = start.elapsed();
+            held.set(elapsed);
+            #[cfg(any(test, feature = "test-support"))]
+            self.metrics
+                .writer_hold_ns
+                .fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+            let sql = (elapsed.as_nanos() as u64).saturating_sub(commit);
             self.metrics.sql_ns.fetch_add(sql, Ordering::Relaxed);
             self.metrics.commit_ns.fetch_add(commit, Ordering::Relaxed);
             self.metrics.commits.fetch_add(
@@ -333,14 +344,17 @@ impl ConnectionStore {
             });
             result
         };
-        match &self.backend {
+        let result = match &self.backend {
             Backend::Live(store) => store.with_conn(measured),
             #[cfg(any(test, feature = "test-support"))]
             Backend::Projection(connection) => {
                 measured(&connection.lock().unwrap_or_else(|error| error.into_inner()))
                     .map_err(|error| cortexkit_store::StoreError::Backend(error.to_string()))
             }
-        }
+        };
+        // Release the writer before formatting or printing a slow-holder line.
+        crate::job_timing::writer_held(held.get(), caller);
+        result
     }
 
     pub fn with_read<T>(
@@ -374,6 +388,12 @@ impl ConnectionStore {
 }
 
 impl SqliteRouteStateStore {
+    /// Exclusive writer-callback time, excluding pooled-reader SQL time.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn writer_hold_ns_for_test(&self) -> u64 {
+        self.store.metrics.writer_hold_ns.load(Ordering::Relaxed)
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn projection_command<T>(
         &self,

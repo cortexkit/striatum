@@ -8,6 +8,19 @@ use striatum_store::StoreStageTiming;
 pub(crate) const SLOW_ACCOUNT_CALL: Duration = Duration::from_millis(250);
 static SERIALIZATION_NS: AtomicU64 = AtomicU64::new(0);
 
+/// Carry the current background pass into the blocking pool and merge only its
+/// completed work. The scope is restored before the pool reuses the thread.
+pub(crate) async fn spawn_job_blocking<F, T>(f: F) -> Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (result, work) =
+        tokio::task::spawn_blocking(striatum_store::job_timing::blocking(f)).await?;
+    striatum_store::job_timing::record(work);
+    Ok(result)
+}
+
 #[cfg(test)]
 pub(crate) fn serialization_ns() -> u64 {
     SERIALIZATION_NS.load(Ordering::Relaxed)
@@ -88,6 +101,28 @@ impl AccountCallTiming {
             serialization.as_secs_f64() * 1_000.0, label("consumer"), label("class"),
             params["estimate"].as_bool().unwrap_or(false), number(params["package_tokens"].as_u64()),
             number(counts.0), number(counts.1));
+        #[cfg(test)]
+        LOG_LINES.with(|lines| {
+            if let Some(lines) = lines.borrow_mut().as_mut() {
+                lines.push(line.clone());
+            }
+        });
+        eprintln!("{line}");
+    }
+
+    pub(crate) fn emit_head_choices(
+        &self,
+        total: Duration,
+        serialization: Duration,
+        stages: StoreStageTiming,
+    ) {
+        if total < SLOW_ACCOUNT_CALL {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        let line = format!("[routing] slow route.head_choices total_ms={} writer_queue_wait_ms={:.3} sql_ms={:.3} commit_ms={:.3} serialization_ms={:.3} operation=route.head_choices",
+            total.as_millis(), ms(stages.writer_queue_ns), ms(stages.sql_ns), ms(stages.commit_ns),
+            serialization.as_secs_f64() * 1_000.0);
         #[cfg(test)]
         LOG_LINES.with(|lines| {
             if let Some(lines) = lines.borrow_mut().as_mut() {

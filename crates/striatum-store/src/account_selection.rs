@@ -2411,8 +2411,9 @@ impl AccountTx<'_> {
             row.deadline = Some(deadline);
             row.observed_at = Some(at);
             row.observation_id = Some(id.into());
-            crate::block_storage::write_source(self.conn, &row).map_err(err)?;
-            keys.push(key);
+            if crate::block_storage::write_source(self.conn, &row).map_err(err)? != 0 {
+                keys.push(key);
+            }
         }
         for key in keys {
             crate::fence_rechecks::register_on(self, "observation", &key).map_err(err)?;

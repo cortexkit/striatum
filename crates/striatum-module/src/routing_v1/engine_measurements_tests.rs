@@ -177,7 +177,7 @@ async fn engine_report_is_declarer_only_decision_bound_and_idempotent() {
     let provider = harness.bind(reserved("colliculus"), None).await;
     let selecting = harness.bind(reserved("callosum"), None).await;
     let mut phone = request();
-    phone["consumer"] = json!("phone.media");
+    phone["consumer"] = json!("colliculus.voice_message");
     let decision = selected(&selecting, &phone).await;
     let body = speed(&decision, "transcribe", "done", Some(1000), 250);
     accepted(&provider, "route.engine_report", &body).await;

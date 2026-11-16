@@ -85,10 +85,20 @@ impl WriterAccountState {
             let outside = self
                 .block_reload
                 .swap(false, std::sync::atomic::Ordering::AcqRel);
-            let reload = bridge.reload_requested() | outside;
+            let requested = bridge.reload_requested();
+            let reload = requested | outside;
             if !reload && self.working.is_some() && self.data_version == Some(version) {
                 return Ok(None);
             }
+            tracing::info!(
+                requested,
+                block_write_outside_command = outside,
+                missing_state = self.working.is_none(),
+                generation = self.generation,
+                previous_data_version = ?self.data_version,
+                data_version = version,
+                "reloading account state before batch"
+            );
             let tx =
                 rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Deferred)
                     .map_err(crate::err)?;
@@ -131,6 +141,11 @@ impl WriterAccountState {
         if self.data_version == Some(version) {
             return Ok(());
         }
+        tracing::info!(
+            previous_data_version = ?self.data_version,
+            data_version = version,
+            "reloading account state after data_version changed inside transaction"
+        );
         match bridge.load(&AccountTx::sql(conn)) {
             Ok(state) => {
                 self.working = Some(state);

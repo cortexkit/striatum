@@ -10,7 +10,7 @@ async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibil
     let consumer = harness.bind(reserved("class-owner"), None).await;
     fill(&runner, A, "a", 1).await;
     fill(&runner, B, "b", 1).await;
-    for legacy in [false, true] {
+    for legacy in [false] {
         refused(
             &consumer.call("route.select", &select_body(legacy)).await,
             legacy,
@@ -47,7 +47,7 @@ async fn select_ledger_cap_reload_is_immediate_and_uncapped_routes_skip_eligibil
             config["concurrency"]["providers"] = providers;
         });
         crate::account_selection::SELECT_ELIGIBILITY_PROBES.store(0, Ordering::Relaxed);
-        for legacy in [false, true] {
+        for legacy in [false] {
             assert_eq!(
                 consumer.call("route.select", &select_body(legacy)).await.0,
                 FrameType::Response
@@ -116,7 +116,7 @@ async fn select_ledger_full_surfaces_reset_audit_logs_and_heads() {
     let consumer = harness.bind(reserved("class-owner"), None).await;
     fill(&runner, A, "a", 1).await;
     fill(&runner, B, "b", 1).await;
-    for legacy in [false, true] {
+    for legacy in [false] {
         for pin in [false, true] {
             let mut body = select_body(legacy);
             if pin {
@@ -159,7 +159,7 @@ async fn select_ledger_ignores_affinity_but_excludes_full_with_blocked_sibling()
     let runner = harness.bind(reserved("class-runner"), None).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
     fill(&runner, A, "a", 1).await;
-    for legacy in [false, true] {
+    for legacy in [false] {
         let mut body = select_body(legacy);
         if !legacy {
             body["affinity"] = json!("a-0");
@@ -173,7 +173,7 @@ async fn select_ledger_ignores_affinity_but_excludes_full_with_blocked_sibling()
     kept["conversation_key"] = json!("a-0");
     assert_concurrency_full(&runner.call("route.account_for", &kept).await, NOW + 30_000);
     block(&harness, B, (NOW + 100_000) as i64);
-    for legacy in [false, true] {
+    for legacy in [false] {
         refused(
             &consumer.call("route.select", &select_body(legacy)).await,
             legacy,
@@ -200,7 +200,7 @@ async fn select_ledger_reset_uses_reservation_deadline_in_epoch_milliseconds() {
     fill(&runner, B, "b", 1).await;
     let consumer = harness.bind(reserved("class-owner"), None).await;
     let _later = at(NOW + 48_000);
-    for legacy in [false, true] {
+    for legacy in [false] {
         refused(
             &consumer.call("route.select", &select_body(legacy)).await,
             legacy,
@@ -271,7 +271,7 @@ async fn select_ledger_skips_full_prefer_before_caller_slots_without_widening_qu
     let consumer = harness.bind(reserved("class-owner"), None).await;
     fill(&runner, A, "a", 1).await;
     fill(&runner, B, "b", 1).await;
-    for legacy in [false, true] {
+    for legacy in [false] {
         let mut body = select_body(legacy);
         body[if legacy {
             "concurrencySlots"

@@ -1779,11 +1779,10 @@ pub(crate) fn refresh_serving_methods(
     broca_credentials: &crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: &std::path::Path,
 ) {
-    use striatum_core::RouteStateStore as _;
     let accounts = state.lock().ok().map(|guard| guard.clone());
     #[cfg(test)]
     after_join_snapshot_for_test();
-    if let (Some(accounts), Ok(facts)) = (accounts, store.get_facts()) {
+    if let (Some(accounts), Ok(catalog)) = (accounts, store.get_selection_catalog()) {
         // The join resolves providers missing their own catalog rows from the
         // cached vault listing and catalog facts, then uses the listed login's
         // authentication method to choose the billing plane.
@@ -1793,7 +1792,12 @@ pub(crate) fn refresh_serving_methods(
             credentials
                 .concurrency_caps
                 .publish_settings(config.concurrency_caps());
-            credentials.refresh_serving_methods(&accounts, &facts, now_ms(), &model_pools);
+            credentials.refresh_serving_methods_if_changed(
+                &accounts,
+                &catalog,
+                now_ms(),
+                &model_pools,
+            );
         }
     }
 }
@@ -1875,79 +1879,84 @@ pub async fn account_quota_loop(
             })
             .map(|row| row.view);
     loop {
-        let listing = resolver.list_scoped().await;
-        if let Ok(listing) = &listing {
-            log_listing_decode_failures(listing, |message| tracing::warn!("{message}"));
-        }
-        let at_ms = now_ms();
-        // Derive which catalog providers Broca has credentials for from each
-        // credential's operator-set provider IDs, reusing this fetched listing.
-        // The cache lock is taken after the fetch, never across the network call.
-        if let Ok(mut credentials) = broca_credentials.lock() {
-            match &listing {
-                Ok(listing) => {
-                    credentials.apply_listing(listing, at_ms.max(0) as u64);
-                }
-                Err(error) => credentials.note_failure(error),
+        striatum_store::job_timing::run("vault_listing_refresh", async {
+            let listing = resolver.list_scoped().await;
+            if let Ok(listing) = &listing {
+                log_listing_decode_failures(listing, |message| tracing::warn!("{message}"));
             }
-        }
-        let roster_row = match state.lock() {
-            Ok(mut guard) => match &listing {
-                Ok(listing) => apply_roster_listing(&mut guard, listing, at_ms),
-                Err(error) => {
-                    guard.roster_poll = roster_poll_failure(error, at_ms);
-                    None
+            let at_ms = now_ms();
+            // Derive which catalog providers Broca has credentials for from each
+            // credential's operator-set provider IDs, reusing this fetched listing.
+            // The cache lock is taken after the fetch, never across the network call.
+            if let Ok(mut credentials) = broca_credentials.lock() {
+                match &listing {
+                    Ok(listing) => {
+                        credentials.apply_listing(listing, at_ms.max(0) as u64);
+                    }
+                    Err(error) => credentials.note_failure(error),
                 }
-            },
-            Err(_) => None,
-        };
-        if let Some(row) = roster_row {
-            if let Err(error) = persist_roster_if_changed(&store, row, &mut persisted_view).await {
-                tracing::warn!(error = %error, "vault roster not persisted");
             }
-        }
+            let roster_row = match state.lock() {
+                Ok(mut guard) => match &listing {
+                    Ok(listing) => apply_roster_listing(&mut guard, listing, at_ms),
+                    Err(error) => {
+                        guard.roster_poll = roster_poll_failure(error, at_ms);
+                        None
+                    }
+                },
+                Err(_) => None,
+            };
+            if let Some(row) = roster_row {
+                if let Err(error) =
+                    persist_roster_if_changed(&store, row, &mut persisted_view).await
+                {
+                    tracing::warn!(error = %error, "vault roster not persisted");
+                }
+            }
 
-        // Readings that arrived since the last admission still end blocks. For a
-        // block on a whole account, a reading that reports more quota windows
-        // adds them to the windows that must all show headroom before the block
-        // ends (its recovery set). Account selection and pricing must
-        // also agree on the serving login, so the method map is built after both
-        // roster and readings have been refreshed.
-        //
-        // This work reads SQLite and can queue repairs behind every batch the
-        // account writer is running. Doing it on this task would block a runtime
-        // worker, and possibly the one driving Tokio's IO and timers, which would
-        // stall the whole routing runtime. Run it on the blocking pool instead.
-        let refresh = {
-            let (state, store, broca_credentials, routing_config_path) = (
-                Arc::clone(&state),
-                Arc::clone(&store),
-                Arc::clone(&broca_credentials),
-                routing_config_path.clone(),
-            );
-            tokio::task::spawn_blocking(move || {
-                refresh_account_views(
-                    &state,
-                    &store,
-                    &broca_credentials,
-                    &routing_config_path,
-                    at_ms,
-                )
-            })
-        };
-        if let Err(error) = refresh.await {
-            if error.is_panic() {
-                std::panic::resume_unwind(error.into_panic());
+            // Readings that arrived since the last admission still end blocks. For a
+            // block on a whole account, a reading that reports more quota windows
+            // adds them to the windows that must all show headroom before the block
+            // ends (its recovery set). Account selection and pricing must
+            // also agree on the serving login, so the method map is built after both
+            // roster and readings have been refreshed.
+            //
+            // This work reads SQLite and can queue repairs behind every batch the
+            // account writer is running. Doing it on this task would block a runtime
+            // worker, and possibly the one driving Tokio's IO and timers, which would
+            // stall the whole routing runtime. Run it on the blocking pool instead.
+            let refresh = {
+                let (state, store, broca_credentials, routing_config_path) = (
+                    Arc::clone(&state),
+                    Arc::clone(&store),
+                    Arc::clone(&broca_credentials),
+                    routing_config_path.clone(),
+                );
+                crate::stage_timing::spawn_job_blocking(move || {
+                    refresh_account_views(
+                        &state,
+                        &store,
+                        &broca_credentials,
+                        &routing_config_path,
+                        at_ms,
+                    )
+                })
+            };
+            if let Err(error) = refresh.await {
+                if error.is_panic() {
+                    std::panic::resume_unwind(error.into_panic());
+                }
+                tracing::warn!(%error, "account view refresh worker failed");
             }
-            tracing::warn!(%error, "account view refresh worker failed");
-        }
-        crate::subscription_economics::refresh(
-            &connection_file_path,
-            &project_root,
-            &state,
-            listing.as_ref().ok(),
-            &broca_credentials,
-        )
+            crate::subscription_economics::refresh(
+                &connection_file_path,
+                &project_root,
+                &state,
+                listing.as_ref().ok(),
+                &broca_credentials,
+            )
+            .await;
+        })
         .await;
         tokio::time::sleep(ACCOUNT_REFRESH_INTERVAL).await;
     }
@@ -1965,7 +1974,7 @@ pub(crate) async fn persist_roster_if_changed(
     }
     let view = row.view.clone();
     let store = Arc::clone(store);
-    tokio::task::spawn_blocking(move || {
+    crate::stage_timing::spawn_job_blocking(move || {
         crate::account_writer::put_account_vault_roster(&store, &row)
     })
     .await

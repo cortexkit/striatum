@@ -183,7 +183,8 @@ pub(crate) fn sync_on(tx: &crate::AccountTx<'_>, now: i64) -> rusqlite::Result<(
         state.check_source(tx.conn, &origin.kind, &origin.origin_key, &origin.provider)?;
         state.check_clock(tx.conn, &origin.kind, &origin.origin_key)?;
         tx.conn.execute(
-            "INSERT OR REPLACE INTO retirement_tombstone VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO retirement_tombstone VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(kind,origin_key,evidence) DO NOTHING",
             params![
                 origin.kind,
                 origin.origin_key,
@@ -2370,6 +2371,22 @@ impl AccountTx<'_> {
                 )
                 .map_err(err)?;
             }
+            if origin.kind == "observation" {
+                // Retirement spends every authorization for this evidence,
+                // including superseded tests that can no longer heal it.
+                self.conn
+                    .execute(
+                        "DELETE FROM probe_authorization WHERE kind=?1 AND origin_key=?2
+                     AND evidence=?3 AND evidence_at=?4",
+                        params![
+                            origin.kind,
+                            origin.origin_key,
+                            origin.evidence,
+                            origin.evidence_at
+                        ],
+                    )
+                    .map_err(err)?;
+            }
         }
         Ok(())
     }
@@ -2536,6 +2553,15 @@ impl AccountTx<'_> {
         let what = format!("heal of {} {}", origin.kind, origin.origin_key);
         let blocks = self.working()?;
         match origin.kind.as_str() {
+            "observation" => {
+                if !authorized || origin.evidence_at >= admitted_at {
+                    return Ok(());
+                }
+                blocks
+                    .check_source(self.conn, &origin.kind, &origin.origin_key, provider)
+                    .map_err(err)?;
+                self.retire_observation_origin(origin, now)?;
+            }
             "account" => {
                 // Only active fences are held: a fence already cleared is
                 // not cleared again.
@@ -2733,6 +2759,27 @@ impl AccountTx<'_> {
             _ => {}
         }
         self.clear_held_clock(origin, now)
+    }
+
+    fn retire_observation_origin(&self, origin: &FenceRecheck, now: i64) -> RouteStateResult<()> {
+        // Retain the receipt time so replayed effects cannot restore this
+        // backoff or an older one. The native retirement trigger clears the
+        // block, while the observations and frozen audit copy stay untouched.
+        self.conn
+            .execute(
+                "INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)
+             SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS
+             (SELECT 1 FROM retirement_tombstone WHERE kind=?1 AND origin_key=?2 AND evidence=?3)",
+                params![
+                    origin.kind,
+                    origin.origin_key,
+                    origin.evidence,
+                    origin.evidence_at,
+                    now
+                ],
+            )
+            .map_err(err)?;
+        Ok(())
     }
 
     /// Record that `pool` succeeded for one account fence's evidence, keyed

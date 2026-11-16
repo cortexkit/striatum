@@ -18,6 +18,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::CONSUMER_PRIORITY,
     cortexkit_role_routing::capabilities::SELECT_KIND,
     cortexkit_role_routing::capabilities::SELECT_MEDIA,
+    cortexkit_role_routing::capabilities::SELECT_SEARCH,
     "select_engine",
     "engine_reports",
     "engine_evals",
@@ -32,6 +33,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     cortexkit_role_routing::capabilities::REPORT_ATTEMPT_OUTCOMES,
     "report_usage_run_id",
     "select_pin_slot",
+    cortexkit_role_routing::capabilities::SELECT_PIN_ORIGIN,
     "select_available_routes",
     cortexkit_role_routing::capabilities::SELECT_ELIGIBLE_ROUTES,
     "select_prefer_prompt_cache",
@@ -153,6 +155,11 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
             .iter()
             .map(|kind| cortexkit_role_routing::placement::Kind::parse(kind))
             .collect();
+        if capabilities.contains(&"select_search") {
+            describe
+                .kinds
+                .push(cortexkit_role_routing::placement::Kind::Search);
+        }
     }
     for &(op, group) in cortexkit_role_routing::capabilities::OP_GROUPS {
         if capabilities.contains(&group) && !describe.ops.iter().any(|name| name == op) {

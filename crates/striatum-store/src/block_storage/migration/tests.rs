@@ -20,12 +20,12 @@ fn migration_function_is_absent(conn: &Connection) {
 fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
     assert_eq!(
         crate::SqliteRouteStateStore::latest_migration_version_for_test(),
-        94
+        95
     );
     let versions = std::iter::once(0).chain(
         crate::route_state_migrations()
             .into_iter()
-            .filter(|migration| migration.version < 94)
+            .filter(|migration| migration.version < 95)
             .map(|migration| migration.version),
     );
     for version in versions {
@@ -54,7 +54,7 @@ fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_functio
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"), "{error}");
-        assert!(error.to_string().contains("94"), "{error}");
+        assert!(error.to_string().contains("95"), "{error}");
         assert!(error.to_string().contains("93"), "{error}");
     }
 }
@@ -461,6 +461,44 @@ fn migration_keeps_null_wall_stamp_fallback_separate_from_an_older_clock() {
         assert_eq!(state.blocks(now).unwrap().blocks,expected.blocks);
         assert_eq!(state.blocks(now).unwrap().blocks[0].evidence_at,clock_time);
         assert_eq!(state.view_origins(),expected_origins);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn migration_retires_pre_fix_cleared_observation_orphans_and_spends_all_authorizations() {
+    let scratch = cortexkit_test_support::ScratchDir::new("cleared-observation-migration");
+    let store = SqliteRouteStateStore::open_at_version_for_test(
+        &crate::dev_descriptor(
+            "cleared-observation-migration",
+            scratch.path().join("state.db").to_string_lossy(),
+        ),
+        93,
+    )
+    .unwrap();
+    let now = crate::now_ms();
+    store.seed_block_parity_fixture_for_test(now);
+    store.with_writer_for_test(|conn| {
+        conn.execute("UPDATE fence_recheck SET cleared_at=?1,claim_generation=3 WHERE kind='observation'",[now-500])?;
+        for owner in ["old-admission-1","old-decision-1","old-admission-2","old-decision-2","final-admission"] {
+            conn.execute("INSERT INTO fence_probe_authorization SELECT ?1,kind,origin_key,evidence,evidence_at,evidence_at+1,claim_generation FROM fence_recheck WHERE kind='observation'",[owner])?;
+        }
+        let before=crate::FrozenBlockData::before_migration(conn)?;
+        let key=serde_json::json!(["cpu-provider-0","account-0"]).to_string();
+        assert_eq!(conn.query_row("SELECT count(*) FROM fence_origin WHERE kind='observation' AND origin_key=?1",[&key],|row|row.get::<_,i64>(0))?,1);
+        assert_eq!(conn.query_row("SELECT count(*) FROM fence_probe_authorization WHERE kind='observation' AND origin_key=?1",[&key],|row|row.get::<_,i64>(0))?,5);
+        install_migration_function(conn)?;
+        conn.execute_batch(MIGRATION)?;
+        assert_eq!(conn.query_row("SELECT count(*) FROM block WHERE kind='observation' AND origin_key=?1 AND is_origin=1 AND source_present=1",[&key],|row|row.get::<_,i64>(0))?,0);
+        assert_eq!(conn.query_row("SELECT retired_at FROM retirement_tombstone WHERE kind='observation' AND origin_key=?1",[&key],|row|row.get::<_,i64>(0))?,now-500);
+        assert_eq!(conn.query_row("SELECT count(*) FROM probe_authorization WHERE kind='observation' AND origin_key=?1",[&key],|row|row.get::<_,i64>(0))?,0);
+        let physical:(String,i64)=conn.query_row("SELECT cleared_by,cleared_at FROM block WHERE kind='observation' AND origin_key=?1",[&key],|row|Ok((row.get(0)?,row.get(1)?)))?;
+        assert_eq!(physical,("retired".into(),now-500));
+        assert!(!crate::BlockState::load(conn)?.blocks(now).unwrap().blocks.iter().any(|block|block.kind=="observation"));
+        // Capture the post-migration audit through its normal presence checks.
+        // It must still contain the original source, clock and five permissions.
+        let after=crate::frozen_block_data::read(conn)?;
+        after.assert_unchanged(&before);
         Ok(())
     }).unwrap();
 }

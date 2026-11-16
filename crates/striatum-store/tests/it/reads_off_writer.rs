@@ -76,6 +76,57 @@ fn pure_account_reads_never_acquire_the_writer() {
 }
 
 #[test]
+fn selection_catalog_and_speed_reads_only_take_the_writer_for_the_change_key() {
+    use std::sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    };
+    let dir = cortexkit_test_support::ScratchDir::new("selection-reads-off-writer");
+    let store = store(&dir);
+    let writer_steps = Arc::new(AtomicU64::new(0));
+    let steps = Arc::clone(&writer_steps);
+    store
+        .with_writer_for_test(|conn| {
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    steps.fetch_add(1, Ordering::Relaxed);
+                    false
+                }),
+            );
+            Ok(())
+        })
+        .unwrap();
+    let mut previous = None;
+    for _ in 0..2 {
+        writer_steps.store(0, Ordering::Relaxed);
+        let acquisitions = store.writer_acquisition_count_for_test();
+        let commits = store.writer_commit_count_for_test();
+        let (snapshot, overlaid) = store
+            .get_facts_with_observed_speed_and_generation(1_800_000_000_000.0, &Default::default())
+            .unwrap();
+        assert!(!snapshot.facts.is_empty());
+        assert_eq!(overlaid.len(), snapshot.facts.len());
+        assert_eq!(store.writer_acquisition_count_for_test() - acquisitions, 1);
+        assert_eq!(store.writer_commit_count_for_test(), commits);
+        assert!(
+            writer_steps.load(Ordering::Relaxed) < 100,
+            "facts, class vectors and speed seeks must run on a reader"
+        );
+        if let Some(previous) = previous {
+            assert!(Arc::ptr_eq(&previous, &snapshot));
+        }
+        previous = Some(snapshot);
+    }
+    store
+        .with_writer_for_test(|conn| {
+            conn.progress_handler(0, None::<fn() -> bool>);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn catalog_inventory_cache_uses_only_the_writer_local_key_check() {
     let dir = cortexkit_test_support::ScratchDir::new("catalog-off-writer");
     let store = store(&dir);

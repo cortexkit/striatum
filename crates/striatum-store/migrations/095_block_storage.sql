@@ -75,8 +75,9 @@ CREATE TABLE success_proof (
 );
 INSERT INTO success_proof SELECT * FROM fence_success_pool;
 
--- Retirement is exact per evidence generation, not a newest-evidence
--- watermark. A delayed older refusal must not revive a retired generation.
+-- Keep retirement rows per evidence generation, not as one stored scope-wide
+-- watermark. Observation writes also reject receipt times no newer than any
+-- retired generation of that same origin.
 CREATE TABLE retirement_tombstone (
   kind TEXT NOT NULL, origin_key TEXT NOT NULL, evidence TEXT NOT NULL,
   evidence_at INTEGER NOT NULL, retired_at INTEGER NOT NULL,
@@ -266,8 +267,9 @@ BEGIN
 END;
 
 -- A retirement remains effective if delayed evidence re-creates its source.
--- The tombstone covers only its exact (kind, origin_key, evidence) signature;
--- new evidence for the same origin is not retired by that tombstone.
+-- These triggers cover the exact (kind, origin_key, evidence) signature.
+-- Observation writes check their receipt time separately before insertion;
+-- other new evidence for the same origin is not retired by these triggers.
 CREATE TRIGGER block_retirement_insert AFTER INSERT ON block
 WHEN EXISTS (SELECT 1 FROM retirement_tombstone t
   WHERE t.kind=NEW.kind AND t.origin_key=NEW.origin_key AND t.evidence=NEW.evidence)
@@ -288,6 +290,20 @@ BEGIN
     cleared_by='retired',source_present=0,claim_owner=NULL
   WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
 END;
+
+-- Earlier successful observation probes only cleared their clocks. Retire
+-- that exact evidence and spend every authorization for it in the successors,
+-- without changing the retained source, clock or authorization audit tables.
+INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)
+SELECT kind,origin_key,evidence,evidence_at,cleared_at FROM block
+WHERE kind='observation' AND is_origin=1 AND managed=1 AND source_present=1
+  AND cleared_by='kept' AND cleared_at IS NOT NULL
+ON CONFLICT(kind,origin_key,evidence) DO NOTHING;
+DELETE FROM probe_authorization AS p
+WHERE p.kind='observation' AND EXISTS (
+  SELECT 1 FROM retirement_tombstone t
+  WHERE t.kind=p.kind AND t.origin_key=p.origin_key AND t.evidence=p.evidence
+    AND t.evidence_at=p.evidence_at);
 
 DROP TRIGGER model_route_state_inherit_fence_scope;
 DROP TRIGGER model_facts_inherit_provider_cooldown;

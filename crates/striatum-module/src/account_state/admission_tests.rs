@@ -1203,8 +1203,16 @@ fn live_sized_admission_state_costs() {
                    {BASE} + i * {STEP}, {BASE} + i * {STEP} + 60000, {BASE} + i * {STEP} + 60000, '{{}}',
                    'run-' || i, {BASE} + i * {STEP} + 10, 0, NULL,
                    CASE WHEN i >= {last_admission} - 200 THEN NULL ELSE {BASE} + i * {STEP} + 1000 END
-                 FROM n;
-                 COMMIT;",
+                  FROM n;
+                 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<279999)
+                 INSERT INTO account_decision (decision_id,mode,trigger,principal,provider,model,family,outcome,code,policy_version,decision_json,created_at)
+                 SELECT 'd'||i,'serve','request','p','prov','model','model','admit','cold_scored',1,'{{}}',{BASE}+i*{STEP} FROM n;
+                 INSERT INTO routing_v1_admission (principal,admission_id,body_json,answer_json,created_at_ms)
+                 SELECT principal,admission_id,json_object('decision_id',decision_id),'{{}}',committed_at FROM account_admission;
+                 WITH RECURSIVE n(i) AS (SELECT 0 UNION ALL SELECT i+1 FROM n WHERE i<64999)
+                 INSERT INTO account_observation_event (principal,runner,event_id,observation_id,bound,effects_json,received_at)
+                 SELECT 'p','runner','event-'||i,'obs-'||i,0,'[]',{BASE}+i*{STEP} FROM n;
+                  COMMIT;",
                 last_conversation = CONVERSATIONS - 1,
                 last_admission = ADMISSIONS - 1,
             ))
@@ -1243,6 +1251,41 @@ fn live_sized_admission_state_costs() {
         state.demand.len(),
     );
     let now = BASE + ADMISSIONS * STEP;
+    for kind in [AccountCommandKind::Observe, AccountCommandKind::QuotaDelta] {
+        owner.reload.store(true, Ordering::Release);
+        let before = store.writer_hold_ns_for_test();
+        let started = std::time::Instant::now();
+        store.account_command(kind, |_| Ok(())).unwrap();
+        let after = store.writer_hold_ns_for_test();
+        println!(
+            "live-size {kind:?} forced reload: wall={:?} writer_hold_ms={:.3}",
+            started.elapsed(),
+            (after - before) as f64 / 1_000_000.0,
+        );
+    }
+    for cycle in 0..3 {
+        for kind in [AccountCommandKind::Observe, AccountCommandKind::QuotaDelta] {
+            let loads = owner.loads.load(Ordering::Relaxed);
+            for write in 0..20 {
+                let payload = char::from(b'a' + write as u8)
+                    .to_string()
+                    .repeat(1024 * 1024);
+                store
+                    .put_quota_snapshot(&payload, cycle * 20 + write)
+                    .unwrap();
+            }
+            let before = store.writer_hold_ns_for_test();
+            store.checkpoint_wal().unwrap();
+            store.account_command(kind, |_| Ok(())).unwrap();
+            let after = store.writer_hold_ns_for_test();
+            println!(
+                "live-size {kind:?} after WAL maintenance cycle={cycle}: reloads={} writer_hold_ms={:.3}",
+                owner.loads.load(Ordering::Relaxed) - loads,
+                (after - before) as f64 / 1_000_000.0,
+            );
+            assert_eq!(owner.loads.load(Ordering::Relaxed), loads);
+        }
+    }
     let mut admits = Vec::new();
     for i in 0..20 {
         let mut fresh = admission(
@@ -1265,8 +1308,65 @@ fn live_sized_admission_state_costs() {
         "live-size admission command: median {:?} max {:?} (20 commands, writer wall time)",
         admits[10], admits[19]
     );
+    for reference in [true, false] {
+        let before = store.writer_hold_ns_for_test();
+        let started = std::time::Instant::now();
+        let pruned = if reference {
+            store.account_command(AccountCommandKind::Maintenance, move |tx| {
+                tx.prune_account_pins(now, 256)
+            })
+        } else {
+            crate::account_writer::prune_account_pins(&store, now, 256)
+        }
+        .unwrap();
+        let after = store.writer_hold_ns_for_test();
+        assert_eq!(pruned, 0);
+        println!(
+            "live-size orphan pins reference={reference}: wall={:?} writer_hold_ms={:.3}",
+            started.elapsed(),
+            (after - before) as f64 / 1_000_000.0,
+        );
+    }
+    let before = store.writer_hold_ns_for_test();
+    let started = std::time::Instant::now();
+    let reference = store.with_writer_for_test(|conn| conn.execute(
+        "DELETE FROM account_decision WHERE rowid IN (
+           SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time
+           WHERE mode='serve' AND created_at<?1
+             AND NOT EXISTS (SELECT 1 FROM account_pin p WHERE p.decision_id=account_decision.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.decision_id=account_decision.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.decision_id=account_decision.decision_id)
+           ORDER BY created_at LIMIT 256)", [now])).unwrap();
+    assert_eq!(reference, 0);
+    let after = store.writer_hold_ns_for_test();
+    println!(
+        "live-size decisions reference: wall={:?} writer_hold_ms={:.3}",
+        started.elapsed(),
+        (after - before) as f64 / 1_000_000.0,
+    );
+    for path in [
+        "decisions",
+        "routing_v1_admission",
+        "account_observation_event",
+    ] {
+        let before = store.writer_hold_ns_for_test();
+        let started = std::time::Instant::now();
+        let pruned = match path {
+            "decisions" => store.prune_serve_decisions(now, 256),
+            "routing_v1_admission" => store.prune_v1_admissions(now, 256),
+            _ => store.prune_observation_events(now, 256),
+        }
+        .unwrap();
+        let after = store.writer_hold_ns_for_test();
+        println!(
+            "live-size retention {path}: {pruned} rows wall={:?} writer_hold_ms={:.3}",
+            started.elapsed(),
+            (after - before) as f64 / 1_000_000.0,
+        );
+    }
     for (name, prune) in [("admissions", 0), ("affinities", 1), ("continuations", 2)] {
         let before = BASE + 2_000 * STEP;
+        let stages = store.writer_hold_ns_for_test();
         let start = std::time::Instant::now();
         let pruned = match prune {
             0 => crate::account_writer::prune_account_admissions(
@@ -1291,9 +1391,11 @@ fn live_sized_admission_state_costs() {
             }
             _ => crate::account_writer::prune_account_continuations(&store, before, 256).unwrap(),
         };
+        let after = store.writer_hold_ns_for_test();
         println!(
-            "live-size prune {name}: {pruned} rows in {:?} (one retention batch, writer wall time)",
-            start.elapsed()
+            "live-size prune {name}: {pruned} rows wall={:?} writer_hold_ms={:.3}",
+            start.elapsed(),
+            (after - stages) as f64 / 1_000_000.0,
         );
     }
     assert_equivalent(&store, &owner, "after live-size commands");

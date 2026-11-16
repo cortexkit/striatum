@@ -16,6 +16,8 @@ use crate::variant_policy;
 pub(crate) struct Refusal {
     pub code: String,
     pub message: String,
+    /// The specific admission or scoring rejection behind a summary code.
+    pub cause: Option<String>,
     /// When a probe this request lost to another request opens again; such a
     /// refusal is answered as a timed wait.
     pub retry_at: Option<i64>,
@@ -25,6 +27,7 @@ fn refuse(code: &str, message: String) -> Refusal {
     Refusal {
         code: code.into(),
         message,
+        cause: None,
         retry_at: None,
     }
 }
@@ -250,7 +253,7 @@ pub(crate) fn select_with_availability(
         let clearing = until
             .map(|ms| format!(" until {}", crate::account_selection::rfc3339(ms as i64)))
             .unwrap_or_default();
-        return Err(refuse(
+        let mut refusal = refuse(
             &rejection.reason,
             format!(
                 "{pin}: {}{clearing}{}",
@@ -261,7 +264,9 @@ pub(crate) fn select_with_availability(
                     .map(|detail| format!(" ({detail})"))
                     .unwrap_or_default()
             ),
-        ));
+        );
+        refusal.cause = Some(rejection.reason.clone());
+        return Err(refusal);
     };
     let adequacy = admitted.adequacy.clone();
     // The shared renderer prices one already-admitted route. Demand remains in
@@ -293,7 +298,12 @@ pub(crate) fn select_with_availability(
                         )
                     },
                 );
-                refuse(error.reason.as_str(), message)
+                let mut refusal = refuse(error.reason.as_str(), message);
+                refusal.cause = error
+                    .rejected
+                    .first()
+                    .map(|rejected| rejected.reason.clone());
+                refusal
             })?;
     selected.score.adequacy = adequacy.adequacy;
     selected.score.raw_adequacy = adequacy.raw_adequacy;
@@ -435,6 +445,25 @@ mod tests {
             providers_without_prompt_cache: HashSet::new(),
             providers_without_cache_write_reports: HashSet::new(),
         }
+    }
+
+    #[test]
+    fn unavailable_pin_preserves_its_admission_cause() {
+        let mut input = pin_input("openai", "gpt-5.5");
+        input.available_models.clear();
+        let refusal = select(
+            "openai/gpt-5.5",
+            input,
+            &striatum_core::DEFAULT_ROUTING_CONFIG,
+            None,
+            None,
+            &BTreeMap::new(),
+        )
+        .err()
+        .expect("an unavailable pin must be refused");
+        assert_eq!(refusal.code, "not_available");
+        assert_eq!(refusal.cause.as_deref(), Some("not_available"));
+        assert_eq!(refusal.message, "openai/gpt-5.5: not_available");
     }
 
     fn catalog(entries: &[(&str, Option<&[&str]>)]) -> ReasoningCatalog {

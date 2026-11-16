@@ -54,7 +54,7 @@ impl crate::SqliteRouteStateStore {
     }
 }
 
-fn read(conn: &Connection) -> rusqlite::Result<FrozenBlockData> {
+pub(crate) fn read(conn: &Connection) -> rusqlite::Result<FrozenBlockData> {
     read_at_boundary(conn, true)
 }
 

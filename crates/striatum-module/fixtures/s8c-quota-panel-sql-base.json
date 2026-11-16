@@ -381,7 +381,7 @@
                 "code": "pin_unavailable",
                 "detail": {
                   "pin": "example-subscription/model-d",
-                  "reason": "quota_exhausted",
+                  "reason": "credential_billing_exhausted",
                   "reset_at_ms": 1800003600000
                 },
                 "message": "No account can serve the pinned route right now. The detail gives the reason and, when known, the time to retry."

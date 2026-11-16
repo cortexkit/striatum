@@ -414,40 +414,6 @@ async fn requires_wire_api_filters_select_head_choices_panels_and_refreshes() {
                 "{what_if:?}"
             );
         }
-        let legacy = consumer
-            .call(
-                "route.select",
-                &json!({
-                        "targetAgent":"mason", "consumer":"mason", "substrate":"broca",
-                "requirements":{"iq":10,"eq":0}, "availableModels":["anthropic/claude-opus-5-5"]
-                    }),
-            )
-            .await;
-        assert_eq!(
-            legacy.0,
-            if admitted {
-                FrameType::Response
-            } else {
-                FrameType::Error
-            },
-            "{legacy:?}"
-        );
-        if admitted {
-            assert_eq!(
-                legacy.1["result"]["selected"]["routeKey"], "anthropic/claude-opus-5-5",
-                "{legacy:?}"
-            );
-        } else {
-            assert!(
-                legacy.1["rejected"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|row| row["routeKey"] == "anthropic/claude-opus-5-5"
-                        && row["reason"] == "runner_requires_wire_api"),
-                "{legacy:?}"
-            );
-        }
         let choices = head
             .call(
                 "route.head_choices",
@@ -1163,16 +1129,11 @@ async fn select_then_account_for_keeps_resolved_membership_across_runner_declara
                     &json!({"consumer":"mason", "requirements":{"iq":0}}),
                 )
                 .await;
-            let legacy = caller.call("route.select", &json!({"targetAgent":"mason", "consumer":"mason", "substrate":"broca", "requirements":{"iq":1,"eq":0}})).await;
             if !reachable {
                 assert_eq!(selection.0, FrameType::Error, "{selection:?}");
-                assert_eq!(legacy.0, FrameType::Error, "{legacy:?}");
                 continue;
             }
             assert_eq!(selection.0, FrameType::Response, "{selection:?}");
-            assert_eq!(legacy.0, FrameType::Response, "{legacy:?}");
-            assert_eq!(legacy.1["result"]["runner"]["module"], "fixture-runner");
-            assert!(legacy.1["result"]["runner"].get("harness").is_none());
             assert_eq!(selection.1["result"]["runner"]["module"], "fixture-runner");
             assert!(selection.1["result"]["runner"].get("harness").is_none());
             let admission = runner.call("route.account_for", &json!({
@@ -1470,10 +1431,7 @@ async fn undeclared_production_runners_keep_the_same_selection_envelope() {
         crate::now_ms(),
     ));
     let caller = harness.bind(reserved("example-consumer"), None).await;
-    for request in [
-        json!({"consumer":"mason", "requirements":{"iq":0}}),
-        json!({"targetAgent":"mason", "consumer":"mason", "substrate":"broca", "requirements":{"iq":1,"eq":0}}),
-    ] {
+    for request in [json!({"consumer":"mason", "requirements":{"iq":0}})] {
         let reply = caller.call("route.select", &request).await;
         assert_eq!(reply.0, FrameType::Response, "{reply:?}");
         if request.get("targetAgent").is_none() {
@@ -1638,8 +1596,7 @@ fn broca_account_reach_uses_raw_vault_identity_but_api_keys_keep_their_fallback(
 }
 
 #[tokio::test]
-async fn broca_missing_provider_account_is_rejected_on_both_select_surfaces_despite_insula_linkage()
-{
+async fn broca_missing_provider_account_is_rejected_on_select_despite_insula_linkage() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = Harness::new("broca-no-runner-account");
     for seeded in harness.store().get_facts().unwrap() {
@@ -1671,10 +1628,7 @@ async fn broca_missing_provider_account_is_rejected_on_both_select_surfaces_desp
     .unwrap();
     *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota;
     let caller = harness.bind(reserved("example-consumer"), None).await;
-    for request in [
-        json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true}),
-        json!({"targetAgent":"mason", "consumer":"mason", "substrate":"broca", "requirements":{"iq":1,"eq":0}}),
-    ] {
+    for request in [json!({"consumer":"mason", "requirements":{"iq":0}, "detail":true})] {
         let reply = caller.call("route.select", &request).await;
         assert_eq!(reply.0, FrameType::Error, "{reply:?}");
         assert!(

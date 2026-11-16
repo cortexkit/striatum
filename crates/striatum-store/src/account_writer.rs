@@ -49,7 +49,15 @@ impl AccountTx<'_> {
     pub fn tick(&self, now_ms: i64) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter("account_tx::account_writer::tick");
-        self.reconcile_block_state()?;
+        crate::job_timing::sync("state_drift_check", || {
+            let started = Instant::now();
+            let result = self.reconcile_block_state();
+            crate::job_timing::record(crate::job_timing::Work {
+                writer_ns: started.elapsed().as_nanos() as u64,
+                ..Default::default()
+            });
+            result
+        })?;
         self.release_expired_admission_probes(now_ms)?;
         self.release_expired_continuations(now_ms)?;
         self.sync_fence_rechecks()
@@ -253,6 +261,23 @@ pub enum AccountCommandKind {
     Selection,
 }
 
+impl AccountCommandKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Admit => "admit",
+            Self::Replay => "replay",
+            Self::Observe => "observe",
+            Self::Report => "report",
+            Self::QuotaDelta => "quota_delta",
+            Self::Release => "release",
+            Self::Maintenance => "maintenance",
+            Self::Tick => "tick",
+            Self::Repair => "repair",
+            Self::Selection => "selection",
+        }
+    }
+}
+
 fn stopped() -> RouteStateStoreError {
     err("store_error: account writer stopped; retry the operation")
 }
@@ -263,7 +288,7 @@ trait Command: Send {
         tx: &AccountTx<'_>,
         state: Option<&mut (dyn crate::AccountWorkingState + 'static)>,
     ) -> RouteStateResult<()>;
-    fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming);
+    fn publish(self: Box<Self>, failure: Option<&str>, timing: ReplyTiming);
 }
 
 /// A command's error may carry a domain refusal without losing its type.
@@ -282,7 +307,7 @@ struct TypedCommand<F, T, E = RouteStateStoreError> {
     run: F,
     result: Option<Result<T, E>>,
     reply: mpsc::Sender<Result<T, E>>,
-    timing: Arc<Mutex<StoreStageTiming>>,
+    timing: Arc<Mutex<ReplyTiming>>,
 }
 
 impl<F, T, E> Command for TypedCommand<F, T, E>
@@ -313,7 +338,7 @@ where
         status
     }
 
-    fn publish(self: Box<Self>, failure: Option<&str>, timing: StoreStageTiming) {
+    fn publish(self: Box<Self>, failure: Option<&str>, timing: ReplyTiming) {
         *self.timing.lock().unwrap() = timing;
         let result = match failure {
             Some(error) => Err(err(format!("store_error: {error}; retry the operation")).into()),
@@ -327,14 +352,29 @@ where
 
 struct Queued {
     enqueued: Instant,
+    label: &'static str,
+    background: bool,
     initialize_only: bool,
     command: Box<dyn Command>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ReplyTiming {
+    stages: StoreStageTiming,
+    work: crate::job_timing::Work,
+}
+
+impl ReplyTiming {
+    fn record(self) {
+        connection_store::record_stage_timing(self.stages);
+        crate::job_timing::record(self.work);
+    }
 }
 
 /// An owned pending reply. Dropping it does not cancel a queued write.
 pub struct AccountReply<T, E = RouteStateStoreError>(
     mpsc::Receiver<Result<T, E>>,
-    Arc<Mutex<StoreStageTiming>>,
+    Arc<Mutex<ReplyTiming>>,
 );
 
 impl<T> AccountReply<T> {
@@ -343,7 +383,7 @@ impl<T> AccountReply<T> {
     pub(crate) fn wait_load(self, bound: std::time::Duration) -> RouteStateResult<T> {
         match self.0.recv_timeout(bound) {
             Ok(result) => {
-                connection_store::record_stage_timing(*self.1.lock().unwrap());
+                self.1.lock().unwrap().record();
                 result
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(err(format!(
@@ -361,7 +401,7 @@ impl<T, E: AccountCommandError> AccountReply<T, E> {
         let result = self.0.recv().unwrap_or_else(|_| Err(stopped().into()));
         // The connection work ran on the writer, but belongs in this caller's
         // timing scope too. Store-wide burst counters still count the batch once.
-        connection_store::record_stage_timing(*self.1.lock().unwrap());
+        self.1.lock().unwrap().record();
         result
     }
 }
@@ -426,6 +466,13 @@ impl AccountWriter {
                                 );
                             }
                             let before = SqliteRouteStateStore::thread_stage_timing();
+                            let mut labels = [None; MAX_BATCH];
+                            for (slot, queued) in labels.iter_mut().zip(&batch) {
+                                *slot = Some(queued.label);
+                            }
+                            let _labels = crate::job_timing::BatchScope::enter(labels);
+                            let background = batch.iter().any(|queued| queued.background);
+                            let cpu = background.then(crate::job_timing::thread_cpu_ns);
                             // A failed state load or connection fails this batch
                             // only: its callers get the error, the writer keeps
                             // running, and the next batch loads again. Exiting
@@ -446,6 +493,19 @@ impl AccountWriter {
                                 writer_queue_ns: after.writer_queue_ns - before.writer_queue_ns,
                                 sql_ns: after.sql_ns - before.sql_ns,
                                 commit_ns: after.commit_ns - before.commit_ns,
+                            };
+                            // A group commit is indivisible: each waiting job is
+                            // charged the inclusive batch hold/CPU, not a guessed
+                            // fraction of shared state loading and commit work.
+                            let timing = ReplyTiming {
+                                stages: timing,
+                                work: crate::job_timing::Work {
+                                    cpu_ns: cpu.map_or(0, |cpu| {
+                                        crate::job_timing::thread_cpu_ns().saturating_sub(cpu)
+                                    }),
+                                    writer_ns: timing.sql_ns + timing.commit_ns,
+                                    ..Default::default()
+                                },
                             };
                             #[cfg(any(test, feature = "test-support"))]
                             if matches!(result, Ok(true)) {
@@ -493,6 +553,7 @@ impl AccountWriter {
 
     fn enqueue<T: Send + 'static, E: AccountCommandError>(
         &self,
+        kind: AccountCommandKind,
         f: impl FnMut(
                 &AccountTx<'_>,
                 Option<&mut (dyn crate::AccountWorkingState + 'static)>,
@@ -500,7 +561,7 @@ impl AccountWriter {
             + Send
             + 'static,
     ) -> RouteStateResult<AccountReply<T, E>> {
-        self.enqueue_inner_with_error(f, false)
+        self.enqueue_inner_with_error(f, false, kind.label())
     }
 
     pub(crate) fn enqueue_inner<T: Send + 'static>(
@@ -513,7 +574,7 @@ impl AccountWriter {
             + 'static,
         initialize_only: bool,
     ) -> RouteStateResult<AccountReply<T>> {
-        self.enqueue_inner_with_error(f, initialize_only)
+        self.enqueue_inner_with_error(f, initialize_only, "initialize")
     }
 
     fn enqueue_inner_with_error<T: Send + 'static, E: AccountCommandError>(
@@ -525,17 +586,20 @@ impl AccountWriter {
             + Send
             + 'static,
         initialize_only: bool,
+        operation: &'static str,
     ) -> RouteStateResult<AccountReply<T, E>> {
         if self.dead.load(Ordering::Acquire) {
             return Err(stopped());
         }
         let (reply, receiver) = mpsc::channel();
-        let timing = Arc::new(Mutex::new(StoreStageTiming::default()));
+        let timing = Arc::new(Mutex::new(ReplyTiming::default()));
         self.sender
             .as_ref()
             .expect("writer sender exists until drop")
             .send(Queued {
                 enqueued: Instant::now(),
+                label: crate::job_timing::label().unwrap_or(operation),
+                background: crate::job_timing::label().is_some(),
                 initialize_only,
                 command: Box::new(TypedCommand {
                     run: f,
@@ -652,7 +716,7 @@ impl SqliteRouteStateStore {
         let writer_trace = crate::writer_entry_trace::current();
         #[cfg(any(test, feature = "test-support"))]
         let command_changes = writer.command_changes.clone();
-        let reply = writer.enqueue(move |tx, state| {
+        let reply = writer.enqueue(kind, move |tx, state| {
             #[cfg(any(test, feature = "test-support"))]
             let _inputs = inputs.as_ref().map(crate::replay::Inputs::install);
             #[cfg(any(test, feature = "test-support"))]

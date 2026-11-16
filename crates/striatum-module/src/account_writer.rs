@@ -405,8 +405,12 @@ pub(crate) fn prune_account_pins(
     #[cfg(test)]
     let _writer_entry =
         striatum_store::writer_entry_trace::enter("module_adapter::prune_account_pins");
+    let keys = store.plan_account_pins(before, limit)?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_pins(before, limit)
+        tx.delete_account_pins(before, &keys)
     })
 }
 

@@ -504,6 +504,7 @@ fn external_commit_is_seen_on_tick_but_internal_commits_and_passive_checkpoint_d
     let (scratch, store) = fixture("state-data-version");
     let owner = install(&store);
     let other = rusqlite::Connection::open(scratch.path().join("state.db")).unwrap();
+    let initial_loads = owner.loads.load(Ordering::Relaxed);
     other
         .execute(
             "INSERT INTO account_selection_salt VALUES (1,'external',1)",
@@ -511,6 +512,7 @@ fn external_commit_is_seen_on_tick_but_internal_commits_and_passive_checkpoint_d
         )
         .unwrap();
     crate::account_writer::tick(&store, 1).unwrap();
+    assert_eq!(owner.loads.load(Ordering::Relaxed), initial_loads + 1);
     assert_eq!(
         snapshot(&owner)
             .selection_salt
@@ -537,6 +539,29 @@ fn external_commit_is_seen_on_tick_but_internal_commits_and_passive_checkpoint_d
     let mut after = snapshot(&owner);
     after.generation = before.generation;
     assert_eq!(after, before);
+}
+
+#[test]
+fn checkpoint_cycles_do_not_reload_unchanged_account_state() {
+    let (_scratch, store) = fixture("state-passive-checkpoints");
+    let owner = install(&store);
+    let loads = owner.loads.load(Ordering::Relaxed);
+    for cycle in 0..3 {
+        for write in 0..20 {
+            let payload = char::from(b'a' + write as u8)
+                .to_string()
+                .repeat(1024 * 1024);
+            store
+                .put_quota_snapshot(&payload, cycle * 20 + write)
+                .unwrap();
+        }
+        store.checkpoint_wal().unwrap();
+        for kind in [AccountCommandKind::Observe, AccountCommandKind::QuotaDelta] {
+            store.account_command(kind, |_| Ok(())).unwrap();
+        }
+        assert_eq!(owner.loads.load(Ordering::Relaxed), loads, "cycle {cycle}");
+        assert_eq!(snapshot(&owner).selection_salt, None);
+    }
 }
 
 #[test]

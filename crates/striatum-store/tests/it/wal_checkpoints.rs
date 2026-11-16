@@ -58,8 +58,10 @@ fn open_configures_writer_and_every_reader_including_later_checkouts() {
         .with_writer_for_test(|conn| {
             let auto: i64 = conn.pragma_query_value(None, "wal_autocheckpoint", |r| r.get(0))?;
             let sync: i64 = conn.pragma_query_value(None, "synchronous", |r| r.get(0))?;
+            let limit: u64 = conn.pragma_query_value(None, "journal_size_limit", |r| r.get(0))?;
             assert_eq!(auto, 0);
             assert_eq!(sync, 1, "SQLite NORMAL is 1");
+            assert_eq!(limit, WAL_SIZE_CAP_BYTES);
             Ok(())
         })
         .unwrap();
@@ -181,7 +183,7 @@ fn grow_wal(store: &SqliteRouteStateStore) -> u64 {
 }
 
 #[test]
-fn request_commits_do_not_checkpoint_until_the_tick_and_tick_caps_the_wal() {
+fn request_commits_do_not_checkpoint_until_the_tick_and_next_write_caps_the_wal() {
     let (dir, store) = open("wal-no-request-checkpoints");
     store.checkpoint_wal().unwrap();
     // Start with a completely backfilled database, then compare its actual
@@ -203,6 +205,7 @@ fn request_commits_do_not_checkpoint_until_the_tick_and_tick_caps_the_wal() {
     let before_timeout = timeout();
     store.checkpoint_wal().unwrap();
     assert_eq!(timeout(), before_timeout);
+    store.put_quota_snapshot("next write", 41).unwrap();
     assert!(std::fs::metadata(dir.join("store.db-wal")).unwrap().len() <= WAL_SIZE_CAP_BYTES);
 }
 
@@ -216,7 +219,7 @@ fn bounded_busy_wait(attempt: i32) -> bool {
 }
 
 #[test]
-fn reader_snapshot_exhausts_tick_wait_budget_and_next_tick_truncates() {
+fn reader_snapshot_never_waits_and_writer_caps_wal_after_reader_releases() {
     let (dir, store) = open("wal-busy-reader");
     store.put_quota_snapshot("old", 0).unwrap();
     let reader = rusqlite::Connection::open(dir.join("store.db")).unwrap();
@@ -231,15 +234,34 @@ fn reader_snapshot_exhausts_tick_wait_budget_and_next_tick_truncates() {
         .set_busy_handler_for_test(Some(bounded_busy_wait))
         .unwrap();
     store.checkpoint_wal().unwrap();
-    assert_eq!(
-        BUSY_CALLS.load(Ordering::SeqCst),
-        WAL_TRUNCATE_WAIT_BOUND.as_millis() as u64 + 1
-    );
+    assert_eq!(BUSY_CALLS.load(Ordering::SeqCst), 0);
     assert_eq!(
         std::fs::metadata(dir.join("store.db-wal")).unwrap().len(),
         bytes
     );
     reader.execute_batch("COMMIT").unwrap();
     store.checkpoint_wal().unwrap();
+    store.put_quota_snapshot("after reader", 41).unwrap();
     assert!(std::fs::metadata(dir.join("store.db-wal")).unwrap().len() <= WAL_SIZE_CAP_BYTES);
+}
+
+#[test]
+fn reopening_the_writer_reapplies_its_journal_size_limit() {
+    let (dir, store) = open("wal-writer-reopen");
+    store
+        .with_writer_for_test(|conn| conn.pragma_update(None, "journal_size_limit", -1))
+        .unwrap();
+    drop(store);
+    let store = SqliteRouteStateStore::open(&dev_descriptor(
+        "wal-checkpoints",
+        dir.join("store.db").to_string_lossy().into_owned(),
+    ))
+    .unwrap();
+    store
+        .with_writer_for_test(|conn| {
+            let limit: u64 = conn.pragma_query_value(None, "journal_size_limit", |r| r.get(0))?;
+            assert_eq!(limit, WAL_SIZE_CAP_BYTES);
+            Ok(())
+        })
+        .unwrap();
 }

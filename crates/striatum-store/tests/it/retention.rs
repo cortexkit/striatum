@@ -570,6 +570,118 @@ fn orphan_pin_retention_is_oldest_first_bounded_and_preserves_young_rows() {
 }
 
 #[test]
+fn planned_pin_delete_rechecks_a_new_reference() {
+    let rig = Rig::new("pin-plan-race");
+    let store = rig.open();
+    let pin = pin_row("orphan", "conversation", 1, "decision");
+    store.account_transaction(|tx| tx.insert_pin(&pin)).unwrap();
+    let keys = store.plan_account_pins(NOW, 256).unwrap();
+    assert_eq!(keys, ["orphan"]);
+    store
+        .account_transaction(|tx| tx.put_affinity(&affinity_row("conversation", &pin, NOW), None))
+        .unwrap();
+    let deleted = store
+        .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
+            tx.delete_account_pins(NOW, &keys)
+        })
+        .unwrap();
+    assert_eq!(deleted, 0);
+    assert_eq!(rig.ids("account_pin", "pin_id"), ["orphan"]);
+}
+
+#[test]
+fn protected_pin_scan_never_acquires_the_writer() {
+    let rig = Rig::new("pin-reader-plan");
+    let store = rig.open();
+    insert_conversation(&store, "protected", 4, NOW);
+    let acquisitions = store.writer_acquisition_count_for_test();
+    assert_eq!(store.prune_account_pins(NOW, 256).unwrap(), 0);
+    assert_eq!(store.writer_acquisition_count_for_test(), acquisitions);
+}
+
+#[test]
+fn protected_decision_scan_never_acquires_the_writer() {
+    let rig = Rig::new("decision-reader-plan");
+    let store = rig.open();
+    insert_conversation(&store, "protected", 4, NOW);
+    let acquisitions = store.writer_acquisition_count_for_test();
+    assert_eq!(store.prune_serve_decisions(NOW, 256).unwrap(), 0);
+    assert_eq!(store.writer_acquisition_count_for_test(), acquisitions);
+}
+
+#[test]
+fn reader_planned_retention_matches_the_original_sql_deletes() {
+    let actual_rig = Rig::new("retention-planned-parity");
+    let oracle_rig = Rig::new("retention-original-parity");
+    let actual = actual_rig.open();
+    let oracle = oracle_rig.open();
+    for store in [&actual, &oracle] {
+        insert_conversation(store, "protected", 3, NOW);
+        store
+            .account_transaction(|tx| {
+                for i in 0..9 {
+                    let id = format!("free-{i}");
+                    tx.insert_decision(&decision(
+                        &id,
+                        DECISION_MODE_SERVE,
+                        "admit",
+                        "cold_scored",
+                        BEFORE - 20 + i,
+                    ))?;
+                    let mut pin = pin_row(&id, &id, 1, &id);
+                    pin.created_at = BEFORE - 20 + i;
+                    tx.insert_pin(&pin)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        for (id, child) in [
+            ("pin", DecisionChild::Pin),
+            ("admission", DecisionChild::Admission),
+            ("hold", DecisionChild::Hold),
+        ] {
+            insert_decisions(
+                store,
+                &[decision(
+                    id,
+                    DECISION_MODE_SERVE,
+                    "admit",
+                    "cold_scored",
+                    BEFORE - 100,
+                )],
+            );
+            reference_decision(store, child, id);
+        }
+    }
+    for limit in [0, 2, 4, 256] {
+        let expected = oracle
+            .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
+                tx.prune_account_pins(BEFORE, limit)
+            })
+            .unwrap();
+        assert_eq!(actual.prune_account_pins(BEFORE, limit).unwrap(), expected);
+        let expected = oracle.with_writer_for_test(|conn| conn.execute(
+            "DELETE FROM account_decision WHERE rowid IN (
+               SELECT rowid FROM account_decision INDEXED BY account_decision_by_mode_time
+               WHERE mode='serve' AND created_at<?1
+                 AND NOT EXISTS (SELECT 1 FROM account_pin p WHERE p.decision_id=account_decision.decision_id)
+                 AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.decision_id=account_decision.decision_id)
+                 AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.decision_id=account_decision.decision_id)
+               ORDER BY created_at LIMIT ?2)", rusqlite::params![BEFORE, limit as i64])).unwrap();
+        assert_eq!(
+            actual.prune_serve_decisions(BEFORE, limit).unwrap(),
+            expected
+        );
+        for (table, key) in [
+            ("account_pin", "pin_id"),
+            ("account_decision", "decision_id"),
+        ] {
+            assert_eq!(actual_rig.ids(table, key), oracle_rig.ids(table, key));
+        }
+    }
+}
+
+#[test]
 fn affinity_plan_rechecks_a_hold_added_before_delete() {
     let rig = Rig::new("affinity-plan-race");
     let store = rig.open();

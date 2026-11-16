@@ -23,6 +23,8 @@ fn queued<T: Send + 'static>(
     (
         Queued {
             enqueued: Instant::now(),
+            label: "test_command",
+            background: false,
             initialize_only: false,
             command:
                 Box::new(
@@ -33,7 +35,7 @@ fn queued<T: Send + 'static>(
                         },
                         result: None,
                         reply,
-                        timing: Arc::new(Mutex::new(StoreStageTiming::default())),
+                        timing: Arc::new(Mutex::new(ReplyTiming::default())),
                     },
                 ),
         },
@@ -224,7 +226,7 @@ fn isolated_batch(fail: bool) -> (Vec<String>, Vec<String>) {
         })
         .unwrap();
     for command in batch {
-        command.command.publish(None, StoreStageTiming::default());
+        command.command.publish(None, ReplyTiming::default());
     }
     let answers = replies
         .into_iter()
@@ -293,7 +295,7 @@ fn begin_commit_and_transaction_aborting_statement_fail_every_command() {
         for command in batch {
             command
                 .command
-                .publish(Some(&error), StoreStageTiming::default());
+                .publish(Some(&error), ReplyTiming::default());
         }
         for reply in replies {
             let error = reply

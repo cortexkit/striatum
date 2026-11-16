@@ -27,9 +27,10 @@ fn typed_queued(
     let (reply, receiver) = mpsc::channel();
     (Queued {
         enqueued: Instant::now(), initialize_only: false,
+        label: "test_command", background: false,
         command: Box::new(TypedCommand {
             run: move |tx: &AccountTx<'_>, _: Option<&mut (dyn crate::AccountWorkingState + 'static)>| run(tx),
-            result: None, reply, timing: Arc::new(Mutex::new(StoreStageTiming::default())),
+            result: None, reply, timing: Arc::new(Mutex::new(ReplyTiming::default())),
         }),
     }, receiver)
 }
@@ -58,7 +59,7 @@ fn typed_refusal_rolls_back_only_its_command_and_commits_batch_sibling() {
         })
         .unwrap();
     for command in batch {
-        command.command.publish(None, StoreStageTiming::default());
+        command.command.publish(None, ReplyTiming::default());
     }
     assert_eq!(
         failure.recv().unwrap(),
@@ -105,7 +106,7 @@ fn typed_store_divergence_still_reloads_and_reruns_the_batch_once() {
         })
         .unwrap();
     for command in batch {
-        command.command.publish(None, StoreStageTiming::default());
+        command.command.publish(None, ReplyTiming::default());
     }
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
     assert_eq!(result.recv().unwrap().unwrap(), "eventual");

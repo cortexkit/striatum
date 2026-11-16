@@ -47,6 +47,7 @@ use crate::{
 
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
+mod admission_cost_tests;
 mod continuation_tests;
 mod first_party_tests;
 #[path = "media_conformance.rs"]
@@ -75,6 +76,7 @@ pub(super) struct Harness {
     route_epochs: tokio::sync::Mutex<RouteEpochs>,
     next_channel: AtomicU16,
     selection_profiles: Arc<Mutex<striatum_core::model_router::RouteTaskProfiles>>,
+    subscription_pools: Mutex<Option<Box<dyn Send + Sync>>>,
 }
 
 impl Drop for Harness {
@@ -139,6 +141,7 @@ impl Harness {
             route_epochs: tokio::sync::Mutex::new(RouteEpochs::new()),
             next_channel: AtomicU16::new(100),
             selection_profiles: Default::default(),
+            subscription_pools: Default::default(),
             dir,
         });
         harness.edit_config(|config| {
@@ -157,6 +160,10 @@ impl Harness {
 
     pub(super) fn store(&self) -> &SharedStore {
         &self.store
+    }
+
+    pub(super) fn set_quota_cache_for_test(&self, cache: crate::QuotaCache) {
+        *self.quota_cache.lock().unwrap() = cache;
     }
 
     /// The store's database file, for tests that read a table directly.
@@ -1585,6 +1592,83 @@ impl RoutingSubject for KitSubject {
         Ok(())
     }
 
+    async fn configure_pin_origin_reserve(
+        &self,
+        provider: &str,
+        enrolled_principals: &[String],
+    ) -> Result<(), String> {
+        let harness = self.harness();
+        harness.edit_config(|config| {
+            config["providers"][provider]["keep_free_percent"] = json!(30);
+            config["pin_origin_callers"] = json!(enrolled_principals);
+        });
+        let now = account_selection::now_ms();
+        let mut state = crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap();
+        let readings: Vec<_> = state
+            .roster
+            .as_ref()
+            .ok_or("pin origin fixture needs a credential roster")?
+            .identities
+            .iter()
+            .filter(|identity| identity.refresh_adapter == provider)
+            .map(|identity| {
+                json!({
+                    "provider":QUOTA_SOURCE,"apiProvider":provider,
+                    "account":identity.account_id,"source":"vault",
+                    "fetchedAt":account_selection::rfc3339(now),
+                    "usage":{
+                        "primary":{"usedPercent":80.0,"windowMinutes":300},
+                        "secondary":{"usedPercent":80.0,"windowMinutes":10080}
+                    }
+                })
+            })
+            .collect();
+        account_quota::apply_provider_reply(
+            &mut state,
+            QUOTA_SOURCE,
+            &serde_json::to_vec(&json!({"result":readings})).map_err(|e| e.to_string())?,
+            now,
+        )?;
+        let account_count = readings.len();
+        if account_count == 0 {
+            return Err(format!("no fixture accounts for {provider}"));
+        }
+        drop(state);
+        // Match the quota readings in the subscription pricing cache as well
+        // as the allocator. Retain the guard until this harness is discarded.
+        *harness.subscription_pools.lock().unwrap() = Some(Box::new(
+            crate::subscription_economics::test_pools(std::collections::HashMap::from([(
+                provider.into(),
+                striatum_core::subscription::SubscriptionPool {
+                    provider: provider.into(),
+                    now_ms: now,
+                    plans: vec![striatum_core::subscription::SubscriptionPlan {
+                        tier: None,
+                        plan: None,
+                        measured: None,
+                        fee_usd: 200.0,
+                        accounts: vec![
+                            striatum_core::subscription::QuotaAccount {
+                                weekly_used: 80.0,
+                                weekly_remaining_fraction: 1.0,
+                                hours_to_reset: 24.0,
+                                short_walled: false,
+                                short_windows: vec![],
+                                banked_resets: 0,
+                                banked_expires_at_ms: None,
+                                banked_credit_expiries_ms: vec![],
+                                prepaid_credits: false,
+                            };
+                            account_count
+                        ],
+                    }],
+                    ..Default::default()
+                },
+            )])),
+        ));
+        Ok(())
+    }
+
     async fn configure_panel_class(
         &self,
         class: &str,
@@ -1795,6 +1879,15 @@ impl RoutingSubject for KitSubject {
     }
 
     async fn route(&self, stamp: &RouteStamp) -> Result<KitRoute, String> {
+        if stamp.principal == "reserved:prefrontal-core" {
+            // The routing conformance suite sends pin_origin checks from
+            // reserved:prefrontal-core instead of its usual example-consumer.
+            // Make example_summary accessible to that fixture caller before
+            // reserve setup; ordinary fixture routes retain ownership checks.
+            self.harness().edit_config(|config| {
+                config["consumers"][fixture::SUMMARY]["owner"] = Value::Null;
+            });
+        }
         if let Some(scope) = &stamp.scope {
             let harness = self.harness();
             let channel = harness.reserve_channel();
@@ -1931,6 +2024,18 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     eprintln!("{}", report.render());
     assert_eq!(report.checks.len(), CHECKS.len());
     for check in [
+        "select_pin_origin_enrolled",
+        "select_pin_origin_unenrolled",
+        "select_pin_origin_unknown",
+        "select_pin_origin_without_pin",
+        "select_search_advertisement",
+        "select_search_declarations",
+        "select_search_nonce",
+        "select_search_requirements",
+        "select_search_privacy",
+        "select_search_allowance",
+        "select_search_ranking",
+        "select_search_reports",
         "observe_credential_refused_requires_backoff",
         "credential_refused_blocks_credential",
         "credential_refused_retry_at_ms_refused",

@@ -125,7 +125,10 @@ async fn open_peer(target: Value, settings: bool, should_send: bool) {
             )
             .await
             .unwrap();
-            let request = read_frame(&mut replacement).await.unwrap().unwrap();
+            let request = crate::test_daemon::read_application_frame(&mut replacement)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(
                 serde_json::from_slice::<Value>(&request.body).unwrap()["op"],
                 "catalog.list",

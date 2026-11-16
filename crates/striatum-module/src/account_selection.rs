@@ -255,6 +255,14 @@ pub(crate) enum ProbeBinding {
     Lost { retry_at: i64 },
 }
 
+/// The account recovery named by selection, including the stored block class.
+#[derive(Clone, Debug)]
+pub(crate) struct AccountBlock {
+    pub reset_at_ms: Option<i64>,
+    pub lifetime: striatum_core::blocks::LifetimeClass,
+    pub credential_code: Option<String>,
+}
+
 /// Why a legacy launch could not claim the probes its route needs.
 #[derive(Debug)]
 pub(crate) enum LaunchRefusal {
@@ -2655,7 +2663,17 @@ impl ClassContext {
         model: &str,
         priced: bool,
     ) -> Option<Option<i64>> {
-        self.blocked_reset_with_policy(
+        self.blocked_account(provider, model, priced)
+            .map(|block| block.reset_at_ms)
+    }
+
+    pub(crate) fn blocked_account(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+    ) -> Option<AccountBlock> {
+        self.blocked_account_with_policy(
             provider,
             model,
             priced,
@@ -2663,13 +2681,13 @@ impl ClassContext {
         )
     }
 
-    fn blocked_reset_with_policy(
+    fn blocked_account_with_policy(
         &self,
         provider: &str,
         model: &str,
         priced: bool,
         policy: AllocatorPolicy,
-    ) -> Option<Option<i64>> {
+    ) -> Option<AccountBlock> {
         // An empty roster may have lost accounts to route or credential
         // fences. Reuse admission's classification so only a dated account
         // limit, not missing credentials or policy exclusions, supplies a reset.
@@ -2683,7 +2701,14 @@ impl ClassContext {
                 empty_roster_refusal(self, provider, model, priced, &fenced, self.now_ms, None)
             {
                 if code == "account_pool_exhausted" {
-                    return Some(detail.and_then(|detail| detail["reset_at_ms"].as_i64()));
+                    let reset = detail.and_then(|detail| detail["reset_at_ms"].as_i64());
+                    return Some(self.account_block_at(
+                        provider,
+                        model,
+                        priced,
+                        reset,
+                        striatum_core::blocks::LifetimeClass::NonQuota,
+                    ));
                 }
             }
         }
@@ -2713,7 +2738,74 @@ impl ClassContext {
             model,
             self.now_ms,
         );
-        Some(reset.into_iter().chain(fenced.values().copied()).min())
+        let reset = reset.into_iter().chain(fenced.values().copied()).min();
+        // The allocator recovery above comes only from typed quota exclusions.
+        // A route or credential origin at that recovery may instead be non-quota.
+        Some(self.account_block_at(
+            provider,
+            model,
+            priced,
+            reset,
+            striatum_core::blocks::LifetimeClass::Quota,
+        ))
+    }
+
+    fn account_block_at(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        reset_at_ms: Option<i64>,
+        fallback: striatum_core::blocks::LifetimeClass,
+    ) -> AccountBlock {
+        use striatum_core::blocks::LifetimeClass;
+        let mut block = AccountBlock {
+            reset_at_ms,
+            lifetime: fallback,
+            credential_code: None,
+        };
+        let Some(fact) = self
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model)
+        else {
+            return block;
+        };
+        let mut non_quota = false;
+        for row in self.class(fact, priced).rows {
+            let account = self.account_id(row);
+            for origin in self.indexed_origins(provider, account, &row.id, model) {
+                if !self.origin_applies(origin, provider, account, &row.id, model)
+                    || self.origin_due(origin, account, model)
+                    || reset_at_ms.is_some_and(|reset| {
+                        self.recheck_hint(origin, account, model) != reset
+                            && self.probe_reserved_until(provider, &row.id) != Some(reset)
+                    })
+                {
+                    continue;
+                }
+                // Only origins participating in the named recovery determine
+                // its class; a later non-quota block origin on another account is unrelated.
+                if origin.quota {
+                    if !non_quota {
+                        block.lifetime = LifetimeClass::Quota;
+                    }
+                    continue;
+                }
+                non_quota = true;
+                block.lifetime = LifetimeClass::NonQuota;
+                if origin.kind == "credential" {
+                    block.credential_code = self
+                        .refusals
+                        .iter()
+                        .find(|refusal| {
+                            refusal.provider_id == provider && refusal.credential_id == row.id
+                        })
+                        .map(|refusal| refusal.code.clone());
+                }
+            }
+        }
+        block
     }
 
     /// Read dated account recovery even when a quota recheck has temporarily
@@ -2730,6 +2822,17 @@ impl ClassContext {
         priced: bool,
         keep_free: f64,
     ) -> Option<i64> {
+        self.account_recovery_with_keep_free(provider, model, priced, keep_free)
+            .and_then(|block| block.reset_at_ms)
+    }
+
+    pub(crate) fn account_recovery_with_keep_free(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        keep_free: f64,
+    ) -> Option<AccountBlock> {
         let mut recovered = self.clone();
         recovered.replace_refusals(
             self.refusals
@@ -2759,9 +2862,7 @@ impl ClassContext {
         // that margin is diagnosed without changing account admission policy.
         let mut policy = self.config.allocator_policy_ref(provider).clone();
         policy.reserve_seven_day = policy.reserve_seven_day.max(keep_free);
-        recovered
-            .blocked_reset_with_policy(provider, model, priced, policy)
-            .flatten()
+        recovered.blocked_account_with_policy(provider, model, priced, policy)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5033,20 +5134,20 @@ struct PinRef {
     generation: u64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidateParams {
     account_id: String,
     credential_id: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CandidatesParams {
     view_digest: String,
     #[serde(default)]
     accounts: Vec<CandidateParams>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct AccountRefParams {
     #[serde(default)]
     account_id: Option<String>,
@@ -5068,6 +5169,8 @@ impl AccountRefParams {
 /// names, snake_case like the rest of the account-selection schema.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct AccountForParams {
+    #[serde(skip)]
+    continuation_input: Option<continuation::Inputs>,
     #[serde(default)]
     head_turn: bool,
     #[serde(skip)]
@@ -5143,6 +5246,7 @@ impl AccountForParams {
         // request has already been parsed and validated by the v1 contract.
         let optional = |name: &str| extras.get(name).cloned().unwrap_or(Value::Null);
         let parsed = Self {
+            continuation_input: None,
             head_turn: request.head_turn,
             call: None,
             service_tier: request.service_tier,
@@ -5782,7 +5886,7 @@ fn prepare_and_admit(
             ),
         ));
     }
-    let (mut roster, route_fenced, class) = match prepare_roster(&parsed, ctx) {
+    let (mut roster, route_fenced, class, selection) = match prepare_roster(&parsed, ctx) {
         Ok(prepared) => prepared,
         Err(reply) => return Err(reply),
     };
@@ -5806,6 +5910,13 @@ fn prepare_and_admit(
             Ok(tier) => tier,
             Err(reply) => return Err(reply),
         };
+    parsed.continuation_input = Some(continuation::Inputs::prepare(
+        &parsed,
+        principal,
+        ctx.classes.as_ref(),
+        class,
+        selection.as_ref(),
+    ));
     if let Some(reply) = route_fence_refusal(&roster, &route_fenced, &parsed, ctx.now_ms) {
         return Err(because("route_fence", reply));
     }
@@ -5967,25 +6078,30 @@ fn prepare_roster(
         RosterBuild,
         BTreeMap<String, i64>,
         striatum_core::accounts::AllowedAccountClass,
+        Option<striatum_store::V1Decision>,
     ),
     OpReply,
 > {
     let provider = normalize(&parsed.provider);
-    let class = match parsed.model_decision_id.as_deref() {
-        None => striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
-        Some(id) => match ctx.store.v1_decision(id) {
-            Ok(Some(decision)) => decision.allowed_account_class,
-            Ok(None) => match ctx.store.decision_account_class(id) {
-                Ok(Some(class)) => class,
-                Ok(None) => {
-                    checking("unknown_decision");
-                    return Err(OpReply::error(
-                        "unknown_decision",
-                        "selection decision does not exist",
-                    ));
-                }
-                Err(error) => return Err(store_error(error)),
-            },
+    let selection = parsed
+        .model_decision_id
+        .as_deref()
+        .map(|id| ctx.store.v1_decision(id))
+        .transpose()
+        .map_err(store_error)?
+        .flatten();
+    let class = match (parsed.model_decision_id.as_deref(), selection.as_ref()) {
+        (_, Some(decision)) => decision.allowed_account_class,
+        (None, None) => striatum_core::accounts::AllowedAccountClass::NotPayPerToken,
+        (Some(id), None) => match ctx.store.decision_account_class(id) {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                checking("unknown_decision");
+                return Err(OpReply::error(
+                    "unknown_decision",
+                    "selection decision does not exist",
+                ));
+            }
             Err(error) => return Err(store_error(error)),
         },
     };
@@ -6015,13 +6131,10 @@ fn prepare_roster(
                 // A decision made by the older select (every core mason launch)
                 // has no v1 row naming its runner. The runner asking is then the
                 // one that will serve the run, so its tier support is checked.
-                let runner = match ctx.store.v1_decision(id) {
-                    Ok(decision) => Some(decision.map_or_else(
-                        || normalize(&parsed.caller.runner),
-                        |decision| decision.runner_module,
-                    )),
-                    Err(error) => return Err(store_error(error)),
-                };
+                let runner = Some(selection.as_ref().map_or_else(
+                    || normalize(&parsed.caller.runner),
+                    |decision| decision.runner_module.clone(),
+                ));
                 let registry = ctx.classes.as_ref().map(|classes| {
                     crate::routing_v1::runners::Registry::build(
                         classes.config.as_ref(),
@@ -6099,7 +6212,7 @@ fn prepare_roster(
                 .unwrap_or_else(|| parsed.initial_input_bytes.div_ceil(4)),
         );
     }
-    Ok((roster, route_fenced, class))
+    Ok((roster, route_fenced, class, selection))
 }
 
 fn tier_candidate_matches(
@@ -7669,6 +7782,16 @@ fn serve(
     }
     let decision_id = new_id("acd");
     let mut context = json!({ "roster": roster.context });
+    if let (Some(input), Outcome::Admit(admitted)) = (&params.continuation_input, &decision.outcome)
+    {
+        let mut input = input.clone();
+        input.auth_method = ctx
+            .classes
+            .as_ref()
+            .map_or("oauth", |classes| classes.method(&admitted.credential_id))
+            .into();
+        context["continuation_input"] = json!(input);
+    }
     if let Some(credential) = &params.warm_credential {
         let result = if affinity_row.is_some() {
             json!({"kind":"ignored", "reason":"existing_affinity"})
@@ -7890,6 +8013,14 @@ fn replay(
     let mut reply: Value = serde_json::from_str(&existing.reply_json).map_err(|error| {
         RouteStateStoreError(format!("stored admission reply undecodable: {error}"))
     })?;
+    if existing.request_mode == "admit" && state == "started" {
+        if let Some(current) = tx.latest_used_continuation(principal, &existing.admission_id)? {
+            reply = serde_json::from_str(&current.reply_json).map_err(|error| {
+                RouteStateStoreError(format!("stored continuation reply undecodable: {error}"))
+            })?;
+            reply["admission"]["id"] = json!(existing.admission_id);
+        }
+    }
     reply["admission"]["state"] = json!(state);
     Ok(OpReply::Result(reply))
 }

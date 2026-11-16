@@ -434,6 +434,7 @@ fn harness_with_pool_keys(
     harness.set_credentials(credentials);
     harness.edit_config(|config| {
         config["runners"] = json!([{ "module": "zeta-runner" }]);
+        config["consumers"]["mason"]["below_bar"] = json!("refuse");
         config["providers"][POOL]["pin_only"] = json!(false);
     });
     harness
@@ -441,13 +442,6 @@ fn harness_with_pool_keys(
 
 fn select(consumer: &str) -> Value {
     json!({ "consumer": consumer, "requirements": { "iq": 30 } })
-}
-
-fn legacy_select() -> Value {
-    json!({
-        "targetAgent": "mason", "consumer": "mason", "executor": "broca",
-        "substrate": "broca", "requirements": {"iq": 30, "eq": 0},
-    })
 }
 
 fn answered_route(reply: &(FrameType, Value)) -> String {
@@ -458,14 +452,6 @@ fn answered_route(reply: &(FrameType, Value)) -> String {
         route["provider"].as_str().unwrap(),
         route["model"].as_str().unwrap()
     )
-}
-
-fn legacy_route(reply: &(FrameType, Value)) -> String {
-    assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
-    reply.1["result"]["selected"]["routeKey"]
-        .as_str()
-        .unwrap()
-        .to_owned()
 }
 
 fn assert_pool_answer(reply: &(FrameType, Value), request: &Value) {
@@ -482,14 +468,8 @@ fn assert_pool_answer(reply: &(FrameType, Value), request: &Value) {
     );
 }
 
-/// Records runner-owned pool auth and admission, unlisted/missing-group fallback,
-/// pinned pools (including a key blocked by an entitlement refusal alongside a
-/// healthy key), and legacy launch identities, plus one vendor model on both
-/// subscription and pool routes.
-/// Pool providers borrow vendor rows; they are not ordinary catalog providers
-/// that happen to have API keys.
 #[tokio::test]
-async fn replay_key_pool_public_cases() {
+async fn key_pool_public_cases_keep_route_auth_pin_and_admission_contracts() {
     use striatum_core::route_state_store::CredentialRefusal;
 
     const NOW: i64 = 1_800_000_000_000;
@@ -593,16 +573,6 @@ async fn replay_key_pool_public_cases() {
                 "frame_type":format!("{:?}", admitted.0), "reply":admitted.1,
             }));
         }
-        let mut legacy = legacy_select();
-        if pinned {
-            legacy["modelPin"] = json!(pool_route);
-        }
-        let selected = owner.call("route.select", &legacy).await;
-        assert_eq!(legacy_route(&selected), pool_route, "{name}");
-        launches.push(json!({
-            "kind":"legacy-select", "method":"route.select", "params":legacy,
-            "frame_type":format!("{:?}", selected.0), "reply":selected.1,
-        }));
         cases.push(super::replay_tests::normalize_paths(
             json!({"name":name,"launches":launches}),
             &harness,
@@ -670,34 +640,77 @@ async fn replay_key_pool_public_cases() {
                     "frame_type":format!("{:?}", admitted.0), "reply":admitted.1,
                 }));
             }
-            let mut legacy = legacy_select();
-            legacy["modelPin"] = json!(pin);
-            let selected = owner.call("route.select", &legacy).await;
-            assert_eq!(legacy_route(&selected), pin);
-            launches.push(json!({
-                "kind":format!("{kind}-legacy-select"), "method":"route.select", "params":legacy,
-                "frame_type":format!("{:?}", selected.0), "reply":selected.1,
-            }));
         }
         cases.push(super::replay_tests::normalize_paths(
             json!({"name":"same-vendor-model-subscription-and-pool", "launches":launches}),
             &harness,
         ));
     }
-    super::replay_tests::assert_or_record(
-        "key-pool-public",
-        json!({"clock_ms":NOW,
-            "body_source":"public routing/v1 select and runner account_for replies plus legacy select replies through the real frame handler; synthetic alias-provider key pools",
-            "cases":cases}),
-    );
+    // The archived key-pool-public golden interleaves retired targetAgent
+    // selections with v1 calls, so it is no longer compared byte-for-byte after
+    // removing those calls. Keep the v1 route, auth and admission assertions here.
+    assert_eq!(cases.len(), 6);
+    for case in cases {
+        let mut ids = std::collections::BTreeSet::new();
+        for launch in case["launches"].as_array().unwrap() {
+            let result = &launch["reply"]["result"];
+            assert_eq!(launch["frame_type"], "Response");
+            if launch["method"] == "route.select" {
+                assert!(ids.insert(result["decision_id"].as_str().unwrap()));
+                assert_eq!(result["expires_at_ms"], NOW + 600_000);
+                assert_eq!(result["context_window"], 200000);
+                assert_eq!(
+                    result["max_output_tokens"],
+                    if case["name"] == "same-vendor-model-subscription-and-pool" {
+                        0
+                    } else {
+                        32000
+                    }
+                );
+                let route = format!(
+                    "{}/{}",
+                    result["route"]["provider"].as_str().unwrap(),
+                    result["route"]["model"].as_str().unwrap()
+                );
+                let reason = if launch["params"].get("pin").is_some() {
+                    "the request's pin"
+                } else {
+                    "the lowest-cost route that meets the requirements"
+                };
+                assert_eq!(
+                    result["explanation"],
+                    format!(
+                        "{route} on {} for consumer mason, chosen by {reason}.",
+                        result["runner"]["module"].as_str().unwrap()
+                    )
+                );
+            } else {
+                assert_eq!(result["admission"]["id"], launch["params"]["admission_id"]);
+                assert_eq!(result["admission"]["state"], "reserved");
+                assert_eq!(
+                    result["reason"]["decision_id"],
+                    launch["params"]["decision_id"]
+                );
+                assert_eq!(result["reason"]["code"], "cold_scored");
+                assert_eq!(result["reason"]["policy_version"], "2");
+                assert_eq!(result["reason"]["quota_age_band"], "unknown");
+                assert_eq!(result["pin"]["id"], "pin_f5622ffb78ee799df2443cb7");
+                assert_eq!(result["pin"]["mode"], "admit");
+                assert_eq!(result["pin"]["generation"], 1);
+                assert_eq!(result["pin"]["admission_valid_until_ms"], NOW + 60_000);
+                assert_eq!(result["pin"]["lease_valid_until_ms"], NOW + 120_000);
+                assert_eq!(result["pin"]["affinity_expires_at_ms"], NOW + 604_800_000);
+            }
+        }
+    }
 }
 
 /// With no pin and no ladder, the key pool's route is the cheapest adequate
 /// one. Operator policy that keeps such a provider out of the automatic order
 /// is cleared first, so the only thing left that can keep it out of a v1 answer
-/// is the pool's standing policy. Legacy and routing/v1 select answer the same route.
+/// is the pool's standing policy. The current select must retain that route.
 #[tokio::test]
-async fn the_automatic_order_answers_the_same_cheaper_pool_route_on_both_surfaces() {
+async fn the_automatic_order_answers_the_cheaper_pool_route() {
     let harness = harness();
     // Clear every exclusion naming the key-pool provider, so its borrowed
     // route is a normal automatic candidate.
@@ -706,14 +719,6 @@ async fn the_automatic_order_answers_the_same_cheaper_pool_route_on_both_surface
 
     let v1 = route.call("route.select", &select("mason")).await;
     assert_pool_answer(&v1, &select("mason"));
-
-    let legacy = route.call("route.select", &legacy_select()).await;
-    assert_eq!(
-        legacy_route(&legacy),
-        format!("{POOL}/{POOL_MODEL_SHORT}"),
-        "the legacy shape still answers the cheaper key-pool route: {}",
-        legacy.1
-    );
 }
 
 /// Remove every operator exclusion entry whose spec names the key-pool
@@ -784,40 +789,6 @@ async fn only_a_key_pool_route_adequate_answers_on_v1() {
 
     let v1 = route.call("route.select", &select("mason")).await;
     assert_pool_answer(&v1, &select("mason"));
-
-    // The same demand on the legacy shape still gets the key-pool route.
-    let legacy = route
-        .call(
-            "route.select",
-            &json!({
-                "targetAgent": "mason", "consumer": "mason", "executor": "broca",
-                "substrate": "broca", "requirements": {"iq": 100, "eq": 0},
-            }),
-        )
-        .await;
-    assert_eq!(
-        legacy_route(&legacy),
-        format!("{POOL}/{POOL_MODEL_SHORT}"),
-        "{}",
-        legacy.1
-    );
-}
-
-#[tokio::test]
-async fn the_legacy_surface_answers_the_key_pool_route() {
-    let harness = harness();
-    let route = harness.bind(reserved("example-consumer"), None).await;
-    // A pin names the route outright, so the legacy surface must serve it: it
-    // selects and leases a pool key for exactly this case.
-    let mut legacy = legacy_select();
-    legacy["modelPin"] = json!(format!("{POOL}/model-pool"));
-    let legacy = route.call("route.select", &legacy).await;
-    assert_eq!(
-        legacy_route(&legacy),
-        format!("{POOL}/model-pool"),
-        "the legacy shape leases a pool key for a pinned key-pool route: {}",
-        legacy.1
-    );
 }
 
 #[tokio::test]
@@ -888,10 +859,6 @@ async fn pooled_pins_skip_a_fenced_key_but_refuse_when_every_key_is_fenced() {
         let route = harness
             .bind(reserved("example-consumer"), Some("pool-project"))
             .await;
-        let mut legacy = legacy_select();
-        legacy["modelPin"] = json!(pin);
-        let legacy = route.call("route.select", &legacy).await;
-        assert_eq!(legacy_route(&legacy), pin, "{pin_kind}");
         let reply = route.call("route.select", &request).await;
         assert_eq!(answered_route(&reply), pin, "{pin_kind}");
         assert_eq!(
@@ -917,11 +884,6 @@ async fn pooled_pins_skip_a_fenced_key_but_refuse_when_every_key_is_fenced() {
             NOW as i64,
         )
         .unwrap();
-        let mut legacy = legacy_select();
-        legacy["modelPin"] = json!(pin);
-        let legacy = route.call("route.select", &legacy).await;
-        assert_eq!(legacy.0, FrameType::Error, "all keys fenced: {legacy:?}");
-        assert_eq!(legacy.1["code"], "explicit_provider_pool_exhausted");
         let mut request = select("mason");
         request["pin"] = json!(pin);
         let refused = route.call("route.select", &request).await;

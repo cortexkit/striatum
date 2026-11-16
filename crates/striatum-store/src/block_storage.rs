@@ -6,7 +6,7 @@ use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 use striatum_core::blocks::Block;
 
-pub(crate) const MIGRATION: &str = include_str!("../migrations/094_block_storage.sql");
+pub(crate) const MIGRATION: &str = include_str!("../migrations/095_block_storage.sql");
 
 /// Migration SQL calls the same quarantine predicate as routing. Keeping the
 /// predicate in Rust avoids a second, incomplete SQL copy of error parsing.
@@ -184,6 +184,9 @@ pub(crate) const NEXT_SOURCE_ORDER: &str = "/* writer bookkeeping: next source o
 /// Record refusal evidence. The keyed register in the same command schedules
 /// new evidence using its prior claim time; an unchanged signature keeps its
 /// classification, claim and heal.
+/// Observation receipts also reject evidence no newer than a retired generation
+/// of the same origin. Retirement rows are not loaded, so that check is a keyed
+/// guard of this insert rather than a request-side state read.
 pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Result<usize> {
     let block = &row.block;
     let scope = &block.scope;
@@ -197,11 +200,13 @@ pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Re
             evidence,evidence_at,quota,next_recheck_at,reset_check_at,observation_id,pool_key_json,deadline,reset_at,
             observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,
             reason,code,wall_class,wall_unscoped,scope_error,listing_fingerprint,recovery_set_json,meta,cleared_reason,cleared_at,cleared_by,source_present,source_order)
-         VALUES (:kind,:key,:provider,:account,:credential,:model,:size,:principal,:admission,
+         SELECT :kind,:key,:provider,:account,:credential,:model,:size,:principal,:admission,
             :evidence,:at,:quota,:next,:reset,:observation,:pool,:deadline,:reset_at,
             :observed,:created,:recorded,:reported,:cooldown,:exhausted,
             :reason,:code,:class,:unscoped,:error,:fingerprint,:recovery,:meta,:clear_reason,:clear_at,:clear_by,:present,
-            :order)
+             :order
+         WHERE :kind!='observation' OR NOT EXISTS (
+             SELECT 1 FROM retirement_tombstone t WHERE t.kind=:kind AND t.origin_key=:key AND t.evidence_at>=:at)
          ON CONFLICT(kind,origin_key) DO UPDATE SET
             provider=excluded.provider,account_id=excluded.account_id,credential_id=excluded.credential_id,
             model=excluded.model,size_class=excluded.size_class,principal=excluded.principal,admission_id=excluded.admission_id,
