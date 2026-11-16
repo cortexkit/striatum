@@ -118,6 +118,8 @@ pub(crate) fn exercise_normal_traffic_for_logging() {
 #[cfg(test)]
 mod report_fence_tests;
 #[cfg(test)]
+mod route_fence_pool_tests;
+#[cfg(test)]
 mod runners_tests;
 #[cfg(test)]
 mod scope_attribution_tests;
