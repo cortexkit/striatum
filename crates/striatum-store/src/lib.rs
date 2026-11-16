@@ -358,7 +358,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 94] {
+fn route_state_migrations() -> [Migration; 95] {
     [
         Migration {
             version: 1,
