@@ -8265,10 +8265,11 @@ mod tests {
 
     #[test]
     fn credential_unusable_class_drops_retention_like_absent() {
-        // A revoked OAuth grant (QTA maps Google's invalid_grant here, RFC 6749
-        // permanent) never self-recovers; retaining the last healthy window
-        // would keep routing to a dead account. Mutation: remove the class from
-        // the dead-credential set and this reddens by name.
+        // A revoked OAuth grant (Insula maps Google's `invalid_grant`, which
+        // RFC 6749 makes permanent, to this class) never self-recovers;
+        // retaining the last healthy window would keep routing to a dead
+        // account. Removing the class from the dead-credential set must make
+        // this test fail.
         let mut cached = vec![usage(serde_json::json!({
             "provider": "gemini",
             "usage": { "primary": { "usedPercent": 12.0, "resetsAt": "2030-01-01T00:00:00Z" } }
@@ -8299,11 +8300,12 @@ mod tests {
 
     #[test]
     fn no_quota_reported_class_drops_retention_and_takes_the_degraded_entry() {
-        // no_quota_reported is an ended plan (gateway affirms success, no plan
-        // block) - QTA 4f6d048; the same truth-not-degradation family,
-        // not trouble: retaining a last-healthy window for it manufactures a
-        // provider that does not exist on this host. Classless degraded entries
-        // (older QTA) and every other class keep the retention path above.
+        // no_quota_reported is an ended plan (the gateway affirms success but
+        // reports no plan block), so like credential_absent below it is a true
+        // state, not trouble: retaining a last-healthy window for it
+        // manufactures a provider that does not exist on this host. Classless
+        // degraded entries (from older Insula builds) and every other class
+        // keep the retention path above.
         let mut cached = vec![usage(serde_json::json!({
             "provider": "codex",
             "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
@@ -8334,7 +8336,8 @@ mod tests {
         // credential_absent is steady state (nobody configured the credential),
         // not trouble: retaining a last-healthy window for it manufactures a
         // provider that does not exist on this host. Classless degraded entries
-        // (older QTA) and every other class keep the retention path above.
+        // (from older Insula builds) and every other class keep the retention
+        // path above.
         let mut cached = vec![usage(serde_json::json!({
             "provider": "codex",
             "usage": { "primary": { "usedPercent": 97.0, "resetsAt": "2030-01-01T00:00:00Z" } }
