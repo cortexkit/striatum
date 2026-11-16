@@ -55,6 +55,8 @@ impl World {
             );
             Ok(())
         });
+        self.witness("probe_claim");
+        self.witness("pool_lease_claim");
         self.ok(Caller::Operator,"route.pool_renew",json!({"provider":POOL_PROVIDER,"session":session,"leaseId":lease.lease_id,"credentialId":lease.credential_id})).await;
         let serving_credential = lease.credential_id.clone();
         self.command("pool/typed serving success", move |tx| {

@@ -147,6 +147,13 @@ impl World {
                         .await,
                     after
                 );
+                self.witness(format!(
+                    "charge/{}/reload={reload}",
+                    match case {
+                        ChargeCase::TwentyDayRoundRobin => "round_robin",
+                        ChargeCase::ReadingFloor => "reading_floor",
+                    }
+                ));
             }
         }
         self.publish_catalog();

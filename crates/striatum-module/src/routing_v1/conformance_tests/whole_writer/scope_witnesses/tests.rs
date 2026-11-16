@@ -7,9 +7,11 @@ impl World {
             let _clock = crate::InjectedClock::set(START);
             let mut size = World::new(&format!("size-admit-{seed}-{reload}")).await;
             size.size_refusal_changes_admit(reload).await;
+            self.witness(format!("scope/size/reload={reload}"));
             let _clock = crate::InjectedClock::set(START);
             let mut principal = World::new(&format!("principal-admit-{seed}-{reload}")).await;
             principal.principal_exclusion_changes_admit(reload).await;
+            self.witness(format!("scope/principal/reload={reload}"));
         }
     }
 

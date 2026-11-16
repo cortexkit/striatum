@@ -76,6 +76,10 @@ impl World {
                 "an older {} wall report cannot recreate healed evidence: {after}",
                 if provider_wide { "provider" } else { "route" }
             );
+            self.witness(format!(
+                "outside/older_{}/reload={reload}",
+                if provider_wide { "provider" } else { "route" }
+            ));
         }
     }
 
@@ -151,6 +155,7 @@ impl World {
             "one terminal failure must stay below the backoff threshold"
         );
         assert_eq!(prior.failure_backoff_reason, None);
+        self.witness(format!("outside/late_completion/reload={reload}"));
     }
 
     fn native_health_outcome(

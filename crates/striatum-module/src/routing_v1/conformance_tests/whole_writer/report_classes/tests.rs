@@ -21,6 +21,7 @@ impl World {
             let _clock = crate::InjectedClock::set(START);
             let mut world = World::new(&format!("report-classes-{seed}-{reload}")).await;
             world.all_report_classes_and_config(reload, seed).await;
+            self.inherit_witnesses(&world);
         }
     }
 
@@ -81,6 +82,7 @@ impl World {
             self.sequence += 1;
             self.commands.insert("config strategy publication".into());
             self.compare("report class/effective policy publication");
+            self.witness(format!("config/reload={reload}"));
             if reload {
                 self.reload();
             }
@@ -120,6 +122,7 @@ impl World {
                 "the real report delivery must replay rather than apply its outcome twice"
             );
             reached.insert(outcome);
+            self.witness(format!("report/{outcome}/reload={reload}"));
             replies.push((body, answer));
         }
         assert_eq!(

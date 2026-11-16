@@ -12,6 +12,7 @@ impl World {
             world.closed_admission_observation_witness(reload).await;
             world.healed_wall_ordering_witness(reload).await;
             world.late_completion_ordering_witness(reload).await;
+            self.inherit_witnesses(&world);
         }
     }
 
@@ -41,6 +42,7 @@ impl World {
             "expiry alone must not release a live run: {renewed}"
         );
         assert!(renewed["validUntilMs"].as_u64().unwrap() > self.now);
+        self.witness(format!("outside/expired_renew/reload={reload}"));
         self.ok(
             Caller::Operator,
             "route.pool_release",
@@ -57,6 +59,7 @@ impl World {
             json!({"live":false,"validUntilMs":null}),
             "a credential id cannot recreate a released lease"
         );
+        self.witness(format!("outside/released_renew/reload={reload}"));
     }
 
     async fn closed_admission_observation_witness(&mut self, reload: bool) {
@@ -117,6 +120,7 @@ impl World {
             replay["observation"]["duplicate"], true,
             "a retried closed-row observation is still deduplicated: {replay}"
         );
+        self.witness(format!("outside/closed_observation/reload={reload}"));
     }
 }
 

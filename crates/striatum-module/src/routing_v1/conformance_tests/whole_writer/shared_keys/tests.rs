@@ -12,11 +12,13 @@ impl World {
                     World::new(&format!("shared-fence-ids-{seed}-{reload}-{reverse}")).await;
                 world.isolate_shared_account();
                 world.two_fence_ids_witness(reverse, reload).await;
+                self.witness(format!("shared/account/reverse={reverse}/reload={reload}"));
                 let _clock = crate::InjectedClock::set(START);
                 let mut world =
                     World::new(&format!("shared-size-kinds-{seed}-{reload}-{reverse}")).await;
                 world.isolate_shared_account();
                 world.two_size_kinds_witness(reverse, reload).await;
+                self.witness(format!("shared/size/reverse={reverse}/reload={reload}"));
             }
         }
     }

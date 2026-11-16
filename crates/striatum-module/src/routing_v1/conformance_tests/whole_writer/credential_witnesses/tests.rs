@@ -6,9 +6,11 @@ impl World {
             let _clock = crate::InjectedClock::set(START);
             let mut world = World::new(&format!("credential-same-evidence-{seed}-{reload}")).await;
             world.same_credential_evidence_witness(reload).await;
+            self.witness(format!("credential/reading/reload={reload}"));
             let _clock = crate::InjectedClock::set(START);
             let mut world = World::new(&format!("credential-listing-cycle-{seed}-{reload}")).await;
             world.fenced_listing_cycle_witness(reload).await;
+            self.witness(format!("credential/listing/reload={reload}"));
         }
     }
 

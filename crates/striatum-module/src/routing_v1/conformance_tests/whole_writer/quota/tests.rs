@@ -64,6 +64,7 @@ impl World {
             );
             Ok(())
         });
+        self.witness("fresh_headroom");
         let id = format!("headroom-admit-{nonce}-{}", self.sequence);
         self.ok(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":id})).await;
     }

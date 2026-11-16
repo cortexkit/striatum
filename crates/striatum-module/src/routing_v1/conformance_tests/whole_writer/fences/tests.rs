@@ -139,6 +139,8 @@ impl World {
         self.command("fence/recovery set", move |tx| {
             tx.set_fence_recovery_set(&id, &[])
         });
+        let tombstone_key = json!([evidence.fence_id]).to_string();
+        let tombstone_evidence = evidence.fence_json.clone();
         let clear_held = move |tx: &mut crate::account_state::AccountCommand<'_>| {
             tx.clear_held_fence(&evidence, now + 1, "whole-writer success")
         };
@@ -152,5 +154,17 @@ impl World {
             self.command("fence/id clear", clear_id);
             self.command("fence/held clear", clear_held);
         }
+        // Cleared immutable fence ids leave the bounded state. Inspect this
+        // durable tombstone as test validation, not as a request-path read.
+        let tombstone=self.harness.store().with_reader_for_test(|conn| {
+            conn.query_row("SELECT source_present,cleared_by,cleared_at,evidence FROM block WHERE kind='account' AND origin_key=?1",
+                [&tombstone_key],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,i64>(2)?,row.get::<_,String>(3)?)))
+        }).unwrap();
+        assert_eq!(
+            tombstone,
+            (0, "kept".into(), now + 1, tombstone_evidence),
+            "the real held-evidence clear must retain its exact audit tombstone"
+        );
+        self.witness("tombstone");
     }
 }

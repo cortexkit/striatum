@@ -40,6 +40,8 @@ mod read_only;
 mod report_classes;
 #[path = "scope_witnesses/tests.rs"]
 mod scope_witnesses;
+#[path = "semantic/tests.rs"]
+mod semantic;
 #[path = "shared_keys/tests.rs"]
 mod shared_keys;
 
@@ -66,6 +68,7 @@ struct World {
     frozen: striatum_store::FrozenBlockData,
     outside: u64,
     commands: BTreeSet<String>,
+    witnesses: BTreeSet<String>,
     trace: striatum_store::writer_entry_trace::Trace,
     _trace_install: striatum_store::writer_entry_trace::Installed,
     bridge_loads: Arc<std::sync::atomic::AtomicU64>,
@@ -160,6 +163,7 @@ impl World {
             frozen,
             outside,
             commands: BTreeSet::new(),
+            witnesses: BTreeSet::new(),
             trace,
             _trace_install: trace_install,
             bridge_loads,
@@ -313,6 +317,7 @@ impl World {
                     admitted,
                     "a repeated admission changed its reply"
                 );
+                self.witness("admission_replay");
                 self.ok(Caller::Runner,"route.account_observe",json!({"kind":"admission_started","event_id":format!("start-{key}"),"admission_id":key,"run_id":key})).await;
                 self.ok(Caller::Runner,"route.account_observe",json!({"kind":"run_finished","event_id":format!("finish-{key}"),"admission_id":key,"run_id":key})).await;
             }
@@ -370,12 +375,40 @@ impl World {
             }
             4 | 5 => {
                 self.ok(Caller::Operator,"route.record_cooldown",json!({"routeKey":subscription,"capacityKey":subscription,"cooldownUntil":self.now+1_000+nonce%100,"providerWide":draw==5,"lastError":"HTTP 503 provider maintenance"})).await;
+                let standing = self
+                    .ok(
+                        Caller::Operator,
+                        "route.cooldown_status",
+                        json!({"routeKey":subscription,"capacityKey":subscription,"now":self.now}),
+                    )
+                    .await;
+                assert_eq!(
+                    standing["cooled"], true,
+                    "the recorded wall did not enforce: {standing}"
+                );
+                self.witness(if draw == 5 {
+                    "provider_wall"
+                } else {
+                    "route_wall"
+                });
                 self.ok(
                     Caller::Operator,
                     "route.clear_cooldown",
                     json!({"routeKey":subscription}),
                 )
                 .await;
+                let cleared = self
+                    .ok(
+                        Caller::Operator,
+                        "route.cooldown_status",
+                        json!({"routeKey":subscription,"capacityKey":subscription,"now":self.now}),
+                    )
+                    .await;
+                assert_eq!(
+                    cleared["cooled"], false,
+                    "operator clear left an enforcing wall: {cleared}"
+                );
+                self.witness("operator_clear");
             }
             6 => {
                 self.advance([1, 60_001, 900_001][nonce as usize % 3]);
@@ -601,6 +634,8 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
         world.report_class_witnesses(seed).await;
         assert_trace_is_declared(&world.trace);
         assert_all_producers_driven(&world.trace);
+        world.assert_semantic_coverage();
+        world.compare("all semantic obligations reached");
     }
 }
 

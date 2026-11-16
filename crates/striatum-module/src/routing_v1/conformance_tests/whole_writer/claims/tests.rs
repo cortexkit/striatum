@@ -117,6 +117,7 @@ impl World {
                 assert!(!self.command("claim/expiry spent proof", move |tx| Ok(tx
                     .probe_authorization_owners()?
                     .contains(&o))));
+                self.witness("probe_expiry");
             }
             let (p, c) = (admission.provider.clone(), admission.credential_id.clone());
             self.command("claim/clear remaining refusal", move |tx| {

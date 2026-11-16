@@ -111,5 +111,6 @@ impl World {
                 "the actual deleting producer was not driven: {name}"
             );
         }
+        self.witness("retention_delete");
     }
 }
