@@ -176,6 +176,10 @@ impl World {
         );
         let store = self.harness.store();
         let context = format!("step={} now={} op={operation}", self.sequence, self.now);
+        // Equality compares the bounded state and cannot see dropped rows.
+        // Validate their physical clock metadata separately as maintenance,
+        // never as part of a production request's read path.
+        store.assert_canonical_block_clocks_for_test().unwrap();
         crate::account_state::assert_fresh_load_for_test(&store, self.now as i64, &context);
         store
             .frozen_block_data_for_test()

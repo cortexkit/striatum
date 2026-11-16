@@ -355,6 +355,9 @@ pub(crate) fn snapshot(store: &SqliteRouteStateStore) -> RouteStateResult<Arc<Ac
         .map_err(|_| RouteStateStoreError("account state publisher has the wrong type".into()))
 }
 
+/// Compare every bounded state field except publication generation. Dropped
+/// block rows are intentionally absent from both sides; their physical clock
+/// fields need separate test/maintenance validation at source transitions.
 #[cfg(test)]
 pub(crate) fn assert_fresh_load_for_test(store: &SqliteRouteStateStore, now: i64, context: &str) {
     // Capture memory first: loading SQL must not repair the value being checked.

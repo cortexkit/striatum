@@ -278,6 +278,13 @@ pub const REVIEWED_OBSERVATION_RETIREMENT_GUARD: (&str, &str) = (
     "retirement guard on the observation-effect insert: one covering keyed seek, LIMIT 1",
 );
 
+/// Only the source-transition trigger's own primary-key lookup is reviewed
+/// here. It is separate from ordinary request reads and the other triggers.
+pub const REVIEWED_CLOCK_NORMALIZATION_TRIGGER: (&str, &str) = (
+    "block_clock_drop",
+    "block by its primary key kind = NEW.kind and origin_key = NEW.origin_key",
+);
+
 /// Writes that run a `SELECT` of their own over other tables (a bound
 /// `json_each` list, or the fields of an `account_observe` report bound as
 /// parameters) yet read their own target only
@@ -305,6 +312,8 @@ pub struct BlockReadTrace {
     route_write_rows: Mutex<Vec<String>>,
     writer_bookkeeping: Mutex<Vec<String>>,
     observation_retirement_guards: Mutex<Vec<String>>,
+    clock_normalization_reads: Mutex<Vec<String>>,
+    clock_normalizations: Mutex<usize>,
     triggers: Mutex<Vec<String>>,
     /// A connection to the traced database, used only to prepare each new
     /// statement text once under an authorizer, and what that found.
@@ -343,6 +352,13 @@ pub struct BlockReads {
     /// Exact observation-effect inserts that make one keyed retirement lookup
     /// inside the writer. These are distinct from own-row and bookkeeping reads.
     pub observation_retirement_guards: Vec<String>,
+    /// Executed normalization bodies with the reviewed primary-key lookup,
+    /// only on the writer connection inside a writer command.
+    pub clock_normalization_reads: Vec<String>,
+    /// Actual executions of the normalization body. Preparation can see a
+    /// trigger even when its WHEN condition is false, so reads are not a count
+    /// of real transitions. The runtime statement trace counts those instead.
+    pub clock_normalizations: usize,
     /// Writes whose only block reads are those of [`REVIEWED_TRIGGERS`] they
     /// fire, by text.
     pub triggers: Vec<String>,
@@ -361,6 +377,10 @@ impl BlockReadTrace {
             observation_retirement_guards: std::mem::take(
                 &mut self.observation_retirement_guards.lock().unwrap(),
             ),
+            clock_normalization_reads: std::mem::take(
+                &mut self.clock_normalization_reads.lock().unwrap(),
+            ),
+            clock_normalizations: std::mem::take(&mut self.clock_normalizations.lock().unwrap()),
             triggers: std::mem::take(&mut self.triggers.lock().unwrap()),
         }
     }
@@ -508,6 +528,24 @@ unsafe extern "C" fn on_block_statement(
     // A trigger's statements arrive as "-- <trigger>"; their reads were
     // found when the statement that fires them was prepared.
     if unsafe { trigger_event(statement, &text) } {
+        if text.strip_prefix("--").is_some_and(|body| {
+            let compact = |sql: &str| {
+                sql.chars()
+                    .filter(|ch| !ch.is_whitespace() && *ch != ';')
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            };
+            compact(body) == compact(crate::block_storage::CLOCK_NORMALIZATION_BODY)
+        }) {
+            *tap.trace.clock_normalizations.lock().unwrap() += 1;
+            if tap.writer && crate::block_state::in_writer_command() {
+                tap.trace
+                    .clock_normalization_reads
+                    .lock()
+                    .unwrap()
+                    .push(text.to_string());
+            }
+        }
         return 0;
     }
     let found = tap.trace.tables_read(&text);
@@ -515,12 +553,25 @@ unsafe extern "C" fn on_block_statement(
         if found.triggers.is_empty() {
             return 0;
         }
-        if found.triggers.iter().all(|name| {
-            REVIEWED_TRIGGERS
-                .iter()
-                .any(|(reviewed, _)| reviewed == name)
-        }) {
-            tap.trace.triggers.lock().unwrap().push(text.into_owned());
+        let normalization = found
+            .triggers
+            .iter()
+            .any(|name| name == REVIEWED_CLOCK_NORMALIZATION_TRIGGER.0);
+        let other = found
+            .triggers
+            .iter()
+            .any(|name| name != REVIEWED_CLOCK_NORMALIZATION_TRIGGER.0);
+        if (!normalization || tap.writer && crate::block_state::in_writer_command())
+            && found.triggers.iter().all(|name| {
+                name == REVIEWED_CLOCK_NORMALIZATION_TRIGGER.0
+                    || REVIEWED_TRIGGERS
+                        .iter()
+                        .any(|(reviewed, _)| reviewed == name)
+            })
+        {
+            if other {
+                tap.trace.triggers.lock().unwrap().push(text.into_owned());
+            }
             return 0;
         }
     }

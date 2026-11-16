@@ -8,6 +8,45 @@ use striatum_core::blocks::Block;
 
 pub(crate) const MIGRATION: &str = include_str!("../migrations/095_block_storage.sql");
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) const CLOCK_NORMALIZATION_BODY: &str =
+    "UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+  WHERE kind=NEW.kind AND origin_key=NEW.origin_key";
+
+#[cfg(any(test, feature = "test-support"))]
+impl crate::SqliteRouteStateStore {
+    /// Test and maintenance validation of physical clock fields that the
+    /// bounded state intentionally drops. This is not a request-path reader.
+    pub fn assert_canonical_block_clocks_for_test(&self) -> crate::RouteStateResult<()> {
+        let sql=format!("{} SELECT kind,origin_key,managed,claim_owner,last_claimed_at,claim_generation FROM block
+            WHERE kind!='observation' AND (source_present=0 OR is_origin=0)
+              AND (managed=1 OR claim_owner IS NOT NULL OR last_claimed_at IS NOT NULL OR claim_generation!=0)
+            ORDER BY kind,origin_key LIMIT 10",crate::block_state::MAINTENANCE_READ);
+        let stale = self
+            .store
+            .with_read(|conn| {
+                conn.prepare(&sql)?
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .map_err(crate::err)?;
+        assert!(
+            stale.is_empty(),
+            "maintenance parity: dropped sources carry stale managed or claim clocks: {stale:?}"
+        );
+        Ok(())
+    }
+}
+
 /// Migration SQL calls the same quarantine predicate as routing. Keeping the
 /// predicate in Rust avoids a second, incomplete SQL copy of error parsing.
 pub(crate) fn install_migration_function(conn: &Connection) -> rusqlite::Result<()> {

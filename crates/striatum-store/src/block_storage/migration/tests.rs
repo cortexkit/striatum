@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "clock_normalization/tests.rs"]
+mod clock_normalization;
+
 fn migration_function_is_absent(conn: &Connection) {
     let error = conn
         .query_row(

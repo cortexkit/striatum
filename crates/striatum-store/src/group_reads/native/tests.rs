@@ -1,3 +1,5 @@
+#[path = "clock_normalization_tests.rs"]
+mod clock_normalization;
 #[path = "observation_guard_tests.rs"]
 mod observation_guard;
 

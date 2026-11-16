@@ -192,3 +192,15 @@ impl World {
         );
     }
 }
+
+#[tokio::test]
+async fn removed_shared_size_sources_enforce_delayed_evidence_before_and_after_reload() {
+    let _clock = crate::InjectedClock::set(START);
+    for reload in [false, true] {
+        for reverse in [false, true] {
+            let mut world = World::new(&format!("removed-shared-size-{reload}-{reverse}")).await;
+            world.isolate_shared_account();
+            world.two_size_kinds_witness(reverse, reload).await;
+        }
+    }
+}

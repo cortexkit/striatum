@@ -60,6 +60,18 @@ CREATE INDEX block_exclusions ON block(principal,admission_id,credential_id)
 CREATE INDEX block_observation ON block(observation_id) WHERE observation_id IS NOT NULL;
 CREATE INDEX block_pool ON block(pool_key_json) WHERE pool_key_json IS NOT NULL;
 
+-- Non-observation clocks leave the bounded state with their source. Drop the
+-- stored clock at the same transition, before an identical source can return.
+-- Evidence and cleared audit fields remain on the row.
+CREATE TRIGGER block_clock_drop AFTER UPDATE OF source_present,kind,wall_class ON block
+WHEN NEW.kind!='observation' AND
+  ((OLD.source_present=1 AND NEW.source_present=0) OR
+   (OLD.is_origin=1 AND NEW.is_origin=0))
+BEGIN
+  UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+  WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
+END;
+
 CREATE TABLE probe_authorization (
   owner TEXT NOT NULL, kind TEXT NOT NULL, origin_key TEXT NOT NULL,
   evidence TEXT NOT NULL, evidence_at INTEGER NOT NULL, claimed_at INTEGER NOT NULL,
@@ -321,3 +333,9 @@ END;
 
 DROP TABLE block_migration_now;
 DROP TABLE block_migration_quarantine;
+
+-- Imported orphan clocks and record-only rows did not pass through a source
+-- transition. Apply the same clock drop without changing their audit evidence.
+UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+WHERE kind!='observation' AND (source_present=0 OR is_origin=0)
+  AND (managed=1 OR claim_owner IS NOT NULL OR last_claimed_at IS NOT NULL OR claim_generation!=0);
