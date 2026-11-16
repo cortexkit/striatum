@@ -146,7 +146,8 @@ async fn settings_slot_pin_spends_below_keep_free() {
     assert_below_margin(Origin::Slot, SETTINGS_CONSUMER).await;
 }
 
-// A mason's request pin is exempt only when prefrontal marks it
+// A request pin from the worker consumer (`prefrontal-core.mason`) is exempt
+// only when its sender, the prefrontal module, marks it
 // `pin_origin: "user"`; the pin-origin tests cover that path. An unmarked pin,
 // like any other caller's raw pin, keeps the reserve.
 #[tokio::test]
