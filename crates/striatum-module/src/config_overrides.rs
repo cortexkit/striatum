@@ -28,7 +28,7 @@ use striatum_store::ReasoningCatalog;
 use subc_jsonc::jsonc_to_json;
 
 const CONFIG_RELATIVE_PATH: &str = "cortexkit/striatum.jsonc";
-pub const DEFAULT_CATALOG_POLL_MS: u64 = 10 * 60_000;
+pub const DEFAULT_CATALOG_POLL_MS: u64 = 30 * 60_000;
 
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(250);
 pub const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(2);

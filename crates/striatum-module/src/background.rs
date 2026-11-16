@@ -168,6 +168,12 @@ pub(super) async fn start(
             Arc::clone(&quota_cache),
             Arc::clone(&account_state),
             Arc::clone(&store),
+            crate::route_facts::Handler {
+                quota_cache: Arc::clone(quota_cache),
+                store: Arc::clone(store),
+                credentials: Arc::clone(&broca_credentials),
+                config_path: config_overrides::config_path(),
+            },
         ),
     );
     loops.spawn(

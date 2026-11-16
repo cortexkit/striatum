@@ -148,7 +148,7 @@ pub(super) fn describe(deps: &Deps<'_>) -> Result<Value, Refusal> {
         .quota_cache
         .lock()
         .ok()
-        .is_some_and(|cache| cache.consumer.route_facts.filters_ready)
+        .is_some_and(|cache| cache.consumer.route_facts.ready(cache.consumer.attached))
     {
         capabilities.to_mut().push("route_fact_stream");
     }

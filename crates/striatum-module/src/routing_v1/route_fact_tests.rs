@@ -13,6 +13,9 @@ const NOW: u64 = 1_800_000_000_000;
 const OWNER: DurableOwner<'_> = DurableOwner::Module("striatum");
 
 mod order_tests;
+#[path = "route_fact_tests/transport_cpu_tests.rs"]
+mod transport_cpu;
+mod transport_tests;
 
 fn result(reply: (FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
@@ -52,6 +55,7 @@ struct Cursor {
     acks: usize,
     terms: usize,
     retries: usize,
+    delays: Vec<Duration>,
     expect_finished: bool,
     remove_failure: Option<std::path::PathBuf>,
 }
@@ -87,7 +91,8 @@ impl StreamCursor for Cursor {
         Ok(())
     }
     async fn nak(&mut self, delay: Duration) -> BusResult<()> {
-        self.inner.nak(delay).await
+        self.delays.push(delay);
+        self.inner.nak(Duration::ZERO).await
     }
     async fn term(&mut self, reason: Option<&str>) -> BusResult<()> {
         self.inner.term(reason).await?;
@@ -122,6 +127,7 @@ async fn bus(handler: &Handler) -> (InMemoryBus, Cursor) {
             acks: 0,
             terms: 0,
             retries: 0,
+            delays: Vec::new(),
             expect_finished: true,
             remove_failure: None,
         },
@@ -152,7 +158,8 @@ async fn consume(handler: &Handler, cursor: &mut Cursor, bytes: &[u8]) {
             &Delivery {
                 message,
                 body: bytes.to_vec(),
-                published_at_ms: NOW - 10
+                published_at_ms: NOW - 10,
+                delivery_count: 1,
             }
         )
         .await
@@ -202,6 +209,7 @@ async fn fact_duplicate_redelivery_applies_once() {
                 message: repeated.message,
                 body: bytes,
                 published_at_ms: NOW,
+                delivery_count: repeated.delivery_count,
             },
         )
         .await
@@ -269,7 +277,7 @@ async fn fact_permanent_refusal_terminated_and_counted() {
 }
 
 #[tokio::test]
-async fn fact_transient_store_failure_retries_without_skipping() {
+async fn fact_transient_store_failure_naks_without_applying() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _runner, handler) = fixture().await;
     let (bus, mut cursor) = bus(&handler).await;
@@ -283,7 +291,15 @@ async fn fact_transient_store_failure_retries_without_skipping() {
     )
     .await
     .unwrap();
-    assert_eq!((cursor.acks, cursor.retries, cursor.terms), (1, 1, 0));
+    assert_eq!((cursor.acks, cursor.terms), (0, 0));
+    assert_eq!(cursor.delays, vec![Duration::from_secs(1)]);
+    assert_eq!(
+        handler
+            .store
+            .account_read(|tx| Ok(tx.admission("reserved:broca", "admission")?.unwrap().state))
+            .unwrap(),
+        "reserved"
+    );
     assert_eq!(
         handler
             .quota_cache
@@ -294,7 +310,44 @@ async fn fact_transient_store_failure_retries_without_skipping() {
             .retries,
         1
     );
-    assert_eq!(cursor.next().await.unwrap().unwrap().message.id, "later");
+}
+
+#[tokio::test]
+async fn fact_transient_redelivery_applies_exactly_once() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _runner, handler) = fixture().await;
+    let (bus, mut cursor) = bus(&handler).await;
+    rusqlite::Connection::open(harness.store_path()).unwrap().execute_batch("CREATE TRIGGER fail_observation BEFORE INSERT ON account_observation BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+    cursor.remove_failure = Some(harness.store_path());
+    let bytes = publish(&bus, "broca", "finish", &finish(false)).await;
+    consume(&handler, &mut cursor, &bytes).await;
+    assert_eq!(cursor.delays, vec![Duration::from_secs(1)]);
+    rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .execute_batch("DROP TRIGGER IF EXISTS fail_observation")
+        .unwrap();
+    let repeated = cursor.next().await.unwrap().unwrap();
+    assert_eq!(repeated.delivery_count, 2);
+    handler
+        .consume(
+            &mut cursor,
+            &AccountNames::derive("box_test").unwrap(),
+            &Delivery {
+                message: repeated.message,
+                body: bytes.clone(),
+                published_at_ms: NOW,
+                delivery_count: repeated.delivery_count,
+            },
+        )
+        .await
+        .unwrap();
+    handler.dispatch("broca", &bytes).await.unwrap();
+    assert_eq!(cursor.acks, 1);
+    let count: i64 = rusqlite::Connection::open(harness.store_path())
+        .unwrap()
+        .query_row("SELECT count(*) FROM account_observation", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]
@@ -302,6 +355,7 @@ async fn fact_capability_absent_until_all_filters_exist() {
     let (harness, runner, handler) = fixture().await;
     let names = AccountNames::derive("box_test").unwrap();
     let filters = route_facts::fact_subjects(&names);
+    handler.quota_cache.lock().unwrap().consumer.attached = true;
     assert_eq!(
         filters,
         vec![
@@ -359,7 +413,7 @@ async fn fact_catalog_event_with_reader_token_wakes_existing_refresh_and_acks() 
         .await
         .unwrap();
     assert!(!receipt.duplicate());
-    consume(&handler, &mut cursor, b"{}").await;
+    consume(&handler, &mut cursor, br#"{"catalog_version":1}"#).await;
     tokio::time::timeout(Duration::from_millis(50), wake.notified())
         .await
         .unwrap();

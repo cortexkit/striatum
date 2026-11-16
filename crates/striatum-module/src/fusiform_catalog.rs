@@ -2290,7 +2290,10 @@ pub async fn catalog_refresh_loop(
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(cadence)) => {},
-                    _ = wake.notified() => { bootstrapped = false; },
+                    _ = wake.notified() => {
+                        coalesce_catalog_wake(&wake).await;
+                        bootstrapped = false;
+                    },
                 }
             }
             Err(reason) => {
@@ -2306,11 +2309,21 @@ pub async fn catalog_refresh_loop(
                 }
                 tokio::select! {
                     _ = tokio::time::sleep(RETRY_INTERVAL) => {},
-                    _ = wake.notified() => { bootstrapped = false; },
+                    _ = wake.notified() => {
+                        coalesce_catalog_wake(&wake).await;
+                        bootstrapped = false;
+                    },
                 }
             }
         }
     }
+}
+
+async fn coalesce_catalog_wake(wake: &tokio::sync::Notify) {
+    // A short fixed window collapses a publication burst without postponing
+    // refresh indefinitely under a continuous stream of catalog changes.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let _ = tokio::time::timeout(Duration::ZERO, wake.notified()).await;
 }
 
 #[cfg(test)]

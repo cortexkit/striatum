@@ -155,6 +155,8 @@ struct Cursor {
     live: LiveQuota,
     acks: usize,
     naks: usize,
+    terms: usize,
+    adapter_message: Option<Message>,
     deliveries: Vec<u64>,
 }
 
@@ -165,6 +167,8 @@ impl Cursor {
             live: live.clone(),
             acks: 0,
             naks: 0,
+            terms: 0,
+            adapter_message: None,
             deliveries: vec![],
         }
     }
@@ -173,7 +177,10 @@ impl Cursor {
 #[async_trait::async_trait]
 impl StreamCursor for Cursor {
     async fn next(&mut self) -> BusResult<Option<StreamDelivery>> {
-        let delivery = self.inner.next().await?;
+        let mut delivery = self.inner.next().await?;
+        if let (Some(delivery), Some(message)) = (&mut delivery, self.adapter_message.take()) {
+            delivery.message = message;
+        }
         if let Some(delivery) = &delivery {
             self.deliveries.push(delivery.delivery_count);
         }
@@ -207,6 +214,7 @@ impl StreamCursor for Cursor {
         self.inner.nak(Duration::ZERO).await
     }
     async fn term(&mut self, reason: Option<&str>) -> BusResult<()> {
+        self.terms += 1;
         self.inner.term(reason).await
     }
     async fn in_progress(&mut self) -> BusResult<()> {
@@ -862,9 +870,53 @@ async fn digest_mismatch_refused_and_not_acked() {
     assert_eq!(cursor.acks, 0);
     assert!(live.store.quota_snapshot().unwrap().is_none());
     assert!(live.cache.lock().unwrap().windows.is_empty());
-    let retry = cursor.inner.next().await.unwrap().unwrap();
-    assert_eq!(retry.message.id, key);
-    assert_eq!(retry.delivery_count, 2);
+    assert_eq!(cursor.terms, 1);
+    assert_eq!(cursor.naks, 0);
+    assert!(cursor.inner.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sdk_notice_tampered_digest_termed_without_applying() {
+    let (_scratch, live) = fixture();
+    let bus = bus();
+    let sample = body("epoch-z", 1, 10);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        ..Default::default()
+    };
+    let key = publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    let original = cursor.inner.next().await.unwrap().unwrap();
+    cursor.inner.nak(Duration::ZERO).await.unwrap();
+    let mut headers = original.message.headers;
+    let tampered = ContentDigest::of_bytes(b"tampered").to_string();
+    headers.insert("Ck-Content-Digest".into(), tampered.clone());
+    let payload = quota_bus::message(
+        SUBJECT.into(),
+        key,
+        b"",
+        headers,
+        Some(&tampered),
+        crate::now_ms(),
+        1,
+    )
+    .unwrap();
+    cursor.adapter_message = Some(payload.message);
+    assert!(matches!(
+        consume_one(
+            &mut cursor,
+            &mut source,
+            &live,
+            &mut SequenceState::default(),
+            SUBJECT
+        )
+        .await,
+        Err(ConsumeError::Rejected(_))
+    ));
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (0, 0, 1));
+    assert!(live.cache.lock().unwrap().windows.is_empty());
+    assert!(live.store.account_quota_readings().unwrap().is_empty());
+    assert!(cursor.inner.next().await.unwrap().is_none());
 }
 
 #[tokio::test]

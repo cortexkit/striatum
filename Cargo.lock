@@ -188,6 +188,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cortexkit-bus-client"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26fc5a0948ddb3e79befaecd46ee73595ab47e976b73b1e25ddd5d9ccd9a629c"
+dependencies = [
+ "async-nats",
+ "async-trait",
+ "base64",
+ "bytes",
+ "cortexkit-bus-naming 0.4.1",
+ "cortexkit-bus-nats",
+ "cortexkit-bus-trait",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "subc-client-rs",
+ "subc-protocol 0.37.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cortexkit-bus-inmemory"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -207,9 +230,9 @@ checksum = "059309f7503eba557d5c1bcf1dfcf59f8fa978516ed0827cf79ecb62ff7fc07a"
 
 [[package]]
 name = "cortexkit-bus-naming"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be84df2874202cd171f19acd2a38f6e13db498b31813a0f0e7a6e91235ddcc54"
+checksum = "d3a24f2395a05513dd72156f57957fd80de801f32af20552cbc1fe4b40d86dc6"
 
 [[package]]
 name = "cortexkit-bus-nats"
@@ -220,7 +243,7 @@ dependencies = [
  "async-nats",
  "async-trait",
  "bytes",
- "cortexkit-bus-naming 0.4.0",
+ "cortexkit-bus-naming 0.4.1",
  "cortexkit-bus-trait",
  "futures-util",
  "tokio",
@@ -559,7 +582,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1219,7 +1242,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1496,7 +1519,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52d1cfed4120b4d927bf7c0f86d2087a4a7d6027c906d9f9d525a80573b9be51"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1531,8 +1554,9 @@ dependencies = [
  "async-nats",
  "async-trait",
  "base64",
+ "cortexkit-bus-client",
  "cortexkit-bus-inmemory",
- "cortexkit-bus-naming 0.4.0",
+ "cortexkit-bus-naming 0.4.1",
  "cortexkit-bus-nats",
  "cortexkit-bus-trait",
  "cortexkit-claustrum-client",
