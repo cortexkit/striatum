@@ -59,7 +59,7 @@ pub struct NativeUsageFacts {
     /// Deliberately NOT the older `toolDurationMs`, which carried the SUM of
     /// per-call durations under a name that read like elapsed time. Subtracting
     /// a sum overstated speed whenever calls overlapped and discarded the sample
-    /// outright once the sum passed the message's own wall clock (Loop R143).
+    /// outright once the sum passed the message's own wall clock.
     /// The old spelling is not accepted: a pre-rename host sends no exclusion at
     /// all, so its samples understate speed for one restart window rather than
     /// overstating it indefinitely.

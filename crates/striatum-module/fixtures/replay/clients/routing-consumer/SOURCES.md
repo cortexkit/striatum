@@ -21,8 +21,8 @@ The latter's methods construct these routing requests at lines 189–439. It
 contains no `route.explain` call. `manager.concurrency_slots` belongs to core,
 not routing, so it is not a routing corpus operation.
 
-The implementation also exposes `route.clear_failure_backoff`. No test asserting
-the request body or captured request was supplied for that method. It remains an
+The implementation also exposes `route.clear_failure_backoff`. The plugin's test suite
+has no test that asserts or captures a request body for that method. It remains an
 explicit blocked method rather than an invented example. The fixture uses a
 synthetic core-owned route; it does not document which principal the live plugin
 used or which session and project identity fields it sent.
