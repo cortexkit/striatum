@@ -39,7 +39,7 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
             .get("model_routing")
             .is_some_and(|section| section.get("model_naming").is_some())
     {
-        return Err("model_naming was removed with the OpenCode 1 plugin model-resolution operations; delete this key before converting this file".into());
+        return Err("model_naming was removed with the retired plugin model-resolution operations; delete this key before converting this file".into());
     }
     remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;

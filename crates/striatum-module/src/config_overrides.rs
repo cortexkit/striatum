@@ -513,7 +513,7 @@ fn parse_config_with_reporter(
             .get("model_routing")
             .is_some_and(|section| section.get("model_naming").is_some())
     {
-        return Err("config_key_removed: model_naming; removed with the OpenCode 1 plugin model-resolution operations; delete this key".into());
+        return Err("config_key_removed: model_naming; removed with the retired plugin model-resolution operations; delete this key".into());
     }
     if value.get("model_families").is_some() {
         return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
