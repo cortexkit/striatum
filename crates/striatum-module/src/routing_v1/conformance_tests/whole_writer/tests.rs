@@ -374,7 +374,9 @@ impl World {
                 self.ok(Caller::Operator,"route.pool_release",json!({"provider":POOL_PROVIDER,"session":key,"leaseId":lease["leaseId"],"endSession":true})).await;
             }
             4 | 5 => {
-                self.ok(Caller::Operator,"route.record_cooldown",json!({"routeKey":subscription,"capacityKey":subscription,"cooldownUntil":self.now+1_000+nonce%100,"providerWide":draw==5,"lastError":"HTTP 503 provider maintenance"})).await;
+                self.advance(1);
+                let deadline = self.now + 1_000 + nonce % 100;
+                self.ok(Caller::Operator,"route.record_cooldown",json!({"routeKey":subscription,"capacityKey":subscription,"cooldownUntil":deadline,"providerWide":draw==5,"lastError":"HTTP 503 provider maintenance"})).await;
                 let standing = self
                     .ok(
                         Caller::Operator,
@@ -386,28 +388,61 @@ impl World {
                     standing["cooled"], true,
                     "the recorded wall did not enforce: {standing}"
                 );
+                let kind = if draw == 5 { "provider" } else { "route" };
+                let key = if draw == 5 {
+                    json!([fixture::SUBSCRIPTION_PROVIDER])
+                } else {
+                    json!([subscription])
+                }
+                .to_string();
+                let clock_key = key.clone();
+                self.command("cooldown/standing source is a live clock", move |tx| {
+                    let state = tx.working_blocks()?.unwrap();
+                    let (_, cleared) = state
+                        .clock(kind, &clock_key)
+                        .expect("the recorded source has no clock");
+                    assert_eq!(
+                        cleared, None,
+                        "the recorded source must be active, not an unrelated wall"
+                    );
+                    Ok(())
+                });
                 self.witness(if draw == 5 {
                     "provider_wall"
                 } else {
                     "route_wall"
                 });
-                self.ok(
-                    Caller::Operator,
-                    "route.clear_cooldown",
-                    json!({"routeKey":subscription}),
-                )
-                .await;
                 let cleared = self
                     .ok(
                         Caller::Operator,
-                        "route.cooldown_status",
-                        json!({"routeKey":subscription,"capacityKey":subscription,"now":self.now}),
+                        "route.clear_cooldown",
+                        json!({"routeKey":subscription}),
                     )
                     .await;
                 assert_eq!(
-                    cleared["cooled"], false,
-                    "operator clear left an enforcing wall: {cleared}"
+                    cleared["clearedCooldownUntil"], deadline,
+                    "the operator must clear the deadline that was actually recorded: {cleared}"
                 );
+                // A route clear leaves a provider's raw term active. Validate
+                // the actual route tombstone or partial provider clear, not
+                // an unrelated OR term in the combined status response.
+                let (source,clear,models)=self.harness.store().with_reader_for_test(|conn|{
+                    conn.query_row("SELECT source_present,cleared_at,cleared_models FROM block WHERE kind=?1 AND origin_key=?2",
+                        [kind,&key],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,Option<i64>>(1)?,row.get::<_,String>(2)?)))
+                }).unwrap();
+                if draw == 5 {
+                    assert_eq!((source, clear), (1, None));
+                    assert!(
+                        serde_json::from_str::<Vec<String>>(&models)
+                            .unwrap()
+                            .iter()
+                            .any(|model| model == "model-c"),
+                        "operator clear did not mask this model under the provider: {models}"
+                    );
+                } else {
+                    assert_eq!(source, 0);
+                    assert!(clear.is_some(), "operator clear left no route tombstone");
+                }
                 self.witness("operator_clear");
             }
             6 => {
