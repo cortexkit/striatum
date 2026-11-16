@@ -573,6 +573,15 @@ pub(crate) fn overlay(
 }
 
 #[cfg(test)]
+pub(crate) fn test_account_pools(
+    state: &AccountQuotaState,
+    prices: &Value,
+    now: i64,
+) -> HashMap<String, SubscriptionPool> {
+    build(state, &Value::Null, prices, now).pools
+}
+
+#[cfg(test)]
 pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop {
     struct Restore(HashMap<String, SubscriptionPool>);
     impl Drop for Restore {
