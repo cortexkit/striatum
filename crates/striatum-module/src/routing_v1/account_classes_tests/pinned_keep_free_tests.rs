@@ -146,14 +146,27 @@ async fn settings_slot_pin_spends_below_keep_free() {
     assert_below_margin(Origin::Slot, SETTINGS_CONSUMER).await;
 }
 
+// A mason's request pin is exempt only when prefrontal marks it
+// `pin_origin: "user"`; the pin-origin tests cover that path. An unmarked pin,
+// like any other caller's raw pin, keeps the reserve.
 #[tokio::test]
-async fn mason_request_pin_spends_below_keep_free() {
-    assert_below_margin(Origin::Request, CONSUMER).await;
-}
-
-#[tokio::test]
-async fn mason_dotted_request_pin_spends_below_keep_free() {
-    assert_below_margin(Origin::Request, "prefrontal-core.mason.retry.launch").await;
+async fn unmarked_mason_request_pins_keep_the_reserve() {
+    let _clock = crate::InjectedClock::set(NOW);
+    for consumer in [CONSUMER, "prefrontal-core.mason.retry.launch"] {
+        let (harness, _pools) = fixture(Origin::Request, 85.0);
+        let caller = harness.bind(reserved(OWNER), None).await;
+        let reply = caller
+            .call(
+                "route.select",
+                &selection_request(Origin::Request, consumer),
+            )
+            .await;
+        assert_eq!(reply.0, FrameType::Error, "{consumer}: {reply:?}");
+        assert!(
+            reply.1.to_string().contains("subscription_reserve"),
+            "{consumer}: {reply:?}"
+        );
+    }
 }
 
 #[tokio::test]
