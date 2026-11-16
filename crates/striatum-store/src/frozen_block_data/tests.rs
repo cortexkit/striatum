@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrozenBlockData {
     legacy_rows: BTreeMap<String, Vec<Vec<Value>>>,
+    legacy_columns: BTreeMap<String, Vec<String>>,
     legacy_schema: BTreeMap<String, Vec<Value>>,
     rows: BTreeMap<(String, String), Vec<Value>>,
     new_row_values: BTreeMap<String, Vec<Value>>,
@@ -19,7 +20,7 @@ impl FrozenBlockData {
         read_at_boundary(conn, false)
     }
 
-    /// Legacy relations and their schema stay identical. Surviving telemetry
+    /// Stored legacy rows and schema stay identical. Surviving telemetry
     /// rows keep their frozen values; new rows use only the catalogue's NULL/zero
     /// defaults. Removed telemetry rows need not survive.
     pub fn assert_unchanged(&self, before: &Self) {
@@ -27,10 +28,31 @@ impl FrozenBlockData {
             self.legacy_schema, before.legacy_schema,
             "frozen legacy schema changed"
         );
-        assert_eq!(
-            self.legacy_rows, before.legacy_rows,
-            "frozen legacy rows changed"
-        );
+        assert_eq!(self.legacy_columns, before.legacy_columns);
+        assert!(self.legacy_rows.keys().eq(before.legacy_rows.keys()));
+        for (name, rows) in &self.legacy_rows {
+            let prior = &before.legacy_rows[name];
+            if name != "fence_origin" {
+                assert_eq!(rows, prior, "frozen legacy rows changed on {name}");
+                continue;
+            }
+            // These two derived outputs embed live ordering stamps, not frozen stored data.
+            const LIVE_ORDERING_OUTPUTS: [&str; 2] = ["evidence", "evidence_at"];
+            assert_eq!(rows.len(), prior.len(), "frozen view row count changed");
+            let columns = &self.legacy_columns[name];
+            for (row, prior) in rows.iter().zip(prior) {
+                assert_eq!(row.len(), columns.len());
+                assert_eq!(prior.len(), columns.len());
+                for ((column, value), prior) in columns.iter().zip(row).zip(prior) {
+                    if !LIVE_ORDERING_OUTPUTS.contains(&column.as_str()) {
+                        assert_eq!(
+                            value, prior,
+                            "frozen view output changed on {name}.{column}"
+                        );
+                    }
+                }
+            }
+        }
         assert_eq!(
             self.new_row_values, before.new_row_values,
             "frozen-column catalogue changed during the test"
@@ -66,6 +88,7 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
     let mut columns: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
     let mut data = FrozenBlockData {
         legacy_rows: BTreeMap::new(),
+        legacy_columns: BTreeMap::new(),
         legacy_schema: BTreeMap::new(),
         rows: BTreeMap::new(),
         new_row_values: BTreeMap::new(),
@@ -133,6 +156,10 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
                     let mut query =
                         conn.prepare(&format!("SELECT {prefix}* FROM {name} ORDER BY {order}"))?;
                     let width = query.column_count();
+                    data.legacy_columns.insert(
+                        (*name).into(),
+                        query.column_names().into_iter().map(String::from).collect(),
+                    );
                     let rows = query
                         .query_map([], |row| {
                             (0..width)

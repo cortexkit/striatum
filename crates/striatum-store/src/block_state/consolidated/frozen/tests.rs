@@ -98,6 +98,31 @@ fn frozen_columns_survive_real_writers_heals_and_operator_clears() {
     assert_eq!(keys[0].credential_id, "new-key");
     assert_eq!(keys[0].walled_until, None);
     assert_eq!(keys[0].cooldown_until, Some(now + 10_000));
+    let before_live_stamp = rig.store.frozen_block_data_for_test().unwrap();
+    let read_pool_evidence = |conn: &rusqlite::Connection| {
+        conn.prepare("SELECT evidence,evidence_at FROM fence_origin WHERE kind IN ('pool_billing','pool_rate') AND provider='frozen' ORDER BY kind")?
+            .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    };
+    let prior_evidence = rig.store.with_reader_for_test(read_pool_evidence).unwrap();
+    rig.store.with_writer_for_test(|conn| {
+        assert_eq!(conn.execute(
+            "UPDATE pool_key_state SET wall_observed_at=?1,cooldown_observed_at=?2 WHERE provider='frozen' AND credential_id='key'",
+            rusqlite::params![now+4,now+5],
+        )?,1);
+        Ok(())
+    }).unwrap();
+    let changed_evidence = rig.store.with_reader_for_test(read_pool_evidence).unwrap();
+    assert_eq!(prior_evidence.len(), 2);
+    assert_eq!(changed_evidence.len(), 2);
+    assert_ne!(
+        changed_evidence, prior_evidence,
+        "live ordering stamps must actually change the retired view's derived output"
+    );
+    rig.store
+        .frozen_block_data_for_test()
+        .unwrap()
+        .assert_unchanged(&before_live_stamp);
     rig.store
         .frozen_block_data_for_test()
         .unwrap()
