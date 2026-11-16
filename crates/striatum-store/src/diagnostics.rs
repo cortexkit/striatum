@@ -386,21 +386,52 @@ mod tests {
                    pin_id, pin_generation, account_id, credential_id, basis, reset_at,
                    retry_after_s, created_at) VALUES
                  ('d-live', 'p', 'h', 'prov', 'pin', 1, 'acct', 'cred', 'reset_soon', {reset}, 30, {live}),
-                 ('d-over', 'p', 'h', 'prov', 'pin', 1, 'acct', 'cred', 'reset_soon', {reset}, 30, {over});
-                 INSERT INTO account_fence (fence_id, provider, account_id, scope_json, fence_json,
-                   source, observed_at, principal, created_at, cleared_at, pool_key_json) VALUES
-                 ('f-standing', 'prov', 'acct', '{{}}', '{{}}', 'quota', {NOW}, 'p', {NOW}, NULL, NULL),
-                 ('f-cleared', 'prov', 'acct', '{{}}', '{{}}', 'quota', {NOW}, 'p', {NOW}, {NOW}, NULL);
-                 INSERT INTO pool_key_state (provider, credential_id, walled_until, wall_reason,
-                   cooldown_until, cooldown_reason, updated_at) VALUES
-                 ('anthropic-platform', 'k-walled', {ahead}, 'billing', NULL, NULL, {NOW}),
-                 ('anthropic-platform', 'k-clear', {NOW}, 'billing', {NOW}, 'rate', {NOW});",
+                 ('d-over', 'p', 'h', 'prov', 'pin', 1, 'acct', 'cred', 'reset_soon', {reset}, 30, {over});",
                 reset = NOW + 600_000,
                 live = NOW - 10_000,
                 over = NOW - 40_000,
-                ahead = NOW + 60_000,
             ),
         );
+        store
+            .account_transaction(|tx| {
+                for (fence_id, cleared_at) in [("f-standing", None), ("f-cleared", Some(NOW))] {
+                    tx.insert_pool_fence(&crate::AccountPoolFenceRow {
+                        evidence: crate::AccountFenceRow {
+                            fence_id: fence_id.into(),
+                            provider: "prov".into(),
+                            account_id: "acct".into(),
+                            scope_json: "{}".into(),
+                            fence_json: "{}".into(),
+                            source: "quota".into(),
+                            observed_at: NOW,
+                            principal: "p".into(),
+                            admission_id: None,
+                            observation_id: None,
+                            created_at: NOW,
+                            cleared_at,
+                            cleared_reason: None,
+                        },
+                        pool_key: None,
+                        recovery_set: vec![],
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        for (key, kind, until, reason) in [
+            (
+                "k-walled",
+                crate::PoolWallKind::Billing,
+                NOW + 60_000,
+                "billing",
+            ),
+            ("k-clear", crate::PoolWallKind::Billing, NOW, "billing"),
+            ("k-clear", crate::PoolWallKind::RateLimited, NOW, "rate"),
+        ] {
+            store
+                .pool_wall("anthropic-platform", key, kind, until, reason, NOW)
+                .unwrap();
+        }
         let holds = store.diagnostic_account_holds(NOW).unwrap();
         assert_eq!(holds.len(), 1, "{holds:?}");
         assert_eq!(holds[0].created_at, NOW - 10_000);
