@@ -3253,6 +3253,85 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     );
 }
 
+/// A source can be deleted while its old probe clock remains in SQL. Check
+/// whether migration leaves that clock for the next sync to drop, and whether
+/// restoring the source makes a sync on the earlier state retry its load.
+#[test]
+fn stale_sync_drop_migration_representability_probe() {
+    fn migrated(source_recreated: bool, at: i64) -> Rig {
+        let scratch = cortexkit_test_support::ScratchDir::new("stale-sync-drop-migration");
+        let descriptor = crate::dev_descriptor(
+            "stale-sync-drop-migration",
+            scratch.path().join("state.db").to_string_lossy(),
+        );
+        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
+            .unwrap();
+        store
+            .with_writer_for_test(|conn| {
+                let insert = || {
+                    conn.execute(
+                        "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,
+                         wall_observed_at,last_error,last_error_at,updated_at)
+                         VALUES ('p0',?1,?2,'provider capacity',?2,?2)",
+                        rusqlite::params![at + 3_600_000, at],
+                    )
+                };
+                insert()?;
+                fence_rechecks::sync(conn)?;
+                conn.execute("DELETE FROM provider_cooldown_state", [])?;
+                if source_recreated {
+                    insert()?;
+                }
+                let source: Option<String> = conn
+                    .query_row("SELECT evidence FROM fence_origin WHERE kind='provider'", [], |r| r.get(0))
+                    .optional()?;
+                let clock: String = conn.query_row(
+                    "SELECT evidence FROM fence_recheck WHERE kind='provider'", [], |r| r.get(0),
+                )?;
+                eprintln!("legacy source_recreated={source_recreated}: source={source:?}, clock={clock}");
+                crate::block_storage::install_migration_function(conn)?;
+                conn.execute_batch(crate::block_storage::MIGRATION)?;
+                let native: (String, bool, bool, Option<String>) = conn.query_row(
+                    "SELECT evidence,source_present,managed,cleared_by FROM block WHERE kind='provider'",
+                    [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )?;
+                eprintln!("migrated source_recreated={source_recreated}: {native:?}");
+                assert_eq!(native.1, source_recreated);
+                assert_eq!(native.2, source_recreated);
+                Ok(())
+            })
+            .unwrap();
+        let owner = Arc::new(TestOwner::default());
+        store.install_account_state_bridge(owner.clone()).unwrap();
+        Rig {
+            store,
+            owner,
+            _scratch: scratch,
+        }
+    }
+    let at = crate::now_ms();
+    let before = migrated(false, at);
+    let stale = before.published();
+    assert!(stale.view_origins().is_empty());
+    assert_eq!(stale.stored_clocks().count(), 0);
+    let after = migrated(true, at);
+    assert_eq!(after.published().view_origins().len(), 1);
+    assert_eq!(after.published().stored_clocks().count(), 1);
+    let loads = after.decide_next_on(stale);
+    after
+        .store
+        .account_command(AccountCommandKind::Maintenance, |tx| {
+            tx.sync_fence_rechecks()
+        })
+        .unwrap();
+    assert_eq!(
+        after.loads_since(loads),
+        2,
+        "stale-sync-drop: the original stale decision must still force a fresh load"
+    );
+}
+
 /// One `sync` decision taken on a stale state. `before` runs on two stores;
 /// the state of the first is kept; `change` then runs on both. The first
 /// store's next sync decides on the kept state: the decision checks SQL by
