@@ -31,7 +31,7 @@ use std::io::{BufRead, Write};
 use striatum_core::model_facts::{
     make_route_key, ModelFact, ModelRequirements, ModelRoute, RoutePricing,
 };
-use striatum_core::model_resolution::{CLASS_PRODUCER, COUNTERS_PRODUCER};
+use striatum_core::usage_facts::{CLASS_PRODUCER, COUNTERS_PRODUCER};
 use striatum_core::model_router::price_selection_shortlist;
 use striatum_core::provider_model_spec::ExclusionPolicy;
 use striatum_core::route_state_store::RouteStateStore;

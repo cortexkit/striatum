@@ -122,6 +122,33 @@ fn striatum_startup_and_check_config_name_the_settings_file() {
 }
 
 #[test]
+fn removed_model_naming_refuses_startup_and_check_config() {
+    for document in [
+        r#"{"model_naming":{}}"#,
+        r#"{"model_naming":null}"#,
+        r#"{"model_routing":{"model_naming":{}}}"#,
+        r#"{"model_routing":{"model_naming":null}}"#,
+    ] {
+        let home = Home::new();
+        let primary = home.config_dir(true).join("striatum.jsonc");
+        test_config::write_raw(&primary, document).unwrap();
+        for output in [
+            home.run(true),
+            home.run_with_args(true, &["--check-config"]),
+        ] {
+            let message = stderr(output);
+            assert!(
+                message.contains("config_key_removed: model_naming"),
+                "{message}"
+            );
+            assert!(message.contains("removed"), "{message}");
+            assert!(message.contains("striatum.jsonc"), "{message}");
+            assert!(!message.contains("missing-connection-file"), "{message}");
+        }
+    }
+}
+
+#[test]
 fn striatum_invalid_settings_file_refuses_startup_and_check_config() {
     let home = Home::new();
     let primary = home.config_dir(true).join("striatum.jsonc");

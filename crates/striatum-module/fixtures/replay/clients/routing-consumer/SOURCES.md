@@ -14,7 +14,6 @@ Undefined JavaScript members are omitted as they are by `JSON.stringify`.
 | `route.record_usage-2.json` | lines 216–250, first (`primary`) account-key case |
 | `route.record_cooldown-1.json` | lines 260–269, caller input passed through the current cooldown encoder |
 | `route.set_decision_outcome-1.json` | lines 271–277, real module rejection test |
-| `route.model_capabilities-1.json` | lines 281–337, first request from the test's request builder |
 
 The test imports the re-export in `packages/opencode/.../routing-consumer.ts`,
 which points to `packages/core/src/features/model-routing/routing-consumer.ts`.
@@ -22,9 +21,8 @@ The latter's methods construct these routing requests at lines 189–439. It
 contains no `route.explain` call. `manager.concurrency_slots` belongs to core,
 not routing, so it is not a routing corpus operation.
 
-The current implementation also exposes `route.resolve_model`,
-`route.agent_model_requirements` and `route.clear_failure_backoff`. No matching
-caller-body test or captured body was supplied for those methods. They remain
-explicit blocked methods rather than invented examples. The fixture authority
-is a synthetic core-owned route; it is not a claim about the plugin's live
-principal or scope stamp.
+The implementation also exposes `route.clear_failure_backoff`. No test asserting
+the request body or captured request was supplied for that method. It remains an
+explicit blocked method rather than an invented example. The fixture uses a
+synthetic core-owned route; it does not document which principal the live plugin
+used or which session and project identity fields it sent.

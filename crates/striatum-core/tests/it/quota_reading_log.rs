@@ -1,12 +1,12 @@
 use serde::Deserialize;
 use serde_json::json;
-use striatum_core::model_resolution::ACCOUNT_PRODUCER;
 use striatum_core::quota::quota_poll::{
     admit_reading_intervals, analyze_reading_log, reading_log_rows_for_poll, render_account_key,
     READING_INTERVAL_MIN_ELAPSED_MS,
 };
 use striatum_core::quota::ProviderUsage;
 use striatum_core::route_state_store::{QuotaReadingLogRow, UsageObservation};
+use striatum_core::usage_facts::ACCOUNT_PRODUCER;
 
 const EPOCH_MS: i64 = 1_893_456_000_000;
 

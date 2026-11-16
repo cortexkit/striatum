@@ -19,7 +19,7 @@
   },
   "blocked_sets": [
     {"client": "contract-0.5.7", "reason": "No exact 0.5.7 contract fixture artifact was hydrated; owner-supplied Magic Context select/report bodies are recorded separately"},
-    {"client": "routing-consumer", "reason": "Nine exact local test bodies are recorded, but route.resolve_model, route.agent_model_requirements and route.clear_failure_backoff lack supplied caller-body tests or captured traffic"},
+    {"client": "routing-consumer", "reason": "Eight exact local test bodies are recorded, but route.clear_failure_backoff lacks supplied caller-body tests or captured traffic"},
     {"client": "direct", "reason": "The supplied census identifies one select but supplies no body or client identity"}
   ],
   "scope_notes": [

@@ -34,6 +34,13 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     {
         return Err("substrates was removed along with legacy route.select; remove the retired routing rule before converting this file".into());
     }
+    if root.contains_key("model_naming")
+        || root
+            .get("model_routing")
+            .is_some_and(|section| section.get("model_naming").is_some())
+    {
+        return Err("model_naming was removed with the OpenCode 1 plugin model-resolution operations; delete this key before converting this file".into());
+    }
     remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
     if !root.contains_key("model_routing")
@@ -284,8 +291,6 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
     root.remove("score_alias");
     root.extend(old);
     root.remove("model_families");
-    root.entry("model_naming")
-        .or_insert_with(|| data["model_naming"].clone());
     root.entry("head_agents")
         .or_insert_with(|| data["head_agents"].clone());
     root.entry("quota_model_pools")

@@ -324,7 +324,7 @@ async fn redelivery_and_a_second_legacy_run_never_restore_the_deleted_token_rela
 }
 
 fn observation_fixture(test: &str) {
-    use striatum_core::model_resolution::{
+    use striatum_core::usage_facts::{
         build_model_speed_observation, build_speed_sample_observation, build_usage_observation,
     };
     let mut compared = 0;
@@ -352,7 +352,7 @@ fn observation_fixture(test: &str) {
             if test == "broca_service_tier_generation_without_tiers_is_standard" {
                 let observation = build_speed_sample_observation(&facts, &[]).unwrap();
                 assert_eq!(
-                    striatum_core::model_resolution::speed_sample_population(
+                    striatum_core::usage_facts::speed_sample_population(
                         observation.service_tier.as_deref(),
                         observation.speed.as_deref()
                     ),

@@ -3513,7 +3513,7 @@ impl SqliteRouteStateStore {
     /// A repeated sample id is a no-op, even when the redelivery contains different data.
     pub fn record_speed_sample_delivery(
         &self,
-        sample: &striatum_core::model_resolution::SpeedSampleObservation,
+        sample: &striatum_core::usage_facts::SpeedSampleObservation,
     ) -> RouteStateResult<UsageRecordResult> {
         let Some(observed_at) = floored_i64(sample.observed_at) else {
             return Ok(UsageRecordResult::default());
@@ -3532,7 +3532,7 @@ impl SqliteRouteStateStore {
             return Ok(UsageRecordResult::default());
         }
         let (population_tier, population_speed) =
-            striatum_core::model_resolution::speed_sample_population(
+            striatum_core::usage_facts::speed_sample_population(
                 sample.service_tier.as_deref(),
                 sample.speed.as_deref(),
             );
@@ -3582,7 +3582,7 @@ impl SqliteRouteStateStore {
         now: f64,
     ) -> RouteStateResult<Option<f64>> {
         let (population_tier, population_speed) =
-            striatum_core::model_resolution::speed_sample_population(service_tier, speed);
+            striatum_core::usage_facts::speed_sample_population(service_tier, speed);
         self.store
             .with_conn(|c: &Connection| {
                 let mut stmt = c.prepare(OBSERVED_SPEED_SAMPLES_SQL)?;

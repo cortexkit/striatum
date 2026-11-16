@@ -1,5 +1,5 @@
 use super::*;
-use striatum_core::model_resolution::{
+use striatum_core::usage_facts::{
     build_speed_sample_observation, build_usage_observation, NativeUsageFacts,
 };
 
