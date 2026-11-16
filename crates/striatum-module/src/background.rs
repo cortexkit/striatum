@@ -219,6 +219,7 @@ pub(super) async fn start(
                 roster_resolver,
                 Arc::clone(&broca_credentials),
                 config_overrides::config_path(),
+                Arc::clone(quota_cache),
             ),
         );
     }
@@ -587,6 +588,7 @@ mod tests {
                     Arc::new(SlowEmptyResolver),
                     credentials,
                     crate::config_overrides::config_path(),
+                    Arc::new(Mutex::new(crate::QuotaCache::default())),
                 ))
             },
         );

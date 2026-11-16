@@ -667,6 +667,7 @@ async fn startup_plan_prices_do_not_wait_for_the_astro_spend_report() {
             &quota,
             None,
             &credentials,
+            &Arc::new(std::sync::Mutex::new(crate::QuotaCache::default())),
         ),
     )
     .await

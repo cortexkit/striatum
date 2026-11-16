@@ -1860,6 +1860,7 @@ pub async fn account_quota_loop(
     resolver: Arc<dyn CredentialResolver>,
     broca_credentials: crate::broca_credentials::SharedBrocaCredentials,
     routing_config_path: PathBuf,
+    quota_cache: crate::SharedQuotaCache,
 ) {
     let project_root =
         std::env::temp_dir().join(format!("{}-account-quota", crate::DEFAULT_MODULE_ID));
@@ -1954,6 +1955,7 @@ pub async fn account_quota_loop(
                 &state,
                 listing.as_ref().ok(),
                 &broca_credentials,
+                &quota_cache,
             )
             .await;
         })
