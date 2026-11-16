@@ -420,7 +420,8 @@ impl World {
                     )
                     .await;
                 assert_eq!(
-                    cleared["clearedCooldownUntil"], deadline,
+                    cleared["clearedCooldownUntil"].as_f64(),
+                    Some(deadline as f64),
                     "the operator must clear the deadline that was actually recorded: {cleared}"
                 );
                 // A route clear leaves a provider's raw term active. Validate
