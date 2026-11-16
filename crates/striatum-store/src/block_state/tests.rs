@@ -476,7 +476,7 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     let credential = |replace: &str, code: &str, recorded: i64| {
         format!(
             "INSERT {replace} INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,
-              quota,next_recheck_at,recorded_at,code)
+              quota,next_recheck_at,observed_at,code)
              VALUES ('credential',json_array('p','c'),'p','c',json_array('{code}',NULL,{recorded}),
                {recorded},0,{recorded}+900000,{recorded},'{code}');"
         )
