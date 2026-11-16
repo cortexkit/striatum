@@ -526,7 +526,10 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     };
     rig.sql(route("", "quota"));
     rig.sql(route("OR REPLACE", "transient"));
-    assert_eq!(rig.published().route_fences("transient").len(), 1);
+    let state = rig.published();
+    let record = state.source_record("account_route", r#"["p","c","m"]"#);
+    assert_eq!(record.iter().count(), 1);
+    assert!(!record.unwrap().is_origin());
     rig.check_native("route fence replaced by a transient row");
 }
 
