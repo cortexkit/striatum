@@ -56,7 +56,8 @@ fn observation_effect_insert_makes_exactly_one_guard_lookup_and_other_inserts_ma
                         at + 1
                     ],
                 )
-            })?;
+            })
+            .map_err(crate::err)?;
             Ok(())
         })
         .unwrap();
@@ -169,6 +170,7 @@ fn observation_retirement_lookup_is_a_covering_seek_without_scan_and_returns_at_
                 }
                 Ok(())
             })
+            .map_err(crate::err)
         })
         .unwrap();
     rig.store
