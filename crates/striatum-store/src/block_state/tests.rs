@@ -3253,9 +3253,9 @@ fn every_production_block_writer_writes_inside_an_account_command() {
     );
 }
 
-/// A source can be deleted while its old probe clock remains in SQL. Check
-/// whether migration leaves that clock for the next sync to drop, and whether
-/// restoring the source makes a sync on the earlier state retry its load.
+/// Migration removes a deleted source's orphan clock from memory. Separate
+/// connections then remove and restore the native source across the writer's
+/// freshness checks; the restored live clock must not be dropped by sync.
 #[test]
 fn stale_sync_drop_migration_representability_probe() {
     fn migrated(source_recreated: bool, at: i64) -> Rig {
@@ -3284,14 +3284,27 @@ fn stale_sync_drop_migration_representability_probe() {
                     insert()?;
                 }
                 let source: Option<String> = conn
-                    .query_row("SELECT evidence FROM fence_origin WHERE kind='provider'", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT evidence FROM fence_origin WHERE kind='provider'",
+                        [],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 let clock: String = conn.query_row(
-                    "SELECT evidence FROM fence_recheck WHERE kind='provider'", [], |r| r.get(0),
+                    "SELECT evidence FROM fence_recheck WHERE kind='provider'",
+                    [],
+                    |r| r.get(0),
                 )?;
-                eprintln!("legacy source_recreated={source_recreated}: source={source:?}, clock={clock}");
-                crate::block_storage::install_migration_function(conn)?;
-                conn.execute_batch(crate::block_storage::MIGRATION)?;
+                eprintln!(
+                    "legacy source_recreated={source_recreated}: source={source:?}, clock={clock}"
+                );
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        store
+            .with_reader_for_test(|conn| {
                 let native: (String, bool, bool, Option<String>) = conn.query_row(
                     "SELECT evidence,source_present,managed,cleared_by FROM block WHERE kind='provider'",
                     [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -3312,13 +3325,55 @@ fn stale_sync_drop_migration_representability_probe() {
     }
     let at = crate::now_ms();
     let before = migrated(false, at);
-    let stale = before.published();
-    assert!(stale.view_origins().is_empty());
-    assert_eq!(stale.stored_clocks().count(), 0);
+    assert!(before.published().view_origins().is_empty());
+    assert_eq!(before.published().stored_clocks().count(), 0);
     let after = migrated(true, at);
     assert_eq!(after.published().view_origins().len(), 1);
     assert_eq!(after.published().stored_clocks().count(), 1);
-    let loads = after.decide_next_on(stale);
+    let path = std::fs::canonicalize(after._scratch.path().join("state.db")).unwrap();
+    let outside = Connection::open(&path).unwrap();
+    outside
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let loads = after.owner.loads.load(Ordering::Relaxed);
+    // This commit makes refresh load the source's removed state. The second
+    // commit below happens after that load, so only the locked check sees it.
+    assert_eq!(
+        outside
+            .execute(
+                "UPDATE block SET source_present=0,managed=0,cleared_by='removed',cleared_at=?1
+             WHERE kind='provider' AND origin_key=json_array('p0')",
+                [at],
+            )
+            .unwrap(),
+        1
+    );
+    let owner = after.owner.clone();
+    let restored = Arc::new(AtomicBool::new(false));
+    let hook_ran = restored.clone();
+    let hook_path = path.clone();
+    crate::account_writer::BEFORE_BEGIN.lock().unwrap().push((
+        path,
+        Box::new(move || {
+            assert_eq!(owner.loads.load(Ordering::Relaxed), loads + 1);
+            let state = owner.published.lock().unwrap().clone().unwrap();
+            assert!(state.0.view_origins().is_empty());
+            assert_eq!(state.0.stored_clocks().count(), 0);
+            let conn = Connection::open(hook_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert_eq!(
+                conn.execute(
+                    "UPDATE block SET source_present=1,managed=1,cleared_by=NULL,cleared_at=NULL
+                     WHERE kind='provider' AND origin_key=json_array('p0')",
+                    [],
+                )
+                .unwrap(),
+                1
+            );
+            hook_ran.store(true, Ordering::Relaxed);
+        }),
+    ));
     after
         .store
         .account_command(AccountCommandKind::Maintenance, |tx| {
@@ -3330,6 +3385,13 @@ fn stale_sync_drop_migration_representability_probe() {
         2,
         "stale-sync-drop: the original stale decision must still force a fresh load"
     );
+    assert!(restored.load(Ordering::Relaxed), "the outside commit ran");
+    let clocks = after.store.fence_rechecks().unwrap();
+    assert_eq!(clocks.len(), 1, "the restored clock was not dropped");
+    assert_eq!(clocks[0].kind, "provider");
+    assert_eq!(clocks[0].origin_key, r#"["p0"]"#);
+    assert!(after.owner.stale.lock().unwrap().is_empty());
+    after.check(&[at], "stale-sync-drop after the real outside commit");
 }
 
 /// One `sync` decision taken on a stale state. `before` runs on two stores;
