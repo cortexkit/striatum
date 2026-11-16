@@ -8,13 +8,20 @@ use serde_json::{json, Value};
 
 use crate::{broca_credentials::SharedBrocaCredentials, routing_v1, SharedQuotaCache, SharedStore};
 
-pub(crate) const PUBLISHERS: &[&str] = &[
-    "broca",
-    "thalamus-harness",
-    "colliculus",
-    "prefrontal-core",
-    "plexus",
-];
+pub(crate) fn fact_subjects(names: &AccountNames) -> Vec<String> {
+    cortexkit_bus_naming::EVENT_CONSUMERS
+        .iter()
+        .find(|consumer| consumer.durable == "m_striatum")
+        .into_iter()
+        .flat_map(|consumer| consumer.filter_subjects)
+        .map(|relative| format!("ck.{}.{relative}", names.account()))
+        .filter(|subject| {
+            names
+                .parse_event_subject(subject)
+                .is_ok_and(|parsed| parsed.event == "route_fact" && parsed.version == 1)
+        })
+        .collect()
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct Health {
@@ -49,12 +56,10 @@ pub(crate) fn filters_ready(
     durable: Option<&str>,
     filters: &[String],
 ) -> bool {
+    let expected = fact_subjects(names);
     durable == Some("m_striatum")
-        && PUBLISHERS.iter().all(|module| {
-            names
-                .event_subject(module, "route_fact", 1)
-                .is_ok_and(|subject| filters.contains(&subject))
-        })
+        && !expected.is_empty()
+        && expected.iter().all(|subject| filters.contains(subject))
 }
 
 #[derive(Deserialize)]
@@ -157,7 +162,10 @@ impl Handler {
         loop {
             let started = std::time::Instant::now();
             let apply = async {
-                if PUBLISHERS.contains(&subject.module.as_str()) {
+                let publisher_subject = names
+                    .event_subject(&subject.module, "route_fact", 1)
+                    .map_err(|e| e.to_string())?;
+                if fact_subjects(names).contains(&publisher_subject) {
                     striatum_store::job_timing::run(
                         "route_fact",
                         self.dispatch(&subject.module, body),

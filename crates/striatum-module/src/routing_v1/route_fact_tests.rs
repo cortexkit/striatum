@@ -301,10 +301,17 @@ async fn fact_transient_store_failure_retries_without_skipping() {
 async fn fact_capability_absent_until_all_filters_exist() {
     let (harness, runner, handler) = fixture().await;
     let names = AccountNames::derive("box_test").unwrap();
-    let filters: Vec<_> = route_facts::PUBLISHERS
-        .iter()
-        .map(|module| names.event_subject(module, "route_fact", 1).unwrap())
-        .collect();
+    let filters = route_facts::fact_subjects(&names);
+    assert_eq!(
+        filters,
+        vec![
+            "ck.box_test.event.broca.route_fact.v1",
+            "ck.box_test.event.thalamus-harness.route_fact.v1",
+            "ck.box_test.event.colliculus.route_fact.v1",
+            "ck.box_test.event.prefrontal-core.route_fact.v1",
+            "ck.box_test.event.plexus.route_fact.v1",
+        ]
+    );
     assert!(!route_facts::filters_ready(&names, None, &filters));
     assert!(!route_facts::filters_ready(
         &names,
