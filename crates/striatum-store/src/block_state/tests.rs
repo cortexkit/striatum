@@ -503,10 +503,10 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     let fence = |cleared: &str| {
         format!(
             "INSERT OR REPLACE INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,
-              quota,next_recheck_at,observed_at,created_at,cleared_at,cleared_by,source_present,meta)
-             VALUES ('account',json_array('f'),'p','a','account-evidence',{NOW},1,{NOW}+900000,
-               {NOW},{NOW},{cleared},CASE WHEN {cleared} IS NULL THEN NULL ELSE 'removed' END,
-               {cleared} IS NULL,
+              quota,next_recheck_at,observed_at,created_at,cleared_at,cleared_by,source_present,recovery_set_json,meta)
+             VALUES ('account',json_array('f'),'p','a','{{}}',{NOW},1,{NOW}+900000,
+               {NOW},{NOW},{cleared},CASE WHEN {cleared} IS NULL THEN NULL ELSE 'kept' END,
+               {cleared} IS NULL,'[]',
                '{{\"scope_json\":\"{{}}\",\"fence_json\":\"{{}}\",\"source\":\"broca_account_limit\",\"principal\":\"x\",\"admission_id\":null}}');"
         )
     };
