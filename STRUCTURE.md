@@ -29,6 +29,7 @@ script/                        deploy, signing, offline store-move and compactio
 
 ## Conventions
 
+- Hand-written source files stay under 5,000 lines; tests and generated files are exempt, and larger existing files must not grow.
 - Tests take scratch paths from `cortexkit-test-support` and never touch live stores or `$HOME`.
 - Fixtures copied from other repositories record their source in `crates/striatum-module/fixtures/IMPORTED.md`.
 - Real-daemon tests are ignored by default; they build sibling checkouts by relative path.
