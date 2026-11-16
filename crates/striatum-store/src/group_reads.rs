@@ -630,7 +630,9 @@ unsafe extern "C" fn on_profile(
     let text = if own.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(own) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(own) }
+            .to_string_lossy()
+            .into_owned()
     };
     let profile = unsafe { &*(context as *const StatementProfile) };
     profile

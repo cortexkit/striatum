@@ -27,6 +27,9 @@ struct WriterMetrics {
     /// in-memory block state then misses that change, so the writer reloads
     /// it before its next batch.
     block_reload: Arc<std::sync::atomic::AtomicBool>,
+    /// Full loads of the account state the writer ran, the first included.
+    /// Each reads every admission and affinity: seconds at live size.
+    state_loads: Arc<AtomicU64>,
     block_writes_outside: AtomicU64,
     /// Block-table rows written by test seeding code, which bypass the
     /// account writer on purpose. They reload the state but are not counted
@@ -213,6 +216,10 @@ impl ConnectionStore {
 
     pub(crate) fn block_reload_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.metrics.block_reload)
+    }
+
+    pub(crate) fn state_load_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.metrics.state_loads)
     }
 
     pub(crate) fn record_command_wait(&self, ns: u64) {
@@ -445,6 +452,11 @@ impl SqliteRouteStateStore {
     #[cfg(any(test, feature = "test-support"))]
     pub fn block_seed_writes_for_test(&self) -> u64 {
         self.store.metrics.block_seed_writes.load(Ordering::Relaxed)
+    }
+    /// Full loads of the account state the writer has run, the first one
+    /// included. Every load after the first one reloads the whole state.
+    pub fn account_state_loads(&self) -> u64 {
+        self.store.metrics.state_loads.load(Ordering::Relaxed)
     }
     /// Whether a block-table write outside an account command is waiting for
     /// the writer to reload the state.

@@ -150,8 +150,9 @@ mod account_fact_tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert!(
-            plan.iter().any(|step| step
-                .contains("SCAN account_observation USING COVERING INDEX account_observation_signed_out")),
+            plan.iter().any(|step| step.contains(
+                "SCAN account_observation USING COVERING INDEX account_observation_signed_out"
+            )),
             "{plan:?}"
         );
         assert!(

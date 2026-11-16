@@ -131,9 +131,16 @@ fn print_scans(store: &striatum_store::SqliteRouteStateStore, runs: &[(String, u
 /// statement that has none (transaction control, pragmas).
 fn plan(store: &striatum_store::SqliteRouteStateStore, sql: &str) -> Vec<String> {
     let trimmed = sql.trim_start();
-    if ["BEGIN", "COMMIT", "SAVEPOINT", "RELEASE", "ROLLBACK", "PRAGMA"]
-        .iter()
-        .any(|word| trimmed.starts_with(word))
+    if [
+        "BEGIN",
+        "COMMIT",
+        "SAVEPOINT",
+        "RELEASE",
+        "ROLLBACK",
+        "PRAGMA",
+    ]
+    .iter()
+    .any(|word| trimmed.starts_with(word))
     {
         return Vec::new();
     }
@@ -196,10 +203,22 @@ fn writer_held_ms(store: &striatum_store::SqliteRouteStateStore, before: u64) ->
     (store.writer_hold_ns_for_test() - before) as f64 / 1e6
 }
 
+/// Call `method` and return its result with the writer hold it caused.
+async fn timed(
+    store: &striatum_store::SqliteRouteStateStore,
+    route: &Route,
+    method: &str,
+    params: Value,
+) -> (Value, f64) {
+    let before = store.writer_hold_ns_for_test();
+    let reply = route.call(method, &params).await;
+    (reply.1["result"].clone(), writer_held_ms(store, before))
+}
+
 #[tokio::test]
 #[ignore = "live-sized writer-hold measurement; run in release with --ignored --nocapture"]
 async fn live_sized_block_and_continue_writer_hold() {
-    let (subject, _consumer, runner, mut request) = paused().await;
+    let (subject, consumer, runner, mut request) = paused().await;
     let store = subject.harness().store().clone();
     seed_history(
         &store,
@@ -212,6 +231,7 @@ async fn live_sized_block_and_continue_writer_hold() {
         ),
     );
     let profile = store.profile_writer_statements_for_test().unwrap();
+    let loads = store.account_state_loads();
     let now = account_selection::now_ms();
     request["exhausted"]["limit_window"] = json!("seven_day");
     request["exhausted"]["resets_at_ms"] = json!(now + 7 * 86_400_000);
@@ -247,6 +267,65 @@ async fn live_sized_block_and_continue_writer_hold() {
         "continue observation reads: {:#?}",
         observation_reads(&runs)
     );
+    // A mix of the requests routing serves all day: selections, admissions,
+    // run lifecycle observations and reports. A full state load during it
+    // would hold the writer for seconds; count them and the longest hold.
+    let mut held = Vec::new();
+    for i in 0..20 {
+        let (selected, ms) = timed(
+            &store,
+            &consumer,
+            "route.select",
+            json!({"consumer":fixture::SUMMARY,"pin":fixture::HOLD_FIRST,
+                "requirements":{"iq":50},"task_ref":format!("mix-task-{i}")}),
+        )
+        .await;
+        held.push(ms);
+        let id = format!("mix-{i}");
+        let (admitted, ms) = timed(
+            &store,
+            &runner,
+            "route.account_for",
+            json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
+                "decision_id":selected["decision_id"],"admission_id":id,
+                "conversation_key":id,"initial_input_bytes":4096}),
+        )
+        .await;
+        held.push(ms);
+        for (kind, event) in [
+            ("admission_started", "started"),
+            ("attempt", "attempt"),
+            ("run_finished", "finished"),
+        ] {
+            let (_, ms) = timed(
+                &store,
+                &runner,
+                "route.account_observe",
+                json!({"event_id":format!("{id}-{event}"),"kind":kind,"admission_id":id,
+                    "run_id":format!("{id}-run"),
+                    "served_account_id":admitted["account"]["account_id"],
+                    "credential_id":admitted["account"]["credential_id"],
+                    "attempt_outcome":{"status":"served"}}),
+            )
+            .await;
+            held.push(ms);
+        }
+        let (_, ms) = timed(
+            &store,
+            &consumer,
+            "route.report",
+            json!({"decision_id":selected["decision_id"],"outcome":"completed",
+                "usage":{"input_tokens":100,"output_tokens":20}}),
+        )
+        .await;
+        held.push(ms);
+    }
+    let (calls, longest) = (held.len(), held.iter().copied().fold(0.0_f64, f64::max));
+    eprintln!(
+        "after the block, the continue and {calls} mixed calls: {} state loads since the \
+         fixture loaded, longest writer hold of a mixed call {longest:.1} ms",
+        store.account_state_loads() - loads
+    );
 }
 
 /// A continue answers its run's sign-in exclusions from the account state,
@@ -259,6 +338,7 @@ async fn a_continue_reads_no_observation_rows() {
     let (subject, _consumer, runner, request) = paused().await;
     let store = subject.harness().store().clone();
     let profile = store.profile_writer_statements_for_test().unwrap();
+    let loads = store.account_state_loads();
     profile.take();
     let offer = result(runner.call("route.account_for", &request).await);
     assert_eq!(offer["kind"], "offer", "{offer}");
@@ -279,7 +359,15 @@ async fn a_continue_reads_no_observation_rows() {
     );
     let signed_out = profile.take();
     crate::account_state::assert_published_equals_fresh_load(&store, "after a sign-in continue");
-    for (label, runs) in [("quota continue", &quota), ("sign-in continue", &signed_out)] {
+    assert_eq!(
+        store.account_state_loads(),
+        loads,
+        "neither continue may reload the account state"
+    );
+    for (label, runs) in [
+        ("quota continue", &quota),
+        ("sign-in continue", &signed_out),
+    ] {
         assert!(
             !runs.is_empty(),
             "{label}: the trace saw no writer statements"
@@ -295,8 +383,10 @@ async fn a_continue_reads_no_observation_rows() {
         {
             let steps = plan(&store, sql);
             assert!(
-                steps.iter().any(|step| step.starts_with("SEARCH o USING INDEX")
-                    && step.contains("(observation_id=?)")),
+                steps
+                    .iter()
+                    .any(|step| step.starts_with("SEARCH o USING INDEX")
+                        && step.contains("(observation_id=?)")),
                 "{label}: the observation-effects write must find its row by key: {steps:?}"
             );
         }
