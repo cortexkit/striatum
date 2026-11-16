@@ -1370,6 +1370,19 @@ pub(crate) fn initialize_at(store: &SqliteRouteStateStore, now_ms: i64) -> Route
     }))
 }
 
+/// The published block and admission state must equal a fresh load of the
+/// store's rows; `step` names the point a failing test reached.
+#[cfg(test)]
+pub(crate) fn assert_published_equals_fresh_load(store: &SqliteRouteStateStore, step: &str) {
+    let published = snapshot(store).unwrap();
+    let loaded = store.account_transaction(AccountState::load).unwrap();
+    assert_eq!(loaded.blocks, published.blocks, "{step}: block state");
+    assert_eq!(
+        loaded.admissions, published.admissions,
+        "{step}: admission state"
+    );
+}
+
 /// After a request mix: the published admission state must equal a fresh
 /// load of the rows that mix wrote. Prints its index sizes, the cost of a
 /// writer fork of it, and the load time.

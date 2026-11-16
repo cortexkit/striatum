@@ -662,6 +662,26 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
+    /// Clear one route's older evidence after a reading proved the pools that
+    /// route draws on recovered. The credential's other routes may draw on
+    /// other pools, so they stay.
+    pub fn clear_account_route_fence_before(
+        &self,
+        provider: &str,
+        credential: &str,
+        model: &str,
+        reading_at: i64,
+    ) -> RouteStateResult<usize> {
+        self.conn
+            .execute(
+                "DELETE FROM account_route_fence
+            WHERE provider=?1 AND credential_id=?2 AND model=?3
+            AND COALESCE(last_reported_at,recorded_at)<?4",
+                params![provider, credential, model, reading_at],
+            )
+            .map_err(err)
+    }
+
     pub fn record_admission_probe_scope(
         &self,
         principal: &str,

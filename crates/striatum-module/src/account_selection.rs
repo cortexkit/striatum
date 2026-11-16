@@ -1356,11 +1356,14 @@ impl ClassContext {
             .map_err(|error| error.to_string())?;
         drop(blocks);
         if let Some(sweep) = sweep {
-            for (provider, credential, at) in
+            for (provider, credential, model, at) in
                 route_fence_recoveries(sweep, &account_ids, &quota, &config, now_ms)
                     .map_err(|e| e.to_string())?
             {
-                sweep.clear_routes(&provider, &credential, at);
+                match model {
+                    Some(model) => sweep.clear_route(&provider, &credential, &model, at),
+                    None => sweep.clear_routes(&provider, &credential, at),
+                }
             }
         } else {
             repair_route_fences(store, &account_ids, &quota, &config, now_ms, || {})?;
@@ -1369,13 +1372,8 @@ impl ClassContext {
             .and_then(|blocks| blocks.account_route_fences(now_ms))
             .map_err(|error| error.to_string())?;
         for fence in &mut route_fences {
-            if let Some(reset) = crate::credential_fences::exhausted_quota_reset(
-                &quota,
-                &account_ids,
-                &fence.credential_id,
-                now_ms,
-                &config.allocator_policy(&fence.provider),
-            ) {
+            if let Some(reset) = route_exhausted_reset(&quota, &account_ids, fence, &config, now_ms)
+            {
                 let fetched = crate::credential_fences::credential_account_id(
                     &account_ids,
                     &fence.credential_id,
@@ -2160,6 +2158,27 @@ impl ClassContext {
         origin: &striatum_store::FenceRecheck,
         account: &str,
     ) -> bool {
+        // A quota route fence on a pooled reading is held back only by its
+        // own pools: a spent pool the model never draws on must not stop its
+        // recheck.
+        if let Some(model) = origin
+            .model
+            .as_deref()
+            .filter(|_| origin.kind == "account_route")
+        {
+            let usage = crate::credential_fences::latest_reading_for_account(&self.quota, account)
+                .and_then(|reading| reading_usage(&reading.entry));
+            if route_is_pooled(usage.as_ref(), &origin.provider, model) {
+                return route_pool_spent(
+                    &self.quota,
+                    account,
+                    &origin.provider,
+                    model,
+                    self.config.quota_model_pools_ref(),
+                    self.now_ms,
+                );
+            }
+        }
         let policy = self.config.allocator_policy(&origin.provider);
         if !crate::credential_fences::current_quota_reading(
             &self.quota,
@@ -4261,13 +4280,210 @@ pub(crate) fn refresh_all_blocks(
     })
 }
 
+/// Whether one route is judged by its own quota pools rather than by the
+/// whole account: the account's reading has Antigravity pool windows, or the
+/// route is one that needs a pool. Readings that meter the whole account
+/// (aggregate windows only) keep the whole-account rules.
+fn route_is_pooled(
+    usage: Option<&striatum_core::quota::Usage>,
+    provider: &str,
+    model: &str,
+) -> bool {
+    usage.is_some_and(|usage| {
+        usage
+            .extra_rate_windows
+            .iter()
+            .flatten()
+            .any(striatum_core::quota_extract::is_account_pool_window)
+    }) || striatum_core::quota_extract::requires_account_pool(&format!("{provider}/{model}"))
+}
+
+/// The decoded usage of a stored reading, if it decodes.
+fn reading_usage(entry: &Value) -> Option<striatum_core::quota::Usage> {
+    serde_json::from_value::<AccountEntry>(entry.clone())
+        .ok()
+        .and_then(|entry| entry.usage)
+}
+
+/// A pool window under 100% used: evidence its pool can serve again.
+fn pool_window_open(window: &RateWindow) -> bool {
+    window.used_percent.is_finite() && (0.0..100.0).contains(&window.used_percent)
+}
+
+/// A pool window at or above 100% used whose reset has not yet passed.
+fn pool_window_spent(window: &RateWindow, now_ms: i64) -> bool {
+    window.used_percent.is_finite()
+        && window.used_percent >= 100.0
+        && window
+            .resets_at
+            .as_deref()
+            .and_then(account_quota::parse_rfc3339_ms)
+            .is_none_or(|reset| reset > now_ms)
+}
+
+/// Whether current evidence shows one pooled route's own pool spent, which
+/// keeps its quota recheck from coming due. The reading must be the account's
+/// latest and fresh (routing's one freshness band, `EXCLUDED_BAND_MS`), and
+/// the spent window's own reset must not have passed. Once the reading ages
+/// out of that band, or the reset passes with no newer reading, the 15-minute
+/// recheck runs again: a quota hold never waits on readings that stopped
+/// arriving. When routing reads no pool for the model, nothing holds the
+/// recheck back.
+fn route_pool_spent(
+    quota: &AccountQuotaState,
+    account: &str,
+    provider: &str,
+    model: &str,
+    model_pools: &[striatum_core::quota_extract::ModelPool],
+    now_ms: i64,
+) -> bool {
+    crate::credential_fences::fresh_route_windows(
+        quota,
+        account,
+        &format!("{provider}/{model}"),
+        model_pools,
+        now_ms,
+    )
+    .is_some_and(|(_, windows)| {
+        windows
+            .iter()
+            .any(|window| pool_window_spent(window, now_ms))
+    })
+}
+
+/// The latest reset of a fresh exhausted window that speaks for one quota
+/// route fence. A pooled route takes only its own pools' resets; a spent pool
+/// the model does not draw on never moves its check time. A reset only
+/// schedules an extra check; it never holds the fence.
+fn route_exhausted_reset(
+    quota: &AccountQuotaState,
+    account_ids: &crate::broca_credentials::CredentialAccounts,
+    fence: &striatum_store::AccountRouteFence,
+    config: &crate::config_overrides::LiveConfig,
+    now_ms: i64,
+) -> Option<i64> {
+    let account =
+        crate::credential_fences::credential_account_id(account_ids, &fence.credential_id)?;
+    let policy = config.allocator_policy(&fence.provider);
+    let usage = crate::credential_fences::latest_fresh_entry(quota, &account, now_ms)
+        .and_then(|entry| entry.usage);
+    if !route_is_pooled(usage.as_ref(), &fence.provider, &fence.model) {
+        return crate::credential_fences::exhausted_quota_reset_for_account(
+            quota, &account, now_ms, &policy,
+        );
+    }
+    let (_, windows) = crate::credential_fences::fresh_route_windows(
+        quota,
+        &account,
+        &format!("{}/{}", fence.provider, fence.model),
+        config.quota_model_pools_ref(),
+        now_ms,
+    )?;
+    windows
+        .iter()
+        .filter(|window| pool_window_spent(window, now_ms))
+        .filter_map(|window| {
+            window
+                .resets_at
+                .as_deref()
+                .and_then(account_quota::parse_rfc3339_ms)
+        })
+        .max()
+}
+
+/// What a newer reading proves about one quota route fence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RouteRecovery {
+    /// Nothing: the fence stands.
+    Unproven,
+    /// The whole account recovered: every route fence of the credential
+    /// reported before the reading may clear.
+    Account,
+    /// The pools this route draws on recovered: only this route clears,
+    /// since the credential's other routes may draw on other pools.
+    Route,
+}
+
+/// Judge one quota route fence against its account's latest reading. Only a
+/// reading newer than `newest_report` (the credential's latest refusal on any
+/// route) can prove recovery. `blocks` are the account's standing pool blocks.
+#[allow(clippy::too_many_arguments)]
+fn route_fence_recovery(
+    fence: &striatum_store::AccountRouteFence,
+    account: &str,
+    newest_report: i64,
+    latest: &account_quota::StoredReading,
+    blocks: &[AccountPoolFenceRow],
+    quota: &AccountQuotaState,
+    config: &crate::config_overrides::LiveConfig,
+    now_ms: i64,
+) -> RouteRecovery {
+    let policy = config.allocator_policy(&fence.provider);
+    if route_is_pooled(
+        reading_usage(&latest.entry).as_ref(),
+        &fence.provider,
+        &fence.model,
+    ) {
+        // A pooled route clears as soon as a fresh reading taken after the
+        // refusal shows every pool its model draws on under 100% used. Pools
+        // the model never draws on neither hold nor clear it, and when the
+        // reading names no pool for the model nothing clears by reading: the
+        // 15-minute recheck decides. Standing account blocks keep their own
+        // rules and still restrict admission on their own.
+        let recovered = crate::credential_fences::fresh_route_windows(
+            quota,
+            account,
+            &format!("{}/{}", fence.provider, fence.model),
+            config.quota_model_pools_ref(),
+            now_ms,
+        )
+        .is_some_and(|(fetched, windows)| {
+            fetched > newest_report && !windows.is_empty() && windows.iter().all(pool_window_open)
+        });
+        return if recovered {
+            RouteRecovery::Route
+        } else {
+            RouteRecovery::Unproven
+        };
+    }
+    // A credential-wide clear requires newer evidence than every report and
+    // recovery of every retained pool, not just the route being scored.
+    let reading = quota_reading_for_model(&latest.entry, account, None, &[]);
+    let recovered = if blocks.is_empty() {
+        crate::credential_fences::fresh_headroom_after_for_account(
+            quota,
+            account,
+            newest_report,
+            now_ms,
+            &policy,
+        )
+    } else {
+        blocks.iter().all(|block| {
+            serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(|mut evidence| {
+                evidence.pool = block.pool_key.clone();
+                evidence.recovery_set = block.recovery_set.clone();
+                evidence.observed_at_ms = evidence.observed_at_ms.max(newest_report);
+                block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
+            })
+        })
+    };
+    if recovered {
+        RouteRecovery::Account
+    } else {
+        RouteRecovery::Unproven
+    }
+}
+
+/// Each recovered quota route fence as (provider, credential, model, reading
+/// time). The model is `None` when the whole account recovered, so every
+/// route of the credential reported before the reading clears.
 fn route_fence_recoveries(
     tx: &(impl BlockReads + ?Sized),
     account_ids: &crate::broca_credentials::CredentialAccounts,
     quota: &AccountQuotaState,
     config: &crate::config_overrides::LiveConfig,
     now_ms: i64,
-) -> RouteStateResult<Vec<(String, String, i64)>> {
+) -> RouteStateResult<Vec<(String, String, Option<String>, i64)>> {
     let latest_reports = tx.route_fence_latest_reports()?;
     let mut recoveries = Vec::new();
     for fence in tx.report_route_fences(now_ms)? {
@@ -4292,40 +4508,47 @@ fn route_fence_recoveries(
         else {
             continue;
         };
-        let reading = quota_reading_for_model(&latest.entry, &account, None, &[]);
-        let policy = config.allocator_policy(&fence.provider);
         let blocks: Vec<_> = tx
             .active_pool_fences(&fence.provider)?
             .into_iter()
             .filter(|block| block.evidence.account_id == account)
             .collect();
-        // A credential-wide clear requires newer evidence than every report
-        // and recovery of every retained pool, not just the route being scored.
-        let recovered = if blocks.is_empty() {
-            crate::credential_fences::fresh_headroom_after_for_account(
-                quota,
-                &account,
-                newest_report,
-                now_ms,
-                &policy,
-            )
-        } else {
-            blocks.iter().all(|block| {
-                serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(
-                    |mut evidence| {
-                        evidence.pool = block.pool_key.clone();
-                        evidence.recovery_set = block.recovery_set.clone();
-                        evidence.observed_at_ms = evidence.observed_at_ms.max(newest_report);
-                        block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
-                    },
-                )
-            })
-        };
-        if recovered {
-            recoveries.push((fence.provider, fence.credential_id, at));
+        match route_fence_recovery(
+            &fence,
+            &account,
+            newest_report,
+            latest,
+            &blocks,
+            quota,
+            config,
+            now_ms,
+        ) {
+            RouteRecovery::Unproven => {}
+            RouteRecovery::Account => {
+                recoveries.push((fence.provider, fence.credential_id, None, at));
+            }
+            RouteRecovery::Route => {
+                recoveries.push((fence.provider, fence.credential_id, Some(fence.model), at));
+            }
         }
     }
     Ok(recoveries)
+}
+
+/// Clear what `route_fence_recoveries` found recovered, in the writer command
+/// that re-read it.
+fn clear_recovered_route(
+    tx: &AccountTx<'_>,
+    provider: &str,
+    credential: &str,
+    model: Option<&str>,
+    at: i64,
+) -> RouteStateResult<()> {
+    match model {
+        Some(model) => tx.clear_account_route_fence_before(provider, credential, model, at),
+        None => tx.clear_account_route_fences_before(provider, credential, at),
+    }
+    .map(|_| ())
 }
 
 pub(crate) fn repair_route_fences(
@@ -4357,10 +4580,10 @@ pub(crate) fn repair_route_fences(
 
         // Re-read reports and pool requirements under the IMMEDIATE writer.
         // A newer report can invalidate the read snapshot's recovery entirely.
-        for (provider, credential, at) in
+        for (provider, credential, model, at) in
             route_fence_recoveries(&*tx, account_ids, quota, config, now_ms)?
         {
-            tx.clear_account_route_fences_before(&provider, &credential, at)?;
+            clear_recovered_route(tx, &provider, &credential, model.as_deref(), at)?;
         }
         Ok(())
     })
@@ -4402,30 +4625,15 @@ fn legacy_route_fence_repair(
                 else {
                     continue;
                 };
-                let reading = quota_reading_for_model(&latest.entry, &account, None, &[]);
-                let policy = config.allocator_policy(&fence.provider);
                 let blocks: Vec<_> = tx
                     .active_pool_fences(&fence.provider)?
                     .into_iter()
                     .filter(|block| block.evidence.account_id == account)
                     .collect();
-                let recovered = if blocks.is_empty() {
-                    crate::credential_fences::fresh_headroom_after_for_account(
-                        quota, &account, report, now_ms, &policy,
-                    )
-                } else {
-                    blocks.iter().all(|block| {
-                        serde_json::from_str::<Fence>(&block.evidence.fence_json).is_ok_and(
-                            |mut evidence| {
-                                evidence.pool = block.pool_key.clone();
-                                evidence.recovery_set = block.recovery_set.clone();
-                                evidence.observed_at_ms = evidence.observed_at_ms.max(report);
-                                block_end(&evidence, reading.as_ref(), now_ms, &policy).is_some()
-                            },
-                        )
-                    })
-                };
-                if let Some(at) = recovered
+                let recovery = route_fence_recovery(
+                    fence, &account, report, latest, &blocks, quota, config, now_ms,
+                );
+                let Some(at) = (recovery != RouteRecovery::Unproven)
                     .then(|| {
                         latest
                             .entry
@@ -4434,13 +4642,11 @@ fn legacy_route_fence_repair(
                             .and_then(account_quota::parse_rfc3339_ms)
                     })
                     .flatten()
-                {
-                    tx.clear_account_route_fences_before(
-                        &fence.provider,
-                        &fence.credential_id,
-                        at,
-                    )?;
-                }
+                else {
+                    continue;
+                };
+                let model = (recovery == RouteRecovery::Route).then_some(fence.model.as_str());
+                clear_recovered_route(tx, &fence.provider, &fence.credential_id, model, at)?;
             }
             Ok(())
         })
