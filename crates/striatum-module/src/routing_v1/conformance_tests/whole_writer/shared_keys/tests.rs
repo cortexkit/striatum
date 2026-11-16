@@ -127,13 +127,40 @@ impl World {
         let cleared = self
             .ok(Caller::Runner, "route.account_for", cleared_request.clone())
             .await;
-        for row in rows {
-            self.command(
-                "shared account/delayed retry of cleared fence id",
-                move |tx| tx.insert_fence(&row),
+        for row in &rows {
+            let row = row.clone();
+            self.adapter(
+                "shared account/duplicate immutable id is rejected",
+                move |store| {
+                    let error = crate::account_writer::execute(
+                        store,
+                        striatum_store::AccountCommandKind::Repair,
+                        move |tx| tx.insert_fence(&row),
+                    )
+                    .unwrap_err();
+                    assert!(
+                        error.to_string().contains("UNIQUE constraint failed"),
+                        "{error}"
+                    );
+                    Ok(())
+                },
             );
         }
         self.assert_active_fence_ids(&[]);
+        // Fence ids are minted once, so a delayed new refusal has a fresh id
+        // even when its evidence and account match a cleared predecessor.
+        // Clearing an older id must not clear the new id merely because both
+        // concern the same account and refusal evidence.
+        let mut delayed = rows[0].clone();
+        delayed.fence_id = "shared-account-delayed".into();
+        delayed.created_at = self.now as i64;
+        self.command(
+            "shared account/delayed evidence with its own fresh id",
+            move |tx| tx.insert_fence(&delayed),
+        );
+        self.assert_active_fence_ids(&["shared-account-delayed"]);
+        self.assert_shared_key_blocked("after-delayed-account-evidence", 4_096)
+            .await;
         assert_eq!(
             self.ok(Caller::Runner, "route.account_for", request.clone())
                 .await,
@@ -145,7 +172,9 @@ impl World {
             cleared
         );
         self.reload();
-        self.assert_active_fence_ids(&[]);
+        self.assert_active_fence_ids(&["shared-account-delayed"]);
+        self.assert_shared_key_blocked("after-delayed-account-evidence-and-reload", 4_096)
+            .await;
         assert_eq!(
             self.ok(Caller::Runner, "route.account_for", request).await,
             before
