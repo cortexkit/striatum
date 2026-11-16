@@ -1,6 +1,7 @@
 use super::*;
 use crate::account_writer as writer;
-use striatum_core::route_state_store::RouteStateUpdate;
+use striatum_core::route_state_store::{DecisionOutcomeUpdate, RouteStateUpdate};
+use striatum_core::RouteOutcome;
 
 impl World {
     pub(super) async fn healed_wall_ordering_witness(&mut self, reload: bool) {
@@ -116,25 +117,26 @@ impl World {
                 .await,
             );
         }
+        let launched = self
+            .harness
+            .store()
+            .v1_decision(selected[0]["decision_id"].as_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(launched.created_at_ms, self.now as i64);
         self.advance(1);
-        self.ok(
-            Caller::Owner,
-            "route.report",
-            json!({"decision_id":selected[1]["decision_id"],
-            "outcome":"failed","runner_code":"HTTP 503 upstream unavailable"}),
-        )
-        .await;
+        // A v1 report's outcome field records run audit, not model-health
+        // evidence. Exercise the separate writer that owns this failure streak.
+        self.native_health_outcome(
+            &selected[1],
+            RouteOutcome::SessionError,
+            Some("HTTP 503 upstream unavailable"),
+        );
         if reload {
             self.reload();
         }
         self.advance(1);
-        self.ok(
-            Caller::Owner,
-            "route.report",
-            json!({"decision_id":selected[0]["decision_id"],
-            "outcome":"completed"}),
-        )
-        .await;
+        self.native_health_outcome(&selected[0], RouteOutcome::Completed, None);
         let prior = self
             .adapter("late completion/inspect and clear actual streak", |store| {
                 writer::clear_failure_backoff(store, &route)
@@ -149,5 +151,24 @@ impl World {
             "one terminal failure must stay below the backoff threshold"
         );
         assert_eq!(prior.failure_backoff_reason, None);
+    }
+
+    fn native_health_outcome(
+        &mut self,
+        selected: &Value,
+        outcome: RouteOutcome,
+        error: Option<&str>,
+    ) {
+        let decision = selected["decision_id"].as_str().unwrap().to_owned();
+        let update = DecisionOutcomeUpdate {
+            provider_outcome: None,
+            outcome,
+            last_error: error.map(str::to_owned),
+            observed_at_ms: self.now as i64,
+            failure_backoff: Default::default(),
+        };
+        self.command("ordering witness/native model-health report", move |tx| {
+            tx.set_decision_outcome(&decision, &update)
+        });
     }
 }
