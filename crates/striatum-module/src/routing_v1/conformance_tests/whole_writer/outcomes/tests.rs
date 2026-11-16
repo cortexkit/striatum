@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "healing/tests.rs"]
+mod healing;
+
 impl World {
     /// Snapshot all native durable block columns, including dropped audit rows.
     /// This test-only maintenance read is outside the commands being measured.
