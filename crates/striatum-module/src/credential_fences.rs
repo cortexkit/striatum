@@ -177,6 +177,25 @@ pub(crate) fn fresh_route_windows(
     ))
 }
 
+/// The Antigravity pool windows of `account_id`'s latest fresh reading, each
+/// with the pool it meters. Empty when that reading meters the whole account
+/// rather than named pools.
+pub(crate) fn fresh_pool_windows(
+    quota: &crate::account_quota::AccountQuotaState,
+    account_id: &str,
+    now_ms: i64,
+) -> Vec<(&'static str, striatum_core::quota::RateWindow)> {
+    latest_fresh_entry(quota, account_id, now_ms)
+        .and_then(|entry| entry.usage)
+        .map(|usage| {
+            striatum_core::quota_extract::named_account_windows(&usage)
+                .into_iter()
+                .filter_map(|(pool, window)| Some((pool?, window)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether a fresh reading with headroom arrived after `fence_observed_ms`
 /// for `account_id`: every window has capacity above its allocator reserve
 /// and below the hold threshold. A quota hold

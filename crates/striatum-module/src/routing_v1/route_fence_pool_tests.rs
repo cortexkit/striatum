@@ -31,20 +31,33 @@ const RUNNER: &str = "carbon-runner";
 const OWNER: &str = "carbon-owner";
 
 fn setup() -> Arc<Harness> {
+    setup_models(&[CARBON])
+}
+
+/// Two Google sign-ins serving every model in `models` through Antigravity.
+fn setup_models(models: &[&str]) -> Arc<Harness> {
     let harness = Harness::new("route-fence-pools");
-    let mut fact = crate::tests::fact("google", CARBON);
-    fact.auth_methods = Some(vec!["oauth".into()]);
-    fact.billing_plane = Some(BillingPlane {
-        provider_id: "google".into(),
-        auth_method: "oauth".into(),
-        kind: "subscription".into(),
-        selection_reason: "test subscription plane".into(),
-        rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })]
-            .into_iter()
-            .collect(),
-    });
-    harness.install_facts(&[fact.clone()]);
-    super::account_classes_tests::catalog_fact(&harness, &fact);
+    let facts: Vec<_> = models
+        .iter()
+        .map(|model| {
+            let mut fact = crate::tests::fact("google", model);
+            fact.auth_methods = Some(vec!["oauth".into()]);
+            fact.billing_plane = Some(BillingPlane {
+                provider_id: "google".into(),
+                auth_method: "oauth".into(),
+                kind: "subscription".into(),
+                selection_reason: "test subscription plane".into(),
+                rates: [("rate.output".into(), BillingRate::Priced { rate: 1.0 })]
+                    .into_iter()
+                    .collect(),
+            });
+            fact
+        })
+        .collect();
+    harness.install_facts(&facts);
+    for fact in &facts {
+        super::account_classes_tests::catalog_fact(&harness, fact);
+    }
     let mut credentials = BrocaCredentials::default();
     credentials.apply_listing(
         &ScopedCredentialListing {
@@ -67,9 +80,9 @@ fn setup() -> Arc<Harness> {
         },
         NOW as u64,
     );
-    credentials.refresh_serving_methods(&Default::default(), &[fact.clone()], NOW, &[]);
+    credentials.refresh_serving_methods(&Default::default(), &facts, NOW, &[]);
     credentials.publish_billing_catalog(
-        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&[fact]),
+        crate::fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&facts),
     );
     credentials.publish_plan_prices(&json!({"prices":[]}));
     harness.set_credentials(credentials);
@@ -402,5 +415,343 @@ async fn selecting_carbon_claims_the_due_recheck_and_its_success_clears_the_fenc
         fenced_credentials(&harness, NOW),
         vec![SPENT.to_owned()],
         "the successful probe clears its own fence and no other"
+    );
+}
+
+const CLAUDE: &str = "antigravity-claude-sonnet-5-5";
+/// Gemini 4 Argon draws on the Gemini pool and, on paid Pro accounts, on its
+/// own Argon pool too.
+const ARGON: &str = "antigravity-gemini-4-argon";
+const THIRD_PARTY_SPENT_RESET: i64 = 1_795_176_704_000;
+
+/// The open account with every pool spent, so only the other account can
+/// serve either pool in these tests.
+fn open_spent_windows() -> Vec<Value> {
+    vec![
+        window("gemini-weekly", 100.0, 10080, OPEN_GEMINI_RESET),
+        window("3p-weekly", 100.0, 10080, THIRD_PARTY_RESET),
+    ]
+}
+
+/// The other account's windows with its Gemini and third-party weekly pools
+/// at these percentages used.
+fn grace_windows(gemini: f64, third_party: f64) -> Vec<Value> {
+    vec![
+        window("gemini-weekly", gemini, 10080, SPENT_GEMINI_RESET),
+        window("3p-weekly", third_party, 10080, THIRD_PARTY_SPENT_RESET),
+    ]
+}
+
+/// Make `quota` the readings the routing ops read.
+fn publish_readings(quota: &crate::account_quota::SharedAccountQuota) {
+    *crate::ACCOUNT_QUOTA.get().unwrap().lock().unwrap() = quota.lock().unwrap().clone();
+}
+
+/// Lift every standing block the readings in `quota` prove recovered, as
+/// the account loop does, with the vault roster the loop reads them through.
+fn refresh_blocks(harness: &Harness, quota: &crate::account_quota::SharedAccountQuota, now: i64) {
+    let mut state = quota.lock().unwrap().clone();
+    let row = |id: &str, account: &str| ListedCredential {
+        id: id.into(),
+        account_id: Some(account.into()),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        credential_type: "oauth".into(),
+        refresh_adapter: Some("antigravity".into()),
+        record_version: 1,
+        operations: vec!["list".into()],
+        ..Default::default()
+    };
+    crate::account_quota::apply_roster_listing(
+        &mut state,
+        &ScopedCredentialListing {
+            view: "two-google-sign-ins".into(),
+            credentials: vec![row(OPEN, OPEN_ACCOUNT), row(SPENT, SPENT_ACCOUNT)],
+            ..Default::default()
+        },
+        now,
+    );
+    crate::account_selection::refresh_all_blocks(
+        harness.store(),
+        &state,
+        &harness.operator_config(),
+        now,
+    )
+    .unwrap();
+}
+
+/// The account a request for `model` is admitted to, or `None` when refused.
+fn model_account(context: &crate::account_selection::ClassContext, model: &str) -> Option<String> {
+    match context
+        .probe(
+            "google",
+            model,
+            false,
+            false,
+            None,
+            "pool-block-conversation",
+        )
+        .outcome
+    {
+        Outcome::Admit(admission) => Some(admission.account_id),
+        _ => None,
+    }
+}
+
+/// The standing account blocks on the Google provider, as their pool keys.
+fn account_blocks(harness: &Harness) -> Vec<Value> {
+    harness
+        .store()
+        .account_read(|tx| tx.active_fences("google"))
+        .unwrap()
+        .into_iter()
+        .map(|row| serde_json::from_str::<Value>(&row.scope_json).unwrap())
+        .collect()
+}
+
+/// Admit `model` on the other account and have Broca report a limit
+/// refusal for it that names no pool, as Broca's refusal on Carbon did.
+/// `at_refusal` are the readings in force when the refusal arrives.
+async fn refuse_on_grace(
+    harness: &Arc<Harness>,
+    model: &str,
+    at_refusal: crate::account_quota::SharedAccountQuota,
+) -> Value {
+    // The other account still had room when the request was admitted.
+    publish_readings(&readings(
+        NOW - 60_000,
+        open_spent_windows(),
+        grace_windows(90.0, 90.0),
+    ));
+    let broca = harness.bind(reserved(RUNNER), None).await;
+    let admission = format!("grace-{model}");
+    let admitted = broca
+        .call(
+            "route.account_for",
+            &json!({
+                "provider":"google","model":model,"mode":"admit",
+                "conversation_key":format!("conversation-{model}"),"admission_id":admission,
+                "candidates":{"view_digest":"two-google-sign-ins","accounts":[
+                    {"credential_id":SPENT,"account_id":SPENT_ACCOUNT}]}
+            }),
+        )
+        .await;
+    assert_eq!(
+        admitted.0,
+        subc_protocol::FrameType::Response,
+        "{}",
+        admitted.1
+    );
+    assert_eq!(
+        admitted.1["result"]["account"]["account_id"], SPENT_ACCOUNT,
+        "{}",
+        admitted.1
+    );
+    publish_readings(&at_refusal);
+    let observed = broca
+        .call(
+            "route.account_observe",
+            &json!({
+                "event_id":format!("limit-{model}"),"kind":"account_limit_exhausted",
+                "admission_id":admission,"resets_at_ms":SPENT_GEMINI_RESET,
+                "resets_at_source":"body","observed_at_ms":NOW
+            }),
+        )
+        .await;
+    assert_eq!(
+        observed.0,
+        subc_protocol::FrameType::Response,
+        "{}",
+        observed.1
+    );
+    assert_memory_matches_store(harness, "after the refusal was recorded");
+    observed.1["result"]["observation"].clone()
+}
+
+/// Broca's refusal on Carbon named no pool. The block it leaves belongs to
+/// Carbon's Gemini pool: a Claude route on the third-party pool is admitted
+/// once that pool recovers, while Carbon stays walled until Gemini does.
+#[tokio::test]
+async fn a_carbon_limit_refusal_walls_only_the_gemini_pool() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let harness = setup_models(&[CARBON, CLAUDE]);
+    refuse_on_grace(
+        &harness,
+        CARBON,
+        readings(
+            NOW - 30_000,
+            open_spent_windows(),
+            grace_windows(100.0, 100.0),
+        ),
+    )
+    .await;
+    assert_eq!(
+        account_blocks(&harness),
+        vec![json!({"window_minutes":null,"scope":{"kind":"every_model"},"name":"gemini"})],
+        "the block is keyed to the refused model's pool"
+    );
+
+    // Both pools spent: both models walled.
+    let both_spent = readings(
+        NOW + 60_000,
+        open_spent_windows(),
+        grace_windows(100.0, 100.0),
+    );
+    let context = load(&harness, &both_spent, NOW + 90_000);
+    assert_memory_matches_store(&harness, "both pools spent");
+    assert_eq!(model_account(&context, CARBON), None);
+    assert_eq!(model_account(&context, CLAUDE), None);
+
+    // The third-party pool resets first: Claude is admitted on the account,
+    // and Carbon stays walled by its spent Gemini pool.
+    let third_party_back = readings(
+        NOW + 120_000,
+        open_spent_windows(),
+        grace_windows(100.0, 3.0),
+    );
+    refresh_blocks(&harness, &third_party_back, NOW + 150_000);
+    let context = load(&harness, &third_party_back, NOW + 150_000);
+    assert_memory_matches_store(&harness, "third-party pool recovered");
+    assert_eq!(account_blocks(&harness).len(), 1, "Gemini is still spent");
+    assert_eq!(
+        model_account(&context, CLAUDE).as_deref(),
+        Some(SPENT_ACCOUNT)
+    );
+    assert_eq!(model_account(&context, CARBON), None);
+
+    // The Gemini pool reads under 100%: the block clears and Carbon is back.
+    let gemini_back = readings(NOW + 180_000, open_spent_windows(), grace_windows(99.5, 3.0));
+    refresh_blocks(&harness, &gemini_back, NOW + 210_000);
+    assert_memory_matches_store(&harness, "Gemini pool recovered");
+    assert_eq!(account_blocks(&harness), Vec::<Value>::new());
+    let gemini_open = readings(NOW + 240_000, open_spent_windows(), grace_windows(10.0, 3.0));
+    let context = load(&harness, &gemini_open, NOW + 240_000);
+    assert_eq!(
+        model_account(&context, CARBON).as_deref(),
+        Some(SPENT_ACCOUNT)
+    );
+}
+
+/// With no fresh reading when the refusal arrives, the refused model alone
+/// names its pool.
+#[tokio::test]
+async fn a_refusal_without_a_fresh_reading_takes_the_pool_of_the_refused_model() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let harness = setup_models(&[CARBON, CLAUDE]);
+    refuse_on_grace(
+        &harness,
+        CLAUDE,
+        readings(
+            NOW - 30 * 60_000,
+            open_spent_windows(),
+            grace_windows(100.0, 100.0),
+        ),
+    )
+    .await;
+    assert_eq!(
+        account_blocks(&harness),
+        vec![json!({"window_minutes":null,"scope":{"kind":"every_model"},"name":"3p"})]
+    );
+}
+
+/// A refused model that draws on two pools cannot be keyed to one, so its
+/// block stays whole-account, with no fixed hold: with no reading newer than
+/// the refusal, the 15-minute recheck admits a probe on the account.
+#[tokio::test]
+async fn a_refusal_on_a_model_drawing_on_two_pools_blocks_the_account_and_is_probed() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let harness = setup_models(&[CARBON, CLAUDE, ARGON]);
+    harness.edit_config(|config| {
+        config["quota_model_pools"] = json!([{"model_prefix": ARGON, "pool": "gemini-argon"}]);
+    });
+    let pro = |gemini: f64, third_party: f64| {
+        let mut windows = grace_windows(gemini, third_party);
+        windows.push(window(
+            "gemini-argon-wtu-weekly",
+            gemini,
+            10080,
+            SPENT_GEMINI_RESET,
+        ));
+        windows
+    };
+    refuse_on_grace(
+        &harness,
+        ARGON,
+        readings(NOW - 30_000, open_spent_windows(), pro(100.0, 100.0)),
+    )
+    .await;
+    assert_eq!(account_blocks(&harness), vec![Value::Null]);
+    // Every pool has room again but the last reading is older than the
+    // refusal, so it proves nothing: only the recheck can open the account.
+    let older = readings(NOW - 10_000, open_spent_windows(), pro(5.0, 5.0));
+    let inside = load(&harness, &older, NOW + 5 * 60_000);
+    assert_memory_matches_store(&harness, "inside the recheck interval");
+    assert_eq!(
+        model_account(&inside, CLAUDE),
+        None,
+        "the whole account is walled"
+    );
+    assert_eq!(model_account(&inside, CARBON), None);
+    let due = load(&harness, &older, NOW + QUOTA_FENCE_RECHECK_MS + 60_000);
+    assert_memory_matches_store(&harness, "after the recheck came due");
+    assert_eq!(
+        model_account(&due, CLAUDE).as_deref(),
+        Some(SPENT_ACCOUNT),
+        "one recheck later the account is probed"
+    );
+    assert_eq!(account_blocks(&harness), vec![Value::Null]);
+}
+
+/// Whether, 16 minutes after Broca's Carbon refusal on the other account,
+/// that account's Carbon recheck has come due, given a reading of its spent
+/// Gemini pool fetched at `fetched_at` with that pool resetting at
+/// `gemini_reset`. A due recheck admits the account as Carbon's probe.
+async fn grace_carbon_probe_due(fetched_at: i64, gemini_reset: i64) -> bool {
+    let harness = setup_models(&[CARBON, CLAUDE]);
+    refuse_on_grace(
+        &harness,
+        CARBON,
+        readings(
+            NOW - 30_000,
+            open_spent_windows(),
+            grace_windows(100.0, 100.0),
+        ),
+    )
+    .await;
+    let spent = readings(
+        fetched_at,
+        open_spent_windows(),
+        vec![
+            window("gemini-weekly", 100.0, 10080, gemini_reset),
+            window("3p-weekly", 100.0, 10080, THIRD_PARTY_SPENT_RESET),
+        ],
+    );
+    let context = load(&harness, &spent, NOW + 16 * 60_000);
+    assert_memory_matches_store(&harness, "after the recheck was judged");
+    assert_eq!(
+        account_blocks(&harness).len(),
+        1,
+        "a spent pool never clears"
+    );
+    model_account(&context, CARBON).as_deref() == Some(SPENT_ACCOUNT)
+}
+
+/// The pool block's recheck follows the pooled route rules: a fresh reading
+/// of its own spent pool holds it; a reading out of the freshness band, or
+/// one whose reset has passed, lets the probe run.
+#[tokio::test]
+async fn a_pool_block_recheck_is_held_only_by_a_fresh_spent_reading_of_its_pool() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    assert!(
+        !grace_carbon_probe_due(NOW + 11 * 60_000, SPENT_GEMINI_RESET).await,
+        "a five-minute-old spent reading holds the probe"
+    );
+    assert!(
+        grace_carbon_probe_due(NOW - 5 * 60_000, SPENT_GEMINI_RESET).await,
+        "a 21-minute-old reading no longer holds it"
+    );
+    assert!(
+        grace_carbon_probe_due(NOW + 11 * 60_000, NOW + 10 * 60_000).await,
+        "a spent reading past its reset no longer holds it"
     );
 }

@@ -2179,6 +2179,26 @@ impl ClassContext {
                 );
             }
         }
+        // A block keyed to a named pool on a pooled reading is held back only
+        // by its own pool being spent, as a pooled route fence is. Once the
+        // reading ages out of the freshness band, or the spent window's reset
+        // passes, the 15-minute recheck runs again.
+        if origin.kind == "account" {
+            let matching: Vec<_> = self
+                .fences
+                .get(&origin.provider)
+                .into_iter()
+                .flatten()
+                .filter(|fence| {
+                    fence.account_id == account && fence.observed_at_ms == origin.evidence_at
+                })
+                .collect();
+            if let Some(spent) =
+                named_pool_blocks_spent(&matching, &self.quota, account, self.now_ms)
+            {
+                return spent;
+            }
+        }
         let policy = self.config.allocator_policy(&origin.provider);
         if !crate::credential_fences::current_quota_reading(
             &self.quota,
@@ -2269,7 +2289,7 @@ impl ClassContext {
                 .collect();
             return !matching.is_empty()
                 && matching.iter().all(|fence| {
-                    block_end(fence, reading.as_ref(), self.now_ms, &policy).is_some()
+                    block_cleared(fence, reading.as_ref(), self.now_ms, &policy).is_some()
                 });
         }
         matches!(origin.kind.as_str(), "provider" | "route" | "size")
@@ -4219,7 +4239,7 @@ fn quota_reading_binds_origin(
         .any(|fence| striatum_core::accounts::pools::binding_pressure(fence, reading, now, policy))
         || relevant
             .iter()
-            .all(|fence| block_end(fence, reading, now, policy).is_some())
+            .all(|fence| block_cleared(fence, reading, now, policy).is_some())
 }
 
 /// Bring the standing blocks on `provider` up to date with the accounts'
@@ -4239,7 +4259,7 @@ fn refresh_blocks(
             .iter()
             .find(|view| view.account_id == fence.account_id)
             .and_then(|view| view.quota.as_ref());
-        if let Some(end) = block_end(&fence, reading, now, policy) {
+        if let Some(end) = block_cleared(&fence, reading, now, policy) {
             tx.clear_fence(&fence_id, now, &wire_str(&end))?;
         } else if let Some(set) = grown_recovery_set(&fence, reading, now, policy) {
             tx.set_fence_recovery_set(&fence_id, &set)?;
@@ -4308,6 +4328,93 @@ fn reading_usage(entry: &Value) -> Option<striatum_core::quota::Usage> {
 /// A pool window under 100% used: evidence its pool can serve again.
 fn pool_window_open(window: &RateWindow) -> bool {
     window.used_percent.is_finite() && (0.0..100.0).contains(&window.used_percent)
+}
+
+/// The pool a block is keyed to by name, with its window length when the
+/// key states one.
+fn named_block_pool(fence: &Fence) -> Option<(&str, Option<u32>)> {
+    let key = fence.pool.as_ref()?;
+    Some((key.name.as_deref()?, key.window_minutes))
+}
+
+/// Whether a block keyed to a named pool is lifted by a fresh reading taken
+/// after it that shows every window of that pool under 100% used. Pools the
+/// block is not keyed to neither hold nor lift it.
+fn named_pool_block_open(
+    fence: &Fence,
+    reading: Option<&QuotaReading>,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> bool {
+    let Some((name, minutes)) = named_block_pool(fence) else {
+        return false;
+    };
+    let Some(reading) = reading.filter(|reading| {
+        reading
+            .observed_at_ms
+            .is_some_and(|observed| observed > fence.observed_at_ms)
+            && striatum_core::accounts::fresh_for_recovery(reading, now, policy)
+    }) else {
+        return false;
+    };
+    let mut windows = reading
+        .pool_windows
+        .iter()
+        .flatten()
+        .filter(|window| {
+            window.pool.as_deref() == Some(name)
+                && minutes.is_none_or(|minutes| window.window_minutes == minutes)
+        })
+        .peekable();
+    windows.peek().is_some()
+        && windows.all(|window| {
+            window.used_percent.is_finite() && (0.0..100.0).contains(&window.used_percent)
+        })
+}
+
+/// When a standing block stops restricting its account: [`block_end`], or a
+/// fresh reading showing the block's own named pool under 100% used.
+fn block_cleared(
+    fence: &Fence,
+    reading: Option<&QuotaReading>,
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> Option<striatum_core::accounts::BlockEnd> {
+    block_end(fence, reading, now, policy).or_else(|| {
+        named_pool_block_open(fence, reading, now, policy)
+            .then_some(striatum_core::accounts::BlockEnd::Reading)
+    })
+}
+
+/// Whether the account's latest fresh reading shows the named pool of one of
+/// these blocks spent: a window of that pool at or above 100% used whose
+/// reset has not passed. `None` when some block is not keyed to a named
+/// pool, or the reading has no pool windows; those blocks keep the
+/// whole-account recheck rules.
+fn named_pool_blocks_spent(
+    fences: &[&Fence],
+    quota: &AccountQuotaState,
+    account: &str,
+    now: EpochMs,
+) -> Option<bool> {
+    if fences.is_empty() {
+        return None;
+    }
+    let pools = fences
+        .iter()
+        .map(|fence| named_block_pool(fence))
+        .collect::<Option<Vec<_>>>()?;
+    let windows = crate::credential_fences::fresh_pool_windows(quota, account, now);
+    if windows.is_empty() {
+        return None;
+    }
+    Some(pools.iter().any(|(name, minutes)| {
+        windows.iter().any(|(pool, window)| {
+            pool == name
+                && minutes.is_none_or(|minutes| window.window_minutes == Some(i64::from(minutes)))
+                && pool_window_spent(window, now)
+        })
+    }))
 }
 
 /// A pool window at or above 100% used whose reset has not yet passed.
@@ -9285,6 +9392,70 @@ fn latest_reading<'r>(
         .and_then(|facts| facts.readings.get(&admission.account_id))
 }
 
+/// The one Antigravity pool a limit refusal that named no pool belongs to:
+/// the pool the refused model draws on. A fresh pooled reading of the account
+/// decides which of its pools the model draws on. With no fresh reading the
+/// model alone decides, through its family's pool, unless operator config
+/// gives the model a second pool. A model drawing on two pools, or on none
+/// routing knows, gets no key, and the block stays whole-account as before.
+/// A fresh reading without pool windows meters the whole account, so its
+/// block stays whole-account too.
+fn refused_model_pool(
+    reading: Option<&QuotaReading>,
+    provider: &str,
+    model: &str,
+    model_pools: &[striatum_core::quota_extract::ModelPool],
+    now: EpochMs,
+    policy: &AllocatorPolicy,
+) -> Option<striatum_core::accounts::PoolKey> {
+    let capacity = format!("{}/{}", normalize(provider), normalize(model));
+    let pool = match reading
+        .filter(|reading| striatum_core::accounts::pools::fresh_for_recovery(reading, now, policy))
+    {
+        Some(reading) => {
+            let named: BTreeSet<&str> = reading
+                .pool_windows
+                .iter()
+                .flatten()
+                .filter_map(|window| window.pool.as_deref())
+                .collect();
+            if named.is_empty() {
+                return None;
+            }
+            let mut drawn = named.into_iter().filter(|pool| {
+                striatum_core::quota_extract::antigravity_capacity_draws_on_pool(
+                    &capacity,
+                    pool,
+                    model_pools,
+                )
+            });
+            match (drawn.next(), drawn.next()) {
+                (Some(pool), None) => pool.to_string(),
+                _ => return None,
+            }
+        }
+        None => {
+            let model_id = normalize(model);
+            let family = striatum_core::quota_extract::antigravity_pool_for_capacity(&capacity)?;
+            if model_pools
+                .iter()
+                .any(|entry| model_id.starts_with(entry.model_prefix.as_str()))
+            {
+                return None;
+            }
+            family.to_string()
+        }
+    };
+    validate_pool_name(&pool).ok()?;
+    // The pool name alone says which models draw on it, so the key covers
+    // every model and the request's own pool decides whether it applies.
+    Some(striatum_core::accounts::PoolKey {
+        window_minutes: None,
+        scope: striatum_core::accounts::PoolScope::EveryModel,
+        name: Some(pool),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_confirmation(
     tx: &AccountTx<'_>,
@@ -9339,6 +9510,26 @@ fn apply_confirmation(
                 effects
                     .push(json!({"effect":"fence","fence_id":new_id("acf"),"fence":wire(&fence)}));
                 return Ok(());
+            }
+            if fence.pool.is_none()
+                && matches!(
+                    observation.kind,
+                    ObservationKind::BrocaLimitExhausted { .. }
+                )
+            {
+                let model_pools = ctx
+                    .classes
+                    .as_ref()
+                    .map(|classes| classes.config.quota_model_pools())
+                    .unwrap_or_default();
+                fence.pool = refused_model_pool(
+                    latest_reading,
+                    &admission.provider,
+                    &admission.model,
+                    &model_pools,
+                    ctx.now_ms,
+                    &ctx.provider_policy(&admission.provider),
+                );
             }
             if fence.pool.is_none() {
                 // A whole-account block lifts only on a reading that reports
@@ -13312,10 +13503,14 @@ mod tests {
         })
     }
 
+    /// A refusal that names no pool on a pooled (Antigravity) account blocks
+    /// the pool the refused model draws on. A spent pool the model never draws
+    /// on neither holds nor lifts that block; a fresh reading of its own pool
+    /// with headroom lifts it.
     #[test]
-    fn a_no_pool_block_lifts_only_on_a_reading_reporting_every_recorded_pool() {
+    fn a_no_pool_refusal_on_a_pooled_account_blocks_and_lifts_by_the_refused_models_pool() {
         let both = [("gemini-5h", 10.0, 300), ("3p-weekly", 20.0, 10080)];
-        let mut rig = provider_fixture(
+        let rig = provider_fixture(
             "recovery-set",
             "antigravity",
             vec![pooled_entry(ACCOUNT_A, "2026-09-29T11:59:00Z", &both)],
@@ -13335,11 +13530,14 @@ mod tests {
             Value::Null,
         );
         let fence = &observed["observation"]["effects"][0]["fence"];
-        assert_eq!(fence["pool"], Value::Null);
         assert_eq!(
-            fence["recovery_set"].as_array().map(Vec::len),
-            Some(2),
-            "both pools of the latest fresh reading: {fence}"
+            fence["pool"],
+            json!({"window_minutes": null, "scope": {"kind": "every_model"}, "name": "gemini"}),
+            "the refused model's pool: {fence}"
+        );
+        assert!(
+            fence["recovery_set"].as_array().is_none_or(Vec::is_empty),
+            "{fence}"
         );
         let read = |rig: &Fixture, fetched_at: &str, windows: &[(&str, f64, i64)]| {
             let body = json!({"result": [pooled_entry(ACCOUNT_A, fetched_at, windows)]});
@@ -13362,29 +13560,26 @@ mod tests {
             });
             rig.call(&rig.ctx(true, now), ACCOUNT_FOR_OP, BROCA, retry)
         };
-        let gemini_only = [("gemini-5h", 10.0, 300)];
-        // A newer fresh reading with headroom in one pool, omitting the other.
-        read(&rig, "2026-09-29T12:02:00Z", &gemini_only);
-        assert!(admit(&rig, NOW + 3 * 60_000, "pool-2").code().is_some());
-        // The same partial reading again, after a restart.
-        rig.reopen();
-        read(&rig, "2026-09-29T12:04:00Z", &gemini_only);
-        assert!(admit(&rig, NOW + 5 * 60_000, "pool-3").code().is_some());
-        // Headroom in one pool but not the other.
+        // The refused model's own pool is still spent.
         read(
             &rig,
-            "2026-09-29T12:06:00Z",
+            "2026-09-29T12:02:00Z",
+            &[("gemini-5h", 100.0, 300), ("3p-weekly", 20.0, 10080)],
+        );
+        assert!(admit(&rig, NOW + 3 * 60_000, "pool-2").code().is_some());
+        // Its own pool has headroom while the other pool is spent: the block
+        // lifts.
+        read(
+            &rig,
+            "2026-09-29T12:04:00Z",
             &[("gemini-5h", 10.0, 300), ("3p-weekly", 100.0, 10080)],
         );
-        assert!(admit(&rig, NOW + 7 * 60_000, "pool-4").code().is_some());
-        // Both pools above reserve: the block lifts.
-        read(&rig, "2026-09-29T12:08:00Z", &both);
-        let lifted = result(admit(&rig, NOW + 9 * 60_000, "pool-5"));
+        let lifted = result(admit(&rig, NOW + 5 * 60_000, "pool-3"));
         assert_eq!(lifted["account"]["account_id"], ACCOUNT_A);
     }
 
     #[test]
-    fn missing_recovery_pool_headroom_does_not_suppress_the_quota_probe() {
+    fn a_spent_pool_reading_out_of_the_freshness_band_does_not_suppress_its_probe() {
         let rig = provider_fixture(
             "partial-reading-probe",
             "antigravity",
@@ -13407,10 +13602,13 @@ mod tests {
             Value::Null,
             Value::Null,
         );
+        // A newer reading shows the block's own pool spent. Once that reading
+        // ages out of the freshness band it no longer holds the due probe:
+        // a hold never waits on readings that stopped arriving.
         let partial = pooled_entry(
             ACCOUNT_A,
             "2026-09-29T12:15:00Z",
-            &[("gemini-5h", 10.0, 300)],
+            &[("gemini-5h", 100.0, 300), ("3p-weekly", 20.0, 10080)],
         );
         account_quota::apply_usage_reply(
             &mut rig.accounts.lock().unwrap(),
@@ -13422,19 +13620,19 @@ mod tests {
         params["candidates"] = json!({"view_digest":"runner-view","accounts":[{
             "account_id":first["account"]["account_id"],"credential_id":first["account"]["credential_id"]}]});
         let probe = rig.call(
-            &rig.ctx(true, NOW + 16 * 60_000),
+            &rig.ctx(true, NOW + 36 * 60_000),
             ACCOUNT_FOR_OP,
             BROCA,
             params.clone(),
         );
         assert!(
             probe.code().is_none(),
-            "a partial healthy reading must not disable the due probe: {probe:?}"
+            "a spent reading out of the freshness band must not disable the due probe: {probe:?}"
         );
         params["admission_id"] = json!("partial-second");
         assert!(rig
             .call(
-                &rig.ctx(true, NOW + 16 * 60_000),
+                &rig.ctx(true, NOW + 36 * 60_000),
                 ACCOUNT_FOR_OP,
                 BROCA,
                 params
@@ -13689,3 +13887,121 @@ mod tests {
 
 mod dry_run;
 pub(crate) use dry_run::Sweep;
+
+#[cfg(test)]
+mod refused_model_pool_tests {
+    use super::*;
+
+    const NOW: EpochMs = 1_794_828_400_000;
+
+    fn pooled(observed_at: EpochMs, pools: &[&str]) -> QuotaReading {
+        QuotaReading {
+            observed_at_ms: Some(observed_at),
+            error_class: None,
+            stale: None,
+            five_hour: None,
+            seven_day: None,
+            general_windows: Some(Vec::new()),
+            scoped: ScopedList::Missing,
+            pool_windows: Some(
+                pools
+                    .iter()
+                    .map(|pool| PoolWindowReading {
+                        pool: Some((*pool).to_string()),
+                        window_minutes: 10080,
+                        used_percent: 100.0,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    fn argon_pool() -> Vec<striatum_core::quota_extract::ModelPool> {
+        vec![striatum_core::quota_extract::ModelPool {
+            model_prefix: "antigravity-gemini-4-argon".into(),
+            pool: "gemini-argon".into(),
+        }]
+    }
+
+    fn pool_of(
+        reading: Option<&QuotaReading>,
+        model: &str,
+        model_pools: &[striatum_core::quota_extract::ModelPool],
+    ) -> Option<String> {
+        refused_model_pool(
+            reading,
+            "google",
+            model,
+            model_pools,
+            NOW,
+            &AllocatorPolicy::default(),
+        )
+        .map(|key| {
+            assert_eq!(key.window_minutes, None);
+            assert_eq!(key.scope, striatum_core::accounts::PoolScope::EveryModel);
+            key.name.unwrap()
+        })
+    }
+
+    #[test]
+    fn a_fresh_pooled_reading_names_the_pool_the_refused_model_draws_on() {
+        let fresh = pooled(NOW - 30_000, &["gemini", "3p"]);
+        assert_eq!(
+            pool_of(Some(&fresh), "antigravity-gemini-4-carbon", &[]).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            pool_of(Some(&fresh), "antigravity-claude-sonnet-5-5", &[]).as_deref(),
+            Some("3p")
+        );
+        // A model routing has no pool for, or one the reading does not show.
+        assert_eq!(pool_of(Some(&fresh), "antigravity-mystery-1", &[]), None);
+        let third_party_only = pooled(NOW - 30_000, &["3p"]);
+        assert_eq!(
+            pool_of(Some(&third_party_only), "antigravity-gemini-4-carbon", &[]),
+            None
+        );
+        // A model drawing on two pools cannot be keyed to one.
+        let pro = pooled(NOW - 30_000, &["gemini", "gemini-argon", "3p"]);
+        assert_eq!(
+            pool_of(Some(&pro), "antigravity-gemini-4-argon", &argon_pool()),
+            None
+        );
+        // On an account without the Argon pool, Argon draws on Gemini alone.
+        assert_eq!(
+            pool_of(Some(&fresh), "antigravity-gemini-4-argon", &argon_pool()).as_deref(),
+            Some("gemini")
+        );
+    }
+
+    #[test]
+    fn without_a_fresh_reading_the_refused_model_names_its_pool() {
+        let stale = pooled(NOW - 30 * 60_000, &["3p"]);
+        for reading in [None, Some(&stale)] {
+            assert_eq!(
+                pool_of(reading, "antigravity-gemini-4-carbon", &[]).as_deref(),
+                Some("gemini")
+            );
+            assert_eq!(
+                pool_of(reading, "antigravity-gpt-6-1", &[]).as_deref(),
+                Some("3p")
+            );
+            assert_eq!(pool_of(reading, "antigravity-mystery-1", &[]), None);
+            assert_eq!(pool_of(reading, "gemini-4-carbon", &[]), None);
+            // Config gives Argon a second pool some accounts publish.
+            assert_eq!(
+                pool_of(reading, "antigravity-gemini-4-argon", &argon_pool()),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn a_fresh_reading_without_pool_windows_keeps_the_block_whole_account() {
+        let aggregate = pooled(NOW - 30_000, &[]);
+        assert_eq!(
+            pool_of(Some(&aggregate), "antigravity-gemini-4-carbon", &[]),
+            None
+        );
+    }
+}
