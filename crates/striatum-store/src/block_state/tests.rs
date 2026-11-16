@@ -976,7 +976,7 @@ fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
     assert_eq!(rig.store.block_writes_outside_command(), 1);
     let tables = rig.store.block_tables_written_outside_command();
     assert_eq!(tables.len(), 1);
-    assert_eq!(tables[0].0, "account_transient_backoff");
+    assert_eq!(tables[0].0, "block");
     rig.sql("SELECT 1;".into());
     assert_eq!(
         rig.owner.loads.load(Ordering::Relaxed),
