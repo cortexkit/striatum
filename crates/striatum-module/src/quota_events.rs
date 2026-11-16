@@ -896,6 +896,11 @@ async fn delivery_loop(
                     down = Some(error.to_string());
                 }
             } else {
+                let before_generation = live
+                    .cache
+                    .lock()
+                    .ok()
+                    .map(|cache| cache.snapshot_persistence.publication_generation);
                 match consume_one(
                     &mut cursor,
                     &mut source,
@@ -906,9 +911,12 @@ async fn delivery_loop(
                 .await
                 {
                     Ok(()) => {
-                        if cursor.acknowledged {
-                            reconnect.healthy();
-                        }
+                        reset_after_quota_ack(
+                            &live,
+                            before_generation,
+                            cursor.acknowledged,
+                            &mut reconnect,
+                        );
                     }
                     Err(ConsumeError::Rejected(error)) => {
                         tracing::warn!(error, "quota event refused")
@@ -930,6 +938,28 @@ async fn delivery_loop(
             schedule.set_attached(false, Instant::now());
             reconnect.failed(Instant::now());
         }
+    }
+}
+
+fn reset_after_quota_ack(
+    live: &LiveQuota,
+    before_generation: Option<u64>,
+    acknowledged: bool,
+    reconnect: &mut quota_bus::reconnect::Backoff,
+) {
+    // Expired quota notices can be ACKed while snapshot recovery is still owed.
+    // Only a published reading/snapshot plus its ACK proves application progress.
+    let after_generation = live
+        .cache
+        .lock()
+        .ok()
+        .map(|cache| cache.snapshot_persistence.publication_generation);
+    if acknowledged
+        && before_generation
+            .zip(after_generation)
+            .is_some_and(|(before, after)| after > before)
+    {
+        reconnect.healthy();
     }
 }
 

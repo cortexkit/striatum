@@ -255,6 +255,68 @@ fn insula_only_consumer_filters_never_enable_route_fact_stream() {
     ));
 }
 
+#[tokio::test]
+async fn expired_quota_ack_without_publication_does_not_reset_bind_backoff() {
+    let (_scratch, live) = fixture();
+    live.store_sample(serde_json::from_str(&body("epoch-z", 1, 10)).unwrap())
+        .unwrap();
+    let before = Some(
+        live.cache
+            .lock()
+            .unwrap()
+            .snapshot_persistence
+            .publication_generation,
+    );
+    let bus = bus();
+    let sample = body("epoch-z", 2, 20);
+    let mut source = Source {
+        snapshot: snapshot_body(&sample),
+        fetch_error: Some("event_not_found".into()),
+        snapshot_error: Some("usage unavailable".into()),
+        ..Default::default()
+    };
+    publish(&bus, &mut source, &sample).await;
+    let mut cursor = Cursor::new(&bus, &live).await;
+    // Expired notices can be ACKed even if the recovery snapshot fails.
+    cursor.verify_publication = false;
+    consume_one(
+        &mut cursor,
+        &mut source,
+        &live,
+        &mut SequenceState::default(),
+        SUBJECT,
+    )
+    .await
+    .unwrap();
+    assert_eq!((cursor.acks, cursor.naks, cursor.terms), (1, 0, 0));
+    assert_eq!(
+        Some(
+            live.cache
+                .lock()
+                .unwrap()
+                .snapshot_persistence
+                .publication_generation
+        ),
+        before
+    );
+    let now = Instant::now();
+    let mut reconnect = quota_bus::reconnect::Backoff::new(now, 47);
+    for _ in 0..8 {
+        reconnect.failed(now);
+    }
+    reset_after_quota_ack(&live, before, true, &mut reconnect);
+    reconnect.failed(now);
+    assert!(
+        reconnect.deadline().duration_since(now) >= Duration::from_secs(48),
+        "ACK of an expired notice without a successful snapshot is not application progress"
+    );
+    live.store_sample(serde_json::from_str(&sample).unwrap())
+        .unwrap();
+    reset_after_quota_ack(&live, before, true, &mut reconnect);
+    reconnect.failed(now);
+    assert!(reconnect.deadline().duration_since(now) <= Duration::from_millis(1200));
+}
+
 fn fixture() -> (ScratchDir, LiveQuota) {
     let scratch = ScratchDir::new("routing-quota-events");
     let store = SqliteRouteStateStore::open(&dev_descriptor(
@@ -400,6 +462,7 @@ struct Cursor {
     naks: usize,
     terms: usize,
     adapter_message: Option<Message>,
+    verify_publication: bool,
     deliveries: Vec<u64>,
 }
 
@@ -412,6 +475,7 @@ impl Cursor {
             naks: 0,
             terms: 0,
             adapter_message: None,
+            verify_publication: true,
             deliveries: vec![],
         }
     }
@@ -430,22 +494,24 @@ impl StreamCursor for Cursor {
         Ok(delivery)
     }
     async fn ack(&mut self) -> BusResult<()> {
-        assert!(
-            !self.live.store.account_quota_readings().unwrap().is_empty(),
-            "ack precedes the write-through account poll"
-        );
-        assert!(
-            self.live.cache.lock().unwrap().available,
-            "ack precedes cache publication"
-        );
-        assert!(!self
-            .live
-            .accounts
-            .lock()
-            .unwrap()
-            .readings
-            .readings
-            .is_empty());
+        if self.verify_publication {
+            assert!(
+                !self.live.store.account_quota_readings().unwrap().is_empty(),
+                "ack precedes the write-through account poll"
+            );
+            assert!(
+                self.live.cache.lock().unwrap().available,
+                "ack precedes cache publication"
+            );
+            assert!(!self
+                .live
+                .accounts
+                .lock()
+                .unwrap()
+                .readings
+                .readings
+                .is_empty());
+        }
         self.inner.ack().await?;
         self.acks += 1;
         Ok(())
