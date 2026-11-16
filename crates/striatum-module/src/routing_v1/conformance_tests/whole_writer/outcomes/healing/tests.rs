@@ -264,6 +264,7 @@ async fn native_partial_pool_success_progresses_once_while_the_whole_fence_stand
             "partial pool success made no durable progress"
         );
         let (provider, id) = (admission.provider.clone(), fence_id.clone());
+        let original_pools = pools.clone();
         let active = world.command(
             "healing/partly recovered fence is still active",
             move |tx| {
@@ -272,7 +273,14 @@ async fn native_partial_pool_success_progresses_once_while_the_whole_fence_stand
                     .into_iter()
                     .find(|row| row.evidence.fence_id == id)
                     .expect("one recovered pool must not clear the whole-account fence");
-                assert_eq!(row.recovery_set.len(), 2);
+                assert_eq!(row.recovery_set, vec![original_pools[1].clone()]);
+                let blocks = tx.working_blocks()?.unwrap();
+                let (_, _, stored) = blocks.account_fence(&id).unwrap();
+                assert_eq!(
+                    serde_json::from_str::<Vec<PoolKey>>(stored).unwrap(),
+                    original_pools.to_vec(),
+                    "a partial proof must not rewrite the original recovery requirements"
+                );
                 Ok(row.evidence)
             },
         );
