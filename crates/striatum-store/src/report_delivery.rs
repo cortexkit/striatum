@@ -33,8 +33,10 @@ pub struct V1ReportUsage {
     pub cost: Option<f64>,
 }
 
-/// The committed answer and whether the delivery already existed. The duplicate
-/// flag comes from the transaction's claim, not a separate preflight read.
+/// The committed answer and whether the delivery already existed. The
+/// duplicate flag is decided inside the transaction that stores the delivery:
+/// if a `(decision_id, delivery_key)` row already stands, its stored answer is
+/// returned as a duplicate; otherwise the delivery is inserted as new.
 pub struct V1ReportOutcome {
     pub recorded: V1Recorded,
     pub duplicate: bool,
