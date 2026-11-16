@@ -1,6 +1,6 @@
 use super::*;
 use crate::account_writer as writer;
-use striatum_core::route_state_store::{RouteStateUpdate, RouteWallClass};
+use striatum_core::route_state_store::RouteStateUpdate;
 
 impl World {
     pub(super) async fn healed_wall_ordering_witness(&mut self, reload: bool) {
@@ -11,7 +11,6 @@ impl World {
                 observed_at_ms: Some(at),
                 unscoped_wall: true,
                 cooldown_until: Some((at + 600_000) as f64),
-                wall_class: Some(RouteWallClass::NonQuota),
                 last_error: Some("HTTP 503 scheduled maintenance".into()),
                 ..Default::default()
             };
