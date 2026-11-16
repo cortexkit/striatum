@@ -3497,20 +3497,254 @@ fn stale_sync_renew_guard_migration_representability_probe() {
     }
 }
 
-/// One `sync` decision taken on a stale state. `before` runs on two stores;
-/// the state of the first is kept; `change` then runs on both. The first
-/// store's next sync decides on the kept state: the decision checks SQL by
-/// key, finds it differs, and the batch runs again on a fresh load. Its rows
-/// must then equal those a SQL sync leaves on the second store.
+/// Install the state owner only after upgrade: the earlier schema has no
+/// block table from which to load and publish captured routing state.
+fn legacy_sync_rig(name: &str) -> Rig {
+    let scratch = cortexkit_test_support::ScratchDir::new(name);
+    let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
+    let version = crate::route_state_migrations().last().unwrap().version - 1;
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, version).unwrap();
+    Rig {
+        store,
+        owner: Arc::new(TestOwner::default()),
+        _scratch: scratch,
+    }
+}
+
+fn upgrade_sync_rig(rig: Rig, name: &str) -> Rig {
+    let Rig {
+        store,
+        owner,
+        _scratch: scratch,
+    } = rig;
+    drop(store);
+    let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
+    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    store.install_account_state_bridge(owner.clone()).unwrap();
+    Rig {
+        store,
+        owner,
+        _scratch: scratch,
+    }
+}
+
+/// A provider-covered route keeps a stored clock even though its origin is
+/// hidden from the source view. Unlike a clock with no source, it survives
+/// migration and can still reach synchronization's evidence-guarded drop.
+fn covered_route_sync_rig(name: &str, wall: i64) -> Rig {
+    let rig = legacy_sync_rig(name);
+    rig.sql(format!(
+        "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,
+           cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+         VALUES ('p0/m0','p0/m0','p0','m0',{}, {wall},'provider capacity',{wall},{wall});",
+        wall + 3_600_000,
+    ));
+    rig.run(|conn| fence_rechecks::legacy::register(conn, "route", r#"["p0/m0"]"#));
+    provider_wall(&rig, wall + 7_200_000, wall, "'provider capacity'");
+    rig.run(|conn| fence_rechecks::legacy::register(conn, "provider", r#"["p0"]"#));
+    upgrade_sync_rig(rig, name)
+}
+
+/// Schedule two meaningful commits from other connections. Refresh first
+/// loads the removed source; the commit before BEGIN then restores it, so
+/// the locked data-version check must load its current clock before deciding.
+fn real_sync_case_change(state: &Rig, before: &Rig, name: &str) -> (u64, Arc<AtomicBool>) {
+    let frame: Vec<Value> = state
+        .store
+        .with_reader_for_test(|conn| {
+            conn.query_row(
+                "SELECT managed,quota,classified,next_recheck_at,reset_check_at,last_claimed_at,
+           claim_generation,claim_owner,cleared_at,cleared_by,cleared_models,source_present
+         FROM block WHERE kind='provider' AND origin_key=json_array('p0')",
+                [],
+                |row| (0..12).map(|column| row.get(column)).collect(),
+            )
+        })
+        .unwrap();
+    let previous_error: Option<Option<String>> = before
+        .store
+        .with_reader_for_test(|conn| {
+            conn.query_row(
+                "SELECT last_error FROM provider_cooldown_state WHERE provider_key='p0'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+        })
+        .unwrap();
+    let restored_error: Option<String> = state
+        .store
+        .with_reader_for_test(|conn| {
+            conn.query_row(
+                "SELECT last_error FROM provider_cooldown_state WHERE provider_key='p0'",
+                [],
+                |row| row.get(0),
+            )
+        })
+        .unwrap();
+    let path = std::fs::canonicalize(state._scratch.path().join("state.db")).unwrap();
+    let loads = state.owner.loads.load(Ordering::Relaxed);
+    let mut outside = Connection::open(&path).unwrap();
+    outside
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    let tx = outside.transaction().unwrap();
+    assert_eq!(
+        tx.execute(
+            "UPDATE block SET source_present=0,managed=0,cleared_at=?1,cleared_by='removed'
+        WHERE kind='provider' AND origin_key=json_array('p0')",
+            [crate::now_ms()]
+        )
+        .unwrap(),
+        1
+    );
+    if let Some(error) = previous_error {
+        tx.execute(
+            "UPDATE provider_cooldown_state SET last_error=?1 WHERE provider_key='p0'",
+            [error],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let owner = state.owner.clone();
+    let committed = Arc::new(AtomicBool::new(false));
+    let hook_ran = committed.clone();
+    let label = name.to_owned();
+    let outside_path = path.clone();
+    crate::account_writer::BEFORE_BEGIN.lock().unwrap().push((
+        path,
+        Box::new(move || {
+            assert_eq!(
+                owner.loads.load(Ordering::Relaxed),
+                loads + 1,
+                "{label}: refresh loaded once"
+            );
+            let published = owner.published.lock().unwrap().clone().unwrap();
+            assert!(
+                published.0.view_origins().is_empty(),
+                "{label}: removed source"
+            );
+            assert_eq!(
+                published.0.stored_clocks().count(),
+                0,
+                "{label}: removed clock"
+            );
+            let mut conn = Connection::open(outside_path).unwrap();
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            let tx = conn.transaction().unwrap();
+            assert_eq!(
+                tx.execute(
+                    "UPDATE block SET managed=?1,quota=?2,classified=?3,next_recheck_at=?4,
+            reset_check_at=?5,last_claimed_at=?6,claim_generation=?7,claim_owner=?8,cleared_at=?9,
+            cleared_by=?10,cleared_models=?11,source_present=?12
+            WHERE kind='provider' AND origin_key=json_array('p0')",
+                    rusqlite::params_from_iter(frame.iter())
+                )
+                .unwrap(),
+                1
+            );
+            tx.execute(
+                "UPDATE provider_cooldown_state SET last_error=?1 WHERE provider_key='p0'",
+                [restored_error],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+            hook_ran.store(true, Ordering::Relaxed);
+        }),
+    ));
+    (loads, committed)
+}
+
+fn sync_case_outcome(state: &Rig, name: &str, committed: Option<&AtomicBool>) {
+    if let Some(committed) = committed {
+        assert!(
+            committed.load(Ordering::Relaxed),
+            "{name}: the outside commit ran"
+        );
+        assert!(
+            state.owner.stale.lock().unwrap().is_empty(),
+            "{name}: no injected load"
+        );
+    }
+    let published = state.published();
+    assert_eq!(
+        published.stored_clocks().count(),
+        1,
+        "{name}: one provider clock remains"
+    );
+    assert!(
+        published.clock("provider", r#"["p0"]"#).is_some(),
+        "{name}: provider clock preserved"
+    );
+    if name == "stale-sync-drop-evidence" {
+        assert!(
+            published.clock("route", r#"["p0/m0"]"#).is_none(),
+            "the covered clock was dropped"
+        );
+        assert!(
+            published.source_record("route", r#"["p0/m0"]"#).is_some(),
+            "its source was not deleted"
+        );
+    }
+}
+
+/// Migrate the original before/after fixtures, then check the corresponding
+/// guarded decision against independent SQL. Cases whose earlier state has
+/// already been removed by migration use real outside-connection commits.
 fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
-    let state = rig(name);
-    let oracle = rig(&format!("{name}-oracle"));
+    let earlier_name = format!("{name}-before");
+    let oracle_name = format!("{name}-oracle");
+    let earlier = legacy_sync_rig(&earlier_name);
+    let state = legacy_sync_rig(name);
+    let oracle = legacy_sync_rig(&oracle_name);
+    before(&earlier);
     before(&state);
     before(&oracle);
-    let stale = state.published();
     change(&state);
     change(&oracle);
-    let loads = state.decide_next_on(stale);
+    let earlier = upgrade_sync_rig(earlier, &earlier_name);
+    let mut state = upgrade_sync_rig(state, name);
+    let mut oracle = upgrade_sync_rig(oracle, &oracle_name);
+    let stale = if name == "stale-sync-drop-evidence" {
+        let wall: i64 = state
+            .store
+            .with_reader_for_test(|conn| {
+                conn.query_row(
+            "SELECT evidence_at FROM block WHERE kind='provider' AND origin_key=json_array('p0')",
+            [], |row| row.get(0),
+        )
+            })
+            .unwrap();
+        state = covered_route_sync_rig(&format!("{name}-covered"), wall);
+        oracle = covered_route_sync_rig(&format!("{name}-covered-oracle"), wall);
+        let stale = state.published();
+        for rig in [&state, &oracle] {
+            rig.sql("UPDATE block SET evidence=evidence||' ' WHERE kind='route' AND origin_key=json_array('p0/m0');".into());
+        }
+        stale
+    } else {
+        for rig in [&state, &oracle] {
+            match name {
+                "stale-sync-renew-evidence" => rig.sql("UPDATE block SET evidence=evidence||' ' WHERE kind='provider' AND origin_key=json_array('p0') AND managed=0;".into()),
+                "stale-sync-renew-schedule" => rig.sql("UPDATE block SET next_recheck_at=next_recheck_at-1 WHERE kind='provider' AND origin_key=json_array('p0') AND managed=0;".into()),
+                _ => {}
+            }
+        }
+        earlier.published()
+    };
+    let (loads, committed) = if matches!(
+        name,
+        "stale-sync-drop"
+            | "stale-sync-retire"
+            | "stale-sync-retire-clock-only"
+            | "stale-sync-quarantine"
+    ) {
+        let (loads, committed) = real_sync_case_change(&state, &earlier, name);
+        (loads, Some(committed))
+    } else {
+        (state.decide_next_on(stale), None)
+    };
     state
         .store
         .account_command(AccountCommandKind::Maintenance, |tx| {
@@ -3522,25 +3756,25 @@ fn stale_sync_case(name: &str, before: impl Fn(&Rig), change: impl Fn(&Rig)) {
         2,
         "{name}: the stale decision is caught and the batch runs on a fresh load"
     );
-    oracle.run(fence_rechecks::sync);
-    // The clocks, the provider rows the cases write, and the archive (each
-    // store's catalogue seed stamps its own open time on its route rows).
+    sync_case_outcome(&state, name, committed.as_deref());
+    oracle.run(|conn| native_sql::synchronize(conn, crate::now_ms()));
+    // Compare current source/clock rows, provider metadata and retirement
+    // tombstones. Removed audit rows are outside the loaded routing state.
     let rows = |rig: &Rig| {
-        let mut rows: Vec<String> = rig
-            .store
-            .with_reader_for_test(|conn| Ok(block_rows(conn)))
-            .unwrap()
-            .unwrap()
-            .into_iter()
-            .filter(|row| {
-                row.starts_with("fence_recheck ") || row.starts_with("provider_cooldown_state ")
-            })
-            .collect();
+        let mut rows = rig.store.with_reader_for_test(native_sql::rows).unwrap();
+        rows.extend(
+            rig.store
+                .with_reader_for_test(|conn| Ok(block_rows(conn)))
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.starts_with("provider_cooldown_state ")),
+        );
         rows.extend(
             rig.store
                 .with_reader_for_test(|conn| {
                     conn.prepare(
-                        "SELECT kind,origin_key,evidence FROM fence_retired_origin ORDER BY rowid",
+                        "SELECT kind,origin_key,evidence FROM retirement_tombstone ORDER BY rowid",
                     )?
                     .query_map([], |r| {
                         Ok(format!(
@@ -3634,7 +3868,7 @@ fn sync_decisions_taken_on_a_stale_state_run_again_on_a_fresh_load() {
     // not), the install's insert-changed-nothing check, the renewal's
     // evidence and next_recheck_at guards, and the drop's evidence guard.
     let register =
-        |rig: &Rig| rig.run(|conn| fence_rechecks::register(conn, "provider", r#"["p0"]"#));
+        |rig: &Rig| rig.run(|conn| fence_rechecks::legacy::register(conn, "provider", r#"["p0"]"#));
     stale_sync_case(
         "stale-sync-retire-clock-only",
         |rig| provider_wall(rig, wall - 3_600_000, wall - 7_200_000, capacity),
