@@ -1,6 +1,8 @@
 use super::*;
 use cortexkit_claustrum_client::{ListedCredential, ScopedCredentialListing};
 
+mod thalamus_reader_tests;
+
 const PARENT: &str = "oauth:anthropic:bob";
 const MODEL: &str = "claude-opus-5-5";
 const MOVED: &str = "oauth:anthropic:alice";

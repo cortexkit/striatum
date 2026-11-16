@@ -484,13 +484,22 @@ impl Route {
     }
 
     pub(super) fn request_frame(&self, method: &str, params: &Value) -> Frame {
+        self.request_frame_raw_params(method, &serde_json::to_vec(params).unwrap())
+    }
+
+    fn request_frame_raw_params(&self, method: &str, params: &[u8]) -> Frame {
+        let mut body = b"{\"method\":".to_vec();
+        body.extend(serde_json::to_vec(method).unwrap());
+        body.extend_from_slice(b",\"params\":");
+        body.extend_from_slice(params);
+        body.push(b'}');
         Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             self.channel,
             self.epoch,
             self.next_corr.fetch_add(1, Ordering::Relaxed),
-            serde_json::to_vec(&json!({ "method": method, "params": params })).unwrap(),
+            body,
         )
         .unwrap()
     }
@@ -501,6 +510,18 @@ impl Route {
         let reply = self
             .harness
             .handle(self.request_frame(method, params))
+            .await;
+        (reply.header.ty, reply.body)
+    }
+
+    pub(super) async fn call_raw_params(
+        &self,
+        method: &str,
+        params: &[u8],
+    ) -> (FrameType, Vec<u8>) {
+        let reply = self
+            .harness
+            .handle(self.request_frame_raw_params(method, params))
             .await;
         (reply.header.ty, reply.body)
     }
