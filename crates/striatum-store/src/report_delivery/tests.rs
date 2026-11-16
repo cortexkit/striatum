@@ -76,11 +76,8 @@ fn completed_reused_decision_without_admission_cannot_resurrect_interrupted_clai
         .store
         .with_conn(|c| {
             assert_eq!(
-                c.query_row(
-                    "SELECT count(*) FROM fence_probe_authorization",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )?,
+                c.query_row("SELECT count(*) FROM probe_authorization", [], |row| row
+                    .get::<_, i64>(0))?,
                 0
             );
             Ok(())
@@ -127,7 +124,7 @@ fn report_admission_probe_settlement_retires_only_its_matching_decision_copy() {
             .unwrap());
         if changed == "other-generation" {
             store.store.with_conn(|c| {
-                c.execute("UPDATE fence_probe_authorization SET claim_generation=claim_generation+1 WHERE owner='d'", [])?;
+                c.execute("UPDATE probe_authorization SET claim_generation=claim_generation+1 WHERE owner='d'", [])?;
                 Ok(())
             }).unwrap();
         } else if changed == "newer-evidence" {
@@ -156,7 +153,7 @@ fn report_admission_probe_settlement_retires_only_its_matching_decision_copy() {
             .store
             .with_conn(|c| {
                 let copies: i64 = c.query_row(
-                    "SELECT count(*) FROM fence_probe_authorization WHERE owner='d'",
+                    "SELECT count(*) FROM probe_authorization WHERE owner='d'",
                     [],
                     |row| row.get(0),
                 )?;
@@ -246,16 +243,19 @@ fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
             true,
         )
         .unwrap();
+    // Source upserts mention meta even when its value is unchanged. Updates
+    // to managed probe clocks, quota/classified or source_order do not name
+    // meta, so they must not add a second source transition to the report audit.
     store.store.with_conn(|c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS report_transition(kind TEXT NOT NULL);
             CREATE TRIGGER IF NOT EXISTS report_audit_outcome AFTER UPDATE OF outcome ON model_route_decisions BEGIN INSERT INTO report_transition VALUES ('outcome'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_continuation AFTER UPDATE OF used_at_ms ON account_continue BEGIN INSERT INTO report_transition VALUES ('continuation'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_route_insert AFTER INSERT ON account_route_fence BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE ON account_route_fence BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_credential_insert AFTER INSERT ON credential_entitlement_fences BEGIN INSERT INTO report_transition VALUES ('credential'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE ON credential_entitlement_fences BEGIN INSERT INTO report_transition VALUES ('credential'); END;
+            CREATE TRIGGER IF NOT EXISTS report_audit_route_insert AFTER INSERT ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
+            CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE OF meta ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
+            CREATE TRIGGER IF NOT EXISTS report_audit_credential_insert AFTER INSERT ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
+            CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE OF meta ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_affinity AFTER UPDATE OF ended_at_ms ON routing_v1_affinity BEGIN INSERT INTO report_transition VALUES ('affinity'); END;
-            CREATE TRIGGER IF NOT EXISTS report_audit_pool AFTER INSERT ON account_fence BEGIN INSERT INTO report_transition VALUES ('pool'); END;
+            CREATE TRIGGER IF NOT EXISTS report_audit_pool AFTER INSERT ON block WHEN NEW.kind='account' BEGIN INSERT INTO report_transition VALUES ('pool'); END;
             CREATE TRIGGER IF NOT EXISTS report_audit_usage AFTER INSERT ON model_route_usage BEGIN INSERT INTO report_transition VALUES ('usage'); END;")?;
         c.execute("INSERT INTO routing_v1_affinity (principal,consumer,affinity,decision_id,updated_at_ms) VALUES (?1,'summary',?2,?2,1)",params![principal,id])?;
         c.execute("INSERT INTO account_continue (principal,selection_id,request_json,answer_json,run_id,admission_id,previous_decision_id,decision_id,valid_until_ms)
@@ -382,7 +382,7 @@ fn assert_effects(store: &SqliteRouteStateStore, value: i64, usage_rows: i64) {
             )?;
             assert_eq!(at, value);
             let block_at: i64 = c.query_row(
-                "SELECT created_at FROM account_fence WHERE fence_id='fence:d'",
+                "SELECT created_at FROM block WHERE kind='account' AND origin_key='[\"fence:d\"]' AND is_origin=1",
                 [],
                 |r| r.get(0),
             )?;
@@ -394,13 +394,13 @@ fn assert_effects(store: &SqliteRouteStateStore, value: i64, usage_rows: i64) {
             )?;
             assert_eq!(used, value);
             let (until, observed): (i64, i64) = c.query_row(
-                "SELECT until_ms,last_reported_at FROM account_route_fence",
+                "SELECT deadline,last_reported_at FROM block WHERE kind='account_route' AND source_present=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
             assert_eq!((until, observed), (100 + value, value));
             let code: String =
-                c.query_row("SELECT code FROM credential_entitlement_fences", [], |r| {
+                c.query_row("SELECT code FROM block WHERE kind='credential' AND source_present=1", [], |r| {
                     r.get(0)
                 })?;
             assert_eq!(code, format!("refusal-{value}"));
@@ -468,6 +468,48 @@ fn concurrent(key: &str, differing: bool) {
 fn concurrent_identical_outcome_reports_apply_effects_once() {
     concurrent("outcome", false);
 }
+
+#[test]
+fn report_effect_source_updates_are_counted_once_without_their_clock_updates() {
+    let descriptor = descriptor();
+    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    seed(&store, "d", "owner");
+    store
+        .record_account_route_fence(&AccountRouteFence {
+            provider: "example".into(),
+            credential_id: "key".into(),
+            model: "model".into(),
+            until_ms: 101,
+            recorded_at: 1,
+            decision_id: "old".into(),
+        })
+        .unwrap();
+    store
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "example".into(),
+                credential_id: "key".into(),
+                code: "old-refusal".into(),
+            },
+            None,
+            1,
+        )
+        .unwrap();
+    store
+        .store
+        .with_conn(|conn| conn.execute("DELETE FROM report_transition", []))
+        .unwrap();
+    // A credential's metadata is still {} when its code changes. The source
+    // update must count even though that metadata value is unchanged, while
+    // registering the new source's clock must not count again.
+    let first = commit(&store, "d", "run:r", 10).unwrap().unwrap();
+    assert_effects(&store, 10, 1);
+    drop(store);
+    let reopened = SqliteRouteStateStore::open(&descriptor).unwrap();
+    assert_eq!(commit(&reopened, "d", "run:r", 20).unwrap(), Some(first));
+    assert_effects(&reopened, 10, 1);
+}
+
 #[test]
 fn concurrent_differing_outcome_reports_conflict_without_losing_effects() {
     concurrent("outcome", true);

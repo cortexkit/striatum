@@ -242,7 +242,7 @@ mod account_fact_tests {
                 .store
                 .with_conn(|conn| {
                     conn.execute(
-                        "UPDATE fence_recheck SET reset_check_at=200 WHERE kind='credential'",
+                        "UPDATE block SET reset_check_at=200 WHERE kind='credential'",
                         [],
                     )
                 })
@@ -536,8 +536,19 @@ mod account_fact_tests {
         ))
         .unwrap();
         store
+            .record_account_route_fence(&AccountRouteFence {
+                provider: "p".into(),
+                credential_id: "c".into(),
+                model: "m".into(),
+                until_ms: 101,
+                recorded_at: 1,
+                decision_id: "preupgrade".into(),
+            })
+            .unwrap();
+        assert_eq!(store.account_route_fences(100).unwrap().len(), 1);
+        store
             .store
-            .with_conn(|conn: &Connection| conn.execute_batch("DROP TABLE account_route_fence"))
+            .with_conn(|conn: &Connection| conn.execute_batch("DROP TABLE block"))
             .unwrap();
         assert!(store.account_route_fences(100).unwrap().is_empty());
         assert!(store
