@@ -24,6 +24,8 @@ mod ledger;
 mod maintenance;
 #[path = "metadata/tests.rs"]
 mod metadata;
+#[path = "outside_state/tests.rs"]
+mod outside_state;
 #[path = "paired_charge/tests.rs"]
 mod paired_charge;
 #[path = "probes/tests.rs"]
@@ -32,6 +34,8 @@ mod probes;
 mod quota;
 #[path = "read_only/tests.rs"]
 mod read_only;
+#[path = "scope_witnesses/tests.rs"]
+mod scope_witnesses;
 
 const START: u64 = 1_800_000_000_000;
 const POOL_PROVIDER: &str = "pool-provider";
@@ -580,6 +584,8 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
             world.request_group(draw, nonce).await;
         }
         world.finished_charge_witnesses(seed).await;
+        world.outside_state_witnesses(seed).await;
+        world.admit_scope_witnesses(seed).await;
         assert_trace_is_declared(&world.trace);
         assert_all_producers_driven(&world.trace);
     }
