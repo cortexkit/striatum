@@ -530,11 +530,11 @@ mod account_fact_tests {
     #[test]
     fn route_fence_reads_tolerate_a_preupgrade_store_without_the_table() {
         let scratch = cortexkit_test_support::ScratchDir::new("route-fence-preupgrade");
-        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+        let descriptor = crate::dev_descriptor(
             "route-fence-preupgrade",
             scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         store
             .record_account_route_fence(&AccountRouteFence {
                 provider: "p".into(),
@@ -550,6 +550,8 @@ mod account_fact_tests {
             .store
             .with_conn(|conn: &Connection| conn.execute_batch("DROP TABLE block"))
             .unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         assert!(store.account_route_fences(100).unwrap().is_empty());
         assert!(store
             .account_route_fence_latest_reports()
