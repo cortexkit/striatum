@@ -645,6 +645,9 @@ fn admission_due_by_values(a: &str) -> String {
 impl crate::AccountTx<'_> {
     /// Delete only planned identities that are still old and unreferenced.
     pub fn delete_account_pins(&self, before: i64, keys: &[String]) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry =
+            crate::writer_entry_trace::enter("account_tx::retention::delete_account_pins");
         let keys = serde_json::to_string(keys).map_err(err)?;
         self.command_sql(|tx| {
             tx.execute(

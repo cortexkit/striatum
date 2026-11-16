@@ -181,6 +181,56 @@ pub(crate) const NEXT_SOURCE_ORDER: &str = "/* writer bookkeeping: next source o
             COALESCE((SELECT MAX(source_order) FROM block WHERE kind='transient_route'),0))+1
     ELSE COALESCE((SELECT MAX(source_order) FROM block WHERE kind=?1),0)+1 END";
 
+pub(crate) const OBSERVATION_RETIREMENT_GUARD_MARKER: &str =
+    "/* writer guard: observation-effect retirement */";
+pub(crate) const OBSERVATION_RETIREMENT_LOOKUP: &str =
+    "SELECT 1 FROM retirement_tombstone WHERE kind='observation' AND origin_key=:key AND evidence_at>=:at LIMIT 1";
+
+fn source_insert_sql(kind: &str) -> String {
+    const BINDINGS: &str = ":kind,:key,:provider,:account,:credential,:model,:size,:principal,:admission,
+        :evidence,:at,:quota,:next,:reset,:observation,:pool,:deadline,:reset_at,
+        :observed,:created,:recorded,:reported,:cooldown,:exhausted,
+        :reason,:code,:class,:unscoped,:error,:fingerprint,:recovery,:meta,:clear_reason,:clear_at,:clear_by,:present,:order";
+    let (marker, values) = if kind == "observation" {
+        (
+            format!("{OBSERVATION_RETIREMENT_GUARD_MARKER} "),
+            format!("SELECT {BINDINGS} WHERE NOT EXISTS ({OBSERVATION_RETIREMENT_LOOKUP})"),
+        )
+    } else {
+        (String::new(), format!("VALUES ({BINDINGS})"))
+    };
+    format!("{marker}INSERT INTO block(kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
+        evidence,evidence_at,quota,next_recheck_at,reset_check_at,observation_id,pool_key_json,deadline,reset_at,
+        observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,
+        reason,code,wall_class,wall_unscoped,scope_error,listing_fingerprint,recovery_set_json,meta,cleared_reason,cleared_at,cleared_by,source_present,source_order)
+        {values}
+        ON CONFLICT(kind,origin_key) DO UPDATE SET
+        provider=excluded.provider,account_id=excluded.account_id,credential_id=excluded.credential_id,
+        model=excluded.model,size_class=excluded.size_class,principal=excluded.principal,admission_id=excluded.admission_id,
+        evidence_at=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.evidence_at ELSE excluded.evidence_at END,
+        quota=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.quota ELSE excluded.quota END,
+        classified=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.classified ELSE 0 END,
+        managed=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN 1 ELSE 0 END,
+        claim_owner=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.claim_owner END,
+        cleared_at=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.cleared_at END,
+        cleared_by=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence AND block.cleared_at IS NOT NULL THEN 'kept' END,
+        cleared_models=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.cleared_models ELSE '[]' END,
+        evidence=excluded.evidence,observation_id=excluded.observation_id,pool_key_json=excluded.pool_key_json,
+        deadline=excluded.deadline,reset_at=excluded.reset_at,observed_at=excluded.observed_at,created_at=excluded.created_at,
+        recorded_at=excluded.recorded_at,last_reported_at=excluded.last_reported_at,cooldown_until=excluded.cooldown_until,
+        quota_exhausted_until=excluded.quota_exhausted_until,reason=excluded.reason,code=excluded.code,
+        wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
+        listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
+        meta=excluded.meta,cleared_reason=excluded.cleared_reason,
+        source_order=CASE WHEN block.source_present=1 THEN block.source_order ELSE excluded.source_order END,source_present=1
+        WHERE excluded.kind NOT IN ('account','principal') OR (excluded.kind='principal' AND block.source_present=0)")
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn is_observation_retirement_insert(sql: &str) -> bool {
+    sql == source_insert_sql("observation")
+}
+
 /// Record refusal evidence. The keyed register in the same command schedules
 /// new evidence using its prior claim time; an unchanged signature keeps its
 /// classification, claim and heal.
@@ -196,37 +246,7 @@ pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Re
         row.source_order
     };
     conn.execute(
-        "INSERT INTO block(kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
-            evidence,evidence_at,quota,next_recheck_at,reset_check_at,observation_id,pool_key_json,deadline,reset_at,
-            observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,
-            reason,code,wall_class,wall_unscoped,scope_error,listing_fingerprint,recovery_set_json,meta,cleared_reason,cleared_at,cleared_by,source_present,source_order)
-         SELECT :kind,:key,:provider,:account,:credential,:model,:size,:principal,:admission,
-            :evidence,:at,:quota,:next,:reset,:observation,:pool,:deadline,:reset_at,
-            :observed,:created,:recorded,:reported,:cooldown,:exhausted,
-            :reason,:code,:class,:unscoped,:error,:fingerprint,:recovery,:meta,:clear_reason,:clear_at,:clear_by,:present,
-             :order
-         WHERE :kind!='observation' OR NOT EXISTS (
-             SELECT 1 FROM retirement_tombstone t WHERE t.kind=:kind AND t.origin_key=:key AND t.evidence_at>=:at)
-         ON CONFLICT(kind,origin_key) DO UPDATE SET
-            provider=excluded.provider,account_id=excluded.account_id,credential_id=excluded.credential_id,
-            model=excluded.model,size_class=excluded.size_class,principal=excluded.principal,admission_id=excluded.admission_id,
-            evidence_at=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.evidence_at ELSE excluded.evidence_at END,
-            quota=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.quota ELSE excluded.quota END,
-            classified=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.classified ELSE 0 END,
-            managed=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN 1 ELSE 0 END,
-            claim_owner=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.claim_owner END,
-            cleared_at=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.cleared_at END,
-            cleared_by=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence AND block.cleared_at IS NOT NULL THEN 'kept' END,
-            cleared_models=CASE WHEN block.managed=1 AND block.evidence=excluded.evidence THEN block.cleared_models ELSE '[]' END,
-            evidence=excluded.evidence,observation_id=excluded.observation_id,pool_key_json=excluded.pool_key_json,
-            deadline=excluded.deadline,reset_at=excluded.reset_at,observed_at=excluded.observed_at,created_at=excluded.created_at,
-            recorded_at=excluded.recorded_at,last_reported_at=excluded.last_reported_at,cooldown_until=excluded.cooldown_until,
-            quota_exhausted_until=excluded.quota_exhausted_until,reason=excluded.reason,code=excluded.code,
-            wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
-            listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
-            meta=excluded.meta,cleared_reason=excluded.cleared_reason,
-            source_order=CASE WHEN block.source_present=1 THEN block.source_order ELSE excluded.source_order END,source_present=1
-            WHERE excluded.kind NOT IN ('account','principal') OR (excluded.kind='principal' AND block.source_present=0)",
+        &source_insert_sql(&block.kind),
         rusqlite::named_params! {
             ":kind":block.kind,":key":block.origin_key,":provider":scope.provider,":account":scope.account_id,
             ":credential":scope.credential_id,":model":scope.model,":size":scope.size_class,":principal":scope.principal,

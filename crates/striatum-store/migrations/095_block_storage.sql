@@ -84,6 +84,7 @@ CREATE TABLE retirement_tombstone (
   PRIMARY KEY(kind,origin_key,evidence)
 );
 CREATE INDEX retirement_tombstone_time ON retirement_tombstone(retired_at);
+CREATE INDEX observation_retirement_guard ON retirement_tombstone(kind,origin_key,evidence_at);
 INSERT INTO retirement_tombstone SELECT * FROM fence_retired_origin;
 
 CREATE TEMP TABLE block_migration_now(at INTEGER NOT NULL);

@@ -1,3 +1,6 @@
+#[path = "observation_guard_tests.rs"]
+mod observation_guard;
+
 fn native_rig(name: &str) -> crate::block_state::tests::Rig {
     let rig = crate::block_state::tests::rig_before_block_migration(name);
     rig.store
@@ -32,6 +35,7 @@ fn new_source_commands_read_only_classified_writer_bookkeeping() {
         "a published-state command must not read block data to decide its action: {reads:#?}"
     );
     assert_eq!(reads.writer_bookkeeping.len(), 1);
+    assert!(reads.observation_retirement_guards.is_empty());
     assert_eq!(
         reads.writer_bookkeeping[0],
         crate::block_storage::NEXT_SOURCE_ORDER

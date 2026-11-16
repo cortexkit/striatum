@@ -269,6 +269,15 @@ pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 1] = [(
     "writer bookkeeping: next source order per kind",
 )];
 
+/// A rare observation-effect insert checks one origin's retirement receipts.
+/// The archive is not loaded. Only the exact guarded insert inside a writer
+/// command gets this category; neither its marker nor its lookup grants an
+/// exemption to a request read or another connection.
+pub const REVIEWED_OBSERVATION_RETIREMENT_GUARD: (&str, &str) = (
+    crate::block_storage::OBSERVATION_RETIREMENT_GUARD_MARKER,
+    "retirement guard on the observation-effect insert: one covering keyed seek, LIMIT 1",
+);
+
 /// Writes that run a `SELECT` of their own over other tables (a bound
 /// `json_each` list, or the fields of an `account_observe` report bound as
 /// parameters) yet read their own target only
@@ -295,6 +304,7 @@ pub struct BlockReadTrace {
     route_writes: Mutex<Vec<String>>,
     route_write_rows: Mutex<Vec<String>>,
     writer_bookkeeping: Mutex<Vec<String>>,
+    observation_retirement_guards: Mutex<Vec<String>>,
     triggers: Mutex<Vec<String>>,
     /// A connection to the traced database, used only to prepare each new
     /// statement text once under an authorizer, and what that found.
@@ -330,6 +340,9 @@ pub struct BlockReads {
     pub route_write_rows: Vec<String>,
     /// Exact catalogued insertion-order reads made inside a writer command.
     pub writer_bookkeeping: Vec<String>,
+    /// Exact observation-effect inserts that make one keyed retirement lookup
+    /// inside the writer. These are distinct from own-row and bookkeeping reads.
+    pub observation_retirement_guards: Vec<String>,
     /// Writes whose only block reads are those of [`REVIEWED_TRIGGERS`] they
     /// fire, by text.
     pub triggers: Vec<String>,
@@ -345,6 +358,9 @@ impl BlockReadTrace {
             route_writes: std::mem::take(&mut self.route_writes.lock().unwrap()),
             route_write_rows: std::mem::take(&mut self.route_write_rows.lock().unwrap()),
             writer_bookkeeping: std::mem::take(&mut self.writer_bookkeeping.lock().unwrap()),
+            observation_retirement_guards: std::mem::take(
+                &mut self.observation_retirement_guards.lock().unwrap(),
+            ),
             triggers: std::mem::take(&mut self.triggers.lock().unwrap()),
         }
     }
@@ -509,6 +525,20 @@ unsafe extern "C" fn on_block_statement(
         }
     }
     if tap.writer
+        && crate::block_state::in_writer_command()
+        && found
+            .read
+            .iter()
+            .any(|table| table == "retirement_tombstone")
+        && text.starts_with(REVIEWED_OBSERVATION_RETIREMENT_GUARD.0)
+        && crate::block_storage::is_observation_retirement_insert(&text)
+    {
+        tap.trace
+            .observation_retirement_guards
+            .lock()
+            .unwrap()
+            .push(text.into_owned());
+    } else if tap.writer
         && crate::block_state::in_writer_command()
         && REVIEWED_WRITER_BOOKKEEPING
             .iter()

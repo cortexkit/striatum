@@ -2768,8 +2768,7 @@ impl AccountTx<'_> {
         self.conn
             .execute(
                 "INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)
-             SELECT ?1,?2,?3,?4,?5 WHERE NOT EXISTS
-             (SELECT 1 FROM retirement_tombstone WHERE kind=?1 AND origin_key=?2 AND evidence=?3)",
+             VALUES (?1,?2,?3,?4,?5) ON CONFLICT(kind,origin_key,evidence) DO NOTHING",
                 params![
                     origin.kind,
                     origin.origin_key,
