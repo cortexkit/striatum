@@ -113,11 +113,13 @@ fn make_rig(name: &str, before_block_migration: bool) -> Rig {
 
 fn observation_source_sql(account: &str) -> String {
     let account = account.replace('\'', "''");
+    // This raw stub stores an evidence key and a JSON-text effects field, not
+    // an observation receipt. Its non-JSON key therefore names no observation.
     format!(
         "INSERT INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,
-           quota,deadline,observed_at,observation_id,next_recheck_at)
+           quota,deadline,next_recheck_at)
          VALUES ('observation',json_array('p','{account}'),'p','{account}',
-           json_array('k',0),{NOW},0,{until},{NOW},'k',{until});",
+           json_array('k','[]'),{NOW},0,{until},{until});",
         until = NOW + 60_000,
     )
 }
@@ -3694,7 +3696,9 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
                 },
             )
             .unwrap();
-        rig.run(fence_rechecks::sync);
+        rig.store
+            .account_transaction(|tx| fence_rechecks::sync_on(tx, NOW).map_err(err))
+            .unwrap();
     }
     fn wall_both_keys(rig: &Rig) {
         for key in ["k0", "k1"] {
@@ -3715,9 +3719,13 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "a route clear the state holds and SQL dropped",
             |rig| {
                 provider_wall(rig, "p1");
-                rig.sql("INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'m',evidence FROM fence_recheck WHERE kind='provider';".into());
+                rig.sql("UPDATE block SET cleared_models=json_array('m') WHERE kind='provider' AND managed=1 AND is_origin=1;".into());
             },
-            |rig| rig.sql("DELETE FROM fence_recheck_route_clear;".into()),
+            |rig| {
+                rig.sql(
+                    "UPDATE block SET cleared_models='[]' WHERE managed=1 AND is_origin=1;".into(),
+                )
+            },
             |rig| acquire(rig, "s1", &["p1"], "m", &keys()),
             "exhausted",
         ),
@@ -3725,7 +3733,30 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "a source wall in SQL that needs a clock the state never installed",
             |_| {},
             |rig| {
-                rig.sql(format!("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1',{},{},'provider capacity',{2},{2});", NOW + 3_600_000, NOW - 1_000, NOW - 1_000))
+                drift_source(rig, |conn| {
+                    conn.execute(
+                        "INSERT INTO provider_cooldown_state(provider_key,wall_observed_at,last_error,last_error_at,updated_at)
+                         VALUES ('p1',?1,'provider capacity',?1,?1)",
+                        [NOW - 1_000],
+                    )?;
+                    crate::block_storage::wall_source(
+                        conn,
+                        crate::block_storage::WallSource {
+                            kind: "provider",
+                            key: "p1",
+                            provider: "p1",
+                            model: None,
+                            cooldown: Some((NOW + 3_600_000) as f64),
+                            exhausted: None,
+                            wall_observed: Some(NOW - 1_000),
+                            observed_at: NOW - 1_000,
+                            error: Some("provider capacity"),
+                            class: None,
+                            unscoped: false,
+                        },
+                    )
+                    .map(Option::unwrap)
+                });
             },
             |rig| acquire(rig, "s1", &["p1"], "m", &keys()),
             "exhausted",
@@ -3762,7 +3793,7 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             wall_both_keys,
             |rig| {
                 rig.sql(format!(
-                    "UPDATE fence_recheck SET next_recheck_at={} WHERE provider='p1';",
+                    "UPDATE block SET next_recheck_at={} WHERE provider='p1' AND managed=1 AND is_origin=1;",
                     NOW - 1
                 ))
             },
@@ -3811,12 +3842,7 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
                 );
                 wall_both_keys(rig);
             },
-            |rig| {
-                rig.sql(
-                    "UPDATE pool_key_state SET walled_until=NULL; DELETE FROM fence_recheck;"
-                        .into(),
-                )
-            },
+            |rig| rig.sql("DELETE FROM block WHERE kind IN ('pool_billing','pool_rate');".into()),
             |rig| {
                 acquire(
                     rig,
@@ -3846,7 +3872,7 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "a refusal to rehydrate on a clock SQL has since cleared",
             |rig| provider_wall(rig, "p1"),
             |rig| {
-                rig.sql("DELETE FROM provider_cooldown_state; DELETE FROM model_route_state; DELETE FROM fence_recheck;".into())
+                rig.sql("DELETE FROM provider_cooldown_state; DELETE FROM model_route_state; DELETE FROM block WHERE kind IN ('provider','route','failure');".into())
             },
             |rig| {
                 format!(
@@ -3859,14 +3885,40 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "Some(1800000060000)",
         ),
     ];
-    // One more case per table the pool check compares, each a row of the
-    // provider SQL holds and the stale state lacks; the answer is the twin's.
-    fn drift_row(rig: &Rig, sql: &str) {
-        rig.sql(
-            sql.replace("{NOW}", &NOW.to_string())
-                .replace("{LATER}", &(NOW + 600_000).to_string())
-                .replace("{BEFORE}", &(NOW - 1_000).to_string()),
-        );
+    // Case labels name the former source tables. Their refusal rows now live
+    // in block; pool-success evidence lives in success_proof. SQL holds a row
+    // the stale state lacks, and a separately loaded store supplies the answer.
+    fn drift_source(
+        rig: &Rig,
+        make: impl Fn(&Connection) -> rusqlite::Result<crate::block_storage::StoredBlock>
+            + Send
+            + 'static,
+    ) {
+        rig.run(move |conn| crate::block_storage::write_source(conn, &make(conn)?).map(|_| ()));
+    }
+    fn account_fixture(
+        pool_key: Option<striatum_core::accounts::PoolKey>,
+        recovery_set: Vec<striatum_core::accounts::PoolKey>,
+    ) -> crate::AccountPoolFenceRow {
+        crate::AccountPoolFenceRow {
+            evidence: crate::AccountFenceRow {
+                fence_id: "drift-fence".into(),
+                provider: "p1".into(),
+                account_id: "a0".into(),
+                scope_json: "{}".into(),
+                fence_json: serde_json::json!({"reset": {"at_ms": NOW + 600_000}}).to_string(),
+                source: "broca_account_limit".into(),
+                observed_at: NOW - 1_000,
+                principal: "x".into(),
+                admission_id: None,
+                observation_id: None,
+                created_at: NOW - 1_000,
+                cleared_at: None,
+                cleared_reason: None,
+            },
+            pool_key,
+            recovery_set,
+        }
     }
     let any = |rig: &Rig| acquire(rig, "s1", &["p1"], "m", &keys());
     let table_cases: Vec<(&str, Step, Step)> = vec![
@@ -3874,68 +3926,184 @@ fn a_pool_decision_on_a_state_stale_in_any_one_input_runs_again_on_a_fresh_load(
             "account_fence",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{}','{\"reset\":{\"at_ms\":{LATER}}}','broca_account_limit',{BEFORE},'x',{BEFORE},NULL,'[]',NULL);")
+                drift_source(rig, |conn| {
+                    crate::block_storage::account_source(conn, &account_fixture(None, Vec::new()))
+                });
             },
         ),
         (
             "credential_entitlement_fences",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO credential_entitlement_fences VALUES ('p1','k0','billing_exhausted','l0',{BEFORE});")
+                drift_source(rig, |_| {
+                    crate::block_storage::credential_source(
+                        &striatum_core::route_state_store::CredentialEntitlementFence {
+                            provider_id: "p1".into(),
+                            credential_id: "k0".into(),
+                            code: "billing_exhausted".into(),
+                            listing_fingerprint: Some("l0".into()),
+                            observed_at_ms: NOW - 1_000,
+                        },
+                    )
+                });
             },
         ),
         (
             "account_route_fence",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO account_route_fence(provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class) VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'quota');")
+                drift_source(rig, |_| {
+                    crate::block_storage::account_route_source(
+                        &crate::AccountRouteFence {
+                            provider: "p1".into(),
+                            credential_id: "k0".into(),
+                            model: "m".into(),
+                            until_ms: NOW + 600_000,
+                            decision_id: "d".into(),
+                            recorded_at: NOW - 1_000,
+                        },
+                        "account_route",
+                        "quota",
+                        Some(NOW - 1_000),
+                    )
+                });
             },
         ),
         (
             "account_non_quota_route_fence",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO account_non_quota_route_fence VALUES ('p1','k0','m',{LATER},'d',{BEFORE},{BEFORE},'transient');")
+                drift_source(rig, |_| {
+                    crate::block_storage::account_route_source(
+                        &crate::AccountRouteFence {
+                            provider: "p1".into(),
+                            credential_id: "k0".into(),
+                            model: "m".into(),
+                            until_ms: NOW + 600_000,
+                            decision_id: "d".into(),
+                            recorded_at: NOW - 1_000,
+                        },
+                        "non_quota_route",
+                        "transient",
+                        Some(NOW - 1_000),
+                    )
+                });
             },
         ),
         (
             "model_route_state",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at) VALUES ('p1/m','p1/m','p1','m',{LATER},{BEFORE},'route capacity',{BEFORE},{BEFORE});")
+                drift_source(rig, |conn| {
+                    conn.execute(
+                        "INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,wall_observed_at,last_error,last_error_at,updated_at)
+                         VALUES ('p1/m','p1/m','p1','m',?1,'route capacity',?1,?1)",
+                        [NOW - 1_000],
+                    )?;
+                    crate::block_storage::wall_source(
+                        conn,
+                        crate::block_storage::WallSource {
+                            kind: "route",
+                            key: "p1/m",
+                            provider: "p1",
+                            model: Some("m"),
+                            cooldown: Some((NOW + 600_000) as f64),
+                            exhausted: None,
+                            wall_observed: Some(NOW - 1_000),
+                            observed_at: NOW - 1_000,
+                            error: Some("route capacity"),
+                            class: None,
+                            unscoped: false,
+                        },
+                    )
+                    .map(Option::unwrap)
+                });
             },
         ),
         (
             "account_size_refusal",
             |_| {},
             |rig| {
-                drift_row(
-                    rig,
-                    "INSERT INTO account_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});",
-                )
+                drift_source(rig, |_| {
+                    crate::block_storage::size_source(
+                        &crate::AccountSizeRefusal {
+                            provider: "p1".into(),
+                            credential_id: "k0".into(),
+                            model: "m".into(),
+                            size_class: 16,
+                            expires_at: NOW + 600_000,
+                            observed_at: NOW - 1_000,
+                        },
+                        true,
+                    )
+                });
             },
         ),
         (
             "account_non_quota_size_refusal",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO account_non_quota_size_refusal VALUES ('p1','k0','m',16,{LATER},{BEFORE});")
+                drift_source(rig, |_| {
+                    crate::block_storage::size_source(
+                        &crate::AccountSizeRefusal {
+                            provider: "p1".into(),
+                            credential_id: "k0".into(),
+                            model: "m".into(),
+                            size_class: 16,
+                            expires_at: NOW + 600_000,
+                            observed_at: NOW - 1_000,
+                        },
+                        false,
+                    )
+                });
             },
         ),
         (
             "account_transient_backoff",
             |_| {},
             |rig| {
-                drift_row(rig, "INSERT INTO account_transient_backoff VALUES ('p1','a0',{LATER},{BEFORE},'k','[]');")
+                drift_source(rig, |_| {
+                    let mut row = crate::block_storage::StoredBlock::from_origin(
+                        crate::fence_rechecks::ViewOrigin {
+                            kind: "observation".into(),
+                            origin_key: serde_json::json!(["p1", "a0"]).to_string(),
+                            provider: "p1".into(),
+                            account_id: Some("a0".into()),
+                            evidence: serde_json::json!(["k", "[]"]).to_string(),
+                            evidence_at: NOW - 1_000,
+                            quota: Some(false),
+                            deadline: Some((NOW + 600_000) as f64),
+                            ..Default::default()
+                        },
+                    )?;
+                    row.deadline = Some(crate::block_storage::Deadline::Integer(NOW + 600_000));
+                    Ok(row)
+                });
             },
         ),
         (
             "fence_success_pool",
             |rig| {
-                drift_row(rig, &format!("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json,cleared_at) VALUES ('drift-fence','p1','a0','{{}}','{{\"reset\":{{\"at_ms\":{{LATER}}}}}}','broca_account_limit',{{BEFORE}},'x',{{BEFORE}},'{}','[{},{}]',NULL);", pool_key(1), pool_key(1), pool_key(2)))
+                drift_source(rig, |conn| {
+                    crate::block_storage::account_source(
+                        conn,
+                        &account_fixture(
+                            Some(serde_json::from_str(&pool_key(1)).unwrap()),
+                            vec![
+                                serde_json::from_str(&pool_key(1)).unwrap(),
+                                serde_json::from_str(&pool_key(2)).unwrap(),
+                            ],
+                        ),
+                    )
+                });
             },
             |rig| {
-                drift_row(rig, &format!("INSERT INTO fence_success_pool VALUES ('drift-fence','{}',{{BEFORE}},{{NOW}});", pool_key(2)))
+                rig.sql(format!(
+                    "INSERT INTO success_proof VALUES ('drift-fence','{}',{},{});",
+                    pool_key(2),
+                    NOW - 1_000,
+                    NOW,
+                ));
             },
         ),
     ];
