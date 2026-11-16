@@ -9,6 +9,7 @@ mod request_reads_tests;
 mod shadow_lines_tests;
 mod signed_out_tests;
 mod unservable_tests;
+mod writer_hold_tests;
 
 fn result(reply: (FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);

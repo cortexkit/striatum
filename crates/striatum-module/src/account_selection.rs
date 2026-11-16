@@ -8756,6 +8756,7 @@ pub(crate) fn observe_authorized(
                 &principal,
                 &admission_principal,
                 allow_served_account,
+                false,
                 &parsed,
                 &params,
                 &roster_digests,
@@ -8765,19 +8766,26 @@ pub(crate) fn observe_authorized(
     .unwrap_or_else(store_error)
 }
 
+/// `fresh_event`: the caller minted `parsed.event_id` itself inside this
+/// command (a continuation's own exhaustion report), so no stored observation
+/// can carry it and the duplicate lookup in `account_observation` is skipped.
+#[allow(clippy::too_many_arguments)]
 fn record_observation(
     tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     admission_principal: &str,
     allow_served_account: bool,
+    fresh_event: bool,
     parsed: &ObserveParams,
     raw: &Value,
     roster_digests: &BTreeMap<String, ProviderRosterFacts>,
 ) -> RouteStateResult<OpReply> {
     let now = ctx.now_ms;
     let runner = normalize(&parsed.caller.runner);
-    let existing = if parsed.attempt_outcome.is_some()
+    let existing = if fresh_event {
+        None
+    } else if parsed.attempt_outcome.is_some()
         || allow_served_account
         || admission_principal != principal
     {

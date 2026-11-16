@@ -372,9 +372,52 @@ pub(crate) struct AdmissionState {
     /// chains are dropped when the command settles, because finishing a run
     /// closes the original before its continuations are finished.
     pub(crate) closing: Vec<RowKey>,
+    /// The bound `signed_out` observations of each open admission, keyed by
+    /// the observation's (principal, admission id). A continuation excludes
+    /// the credentials its run reported signed out; it reads them here, not
+    /// from `account_observation`. Dropped when the admission closes.
+    pub(crate) signed_out: BTreeMap<RowKey, BTreeSet<SignedOut>>,
     /// Writes decided since the command last drained them; empty whenever a
     /// state is published.
     pub(crate) pending: Vec<Effect>,
+}
+
+/// What a bound `signed_out` observation says, read out of its stored body
+/// the way `AccountTx::signed_out_credentials` reads it with `json_extract`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum SignedOut {
+    /// The body is not JSON. The SQL read fails on such a row.
+    Unreadable,
+    Row {
+        /// `$.run_id` when it is a string; any other value never equals a run.
+        run_id: Option<String>,
+        /// `$.exhausted.credential_id`: a string, or an object or array as
+        /// its JSON text. `None` (missing, null, a number or a boolean) is a
+        /// value the SQL read cannot return as a credential, so it fails too.
+        credential_id: Option<String>,
+    },
+}
+
+impl SignedOut {
+    pub(crate) fn parse(observation_json: &str) -> Self {
+        let Ok(body) = serde_json::from_str::<serde_json::Value>(observation_json) else {
+            return Self::Unreadable;
+        };
+        let credential_id = match body.get("exhausted").and_then(|e| e.get("credential_id")) {
+            Some(serde_json::Value::String(text)) => Some(text.clone()),
+            Some(value @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) => {
+                Some(value.to_string())
+            }
+            _ => None,
+        };
+        Self::Row {
+            run_id: body
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
+            credential_id,
+        }
+    }
 }
 
 /// The index state an admission row contributes, before and after a change.
@@ -396,6 +439,7 @@ impl AdmissionState {
             offers,
             chains,
             continuation_sources: _,
+            signed_out,
         } = rows;
         let mut state = Self::default();
         for row in open {
@@ -442,6 +486,9 @@ impl AdmissionState {
             state.latest.insert(conversation, Arc::new(newest));
         }
         state.load_continuations(offers, chains);
+        for row in signed_out {
+            state.record_signed_out(&row.principal, &row.admission_id, &row.observation_json);
+        }
         state
     }
 
@@ -1501,12 +1548,31 @@ impl AdmissionState {
         }
     }
 
-    /// End-of-command cleanup: a chain lives only while its original is open.
+    /// End-of-command cleanup: a chain and the sign-in exclusions live only
+    /// while their admission is open.
     pub(crate) fn settle(&mut self) {
         for original in std::mem::take(&mut self.closing) {
             if !self.open.contains_key(&original) {
                 self.chains.remove(&original);
+                self.signed_out.remove(&original);
             }
+        }
+    }
+
+    /// Keep a bound `signed_out` observation if it names an open admission.
+    /// The loader passes every stored one, a command each one it binds.
+    pub(crate) fn record_signed_out(
+        &mut self,
+        principal: &str,
+        admission_id: &str,
+        observation_json: &str,
+    ) {
+        let admission = key(principal, admission_id);
+        if self.open.contains_key(&admission) {
+            self.signed_out
+                .entry(admission)
+                .or_default()
+                .insert(SignedOut::parse(observation_json));
         }
     }
 }
@@ -1522,6 +1588,49 @@ impl AdmissionState {
         self.open
             .get(&key(principal, admission_id))
             .map(Arc::as_ref)
+    }
+
+    /// `AccountTx::signed_out_credentials` over an open admission: the
+    /// distinct credentials its bound `signed_out` observations name for
+    /// `run_id`. An error where that SQL read fails on a row. Only an open
+    /// admission can continue, so only open ones are held.
+    pub(crate) fn signed_out_credentials(
+        &self,
+        principal: &str,
+        admission_id: &str,
+        run_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let mut credentials = BTreeSet::new();
+        for row in self
+            .signed_out
+            .get(&key(principal, admission_id))
+            .into_iter()
+            .flatten()
+        {
+            match row {
+                SignedOut::Unreadable => {
+                    return Err(format!(
+                        "signed-out observation of admission {admission_id} is not JSON"
+                    ))
+                }
+                SignedOut::Row {
+                    run_id: Some(run),
+                    credential_id,
+                } if run == run_id => match credential_id {
+                    Some(credential) => {
+                        credentials.insert(credential.clone());
+                    }
+                    None => {
+                        return Err(format!(
+                            "signed-out observation of admission {admission_id} names no \
+                             credential"
+                        ))
+                    }
+                },
+                SignedOut::Row { .. } => {}
+            }
+        }
+        Ok(credentials.into_iter().collect())
     }
 
     pub(crate) fn affinity(

@@ -366,6 +366,57 @@ async fn signed_out_is_never_reoffered_to_reporting_run_after_global_recovery() 
     );
 }
 
+/// A run's sign-in exclusion is held in the account state, which a restart
+/// or a reload builds again from the stored observations. After a reload the
+/// run still never gets its signed-out credential back, even once that
+/// credential has recovered for everyone else.
+#[tokio::test]
+async fn signed_out_exclusion_survives_an_account_state_reload() {
+    let (subject, _, runner, request) = paused().await;
+    let request = signed_out(request);
+    let offer = result(runner.call("route.account_for", &request).await);
+    assert_eq!(offer["kind"], "offer", "{offer}");
+    result(
+        runner
+            .call(
+                "route.account_observe",
+                &offer_observation(&offer, "attempt", "used-signed-out-offer"),
+            )
+            .await,
+    );
+    let credential = request["exhausted"]["credential_id"].as_str().unwrap();
+    relist(&subject, credential, "active", true);
+    result(
+        runner
+            .call(
+                "route.account_for",
+                &target_original(&request, "other-run-after-recovery"),
+            )
+            .await,
+    );
+    let mut credentials = fixture::continue_credentials();
+    credentials.retain(|c| {
+        c.account.credential_id == credential || c.account.credential_id == offer["credential_id"]
+    });
+    subject
+        .configure_continue_credentials(&credentials)
+        .await
+        .unwrap();
+    let store = subject.harness().store().clone();
+    store.reload_account_state_for_test().unwrap();
+    crate::account_state::assert_published_equals_fresh_load(&store, "after the reload");
+    let mut next = request.clone();
+    next["selection_id"] = json!("after-reload");
+    next["previous_decision_id"] = offer["decision_id"].clone();
+    next["exhausted"] = json!({"credential_id":offer["credential_id"],"account":offer["account"],"limit_window":"five_hour","observed_at_ms":account_selection::now_ms(),"resets_at_ms":account_selection::now_ms()+300_000});
+    let held = result(runner.call("route.account_for", &next).await);
+    assert_eq!(
+        held["kind"], "hold",
+        "the reloaded state must remember the run's signed-out credential: {held}"
+    );
+    crate::account_state::assert_published_equals_fresh_load(&store, "after the next continue");
+}
+
 #[tokio::test]
 async fn signed_out_hold_uses_only_alternate_accounts_known_reset() {
     let (subject, _, runner, request) = paused().await;

@@ -129,6 +129,76 @@ mod account_fact_tests {
         assert!(remaining.iter().any(|row| row.provider == "other"));
     }
 
+    /// The account state loader finds bound `signed_out` observations through
+    /// their partial index alone: it scans that index and reads the matched
+    /// rows by rowid, never the table itself or the principal index, so a
+    /// load does not read the hundreds of thousands of other observations.
+    #[test]
+    fn signed_out_observations_load_through_their_partial_index() {
+        let scratch = cortexkit_test_support::ScratchDir::new("signed-out-observations");
+        let descriptor = crate::dev_descriptor(
+            "signed-out-observations",
+            scratch.path().join("store.db").to_string_lossy(),
+        );
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let connection = Connection::open(scratch.path().join("store.db")).unwrap();
+        let plan: Vec<String> = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {SIGNED_OUT_OBSERVATIONS_SQL}"))
+            .unwrap()
+            .query_map([], |row| row.get(3))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|step| step
+                .contains("SCAN account_observation USING COVERING INDEX account_observation_signed_out")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .filter(|step| step.contains("account_observation"))
+                .all(|step| step.contains("account_observation_signed_out")
+                    || step.contains("INTEGER PRIMARY KEY (rowid=?)")),
+            "{plan:?}"
+        );
+        store
+            .account_transaction(|tx| {
+                for (id, kind, bound, admission) in [
+                    ("kept", "signed_out", true, Some("admission")),
+                    ("unbound", "signed_out", false, Some("admission")),
+                    ("other-kind", "attempt", true, Some("admission")),
+                    ("no-admission", "signed_out", true, None),
+                ] {
+                    tx.insert_observation(&AccountObservationRow {
+                        observation_id: id.into(),
+                        principal: "owner".into(),
+                        runner: "runner".into(),
+                        event_id: id.into(),
+                        kind: kind.into(),
+                        admission_id: admission.map(Into::into),
+                        bound,
+                        observation_json: format!(r#"{{"run_id":"{id}"}}"#),
+                        effects_json: "[]".into(),
+                        received_at: 100,
+                    })?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let loaded = store
+            .account_read(|tx| tx.load_admission_group())
+            .unwrap()
+            .signed_out;
+        assert_eq!(
+            loaded,
+            vec![SignedOutObservationRow {
+                principal: "owner".into(),
+                admission_id: "admission".into(),
+                observation_json: r#"{"run_id":"kept"}"#.into(),
+            }]
+        );
+    }
+
     #[test]
     fn observation_backoffs_use_only_committed_bound_effects_and_expire() {
         let scratch = cortexkit_test_support::ScratchDir::new("observation-backoffs");

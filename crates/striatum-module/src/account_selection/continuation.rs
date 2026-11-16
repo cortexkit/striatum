@@ -78,7 +78,7 @@ fn standing(record: V1Recorded, request: &ContinueRequest) -> Result<Value, Refu
 }
 
 fn record_signed_out(
-    tx: &AccountTx<'_>,
+    tx: &mut crate::account_state::AccountCommand<'_>,
     ctx: &CommandContext,
     principal: &str,
     runner: &str,
@@ -442,7 +442,7 @@ pub(crate) fn continue_account_with_call(
                     "resets_at_ms":request.exhausted.resets_at_ms, "retry_after_s":request.exhausted.retry_after_s,
                     "observed_at_ms":request.exhausted.observed_at_ms});
                 let observation: ObserveParams = serde_json::from_value(raw.clone()).map_err(|e|RouteStateStoreError(e.to_string()))?;
-                record_observation(tx,&scoped,principal,principal,false,&observation,&raw,&roster_facts)?;
+                record_observation(tx,&scoped,principal,principal,false,true,&observation,&raw,&roster_facts)?;
             }
             if !ctx.flags.enabled { return Ok(refuse("account_selection_disabled", "account selection is disabled")); }
             if original.get("requested_account").is_some_and(|value| !value.is_null()) {

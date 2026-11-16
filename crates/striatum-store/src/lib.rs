@@ -120,8 +120,9 @@ pub use account_selection::{
     AccountFenceRow, AccountHoldRow, AccountObservationRow, AccountPinRow, AccountPoolFenceRow,
     AccountRouteFence, AccountSizeRefusal, AccountTx, AdmissionGroupRows, AdmissionScanRow,
     AdmissionStateRow, ContinuationStateRow, CredentialProbeClaim, LatestAdmissionRow,
-    PrunedAdmission, PrunedContinuation, ReservationRef, ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE,
-    KEYED_EXCEPTION, OBSERVATION_BACKOFFS_SQL,
+    PrunedAdmission, PrunedContinuation, ReservationRef, SignedOutObservationRow,
+    ACCOUNT_DEMAND_SQL, DECISION_MODE_SERVE, KEYED_EXCEPTION, OBSERVATION_BACKOFFS_SQL,
+    SIGNED_OUT_OBSERVATIONS_SQL,
 };
 
 pub struct ClearedRouteCooldowns {
@@ -347,7 +348,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 93] {
+fn route_state_migrations() -> [Migration; 94] {
     [
         Migration {
             version: 1,
@@ -720,6 +721,10 @@ fn route_state_migrations() -> [Migration; 93] {
         Migration {
             version: 94,
             statements: include_str!("../migrations/094_consumer_names.sql"),
+        },
+        Migration {
+            version: 95,
+            statements: include_str!("../migrations/095_observation_signed_out_index.sql"),
         },
     ]
 }
