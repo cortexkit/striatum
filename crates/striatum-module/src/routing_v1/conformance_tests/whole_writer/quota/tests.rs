@@ -25,9 +25,13 @@ impl World {
     pub(super) async fn quota_group(&mut self, nonce: u64) {
         let id = format!("quota-hold-{nonce}-{}", self.sequence);
         self.publish_quota_used(0.0);
-        self.ok(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":format!("before-{id}")})).await;
+        let first=self.ok(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":format!("before-{id}")})).await;
         self.publish_quota_used(100.0);
-        let reply=self.request(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":id,"hold_wait_max_s":120})).await;
+        // A reading alone preserves an established pin; cold work still has
+        // to wait for headroom. Confirmed refusals are exercised separately.
+        let retained=self.ok(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":format!("sticky-{id}")})).await;
+        assert_retained_account(&first, &retained);
+        let reply=self.request(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":format!("cold-{id}"),"admission_id":id,"hold_wait_max_s":120})).await;
         assert_eq!(
             reply.0,
             FrameType::Error,
@@ -68,4 +72,30 @@ impl World {
         let id = format!("headroom-admit-{nonce}-{}", self.sequence);
         self.ok(Caller::Runner,"route.account_for",json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c","conversation_key":id,"admission_id":id})).await;
     }
+}
+
+fn assert_retained_account(first: &Value, retained: &Value) {
+    first["account"]["account_id"]
+        .as_str()
+        .expect("the initial admission selected an account");
+    let pin = first["pin"]["id"]
+        .as_str()
+        .expect("the initial admission created a real pin");
+    let generation = first["pin"]["generation"]
+        .as_u64()
+        .expect("the initial pin has a generation");
+    assert_eq!(
+        retained["account"], first["account"],
+        "a full reading keeps the established account"
+    );
+    assert_eq!(
+        retained["pin"]["id"].as_str(),
+        Some(pin),
+        "a full reading keeps the existing pin"
+    );
+    assert_eq!(
+        retained["pin"]["generation"].as_u64(),
+        Some(generation),
+        "a reading alone does not advance the pin generation"
+    );
 }
