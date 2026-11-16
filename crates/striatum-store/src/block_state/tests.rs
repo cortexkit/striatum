@@ -14,6 +14,9 @@ use striatum_core::route_state_store::{FactSource, RouteStateStore, RouteStateUp
 use striatum_core::RouteStateResult;
 
 #[cfg(test)]
+#[path = "native_generator/tests.rs"]
+mod native_generator;
+#[cfg(test)]
 #[path = "native_sql/tests.rs"]
 mod native_sql;
 
@@ -47,6 +50,7 @@ struct TestOwner {
     /// States the next loads return instead of reading SQL, last first: a
     /// stale state stands in for one that drifted from SQL.
     stale: Mutex<Vec<BlockState>>,
+    renewal_witnesses: Mutex<native_generator::Witnesses>,
 }
 
 impl AccountStateBridge for TestOwner {
@@ -2211,253 +2215,7 @@ const ERRORS: [&str; 4] = [
 
 /// One step of the generated sequence. Returns the operation's name.
 fn step(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
-    let p = rng.pick(&PROVIDERS);
-    let c = rng.pick(&CREDENTIALS);
-    let m = rng.pick(&MODELS);
-    let offset = rng.below(4);
-    let at = rng.time(now);
-    let until = rng.time(now) + 3_600_000;
-    match rng.below(44) {
-        0 => {
-            let id = if rng.below(2) == 0 {
-                format!("f{}", rng.below(4))
-            } else {
-                format!("credential-quota:[\"{p}\",\"{c}\"]:{}", rng.below(3))
-            };
-            let pool = match rng.below(3) {
-                0 => "NULL".to_owned(),
-                key => format!("'{}'", pool_key(key as u32)),
-            };
-            let recovery = if rng.below(2) == 0 {
-                "[]".to_owned()
-            } else {
-                format!("[{},{}]", pool_key(1), pool_key(2))
-            };
-            rig.sql(format!("INSERT OR IGNORE INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json) VALUES ('{id}','{p}','a0','{{}}','{{\"reset\":{{\"at_ms\":{until}}}}}','broca_account_limit',{at},'x',{at},{pool},'{recovery}');"));
-            "insert account fence"
-        }
-        1 => {
-            rig.sql(format!("UPDATE account_fence SET cleared_at={now} WHERE rowid IN (SELECT rowid FROM account_fence WHERE cleared_at IS NULL ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "clear account fence"
-        }
-        2 => {
-            rig.sql(format!("INSERT INTO credential_entitlement_fences VALUES ('{p}','{c}','billing_exhausted',NULL,{at}) ON CONFLICT(provider_id,credential_id) DO UPDATE SET observed_at_ms=excluded.observed_at_ms;"));
-            "upsert credential fence"
-        }
-        3 => {
-            rig.sql(format!("INSERT OR REPLACE INTO credential_entitlement_fences VALUES ('{p}','{c}','model_unsupported',NULL,{at});"));
-            "replace credential fence"
-        }
-        4 => {
-            let class = rng.pick(&["quota", "transient"]);
-            rig.sql(format!("INSERT INTO account_route_fence VALUES ('{p}','{c}','{m}',{until},'d',{at},{at},'{class}') ON CONFLICT(provider,credential_id,model) DO UPDATE SET wall_class=excluded.wall_class,until_ms=excluded.until_ms,last_reported_at=excluded.last_reported_at;"));
-            "upsert account route fence"
-        }
-        5 => {
-            let kind = rng.pick(&["billing", "transient"]);
-            rig.sql(format!("INSERT OR REPLACE INTO account_non_quota_route_fence VALUES ('{p}','{c}','{m}',{until},'d',{at},{at},'{kind}');"));
-            "replace non-quota route fence"
-        }
-        6 => {
-            let (wall, cooldown) = (
-                rng.maybe_time(now + 3_600_000),
-                rng.maybe_time(now + 3_600_000),
-            );
-            rig.sql(format!("INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_reason,cooldown_until,cooldown_reason,wall_observed_at,cooldown_observed_at,updated_at) VALUES ('{p}','{c}',{wall},'billing',{cooldown},'rate',{at},{at},{at}) ON CONFLICT(provider,credential_id) DO UPDATE SET walled_until=excluded.walled_until,cooldown_until=excluded.cooldown_until,updated_at=excluded.updated_at;"));
-            "upsert pool key"
-        }
-        7 => {
-            rig.sql(format!("UPDATE pool_key_state SET last_used_at={at},updated_at={at} WHERE rowid IN (SELECT rowid FROM pool_key_state ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "touch pool key"
-        }
-        8 => {
-            let (cooldown, quota) = (
-                rng.maybe_time(now + 3_600_000),
-                rng.maybe_time(now + 3_600_000),
-            );
-            let error = rng.pick(&ERRORS);
-            let unscoped = rng.below(2);
-            let class = rng.pick(&["NULL", "'quota'", "'billing'"]);
-            rig.sql(format!("INSERT OR REPLACE INTO provider_cooldown_state(provider_key,cooldown_until,quota_exhausted_until,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at) VALUES ('{p}',{cooldown},{quota},{at},{unscoped},{class},{error},{at},{at});"));
-            "replace provider row"
-        }
-        9 => {
-            // A route row recording its provider's wall exactly is hidden by
-            // the provider origin; a shorter or different one is not.
-            let copy = rng.below(2) == 0;
-            let shorter = if rng.below(2) == 0 { "-1" } else { "" };
-            if copy {
-                rig.sql(format!("INSERT OR REPLACE INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at) SELECT '{p}/{m}','{p}/{m}',provider_key,'{m}',cooldown_until{shorter},quota_exhausted_until,wall_observed_at,wall_unscoped,wall_class,last_error,last_error_at,updated_at FROM provider_cooldown_state WHERE provider_key='{p}';"));
-            } else {
-                let (cooldown, quota, failure) = (
-                    rng.maybe_time(now + 3_600_000),
-                    rng.maybe_time(now + 3_600_000),
-                    rng.maybe_time(now + 3_600_000),
-                );
-                let error = rng.pick(&ERRORS);
-                let unscoped = rng.below(2);
-                rig.sql(format!("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,wall_observed_at,wall_unscoped,last_error,last_error_at,updated_at,failure_backoff_until,failure_backoff_reason,failure_observed_at) VALUES ('{p}/{m}','{p}/{m}','{p}','{m}',{cooldown},{quota},{at},{unscoped},{error},{at},{at},{failure},'error',{at}) ON CONFLICT(route_key) DO UPDATE SET cooldown_until=excluded.cooldown_until,quota_exhausted_until=excluded.quota_exhausted_until,wall_observed_at=excluded.wall_observed_at,last_error=excluded.last_error,failure_backoff_until=excluded.failure_backoff_until,wall_unscoped=excluded.wall_unscoped;"));
-            }
-            "write route row"
-        }
-        10 => {
-            rig.sql(format!("UPDATE model_route_state SET latency_ema_ms={offset},updated_at={at} WHERE rowid IN (SELECT rowid FROM model_route_state ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "route data only"
-        }
-        11 => {
-            let size = 16 + rng.below(2);
-            let table = rng.pick(&["account_size_refusal", "account_non_quota_size_refusal"]);
-            rig.sql(format!(
-                "INSERT OR REPLACE INTO {table} VALUES ('{p}','{c}','{m}',{size},{until},{at});"
-            ));
-            "size refusal"
-        }
-        12 => {
-            rig.sql(format!("UPDATE OR IGNORE account_size_refusal SET size_class=size_class+1 WHERE rowid IN (SELECT rowid FROM account_size_refusal ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "move a size refusal's key"
-        }
-        13 => {
-            rig.sql(format!("INSERT OR IGNORE INTO account_principal_exclusion VALUES ('x','adm{offset}','{c}','runner','roster',NULL,{at});"));
-            "principal exclusion"
-        }
-        14 => {
-            rig.sql(format!("INSERT INTO account_transient_backoff VALUES ('{p}','a{offset}',{until},{at},'k{at}','[]') ON CONFLICT(provider,account_id) DO UPDATE SET retry_at_ms=excluded.retry_at_ms,evidence_key=excluded.evidence_key;"));
-            "transient backoff"
-        }
-        15 => {
-            let table = rng.pick(&[
-                "account_fence",
-                "credential_entitlement_fences",
-                "account_route_fence",
-                "account_non_quota_route_fence",
-                "pool_key_state",
-                "provider_cooldown_state",
-                "model_route_state",
-                "account_size_refusal",
-                "account_principal_exclusion",
-                "account_transient_backoff",
-                "account_eligibility",
-            ]);
-            rig.sql(format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "delete a source row"
-        }
-        16 | 17 => {
-            rig.run(fence_rechecks::sync);
-            "sync"
-        }
-        18 => {
-            let owner = owner_name(rng.below(3));
-            rig.run(move |conn| {
-                let origins = fence_rechecks::read(conn)?;
-                if let Some(origin) = origins.get(offset as usize) {
-                    // Late enough that the clock is due and the claim succeeds.
-                    let claimed_at = now + 4 * 3_600_000;
-                    fence_rechecks::claim_with_authorization(
-                        conn,
-                        std::slice::from_ref(origin),
-                        claimed_at,
-                        &owner,
-                    )?;
-                }
-                Ok(())
-            });
-            "claim"
-        }
-        19 => {
-            rig.sql(format!("UPDATE fence_recheck SET cleared_at={now},claim_owner=NULL WHERE rowid IN (SELECT rowid FROM fence_recheck ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "heal a clock"
-        }
-        20 => {
-            rig.sql(format!("UPDATE fence_recheck SET quota=1-quota,classified=1 WHERE kind='credential' AND rowid IN (SELECT rowid FROM fence_recheck WHERE kind='credential' ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "classify a credential"
-        }
-        21 => {
-            rig.sql(format!("INSERT OR IGNORE INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'{m}',evidence FROM fence_recheck WHERE kind IN ('provider','route') ORDER BY rowid LIMIT 1 OFFSET {offset};"));
-            "partial route clear"
-        }
-        22 => {
-            rig.sql("DELETE FROM fence_recheck_route_clear;".into());
-            "delete every route clear"
-        }
-        23 => {
-            rig.sql(format!("DELETE FROM fence_probe_authorization WHERE rowid IN (SELECT rowid FROM fence_probe_authorization ORDER BY rowid LIMIT 1 OFFSET {offset});"));
-            "release an authorization"
-        }
-        24 => {
-            // Either a pool healed for an active fence's current evidence,
-            // which shrinks its recovery set, or one for other evidence.
-            let key = pool_key(1 + rng.below(2) as u32);
-            if rng.below(2) == 0 {
-                rig.sql(format!("INSERT OR REPLACE INTO fence_success_pool SELECT fence_id,'{key}',MIN(observed_at,created_at),{now} FROM account_fence ORDER BY rowid LIMIT 1 OFFSET {offset};"));
-            } else {
-                rig.sql(format!("INSERT OR REPLACE INTO fence_success_pool VALUES ('f{offset}','{key}',{at},{now});"));
-            }
-            "success pool"
-        }
-        25 => {
-            let update = RouteStateUpdate {
-                observed_at_ms: Some(at),
-                cooldown_until: Some(until as f64),
-                last_error: Some("provider capacity".into()),
-                ..Default::default()
-            };
-            rig.store
-                .record_provider_cooldown(p, &format!("{p}/{m}"), &format!("{p}/{m}"), &update)
-                .unwrap();
-            "record provider cooldown"
-        }
-        26 => {
-            let update = RouteStateUpdate {
-                observed_at_ms: Some(at),
-                quota_exhausted_until: (rng.below(2) == 0).then_some(until as f64),
-                latency_ema_ms: Some(10.0),
-                increment_failure: rng.below(2) == 0,
-                ..Default::default()
-            };
-            rig.store
-                .update_route_state(&format!("{p}/{m}"), &format!("{p}/{m}"), &update)
-                .unwrap();
-            "update route state"
-        }
-        27 => {
-            // A catalogue insert's trigger creates the route's state row
-            // with any live provider wall.
-            rig.store
-                .upsert_fact(&fact(p, &format!("{m}-{}", rng.below(4))), FactSource::Seed)
-                .unwrap();
-            "catalogue insert"
-        }
-        28 => {
-            rig.store
-                .clear_route_cooldowns(&format!("{p}/{m}"))
-                .unwrap();
-            "operator clear"
-        }
-        29 => {
-            // An empty model covers every model on the provider.
-            let model = if rng.below(3) == 0 { "" } else { m };
-            let fingerprint = rng.pick(&["NULL", "'l0'", "'l1'"]);
-            rig.sql(format!("INSERT INTO account_eligibility VALUES ('{p}','{c}','{model}',{fingerprint},'model_unsupported',{at}) ON CONFLICT(provider,credential_id,model) DO UPDATE SET listing_fingerprint=excluded.listing_fingerprint,observed_at=excluded.observed_at;"));
-            "eligibility fact"
-        }
-        30 => {
-            rig.sql(format!(
-                "DELETE FROM account_eligibility WHERE provider='{p}' AND credential_id='{c}';"
-            ));
-            "replace a listing's eligibility"
-        }
-        31..=42 => decide_both(rig, rng, now),
-        _ => {
-            let result = rig.store.account_command(AccountCommandKind::Maintenance, move |tx| {
-                tx.pool_sql(|conn| {
-                    conn.execute_batch(&format!("INSERT OR REPLACE INTO account_transient_backoff VALUES ('{p}','failed',{until},{at},'k','[]'); DELETE FROM fence_recheck WHERE rowid IN (SELECT rowid FROM fence_recheck LIMIT 1);"))
-                })?;
-                Err::<(), _>(err("planned failure"))
-            });
-            assert!(result.is_err());
-            "failed command"
-        }
-    }
+    native_generator::step(rig, rng, now)
 }
 
 /// The claim, probe and healing decisions a command takes: one chosen at
@@ -2604,8 +2362,8 @@ fn decide_both(rig: &Rig, rng: &mut Rng, now: i64) -> &'static str {
                         let refused: Option<(String, String)> = tx
                             .conn
                             .query_row(
-                                "SELECT provider_id,credential_id FROM credential_entitlement_fences
-                                 ORDER BY rowid LIMIT 1 OFFSET ?1",
+                                "SELECT provider,credential_id FROM block
+                                 WHERE kind='credential' AND source_present=1 ORDER BY rowid LIMIT 1 OFFSET ?1",
                                 [first as i64 % 2],
                                 |r| Ok((r.get(0)?, r.get(1)?)),
                             )
@@ -4016,7 +3774,7 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
     let (mut installs, mut renewals, mut expired) = (0usize, 0usize, 0usize);
     let mut archived = 0usize;
     let archive = |conn: &Connection| -> RouteStateResult<Vec<String>> {
-        conn.prepare("SELECT kind,origin_key,evidence,evidence_at,retired_at FROM fence_retired_origin ORDER BY rowid")
+        conn.prepare("SELECT kind,origin_key,evidence,evidence_at,retired_at FROM retirement_tombstone ORDER BY rowid")
             .map_err(err)?
             .query_map([], |r| {
                 Ok(format!(
@@ -4038,6 +3796,7 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
             // origin, and an origin a clock holds is never archived, so the
             // other steps leave new origins for the sync below to archive.
             if index % 2 == 0 {
+                let witnesses = rig.owner.renewal_witnesses.lock().unwrap().clone();
                 let (sql, memory, counts) = rig
                     .store
                     .account_command(AccountCommandKind::Maintenance, move |tx| {
@@ -4048,11 +3807,12 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
                                     .view_origins_in_scan_order()
                                     .into_iter()
                                     .map(|origin| {
-                                        let renew = state
-                                            .clock(&origin.kind, &origin.origin_key)
-                                            .is_some_and(|(clock, _)| {
-                                                clock.evidence != origin.evidence
-                                            });
+                                        let renew = native_generator::renewed(
+                                            &witnesses,
+                                            &origin.kind,
+                                            &origin.origin_key,
+                                            &origin.evidence,
+                                        );
                                         let lapsed = origin
                                             .deadline
                                             .is_some_and(|deadline| deadline <= now as f64);
@@ -4139,7 +3899,7 @@ fn sync_and_register_decided_on_the_state_equal_sql_over_generated_writes() {
             archived = rig
                 .store
                 .with_reader_for_test(|conn| {
-                    conn.query_row("SELECT count(*) FROM fence_retired_origin", [], |r| {
+                    conn.query_row("SELECT count(*) FROM retirement_tombstone", [], |r| {
                         r.get::<_, usize>(0)
                     })
                 })
