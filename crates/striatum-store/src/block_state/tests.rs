@@ -3350,19 +3350,31 @@ fn legacy_sync_rig(name: &str) -> Rig {
 fn sync_retires_provider_and_independent_route_without_invalidating_its_own_state() {
     let name = "sync-own-retirement";
     let legacy = legacy_sync_rig(name);
+    let observed = crate::now_ms();
+    let deadline = observed + 5_000;
     legacy.sql(format!(
         "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
-         VALUES ('retire-self',{}, {NOW},'provider capacity',{NOW},{NOW});
+         VALUES ('retire-self',{deadline}, {observed},'provider capacity',{observed},{observed});
          INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
-         VALUES ('retire-self/model','retire-self/model','retire-self','model',{}, {NOW},'route capacity',{NOW},{NOW});",
-        NOW + 1_000, NOW + 500,
+         VALUES ('retire-self/model','retire-self/model','retire-self','model',{}, {observed},'route capacity',{observed},{observed});",
+        deadline - 500,
     ));
     let rig = upgrade_sync_rig(legacy, name);
+    assert!(
+        crate::now_ms() < deadline - 500,
+        "migration completed while both imported refusals were still live"
+    );
     assert_eq!(rig.published().view_origins().len(), 2);
     assert_eq!(rig.published().stored_clocks().count(), 0);
+    // Tick uses the actual clock for synchronization, not its expiry argument.
+    // Let the imported evidence expire naturally; no freshness guard is bypassed.
+    let remaining = (deadline + 1).saturating_sub(crate::now_ms());
+    if remaining > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(remaining as u64));
+    }
     let loads = rig.owner.loads.load(Ordering::Relaxed);
     rig.store
-        .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW + 20_000))
+        .account_command(AccountCommandKind::Tick, |tx| tx.tick(crate::now_ms()))
         .unwrap();
     assert_eq!(
         rig.loads_since(loads),
@@ -3379,7 +3391,7 @@ fn sync_retires_provider_and_independent_route_without_invalidating_its_own_stat
         retired, 2,
         "both imported evidence generations were retired"
     );
-    rig.check(&[NOW + 20_000], "after retiring both independent sources");
+    rig.check(&[deadline + 1], "after retiring both independent sources");
 }
 
 fn upgrade_sync_rig(rig: Rig, name: &str) -> Rig {
