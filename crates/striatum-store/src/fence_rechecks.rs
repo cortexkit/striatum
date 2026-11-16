@@ -2665,7 +2665,7 @@ impl AccountTx<'_> {
                     .entitlement_fence(provider, credential)
                     .filter(|fence| fence.observed_at_ms < admitted_at)
                 {
-                    self.clear_held_entitlement_fence(&fence)?;
+                    self.clear_held_entitlement_fence_at(&fence, now)?;
                 }
             }
             "account_route" => {

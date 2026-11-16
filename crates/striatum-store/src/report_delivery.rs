@@ -554,10 +554,20 @@ impl AccountTx<'_> {
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::report_delivery::clear_held_entitlement_fence",
         );
+        self.clear_held_entitlement_fence_at(fence, crate::now_ms())
+    }
+
+    /// Keep a successful report's captured time on the retained refusal row;
+    /// statement execution can occur later or repeat after a writer retry.
+    pub(crate) fn clear_held_entitlement_fence_at(
+        &self,
+        fence: &striatum_core::route_state_store::CredentialEntitlementFence,
+        now: i64,
+    ) -> RouteStateResult<()> {
         let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?6,cleared_by='removed',claim_owner=NULL
             WHERE kind='credential' AND is_origin=1 AND source_present=1 AND provider=?1 AND credential_id=?2
             AND code=?3 AND listing_fingerprint IS ?4 AND observed_at=?5",
-            params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms,crate::now_ms()]).map_err(err)?;
+            params![fence.provider_id,fence.credential_id,fence.code,fence.listing_fingerprint,fence.observed_at_ms,now]).map_err(err)?;
         crate::block_state::expect_changes(
             changed,
             1,
