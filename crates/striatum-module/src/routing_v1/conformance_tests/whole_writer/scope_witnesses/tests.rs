@@ -98,16 +98,16 @@ impl World {
             .await;
         assert!(admitted["account"]["credential_id"].is_string());
         let now = self.now as i64;
-        let roster = crate::ACCOUNT_QUOTA
-            .get()
-            .unwrap()
+        // This vault-backed request scopes the refusal using the credential
+        // listing's version, not the separate quota poll's roster version.
+        let shared = self.harness.credentials();
+        let roster = shared
             .lock()
             .unwrap()
-            .roster
-            .as_ref()
+            .listing_version()
             .unwrap()
-            .view
-            .clone();
+            .0
+            .to_owned();
         let rows: Vec<_> = self
             .catalog
             .accounts

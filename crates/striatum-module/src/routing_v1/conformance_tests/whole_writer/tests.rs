@@ -14,6 +14,8 @@ mod claims;
 mod continuation;
 #[path = "credential/tests.rs"]
 mod credential;
+#[path = "credential_witnesses/tests.rs"]
+mod credential_witnesses;
 #[path = "fences/tests.rs"]
 mod fences;
 #[path = "history/tests.rs"]
@@ -586,6 +588,7 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
         world.finished_charge_witnesses(seed).await;
         world.outside_state_witnesses(seed).await;
         world.admit_scope_witnesses(seed).await;
+        world.credential_witnesses(seed).await;
         assert_trace_is_declared(&world.trace);
         assert_all_producers_driven(&world.trace);
     }

@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "ordering/tests.rs"]
+mod ordering;
+
 impl World {
     pub(super) async fn outside_state_witnesses(&mut self, seed: u64) {
         for reload in [false, true] {
@@ -7,6 +10,8 @@ impl World {
             let mut world = World::new(&format!("outside-state-{seed}-{reload}")).await;
             world.expired_and_released_lease_witness(reload).await;
             world.closed_admission_observation_witness(reload).await;
+            world.healed_wall_ordering_witness(reload).await;
+            world.late_completion_ordering_witness(reload).await;
         }
     }
 
