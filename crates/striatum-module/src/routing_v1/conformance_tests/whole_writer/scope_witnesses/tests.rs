@@ -62,7 +62,7 @@ impl World {
             "a size wall must change the real Admit reply: {}",
             blocked.1
         );
-        assert_eq!(blocked.1["code"], "account_pool_exhausted", "{}", blocked.1);
+        assert_eq!(blocked.1["code"], "account_not_authorized", "{}", blocked.1);
         let small = self
             .ok(
                 Caller::Runner,

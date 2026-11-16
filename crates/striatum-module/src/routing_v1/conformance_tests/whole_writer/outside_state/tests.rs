@@ -97,19 +97,19 @@ impl World {
             .ok(Caller::Runner, "route.account_observe", params.clone())
             .await;
         assert_eq!(
-            late["bound"], true,
+            late["observation"]["bound"], true,
             "a closed admission remains attributable: {late}"
         );
         assert_eq!(
-            late["duplicate"], false,
+            late["observation"]["duplicate"], false,
             "the observation is a new event: {late}"
         );
         let replay = self
             .ok(Caller::Runner, "route.account_observe", params)
             .await;
-        assert_eq!(replay["bound"], true, "{replay}");
+        assert_eq!(replay["observation"]["bound"], true, "{replay}");
         assert_eq!(
-            replay["duplicate"], true,
+            replay["observation"]["duplicate"], true,
             "a retried closed-row observation is still deduplicated: {replay}"
         );
     }
