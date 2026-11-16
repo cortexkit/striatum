@@ -24,7 +24,7 @@ pub(crate) const ROUTE_READ_PROVIDER_PRIOR_OBSERVED: &str = concat!(
 pub(crate) const ROUTE_READ_PROVIDER_INHERITED_ROUTES: &str = concat!(route_write_read!(), "SELECT m.route_key,m.model_id,m.wall_observed_at,m.last_error,m.last_error_at,a.wall_class,COALESCE(a.wall_unscoped,0) FROM model_route_state m
     LEFT JOIN block a ON a.kind='route' AND a.origin_key=json_array(m.route_key) AND a.is_origin=1
     LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
-    LEFT JOIN block p ON p.kind='provider' AND p.origin_key=json_array(p.provider_key) AND p.is_origin=1 AND p.source_present=1
+    LEFT JOIN block p ON p.kind='provider' AND p.origin_key=json_array(m.provider_id) AND p.is_origin=1 AND p.source_present=1
     WHERE m.provider_id=?1 AND ((b.cooldown_until IS NULL AND b.quota_exhausted_until IS NULL)
         OR (b.observed_at=p.observed_at AND b.scope_error IS p.scope_error
           AND COALESCE(b.cooldown_until,0)<=COALESCE(p.cooldown_until,0)
