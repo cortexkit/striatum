@@ -120,11 +120,7 @@ pub(super) async fn select(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    super::consumers::record_select(
-        "routing/v1",
-        params["consumer"].as_str(),
-        &super::operator_config(deps),
-    );
+    super::consumers::record_select("routing/v1", params, &super::operator_config(deps));
     let capabilities = super::describe::capabilities();
     if capabilities.contains(&"select_kind") && capabilities.contains(&"select_media") {
         let config = super::operator_config(deps);

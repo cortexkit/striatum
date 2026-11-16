@@ -259,7 +259,8 @@ async fn priority_select_calls_log_one_class_and_head_mark_on_the_select_surface
                 calls,
                 vec![json!({
                     "surface":if legacy {"route.select"} else {"routing/v1"},
-                    "consumer":consumer,"class":class,"head_request":class == "interactive"
+                    "consumer":consumer,"class":class,"head_request":class == "interactive",
+                    "pinned":false,"pin_origin":null
                 })]
             );
             let mut admission = request(&format!("unchanged-{legacy}"));
@@ -285,6 +286,38 @@ async fn priority_select_calls_log_one_class_and_head_mark_on_the_select_surface
             capture(consumer, Some(class)).await
         );
     }
+}
+
+#[tokio::test]
+async fn select_call_line_reports_the_pin_and_its_origin_as_sent() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    crate::routing_v1::consumers::replace_catalog(&json!([{
+        "module_id":"class-owner","nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":[{"name":"class-owner.mason"}]}}
+    }]));
+    let owner = harness.bind(reserved("class-owner"), None).await;
+    crate::take_operator_infos();
+    // The line is written before the pin is resolved, so an unknown model is
+    // enough; class-owner isn't enrolled for user pins, and the line still
+    // shows what it sent.
+    owner
+        .call_raw(
+            "route.select",
+            &json!({"consumer":"class-owner.mason","requirements":{"iq":30,"eq":0},
+                "pin":{"model":"nobody/unknown-model"},"pin_origin":"user"}),
+        )
+        .await;
+    let calls: Vec<Value> = crate::take_operator_infos()
+        .iter()
+        .filter_map(|line| {
+            line.strip_prefix("routing select call ")
+                .map(|body| serde_json::from_str(body).unwrap())
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0]["pinned"], json!(true));
+    assert_eq!(calls[0]["pin_origin"], json!("user"));
 }
 
 #[tokio::test]

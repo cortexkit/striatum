@@ -530,8 +530,12 @@ impl Registry {
 }
 
 /// Count requests at the API boundary, not selection attempts: internal
-/// retries must not turn one API call into several log lines.
-pub(crate) fn record_select(surface: &str, consumer: Option<&str>, config: &LiveConfig) {
+/// retries must not turn one API call into several log lines. `pinned` and
+/// `pin_origin` are logged as the caller sent them, before routing checks
+/// whether that caller may mark a user pin, so an operator can see what
+/// actually arrived on the wire.
+pub(crate) fn record_select(surface: &str, params: &Value, config: &LiveConfig) {
+    let consumer = params.get("consumer").and_then(Value::as_str);
     let class = consumer
         .and_then(|name| effective(config).defaults_for(name).priority)
         .unwrap_or_default();
@@ -539,7 +543,9 @@ pub(crate) fn record_select(surface: &str, consumer: Option<&str>, config: &Live
         "routing select call {}",
         serde_json::json!({
             "surface":surface,"consumer":consumer,"class":class,
-            "head_request":class == cortexkit_role_routing::declarations::ConsumerPriority::Interactive
+            "head_request":class == cortexkit_role_routing::declarations::ConsumerPriority::Interactive,
+            "pinned":params.get("pin").is_some_and(|pin| !pin.is_null()),
+            "pin_origin":params.get("pin_origin").and_then(Value::as_str)
         })
     ));
 }
