@@ -608,18 +608,18 @@ impl<'a> Allocator<'a> {
     }
 
     /// Step 2: retain the affinity unless an invalidation rule applies. A
-    /// better score elsewhere, a reading below the reserve, or a stale reading
-    /// never moves it.
+    /// better score elsewhere or a quota reading, even at 100%, never moves it
+    /// on its own. Explicit policy floors and confirmed blocks still apply.
     fn evaluate_affinity(
         &self,
         affinity: &ConversationAffinity,
-        check_expiry: bool,
+        existing_affinity: bool,
     ) -> AffinityVerdict {
         use AffinityVerdict::Leave;
         if normalize(&affinity.affinity_model) != self.affinity_model {
             return Leave(InvalidationReason::UserModelChange);
         }
-        if check_expiry && self.now >= affinity.expires_at_ms && !affinity.lease_active {
+        if existing_affinity && self.now >= affinity.expires_at_ms && !affinity.lease_active {
             return Leave(InvalidationReason::IdleExpired);
         }
         let view = match &self.state.roster {
@@ -682,14 +682,13 @@ impl<'a> Allocator<'a> {
             return Leave(InvalidationReason::PolicyFloor);
         }
         let fences = self.fences_for(&affinity.account_id);
+        // Rounded quota readings are not refusals: keep an existing session's
+        // prompt cache. Synthetic affinities used to compute cold-session
+        // holds still obey the reading and the caller and provider wait caps.
         let reading = view
+            .filter(|_| !existing_affinity)
             .and_then(|view| view.quota.as_ref())
             .filter(|reading| self.fresh_full(reading));
-        // Everything that blocks this conversation's next request on its
-        // account: every standing block, and every window a full-band reading
-        // shows at 100% used. The reading-based ones are soft and local to
-        // this conversation: they create no fence and are re-evaluated at
-        // every admission, so a newer reading below 100 ends them.
         let mut blockers: Vec<Blocker> = Vec::new();
         if self.budget_blocked(&affinity.account_id) {
             blockers.push(Blocker {

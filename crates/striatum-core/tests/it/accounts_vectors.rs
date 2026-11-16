@@ -16,8 +16,9 @@ use striatum_core::accounts::evidence::{
     ResetSource, WindowEvidence,
 };
 use striatum_core::accounts::{
-    decide, eligibility::scope_check, ConfirmationSource, FenceScope, GeneralWindow, HoldBasis,
-    ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime, ScopedList, ScopedWindow,
+    decide, eligibility::scope_check, AdmitReason, AffinityOutcome, ConfirmationSource, FenceScope,
+    GeneralWindow, ModelFamily, ObservationSource, PoolKey, PoolScope, ResetTime, ScopedList,
+    ScopedWindow,
 };
 
 const VECTORS: &str = include_str!("../fixtures/antauth-routing-vectors-b504bc84-20260929.json");
@@ -635,14 +636,10 @@ fn broca_limit_windows_map_to_pool_keys_and_retry_after_is_not_a_reset() {
     );
 }
 
-/// The three laundering paths' allocator side: routing holds the rounded-100
-/// reading (raw 0.995) in the full band with no fence, and the 5h reset is 14
-/// minutes away. The conversation gets a soft, local proactive hold, as the
-/// reference's pre-send check gives it: the hold's basis is the reading, not a
-/// confirmed fence, and the account is not fenced for cold work, only
-/// zero-weighted.
+/// Rounded-100 readings (raw 0.995) do not confirm exhaustion or interrupt an
+/// established session, regardless of how the reading reached routing.
 #[test]
-fn laundering_paths_give_only_a_soft_local_hold_and_no_shared_fence() {
+fn laundering_paths_retain_sticky_sessions_without_a_shared_fence() {
     // Direct submission and the passive feed both land as header readings;
     // Insula-carried headers keep their Insula source.
     for (path, source) in [
@@ -664,14 +661,17 @@ fn laundering_paths_give_only_a_soft_local_hold_and_no_shared_fence() {
         ]);
         st.affinity = Some(affinity("acct-a", "claude-sonnet-5", 3));
         let decision = decide(&request(), &st, NOW);
-        let hold = decision
-            .hold()
-            .unwrap_or_else(|| panic!("{path}: expected a hold, got {:?}", decision.outcome));
-        assert_eq!(hold.account_id, "acct-a", "{path}");
-        assert_eq!(hold.basis, HoldBasis::ProactiveReading, "{path}");
+        let admission = decision
+            .admission()
+            .unwrap_or_else(|| panic!("{path}: expected admission, got {:?}", decision.outcome));
+        assert_eq!(admission.account_id, "acct-a", "{path}");
+        assert_eq!(admission.reason, AdmitReason::StickyHit, "{path}");
         assert_eq!(
-            (hold.base_retry_after_s, hold.retry_after_s),
-            (840, 846),
+            admission.affinity,
+            AffinityOutcome::Retained {
+                pin_id: "pin-acct-a".into(),
+                pin_generation: 3
+            },
             "{path}"
         );
         let note = decision.account_note("acct-a").unwrap();
