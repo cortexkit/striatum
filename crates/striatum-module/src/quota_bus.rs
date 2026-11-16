@@ -167,6 +167,12 @@ fn mark_bound(client: &BusClient, handler: &Handler, bound_revision: u64) {
     let mut revisions = client.connection_changes();
     let matches = *revisions.borrow_and_update() == bound_revision;
     if let Ok(mut cache) = handler.quota_cache.lock() {
+        // The source line is the operator's signal that quota readings come
+        // from Insula's events; `attached()` stays silent here because this
+        // has already flipped the flag it compares against.
+        if matches && !cache.consumer.attached {
+            eprintln!("[striatum] quota source=insula events (10m snapshot backstop)");
+        }
         cache.consumer.attached = matches;
         if matches {
             cache.consumer.last_error = None;
