@@ -472,11 +472,10 @@ mod lookup_plan_tests {
         store
             .with_writer_for_test(|conn| {
                 let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                let count = statement.parameter_count();
                 let rows = statement
                     .query_map(
-                        rusqlite::params_from_iter(
-                            ["p", "c", "x"].into_iter().take(sql.matches('?').count()),
-                        ),
+                        rusqlite::params_from_iter(["p", "c", "x"].into_iter().cycle().take(count)),
                         |row| row.get::<_, String>(3),
                     )?
                     .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -508,6 +507,29 @@ mod lookup_plan_tests {
             "{plan:?}"
         );
     }
+
+    #[test]
+    fn fork_parent_and_closed_used_binding_lookups_never_scan() {
+        for sql in [fork_parent_sql(), fork_used_binding_sql()] {
+            let plan = plan(&sql);
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("account_continue_by_admission")),
+                "{plan:?}"
+            );
+            assert!(
+                plan.iter()
+                    .any(|line| line.contains("sqlite_autoindex_account_admission_1")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan
+                    .iter()
+                    .any(|line| line.starts_with("SCAN ") || line.contains("TEMP B-TREE")),
+                "{plan:?}"
+            );
+        }
+    }
 }
 
 /// Marks the SQL text of a keyed-exception read. The module serves the
@@ -531,7 +553,57 @@ pub fn keyed_exception_reads() -> u64 {
     KEYED_EXCEPTION_READS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+fn fork_parent_sql() -> String {
+    format!(
+        "SELECT {ADMISSION_COLUMNS}, EXISTS(SELECT 1 FROM account_continue c
+        WHERE c.principal=?1 AND c.admission_id=?2 AND c.used_at_ms IS NOT NULL)
+        FROM account_admission {KEYED_EXCEPTION} WHERE principal=?1 AND admission_id=?2"
+    )
+}
+
+fn fork_used_binding_sql() -> String {
+    format!(
+        "SELECT {ADMISSION_COLUMNS} FROM account_admission {KEYED_EXCEPTION}
+        WHERE principal=?1 AND admission_id=(SELECT reservation_id FROM account_continue
+            WHERE principal=?1 AND admission_id=?2 AND used_at_ms IS NOT NULL
+            ORDER BY rowid DESC LIMIT 1)"
+    )
+}
+
 impl AccountTx<'_> {
+    /// The parent lookup also reports whether its run moved. That keyed
+    /// existence check avoids a second statement for a closed unmoved run.
+    pub fn fork_parent_by_key(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<(AccountAdmissionRow, bool)>> {
+        self.conn
+            .query_row(&fork_parent_sql(), params![principal, id], |row| {
+                Ok((
+                    admission_from_row(row)?,
+                    row.get(row.as_ref().column_count() - 1)?,
+                ))
+            })
+            .optional()
+            .map_err(err)
+    }
+
+    /// A closed moved parent's latest used reservation, in one keyed statement.
+    pub fn fork_used_binding_by_key(
+        &self,
+        principal: &str,
+        id: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        self.conn
+            .query_row(
+                &fork_used_binding_sql(),
+                params![principal, id],
+                admission_from_row,
+            )
+            .optional()
+            .map_err(err)
+    }
     /// Keyed exception: one admission by primary key, for a caller whose
     /// memory state does not hold it because it is closed or absent.
     pub fn admission_by_key(

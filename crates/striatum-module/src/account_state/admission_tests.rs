@@ -989,7 +989,7 @@ pub(crate) fn pinned_admission_for_route(
 }
 
 fn prune_everything_before(store: &SqliteRouteStateStore, before: i64) {
-    crate::account_writer::prune_account_admissions(store, before, 100, before + 30 * 60_000)
+    crate::account_writer::prune_account_admissions(store, before, 100, before + 90 * 60_000)
         .unwrap();
 }
 
@@ -1372,7 +1372,7 @@ fn live_sized_admission_state_costs() {
             0 => crate::account_writer::prune_account_admissions(
                 &store,
                 before,
-                256,
+                crate::retention::ADMISSION_DELETE_BATCH_ROWS,
                 now + 30 * 60_000,
             )
             .unwrap(),

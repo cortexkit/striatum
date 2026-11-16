@@ -88,15 +88,6 @@
       "format": "double",
       "default": null
     },
-    "model_naming": {
-      "description": "How providers spell model ids and which model families the capability\nheuristic recognizes; see `ModelNamingConfig`.",
-      "$ref": "#/$defs/ModelNamingConfig",
-      "default": {
-        "basic_families": [],
-        "provider_rewrites": {},
-        "vendor_prefixes": []
-      }
-    },
     "models": {
       "description": "Keyed by \"provider/model\" or \"provider/model/variant\".",
       "type": "object",
@@ -225,25 +216,6 @@
       "enum": [
         "emergency",
         "capacity"
-      ]
-    },
-    "BasicFamilyConfig": {
-      "type": "object",
-      "properties": {
-        "family": {
-          "type": "string"
-        },
-        "needles": {
-          "type": "array",
-          "items": {
-            "type": "string"
-          }
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "family",
-        "needles"
       ]
     },
     "BelowBarPolicy": {
@@ -665,64 +637,6 @@
         }
       },
       "additionalProperties": false
-    },
-    "ModelNamingConfig": {
-      "description": "Operator config for `striatum_core::ModelNaming`, the model-id\nspelling `route.resolve_model` applies per provider and the model families\n`route.model_capabilities` recognizes by name. The config converter writes\nthe shipped values from its data file.",
-      "type": "object",
-      "properties": {
-        "basic_families": {
-          "description": "Families recognized by a substring of the normalized model id, each\nwith the basic variants. The first match wins.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/BasicFamilyConfig"
-          }
-        },
-        "provider_rewrites": {
-          "description": "The rewrites each provider applies to a model id, in order.",
-          "type": "object",
-          "additionalProperties": {
-            "type": "array",
-            "items": {
-              "$ref": "#/$defs/ModelRewriteConfig"
-            }
-          },
-          "default": {}
-        },
-        "vendor_prefixes": {
-          "description": "For a gateway serving other vendors' models as `vendor/model`: the\nvendor of a bare model id, by the id's prefix. The first match wins.",
-          "type": "array",
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/VendorPrefixConfig"
-          }
-        }
-      },
-      "additionalProperties": false
-    },
-    "ModelRewriteConfig": {
-      "description": "`vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a\ndashed two-part Claude-style version with a dot; `{\"preview_alias\": a}`\nexpands the bare alias `a` to its `-preview` id.",
-      "oneOf": [
-        {
-          "type": "string",
-          "enum": [
-            "vendor_prefix",
-            "dot_version"
-          ]
-        },
-        {
-          "type": "object",
-          "properties": {
-            "preview_alias": {
-              "type": "string"
-            }
-          },
-          "additionalProperties": false,
-          "required": [
-            "preview_alias"
-          ]
-        }
-      ]
     },
     "NoCap": {
       "type": "string",
@@ -1389,22 +1303,6 @@
         "standard",
         "fast",
         "ultrafast"
-      ]
-    },
-    "VendorPrefixConfig": {
-      "type": "object",
-      "properties": {
-        "prefix": {
-          "type": "string"
-        },
-        "vendor": {
-          "type": "string"
-        }
-      },
-      "additionalProperties": false,
-      "required": [
-        "prefix",
-        "vendor"
       ]
     }
   }

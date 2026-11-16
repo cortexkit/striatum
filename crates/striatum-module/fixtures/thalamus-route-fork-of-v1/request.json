@@ -1,0 +1,1 @@
+{"admission_id":"synthetic-fork-admission","conversation_key":"synthetic-fork-session","fork_of":{"admission_id":"new-parent"},"head_turn":true,"hold_wait_max_s":0,"model":"synthetic-model","provider":"anthropic"}

@@ -73,6 +73,10 @@ use crate::config_overrides::read_routing_config_value;
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 /// Most rows one batch deletes. Each batch is one short transaction.
 pub const RETENTION_BATCH_ROWS: usize = 256;
+/// Admission cleanup copies demand and latest-admission indexes as it deletes.
+/// Eight keyed rows keep those writer commands below ten milliseconds on the
+/// live-sized admission fixture; candidate discovery runs on a pooled reader.
+pub const ADMISSION_DELETE_BATCH_ROWS: usize = 8;
 /// Most batches one pass runs per table. With the batch size and interval
 /// above, a pass can retire about 4,000 rows a minute per table, well above
 /// what serving writes, so a backlog drains without any single long delete.
@@ -555,15 +559,21 @@ fn run_retention_pass_with_affinity_sweep(
         || counted(store.purge_shadow_decisions(rows)),
     );
     let history_before = before(now_ms, window_ms(windows.account_selection_days, DAY_MS));
-    let (admissions, admissions_drained) =
-        drain("account_admission", budget, per_table, batches, || {
+    let (admissions, admissions_drained) = drain_batches(
+        "account_admission",
+        rows.min(ADMISSION_DELETE_BATCH_ROWS),
+        budget,
+        per_table,
+        batches,
+        || {
             counted(crate::account_writer::prune_account_admissions(
                 store,
                 history_before,
-                rows,
+                rows.min(ADMISSION_DELETE_BATCH_ROWS),
                 now_ms,
             ))
-        });
+        },
+    );
     let (holds, holds_drained) = drain("account_hold", budget, per_table, batches, || {
         counted(store.prune_account_holds(history_before, rows))
     });
@@ -1718,10 +1728,15 @@ mod tests {
         );
         assert_eq!(left("routing_v1_affinity", "affinity"), ["warm"]);
 
-        // Once the runs finish and a week passes, the rest goes too.
+        // Used moves remain fork bindings while their parent admission is
+        // retained. Age the finished admissions past their thirty-day window
+        // before expecting the old move and its replay records to retire.
+        let history_old = NOW - 31 * DAY_MS;
         connection
             .execute_batch(&format!(
-                "UPDATE account_admission SET state = 'finished', finished_at = {old}"
+                "UPDATE account_admission SET state = 'finished', committed_at={history_old},
+                 admission_valid_until={history_old}, lease_valid_until={history_old},
+                 started_at={history_old}, finished_at={history_old}, last_observed_at=NULL"
             ))
             .unwrap();
         let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());

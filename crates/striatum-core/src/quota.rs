@@ -844,8 +844,8 @@ mod tests {
         serde_json::from_value(defaults["quota_model_pools"].clone()).unwrap()
     }
     use crate::model_facts::{Confidence, ModelRequirements, ModelScores, ScoreProvenance};
-    use crate::model_resolution::ACCOUNT_PRODUCER;
     use crate::model_router::{RouteRuntimeState, SelectModelRouteInput};
+    use crate::usage_facts::ACCOUNT_PRODUCER;
 
     const NOW_MS: f64 = 1_893_456_000_000.0; // 2030-01-01T00:00:00Z
 

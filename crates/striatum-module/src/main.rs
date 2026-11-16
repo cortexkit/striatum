@@ -38,7 +38,6 @@ mod legacy_wire;
 #[cfg(test)]
 mod literal_census_tests;
 mod logging;
-mod model_resolution;
 mod panel_policy;
 mod project_settings;
 mod quota_bus;
@@ -65,6 +64,7 @@ mod test_daemon;
 #[path = "test_exe/tests.rs"]
 mod test_exe;
 mod tier_settings;
+mod usage_facts;
 mod variant_policy;
 mod winner_ladder;
 mod work_model_pin;
@@ -1013,70 +1013,11 @@ impl Drop for InjectedClock {
     }
 }
 
-/// The per-thread test state a route handler reads: the injected clocks, ID
-/// sequence and diagnostics buffer. Route handlers run on a blocking thread (see
-/// [`run_route_handler_off_async_workers`]), so the state of the thread that
-/// dispatched the handler is installed there for the handler's lifetime.
 #[cfg(test)]
-#[derive(Clone)]
-struct TestThreadState {
-    now_ms: Option<u64>,
-    warnings: OperatorWarnings,
-    infos: OperatorWarnings,
-    replay: Option<striatum_store::replay::Inputs>,
-    writer_trace: Option<striatum_store::writer_entry_trace::Trace>,
-}
-
+#[path = "test_thread_state/tests.rs"]
+mod test_thread_state;
 #[cfg(test)]
-impl TestThreadState {
-    fn capture() -> Self {
-        Self {
-            now_ms: INJECTED_NOW_MS.with(std::cell::Cell::get),
-            warnings: OPERATOR_WARNINGS.with(|sink| Arc::clone(&sink.borrow())),
-            infos: OPERATOR_INFOS.with(|sink| Arc::clone(&sink.borrow())),
-            replay: striatum_store::replay::current(),
-            writer_trace: striatum_store::writer_entry_trace::current(),
-        }
-    }
-
-    /// Make this the current thread's state until the returned guard drops,
-    /// which puts back what the thread had before. Blocking threads are reused,
-    /// so a handler's state must not outlive it.
-    fn install(self) -> InstalledTestThreadState {
-        let replay = self.replay.as_ref().map(|inputs| inputs.install());
-        let writer_trace = self.writer_trace.as_ref().map(|trace| trace.install());
-        InstalledTestThreadState {
-            previous: Some(TestThreadState {
-                now_ms: INJECTED_NOW_MS.with(|clock| clock.replace(self.now_ms)),
-                warnings: OPERATOR_WARNINGS.with(|sink| sink.replace(self.warnings)),
-                infos: OPERATOR_INFOS.with(|sink| sink.replace(self.infos)),
-                replay: None,
-                writer_trace: None,
-            }),
-            _replay: replay,
-            _writer_trace: writer_trace,
-        }
-    }
-}
-
-/// Holds the state a thread had before [`TestThreadState::install`].
-#[cfg(test)]
-struct InstalledTestThreadState {
-    previous: Option<TestThreadState>,
-    _replay: Option<striatum_store::replay::Guard>,
-    _writer_trace: Option<striatum_store::writer_entry_trace::Installed>,
-}
-
-#[cfg(test)]
-impl Drop for InstalledTestThreadState {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            INJECTED_NOW_MS.with(|clock| clock.set(previous.now_ms));
-            OPERATOR_WARNINGS.with(|sink| *sink.borrow_mut() = previous.warnings);
-            OPERATOR_INFOS.with(|sink| *sink.borrow_mut() = previous.infos);
-        }
-    }
-}
+use test_thread_state::TestThreadState;
 
 /// Resolve the storage descriptor, preferring the daemon-delivered one from
 /// `HELLO_ACK.storage` and falling back to a local dev descriptor when storage is
@@ -3593,12 +3534,14 @@ async fn handle_record_usage(
             }
         };
     if params.speed_sample {
-        let result = model_resolution::speed_sample_observation_from_store(&params, store)
-            .and_then(|sample| match sample {
-                Some(sample) => store
-                    .record_speed_sample_delivery(&sample)
-                    .map_err(|e| e.to_string()),
-                None => Ok(striatum_core::route_state_store::UsageRecordResult::default()),
+        let result =
+            usage_facts::speed_sample_observation_from_store(&params, store).and_then(|sample| {
+                match sample {
+                    Some(sample) => store
+                        .record_speed_sample_delivery(&sample)
+                        .map_err(|e| e.to_string()),
+                    None => Ok(striatum_core::route_state_store::UsageRecordResult::default()),
+                }
             });
         return match result {
             Ok(result) => {
@@ -3632,7 +3575,7 @@ async fn handle_record_usage(
             }
         };
     }
-    let observation = match model_resolution::usage_observation_from_store(params, store) {
+    let observation = match usage_facts::usage_observation_from_store(params, store) {
         Ok(observation) => observation,
         Err(error) => {
             return send_route_error(writer, ver, channel, epoch, corr, "store_error", &error)
@@ -4594,9 +4537,6 @@ pub(crate) fn handles(method: &str) -> bool {
             | ROUTE_MODEL_FACTS_OP
             | ROUTE_CATALOG_TARGETS_OP
             | ROUTE_HEAD_CHOICES_OP
-            | model_resolution::RESOLVE_MODEL_OP
-            | model_resolution::MODEL_CAPABILITIES_OP
-            | model_resolution::AGENT_MODEL_REQUIREMENTS_OP
             | ROUTE_MODEL_UPSERT_OP
             | ROUTE_LIST_INFERRED_OP
             | ROUTE_LIST_UNSCORED_OP
@@ -4675,21 +4615,6 @@ pub(crate) fn served_operations() -> Vec<ManagementOperation> {
         },
         ManagementOperation {
             name: ROUTE_HEAD_CHOICES_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: None,
-        },
-        ManagementOperation {
-            name: model_resolution::RESOLVE_MODEL_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: None,
-        },
-        ManagementOperation {
-            name: model_resolution::MODEL_CAPABILITIES_OP.to_string(),
-            kind: ManagementOperationKind::Query,
-            description: None,
-        },
-        ManagementOperation {
-            name: model_resolution::AGENT_MODEL_REQUIREMENTS_OP.to_string(),
             kind: ManagementOperationKind::Query,
             description: None,
         },
@@ -7328,7 +7253,7 @@ mod tests {
                 tool_elapsed_ms,
                 ..Default::default()
             };
-            let observation = model_resolution::usage_observation_from_store(facts, &store)
+            let observation = usage_facts::usage_observation_from_store(facts, &store)
                 .unwrap()
                 .expect("recordable refusal");
             assert_eq!(
@@ -10605,6 +10530,32 @@ mod tests {
                 _ => true,
             }
         }));
+    }
+
+    #[tokio::test]
+    async fn removed_opencode_plugin_operations_are_unknown_methods() {
+        let rig = Rig::new("removed-opencode-plugin-wire");
+        let store = Arc::new(rig.open_store());
+        let operations = served_operations();
+        for method in [
+            "route.resolve_model",
+            "route.model_capabilities",
+            "route.agent_model_requirements",
+        ] {
+            assert!(!handles(method), "{method}");
+            assert!(operations.iter().all(|op| op.name != method), "{method}");
+            for request in [
+                json!({"method":method}),
+                json!({"method":method,"params":null}),
+                json!({"method":method,"params":{"action":"pipeline","providerID":"wireco","modelID":"model"}}),
+            ] {
+                let response = run_route_wire_request(&store, request).await;
+                assert_eq!(response.header.ty, FrameType::Error, "{method}");
+                let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+                assert_eq!(body["code"], "unknown_method", "{method}: {body}");
+                assert_eq!(body["message"], format!("unknown method '{method}'"));
+            }
+        }
     }
 
     #[test]

@@ -16,6 +16,8 @@ python3 -m unittest scripts/tests/test_rust_include_boundary.py
 python3 scripts/rust-include-boundary.py
 python3 -m unittest scripts/tests/test_test_scratch.py
 python3 scripts/test-scratch.py
+python3 -m unittest scripts/tests/test_source_size.py
+python3 scripts/source-size.py
 python3 -m unittest scripts/tests/test_test_self_exec.py
 python3 scripts/test-self-exec.py
 python3 scripts/test-dev-binaries.py

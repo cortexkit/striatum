@@ -796,6 +796,31 @@ fn module_consumer_policy_inherits_without_legacy_aliases() {
 }
 
 #[test]
+fn removed_model_naming_setting_is_a_clear_config_error() {
+    for document in [
+        json!({"model_naming":{}}),
+        json!({"model_naming":null}),
+        json!({"model_routing":{"model_naming":{}}}),
+        json!({"model_routing":{"model_naming":null}}),
+    ] {
+        let error = parse_config(&document.to_string()).unwrap_err();
+        assert!(
+            error.contains("config_key_removed: model_naming"),
+            "{error}"
+        );
+        assert!(error.contains("removed"), "{error}");
+        let error = crate::config_convert::convert_value(document).unwrap_err();
+        assert!(
+            error.contains("model_naming") && error.contains("removed"),
+            "{error}"
+        );
+    }
+    let converted = crate::config_convert::convert_value(json!({"model_routing":{}})).unwrap();
+    assert!(converted.get("model_naming").is_none());
+    parse_config(&converted.to_string()).unwrap();
+}
+
+#[test]
 fn removed_substrates_setting_is_a_clear_config_error() {
     let error = parse_config(r#"{"model_routing":{"substrates":{"all":{"default":"broca"}}}}"#)
         .unwrap_err();

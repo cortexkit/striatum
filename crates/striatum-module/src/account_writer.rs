@@ -391,9 +391,13 @@ pub(crate) fn prune_account_admissions(
     #[cfg(test)]
     let _writer_entry =
         striatum_store::writer_entry_trace::enter("module_adapter::prune_account_admissions");
-    // Pruning is a writer command so the admission state drops the same rows.
+    let keys = store.plan_account_admissions(before, limit, now_ms)?;
+    if keys.is_empty() {
+        return Ok(0);
+    }
+    // Planning stays off the writer; keyed rechecks and state updates are atomic.
     execute(store, AccountCommandKind::Maintenance, move |tx| {
-        tx.prune_account_admissions(before, limit, now_ms)
+        tx.delete_account_admissions(before, &keys, now_ms)
     })
 }
 

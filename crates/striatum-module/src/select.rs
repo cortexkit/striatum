@@ -997,22 +997,6 @@ async fn handle_select_request_attempt(
     if envelope.method == ROUTE_MODEL_FACTS_OP {
         return handle_model_facts(frame, writer, store, operator_config_path).await;
     }
-    if envelope.method == model_resolution::RESOLVE_MODEL_OP {
-        return model_resolution::handle_resolve_model(frame, writer, &live_config.model_naming())
-            .await;
-    }
-    if envelope.method == model_resolution::MODEL_CAPABILITIES_OP {
-        return model_resolution::handle_model_capabilities(
-            frame,
-            writer,
-            store,
-            &live_config.model_naming(),
-        )
-        .await;
-    }
-    if envelope.method == model_resolution::AGENT_MODEL_REQUIREMENTS_OP {
-        return model_resolution::handle_agent_model_requirements(frame, writer).await;
-    }
     if envelope.method == ROUTE_MODEL_UPSERT_OP {
         let ladder_sources =
             winner_ladder::LadderSources::live(routing_config_path, operator_config_path);

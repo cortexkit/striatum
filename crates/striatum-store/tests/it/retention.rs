@@ -265,6 +265,153 @@ fn affinity_row(conversation: &str, pin: &AccountPinRow, expires_at: i64) -> Acc
     }
 }
 
+#[test]
+fn fork_parent_retention_follows_affinity_deadline_and_grace_without_a_cycle() {
+    let rig = Rig::new("fork-parent-retention");
+    let store = rig.open();
+    let pin = pin_row("warm-parent", "warm-conversation", 1, "warm-decision");
+    let old = NOW - 60 * DAY;
+    let mut affinity = affinity_row("warm-conversation", &pin, NOW - DAY);
+    affinity.lease_valid_until = Some(NOW + DAY);
+    store
+        .account_transaction(|tx| {
+            tx.insert_pin(&pin)?;
+            tx.put_affinity(&affinity, None)?;
+            tx.insert_admission(&admission_row("parent", "warm-decision", &pin, old))
+        })
+        .unwrap();
+    let cutoff = NOW - 30 * DAY;
+    assert!(store
+        .plan_account_admissions(cutoff, 256, NOW)
+        .unwrap()
+        .is_empty());
+    assert_eq!(store.prune_account_admissions(cutoff, 256, NOW).unwrap(), 0);
+    assert!(store
+        .account_read(|tx| tx.admission(PRINCIPAL, "parent"))
+        .unwrap()
+        .is_some());
+    let grace_end = NOW + DAY + 3_600_000;
+    assert_eq!(
+        store
+            .prune_account_admissions(cutoff, 256, grace_end)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .prune_account_admissions(cutoff, 256, grace_end + 1)
+            .unwrap(),
+        1
+    );
+    assert!(store
+        .account_read(|tx| tx.admission(PRINCIPAL, "parent"))
+        .unwrap()
+        .is_none());
+    let batch = store
+        .prune_account_affinities(grace_end - 3_600_000 + 1, 256)
+        .unwrap();
+    assert_eq!(batch.affinities, 1);
+    assert_eq!(batch.pins, 1);
+    assert!(rig.ids("account_pin", "pin_id").is_empty());
+}
+
+#[test]
+fn fork_parent_retention_writer_rechecks_a_refreshed_affinity() {
+    let rig = Rig::new("fork-parent-retention-recheck");
+    let store = rig.open();
+    let pin = pin_row("parent", "conversation", 1, "decision");
+    let affinity = affinity_row("conversation", &pin, NOW - 2 * DAY);
+    store
+        .account_transaction(|tx| {
+            tx.insert_pin(&pin)?;
+            tx.put_affinity(&affinity, None)?;
+            tx.insert_admission(&admission_row("parent", "decision", &pin, NOW - 60 * DAY))
+        })
+        .unwrap();
+    let cutoff = NOW - 30 * DAY;
+    let keys = store.plan_account_admissions(cutoff, 256, NOW).unwrap();
+    assert_eq!(keys.len(), 1);
+    store
+        .account_transaction(|tx| {
+            tx.touch_affinity(
+                PRINCIPAL,
+                "conversation",
+                "anthropic",
+                ("parent", 1),
+                NOW,
+                NOW + 7 * DAY,
+                None,
+            )
+        })
+        .unwrap();
+    let deleted = store
+        .account_command(striatum_store::AccountCommandKind::Maintenance, move |tx| {
+            tx.delete_account_admissions_returning(cutoff, &keys, NOW)
+        })
+        .unwrap();
+    assert!(deleted.is_empty());
+}
+
+#[test]
+fn fork_parent_retention_keeps_used_move_and_reservation_past_thirty_days() {
+    let rig = Rig::new("fork-retained-used-move");
+    let store = rig.open();
+    let pin = pin_row("parent-pin", "parent-conversation", 1, "parent-decision");
+    let moved_pin = pin_row("moved-pin", "moved-conversation", 1, "moved-decision");
+    let old = NOW - 60 * DAY;
+    let mut moved = admission_row("moved", "moved-decision", &moved_pin, old);
+    moved.account_id = "oauth:anthropic:alice".into();
+    moved.credential_id = moved.account_id.clone();
+    store
+        .account_transaction(|tx| {
+            tx.insert_pin(&pin)?;
+            tx.insert_pin(&moved_pin)?;
+            tx.put_affinity(&affinity_row("parent-conversation", &pin, NOW + DAY), None)?;
+            tx.insert_admission(&admission_row("parent", "parent-decision", &pin, old))?;
+            tx.insert_admission(&moved)?;
+            tx.record_admission_probe_scope(PRINCIPAL, "moved", 1, Some("moved-decision"))?;
+            Ok(())
+        })
+        .unwrap();
+    store.with_writer_for_test(|conn| conn.execute(
+        "INSERT INTO account_continue (principal, selection_id, request_json, answer_json, run_id,
+            admission_id, previous_decision_id, decision_id, reservation_id, valid_until_ms, used_at_ms)
+         VALUES (?1,'move','{}','{}','head-run','parent','parent-decision','moved-decision','moved',?2,?2)",
+        rusqlite::params![PRINCIPAL, old],
+    )).unwrap();
+    let cutoff = NOW - 30 * DAY;
+    assert_eq!(store.prune_account_admissions(cutoff, 256, NOW).unwrap(), 0);
+    assert_eq!(store.prune_account_continuations(cutoff, 256).unwrap(), 0);
+    let current = store
+        .account_read(|tx| tx.fork_used_binding_by_key(PRINCIPAL, "parent"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.account_id, "oauth:anthropic:alice");
+    assert_eq!(current.credential_id, current.account_id);
+    let after_grace = NOW + DAY + 3_600_001;
+    assert_eq!(
+        store
+            .prune_account_admissions(cutoff, 256, after_grace)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .prune_account_admissions(cutoff, 256, after_grace)
+            .unwrap(),
+        1
+    );
+    assert_eq!(store.prune_account_continuations(cutoff, 256).unwrap(), 1);
+    assert_eq!(
+        store
+            .prune_account_affinities(after_grace - 3_600_000, 256)
+            .unwrap()
+            .affinities,
+        1
+    );
+    assert_eq!(store.prune_account_pins(cutoff, 256).unwrap(), 1);
+}
+
 /// An old serve decision referenced only by `child` survives; its
 /// unreferenced neighbours on both sides in time are deleted without a
 /// foreign-key error, with one large batch and with batches smaller than the

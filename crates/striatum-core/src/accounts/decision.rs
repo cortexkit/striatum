@@ -329,6 +329,8 @@ pub struct RosterNote {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Explanation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<ForkNote>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_fence_probe: Option<String>,
     pub policy_version: u32,
     pub provider: String,
@@ -357,10 +359,23 @@ pub struct Explanation {
     pub accounts: Vec<AccountNote>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ForkNote {
+    Honoured {
+        admission_id: String,
+    },
+    Refused {
+        admission_id: String,
+        reason: String,
+    },
+}
+
 /// Why the chosen account was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmitReason {
+    ForkParent,
     CredentialFenceProbe,
     PaidCredits,
     /// Existing affinity retained.
@@ -436,6 +451,8 @@ pub struct Hold {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HoldBasis {
+    /// A fork cannot replace its parent's unavailable credential or account.
+    ForkParentUnavailable,
     /// A confirmed block on the account (shared state).
     ConfirmedFence,
     /// A full-band reading with a window at 100% used (possibly a rounded raw

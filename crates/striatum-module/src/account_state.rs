@@ -627,6 +627,56 @@ impl AccountCommand<'_> {
         Ok(row)
     }
 
+    /// Resolve a fork's current parent binding without changing the original
+    /// admission's provenance. Live runs use the latest used continuation
+    /// held in memory for resuming that run.
+    pub(crate) fn fork_parent(
+        &self,
+        principal: &str,
+        id: &str,
+        provider: &str,
+    ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        let live = self
+            .admission_state()
+            .and_then(|state| state.open_admission(principal, id));
+        let (mut parent, moved) = if let Some(open) = live {
+            (open.row.clone(), false)
+        } else {
+            keyed_exception();
+            let Some(found) = self.sql.fork_parent_by_key(principal, id)? else {
+                return Ok(None);
+            };
+            found
+        };
+        if parent.provider != provider
+            || !matches!(
+                parent.state.as_str(),
+                "reserved" | "started" | "finished" | "released"
+            )
+        {
+            return Ok(None);
+        }
+        let current = if live.is_some() {
+            self.latest_used_continuation(principal, id)?
+        } else if moved {
+            keyed_exception();
+            self.sql.fork_used_binding_by_key(principal, id)?
+        } else {
+            None
+        };
+        if moved && current.is_none() {
+            return Ok(None);
+        }
+        if let Some(current) = current {
+            parent.account_id = current.account_id;
+            parent.credential_id = current.credential_id;
+            parent.pin_id = current.pin_id;
+            parent.pin_generation = current.pin_generation;
+        }
+        self.visit_account(provider, &parent.account_id);
+        Ok(Some(parent))
+    }
+
     /// The admission only if it is open (`reserved`, `started`, `expired`),
     /// for a caller that has already handled closed ones, or for whom a
     /// closed one means the same as none. No SQL read with a state.
@@ -1425,6 +1475,28 @@ impl AccountCommand<'_> {
         let deleted = self
             .sql
             .prune_account_admissions_returning(before, limit, now_ms)?;
+        self.apply_pruned_admissions(deleted)
+    }
+
+    pub(crate) fn delete_account_admissions(
+        &mut self,
+        before: i64,
+        keys: &[i64],
+        now_ms: i64,
+    ) -> RouteStateResult<usize> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::delete_account_admissions");
+        let deleted = self
+            .sql
+            .delete_account_admissions_returning(before, keys, now_ms)?;
+        self.apply_pruned_admissions(deleted)
+    }
+
+    fn apply_pruned_admissions(
+        &mut self,
+        deleted: Vec<striatum_store::PrunedAdmission>,
+    ) -> RouteStateResult<usize> {
         if let Some(state) = self.state.as_deref_mut() {
             for row in &deleted {
                 state.inflight.remove(

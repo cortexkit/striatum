@@ -23,7 +23,6 @@ use crate::model_facts::{
     fact_to_route, BasketDimension, BasketPrice, ClassVector, ModelFact, ModelMetric,
     ModelRequirements, ModelRoute, ScoreProvenance, CLASS_VECTOR_SAMPLE_FLOOR,
 };
-use crate::model_resolution::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
 use crate::provider_model_spec::{ExclusionPolicy, ExclusionSource, ExclusionSpecs};
 use crate::route_scoring::{score_adequacy, AdequacyScore, MetricFit};
 use crate::routing_config::{
@@ -36,6 +35,7 @@ use crate::slot_saturation::{
     pick_unsaturated, ConcurrencySlots, SlotSaturation, REASON_PROVIDER_SATURATED,
 };
 use crate::task_profile::{TaskProfile, TokenVector};
+use crate::usage_facts::{use_basket_permitted, CLASS_PRODUCER, COUNTERS_PRODUCER};
 
 /// Profiles resolved for one select's workload and intelligence-demand bucket,
 /// keyed by exact route key. The caller supplies a single in-memory refresh snapshot; selection

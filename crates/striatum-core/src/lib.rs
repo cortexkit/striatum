@@ -23,7 +23,6 @@ pub mod key_pool;
 pub mod launch_policy;
 pub mod model_facts;
 pub mod model_facts_seed;
-pub mod model_resolution;
 pub mod model_router;
 pub mod package_ceiling;
 pub mod panel;
@@ -42,6 +41,7 @@ pub mod seat_routing;
 pub mod slot_saturation;
 pub mod subscription;
 pub mod task_profile;
+pub mod usage_facts;
 
 pub use aa_infer::{
     aa_elo_curve, elo_floor, infer_elo_from_aa, infer_elo_from_aa_static, inferred_scores,
@@ -71,19 +71,6 @@ pub use model_facts::{
     ENUMERATED_WORKLOAD_CLASSES, GRAND_FAMILY_NORMALIZATIONS, MODEL_METRICS,
 };
 pub use model_facts_seed::model_facts_seed;
-pub use model_resolution::{
-    build_model_speed_observation, find_most_specific_fallback_entry, fuzzy_match_model,
-    map_agent_to_workload_class, parse_workload_class, resolve_compatible_model_settings,
-    resolve_model_capabilities, resolve_model_id_alias, resolve_model_pipeline,
-    resolve_user_model_pin, use_basket_permitted, BasicFamily, BrocaUsageFacts,
-    DelegatedModelConfig, DesiredModelSettings, FallbackEntry, ModelAliasResolution,
-    ModelCapabilities, ModelCapabilitiesInput, ModelCapabilitiesSnapshot,
-    ModelCapabilitiesSnapshotEntry, ModelNaming, ModelResolutionConstraints, ModelResolutionIntent,
-    ModelResolutionPolicy, ModelResolutionRequest, ModelResolutionResult, ModelRewrite,
-    ModelSettingsCompatibilityChange, ModelSettingsCompatibilityResult, NativeUsageFacts,
-    SnapshotLimit, SnapshotModalities, UserModelPinRequest, VariantFact, VendorPrefix,
-    ACCOUNT_PRODUCER, CLASS_PRODUCER, COUNTERS_PRODUCER, VALID_WORKLOAD_CLASSES,
-};
 pub use model_router::{
     admit_routes, select_model_route, select_model_route_with_config,
     select_model_route_with_slots, selection_cost, AdmissionResult, AdmittedRoute,
@@ -143,3 +130,8 @@ pub use slot_saturation::{
     REASON_PROVIDER_SATURATED,
 };
 pub mod concurrency_availability;
+pub use usage_facts::{
+    build_model_speed_observation, map_agent_to_workload_class, parse_workload_class,
+    use_basket_permitted, BrocaUsageFacts, NativeUsageFacts, VariantFact, ACCOUNT_PRODUCER,
+    CLASS_PRODUCER, COUNTERS_PRODUCER, VALID_WORKLOAD_CLASSES,
+};

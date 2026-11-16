@@ -487,13 +487,22 @@ impl Route {
     }
 
     pub(super) fn request_frame(&self, method: &str, params: &Value) -> Frame {
+        self.request_frame_raw_params(method, &serde_json::to_vec(params).unwrap())
+    }
+
+    fn request_frame_raw_params(&self, method: &str, params: &[u8]) -> Frame {
+        let mut body = b"{\"method\":".to_vec();
+        body.extend(serde_json::to_vec(method).unwrap());
+        body.extend_from_slice(b",\"params\":");
+        body.extend_from_slice(params);
+        body.push(b'}');
         Frame::build(
             FrameType::Request,
             Flags::new(false, Priority::Interactive, false),
             self.channel,
             self.epoch,
             self.next_corr.fetch_add(1, Ordering::Relaxed),
-            serde_json::to_vec(&json!({ "method": method, "params": params })).unwrap(),
+            body,
         )
         .unwrap()
     }
@@ -504,6 +513,18 @@ impl Route {
         let reply = self
             .harness
             .handle(self.request_frame(method, params))
+            .await;
+        (reply.header.ty, reply.body)
+    }
+
+    pub(super) async fn call_raw_params(
+        &self,
+        method: &str,
+        params: &[u8],
+    ) -> (FrameType, Vec<u8>) {
+        let reply = self
+            .harness
+            .handle(self.request_frame_raw_params(method, params))
             .await;
         (reply.header.ty, reply.body)
     }
@@ -1791,6 +1812,55 @@ impl RoutingSubject for KitSubject {
                 window.remove("resetsAt");
             }
         }
+        let provider = reading.entry["apiProvider"]
+            .as_str()
+            .ok_or("quota provider missing")?
+            .to_owned();
+        drop(quota);
+        let h = self.harness();
+        let scope = striatum_core::accounts::FenceScope::General(
+            striatum_core::accounts::GeneralWindow::FiveHour,
+        );
+        let fence = striatum_core::accounts::Fence {
+            account_id: account_id.into(),
+            pool: Some(scope.into()),
+            recovery_set: Vec::new(),
+            observed_at_ms: now,
+            reset: reset_at_ms
+                .map(|at| striatum_core::accounts::ResetTime::At(at as i64))
+                .unwrap_or(striatum_core::accounts::ResetTime::Missing),
+            retry_hint_ms: None,
+            source: striatum_core::accounts::ConfirmationSource::BrocaAccountLimit,
+        };
+        static BLOCK_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let sequence = BLOCK_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        h.store()
+            .account_transaction(|tx| {
+                for old in tx
+                    .active_fences(&provider)?
+                    .into_iter()
+                    .filter(|row| row.account_id == account_id)
+                {
+                    tx.clear_fence(&old.fence_id, now, "fixture_replaced")?;
+                }
+                tx.insert_fence(&striatum_store::AccountFenceRow {
+                    fence_id: format!("kit-block-{sequence}"),
+                    provider: provider.clone(),
+                    account_id: account_id.into(),
+                    scope_json: serde_json::to_string(&scope).unwrap(),
+                    fence_json: serde_json::to_string(&fence).unwrap(),
+                    source: "broca_limit_exhausted".into(),
+                    observed_at: now,
+                    principal: "fixture".into(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: now,
+                    cleared_at: None,
+                    cleared_reason: None,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        *self.observe_blocks.lock().unwrap() = true;
         Ok(())
     }
 
@@ -1926,6 +1996,7 @@ impl RoutingSubject for KitSubject {
 /// model-input hook is absent here; classifier handler tests cover question
 /// limits and input-spend caps against the catalog and provider description.
 const NOT_APPLICABLE: &[&str] = &[
+    "fork_of_undeclared_refused",
     "account_observe_success_undeclared",
     "undeclared_pin_slot_refused",
     "undeclared_available_routes_refused",
@@ -2079,6 +2150,16 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
         "continue_account_decision_chain",
         "account_head_turn_runner",
         "account_head_turn_non_runner",
+        "fork_of_parent_account",
+        "fork_of_blocked_parent",
+        "fork_of_unknown_retry",
+        "fork_of_private_parent",
+        "fork_of_excludes_requested_account",
+        "fork_of_excludes_warm_credential",
+        "fork_of_excludes_parent_conversation_key",
+        "fork_of_excludes_candidates",
+        "fork_of_non_admit_refused",
+        "fork_of_admission_conflict",
     ] {
         assert_eq!(
             report.outcome(check),
@@ -2100,6 +2181,26 @@ async fn routing_v1_conformance_kit_matches_served_checks() {
     let actual: std::collections::BTreeSet<_> = report.not_applicable().into_iter().collect();
     let expected: std::collections::BTreeSet<_> = expected_not_applicable.into_iter().collect();
     assert_eq!(actual, expected, "{}", report.render());
+}
+
+#[tokio::test]
+async fn routing_v1_fork_of_undeclared_conformance_case() {
+    let subject = KitSubject {
+        observe_blocks: Mutex::new(false),
+        media: Mutex::new(Default::default()),
+        harness: Mutex::new(Harness::new("kit-fork-undeclared")),
+    };
+    let report = super::describe::without_capability(
+        cortexkit_role_routing::capabilities::ACCOUNT_FORK_OF,
+        run_suite(&subject),
+    )
+    .await;
+    assert_eq!(
+        report.outcome("fork_of_undeclared_refused"),
+        Some(&cortexkit_role_routing_conformance::CheckOutcome::Passed),
+        "{}",
+        report.render()
+    );
 }
 
 #[tokio::test]

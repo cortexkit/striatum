@@ -3642,7 +3642,7 @@ fn complete_ephemeral_row_trailing_window_boundary_pinned_to_now_argument() {
 // visible tokens; 39,620 would price the 11,282 reasoning tokens twice.
 #[test]
 fn broca_codex_run_usage_reaches_the_class_vector_with_reasoning_counted_once() {
-    use striatum_core::model_resolution::build_usage_observation;
+    use striatum_core::usage_facts::build_usage_observation;
     use striatum_core::{BrocaUsageFacts, NativeUsageFacts};
 
     let rig = Rig::new("class-vector-broca-reasoning");

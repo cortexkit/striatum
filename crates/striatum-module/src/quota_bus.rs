@@ -9,6 +9,7 @@ use cortexkit_bus_trait::{
 use subc_client_rs::{ConsumerOptions, SubcConsumer};
 
 use crate::route_facts::{Delivery, Handler};
+use crate::subscription_economics::multiplier;
 
 const DURABLE: &str = "m_striatum";
 
@@ -59,16 +60,19 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
     let (tx, deliveries) = tokio::sync::mpsc::channel(1);
     let task_names = names.clone();
     let task = tokio::spawn(async move {
-        let result = read_events(
-            client,
+        let events = read_events(
+            &client,
             task_names,
             &handler,
             reader,
             changes,
             bound_revision,
             &tx,
-        )
-        .await;
+        );
+        let result = tokio::select! {
+            result = events => result,
+            () = multiplier::watch(&client) => Err("multiplier watch stopped".into()),
+        };
         unbound(
             &handler,
             result
@@ -90,7 +94,7 @@ async fn attach_inner(path: PathBuf, handler: Handler) -> Result<AttachedBus, St
 }
 
 async fn read_events(
-    client: BusClient,
+    client: &BusClient,
     names: AccountNames,
     handler: &Handler,
     mut reader: cortexkit_bus_client::EventReader,
@@ -100,7 +104,7 @@ async fn read_events(
 ) -> Result<(), String> {
     loop {
         let mut source = metadata::SdkSource {
-            client: &client,
+            client,
             names: &names,
             handler,
             bound_revision,
@@ -116,7 +120,7 @@ async fn read_events(
             .event_reader(DURABLE)
             .await
             .map_err(|e| e.to_string())?;
-        mark_bound(&client, handler, bound_revision);
+        mark_bound(client, handler, bound_revision);
         handler.wake_catalog_rebind()?;
     }
 }

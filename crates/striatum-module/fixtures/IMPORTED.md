@@ -61,3 +61,25 @@ The manifest and provenance are retained alongside the JSON inputs.
 | `colliculus-5b/media-role-describe.json` | `4f9856a6c68ac918e645b2cef2419b17625469b61cfbc64b11723a6991d5e7cd` |
 | `colliculus-5b/PROVENANCE.txt` | `34332247a2606f54598ae67a89929f990af41a79fdcaf0b84efa42fc55457b0c` |
 | `colliculus-5b/SHA256SUMS` | `4c74fa6cff5438da8e0b98a87e80a1365e778aa2063d098d647a9d24ebcd574a` |
+
+## Thalamus parent-linked phone-call forks
+
+`thalamus-route-fork-of-v1/` copies the supplied relay request and hold-envelope
+samples byte for byte from Thalamus commit
+`07093f5525ca78b2341cf65dbc0e1c7268dfd328`. The source directory is
+`.cortexkit/internal-docs/investigations/thalamus-route-fork-of-v1/`; its README
+records capture by
+`routing::tests::fork_of::fork_of_uses_the_newest_parent_and_inherits_its_head_turn`.
+The data is synthetic. The request is the exact compact params body, not a
+method envelope; the hold sample wraps the error body in `error`.
+
+Before import, the manifest's own SHA-256 was checked against the prefix
+`73031db3` that THALAMUS quoted in its handoff message, and then both files
+were verified against the manifest.
+The reader tests send the request bytes unchanged through routing's v1 handler.
+
+| Imported path | SHA-256 |
+| --- | --- |
+| `thalamus-route-fork-of-v1/request.json` | `a96e194685b92151f7ceceed5e0dafc580ed3b0f5836b43d6d14fe5299151a36` |
+| `thalamus-route-fork-of-v1/hold-answer.json` | `94b1c12960b67c9841db267888af00a66fe847bf9a2911ea0c85c7ff395c54f8` |
+| `thalamus-route-fork-of-v1/SHA256SUMS` | `73031db341c99611a1a92e71b8fea6fdec1bf7ef72fdbcbe9d74b5b731ffe4ac` |

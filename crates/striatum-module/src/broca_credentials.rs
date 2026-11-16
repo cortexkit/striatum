@@ -97,6 +97,13 @@ pub struct BrocaCredentials {
 }
 
 impl BrocaCredentials {
+    pub(crate) fn set_watch_confirmed(&mut self, view: Option<&str>) {
+        let confirmed = view.is_some() && self.inner.view.as_deref() == view;
+        if self.inner.watch_confirmed != confirmed {
+            Arc::make_mut(&mut self.inner).watch_confirmed = confirmed;
+        }
+    }
+
     pub fn apply_listing(&mut self, listing: &ScopedCredentialListing, at_ms: u64) -> bool {
         std::ops::DerefMut::deref_mut(self).apply_listing(listing, at_ms)
     }
@@ -233,6 +240,9 @@ pub struct CredentialData {
     serving_refresh_builds: usize,
     view: Option<String>,
     reached_at_ms: Option<u64>,
+    // A held watch confirms the applied digest without extending the age limit
+    // after disconnect. Never restore this evidence from a saved listing.
+    watch_confirmed: bool,
     providers: HashSet<String>,
     active: usize,
     unmapped: usize,
@@ -509,9 +519,10 @@ impl CredentialData {
 
     pub(crate) fn listing_is_fresh(&self, now_ms: u64) -> bool {
         self.view.is_some()
-            && self
-                .reached_at_ms
-                .is_some_and(|at| now_ms.saturating_sub(at) <= MAX_AGE_MS)
+            && (self.watch_confirmed
+                || self
+                    .reached_at_ms
+                    .is_some_and(|at| now_ms.saturating_sub(at) <= MAX_AGE_MS))
     }
 
     pub(crate) fn wire_api(&self, fact: &ModelFact, auth_method: &str) -> Option<&str> {
@@ -655,10 +666,7 @@ impl CredentialData {
     /// is ambiguous, API keys are left out for the same reason. A provider
     /// served by API keys alone keeps them (its serving method is `apikey`).
     pub(crate) fn serving_identities(&self, fact: &ModelFact) -> Vec<(String, Option<String>)> {
-        if self
-            .reached_at_ms
-            .is_none_or(|at| crate::now_ms().saturating_sub(at) > MAX_AGE_MS)
-        {
+        if !self.listing_is_fresh(crate::now_ms()) {
             return Vec::new();
         }
         let serving = self
@@ -843,6 +851,7 @@ impl CredentialData {
         if self.view.as_deref() == Some(&listing.view) {
             return false;
         }
+        self.watch_confirmed = false;
         self.view = Some(listing.view.clone());
         self.listed = listing.credentials.clone();
         self.serving.clear();
@@ -873,11 +882,7 @@ impl CredentialData {
     }
 
     pub(crate) fn media_listing_ready(&self, at_ms: u64) -> bool {
-        self.media_list_granted
-            && self.last_error.is_none()
-            && self
-                .reached_at_ms
-                .is_some_and(|at| at_ms.saturating_sub(at) <= MAX_AGE_MS)
+        self.media_list_granted && self.last_error.is_none() && self.listing_is_fresh(at_ms)
     }
 
     pub(crate) fn mapped_providers(&self) -> HashSet<String> {
@@ -1216,10 +1221,10 @@ impl CredentialData {
                 format!("no vault credential resolves provider {provider}: {detail}"),
             ))
         };
-        let Some(reached_at_ms) = self.reached_at_ms else {
+        if self.reached_at_ms.is_none() {
             return unresolved("the credential listing has not been read");
-        };
-        if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
+        }
+        if !self.listing_is_fresh(now_ms) {
             return unresolved("the credential listing is over 15 minutes old");
         }
         let keys: Vec<_> = self
@@ -1257,12 +1262,12 @@ impl CredentialData {
     fn fallback_reason(&self, now_ms: u64) -> Option<String> {
         // The legacy shapes judge reach for the Broca runner from this listing.
         let runner = crate::legacy_wire::BROCA;
-        let Some(reached_at_ms) = self.reached_at_ms else {
+        if self.reached_at_ms.is_none() {
             return Some(format!(
                 "{runner} reachability unknown: credential listing unavailable"
             ));
-        };
-        if now_ms.saturating_sub(reached_at_ms) > MAX_AGE_MS {
+        }
+        if !self.listing_is_fresh(now_ms) {
             return Some(format!(
                 "{runner} reachability unknown: credential listing stale (over 15 minutes)"
             ));
@@ -1341,6 +1346,46 @@ impl CredentialData {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn quiet_confirmed_watch_keeps_every_listing_age_gate_open() {
+        let mut cache = BrocaCredentials::default();
+        let mut login = credential("oauth:anthropic:login", &["anthropic"]);
+        login.auth_method = Some("claude-code".into());
+        let mut key = credential("apikey:metered:key", &["metered"]);
+        key.auth_method = Some("apikey".into());
+        key.credential_type = "apikey".into();
+        let mut rows = listing(vec![login, key]);
+        rows.grant_tuples
+            .push(cortexkit_claustrum_client::ListedGrant {
+                selector_kind: "category".into(),
+                selector: "media-provider".into(),
+                operation: "list".into(),
+            });
+        let now = crate::now_ms();
+        cache.apply_listing(&rows, now - MAX_AGE_MS - 1);
+        assert!(!cache.listing_is_fresh(now));
+        cache.set_watch_confirmed(Some("unapplied-view"));
+        assert!(!cache.listing_is_fresh(now));
+        cache.set_watch_confirmed(Some(&rows.view));
+        assert!(cache.listing_is_fresh(now));
+        assert!(!cache.api_key_credentials_by_provider(now).is_empty());
+        assert!(!cache
+            .serving_identities(&crate::tests::fact("anthropic", "sonnet"))
+            .is_empty());
+        assert!(cache.media_listing_ready(now));
+        assert!(cache.pool_keys("metered", now).is_ok());
+        assert!(cache.fallback_reason(now).is_none());
+        cache.set_watch_confirmed(None);
+        assert!(!cache.listing_is_fresh(now));
+        assert!(cache.api_key_credentials_by_provider(now).is_empty());
+        assert!(cache
+            .serving_identities(&crate::tests::fact("anthropic", "sonnet"))
+            .is_empty());
+        assert!(!cache.media_listing_ready(now));
+        assert!(cache.pool_keys("metered", now).is_err());
+        assert!(cache.fallback_reason(now).is_some());
+    }
+
     #[test]
     fn positive_listing_keeps_a_still_allowed_roster_method() {
         let mut credentials = super::BrocaCredentials::default();

@@ -278,7 +278,10 @@ fn retention_keeps_the_second_used_offer_while_its_predecessor_is_started() {
 #[test]
 fn retention_prunes_offer_chains_last_first_without_changing_a_later_hold() {
     let (scratch, mut store, mut owner) = fixture("retention-offer-chain");
-    original(&store);
+    reserve(&store, row("original", T), T);
+    // An expired original cannot be a fork parent, so its used chain can
+    // retire once succession evidence no longer needs each offer.
+    run(&store, T, |tx| tx.mark_admission_expired("p", "original")).unwrap();
     run(&store, T + 1, |tx| {
         offer(tx, "b", "original", "decision-original", "b", T + 1)?;
         tx.use_continuation("decision-b", T + 1)
@@ -289,7 +292,6 @@ fn retention_prunes_offer_chains_last_first_without_changing_a_later_hold() {
     run(&store, T + 3, |tx| {
         offer(tx, "c", "original", "decision-b", "c", T + 3)?;
         tx.use_continuation("decision-c", T + 3)?;
-        tx.mark_admission_finished("p", "original", NOW - 8 * DAY)?;
         tx.finish_continuations("p", "original", "run", NOW - 8 * DAY)
     })
     .unwrap();

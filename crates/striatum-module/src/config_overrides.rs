@@ -508,6 +508,13 @@ fn parse_config_with_reporter(
     {
         return Err("config_key_removed: substrates; removed along with legacy route.select; delete this key".into());
     }
+    if value.get("model_naming").is_some()
+        || value
+            .get("model_routing")
+            .is_some_and(|section| section.get("model_naming").is_some())
+    {
+        return Err("config_key_removed: model_naming; removed with the retired plugin model-resolution operations; delete this key".into());
+    }
     if value.get("model_families").is_some() {
         return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
     }
@@ -1295,10 +1302,6 @@ struct RoutingConfigFile {
     /// Absent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.
     #[serde(default = "default_pin_origin_callers")]
     pin_origin_callers: Vec<String>,
-    /// How providers spell model ids and which model families the capability
-    /// heuristic recognizes; see `ModelNamingConfig`.
-    #[serde(default)]
-    model_naming: ModelNamingConfig,
     /// Target agents that are heads: operator-facing sessions that may spend
     /// a subscription's kept-free reserve. Matched case-insensitively.
     #[serde(default)]
@@ -1331,7 +1334,6 @@ impl Default for RoutingConfigFile {
             consumers: Default::default(),
             runners: Default::default(),
             pin_origin_callers: default_pin_origin_callers(),
-            model_naming: Default::default(),
             head_agents: Default::default(),
             quota_model_pools: Default::default(),
             catalog: Default::default(),
@@ -1485,11 +1487,6 @@ impl LiveConfig {
             .any(|head| head.trim().eq_ignore_ascii_case(agent))
     }
 
-    /// The configured model-id spelling and capability families.
-    pub(crate) fn model_naming(&self) -> striatum_core::ModelNaming {
-        self.config.model_naming.naming()
-    }
-
     pub(crate) fn allocator_policy(
         &self,
         provider: &str,
@@ -1607,97 +1604,11 @@ struct RetentionSection {
     model_route_usage_days: Option<serde_json::Value>,
 }
 
-/// Operator config for `striatum_core::ModelNaming`, the model-id
-/// spelling `route.resolve_model` applies per provider and the model families
-/// `route.model_capabilities` recognizes by name. The config converter writes
-/// the shipped values from its data file.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ModelNamingConfig {
-    /// For a gateway serving other vendors' models as `vendor/model`: the
-    /// vendor of a bare model id, by the id's prefix. The first match wins.
-    #[serde(default)]
-    vendor_prefixes: Vec<VendorPrefixConfig>,
-    /// The rewrites each provider applies to a model id, in order.
-    #[serde(default)]
-    provider_rewrites: BTreeMap<String, Vec<ModelRewriteConfig>>,
-    /// Families recognized by a substring of the normalized model id, each
-    /// with the basic variants. The first match wins.
-    #[serde(default)]
-    basic_families: Vec<BasicFamilyConfig>,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct QuotaModelPoolConfig {
     model_prefix: String,
     pool: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct VendorPrefixConfig {
-    prefix: String,
-    vendor: String,
-}
-
-/// `vendor_prefix` serves the id as `vendor/model`; `dot_version` spells a
-/// dashed two-part Claude-style version with a dot; `{"preview_alias": a}`
-/// expands the bare alias `a` to its `-preview` id.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-enum ModelRewriteConfig {
-    VendorPrefix,
-    DotVersion,
-    PreviewAlias(String),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct BasicFamilyConfig {
-    family: String,
-    needles: Vec<String>,
-}
-
-impl ModelNamingConfig {
-    fn naming(&self) -> striatum_core::ModelNaming {
-        use striatum_core::{BasicFamily, ModelNaming, ModelRewrite, VendorPrefix};
-        ModelNaming {
-            vendor_prefixes: self
-                .vendor_prefixes
-                .iter()
-                .map(|entry| VendorPrefix {
-                    prefix: entry.prefix.clone(),
-                    vendor: entry.vendor.clone(),
-                })
-                .collect(),
-            provider_rewrites: self
-                .provider_rewrites
-                .iter()
-                .map(|(provider, rewrites)| {
-                    let rewrites = rewrites
-                        .iter()
-                        .map(|rewrite| match rewrite {
-                            ModelRewriteConfig::VendorPrefix => ModelRewrite::VendorPrefix,
-                            ModelRewriteConfig::DotVersion => ModelRewrite::DotVersion,
-                            ModelRewriteConfig::PreviewAlias(alias) => {
-                                ModelRewrite::PreviewAlias(alias.clone())
-                            }
-                        })
-                        .collect();
-                    (provider.clone(), rewrites)
-                })
-                .collect(),
-            basic_families: self
-                .basic_families
-                .iter()
-                .map(|family| BasicFamily {
-                    family: family.family.clone(),
-                    needles: family.needles.clone(),
-                })
-                .collect(),
-        }
-    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema)]

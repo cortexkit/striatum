@@ -159,7 +159,7 @@
     {
       "client": "routing-consumer",
       "status": "recorded-with-blocked-methods",
-      "body_source": "packages/opencode/src/features/model-routing/routing-consumer.test.ts:38-279,281-337 at baseline 428d689f; undefined members omitted exactly as JSON.stringify",
+      "body_source": "packages/opencode/src/features/model-routing/routing-consumer.test.ts:38-279 at baseline 428d689f; undefined members omitted exactly as JSON.stringify",
       "bodies": [
         {
           "path": "routing-consumer/route.model_facts-1.json",
@@ -192,15 +192,9 @@
         {
           "path": "routing-consumer/route.set_decision_outcome-1.json",
           "method": "route.set_decision_outcome"
-        },
-        {
-          "path": "routing-consumer/route.model_capabilities-1.json",
-          "method": "route.model_capabilities"
         }
       ],
       "blocked_methods": [
-        "route.resolve_model",
-        "route.agent_model_requirements",
         "route.clear_failure_backoff"
       ]
     },

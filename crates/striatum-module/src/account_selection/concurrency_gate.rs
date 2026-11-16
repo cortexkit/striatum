@@ -125,7 +125,8 @@ impl Gate {
         {
             return Check::Room;
         }
-        let kept = matches!(admission.affinity, AffinityOutcome::Retained { .. });
+        let kept = params.fork_of.is_some()
+            || matches!(admission.affinity, AffinityOutcome::Retained { .. });
         // A head call is never refused, and it stays on its affinity account.
         if kept && self.head_call {
             return Check::Room;
@@ -273,6 +274,9 @@ impl Gate {
             "kind": "refuse", "code": "concurrency_full", "retryable": true,
             "reset_at_ms": reset_at_ms,
         });
+        if let Some(parent) = &params.fork_of {
+            explained["explanation"]["fork_of"] = json!({"kind":"refused", "admission_id":parent.admission_id, "reason":"concurrency_full"});
+        }
         record.decision_json = explained.to_string();
         tx.insert_decision(&record)?;
         if let Some(call) = &params.call {

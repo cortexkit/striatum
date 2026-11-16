@@ -466,9 +466,8 @@ fn prepare_usage(
         untimed: true,
         ..Default::default()
     };
-    let Some(observation) =
-        crate::model_resolution::usage_observation_from_store(facts, deps.store)
-            .map_err(store_refusal)?
+    let Some(observation) = crate::usage_facts::usage_observation_from_store(facts, deps.store)
+        .map_err(store_refusal)?
     else {
         return Ok(None);
     };

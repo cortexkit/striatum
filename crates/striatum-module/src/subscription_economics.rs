@@ -8,6 +8,8 @@ use crate::{
     quota_consumer::QuotaConsumer,
 };
 use serde_json::{json, Value};
+
+pub(crate) mod multiplier;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
@@ -35,10 +37,58 @@ enum PlanGroup {
     // a tier identifies a quota budget but does not establish a measured plan.
     Unjoined(Option<String>, u64),
 }
-static CACHE: OnceLock<Mutex<EconomicsCache>> = OnceLock::new();
+#[derive(Default)]
+struct Runtime {
+    economics: EconomicsCache,
+    inputs: Option<Inputs>,
+    report: Value,
+    multipliers: multiplier::State,
+    poll: multiplier::PollSchedule,
+}
+
+struct Inputs {
+    state: AccountQuotaState,
+    prices: Value,
+    credentials: BTreeMap<String, BTreeSet<String>>,
+    unpriced_tiers: BTreeSet<String>,
+}
+
+impl Runtime {
+    fn rebuild(&mut self, now: i64) {
+        if let Some(inputs) = &self.inputs {
+            self.economics = build_with_credentials(
+                &inputs.state,
+                &self.report,
+                &inputs.prices,
+                now,
+                &inputs.credentials,
+            );
+            self.economics.unpriced_tiers = inputs.unpriced_tiers.clone();
+        }
+    }
+
+    fn bucket_item(&mut self, item: cortexkit_bus_client::BucketItem, now: i64) {
+        if self.multipliers.apply(item) {
+            self.report = self.multipliers.report();
+            self.rebuild(now);
+        }
+    }
+
+    fn poll_report(&mut self, report: Value, generation: u64, reader_bound: bool) {
+        // A failed backstop cannot override a caught-up bucket. Without that
+        // live source, retain the existing poll's Null/fallback behavior.
+        if self.multipliers.generation == generation
+            && (report["latest"].is_array() || !(reader_bound && self.multipliers.ready))
+        {
+            self.report = report;
+        }
+    }
+}
+
+static CACHE: OnceLock<Mutex<Runtime>> = OnceLock::new();
 static WARNED_AMBIGUOUS_ACCOUNTS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-fn cache() -> &'static Mutex<EconomicsCache> {
-    CACHE.get_or_init(|| Mutex::new(EconomicsCache::default()))
+fn cache() -> &'static Mutex<Runtime> {
+    CACHE.get_or_init(|| Mutex::new(Runtime::default()))
 }
 
 /// Join by account reference, not provider/tier spelling: Antigravity's quota
@@ -466,10 +516,25 @@ pub(crate) async fn refresh(
     state: &SharedAccountQuota,
     listing: Option<&cortexkit_claustrum_client::ScopedCredentialListing>,
     credentials: &crate::broca_credentials::SharedBrocaCredentials,
+    quota_cache: &crate::SharedQuotaCache,
 ) {
     let now = crate::now_ms() as i64;
     let from = now - 24 * 3_600_000;
+    let reader_bound = multiplier::reader_bound(quota_cache);
+    let (poll_due, generation) = cache()
+        .lock()
+        .map(|mut runtime| {
+            let bound = reader_bound && runtime.multipliers.ready;
+            (
+                runtime.poll.due(bound, std::time::Instant::now()),
+                runtime.multipliers.generation,
+            )
+        })
+        .unwrap_or((true, 0));
     let report = async {
+        if !poll_due {
+            return Value::Null;
+        }
         if let Ok(mut astro) =
             QuotaConsumer::connect_module(connection, project, "astrocyte", "management_surface")
                 .await
@@ -497,6 +562,7 @@ pub(crate) async fn refresh(
         striatum_store::job_timing::run("plan_price_refresh", prices),
         striatum_store::job_timing::run("spend_report_refresh", report)
     );
+    let reader_bound = multiplier::reader_bound(quota_cache);
     striatum_store::job_timing::sync("subscription_economics", || {
         let credential_ids = if let Ok(credentials) = credentials.lock() {
             credentials.api_key_credentials_by_provider(now as u64)
@@ -506,12 +572,22 @@ pub(crate) async fn refresh(
         let Some(snapshot) = state.lock().ok().map(|s| s.clone()) else {
             return;
         };
-        let mut next = build_with_credentials(&snapshot, &report, &prices, now, &credential_ids);
-        if let Some(listing) = listing {
-            next.unpriced_tiers = unpriced_tiers(listing, &prices);
-        }
         if let Ok(mut guard) = cache().lock() {
-            *guard = next;
+            if poll_due {
+                guard.poll.completed(std::time::Instant::now());
+                // A watch update received during the call is newer than the poll's
+                // snapshot. Do not overwrite it when the slower call returns.
+                guard.poll_report(report, generation, reader_bound);
+            }
+            guard.inputs = Some(Inputs {
+                state: snapshot,
+                unpriced_tiers: listing
+                    .map(|listing| unpriced_tiers(listing, &prices))
+                    .unwrap_or_default(),
+                prices,
+                credentials: credential_ids,
+            });
+            guard.rebuild(now);
         }
     });
 }
@@ -558,7 +634,8 @@ fn set_banked_allowance(pools: &mut HashMap<String, SubscriptionPool>, now: i64)
 pub(crate) fn health_detail() -> Value {
     cache()
         .lock()
-        .map(|c| json!({"refreshedAtMs":c.refreshed_at_ms,"unpricedPlanTiers":c.unpriced_tiers}))
+        .map(|c| json!({"refreshedAtMs":c.economics.refreshed_at_ms,"unpricedPlanTiers":c.economics.unpriced_tiers,
+            "multiplierBucket": c.multipliers.health(), "multiplierPollSeconds":c.poll.interval().as_secs()}))
         .unwrap_or(Value::Null)
 }
 
@@ -568,7 +645,10 @@ pub(crate) fn overlay(
     now: i64,
     pricing: &RoutePricing,
 ) {
-    let pools = cache().lock().map(|c| c.pools.clone()).unwrap_or_default();
+    let pools = cache()
+        .lock()
+        .map(|c| c.economics.pools.clone())
+        .unwrap_or_default();
     overlay_pools(pools, snapshot, facts, now, pricing);
 }
 
@@ -586,10 +666,13 @@ pub(crate) fn test_pools(pools: HashMap<String, SubscriptionPool>) -> impl Drop 
     struct Restore(HashMap<String, SubscriptionPool>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            cache().lock().unwrap().pools = std::mem::take(&mut self.0);
+            cache().lock().unwrap().economics.pools = std::mem::take(&mut self.0);
         }
     }
-    Restore(std::mem::replace(&mut cache().lock().unwrap().pools, pools))
+    Restore(std::mem::replace(
+        &mut cache().lock().unwrap().economics.pools,
+        pools,
+    ))
 }
 
 /// Attach the cached subscription pools to the selection's snapshot. Every
@@ -655,6 +738,322 @@ fn overlay_pools(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multiplier_watch_reuses_the_quota_bus_connection() {
+        let source = include_str!("quota_bus.rs");
+        assert_eq!(source.matches("BusClient::connect(").count(), 1);
+        assert!(source.contains("multiplier::watch(&client)"));
+        let watch = include_str!("subscription_economics/multiplier.rs");
+        assert!(!watch.contains("BusClient::connect("));
+        assert!(!watch.contains("SubcConsumer::connect("));
+        let compact: String = watch.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(compact.contains("client.bucket(\"astrocyte\",\"multiplier\")"));
+        let bucket = cortexkit_bus_naming::MODULE_BUCKETS
+            .iter()
+            .find(|bucket| bucket.owner == "astrocyte" && bucket.name == "multiplier")
+            .unwrap();
+        assert!(bucket.readers.contains(&"striatum"));
+        assert_eq!(bucket.max_value_bytes, 64 * 1024);
+    }
+
+    fn multiplier_put(key: &str, row: &Value) -> cortexkit_bus_client::BucketItem {
+        cortexkit_bus_client::BucketItem::Put {
+            key: key.into(),
+            revision: 1,
+            value: serde_json::to_vec(row).unwrap().into(),
+        }
+    }
+
+    fn multiplier_runtime(
+        report: &Value,
+        state: AccountQuotaState,
+        credentials: BTreeMap<String, BTreeSet<String>>,
+        now: i64,
+    ) -> Runtime {
+        let mut runtime = Runtime {
+            inputs: Some(Inputs {
+                state,
+                prices: prices(),
+                credentials,
+                unpriced_tiers: BTreeSet::new(),
+            }),
+            ..Default::default()
+        };
+        runtime.multipliers.begin();
+        for (index, row) in report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .rev()
+        {
+            // Opaque keys deliberately carry no provider or plan spelling.
+            runtime.bucket_item(multiplier_put(&format!("opaque-{index}"), row), now);
+        }
+        runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, now);
+        runtime
+    }
+
+    #[test]
+    fn multiplier_kv_and_poll_fixtures_have_identical_multipliers_and_selection_prices() {
+        let (mut credential_report, credentials, _) = credential_fixture();
+        for row in credential_report["latest"].as_array_mut().unwrap() {
+            if ["opencodego", "kimi-for-coding"].contains(&row["quota_provider"].as_str().unwrap())
+            {
+                row["routing_eligible"] = json!(true);
+                row["multiplier"] = json!(8.0);
+            }
+        }
+        for report in [report_v2(), credential_report] {
+            let now = report["latest"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["interval_end_ms"].as_i64().unwrap())
+                .max()
+                .unwrap()
+                + 1;
+            let state = v2_state(now);
+            let polled =
+                build_with_credentials(&state, &report, &prices(), now, &credentials).pools;
+            let bucket = multiplier_runtime(&report, state, credentials.clone(), now);
+            assert_eq!(
+                bucket.multipliers.health()["planCount"],
+                report["latest"].as_array().unwrap().len()
+            );
+            assert_eq!(bucket.economics.pools, polled);
+            for provider in polled.keys() {
+                for operator in [None, Some(6.0)] {
+                    assert_eq!(
+                        credential_route_price(
+                            bucket.economics.pools.clone(),
+                            now,
+                            provider,
+                            operator
+                        ),
+                        credential_route_price(polled.clone(), now, provider, operator),
+                        "selection pricing for {provider} with operator {operator:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn multiplier_delete_and_change_match_a_fresh_load_and_update_pricing() {
+        let report = report_v2();
+        let now = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["interval_end_ms"].as_i64().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        let index = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|row| row["plan"] == "openai/pro_200")
+            .unwrap();
+        let key = format!("opaque-{index}");
+        let state = v2_state(now);
+        let mut runtime = multiplier_runtime(&report, state.clone(), BTreeMap::new(), now);
+        assert_eq!(
+            runtime.economics.pools["openai"].plans[1]
+                .measured
+                .as_ref()
+                .unwrap()
+                .multiplier,
+            21.452711840768313
+        );
+        runtime.bucket_item(
+            cortexkit_bus_client::BucketItem::Delete {
+                key: key.clone(),
+                revision: 2,
+            },
+            now,
+        );
+        assert!(runtime.economics.pools["openai"]
+            .plans
+            .iter()
+            .all(|plan| plan.measured.is_none()));
+        let mut remaining = report.clone();
+        remaining["latest"].as_array_mut().unwrap().remove(index);
+        assert_eq!(
+            runtime.economics.pools,
+            build(&state, &remaining, &prices(), now).pools
+        );
+        assert_eq!(runtime.multipliers.health()["planCount"], 4);
+
+        let mut changed = report["latest"][index].clone();
+        changed["multiplier"] = json!(37.0);
+        runtime.bucket_item(multiplier_put(&key, &changed), now);
+        remaining["latest"].as_array_mut().unwrap().push(changed);
+        assert_eq!(
+            runtime.economics.pools,
+            build(&state, &remaining, &prices(), now).pools
+        );
+        assert_eq!(
+            runtime.economics.pools["openai"].plans[1]
+                .measured
+                .as_ref()
+                .unwrap()
+                .multiplier,
+            37.0
+        );
+    }
+
+    #[test]
+    fn multiplier_bad_value_retains_last_good_once_per_key_and_isolates_other_keys() {
+        let report = report_v2();
+        let now = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["interval_end_ms"].as_i64().unwrap())
+            .max()
+            .unwrap()
+            + 1;
+        let mut runtime = multiplier_runtime(&report, v2_state(now), BTreeMap::new(), now);
+        let before = runtime.economics.pools.clone();
+        let good = runtime.report.clone();
+        let index = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|row| row["plan"] == "openai/pro_200")
+            .unwrap();
+        let key = format!("opaque-{index}");
+        let mut invalid = report["latest"][index].clone();
+        invalid["multiplier"] = json!("not a number");
+        for bytes in [
+            b"not JSON".to_vec(),
+            serde_json::to_vec(&invalid).unwrap(),
+            b"{}".to_vec(),
+        ] {
+            runtime.bucket_item(
+                cortexkit_bus_client::BucketItem::Put {
+                    key: key.clone(),
+                    revision: 2,
+                    value: bytes.into(),
+                },
+                now,
+            );
+            assert_eq!(runtime.report, good);
+            assert_eq!(runtime.economics.pools, before);
+        }
+        assert_eq!(
+            runtime.multipliers.health()["badValueKeys"],
+            json!([key.clone()])
+        );
+        let other_index = report["latest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|row| row["plan"] == "openai/pro_100")
+            .unwrap();
+        let mut changed = report["latest"][other_index].clone();
+        changed["routing_eligible"] = json!(true);
+        changed["multiplier"] = json!(11.0);
+        runtime.bucket_item(
+            multiplier_put(&format!("opaque-{other_index}"), &changed),
+            now,
+        );
+        assert_eq!(
+            runtime.economics.pools["openai"].plans[0]
+                .measured
+                .as_ref()
+                .unwrap()
+                .multiplier,
+            11.0
+        );
+        assert_eq!(
+            runtime.economics.pools["openai"].plans[1],
+            before["openai"].plans[1]
+        );
+
+        runtime.multipliers.begin();
+        runtime.bucket_item(
+            cortexkit_bus_client::BucketItem::Put {
+                key,
+                revision: 3,
+                value: b"still bad".to_vec().into(),
+            },
+            now,
+        );
+        runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, now);
+        assert_eq!(
+            runtime.economics.pools["openai"]
+                .plans
+                .iter()
+                .find_map(|plan| plan.measured.as_ref())
+                .unwrap()
+                .multiplier,
+            21.452711840768313
+        );
+        assert_eq!(runtime.multipliers.health()["planCount"], 1);
+    }
+
+    #[test]
+    fn multiplier_rebind_replaces_the_map_including_missing_keys_and_empty_buckets() {
+        let report = report_v2();
+        let mut runtime = multiplier_runtime(&report, v2_state(NOW), BTreeMap::new(), NOW);
+        let before = runtime.report.clone();
+        runtime.multipliers.begin();
+        runtime.bucket_item(multiplier_put("new-opaque-key", &report["latest"][0]), NOW);
+        assert_eq!(
+            runtime.report, before,
+            "a partial snapshot must not remove live rows"
+        );
+        runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
+        let remaining = json!({"latest":[report["latest"][0]]});
+        assert_eq!(runtime.report, remaining);
+        let fresh = multiplier_runtime(&remaining, v2_state(NOW), BTreeMap::new(), NOW);
+        assert_eq!(runtime.economics.pools, fresh.economics.pools);
+        assert_eq!(
+            runtime.multipliers.health()["keys"],
+            json!(["new-opaque-key"])
+        );
+        runtime.multipliers.begin();
+        runtime.bucket_item(cortexkit_bus_client::BucketItem::CaughtUp, NOW);
+        assert_eq!(runtime.report, json!({"latest":[]}));
+        assert_eq!(runtime.multipliers.health()["planCount"], 0);
+    }
+
+    #[test]
+    fn multiplier_failed_backstop_preserves_caught_up_rows_but_unbound_poll_keeps_old_fallback() {
+        let report = report_v2();
+        let mut runtime = multiplier_runtime(&report, v2_state(NOW), BTreeMap::new(), NOW);
+        let before = runtime.economics.pools.clone();
+        runtime.poll_report(Value::Null, runtime.multipliers.generation, true);
+        runtime.rebuild(NOW);
+        assert_eq!(runtime.economics.pools, before);
+        runtime.poll_report(Value::Null, runtime.multipliers.generation, false);
+        runtime.rebuild(NOW);
+        assert_eq!(
+            runtime.economics.pools,
+            build(&v2_state(NOW), &Value::Null, &prices(), NOW).pools
+        );
+    }
+
+    #[test]
+    fn multiplier_watch_update_wins_over_an_in_flight_poll() {
+        let report = report_v2();
+        let mut runtime = multiplier_runtime(&report, v2_state(NOW), BTreeMap::new(), NOW);
+        let generation = runtime.multipliers.generation;
+        runtime.bucket_item(
+            cortexkit_bus_client::BucketItem::Delete {
+                key: "opaque-0".into(),
+                revision: 2,
+            },
+            NOW,
+        );
+        let after_delete = runtime.report.clone();
+        runtime.poll_report(report, generation, true);
+        assert_eq!(runtime.report, after_delete);
+    }
+
     use super::*;
 
     fn credential_fixture() -> (Value, BTreeMap<String, BTreeSet<String>>, i64) {
