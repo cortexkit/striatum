@@ -632,8 +632,8 @@ mod tests {
             .store
             .with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO block(kind,origin_key,provider,evidence,evidence_at,deadline,cooldown_until,observed_at,next_recheck_at)
-                     VALUES ('provider',json_array('legacy'),'legacy',json_array(?1,NULL,100),100,?1,?1,100,?1)",
+                    "INSERT INTO block(kind,origin_key,provider,evidence,evidence_at,quota,deadline,cooldown_until,observed_at,next_recheck_at)
+                     VALUES ('provider',json_array('legacy'),'legacy',json_array(?1,NULL,100),100,0,?1,?1,100,?1)",
                     [now - 10_000],
                 )?;
                 conn.execute(

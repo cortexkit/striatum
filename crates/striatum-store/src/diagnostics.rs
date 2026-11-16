@@ -365,13 +365,13 @@ mod tests {
                  ('p/live', 'p/live', 'p', 'live', 'quota', {NOW}, 0),
                  ('p/backoff', 'p/backoff', 'p', 'backoff', NULL, NULL, 0),
                  ('p/passed', 'p/passed', 'p', 'passed', NULL, NULL, 0);
-                 INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,deadline,
+                 INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,deadline,
                    cooldown_until,quota_exhausted_until,wall_class,next_recheck_at) VALUES
-                 ('route',json_array('p/live'),'p','live',json_array(NULL,{ahead},NULL),{NOW},{ahead},NULL,{ahead},'billing',{ahead}),
-                 ('route',json_array('p/passed'),'p','passed',json_array({NOW},{NOW},NULL),0,{NOW},{NOW},{NOW},NULL,{NOW});
-                 INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,deadline,next_recheck_at) VALUES
-                 ('failure',json_array('p/backoff'),'p','backoff',json_array({ahead},NULL,NULL),0,{ahead},{ahead}),
-                 ('failure',json_array('p/passed'),'p','passed',json_array({NOW},NULL,NULL),0,{NOW},{NOW});",
+                 ('route',json_array('p/live'),'p','live',json_array(NULL,{ahead},NULL),{NOW},0,{ahead},NULL,{ahead},'billing',{ahead}),
+                 ('route',json_array('p/passed'),'p','passed',json_array({NOW},{NOW},NULL),0,0,{NOW},{NOW},{NOW},NULL,{NOW});
+                 INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,deadline,next_recheck_at) VALUES
+                 ('failure',json_array('p/backoff'),'p','backoff',json_array({ahead},NULL,NULL),0,0,{ahead},{ahead}),
+                 ('failure',json_array('p/passed'),'p','passed',json_array({NOW},NULL,NULL),0,0,{NOW},{NOW});",
                 ahead = NOW + 60_000
             ),
         );
