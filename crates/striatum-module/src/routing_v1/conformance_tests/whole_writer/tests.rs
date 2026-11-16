@@ -32,6 +32,8 @@ mod outside_state;
 mod paired_charge;
 #[path = "probes/tests.rs"]
 mod probes;
+#[path = "producer_catalogue/tests.rs"]
+mod producer_catalogue;
 #[path = "quota/tests.rs"]
 mod quota;
 #[path = "read_only/tests.rs"]
@@ -567,6 +569,7 @@ fn assert_trace_is_declared(trace: &striatum_store::writer_entry_trace::Trace) {
 
 fn assert_all_producers_driven(trace: &striatum_store::writer_entry_trace::Trace) {
     assert_trace_is_declared(trace);
+    producer_catalogue::assert_reconciled(trace);
     let mut expected = declared_adapters();
     expected.extend(declared_mutable_commands());
     expected.extend(metadata::native_declarations());
