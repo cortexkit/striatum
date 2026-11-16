@@ -45,6 +45,7 @@ mod quota_bus;
 mod quota_consumer;
 mod quota_events;
 mod retention;
+mod route_facts;
 mod routing_v1;
 mod runtime_lag;
 mod select;
@@ -1745,9 +1746,10 @@ async fn answer_route_request<F, Fut>(
 ///
 /// A panic in the handler is resumed here, so it ends this task just as it did
 /// when the handler ran on the task itself.
-async fn run_route_handler_off_async_workers<F>(handler: F) -> Result<(), ModuleError>
+async fn run_route_handler_off_async_workers<F, T>(handler: F) -> Result<T, ModuleError>
 where
-    F: std::future::Future<Output = Result<(), ModuleError>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, ModuleError>> + Send + 'static,
+    T: Send + 'static,
 {
     let runtime = tokio::runtime::Handle::current();
     #[cfg(test)]

@@ -25,6 +25,7 @@ pub(super) struct ConsumerHealth {
     pub lag: Option<u64>,
     pub ack_pending: Option<usize>,
     pub last_error: Option<String>,
+    pub route_facts: crate::route_facts::Health,
 }
 
 struct SnapshotSchedule {

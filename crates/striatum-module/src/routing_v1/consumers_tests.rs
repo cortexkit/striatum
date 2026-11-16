@@ -2543,6 +2543,7 @@ fn body_claims_and_unattested_principals_never_grant_configured_ownership() {
             principal: principal.into(),
             scope: None,
             scope_authority: None,
+            event_module: None,
         };
         assert_eq!(
             registry

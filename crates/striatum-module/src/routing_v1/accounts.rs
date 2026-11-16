@@ -128,7 +128,7 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
             )
         })
         .unwrap_or_else(|_| super::operator_config(deps).v1_runners());
-    if caller.binding_is_current() {
+    if caller.module_identity_is_current() {
         if let Some(module) = caller.attested_module().filter(|module| {
             runners.iter().any(|runner| runner.module == *module)
                 || super::consumers::is_media_provider(module)

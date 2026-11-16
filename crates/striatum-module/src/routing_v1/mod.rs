@@ -130,6 +130,9 @@ mod task_ref_tests;
 #[cfg(test)]
 mod wire_pair_tests;
 
+#[cfg(test)]
+mod route_fact_tests;
+
 /// The `routing/v1` capability a routing provider lists in its manifest.
 pub(crate) const PROVIDES: &str = cortexkit_role_routing::PROVIDES;
 
@@ -180,6 +183,8 @@ pub(crate) struct Caller {
     pub scope: Option<crate::DecisionScope>,
     /// Authority from the daemon's scope stamp, independent of ledger metadata.
     pub scope_authority: Option<ScopeAuthority>,
+    /// A module authenticated by the bus's publisher subject permissions.
+    event_module: Option<String>,
 }
 
 /// Retain daemon-stamped authorization for consumer admission even when routing
@@ -206,7 +211,26 @@ impl Caller {
             principal: crate::route_principal(channel, epoch),
             scope: crate::route_scope(channel, epoch),
             scope_authority: crate::route_scope_authority(channel, epoch),
+            event_module: None,
         }
+    }
+
+    pub(crate) fn for_event(module: &str) -> Self {
+        Self {
+            binding: None,
+            principal: format!("reserved:{module}"),
+            scope: None,
+            scope_authority: None,
+            event_module: Some(module.to_owned()),
+        }
+    }
+
+    fn module_identity_is_current(&self) -> bool {
+        self.binding_is_current()
+            || self
+                .event_module
+                .as_ref()
+                .is_some_and(|module| self.principal == format!("reserved:{module}"))
     }
 
     pub(crate) fn binding_is_current(&self) -> bool {
@@ -409,7 +433,7 @@ pub(crate) fn record_call(
     Ok(())
 }
 
-async fn answer(
+pub(crate) async fn answer(
     method: &str,
     params: &Value,
     caller: &Caller,

@@ -1662,7 +1662,8 @@ impl AccountTx<'_> {
 
     /// The runner started the admitted run. A start after the reservation
     /// expired is still accepted, and marked late, because the run's freeze
-    /// wins. Returns whether the row changed.
+    /// wins. Returns whether the lifecycle transitioned to started; a finished
+    /// row can still gain missing start evidence without making that transition.
     pub fn mark_admission_started(
         &self,
         principal: &str,
@@ -1671,15 +1672,27 @@ impl AccountTx<'_> {
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {
-        self.conn
+        let changed = self
+            .conn
             .execute(
                 "UPDATE account_admission SET state = 'started', run_id = ?3, started_at = ?4, \
                  started_late = ?5, last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
                  WHERE principal = ?1 AND admission_id = ?2 AND state IN ('reserved', 'expired')",
                 params![principal, admission_id, run_id, at, i64::from(late)],
             )
-            .map(|changed| changed == 1)
-            .map_err(err)
+            .map_err(err)?
+            == 1;
+        if !changed {
+            // Redelivery can put the start after the finish. Retain the run's
+            // evidence without reopening the admission or its concurrency slot.
+            self.conn.execute(
+                "UPDATE account_admission SET run_id = ?3, started_at = ?4, started_late = ?5, \
+                 last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
+                 WHERE principal = ?1 AND admission_id = ?2 AND state = 'finished' AND run_id IS NULL",
+                params![principal, admission_id, run_id, at, i64::from(late)],
+            ).map_err(err)?;
+        }
+        Ok(changed)
     }
 
     /// Release an admission that never started, removing its demand. A second

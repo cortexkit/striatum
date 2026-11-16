@@ -7,7 +7,7 @@ use cortexkit_bus_nats::{ConnectConfig, NatsConnection, NatsStreamCursor};
 use cortexkit_bus_trait::{DurableOwner, Stream};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use subc_client_rs::{CallOptions, ConsumerIdentity, ConsumerOptions, SubcConsumer};
+use subc_client_rs::{CallOptions, ConsumerOptions, SubcConsumer};
 use subc_protocol::{BindIdentity, RouteTarget};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -15,7 +15,6 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 struct CredentialRoute {
     consumer: SubcConsumer,
     identity: BindIdentity,
-    principal: ConsumerIdentity,
 }
 
 impl CredentialRoute {
@@ -31,7 +30,6 @@ impl CredentialRoute {
                     .map_err(|e| e.to_string())?,
                 CallOptions {
                     timeout: TIMEOUT,
-                    consumer_identity: Some(self.principal.clone()),
                     ..Default::default()
                 },
             )
@@ -96,19 +94,12 @@ pub(super) async fn attach(path: PathBuf) -> Result<AttachedBus, String> {
 }
 
 async fn attach_inner(path: PathBuf) -> Result<AttachedBus, String> {
-    let nonce = subc_client_rs::launch_nonce()
-        .map_err(|_| "launch nonce unreadable")?
-        .ok_or("routing launch nonce absent")?;
     let consumer = SubcConsumer::connect(&path, ConsumerOptions::default())
         .await
         .map_err(|_| "ckbus route unavailable")?;
     let route = Arc::new(CredentialRoute {
         consumer,
         identity: BindIdentity::new(super::DEFAULT_MODULE_ID, "bus"),
-        principal: ConsumerIdentity {
-            module_id: super::DEFAULT_MODULE_ID.into(),
-            launch_nonce: nonce.value().to_owned(),
-        },
     });
     let mut credential: Credential =
         serde_json::from_value(route.call("ckbus.credential", json!({})).await?)

@@ -227,6 +227,15 @@ impl Harness {
         self.broca_credentials.lock().unwrap().clone()
     }
 
+    pub(super) fn fact_handler(&self) -> crate::route_facts::Handler {
+        crate::route_facts::Handler {
+            quota_cache: Arc::clone(&self.quota_cache),
+            store: Arc::clone(&self.store),
+            credentials: self.credentials(),
+            config_path: self.config_path_for_test(),
+        }
+    }
+
     pub(super) fn observe_runner_describe(&self, module: &str, describe: &Value) {
         let credentials = self.broca_credentials.lock().unwrap();
         super::runners::DescribeCache::default().reply(
