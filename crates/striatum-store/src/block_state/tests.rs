@@ -3343,6 +3343,45 @@ fn legacy_sync_rig(name: &str) -> Rig {
     }
 }
 
+/// Imported future refusals can expire before their first tick registers a
+/// clock. Retiring the provider must not invalidate the same tick's check of
+/// a different-cause route on that provider.
+#[test]
+fn sync_retires_provider_and_independent_route_without_invalidating_its_own_state() {
+    let name = "sync-own-retirement";
+    let legacy = legacy_sync_rig(name);
+    legacy.sql(format!(
+        "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+         VALUES ('retire-self',{}, {NOW},'provider capacity',{NOW},{NOW});
+         INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
+         VALUES ('retire-self/model','retire-self/model','retire-self','model',{}, {NOW},'route capacity',{NOW},{NOW});",
+        NOW + 1_000, NOW + 500,
+    ));
+    let rig = upgrade_sync_rig(legacy, name);
+    assert_eq!(rig.published().view_origins().len(), 2);
+    assert_eq!(rig.published().stored_clocks().count(), 0);
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.store
+        .account_command(AccountCommandKind::Tick, |tx| tx.tick(NOW + 20_000))
+        .unwrap();
+    assert_eq!(
+        rig.loads_since(loads),
+        0,
+        "fresh state is not retried because of the tick's own writes"
+    );
+    assert!(rig.published().view_origins().is_empty());
+    assert_eq!(rig.published().stored_clocks().count(), 0);
+    let retired: i64 = rig.store.with_reader_for_test(|conn| conn.query_row(
+        "SELECT count(*) FROM retirement_tombstone WHERE kind IN ('provider','route') AND json_extract(origin_key,'$[0]') LIKE 'retire-self%'",
+        [], |row| row.get(0),
+    )).unwrap();
+    assert_eq!(
+        retired, 2,
+        "both imported evidence generations were retired"
+    );
+    rig.check(&[NOW + 20_000], "after retiring both independent sources");
+}
+
 fn upgrade_sync_rig(rig: Rig, name: &str) -> Rig {
     let Rig {
         store,
