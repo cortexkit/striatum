@@ -1687,11 +1687,31 @@ fn authorized_recovery_rig(empty: bool) -> Rig {
             })
             .into()
     };
-    rig.sql(format!(
-        "INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
-         VALUES ('whole','p0','a0','{{}}','{{}}','broca_account_limit',{},'x',{},NULL,'{}');",
-        NOW - 1_000_000, NOW - 1_000_000, serde_json::to_string(&pools).unwrap()
-    ));
+    rig.run(move |conn| {
+        let row = crate::block_storage::account_source(
+            conn,
+            &crate::AccountPoolFenceRow {
+                evidence: crate::AccountFenceRow {
+                    fence_id: "whole".into(),
+                    provider: "p0".into(),
+                    account_id: "a0".into(),
+                    scope_json: "{}".into(),
+                    fence_json: "{}".into(),
+                    source: "broca_account_limit".into(),
+                    observed_at: NOW - 1_000_000,
+                    principal: "x".into(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: NOW - 1_000_000,
+                    cleared_at: None,
+                    cleared_reason: None,
+                },
+                pool_key: None,
+                recovery_set: pools.clone(),
+            },
+        )?;
+        crate::block_storage::write_source(conn, &row).map(|_| ())
+    });
     rig
 }
 
@@ -1713,7 +1733,7 @@ fn authorized_recovery_success(rig: &Rig, model: &str, known: bool, at: i64) {
                 )?);
                 tx.conn
                     .execute(
-                        "UPDATE fence_recheck SET reset_check_at=?1 WHERE kind='account'",
+                        "UPDATE block SET reset_check_at=?1 WHERE kind='account' AND managed=1 AND is_origin=1",
                         [at + if known { 100 } else { 5 }],
                     )
                     .map_err(err)?;
