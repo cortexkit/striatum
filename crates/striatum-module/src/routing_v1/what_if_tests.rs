@@ -586,16 +586,10 @@ async fn scoring_anchor_follows_the_effective_mode_for_decisions_and_previews() 
                 config["providers"]["example-subscription"]["banked_resets"] = json!("capacity");
             }
         });
-        for (request, id_field) in [
-            (
-                json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}),
-                "decision_id",
-            ),
-            (
-                json!({"targetAgent":"mason","requirements":{"iq":50,"eq":50},"availableModels":["example-provider/model-a"]}),
-                "decisionID",
-            ),
-        ] {
+        for (request, id_field) in [(
+            json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50}}),
+            "decision_id",
+        )] {
             let (ty, reply) = consumer.call("route.select", &request).await;
             assert_eq!(ty, FrameType::Response, "{reply}");
             let decision = harness
@@ -981,7 +975,7 @@ async fn what_if_all_panel_classes_keep_the_floor_when_strong_families_are_walle
         .map(|index| {
             (
                 format!("cpu-provider-0/model-{index}"),
-                json!({"not_for":["athena","lab"]}),
+                json!({"not_for":["prefrontal-core.athena","prefrontal-core.lab"]}),
             )
         })
         .collect();
@@ -1134,79 +1128,4 @@ async fn what_if_panel_refuses_unknown_classes_as_select_panel_does() {
         .await;
     assert_eq!(ty, FrameType::Error, "iqs or panel is required: {body}");
     assert_eq!(before, rows(&harness));
-}
-
-#[tokio::test]
-async fn consumer_rename_what_if_equivalence_for_both_deployment_orders() {
-    let (harness, _) = configured().await;
-    prepare_runner_preview(&harness);
-    let operator = operator(&harness).await;
-    let pairs = [
-        ("mason", "prefrontal-core.mason"),
-        ("sidekick", "prefrontal-core.sidekick"),
-        ("athena", "prefrontal-core.athena"),
-        ("athena.gather", "prefrontal-core.athena.gather"),
-        ("synthesizer", "prefrontal-core.athena.synthesizer"),
-        ("lab", "prefrontal-core.lab"),
-        ("core", "prefrontal-core.wake"),
-        ("codemode", "basal.codemode"),
-        ("flow", "basal.flow"),
-        ("mc_summary", "magic-context.summary"),
-        ("mc_dream", "magic-context.dream"),
-        ("mc_dream_classify", "magic-context.dream.classify-memories"),
-        ("mc_dream_curate", "magic-context.dream.curate"),
-        (
-            "mc_dream_compress_cues",
-            "magic-context.dream.compress-cues",
-        ),
-        (
-            "mc_dream_review_user",
-            "magic-context.dream.review-user-memories",
-        ),
-        ("mc_dream_map", "magic-context.dream.map-memories"),
-        ("mc_dream_primers", "magic-context.dream.refresh-primers"),
-        (
-            "mc_dream_retrospective",
-            "magic-context.dream.reflect-events",
-        ),
-        ("mc_dream_verify", "magic-context.dream.verify"),
-        ("mc_dream_verify", "magic-context.dream.verify-broad"),
-    ];
-    let iqs: Vec<_> = (10..=100).step_by(10).collect();
-    let mut expected = None;
-    for document in [
-        include_str!("../../fixtures/consumer-names-old.jsonc"),
-        include_str!("../../fixtures/consumer-names-new.jsonc"),
-    ] {
-        let policy: Value =
-            serde_json::from_str(&subc_jsonc::jsonc_to_json(document).unwrap()).unwrap();
-        harness.edit_config(|config| {
-            for key in ["consumers", "models", "providers"] {
-                config[key] = policy[key].clone();
-            }
-        });
-        for (old, new) in pairs {
-            for consumer in [old, new] {
-                let result = evaluate(&operator, json!({"consumer": consumer, "iqs": iqs, "runner_declarations": {"broca": broad_runner_slot()}})).await;
-                let picks: Vec<_> = result["results"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|row| {
-                        assert_eq!(
-                            row["pick"]["route"], "example-provider/model-b",
-                            "{consumer}: {row}"
-                        );
-                        (row["iq"].clone(), row["pick"].clone())
-                    })
-                    .collect();
-                assert_eq!(picks.len(), 10);
-                if let Some(expected) = &expected {
-                    assert_eq!(&picks, expected, "{consumer}");
-                } else {
-                    expected = Some(picks);
-                }
-            }
-        }
-    }
 }

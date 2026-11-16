@@ -19,7 +19,7 @@ fn body(method: &str, params: Value) -> Vec<u8> {
 fn the_older_shapes_are_recognised_by_their_marker_alone() {
     let v1_select = json!({"consumer": "flow", "requirements": {"iq": 50}});
     assert!(claims(&body("route.select", v1_select)));
-    assert!(!claims(&body(
+    assert!(claims(&body(
         "route.select",
         json!({"targetAgent": "mason", "requirements": {"iq": 50, "eq": 50}})
     )));
@@ -43,19 +43,6 @@ fn the_older_shapes_are_recognised_by_their_marker_alone() {
     }
     for method in ["route.model_facts", "route.catalog_targets"] {
         assert!(!claims(&body(method, json!({}))), "{method}");
-    }
-}
-
-#[test]
-fn legacy_detail_does_not_mark_a_contract_select() {
-    for detail in [json!(true), json!(false), json!(null)] {
-        let mut legacy = json!({
-            "consumer": "mason", "requirements": {"iq": 30, "eq": 0},
-            "detail": detail, "targetAgent": "mason", "executor": "broca", "substrate": "broca"
-        });
-        assert!(!claims(&body("route.select", legacy.clone())));
-        legacy.as_object_mut().unwrap().remove("targetAgent");
-        assert!(claims(&body("route.select", legacy)));
     }
 }
 
@@ -110,26 +97,8 @@ fn refused_field(reply: &(FrameType, Value)) -> (&str, &str) {
 }
 
 #[tokio::test]
-async fn route_select_is_older_with_target_agent_and_v1_without() {
+async fn route_select_keeps_the_current_answer_and_refuses_old_members() {
     let (_harness, route) = configured().await;
-    let older = route
-        .call(
-            "route.select",
-            &json!({
-                "targetAgent": "mason",
-                "requirements": {"iq": 50, "eq": 50},
-                "availableModels": ["example-provider/model-a"],
-            }),
-        )
-        .await;
-    assert_eq!(older.0, FrameType::Response, "{}", older.1);
-    assert!(older.1["result"]["decisionID"].is_string(), "{}", older.1);
-    assert_eq!(
-        older.1["result"]["decision_id"],
-        older.1["result"]["decisionID"]
-    );
-    assert!(older.1["result"]["selected"].is_object(), "{}", older.1);
-
     let v1 = route
         .call(
             "route.select",

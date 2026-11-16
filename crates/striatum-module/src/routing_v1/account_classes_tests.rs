@@ -639,7 +639,7 @@ pub(super) fn setup(provider: &str, converted_live: bool) -> (Arc<Harness>, Broc
     setup_at_version(provider, converted_live, None)
 }
 
-fn account_fact(provider: &str) -> striatum_core::ModelFact {
+pub(super) fn account_fact(provider: &str) -> striatum_core::ModelFact {
     let mut fact = crate::tests::fact(provider, "model");
     fact.auth_methods = Some(vec!["oauth".into(), "apikey".into()]);
     fact.billing_plane = Some(BillingPlane {
@@ -654,7 +654,7 @@ fn account_fact(provider: &str) -> striatum_core::ModelFact {
     fact
 }
 
-fn setup_at_version(
+pub(super) fn setup_at_version(
     provider: &str,
     converted_live: bool,
     version: Option<u32>,
@@ -786,7 +786,7 @@ async fn decisions_keep_both_wire_classes_after_consumer_edits() {
     let runner = harness.bind(reserved(RUNNER), None).await;
     let mut decisions = Vec::new();
     for consumer in ["mason", "codemode", "flow"] {
-        for legacy in [false, true] {
+        for legacy in [false] {
             let mut request = json!({"consumer":consumer,"requirements":{"iq":30,"eq":0}});
             if legacy {
                 request.as_object_mut().unwrap().remove("consumer");
@@ -4246,7 +4246,7 @@ async fn codex_selected_provider(used: [f64; 3], legacy: bool) -> String {
 #[tokio::test]
 async fn codex_three_exhausted_accounts_select_an_adequate_fallback() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 100.0], legacy).await,
             "fallback"
@@ -4260,7 +4260,7 @@ async fn codex_accounts_below_the_broca_floor_keep_luna() {
     // and 96% accounts still have quota above the reserve: sidekicks keep
     // running on them instead of losing the pool.
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 95.0, 96.0], legacy).await,
             "openai"
@@ -4271,7 +4271,7 @@ async fn codex_accounts_below_the_broca_floor_keep_luna() {
 #[tokio::test]
 async fn codex_one_account_with_headroom_keeps_luna() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 10.0], legacy).await,
             "openai"
@@ -4304,7 +4304,7 @@ async fn codex_reserve_limited_refusal_carries_earliest_reset() {
 #[tokio::test]
 async fn codex_reserve_held_last_account_is_unavailable_to_sidekicks() {
     let _clock = crate::InjectedClock::set(NOW);
-    for legacy in [true, false] {
+    for legacy in [false] {
         assert_eq!(
             codex_selected_provider([100.0, 100.0, 99.0], legacy).await,
             "fallback"
@@ -4313,7 +4313,7 @@ async fn codex_reserve_held_last_account_is_unavailable_to_sidekicks() {
 }
 
 #[tokio::test]
-async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() {
+async fn codex_runtime_wall_on_last_headroom_account_reaches_selection() {
     let _clock = crate::InjectedClock::set(NOW);
     let harness = codex_pool([100.0, 100.0, 10.0]);
     harness
@@ -4328,13 +4328,18 @@ async fn codex_runtime_wall_on_last_headroom_account_reaches_legacy_selection() 
         })
         .unwrap();
     let caller = harness.bind(reserved(OWNER), None).await;
-    let reply = caller.call("route.select", &json!({
-        "consumer":"sidekick", "targetAgent":"explore", "executor":"broca", "substrate":"broca",
-        "requirements":{"iq":1,"eq":0}
-    })).await;
+    let reply = caller
+        .call(
+            "route.select",
+            &json!({
+                "consumer":"sidekick",
+                "requirements":{"iq":1,"eq":0}
+            }),
+        )
+        .await;
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     assert_eq!(
-        reply.1["result"]["selected"]["routeKey"], "fallback/adequate",
+        reply.1["result"]["route"]["provider"], "fallback",
         "{}",
         reply.1
     );

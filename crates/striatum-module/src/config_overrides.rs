@@ -11,7 +11,6 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::config_policy::{
     ConsumerPolicy, ExcludeGroups, PanelPolicies, Pins, ProviderPolicy, RunnerPolicy, VariantGroups,
 };
-use crate::substrate_policy::SubstrateGroups;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -499,6 +498,13 @@ fn parse_config_with_reporter(
     if value.get("aa").is_some() {
         return Err("config_key_removed: aa; delete this key".into());
     }
+    if value.get("substrates").is_some()
+        || value
+            .get("model_routing")
+            .is_some_and(|section| section.get("substrates").is_some())
+    {
+        return Err("config_key_removed: substrates; removed along with legacy route.select; delete this key".into());
+    }
     if value.get("model_families").is_some() {
         return Err("config_key_removed: model_families; families now come from Fusiform's model.lineage; delete this section".into());
     }
@@ -690,7 +696,6 @@ fn live_config_at_with_reporter(
     }
     let active = match next {
         Ok(config) => {
-            crate::routing_v1::consumers::settings_loaded(&config);
             crate::routing_v1::runners::placements::settings_loaded(&config);
             Arc::new(config)
         }
@@ -892,10 +897,6 @@ impl LiveConfig {
 
     pub fn variant_groups(&self) -> &VariantGroups {
         &self.config.model_routing.variants
-    }
-
-    pub(crate) fn substrate_groups(&self) -> &SubstrateGroups {
-        &self.config.model_routing.substrates
     }
 
     pub fn panels(&self) -> &PanelPolicies {
@@ -1712,11 +1713,6 @@ struct ModelRoutingSection {
     /// be an effort the catalog publishes for the matched models.
     #[serde(skip)]
     variants: VariantGroups,
-    /// Route-to-harness mapping. Resolve the workload group, consumer group,
-    /// then `all`, taking each group's longest matching route key or default.
-    /// Routes not covered by any group run on Broca.
-    #[serde(default)]
-    substrates: SubstrateGroups,
     #[serde(default)]
     panels: PanelPolicies,
     #[serde(skip)]

@@ -120,11 +120,7 @@ pub(super) async fn select(
     caller: &Caller,
     deps: &Deps<'_>,
 ) -> Result<Value, Refusal> {
-    super::consumers::record_select(
-        "routing/v1",
-        params["consumer"].as_str(),
-        &super::operator_config(deps),
-    );
+    super::consumers::record_select("routing/v1", params, &super::operator_config(deps));
     let capabilities = super::describe::capabilities();
     if capabilities.contains(&"select_kind") && capabilities.contains(&"select_media") {
         let config = super::operator_config(deps);
@@ -1772,7 +1768,7 @@ async fn select_at_tier_attempt(
         let request_pin_exempt = inputs.consumer_pinned
             || (request.pin.is_none() && request.pin_slot.is_some())
             || request.pin_origin == Some(PinOrigin::User)
-            || request_pin_is_keep_free_exempt(&consumer, request.pin.as_deref(), &consumer_policy);
+            || request_pin_is_keep_free_exempt(request.pin.as_deref(), &consumer_policy);
         let mut request_pin = request.pin.clone().or_else(|| {
             request
                 .pin_slot
@@ -3450,16 +3446,9 @@ impl<'a> Selection<'a> {
 const PINNED_KEEP_FREE_EXPLANATION: &str = "pinned: keep-free margin not applied";
 
 fn request_pin_is_keep_free_exempt(
-    consumer: &str,
     pin: Option<&str>,
     policy: &crate::config_policy::ConsumerPolicy,
 ) -> bool {
-    // Keep raw mason pins exempt until core sends pin_origin for user choices.
-    // Remove this compatibility rule once core's marker is live; other raw
-    // request pins still need the marker or an operator-settings match.
-    if consumer == "prefrontal-core.mason" || consumer.starts_with("prefrontal-core.mason.") {
-        return true;
-    }
     let Some(requested) = pin.and_then(RouteRef::parse_pin) else {
         return false;
     };

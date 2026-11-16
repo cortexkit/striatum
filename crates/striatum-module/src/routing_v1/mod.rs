@@ -54,6 +54,8 @@ mod select;
 #[cfg(test)]
 mod service_tier_tests;
 mod shapes;
+#[cfg(test)]
+mod subscription_incident_tests;
 mod what_if;
 #[cfg(test)]
 mod what_if_tests;

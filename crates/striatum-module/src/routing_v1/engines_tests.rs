@@ -26,8 +26,10 @@ fn setup(engines: Vec<Value>) -> Arc<Harness> {
         config["consumers"] = json!({"colliculus":{"owner":"colliculus","pay_per_token":true,"context_tokens":999999}});
     });
     super::consumers::replace_catalog(&json!([
-        {"module_id":"colliculus","nonce_verified":true,"role_declarations":{"media-provider/v1":{"engines":engines}}},
-        {"module_id":"callosum","nonce_verified":true,"role_declarations":{"routing/v1":{"consumers":[{"name":"phone.media"}]}}}
+        {"module_id":"colliculus","nonce_verified":true,"role_declarations":{
+            "media-provider/v1":{"engines":engines},
+            "routing/v1":{"consumers":[{"name":"colliculus.voice_message","selectors":["callosum"]}]}
+        }}
     ]));
     harness.set_credentials(media_credentials(vec![key("opaque-media")]));
     harness
@@ -308,15 +310,25 @@ async fn engine_ranking_is_deterministic_with_kind_specific_fixture_facts() {
 }
 
 #[tokio::test]
-async fn engine_phone_consumer_is_admitted_only_for_declaring_principal() {
+async fn engine_phone_consumer_admits_its_declaring_owner_and_callosum_selector_only() {
     let harness = setup(vec![]);
-    let owner = harness.bind(reserved("callosum"), None).await;
+    let owner = harness.bind(reserved("colliculus"), None).await;
+    let selector = harness.bind(reserved("callosum"), None).await;
     let foreign = harness.bind(reserved("stranger"), None).await;
-    let params = json!({"consumer":"phone.media","kind":"transcribe","requirements":{},"privacy":"local_only","caller_local":[engine("phone",true)]});
+    let params = json!({"consumer":"colliculus.voice_message","kind":"transcribe","requirements":{},"privacy":"local_only","caller_local":[engine("phone",true)]});
     assert_eq!(
         selected(&owner, &params).await["engine"]["caller_local"],
         true
     );
+    assert_eq!(
+        selected(&selector, &params).await["engine"]["caller_local"],
+        true
+    );
+    let mut old = params.clone();
+    old["consumer"] = json!("phone.media");
+    let unknown = selector.call("route.select_engine", &old).await;
+    assert_eq!(unknown.0, FrameType::Error);
+    assert_eq!(unknown.1["code"], "unknown_consumer", "{}", unknown.1);
     let refused = foreign.call("route.select_engine", &params).await;
     assert_eq!(refused.0, FrameType::Error);
     assert_eq!(refused.1["code"], "consumer_not_owned", "{}", refused.1);

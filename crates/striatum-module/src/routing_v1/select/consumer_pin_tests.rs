@@ -46,12 +46,6 @@ async fn configured(configured_consumer: &str) -> (Arc<Harness>, Route) {
         config["consumers"][configured_consumer] = json!({
             "owner":"prefrontal-core", "pin":{"model":OPUS,"variant":"medium"}
         });
-        if configured_consumer == "synthesizer" {
-            config["consumers"][configured_consumer]
-                .as_object_mut()
-                .unwrap()
-                .remove("owner");
-        }
         config["consumers"]["prefrontal-core.athena"] = json!({"owner":"prefrontal-core"});
         config["models"][OPUS]["pin_only_for"] = json!(["prefrontal-core.athena"]);
         config["models"][OPUS]["subscription"] = json!(true);
@@ -112,17 +106,7 @@ async fn settings_pin_selects_exact_model_and_variant_through_hard_admission() {
 }
 
 #[tokio::test]
-async fn old_and_new_consumer_names_resolve_the_same_settings_pin() {
-    for configured_consumer in [CHAIR, "synthesizer"] {
-        let (_harness, route) = configured(configured_consumer).await;
-        for consumer in [CHAIR, "synthesizer"] {
-            assert_chair(&answered(&route, &request(consumer)).await);
-        }
-    }
-}
-
-#[tokio::test]
-async fn settings_pin_inherits_operator_ancestors_for_both_names() {
+async fn settings_pin_inherits_operator_ancestors() {
     let (harness, route) = configured(CHAIR).await;
     harness.edit_config(|config| {
         config["consumers"][CHAIR]
@@ -131,9 +115,7 @@ async fn settings_pin_inherits_operator_ancestors_for_both_names() {
             .remove("pin");
         config["consumers"]["prefrontal-core"]["pin"] = json!({"model":OPUS,"variant":"medium"});
     });
-    for consumer in [CHAIR, "synthesizer"] {
-        assert_chair(&answered(&route, &request(consumer)).await);
-    }
+    assert_chair(&answered(&route, &request(CHAIR)).await);
 }
 
 #[tokio::test]
@@ -192,4 +174,42 @@ async fn opus_stays_out_of_automatic_athena_panel_seats() {
         answer.seats[0].answer.route.model, "claude-fable-5-2",
         "{reply:?}"
     );
+}
+
+#[tokio::test]
+async fn canonical_athena_chair_pin_reaches_panel_and_picker_policy_view() {
+    let (harness, panel_caller) = configured(CHAIR).await;
+    let picker = harness.bind(reserved("occipital"), None).await;
+    // Model pickers read the configured synthesizer pin from the panel policy
+    // view; route.head_choices lists models, not configured pins.
+    let request = json!({"panelSpec":{"class":"AUDIT"}, "substrate":"broca",
+        "availableModels":[OPUS,FABLE], "packageTokens":1000});
+    for (caller, principal) in [
+        (&panel_caller, "reserved:prefrontal-core"),
+        (&picker, "reserved:occipital"),
+    ] {
+        crate::take_operator_infos();
+        let reply = caller.call("route.select_panel", &request).await;
+        assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+        assert_eq!(
+            reply.1["result"]["policy"]["pins"]["synthesizer"],
+            json!({"model":"anthropic/claude-opus-5-5","variant":"medium"}),
+            "{reply:?}"
+        );
+        let logs: Vec<_> = crate::take_operator_infos()
+            .into_iter()
+            .filter(|line| line.starts_with("[routing] legacy panel call "))
+            .collect();
+        assert_eq!(
+            logs,
+            [format!("[routing] legacy panel call principal={principal}")]
+        );
+    }
+    let config = harness.operator_config();
+    let pin = config
+        .slot_pin(crate::config_policy::ATHENA_SYNTHESIZER_CONSUMER)
+        .unwrap();
+    assert_eq!(pin.model, OPUS);
+    assert_eq!(pin.variant.as_deref(), Some("medium"));
+    assert!(config.slot_pin("synthesizer").is_none());
 }

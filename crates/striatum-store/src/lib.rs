@@ -347,7 +347,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 92] {
+fn route_state_migrations() -> [Migration; 93] {
     [
         Migration {
             version: 1,
@@ -716,6 +716,10 @@ fn route_state_migrations() -> [Migration; 92] {
         Migration {
             version: 93,
             statements: include_str!("../migrations/093_pin_retention.sql"),
+        },
+        Migration {
+            version: 94,
+            statements: include_str!("../migrations/094_consumer_names.sql"),
         },
     ]
 }
@@ -4404,6 +4408,9 @@ fn confidence_str(c: Confidence) -> &'static str {
 }
 
 #[cfg(test)]
+mod consumer_names_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use striatum_core::ScoreProvenance;
@@ -4605,7 +4612,7 @@ mod tests {
         }
         assert_eq!(
             restarted
-                .v1_affinity_decision("owner", "mason", "conversation")
+                .v1_affinity_decision("owner", "prefrontal-core.mason", "conversation")
                 .unwrap()
                 .unwrap()
                 .decision_id,

@@ -27,6 +27,13 @@ pub fn convert_value(value: Value) -> Result<Value, String> {
         .as_object()
         .cloned()
         .ok_or("routing config must be an object")?;
+    if root.contains_key("substrates")
+        || root
+            .get("model_routing")
+            .is_some_and(|section| section.get("substrates").is_some())
+    {
+        return Err("substrates was removed along with legacy route.select; remove the retired routing rule before converting this file".into());
+    }
     remove_account_model_families(&mut root);
     remove_account_flag(&mut root)?;
     if !root.contains_key("model_routing")

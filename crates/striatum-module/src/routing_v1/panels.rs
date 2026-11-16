@@ -892,9 +892,9 @@ async fn candidates(
     let class = class(request)?;
     let panel_policy = crate::panel_policy::class_policy(config.panels(), class);
     let class_consumer = if class == scoring::PanelClass::Lab {
-        "lab"
+        crate::select_policy::Consumer::Lab.id()
     } else {
-        "athena"
+        crate::select_policy::Consumer::Athena.id()
     };
     let group_consumer =
         if crate::config_policy::consumer_matches(class_consumer, &request.consumer) {
@@ -937,7 +937,7 @@ async fn candidates(
         seed: request.seed.clone().unwrap_or_default(),
         pins: scoring::PanelPins {
             synthesizer: config
-                .slot_pin("synthesizer")
+                .slot_pin(crate::config_policy::ATHENA_SYNTHESIZER_CONSUMER)
                 .map(|pin| scoring::PanelSynthesizerPin {
                     model: pin.model.clone(),
                     variant: pin.variant.clone(),

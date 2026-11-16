@@ -231,7 +231,7 @@ fn broca_selected_route(reply: &(FrameType, Value), legacy: bool) -> String {
 #[tokio::test]
 async fn broca_fresh_billing_fence_skips_the_route_on_both_select_surfaces() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
-    for legacy in [false, true] {
+    for legacy in [false] {
         let harness = broca_fence_harness();
         let before = broca_select(&harness, legacy).await;
         assert_eq!(broca_selected_route(&before, legacy), "inception/mercury-3");
@@ -275,7 +275,7 @@ async fn broca_fresh_billing_fence_skips_the_route_on_both_select_surfaces() {
 #[tokio::test]
 async fn broca_selected_one_hour_probe_admits_only_once_on_both_surfaces() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
-    for legacy in [false, true] {
+    for legacy in [false] {
         let harness = broca_fence_harness();
         fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
         let selected = broca_select(&harness, legacy).await;
@@ -310,7 +310,7 @@ async fn broca_selected_one_hour_probe_admits_only_once_on_both_surfaces() {
 #[tokio::test]
 async fn broca_concurrent_selects_reserve_one_probe_and_admit_its_decision() {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
-    for legacy in [false, true] {
+    for legacy in [false] {
         let harness = broca_fence_harness();
         fence_inception(&harness, FENCE_NOW as i64 - 400 * 60_000);
         let (a, b) = tokio::join!(
@@ -494,11 +494,6 @@ async fn broca_v1_lost_probe_binding_falls_back() {
     lost_probe_binding_fallback_case(false).await;
 }
 
-#[tokio::test]
-async fn broca_legacy_lost_probe_binding_falls_back() {
-    lost_probe_binding_fallback_case(true).await;
-}
-
 async fn lost_probe_binding_fallback_case(legacy: bool) {
     let _clock = crate::InjectedClock::set(FENCE_NOW);
     let harness = broca_fence_harness();
@@ -517,11 +512,6 @@ async fn lost_probe_binding_fallback_case(legacy: bool) {
 #[tokio::test]
 async fn broca_v1_lost_probe_binding_without_fallback_returns_the_durable_reset() {
     lost_probe_binding_wait_case(false).await;
-}
-
-#[tokio::test]
-async fn broca_legacy_lost_probe_binding_without_fallback_returns_the_durable_reset() {
-    lost_probe_binding_wait_case(true).await;
 }
 
 async fn lost_probe_binding_wait_case(legacy: bool) {
@@ -1059,7 +1049,7 @@ async fn credentialed_ladders_skip_an_unentitled_entry_on_both_wire_shapes() {
         )
         .unwrap();
     let route = harness.bind(reserved("example-consumer"), None).await;
-    for legacy in [false, true] {
+    for legacy in [false] {
         let mut params = select("mason");
         params["detail"] = json!(true);
         if legacy {

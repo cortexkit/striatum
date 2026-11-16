@@ -3,7 +3,7 @@ use serde_json::json;
 use crate::routing_v1::consumers::Catalog;
 
 #[tokio::test]
-async fn declared_names_check_identity_after_schema_and_keep_null_transition_defaults() {
+async fn declared_names_check_identity_after_schema_including_null_defaults() {
     crate::routing_v1::describe::with_candidate_capabilities(&["consumer_declarations"], async {
         for member in [
             json!({"iq": 0}),
@@ -30,23 +30,17 @@ async fn declared_names_check_identity_after_schema_and_keep_null_transition_def
             assert!(!names.contains_key("callosum_task"), "{member}");
             assert!(names.contains_key("callosum"));
             assert!(names.contains_key("callosum.task"));
-            for (name, eq) in [("phone.media", 22), ("null-legacy", 33)] {
+            for name in ["phone.media", "null-legacy"] {
+                assert!(!names.contains_key(name));
                 assert!(
                     catalog.issues.iter().any(|issue| {
-                        issue.contains("transitional")
+                        issue.contains("ignored")
                             && issue.contains(&format!("consumer {name:?}"))
                             && issue.contains("from module \"callosum\"")
                     }),
                     "{name}: {:?}",
                     catalog.issues
                 );
-                let defaults = &names[name];
-                assert_eq!(defaults.eq, Some(eq));
-                assert_eq!(defaults.iq, None);
-                assert_eq!(defaults.ladder, None);
-                assert_eq!(defaults.placement, None);
-                assert_eq!(defaults.selectors, None);
-                assert_eq!(defaults.kind, None);
             }
             assert_eq!(catalog.issues.len(), 3);
             assert!(catalog
@@ -60,7 +54,7 @@ async fn declared_names_check_identity_after_schema_and_keep_null_transition_def
                     .iter()
                     .filter(|issue| issue.contains("transitional"))
                     .count(),
-                2
+                0
             );
         }
         // An invalid schema still refuses the whole slot before identity checks.
