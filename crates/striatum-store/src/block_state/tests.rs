@@ -1629,7 +1629,7 @@ fn a_pool_block_whose_recovery_set_grew_after_the_state_is_kept() {
                     cleared_reason: None,
                 },
                 pool_key: None,
-                recovery_set,
+                recovery_set: recovery_set.clone(),
             },
         )?;
         crate::block_storage::write_source(conn, &row).map(|_| ())
