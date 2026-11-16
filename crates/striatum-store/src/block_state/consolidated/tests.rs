@@ -581,3 +581,100 @@ fn native_pool_writer_keeps_frozen_deadlines_null_and_preserves_claim_history() 
         Ok(())
     }).unwrap();
 }
+
+#[test]
+fn model_recovery_clears_older_native_evidence_at_the_reading_time() {
+    let scratch = cortexkit_test_support::ScratchDir::new("native-model-recovery-clear");
+    let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+        "native-model-recovery-clear",
+        scratch.path().join("state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    let at = 1_900_000_000_000;
+    for (provider, credential, model, recorded) in [
+        ("p", "c", "target", 10),
+        ("p", "c", "sibling", 1),
+        ("p", "other", "target", 1),
+        ("other", "c", "target", 1),
+        ("p", "c", "latest", 1),
+        ("p", "c", "unreported", 8),
+    ] {
+        store
+            .record_account_route_fence(&crate::AccountRouteFence {
+                provider: provider.into(),
+                credential_id: credential.into(),
+                model: model.into(),
+                until_ms: at + 60_000,
+                recorded_at: at + recorded,
+                decision_id: "recovery-proof".into(),
+            })
+            .unwrap();
+    }
+    // Separate the latest report from first-recorded time and exercise the
+    // fallback for an imported refusal that has no report-order timestamp.
+    store.with_writer_for_test(move |conn| {
+        conn.execute("UPDATE block SET last_reported_at=?1 WHERE kind='account_route' AND model='latest'", [at+20])?;
+        conn.execute("UPDATE block SET last_reported_at=NULL WHERE kind='account_route' AND model='unreported'", [])?;
+        Ok(())
+    }).unwrap();
+    let clear = |model, offset| {
+        store
+            .account_transaction(|tx| {
+                tx.clear_account_route_fence_before("p", "c", model, at + offset)
+            })
+            .unwrap()
+    };
+    assert_eq!(clear("target", 10), 0, "equal report evidence is not older");
+    assert_eq!(
+        clear("target", 11),
+        1,
+        "the native target source was cleared"
+    );
+    assert_eq!(
+        clear("latest", 20),
+        0,
+        "latest report, not first record, controls recovery"
+    );
+    assert_eq!(clear("latest", 21), 1);
+    assert_eq!(
+        clear("unreported", 8),
+        0,
+        "missing report time falls back to first record"
+    );
+    assert_eq!(clear("unreported", 9), 1);
+    let rows = store.with_reader_for_test(|conn| {
+        conn.prepare("SELECT provider,credential_id,model,source_present,cleared_at FROM block WHERE kind='account_route' ORDER BY provider,credential_id,model")?
+            .query_map([], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,bool>(3)?,row.get::<_,Option<i64>>(4)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+    }).unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("other".into(), "c".into(), "target".into(), true, None),
+            (
+                "p".into(),
+                "c".into(),
+                "latest".into(),
+                false,
+                Some(at + 21)
+            ),
+            ("p".into(), "c".into(), "sibling".into(), true, None),
+            (
+                "p".into(),
+                "c".into(),
+                "target".into(),
+                false,
+                Some(at + 11)
+            ),
+            (
+                "p".into(),
+                "c".into(),
+                "unreported".into(),
+                false,
+                Some(at + 9)
+            ),
+            ("p".into(), "other".into(), "target".into(), true, None),
+        ],
+        "only the proved models clear, each at its captured reading time"
+    );
+}
