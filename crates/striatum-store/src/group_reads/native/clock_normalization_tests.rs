@@ -109,6 +109,22 @@ fn becoming_record_only_drops_the_clock_but_observation_source_removal_keeps_its
     parity(&rig);
     let reads = trace.take();
     assert_eq!(
+        reads.clock_normalizations, 0,
+        "a transient report must not downgrade a standing quota origin: {reads:#?}"
+    );
+    let key = "[\"normalization\",\"route-credential\",\"model\"]";
+    assert!(rig.published().clock("account_route", key).is_some());
+    // The transient recorder deliberately preserves quota evidence. Exercise
+    // an actual typed-class loss in the schema through a writer command.
+    rig.store.account_command(AccountCommandKind::Repair,move|tx| {
+        let changed=tx.conn.execute("UPDATE block SET wall_class='transient' WHERE kind='account_route' AND origin_key=?1",[key])
+            .map_err(crate::err)?;
+        assert_eq!(changed,1);
+        Ok(())
+    }).unwrap();
+    parity(&rig);
+    let reads = trace.take();
+    assert_eq!(
         reads.clock_normalizations, 1,
         "an origin becoming a record drops one clock: {reads:#?}"
     );
