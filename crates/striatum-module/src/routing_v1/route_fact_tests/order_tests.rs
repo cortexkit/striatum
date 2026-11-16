@@ -116,24 +116,31 @@ async fn end_state(order: &[usize], legacy: bool) -> Value {
         "blocks":blocks, "report":report, "usage":usage})
 }
 
-#[tokio::test]
-async fn every_admission_fact_order_has_the_in_order_end_state() {
+async fn assert_every_order(legacy: bool) {
     let _clock = crate::InjectedClock::set(NOW);
     let mut orders = Vec::new();
     permutations(&mut [0, 1, 2, 3, 4, 5], 0, &mut orders);
     assert_eq!(orders.len(), 720);
-    for legacy in [false, true] {
-        let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy).await;
-        assert_eq!(expected["admission"]["state"], "finished");
-        assert_eq!(expected["inflight"], 0);
-        assert_eq!(expected["usage"], json!([1, 20]));
-        assert!(!expected["blocks"].as_array().unwrap().is_empty());
-        for order in &orders {
-            assert_eq!(
-                end_state(order, legacy).await,
-                expected,
-                "legacy={legacy} order={order:?}"
-            );
-        }
+    let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy).await;
+    assert_eq!(expected["admission"]["state"], "finished");
+    assert_eq!(expected["inflight"], 0);
+    assert_eq!(expected["usage"], json!([1, 20]));
+    assert!(!expected["blocks"].as_array().unwrap().is_empty());
+    for order in &orders {
+        assert_eq!(
+            end_state(order, legacy).await,
+            expected,
+            "legacy={legacy} order={order:?}"
+        );
     }
+}
+
+#[tokio::test]
+async fn every_admission_fact_order_has_the_in_order_end_state() {
+    assert_every_order(false).await;
+}
+
+#[tokio::test]
+async fn every_legacy_admission_fact_order_has_the_in_order_end_state() {
+    assert_every_order(true).await;
 }
