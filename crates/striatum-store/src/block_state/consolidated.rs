@@ -270,6 +270,13 @@ impl BlockState {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(super) fn source_count_for_test(&self, kind: &str) -> usize {
+        self.block_rows()
+            .filter(|row| row.block.kind == kind && row.source_present)
+            .count()
+    }
+
     fn rows(&self, table: usize) -> impl Iterator<Item = (i64, &Record)> {
         self.tables
             .get(table)

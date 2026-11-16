@@ -13,6 +13,10 @@ use std::sync::Mutex;
 use striatum_core::route_state_store::{FactSource, RouteStateStore, RouteStateUpdate};
 use striatum_core::RouteStateResult;
 
+#[cfg(test)]
+#[path = "native_sql/tests.rs"]
+mod native_sql;
+
 #[derive(Clone)]
 struct TestState(BlockState);
 
@@ -107,6 +111,17 @@ fn make_rig(name: &str, before_block_migration: bool) -> Rig {
     }
 }
 
+fn observation_source_sql(account: &str) -> String {
+    let account = account.replace('\'', "''");
+    format!(
+        "INSERT INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,
+           quota,deadline,observed_at,observation_id,next_recheck_at)
+         VALUES ('observation',json_array('p','{account}'),'p','{account}',
+           json_array('k',0),{NOW},0,{until},{NOW},'k',{until});",
+        until = NOW + 60_000,
+    )
+}
+
 impl Rig {
     pub(crate) fn reload(&self) {
         self.owner.request_reload();
@@ -158,8 +173,8 @@ impl Rig {
         );
     }
 
-    /// Memory equals a fresh load, its view rows equal SQLite's view, and its
-    /// blocks equal the SQL adapter's at each time.
+    /// Memory equals a fresh load, its source origins equal an independent SQL
+    /// projection, and its blocks equal the SQL adapter's at each time.
     fn check(&self, times: &[i64], context: &str) {
         let memory = self.published();
         assert_eq!(
@@ -169,14 +184,7 @@ impl Rig {
         );
         let view = self
             .store
-            .with_reader_for_test(|conn| {
-                let mut rows = conn
-                    .prepare("SELECT kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,evidence,evidence_at,quota,deadline,reset_at FROM fence_origin")?
-                    .query_map([], |r| fence_rechecks::view_origin(r, 0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                rows.sort_by(|a, b| (&a.kind, &a.origin_key).cmp(&(&b.kind, &b.origin_key)));
-                Ok(rows)
-            })
+            .with_reader_for_test(native_sql::origins)
             .unwrap();
         assert_eq!(memory.view_origins(), view, "view rows: {context}");
         let stored = self.store.with_reader_for_test(sql_fingerprints).unwrap();
@@ -909,16 +917,15 @@ fn copy_triggers_without_replace_leave_the_rows_the_replace_left() {
 fn a_whole_table_delete_is_captured() {
     let rig = rig("block-state-truncate");
     rig.sql(format!(
-        "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');
-         INSERT INTO account_transient_backoff VALUES ('p','b',{},{NOW},'k','[]');",
-        NOW + 60_000,
-        NOW + 60_000
+        "{}{}",
+        observation_source_sql("a"),
+        observation_source_sql("b"),
     ));
-    assert_eq!(rig.published().table_sizes()[10].1, 2);
+    assert_eq!(rig.published().source_count_for_test("observation"), 2);
     // Without a WHERE clause SQLite may drop every row at once without
     // reporting each; the writer connection's authorizer prevents that.
-    rig.sql("DELETE FROM account_transient_backoff;".into());
-    assert_eq!(rig.published().table_sizes()[10].1, 0);
+    rig.sql("DELETE FROM block;".into());
+    assert_eq!(rig.published().source_count_for_test("observation"), 0);
     rig.check(&[NOW], "after a whole-table delete");
 }
 
@@ -928,28 +935,18 @@ fn a_failed_command_leaves_no_captured_row() {
     let result = rig
         .store
         .account_command(AccountCommandKind::Maintenance, |tx| {
-            tx.pool_sql(|conn| {
-                conn.execute_batch(&format!(
-                    "INSERT INTO account_transient_backoff VALUES ('p','a',{},{NOW},'k','[]');",
-                    NOW + 60_000
-                ))
-            })?;
+            tx.pool_sql(|conn| conn.execute_batch(&observation_source_sql("a")))?;
             Err::<(), _>(err("planned failure after a block write"))
         });
     assert!(result.is_err());
-    assert_eq!(rig.published().table_sizes()[10].1, 0);
+    assert_eq!(rig.published().source_count_for_test("observation"), 0);
     rig.check(&[NOW], "after a failed command");
 }
 
 #[test]
 fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
     let rig = rig("block-state-outside");
-    let row = |account: &str| {
-        format!(
-            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
-            NOW + 60_000
-        )
-    };
+    let row = observation_source_sql;
     // A test seed bypasses the writer on purpose: it reloads the state but is
     // not a violation.
     let loads = rig.owner.loads.load(Ordering::Relaxed);
@@ -961,7 +958,7 @@ fn a_write_outside_a_command_reloads_the_state_before_the_next_batch() {
     assert_eq!(rig.store.block_seed_writes_for_test(), seeds + 1);
     assert_eq!(rig.store.block_writes_outside_command(), 0);
     assert_eq!(
-        rig.published().table_sizes()[10].1,
+        rig.published().source_count_for_test("observation"),
         0,
         "the hook saw no command"
     );
@@ -1006,7 +1003,9 @@ fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
             },
         )
         .unwrap();
-    rig.run(fence_rechecks::sync);
+    rig.store
+        .account_transaction(|tx| fence_rechecks::sync_on(tx, NOW).map_err(err))
+        .unwrap();
     let origins = rig.store.account_read(|tx| tx.fence_rechecks()).unwrap();
     assert_eq!(origins.len(), 1, "{origins:?}");
     let before_the_winner = rig.published();
@@ -1038,7 +1037,7 @@ fn a_claim_decided_on_a_stale_state_runs_again_on_a_fresh_load() {
     let owners = |rig: &Rig| {
         rig.store
             .with_reader_for_test(|conn| {
-                conn.prepare("SELECT claim_owner FROM fence_recheck UNION ALL SELECT owner FROM fence_probe_authorization")?
+                conn.prepare("SELECT claim_owner FROM block WHERE managed=1 AND is_origin=1 UNION ALL SELECT owner FROM probe_authorization")?
                     .query_map([], |r| r.get::<_, Option<String>>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -1802,12 +1801,7 @@ fn a_periodic_full_comparison_finds_a_missed_change_in_place() {
 #[test]
 fn a_commit_from_another_connection_just_before_a_batch_is_loaded_inside_it() {
     let rig = rig("block-state-outside-before-begin");
-    let row = |account: &str| {
-        format!(
-            "INSERT INTO account_transient_backoff VALUES ('p','{account}',{},{NOW},'k','[]');",
-            NOW + 60_000
-        )
-    };
+    let row = observation_source_sql;
     rig.sql(row("first"));
     let path = std::fs::canonicalize(rig._scratch.path().join("state.db")).unwrap();
     let outside = path.clone();
@@ -4353,4 +4347,75 @@ fn a_recovery_from_older_evidence_does_not_lift_a_renewed_pool_block() {
         matches!(acquire(&current), crate::PoolAcquireOutcome::Leased(_)),
         "a recovery from the current evidence lifts it"
     );
+}
+
+#[test]
+fn native_sql_projection_is_an_independent_reference() {
+    let rig = rig("native-source-sql-reference");
+    rig.store
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "p0".into(),
+                credential_id: "c0".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            None,
+            NOW,
+        )
+        .unwrap();
+    rig.store
+        .account_transaction(|tx| {
+            tx.insert_pool_fence(&crate::AccountPoolFenceRow {
+                evidence: crate::AccountFenceRow {
+                    fence_id: "credential-quota:[\"p0\",\"c0\"]:quota-report".into(),
+                    provider: "p0".into(),
+                    account_id: "a0".into(),
+                    scope_json: "null".into(),
+                    fence_json: "{\"reset\":{\"kind\":\"missing\"}}".into(),
+                    source: "broca_account_limit".into(),
+                    observed_at: NOW,
+                    principal: "test".into(),
+                    admission_id: None,
+                    observation_id: None,
+                    created_at: NOW,
+                    cleared_at: None,
+                    cleared_reason: None,
+                },
+                pool_key: None,
+                recovery_set: Vec::new(),
+            })
+        })
+        .unwrap();
+    rig.store
+        .record_provider_cooldown(
+            "p0",
+            "p0/m0",
+            "p0/m0",
+            &RouteStateUpdate {
+                observed_at_ms: Some(NOW),
+                cooldown_until: Some((NOW + 60_000) as f64),
+                last_error: Some("provider capacity".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    rig.sql(format!(
+        "UPDATE block SET observed_at={} WHERE kind='provider';
+         UPDATE block SET observed_at={},created_at={} WHERE kind='account';",
+        NOW + 1,
+        NOW + 2,
+        NOW + 3,
+    ));
+    rig.check(
+        &[NOW - 1, NOW, NOW + 60_001],
+        "independent native SQL reference",
+    );
+    let origins = rig.store.with_reader_for_test(native_sql::origins).unwrap();
+    let provider = origins.iter().find(|row| row.kind == "provider").unwrap();
+    assert_eq!(provider.evidence_at, NOW + 1);
+    assert_eq!(provider.deadline, Some((NOW + 60_000) as f64));
+    let account = origins.iter().find(|row| row.kind == "account").unwrap();
+    assert_eq!(account.evidence_at, NOW + 2);
+    let credential = origins.iter().find(|row| row.kind == "credential").unwrap();
+    assert_eq!(credential.quota, Some(true));
 }
