@@ -36,6 +36,8 @@ mod probes;
 mod quota;
 #[path = "read_only/tests.rs"]
 mod read_only;
+#[path = "report_classes/tests.rs"]
+mod report_classes;
 #[path = "scope_witnesses/tests.rs"]
 mod scope_witnesses;
 #[path = "shared_keys/tests.rs"]
@@ -596,6 +598,7 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
         world.admit_scope_witnesses(seed).await;
         world.credential_witnesses(seed).await;
         world.shared_key_witnesses(seed).await;
+        world.report_class_witnesses(seed).await;
         assert_trace_is_declared(&world.trace);
         assert_all_producers_driven(&world.trace);
     }
