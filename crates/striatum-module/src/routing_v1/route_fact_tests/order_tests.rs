@@ -12,9 +12,19 @@ fn permutations(items: &mut [usize], at: usize, out: &mut Vec<Vec<usize>>) {
     }
 }
 
-async fn end_state(order: &[usize], legacy: bool, check_load: bool) -> Value {
+async fn end_state(
+    order: &[usize],
+    legacy: bool,
+    check_load: bool,
+    template: Option<&std::path::Path>,
+) -> Value {
     let _ids = striatum_store::replay::Inputs::new(NOW as i64).install();
-    let (harness, _) = super::super::account_classes_tests::setup("synthetic", false);
+    let (harness, _) = match template {
+        Some(template) => {
+            super::super::account_classes_tests::setup_from_template("synthetic", false, template)
+        }
+        None => super::super::account_classes_tests::setup("synthetic", false),
+    };
     harness.edit_config(|config| config["runners"] = json!([{"module":"broca","via_vault":true}]));
     let runner = harness.bind(reserved("broca"), None).await;
     let owner = harness.bind(reserved("class-owner"), None).await;
@@ -125,23 +135,59 @@ async fn end_state(order: &[usize], legacy: bool, check_load: bool) -> Value {
         "blocks":blocks, "report":report, "usage":usage})
 }
 
+fn schema(path: &std::path::Path) -> (i64, Vec<(String, String, String, Option<String>)>) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let version = conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let mut stmt = conn
+        .prepare("SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name")
+        .unwrap();
+    let objects = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    (version, objects)
+}
+
 async fn assert_every_order(legacy: bool) {
     let _clock = crate::InjectedClock::set(NOW);
     let mut orders = Vec::new();
     permutations(&mut [0, 1, 2, 3, 4, 5], 0, &mut orders);
     assert_eq!(orders.len(), 720);
-    let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy, false).await;
+    // Migrate once, then copy a consistent SQLite snapshot instead of rerunning
+    // the entire migration chain for each order. Each copy still gets its own
+    // setup, selection, admission, caches and six production frame-handler calls.
+    let fresh = Harness::new("admission-order-template");
+    let template = fresh.store_path().with_file_name("template.db");
+    rusqlite::Connection::open(fresh.store_path())
+        .unwrap()
+        .execute("VACUUM INTO ?1", [template.to_str().unwrap()])
+        .unwrap();
+    let copy = Harness::from_template("admission-order-schema-check", &template);
+    assert_eq!(schema(&copy.store_path()), schema(&fresh.store_path()));
+    drop(copy);
+    // Keep the reference on the original fresh-store path so it also checks
+    // that reusing the migrated schema preserves the end state.
+    let expected = end_state(&[0, 1, 2, 3, 4, 5], legacy, false, None).await;
     assert_eq!(expected["admission"]["state"], "finished");
     assert_eq!(expected["inflight"], 0);
     assert_eq!(expected["usage"], json!([1, 20]));
     assert!(!expected["blocks"].as_array().unwrap().is_empty());
+    let mut compared = 0;
     for order in &orders {
         assert_eq!(
-            end_state(order, legacy, false).await,
+            end_state(order, legacy, false, Some(&template)).await,
             expected,
             "legacy={legacy} order={order:?}"
         );
+        compared += 1;
     }
+    assert_eq!(compared, 720);
+    println!("legacy={legacy}: compared all {compared} admission fact permutations");
 }
 
 #[tokio::test]
@@ -158,6 +204,6 @@ async fn every_legacy_admission_fact_order_has_the_in_order_end_state() {
 async fn finished_then_started_matches_fresh_account_state_in_both_shapes() {
     let _clock = crate::InjectedClock::set(NOW);
     for legacy in [false, true] {
-        end_state(&[1, 2, 3, 4, 0, 5], legacy, true).await;
+        end_state(&[1, 2, 3, 4, 0, 5], legacy, true, None).await;
     }
 }
