@@ -227,7 +227,7 @@ mod tests {
         let frame = json!({"group":"synthetic","path":"$.state","tables":{
             "model_route_state":[{"route_key":"bridge-provider/model","capacity_key":"bridge-provider/model",
                 "provider_id":"bridge-provider","model_id":"model","updated_at":at,
-                "cooldown_until":(at+60000)as f64,"wall_observed_at":at}],
+                "cooldown_until":at+60000,"wall_observed_at":at}],
             "account_route_fence":[{"provider":"bridge-provider","credential_id":"credential","model":"model",
                 "until_ms":at+90000,"decision_id":"decision","recorded_at":at,"last_reported_at":at,"wall_class":"quota"}]
         }});
