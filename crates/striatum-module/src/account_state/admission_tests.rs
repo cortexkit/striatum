@@ -134,8 +134,10 @@ fn assert_same_answers(
                 for hash in ["h0", "h1", "h2"] {
                     let affinity = tx.affinity(principal, hash, PROVIDER)?;
                     assert_eq!(
-                        state.affinity(principal, hash, PROVIDER),
-                        affinity.as_ref(),
+                        state
+                            .affinity(principal, hash, PROVIDER)
+                            .map(super::compact_rows::expand_affinity),
+                        affinity,
                         "{context}: affinity {principal}/{hash}"
                     );
                     if let Some(affinity) = &affinity {
@@ -168,8 +170,8 @@ fn assert_same_answers(
                     .filter(|row| OPEN.contains(&row.state.as_str()));
                 let memory = state.open_admission(principal, id);
                 assert_eq!(
-                    memory.map(|open| &open.row),
-                    open.as_ref(),
+                    memory.map(|open| super::compact_rows::expand_admission(&open.row)),
+                    open,
                     "{context}: admission {id}"
                 );
                 if open.is_some() {
@@ -982,7 +984,8 @@ fn pruning_the_newest_finished_admission_reveals_the_older_open_one() {
         Ok(())
     })
     .unwrap();
-    let conversation = ("p".to_string(), "h".to_string(), PROVIDER.to_string());
+    let conversation: super::admissions::ConversationKey =
+        ("p".into(), "h".into(), PROVIDER.into());
     let latest = |owner: &StateOwner| {
         published(owner)
             .latest
@@ -1012,7 +1015,8 @@ fn pruning_a_pins_last_started_admission_clears_its_started_count() {
         Ok(())
     })
     .unwrap();
-    let conversation = ("p".to_string(), "h".to_string(), PROVIDER.to_string());
+    let conversation: super::admissions::ConversationKey =
+        ("p".into(), "h".into(), PROVIDER.into());
     assert_eq!(published(&owner).pin_started.get(&conversation), Some(&1));
     prune_everything_before(&store, 100);
     assert_eq!(published(&owner).pin_started.get(&conversation), None);
@@ -1064,7 +1068,7 @@ fn pruning_the_newest_used_offer_reveals_the_older_used_one() {
         Ok(())
     })
     .unwrap();
-    let original = ("p".to_string(), "original".to_string());
+    let original: super::admissions::RowKey = ("p".into(), "original".into());
     let latest_used = |owner: &StateOwner| {
         published(owner)
             .chains

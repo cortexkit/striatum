@@ -13,8 +13,11 @@ use striatum_store::{
 
 mod admissions;
 mod blocks;
+mod compact_rows;
+mod conversation_hash;
 mod inflight;
 mod pin_members;
+mod shared_text;
 mod waiters;
 
 pub(crate) use admissions::AdmissionState;
@@ -149,7 +152,7 @@ pub(crate) fn open_preflight_admission(
     Ok(published_at(store, now_ms)?
         .admissions
         .open_admission(principal, admission_id)
-        .map(|open| open.row.clone()))
+        .map(|open| compact_rows::expand_admission(&open.row)))
 }
 
 /// Keyed exception for a request refused before its writer command: a
@@ -585,7 +588,7 @@ impl AccountCommand<'_> {
         };
         if let Some(open) = state.open_admission(principal, admission_id) {
             self.visit_account(&open.row.provider, &open.row.account_id);
-            return Ok(Some(open.row.clone()));
+            return Ok(Some(compact_rows::expand_admission(&open.row)));
         }
         keyed_exception();
         let row = self.sql.admission_by_key(principal, admission_id)?;
@@ -608,7 +611,7 @@ impl AccountCommand<'_> {
             .admission_state()
             .and_then(|state| state.open_admission(principal, id));
         let (mut parent, moved) = if let Some(open) = live {
-            (open.row.clone(), false)
+            (compact_rows::expand_admission(&open.row), false)
         } else {
             keyed_exception();
             let Some(found) = self.sql.fork_parent_by_key(principal, id)? else {
@@ -656,7 +659,7 @@ impl AccountCommand<'_> {
         match self.admission_state() {
             Some(state) => Ok(state.open_admission(principal, admission_id).map(|open| {
                 self.visit_account(&open.row.provider, &open.row.account_id);
-                open.row.clone()
+                compact_rows::expand_admission(&open.row)
             })),
             None => Ok(self
                 .sql
@@ -677,7 +680,7 @@ impl AccountCommand<'_> {
             .and_then(|state| state.open_admission(principal, id))
         {
             return Ok(Some(striatum_store::AdmissionStateRow {
-                row: open.row.clone(),
+                row: compact_rows::expand_admission(&open.row),
                 input_size_class: open.input_size_class,
                 model_decision_id: open.model_decision_id.clone(),
                 rowid: open.rowid,
@@ -713,7 +716,7 @@ impl AccountCommand<'_> {
         match self.admission_state() {
             Some(state) => Ok(state.affinity(principal, hash, provider).map(|row| {
                 self.visit_account(&row.provider, &row.account_id);
-                row.clone()
+                compact_rows::expand_affinity(row)
             })),
             None => self.sql.affinity(principal, hash, provider),
         }
@@ -988,7 +991,11 @@ impl AccountCommand<'_> {
                     at,
                 } => {
                     if !sql.set_affinity_lease_end(
-                        &conversation,
+                        &(
+                            conversation.0.to_string(),
+                            conversation.1.to_string(),
+                            conversation.2.to_string(),
+                        ),
                         (&pin_id, pin_generation),
                         previous,
                         at,
@@ -1208,7 +1215,7 @@ impl AccountCommand<'_> {
             let state = self.admission_state().expect("checked above");
             let left = state
                 .chains
-                .get(&(principal.to_owned(), admission.to_owned()))
+                .get(&(principal.into(), admission.to_owned()))
                 .and_then(|chain| chain.runs.get(run))
                 .and_then(|rows| rows.values().find(|row| row.decision_id == previous))
                 .map(|row| row.reservation_id.clone())
@@ -1406,7 +1413,7 @@ impl AccountCommand<'_> {
                 state.inflight.remove(
                     &row.provider,
                     &row.account_id,
-                    &(row.principal.clone(), row.admission_id.clone()),
+                    &(row.principal.as_str().into(), row.admission_id.clone()),
                     self.now_ms,
                 );
             }
@@ -1417,7 +1424,7 @@ impl AccountCommand<'_> {
                 MAINTENANCE_READS.fetch_add(1, Ordering::Relaxed);
                 let latest = sql.latest_admission_for_conversation(
                     &conversation.0,
-                    &conversation.1,
+                    &conversation.1.to_string(),
                     &conversation.2,
                 )?;
                 state.set_latest(conversation, latest);
@@ -1437,6 +1444,10 @@ impl AccountCommand<'_> {
             self.sql
                 .delete_account_affinities_returning(keys, before, lease_before)?;
         if let Some(state) = self.admissions() {
+            let deleted: Vec<_> = deleted
+                .into_iter()
+                .map(|(p, h, v)| (p.into(), h.into(), v.into()))
+                .collect();
             state.prune_affinities(&deleted);
             state.pending.clear();
         }
@@ -1627,6 +1638,8 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
 
 #[cfg(test)]
 mod admission_tests;
+#[cfg(all(test, feature = "heap-measure"))]
+mod compact_cpu_tests;
 #[cfg(test)]
 mod inflight_tests;
 #[cfg(all(test, feature = "heap-measure"))]
