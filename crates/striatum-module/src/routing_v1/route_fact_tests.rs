@@ -229,6 +229,15 @@ fn prefrontal_rename_new_subject_is_a_complete_durable_filter() {
     assert_ne!(old, new);
     assert!(route_facts::filters_ready(&names, Some("m_striatum"), &new));
     assert!(route_facts::filters_ready(&names, Some("m_striatum"), &old));
+    let reader_only: Vec<_> = old
+        .iter()
+        .map(|subject| format!("{subject}.striatum"))
+        .collect();
+    assert!(!route_facts::filters_ready(
+        &names,
+        Some("m_striatum"),
+        &reader_only
+    ));
     let incomplete: Vec<_> = new
         .into_iter()
         .filter(|s| !s.contains("event.prefrontal."))

@@ -108,14 +108,23 @@ pub(crate) fn filters_ready(
 }
 
 fn equivalent_subject(names: &AccountNames, left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
     match (
         names.parse_event_subject(left),
         names.parse_event_subject(right),
     ) {
-        (Ok(left), Ok(right)) => {
-            left.event == right.event
-                && left.version == right.version
-                && striatum_core::module_identity::equal(&left.module, &right.module)
+        (Ok(left_parts), Ok(right_parts)) => {
+            let left_prefix = format!("ck.{}.event.{}.", names.account(), left_parts.module);
+            let right_prefix = format!("ck.{}.event.{}.", names.account(), right_parts.module);
+            // Only the module token is aliased; every remaining token must match
+            // exactly. A filter ending in `.v1.striatum` cannot replace `.v1`.
+            striatum_core::module_identity::equal(&left_parts.module, &right_parts.module)
+                && left
+                    .strip_prefix(&left_prefix)
+                    .zip(right.strip_prefix(&right_prefix))
+                    .is_some_and(|(left, right)| left == right)
         }
         _ => false,
     }
