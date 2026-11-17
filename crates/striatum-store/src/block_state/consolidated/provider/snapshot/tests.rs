@@ -305,3 +305,101 @@ fn provider_projection_does_not_retroactively_inherit_an_existing_catalogue_row(
     );
     pair.assert_no_stored_inheritance();
 }
+
+#[test]
+fn real_older_model_success_can_leave_a_newer_provider_without_a_route_source() {
+    let scratch = cortexkit_test_support::ScratchDir::new("real-provider-source-reachability");
+    let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
+        "real-provider-source-reachability",
+        scratch.path().join("state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    let now = crate::now_ms();
+    let fact: striatum_core::ModelFact = serde_json::from_value(serde_json::json!({
+        "providerID":"reach", "modelID":"before", "scores":{"elo":1000,"eq":50,"speed":50}, "confidence":"unknown"
+    })).unwrap();
+    store
+        .upsert_fact(&fact, striatum_core::FactSource::Override)
+        .unwrap();
+    store
+        .update_route_state(
+            "reach/before",
+            "reach/before",
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some((now + 120_000) as f64),
+                observed_at_ms: Some(now - 200),
+                last_error: Some("independent-capacity".into()),
+                unscoped_wall: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    store
+        .record_provider_cooldown(
+            "reach",
+            "reach/other",
+            "reach/other",
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some((now + 90_000) as f64),
+                observed_at_ms: Some(now - 100),
+                last_error: Some("provider-capacity".into()),
+                unscoped_wall: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.build_snapshot(now as f64).unwrap().by_route["reach/before"].cooldown_until,
+        Some((now + 120_000) as f64)
+    );
+    // This successful run started after the model refusal, but before the
+    // provider's newer evidence. It can heal only the older refusal.
+    store
+        .account_transaction(|tx| {
+            tx.heal_serving_fences(
+                "reach",
+                "account",
+                "credential",
+                "before",
+                None,
+                now - 150,
+                now,
+            )
+        })
+        .unwrap();
+    store.with_reader_for_test(|conn| {
+        let state: (bool,bool,Option<i64>,String) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM block WHERE kind='provider' AND provider='reach' AND source_present=1),
+             EXISTS(SELECT 1 FROM block WHERE kind='route' AND origin_key=json_array('reach/before') AND source_present=1),
+             (SELECT wall_observed_at FROM model_route_state WHERE route_key='reach/before'),
+             (SELECT cleared_models FROM block WHERE kind='provider' AND provider='reach')", [],
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)))?;
+        assert_eq!(state,(true,false,Some(now-200),"[]".into()));
+        Ok(())
+    }).unwrap();
+    assert!(store
+        .load_blocks(now)
+        .unwrap()
+        .blocks
+        .iter()
+        .any(|row| row.kind == "provider" && row.scope.provider == "reach"));
+    assert_eq!(
+        store
+            .get_provider_cooldown("reach")
+            .unwrap()
+            .unwrap()
+            .cooldown_until,
+        Some((now + 90_000) as f64)
+    );
+    let snapshot = store.build_snapshot(now as f64).unwrap();
+    assert!(
+        striatum_core::route_state_store::route_cooled(
+            None,
+            &snapshot,
+            "reach/before",
+            "reach/before",
+            now as f64
+        ),
+        "the shared snapshot must still enforce the newer provider wall"
+    );
+}
