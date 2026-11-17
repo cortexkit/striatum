@@ -6,25 +6,24 @@ use rusqlite::types::Value as SqlValue;
 fn health(h: &Harness) -> Vec<(String, Vec<Vec<SqlValue>>)> {
     let conn = rusqlite::Connection::open(h.store_path()).unwrap();
     [
-        "model_route_state",
-        "account_route_fence",
-        "account_non_quota_route_fence",
-        "credential_entitlement_fences",
+        ("model_route_state", "SELECT * FROM model_route_state ORDER BY rowid"),
+        ("account_route_source", "SELECT provider,credential_id,model,deadline,
+            json_extract(source_metadata_json,'$.decision_id'),recorded_at,last_reported_at,wall_class
+            FROM block WHERE kind='account_route' AND source_present=1 ORDER BY source_order,origin_key"),
+        ("non_quota_route_sources", "SELECT provider,credential_id,model,deadline,
+            json_extract(source_metadata_json,'$.decision_id'),recorded_at,last_reported_at,wall_class
+            FROM block WHERE kind IN ('non_quota_route','transient_route') AND source_present=1 ORDER BY source_order,origin_key"),
+        ("credential_source", "SELECT provider,credential_id,code,listing_fingerprint,observed_at
+            FROM block WHERE kind='credential' AND source_present=1 ORDER BY source_order,origin_key"),
     ]
     .into_iter()
-    .map(|table| {
-        let mut query = conn
-            .prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))
-            .unwrap();
+    .map(|(label, sql)| {
+        let mut query = conn.prepare(sql).unwrap();
         let columns = query.column_count();
-        let rows = query
-            .query_map([], |row| {
-                (0..columns).map(|column| row.get(column)).collect()
-            })
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        (table.into(), rows)
+        let rows = query.query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        }).unwrap().collect::<Result<_, _>>().unwrap();
+        (label.into(), rows)
     })
     .collect()
 }
@@ -58,9 +57,16 @@ async fn media_report(status: &str, outcome: &str) -> (std::sync::Arc<Harness>, 
                 crate::now_ms() as i64,
             )
             .unwrap();
-        conn.execute("INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class)
-            VALUES ('media-vendor','opaque-media','remote',?1,?2,?3,?3,'quota')",
-            rusqlite::params![reset as i64, id, crate::now_ms() as i64]).unwrap();
+        h.store()
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: "media-vendor".into(),
+                credential_id: "opaque-media".into(),
+                model: "remote".into(),
+                until_ms: reset as i64,
+                decision_id: id.into(),
+                recorded_at: crate::now_ms() as i64,
+            })
+            .unwrap();
     }
     let before = health(&h);
     let body = json!({"decision_id":id,"outcome":outcome,"credential_id":"opaque-media", "reset_at_ms":reset,
