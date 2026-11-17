@@ -10,12 +10,15 @@ fn stores(
 ) {
     let scratch = cortexkit_test_support::ScratchDir::new(label);
     let old = SqliteRouteStateStore::open_at_version_for_test(
-        &crate::dev_descriptor(label, scratch.path().join("old.db").to_string_lossy()),
+        &crate::dev_descriptor(
+            &format!("{label}-old"),
+            scratch.path().join("old.db").to_string_lossy(),
+        ),
         95,
     )
     .unwrap();
     let native = SqliteRouteStateStore::open(&crate::dev_descriptor(
-        label,
+        &format!("{label}-native"),
         scratch.path().join("native.db").to_string_lossy(),
     ))
     .unwrap();
