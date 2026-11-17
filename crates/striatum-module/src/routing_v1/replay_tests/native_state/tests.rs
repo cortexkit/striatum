@@ -3,6 +3,8 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "frozen_audit/tests.rs"]
+mod frozen_audit;
 #[path = "write_audit/tests.rs"]
 mod write_audit;
 
@@ -175,6 +177,7 @@ pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
 pub(super) fn snapshot(harness: &Harness) -> Value {
     let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
     check_tables(&connection).unwrap();
+    frozen_audit::check(harness, &connection);
     let mut tables = serde_json::Map::new();
     for name in INCLUDED_TABLES {
         let mut statement = connection

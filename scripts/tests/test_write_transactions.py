@@ -64,6 +64,21 @@ class WriteTransactionsTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.frozen(source), [])
 
+    def test_every_replay_frozen_mixed_column_rejects_a_production_reader(self):
+        for table, columns in (
+            ("model_route_state", ("cooldown_until", "quota_exhausted_until", "wall_class", "wall_unscoped")),
+            ("provider_cooldown_state", ("quota_exhausted_until", "wall_class", "wall_unscoped")),
+        ):
+            for column in columns:
+                with self.subTest(table=table, column=column):
+                    source = f'fn serving() {{ conn.prepare("SELECT r.{column} FROM {table} r"); }}'
+                    self.assertEqual(self.frozen(source), [(1, f"frozen column {table}.{column}")])
+
+    def test_repository_serving_sql_has_no_frozen_block_reader(self):
+        rules = GUARD["read_frozen_names"](GUARD["FROZEN_NAMES"])
+        _, errors = GUARD["frozen_sql_violations"](ROOT, rules)
+        self.assertEqual(errors, [])
+
     def test_comments_attributes_and_test_only_oracle_items_are_not_serving_sql(self):
         self.assertEqual(self.frozen('''
 // const SQL: &str = "SELECT * FROM account_fence";

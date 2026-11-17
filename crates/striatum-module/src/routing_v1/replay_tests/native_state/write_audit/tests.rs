@@ -97,6 +97,7 @@ pub(super) struct WriteAudit {
     path: PathBuf,
     label: String,
     before: BTreeMap<String, DigestRows>,
+    frozen: super::frozen_audit::Guard,
 }
 
 pub(super) fn begin(harness: &Harness, label: &str) -> WriteAudit {
@@ -112,6 +113,7 @@ pub(super) fn begin(harness: &Harness, label: &str) -> WriteAudit {
         path,
         label: label.to_string(),
         before,
+        frozen: super::frozen_audit::begin(harness),
     }
 }
 
@@ -157,7 +159,8 @@ impl WriteAudit {
             "classification":"completed writer statements; authorizer on a separate read-only prepare includes possible trigger targets, not affected-row or commit counts",
             "net_change_scope":"every named column and raw SQL value type; rowset order canonicalized, implicit rowids not included",
             "live_capture_update_hook_unchanged":true,"live_writer_authorizer_unchanged":true,
-            "read_budget_proof":false,"unclassified_statements":unclassified,"excluded_tables":tables})
+            "read_budget_proof":false,"unclassified_statements":unclassified,"excluded_tables":tables,
+            "frozen_audit_tables":13,"frozen_audit_frame_checks":self.frozen.frame_checks()})
     }
 }
 
