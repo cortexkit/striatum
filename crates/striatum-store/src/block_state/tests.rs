@@ -3518,6 +3518,71 @@ fn sync_retires_provider_and_independent_route_without_invalidating_its_own_stat
     rig.check(&[deadline + 1], "after retiring both independent sources");
 }
 
+#[test]
+fn retirement_records_sync_time_without_rewriting_source_evidence_time() {
+    let rig = rig("retirement-sync-time");
+    let synced_at = 1_800_000_000_000i64;
+    let evidence_at = synced_at - 3_600_000;
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.pool_sql(|conn| {
+                conn.execute(
+                    "INSERT INTO provider_cooldown_state(provider_key,wall_observed_at,updated_at)
+                     VALUES ('retirement-time',?1,?1)",
+                    [evidence_at],
+                )?;
+                let row = crate::block_storage::wall_source(
+                    conn,
+                    crate::block_storage::WallSource {
+                        kind: "provider",
+                        key: "retirement-time",
+                        provider: "retirement-time",
+                        model: None,
+                        cooldown: Some((synced_at - 1) as f64),
+                        exhausted: None,
+                        wall_observed: Some(evidence_at),
+                        observed_at: evidence_at,
+                        error: None,
+                        class: None,
+                        unscoped: false,
+                    },
+                )?
+                .expect("the fixture supplies a provider deadline");
+                crate::block_storage::write_source(conn, &row)?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    assert_eq!(rig.published().view_origins().len(), 1);
+    assert!(rig
+        .published()
+        .clock("provider", r#"["retirement-time"]"#)
+        .is_none());
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            fence_rechecks::sync_on(tx, synced_at).map_err(err)
+        })
+        .unwrap();
+    assert_eq!(rig.owner.loads.load(Ordering::Relaxed), loads);
+    // Retention ages a receipt from retirement, not from the older refusal.
+    // Preserve both times so a delayed sync cannot shorten that retention.
+    rig.store
+        .with_reader_for_test(|conn| {
+            let (stored_evidence_at, retired_at): (i64, i64) = conn.query_row(
+                "SELECT evidence_at,retired_at FROM retirement_tombstone
+             WHERE kind='provider' AND origin_key=json_array('retirement-time')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            assert_eq!(stored_evidence_at, evidence_at);
+            assert_eq!(retired_at, synced_at);
+            Ok(())
+        })
+        .unwrap();
+    rig.check_native("after retiring at the supplied synchronization time");
+}
+
 /// Give the tick an externally superseded snapshot to exercise its keyed
 /// guards independently of the writer's earlier data-version refresh. A
 /// nontransactional counter also catches attempted tombstones rolled back
