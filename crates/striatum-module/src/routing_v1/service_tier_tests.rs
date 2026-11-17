@@ -1487,6 +1487,7 @@ async fn replay_tier_consumer_precedence() {
     let _clock = crate::InjectedClock::set(NOW);
     let _inputs = striatum_store::replay::Inputs::new(NOW as i64).install();
     let (harness, _) = setup(&["pro_500"], true, true);
+    let _state_write_audit = super::replay_tests::audit_state_writes(&harness, "tier-consumers");
     let project = harness.store_path().parent().unwrap().join("tier-project");
     let path = project.join(".cortexkit/striatum.jsonc");
     let settings = json!({"consumers": {

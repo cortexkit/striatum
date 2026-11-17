@@ -3,6 +3,13 @@
 use super::*;
 use std::collections::BTreeSet;
 
+#[path = "write_audit/tests.rs"]
+mod write_audit;
+
+pub(super) fn audit_writes(harness: &Harness, label: &str) -> impl Drop {
+    write_audit::begin(harness, label)
+}
+
 // Request-mutated state plus pre-migration refusal/probe tables, such as
 // account_fence and fence_recheck, now kept only as frozen evidence. Every new
 // table needs explicit classification rather than a match on its spelling.

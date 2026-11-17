@@ -85,6 +85,10 @@ pub(super) fn persistent_effects(harness: &Harness) -> Value {
     native_state::snapshot(harness)
 }
 
+pub(super) fn audit_state_writes(harness: &Harness, label: &str) -> impl Drop {
+    native_state::audit_writes(harness, label)
+}
+
 pub(super) fn normalize_paths(value: Value, harness: &Harness) -> Value {
     let path = harness.store_path();
     let directory = path.parent().unwrap().to_str().unwrap();
@@ -113,6 +117,8 @@ async fn replay(file: &str) {
         let _clock = crate::InjectedClock::set(NOW as u64);
         let _inputs = striatum_store::replay::Inputs::new(NOW).install();
         let (harness, mut route) = configured().await;
+        let _state_write_audit = (file == "report-outcomes")
+            .then(|| audit_state_writes(&harness, &format!("report-outcomes-{}", case.name)));
         if case.core {
             let mut catalog = fixture::catalog();
             catalog.runners[0].module = "broca".into();
@@ -1010,6 +1016,7 @@ async fn replay_availability_cases() {
         let _clock = crate::InjectedClock::set(NOW as u64);
         let _inputs = striatum_store::replay::Inputs::new(NOW).install();
         let (harness, route) = configured().await;
+        let _state_write_audit = audit_state_writes(&harness, &format!("availability-{scenario}"));
         let key = "example-subscription/model-c";
         let affinity_request = json!({"consumer":fixture::SUMMARY,"requirements":{"iq":50},"affinity":"existing-live-affinity"});
         let (_, affinity) = route.call("route.select", &affinity_request).await;
