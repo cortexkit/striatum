@@ -218,3 +218,56 @@ mod tests {
         assert_eq!(escape_line("line\r\nbreak"), r#"line\r\nbreak"#);
     }
 }
+
+/// Where this thread's diagnostics are collected in tests. A blocking thread
+/// that runs a route handler shares the buffer of the thread that dispatched
+/// the handler (see `TestThreadState` in `main.rs`).
+#[cfg(test)]
+pub(crate) type OperatorWarnings = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+#[cfg(test)]
+thread_local! {
+    /// Diagnostics written on this thread, so a test can assert that a failure
+    /// it caused was reported to the operator.
+    pub(crate) static OPERATOR_WARNINGS: std::cell::RefCell<OperatorWarnings> =
+        std::cell::RefCell::new(OperatorWarnings::default());
+    pub(crate) static OPERATOR_INFOS: std::cell::RefCell<OperatorWarnings> =
+        std::cell::RefCell::new(OperatorWarnings::default());
+}
+
+/// Write an informational line without treating it as an operator warning.
+pub(crate) fn info_operator(line: String) {
+    #[cfg(test)]
+    OPERATOR_INFOS.with(|sink| sink.borrow().lock().unwrap().push(line.clone()));
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+pub(crate) fn take_operator_infos() -> Vec<String> {
+    OPERATOR_INFOS.with(|sink| std::mem::take(&mut *sink.borrow().lock().unwrap()))
+}
+
+/// Write one diagnostic line to the module's stderr log.
+pub(crate) fn warn_operator(line: String) {
+    #[cfg(test)]
+    OPERATOR_WARNINGS.with(|sink| {
+        sink.borrow()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(line.clone())
+    });
+    eprintln!("{line}");
+}
+
+/// The diagnostics written on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_operator_warnings() -> Vec<String> {
+    OPERATOR_WARNINGS.with(|sink| {
+        std::mem::take(
+            &mut *sink
+                .borrow()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    })
+}

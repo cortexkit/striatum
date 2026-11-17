@@ -38,6 +38,12 @@ mod legacy_wire;
 #[cfg(test)]
 mod literal_census_tests;
 mod logging;
+pub(crate) use logging::{info_operator, warn_operator};
+#[cfg(test)]
+pub(crate) use logging::{
+    take_operator_infos, take_operator_warnings, OperatorWarnings, OPERATOR_INFOS,
+    OPERATOR_WARNINGS,
+};
 #[cfg(all(test, feature = "heap-measure"))]
 mod memory_measurements;
 mod panel_policy;
@@ -903,59 +909,6 @@ fn record_cooldown_params_error(params: &RecordCooldownParams) -> Option<String>
         }
     }
     None
-}
-
-/// Where this thread's diagnostics are collected in tests. A blocking thread
-/// that runs a route handler shares the buffer of the thread that dispatched
-/// the handler (see [`TestThreadState`]).
-#[cfg(test)]
-type OperatorWarnings = Arc<Mutex<Vec<String>>>;
-
-#[cfg(test)]
-thread_local! {
-    /// Diagnostics written on this thread, so a test can assert that a failure
-    /// it caused was reported to the operator.
-    static OPERATOR_WARNINGS: std::cell::RefCell<OperatorWarnings> =
-        std::cell::RefCell::new(OperatorWarnings::default());
-    static OPERATOR_INFOS: std::cell::RefCell<OperatorWarnings> =
-        std::cell::RefCell::new(OperatorWarnings::default());
-}
-
-/// Write an informational line without treating it as an operator warning.
-fn info_operator(line: String) {
-    #[cfg(test)]
-    OPERATOR_INFOS.with(|sink| sink.borrow().lock().unwrap().push(line.clone()));
-    eprintln!("{line}");
-}
-
-#[cfg(test)]
-fn take_operator_infos() -> Vec<String> {
-    OPERATOR_INFOS.with(|sink| std::mem::take(&mut *sink.borrow().lock().unwrap()))
-}
-
-/// Write one diagnostic line to the module's stderr log.
-fn warn_operator(line: String) {
-    #[cfg(test)]
-    OPERATOR_WARNINGS.with(|sink| {
-        sink.borrow()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(line.clone())
-    });
-    eprintln!("{line}");
-}
-
-/// The diagnostics written on this thread since the last call.
-#[cfg(test)]
-fn take_operator_warnings() -> Vec<String> {
-    OPERATOR_WARNINGS.with(|sink| {
-        std::mem::take(
-            &mut *sink
-                .borrow()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    })
 }
 
 /// Record the audit row for a selection that ended without a route. The

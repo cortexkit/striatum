@@ -1,5 +1,5 @@
 # Repository-relative path and maximum permitted line count.
 crates/striatum-module/src/account_selection.rs 14083
-crates/striatum-module/src/main.rs 11957
+crates/striatum-module/src/main.rs 11912
 crates/striatum-store/src/fence_rechecks.rs 5773
 crates/striatum-store/src/lib.rs 8364
