@@ -6,6 +6,13 @@ fn bound_observation_replay_keeps_its_last_effect_and_healed_clock() {
         {"effect":"transient_backoff","provider":"observation-provider","account_id":"account","retry_at_ms":now+1000},
         {"effect":"transient_backoff","provider":"observation-provider","account_id":"account","retry_at_ms":now+2000}
     ]).to_string();
+    // The old origin view encodes two stored TEXT columns, not a JSON id/index
+    // pair: the effect key and the complete effect body both identify evidence.
+    let expected_evidence = serde_json::json!([
+        "[\"observation\",1]",
+        serde_json::from_str::<serde_json::Value>(&effects).unwrap()[1].to_string()
+    ])
+    .to_string();
     let observation = crate::AccountObservationRow {
         observation_id: "observation".into(),
         principal: "principal".into(),
@@ -27,7 +34,7 @@ fn bound_observation_replay_keeps_its_last_effect_and_healed_clock() {
     assert_eq!(state, rig.fresh());
     let rows = state.fence_rechecks(now).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].evidence, "[\"observation\",1]");
+    assert_eq!(rows[0].evidence, expected_evidence);
     assert_eq!(rows[0].next_recheck_at, now + 2000);
     let (key, evidence) = (rows[0].origin_key.clone(), rows[0].evidence.clone());
     let probe = now + 2001;

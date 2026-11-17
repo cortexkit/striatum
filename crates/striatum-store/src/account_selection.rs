@@ -3287,9 +3287,11 @@ impl crate::AccountTx<'_> {
 }
 
 /// Read the effects of one bound observation by its replay key. Evidence
-/// signatures keep SQLite's effect index and JSON string representation.
+/// signatures include the effect key and body as their original stored TEXT.
+/// Empty-string concatenation removes JSON subtypes so the outer array quotes
+/// both values, matching the original two-column origin signature.
 pub(crate) const TRANSIENT_BACKOFF_EFFECTS_SQL: &str = "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
-                o.received_at,json_array(o.observation_id,e.key)
+                o.received_at,json_array(json_array(o.observation_id,e.key) || '',e.value || '')
             FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
             WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
                 AND json_extract(e.value,'$.effect')='transient_backoff'

@@ -195,8 +195,8 @@ UPDATE block SET (source_order,recorded_at,observation_id,source_metadata_json) 
    FROM account_principal_exclusion x
    WHERE block.origin_key=json_array(x.principal,x.admission_id,x.credential_id))
 WHERE kind='principal';
-UPDATE block SET (source_order,observation_id) =
-  (SELECT t.rowid,CASE WHEN json_valid(t.evidence_key) THEN json_extract(t.evidence_key,'$[0]') END FROM account_transient_backoff t
+UPDATE block SET (source_order,observation_id,observed_at) =
+  (SELECT t.rowid,CASE WHEN json_valid(t.evidence_key) THEN json_extract(t.evidence_key,'$[0]') END,t.evidence_at FROM account_transient_backoff t
    WHERE block.origin_key=json_array(t.provider,t.account_id))
 WHERE kind='observation';
 UPDATE block SET (source_order,reason,observed_at) =

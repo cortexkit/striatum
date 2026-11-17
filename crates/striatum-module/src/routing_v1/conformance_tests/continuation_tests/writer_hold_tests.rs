@@ -188,7 +188,7 @@ fn report(label: &str, runs: &[(String, u64)], held_ms: f64) {
 // Pin the complete keyed effect read. A prefix exemption could also accept a
 // statement that scans observation history after losing its id predicate.
 const OBSERVATION_EFFECT_READ: &str = "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
-                o.received_at,json_array(o.observation_id,e.key)
+                o.received_at,json_array(json_array(o.observation_id,e.key) || '',e.value || '')
             FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
             WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
                 AND json_extract(e.value,'$.effect')='transient_backoff'
