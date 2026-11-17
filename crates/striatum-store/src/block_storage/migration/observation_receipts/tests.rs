@@ -32,8 +32,8 @@ fn migrated(
             rusqlite::params![now+60000,now-1000,body])?;
         crate::fence_rechecks::legacy::sync_at(conn, now)?;
         if claimed {
-            conn.execute("UPDATE fence_recheck SET claim_owner='receipt-owner',claim_generation=7,last_claimed_at=?1,next_recheck_at=?2
-                WHERE kind='observation'",rusqlite::params![now+60001,now+3660001])?;
+            conn.execute("UPDATE fence_recheck SET claim_owner='receipt-owner',claim_generation=7,last_claimed_at=?1,next_recheck_at=?2,evidence_at=?3
+                WHERE kind='observation'",rusqlite::params![now+60001,now+3660001,now-4000])?;
             conn.execute("INSERT INTO fence_probe_authorization SELECT 'receipt-owner',kind,origin_key,evidence,evidence_at,?1,claim_generation
                 FROM fence_recheck WHERE kind='observation'",[now+60001])?;
         }

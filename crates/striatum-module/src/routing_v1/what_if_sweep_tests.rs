@@ -578,3 +578,87 @@ async fn a_route_state_write_during_a_sweep_leaves_its_later_evaluations_alone()
         .unwrap();
     assert_ne!(next, before, "a new sweep sees the committed write");
 }
+
+#[tokio::test]
+async fn what_if_cleared_account_source_drops_its_clock_like_sql_without_live_writes() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let (harness, operator) = fixture_with_repairs().await;
+    harness
+        .store()
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+    let initial = crate::account_state::snapshot(harness.store()).unwrap();
+    let key = serde_json::json!(["fresh-headroom-fixture"]).to_string();
+    assert!(
+        initial.blocks.clock("account", &key).is_some(),
+        "the fixture must start with a registered clock"
+    );
+    let reference = harness.store().private_account_copy_for_test(NOW).unwrap();
+    reference
+        .account_transaction(|tx| tx.clear_fence("fresh-headroom-fixture", NOW, "fresh headroom"))
+        .unwrap();
+    let (expected, expected_sync) = reference
+        .account_read(|tx| {
+            let state = tx.load_block_state()?;
+            Ok((
+                state
+                    .clock("account", &key)
+                    .map(|(clock, cleared)| (clock.clone(), cleared)),
+                state.needs_sync(),
+            ))
+        })
+        .unwrap();
+    assert!(
+        expected.is_none(),
+        "the ordinary SQL clear trigger and loader remove the clock"
+    );
+    let before = rows(&harness);
+    let checks = Arc::new(AtomicUsize::new(0));
+    let checked = checks.clone();
+    let _hook = crate::account_selection::Sweep::hook(
+        &harness.config_path_for_test(),
+        move |sweep, _, _| {
+            let crate::account_state::Published::State(state) = sweep.published() else {
+                panic!("this regression must exercise native private sweep state");
+            };
+            assert!(state
+                .blocks
+                .active_fences("example-subscription")
+                .iter()
+                .all(|fence| fence.fence_id != "fresh-headroom-fixture"));
+            assert_eq!(
+                state
+                    .blocks
+                    .clock("account", &key)
+                    .map(|(clock, cleared)| (clock.clone(), cleared)),
+                expected,
+                "a what-if clear must drop the complete clock, not only hide its source"
+            );
+            assert_eq!(
+                state.blocks.needs_sync(),
+                expected_sync,
+                "the private clear must not leave a repairable orphan clock"
+            );
+            checked.fetch_add(1, Ordering::Relaxed);
+        },
+    );
+    let trace = harness.store().trace_block_reads_for_test().unwrap();
+    let _answer = evaluate(&operator, request()).await;
+    assert!(
+        checks.load(Ordering::Relaxed) >= 2,
+        "multiple points use the same cleared private state"
+    );
+    assert!(
+        trace.take().reader.is_empty(),
+        "a live what-if must not read block SQL"
+    );
+    assert_eq!(
+        before,
+        rows(&harness),
+        "the sweep cannot clear durable state"
+    );
+    assert_eq!(
+        *initial,
+        *crate::account_state::snapshot(harness.store()).unwrap()
+    );
+}
