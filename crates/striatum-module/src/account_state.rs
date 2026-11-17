@@ -1626,10 +1626,10 @@ pub(crate) fn report_admission_state(store: &SqliteRouteStateStore) {
 
 #[cfg(test)]
 mod admission_tests;
-#[cfg(all(test, feature = "heap-measure"))]
-mod memory_tests;
 #[cfg(test)]
 mod inflight_tests;
+#[cfg(all(test, feature = "heap-measure"))]
+mod memory_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
