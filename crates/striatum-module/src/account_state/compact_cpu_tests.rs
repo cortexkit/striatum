@@ -1,4 +1,6 @@
-//! Profiler-off writer CPU comparison using the live-shaped rows seeded here.
+//! Writer CPU comparison, run without a profiler, on the heap-measurement rows
+//! from `memory_tests::rows()`: about 31k open admissions and 125k pinned
+//! conversations, the size of the live store's account state in November 2026.
 
 use super::*;
 use rusqlite::params;
