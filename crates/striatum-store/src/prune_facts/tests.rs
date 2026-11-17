@@ -357,3 +357,111 @@ fn live_sized_catalog_prune_writer_hold() {
         "keyed writer phase must be shorter than full scan"
     );
 }
+
+#[test]
+fn prune_ends_route_and_failure_sources_atomically_like_the_old_schema() {
+    let scratch = cortexkit_test_support::ScratchDir::new("prune-native-source-lifetime");
+    let old_descriptor = dev_descriptor(
+        "prune-old-source-lifetime",
+        scratch.path().join("old.db").to_string_lossy(),
+    );
+    let old = SqliteRouteStateStore::open_at_version_for_test(&old_descriptor, 95).unwrap();
+    let (_native_scratch, native) = rig("prune-native-source-lifetime");
+    let now = crate::now_ms();
+    old.with_writer_for_test(|conn| {
+        seed(conn)?;
+        conn.execute("UPDATE model_route_state SET cooldown_until=?1,wall_unscoped=1,wall_observed_at=?2,last_error='route capacity',
+            failure_backoff_until=?1,failure_backoff_reason='send failure',failure_observed_at=?2 WHERE route_key='p/unpicked'",params![now+3600000,now])?;
+        crate::fence_rechecks::legacy::sync_at(conn,now)?;
+        assert_eq!(conn.query_row("SELECT count(*) FROM fence_origin WHERE kind IN ('route','failure')",[],|row|row.get::<_,i64>(0))?,2);
+        old_prune(conn)?;
+        crate::fence_rechecks::legacy::sync_at(conn,now)?;
+        assert_eq!(conn.query_row("SELECT count(*) FROM fence_origin WHERE kind IN ('route','failure')",[],|row|row.get::<_,i64>(0))?,0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM fence_recheck WHERE kind IN ('route','failure')",[],|row|row.get::<_,i64>(0))?,0);
+        Ok(())
+    }).unwrap();
+    native
+        .with_writer_for_test(|conn| {
+            seed(conn)?;
+            let wall = crate::block_storage::wall_source(
+                conn,
+                crate::block_storage::WallSource {
+                    kind: "route",
+                    key: "p/unpicked",
+                    provider: "p",
+                    model: Some("unpicked"),
+                    cooldown: Some((now + 3600000) as f64),
+                    exhausted: None,
+                    wall_observed: Some(now),
+                    observed_at: now,
+                    error: Some("route capacity"),
+                    class: None,
+                    unscoped: true,
+                },
+            )?
+            .unwrap();
+            crate::block_storage::write_source(conn, &wall)?;
+            let failure = crate::block_storage::failure_source(
+                conn,
+                crate::block_storage::FailureSource {
+                    key: "p/unpicked",
+                    provider: "p",
+                    model: "unpicked",
+                    deadline: Some((now + 3600000) as f64),
+                    reason: Some("send failure"),
+                    observed_at: now,
+                    error: Some("route capacity"),
+                    class: None,
+                    unscoped: true,
+                },
+            )?
+            .unwrap();
+            crate::block_storage::write_source(conn, &failure)?;
+            Ok(())
+        })
+        .unwrap();
+    native
+        .account_transaction(|tx| tx.sync_fence_rechecks())
+        .unwrap();
+    assert_eq!(
+        native
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .filter(|row| matches!(row.kind.as_str(), "route" | "failure"))
+            .count(),
+        2
+    );
+    native.prune_unserved_unpicked_facts().unwrap();
+    native.with_reader_for_test(|conn| {
+        assert_eq!(conn.query_row("SELECT count(*) FROM block WHERE kind IN ('route','failure') AND (source_present=1 OR managed=1)",[],|row|row.get::<_,i64>(0))?,0,
+            "pruning must end source and clock in the same writer transaction");
+        Ok(())
+    }).unwrap();
+    let readd = |conn: &Connection| {
+        conn.execute("INSERT INTO model_facts(route_key,capacity_key,provider_id,model_id,scores_json,confidence,updated_at,source,fusiform_present)
+        VALUES ('p/unpicked','p/unpicked','p','unpicked','{}','curated',0,'seed',1)",[]).map(|_|())
+    };
+    old.with_writer_for_test(|conn| {
+        readd(conn)?;
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM fence_origin WHERE kind IN ('route','failure')",
+                [],
+                |row| row.get::<_, i64>(0)
+            )?,
+            0
+        );
+        Ok(())
+    })
+    .unwrap();
+    native.with_writer_for_test(readd).unwrap();
+    assert!(
+        native
+            .fence_rechecks()
+            .unwrap()
+            .iter()
+            .all(|row| !matches!(row.kind.as_str(), "route" | "failure")),
+        "rediscovery cannot restore the deleted route's refusal"
+    );
+}

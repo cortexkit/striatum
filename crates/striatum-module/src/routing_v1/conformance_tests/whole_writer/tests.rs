@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 mod authorization;
 #[path = "catalogue/tests.rs"]
 mod catalogue;
+#[path = "catalogue_prune/tests.rs"]
+mod catalogue_prune;
 #[path = "claims/tests.rs"]
 mod claims;
 #[path = "continuation/tests.rs"]
