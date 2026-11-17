@@ -38,6 +38,9 @@ pub(crate) use describe::inherit_capabilities;
 mod engines;
 #[cfg(test)]
 mod engines_tests;
+#[cfg(test)]
+#[path = "native_fixture_sources/tests.rs"]
+mod native_fixture_sources;
 mod panels;
 #[cfg(test)]
 mod panels_estimate_tests;

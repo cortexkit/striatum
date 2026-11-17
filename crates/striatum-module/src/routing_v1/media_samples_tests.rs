@@ -868,14 +868,16 @@ async fn capture_unavailable(samples: &mut Samples) {
                         )
                         .unwrap();
                     if cause == "route-failure-backoff" {
-                        rusqlite::Connection::open(harness.store_path()).unwrap().execute(
-                            "UPDATE model_route_state SET failure_backoff_until=?1 WHERE route_key=?2",
-                            rusqlite::params![until, key],
-                        ).unwrap();
+                        crate::routing_v1::native_fixture_sources::failure_backoff(
+                            store,
+                            &key,
+                            until as f64,
+                            None,
+                        );
                     }
                 }
                 if cause == "route-failure-backoff" {
-                    // Publish the external SQL commit to the writer's account snapshot.
+                    // Publish the native fixture input to the serving snapshot.
                     store.reload_account_state_for_test().unwrap();
                 }
             }

@@ -556,13 +556,14 @@ async fn capture_unavailable(samples: &mut Samples, version: Version) {
                     )
                     .unwrap();
                 if name == "route-failure-backoff" {
-                    rusqlite::Connection::open(harness.store_path()).unwrap().execute(
-                        "UPDATE model_route_state SET failure_backoff_until=?1 WHERE route_key=?2",
-                        rusqlite::params![until, route_key],
-                    ).unwrap();
-                    // The route-state snapshot reads the account state, which
-                    // takes another connection's commit at the writer's next
-                    // batch; load it now so the vector sees the backoff.
+                    crate::routing_v1::native_fixture_sources::failure_backoff(
+                        store,
+                        route_key,
+                        until as f64,
+                        None,
+                    );
+                    // Serving reads the published account snapshot. Load the
+                    // new native fixture input before capturing the wire reply.
                     store.reload_account_state_for_test().unwrap();
                 }
             }

@@ -23,10 +23,12 @@ async fn typed_panel_shortfall_retains_quota_and_backoff_reset_times() {
     h.store()
         .update_route_state(backoff_route, backoff_route, &RouteStateUpdate::default())
         .unwrap();
-    rusqlite::Connection::open(h.store_path()).unwrap().execute(
-        "UPDATE model_route_state SET failure_backoff_until=?1, failure_backoff_reason='three terminal errors' WHERE route_key=?2",
-        rusqlite::params![backoff_reset as f64, backoff_route],
-    ).unwrap();
+    crate::routing_v1::native_fixture_sources::failure_backoff(
+        h.store(),
+        backoff_route,
+        backoff_reset as f64,
+        Some("three terminal errors"),
+    );
     let answer = panel(&route, &request).await;
     assert!(answer.seats.is_empty());
     let encoded = serde_json::to_value(answer).unwrap();
