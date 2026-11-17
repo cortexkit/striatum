@@ -147,6 +147,9 @@ pub(crate) fn needs_sync(conn: &Connection) -> rusqlite::Result<bool> {
 pub(crate) mod legacy;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use legacy::{quarantined_origins, retire_expired, snapshot_origins, sync, sync_at};
+#[cfg(test)]
+#[path = "fence_rechecks/native_fixture/tests.rs"]
+mod native_fixture;
 
 pub(crate) fn register(conn: &Connection, kind: &str, key: &str) -> rusqlite::Result<()> {
     if !enabled(conn)? {
@@ -3076,20 +3079,8 @@ mod tests {
 
     #[test]
     fn blocks_parity_new_evidence_and_orphan_observation() {
-        let scratch = cortexkit_test_support::ScratchDir::new("block-parity-overlay");
-        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "block-parity-overlay",
-            scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
         let now = 1_900_000_000_000;
-        store.seed_block_parity_fixture_for_test(now);
-        store.with_writer_for_test(|conn| conn.execute_batch(&format!(r#"
-            UPDATE fence_recheck SET last_claimed_at={now},next_recheck_at={now}+900000 WHERE kind='credential' AND credential_id='oauth:cpu-0';
-            UPDATE credential_entitlement_fences SET code='new-refusal' WHERE credential_id='oauth:cpu-0';
-            DELETE FROM account_transient_backoff;
-            UPDATE pool_key_state SET wall_reason='new-evidence',walled_until={now}-1;
-        "#))).unwrap();
+        let (_scratch, store) = native_fixture::changed_evidence_parity_store(now);
         let loaded = store.load_blocks(now).unwrap();
         let credential = loaded
             .blocks
@@ -4788,7 +4779,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let before: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        let before: (i64, Option<f64>) = store
+            .store
+            .with_conn(|conn| native_fixture::failure_state(conn, "p/m"))
+            .unwrap();
         assert_eq!(before, (1, Some(600_030.0)));
         store
             .set_decision_outcome(
@@ -4802,7 +4796,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let after: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        let after: (i64, Option<f64>) = store
+            .store
+            .with_conn(|conn| native_fixture::failure_state(conn, "p/m"))
+            .unwrap();
         assert_eq!(after,before,"an in-flight success admitted before the refusal cannot erase its newer failure evidence");
         assert!(store
             .fence_rechecks()
@@ -4822,7 +4819,10 @@ mod tests {
                 },
             )
             .unwrap();
-        let healed: (i64,Option<f64>)=store.store.with_conn(|conn|conn.query_row("SELECT consecutive_terminal_failures,failure_backoff_until FROM model_route_state WHERE route_key='p/m'",[],|row|Ok((row.get(0)?,row.get(1)?)))).unwrap();
+        let healed: (i64, Option<f64>) = store
+            .store
+            .with_conn(|conn| native_fixture::failure_state(conn, "p/m"))
+            .unwrap();
         assert_eq!(
             healed,
             (0, None),
@@ -4946,7 +4946,7 @@ mod tests {
             .unwrap();
         store.store.with_conn(|conn| {
             let inherited: (i64, bool) = conn.query_row(
-                "SELECT wall_observed_at,wall_unscoped FROM model_route_state WHERE route_key='p/telemetry'",
+                "SELECT m.wall_observed_at,b.wall_unscoped FROM model_route_state m JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.source_present=1 WHERE m.route_key='p/telemetry'",
                 [], |row| Ok((row.get(0)?, row.get(1)?)),
             )?;
             assert_eq!(inherited, (now - 100, false), "telemetry-only discovery still inherits provider provenance");
@@ -5007,11 +5007,7 @@ mod tests {
             store
                 .store
                 .with_conn(|conn| {
-                    let unscoped: bool = conn.query_row(
-                        "SELECT wall_unscoped FROM model_route_state WHERE route_key='p/new'",
-                        [],
-                        |row| row.get(0),
-                    )?;
+                    let unscoped: bool = native_fixture::route_unscoped(conn, "p/new")?;
                     assert!(
                         unscoped,
                         "the model refusal must not inherit the provider's scope"
