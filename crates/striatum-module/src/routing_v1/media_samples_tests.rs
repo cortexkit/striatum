@@ -418,9 +418,14 @@ impl Samples {
     }
 
     fn verify(self) {
-        let directory =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test-vectors/route-select-media-v1");
-        let update = std::env::var_os("UPDATE_ROUTE_SELECT_MEDIA_VECTORS").is_some();
+        self.verify_set("route-select-media-v1", "UPDATE_ROUTE_SELECT_MEDIA_VECTORS");
+    }
+
+    fn verify_set(self, name: &str, update_variable: &str) {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-vectors")
+            .join(name);
+        let update = std::env::var_os(update_variable).is_some();
         let mut sums = String::new();
         for (name, bytes) in &self.0 {
             let path = directory.join(name);
@@ -448,6 +453,108 @@ impl Samples {
             .collect();
         assert_eq!(files, expected, "extra or missing vector files");
     }
+}
+
+#[tokio::test]
+async fn serving_bytes_match_transcription_bias_vectors() {
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let _ids = striatum_store::replay::Inputs::new(NOW).install();
+    let harness = fixture_for_realtime(true);
+    harness.edit_config(|config| {
+        config["consumers"][VOICE] = json!({"mode":"demand","iq":40});
+    });
+    let mut key = super::super::key("opaque-transcribe-media");
+    key.provider_ids = vec!["openai".into(), "google".into()];
+    harness.set_credentials(super::super::media_credentials(vec![key]));
+    let mut audio = served_row("openai/gpt-transcribe");
+    audio["quality.grade"] = json!(80);
+    // Preserve the older samples' priced/adequate versus unpriced/higher-grade contrast.
+    let catalog = json!({
+        "catalog_version":41,"resolved_at_ms":NOW,
+        "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
+        "models":{
+            "openai/gpt-transcribe":audio,
+            "google/gemini-3.8-flash":{
+                "existence":"present","model.type":"transcription","quality.grade":100
+            },
+            "apple/phone-transcriber":{
+                "existence":"present","model.type":"transcription","quality.grade":80
+            }
+        }
+    });
+    let snapshot =
+        crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
+            .unwrap();
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+    let phone = harness.bind(reserved("callosum"), None).await;
+    let base: Value = serde_json::from_str(include_str!(
+        "../../../../test-vectors/route-select-media-v1/voice-message-caller-local-en.json"
+    ))
+    .unwrap();
+    let mut request = base["request"]["params"].clone();
+    request["caller_local"][0]["bias_limit"] = json!({"unit":"phrases","max":100});
+    request["requirements"]["bias"] = json!(true);
+    let mut samples = Samples::default();
+    for (name, wants_bias, offers_bias, model) in [
+        (
+            "voice-message-bias-caller-local",
+            true,
+            true,
+            "phone-transcriber",
+        ),
+        ("voice-message-bias-remote", true, false, "gpt-transcribe"),
+        (
+            "voice-message-no-bias-caller-local",
+            false,
+            true,
+            "phone-transcriber",
+        ),
+    ] {
+        if !wants_bias {
+            request["requirements"]
+                .as_object_mut()
+                .unwrap()
+                .remove("bias");
+        }
+        if offers_bias {
+            request["caller_local"][0]["bias_limit"] = json!({"unit":"phrases","max":100});
+        } else {
+            request["caller_local"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("bias_limit");
+        }
+        let selected = samples
+            .capture(name, &harness, &phone, &request, Some(model))
+            .await;
+        let result = &selected["result"];
+        if offers_bias {
+            assert_eq!(
+                result["engine"],
+                json!({
+                    "caller_local":true,"index":0,"local":true,
+                    "model":"phone-transcriber","provider":"apple"
+                })
+            );
+            assert!(result.get("price").is_none());
+        } else {
+            assert_eq!(
+                result["engine"],
+                json!({
+                    "caller_local":false,"local":false,"module":"colliculus",
+                    "model":"gpt-transcribe","provider":"openai"
+                })
+            );
+            assert_eq!(
+                result["price"]["rates"]["input_audio.per_second"]["rate"],
+                0.000075
+            );
+        }
+    }
+    samples.verify_set(
+        "route-select-media-v1.5",
+        "UPDATE_TRANSCRIPTION_BIAS_VECTORS",
+    );
 }
 
 #[tokio::test]
