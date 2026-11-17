@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "snapshot/tests.rs"]
+mod snapshot;
+
 #[test]
 fn inherited_route_uses_claimed_provider_clock_but_provider_status_keeps_raw_deadline() {
     let scratch = cortexkit_test_support::ScratchDir::new("consolidated-inherited-provider");
