@@ -13,7 +13,19 @@ struct DigestRows {
 }
 
 fn read_only(path: &std::path::Path) -> rusqlite::Connection {
-    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    // The writer's connection-local catalogue counter is absent from another
+    // connection. Recreate only its temporary schema to prepare its read;
+    // main remains read-only and no routing data or counter value is copied.
+    conn.execute_batch(
+        "CREATE TEMP TABLE catalog_facts_writes (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1), writes INTEGER NOT NULL
+    )",
+    )
+    .unwrap();
+    conn
 }
 
 fn excluded_digests(conn: &rusqlite::Connection) -> BTreeMap<String, DigestRows> {
@@ -202,6 +214,12 @@ fn excluded_write_audit_flags_executed_dml_and_classifies_without_mutating() {
     assert!(write_targets(&side, "SELECT * FROM routing_call_window")
         .unwrap()
         .is_empty());
+    assert!(write_targets(
+        &side,
+        "SELECT writes FROM temp.catalog_facts_writes WHERE singleton = 1"
+    )
+    .unwrap()
+    .is_empty());
     let sql = "UPDATE routing_call_window SET started_at_ms=started_at_ms+1";
     assert!(write_targets(&side, sql)
         .unwrap()
