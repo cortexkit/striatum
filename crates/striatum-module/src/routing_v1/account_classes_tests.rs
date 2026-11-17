@@ -660,6 +660,24 @@ pub(super) fn setup_at_version(
     version: Option<u32>,
 ) -> (Arc<Harness>, BrocaCredentials) {
     let harness = Harness::new_at_version("account-classes", version);
+    configure_harness(harness, provider, converted_live, version)
+}
+
+pub(super) fn setup_from_template(
+    provider: &str,
+    converted_live: bool,
+    template: &std::path::Path,
+) -> (Arc<Harness>, BrocaCredentials) {
+    let harness = Harness::from_template("account-classes", template);
+    configure_harness(harness, provider, converted_live, None)
+}
+
+fn configure_harness(
+    harness: Arc<Harness>,
+    provider: &str,
+    converted_live: bool,
+    version: Option<u32>,
+) -> (Arc<Harness>, BrocaCredentials) {
     let fact = account_fact(provider);
     // Historical fixtures seed only decisions before upgrading. Current fact
     // writers require the current schema, so install those facts after upgrade.
