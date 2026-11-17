@@ -650,6 +650,20 @@ async fn effect_case(status: Option<&str>, outcome: &str, extra: Value, seed: bo
                 recorded_at: EFFECT_NOW as i64 - 100,
             })
             .unwrap();
+        // Report preparation may persist a recheck schedule for this refusal.
+        // Do that through normal synchronization before taking either snapshot.
+        harness
+            .store()
+            .account_transaction(|tx| tx.sync_fence_rechecks())
+            .unwrap();
+        let managed: i64 = harness.store().with_reader_for_test(|conn| conn.query_row(
+            "SELECT managed FROM block WHERE kind='account_route' AND origin_key=json_array('example-subscription',?1,'model-c') AND source_present=1",
+            [credential.as_str()], |row| row.get(0),
+        )).unwrap();
+        assert_eq!(
+            managed, 1,
+            "the seeded account-route clock must be registered before the test acts"
+        );
     }
     let mut body = json!({"decision_id":id,"outcome":outcome,"credential_id":credential});
     body.as_object_mut()
