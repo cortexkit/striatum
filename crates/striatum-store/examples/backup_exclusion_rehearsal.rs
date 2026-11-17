@@ -40,6 +40,50 @@ fn table_bytes(conn: &Connection, table: &str) -> i64 {
     )
 }
 
+fn native_digests(conn: &Connection) -> std::collections::BTreeMap<String, (u64, String)> {
+    [
+        "block",
+        "probe_authorization",
+        "success_proof",
+        "retirement_tombstone",
+    ]
+    .into_iter()
+    .map(|table| {
+        let columns = conn
+            .prepare(&format!("PRAGMA table_xinfo({table})"))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|column| format!("\"{}\"", column.unwrap().replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut hasher = blake3::Hasher::new();
+        let mut count = 0u64;
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT rowid,json_array({columns}) FROM {table} ORDER BY rowid"
+            ))
+            .unwrap();
+        for row in statement
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+        {
+            let (rowid, value) = row.unwrap();
+            hasher.update(&rowid.to_le_bytes());
+            hasher.update(&(value.len() as u64).to_le_bytes());
+            hasher.update(value.as_bytes());
+            count += 1;
+        }
+        (
+            table.to_string(),
+            (count, hasher.finalize().to_hex().to_string()),
+        )
+    })
+    .collect()
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     assert_eq!(
@@ -67,7 +111,7 @@ fn main() {
     let started = Instant::now();
     drop(open(&upgraded));
     println!(
-        "open applying the pending migrations (through 58): {:?}",
+        "open applying the pending migrations: {:?}",
         started.elapsed()
     );
 
@@ -101,6 +145,8 @@ fn main() {
         println!("  kept {table}: {rows} rows, {bytes} bytes");
     }
     println!("skippable total {skipped_bytes} bytes; kept total {kept_bytes} bytes");
+    let native_before = native_digests(&conn);
+    println!("native table row counts and digests before exclusion: {native_before:?}");
     let head: Option<String> = conn
         .query_row(
             "SELECT parent_session_id FROM model_route_parent_failures \
@@ -164,6 +210,11 @@ fn main() {
     let started = Instant::now();
     let store = open(&restored);
     println!("open of the restored store: {:?}", started.elapsed());
+    let native_after = store
+        .with_reader_for_test(|conn| Ok(native_digests(conn)))
+        .unwrap();
+    assert_eq!(native_after, native_before, "native block, authorization, success and retirement rows survive history exclusion exactly");
+    println!("native table row counts and digests after restore: {native_after:?}");
     if let Some(head) = head {
         let failed = store.recent_failed_decisions_for_parent(&head, 0).unwrap();
         println!(

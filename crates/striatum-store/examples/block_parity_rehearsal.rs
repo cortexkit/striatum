@@ -4,7 +4,12 @@
 
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
-use striatum_store::{dev_descriptor, BlockParity, SqliteRouteStateStore};
+use striatum_store::BlockParity;
+#[cfg(test)]
+use striatum_store::{dev_descriptor, SqliteRouteStateStore};
+
+#[path = "block_parity_rehearsal/native.rs"]
+mod native;
 
 fn rehearse(
     source: &Path,
@@ -19,11 +24,7 @@ fn rehearse(
         [target.to_str().ok_or("work path must be UTF-8")?],
     )?;
     drop(snapshot);
-    let store = SqliteRouteStateStore::open(&dev_descriptor(
-        "block-parity-rehearsal",
-        target.to_string_lossy(),
-    ))?;
-    Ok(store.block_parity(now)?)
+    native::rehearse(&target, now)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -36,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let now: i64 = args[2].to_str().ok_or("NOW_MS must be UTF-8")?.parse()?;
     let report = rehearse(&source, &work, now)?;
     println!(
-        "now_ms={now} adapter_load_us={} active_blocks={} cleared_evidence={}",
+        "now_ms={now} reference_adapter_load_us={} reference_active_blocks={} reference_cleared_evidence={}",
         report.load_time.as_micros(),
         report.active,
         report.cleared_evidence
@@ -65,10 +66,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn blocks_parity_rehearsal_clones_without_touching_source() {
     let scratch = cortexkit_test_support::ScratchDir::new("block-parity-rehearsal");
     let source = scratch.path().join("snapshot.db");
-    let store = SqliteRouteStateStore::open(&dev_descriptor(
-        "block-parity-source",
-        source.to_string_lossy(),
-    ))
+    // The independent SQL fixture is frozen at schema 93. The rehearsal
+    // upgrades only its disposable clone through the registered migrations.
+    let store = SqliteRouteStateStore::open_at_version_for_test(
+        &dev_descriptor("block-parity-source", source.to_string_lossy()),
+        93,
+    )
     .unwrap();
     let now = 1_900_000_000_000;
     store.seed_block_parity_fixture_for_test(now);
