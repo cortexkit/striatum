@@ -231,9 +231,12 @@ UPDATE block SET (evidence_at,quota,classified,next_recheck_at,reset_check_at,la
 WHERE EXISTS (SELECT 1 FROM fence_recheck r WHERE r.kind=block.kind
   AND r.origin_key=block.origin_key AND r.evidence=block.evidence);
 
--- New evidence preserves a previous probe's time, but not its owner or
+-- New evidence preserves the claim counter and prior probe time; claim_owner
+-- stays NULL. Reusing an earlier signature must not reuse an old authorization's
 -- generation. Clock advancement never makes an old refusal newly observed.
 UPDATE block SET
+  claim_generation=(SELECT r.claim_generation FROM fence_recheck r
+    WHERE r.kind=block.kind AND r.origin_key=block.origin_key),
   last_claimed_at=(SELECT r.last_claimed_at FROM fence_recheck r
     WHERE r.kind=block.kind AND r.origin_key=block.origin_key),
   next_recheck_at=MAX(next_recheck_at,COALESCE((SELECT r.next_recheck_at FROM fence_recheck r
