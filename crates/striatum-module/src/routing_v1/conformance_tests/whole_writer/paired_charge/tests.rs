@@ -285,9 +285,9 @@ fn assert_only_finished_charge_differs(
         }]
     );
     let conversation = (
-        right.principal.clone(),
-        right.conversation_hash.clone(),
-        right.provider.clone(),
+        right.principal.clone().into(),
+        right.conversation_hash.clone().into(),
+        right.provider.clone().into(),
     );
     let latest = expected.admissions.latest.get(&conversation).unwrap();
     assert_eq!(latest.admission_id, right.admission_id);
