@@ -3,8 +3,11 @@
 
 use super::*;
 
+mod functions;
 #[path = "native_reference.rs"]
 mod native_reference;
+
+pub(super) use functions::compare as compare_functions;
 
 pub(super) fn native(conn: &Connection) -> rusqlite::Result<bool> {
     native_reference::enabled(conn)

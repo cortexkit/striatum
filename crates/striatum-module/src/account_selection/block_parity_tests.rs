@@ -256,18 +256,22 @@ fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
         .map_or(1, usize::from)
         .min(8);
     let chunk_size = identities.len().div_ceil(workers).max(1);
+    let next_identity = std::sync::atomic::AtomicUsize::new(0);
     let comparisons: u64 = std::thread::scope(|scope| {
         let mut threads = Vec::new();
-        for chunk in identities.chunks(chunk_size) {
-            // ClassContext has worker-local lazy indexes. Share immutable
-            // identities, but retain a separate context pair for each worker.
+        for _ in 0..workers {
+            // Each worker owns the same fixed context pairs and their lazy
+            // indexes, then reuses them across small identity shards. The
+            // atomic cursor balances cheap source scopes and costly accounts.
             let current = current.clone();
             let reference = reference.clone();
             let times = &times;
             let reference_origins = &reference_origins;
+            let identities = &identities;
+            let next_identity = &next_identity;
             threads.push(scope.spawn(move || {
                 let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
-                let mut comparisons = 0_u64;
+                let mut contexts = Vec::with_capacity(times.len() * 3 * 2 * 2);
                 for &at in times {
                     for owner in [None, Some("parity-owner"), Some("parity-other-owner")] {
                         for continuation in [false, true] {
@@ -281,11 +285,22 @@ fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
                                         .then(|| c.credentials.listed_credentials()[0].id.clone());
                                     c.media_route = media;
                                 }
-                                for identity in chunk {
-                                    compare_identity(&new, &old, reference_origins, identity);
-                                    comparisons += 1;
-                                }
+                                contexts.push((new, old));
                             }
+                        }
+                    }
+                }
+                let mut comparisons = 0_u64;
+                loop {
+                    let start = next_identity.fetch_add(64, std::sync::atomic::Ordering::Relaxed);
+                    if start >= identities.len() {
+                        break;
+                    }
+                    let chunk = &identities[start..(start + 64).min(identities.len())];
+                    for (new, old) in &contexts {
+                        for identity in chunk {
+                            compare_identity(new, old, reference_origins, identity);
+                            comparisons += 1;
                         }
                     }
                 }
