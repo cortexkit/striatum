@@ -3198,14 +3198,14 @@ mod tests {
             scope: striatum_core::accounts::PoolScope::EveryModel,
             window_minutes: Some(300),
         };
-        store.store.with_conn(|conn| {
-            for (id,pool) in [("empty",None),("named",Some(&named)),("unclaimed",Some(&named))] {
-                conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
-                    VALUES (?1,'p','a','{}','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',100,'test',100,?2,'[]')",
-                    params![id,pool.map(|pool|serde_json::to_string(pool).unwrap())])?;
-            }
-            Ok(())
-        }).unwrap();
+        native_fixture::seed_pool_fences(
+            &store,
+            &[
+                ("empty", None, vec![]),
+                ("named", Some(&named), vec![]),
+                ("unclaimed", Some(&named), vec![]),
+            ],
+        );
         let claimed: Vec<_> = store
             .fence_rechecks()
             .unwrap()
@@ -3955,14 +3955,14 @@ mod tests {
             scope: PoolScope::Family(ModelFamily::Opus),
             window_minutes: Some(300),
         };
-        store.store.with_conn(|conn| {
-            for (id,pool,recovery) in [("gemini",Some(&gemini),vec![]),("claude",Some(&claude),vec![]),("whole",None,vec![gemini.clone(),claude.clone()])] {
-                conn.execute("INSERT INTO account_fence(fence_id,provider,account_id,scope_json,fence_json,source,observed_at,principal,created_at,pool_key_json,recovery_set_json)
-                    VALUES (?1,'p','a','{}','{\"reset\":{\"kind\":\"missing\"}}','broca_account_limit',100,'test',100,?2,?3)",
-                    params![id,pool.map(|pool|serde_json::to_string(pool).unwrap()),serde_json::to_string(&recovery).unwrap()])?;
-            }
-            Ok(())
-        }).unwrap();
+        native_fixture::seed_pool_fences(
+            &store,
+            &[
+                ("gemini", Some(&gemini), vec![]),
+                ("claude", Some(&claude), vec![]),
+                ("whole", None, vec![gemini.clone(), claude.clone()]),
+            ],
+        );
         // With no request scope, even a newer success cannot guess a pool.
         store
             .account_transaction(|tx| {
@@ -4126,10 +4126,7 @@ mod tests {
             .unwrap();
             let now = crate::now_ms();
             let until = now + duration;
-            store.store.with_conn(|conn|conn.execute_batch(&format!(
-                "INSERT INTO credential_entitlement_fences VALUES ('p','c','ENTITLEMENT_ERROR',NULL,{now});
-                 INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,failure_backoff_until,failure_backoff_reason,failure_observed_at)
-                   VALUES ('failure/m','failure/m','failure','m',{now},{until},'failure',{now});"))).unwrap();
+            native_fixture::cap_inputs(&store, now, until);
             for kind in [
                 crate::PoolWallKind::Billing,
                 crate::PoolWallKind::RateLimited,
@@ -4494,18 +4491,14 @@ mod tests {
         ))
         .unwrap();
         let now = crate::now_ms();
-        store.store.with_conn(|conn|conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at,wall_observed_at) VALUES ('legacy',?1,100,100)",[now-10_000])).unwrap();
+        native_fixture::expired_unmanaged_provider(&store, now);
         assert!(
             store.fence_rechecks().unwrap().is_empty(),
             "unmanaged historical evidence must retire at sync too"
         );
         let archived_before: i64 = store
             .store
-            .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM fence_retired_origin", [], |row| {
-                    row.get(0)
-                })
-            })
+            .with_conn(|conn| native_fixture::retired_count(conn))
             .unwrap();
         assert_eq!(archived_before, 0, "scoring must remain read-only");
         store
@@ -4516,11 +4509,7 @@ mod tests {
             .unwrap();
         let archived_after: i64 = store
             .store
-            .with_conn(|conn| {
-                conn.query_row("SELECT COUNT(*) FROM fence_retired_origin", [], |row| {
-                    row.get(0)
-                })
-            })
+            .with_conn(|conn| native_fixture::retired_count(conn))
             .unwrap();
         assert_eq!(
             archived_after, 1,

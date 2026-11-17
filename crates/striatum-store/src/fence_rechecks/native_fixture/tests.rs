@@ -101,3 +101,89 @@ pub(super) fn load_and_compare(store: &SqliteRouteStateStore, now: i64) -> super
         .unwrap();
     loaded
 }
+
+pub(super) fn seed_pool_fences(
+    store: &SqliteRouteStateStore,
+    entries: &[(
+        &str,
+        Option<&striatum_core::accounts::PoolKey>,
+        Vec<striatum_core::accounts::PoolKey>,
+    )],
+) {
+    store
+        .account_transaction(|tx| {
+            for (id, pool, recovery) in entries {
+                tx.insert_pool_fence(&crate::AccountPoolFenceRow {
+                    evidence: crate::AccountFenceRow {
+                        fence_id: (*id).into(),
+                        provider: "p".into(),
+                        account_id: "a".into(),
+                        scope_json: "{}".into(),
+                        fence_json: "{\"reset\":{\"kind\":\"missing\"}}".into(),
+                        source: "broca_account_limit".into(),
+                        observed_at: 100,
+                        principal: "test".into(),
+                        created_at: 100,
+                        admission_id: None,
+                        observation_id: None,
+                        cleared_at: None,
+                        cleared_reason: None,
+                    },
+                    pool_key: pool.cloned(),
+                    recovery_set: recovery.clone(),
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// Keep both raw failure deadlines: a short retry and an overlong refusal.
+/// Clock registration, rather than a pre-clamped fixture, must enforce the cap.
+pub(super) fn cap_inputs(store: &SqliteRouteStateStore, now: i64, until: i64) {
+    store
+        .record_credential_entitlement_fence(
+            &striatum_core::route_state_store::CredentialRefusal {
+                provider_id: "p".into(),
+                credential_id: "c".into(),
+                code: "ENTITLEMENT_ERROR".into(),
+            },
+            None,
+            now,
+        )
+        .unwrap();
+    store.account_transaction(|tx| {
+        tx.pool_sql(|conn| {
+            conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,updated_at,failure_observed_at)
+                VALUES ('failure/m','failure/m','failure','m',?1,?1)", [now])?;
+            let row = crate::block_storage::failure_source(conn, crate::block_storage::FailureSource {
+                key: "failure/m", provider: "failure", model: "m", deadline: Some(until as f64),
+                reason: Some("failure"), observed_at: now, error: None, class: None, unscoped: false,
+            })?.expect("the fixture supplies a failure deadline");
+            crate::block_storage::write_source(conn,&row)?;
+            Ok(())
+        })?;
+        super::register_on(tx,"failure",&serde_json::json!(["failure/m"]).to_string()).map_err(crate::err)
+    }).unwrap();
+}
+
+/// Leave this expired refusal without a registered probe retry. Sync must
+/// archive it; a registered retry would instead keep it available for probing.
+pub(super) fn expired_unmanaged_provider(store: &SqliteRouteStateStore, now: i64) {
+    store.account_transaction(|tx| tx.pool_sql(|conn| {
+        conn.execute("INSERT INTO provider_cooldown_state(provider_key,updated_at,wall_observed_at) VALUES ('legacy',100,100)", [])?;
+        let row = crate::block_storage::wall_source(conn, crate::block_storage::WallSource {
+            kind: "provider", key: "legacy", provider: "legacy", model: None,
+            cooldown: Some((now-10_000) as f64), exhausted: None, wall_observed: Some(100), observed_at: 100,
+            error: None, class: None, unscoped: false,
+        })?.expect("the fixture supplies a provider deadline");
+        crate::block_storage::write_source(conn,&row)?;
+        Ok(())
+    })).unwrap();
+}
+
+pub(super) fn retired_count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM retirement_tombstone", [], |row| {
+        row.get(0)
+    })
+}
