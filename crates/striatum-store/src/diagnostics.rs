@@ -40,6 +40,10 @@ pub struct DiagnosticRouteWall {
     pub wall_class: Option<RouteWallClass>,
 }
 
+#[cfg(test)]
+#[path = "diagnostics/provider_projection/tests.rs"]
+mod provider_projection;
+
 /// One account hold whose retry time has not yet come.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiagnosticAccountHold {
