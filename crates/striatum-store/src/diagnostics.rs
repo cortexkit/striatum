@@ -10,7 +10,7 @@
 use rusqlite::{params, Connection};
 use striatum_core::{RouteStateResult, RouteWallClass};
 
-use super::{err, row_wall_class, SqliteRouteStateStore};
+use super::{err, SqliteRouteStateStore};
 
 /// Rejection reasons that describe the catalog rather than a wall: a route
 /// awaiting operator scores, retired upstream, or excluded by policy is
