@@ -197,7 +197,7 @@ impl Drop for WriteAudit {
 #[test]
 fn excluded_write_audit_flags_executed_dml_and_classifies_without_mutating() {
     let harness = Harness::new("replay-excluded-write-plant");
-    let side = read_only(harness.store_path());
+    let side = read_only(&harness.store_path());
     let before = excluded_digests(&side);
     assert!(write_targets(&side, "SELECT * FROM routing_call_window")
         .unwrap()
