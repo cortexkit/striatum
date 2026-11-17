@@ -3,6 +3,9 @@ use super::*;
 #[path = "clock_normalization/tests.rs"]
 mod clock_normalization;
 
+#[path = "observation_receipts/tests.rs"]
+mod observation_receipts;
+
 fn migration_function_is_absent(conn: &Connection) {
     let error = conn
         .query_row(
