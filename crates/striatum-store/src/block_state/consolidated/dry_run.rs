@@ -46,7 +46,14 @@ impl BlockState {
                 .unwrap_or(0)
                 + 1;
         }
-        self.tables[0].put(row.rowid, key, Some(Arc::new(Record::Block(row))));
+        // Match SQL decode's held-row filter after a private clear. Keeping an
+        // absent source here would leave its retry clock active in later
+        // what-if evaluations.
+        self.tables[0].put(
+            row.rowid,
+            key,
+            row.held().then(|| Arc::new(Record::Block(row))),
+        );
     }
 
     /// A credential keeps the first classification made within the sweep.
