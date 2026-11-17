@@ -61,7 +61,9 @@ impl Inputs {
                 .entry(key.clone())
                 .or_insert_with(|| json!({"existence":"present"}));
             if let Some(grade) = fact.grade {
-                row["quality.grade"] = json!(grade);
+                if let Some(kind) = row["model.type"].as_str().map(str::to_owned) {
+                    row[format!("quality.grade.{kind}")] = json!(grade);
+                }
             }
             if let Some(limit) = fact.max_output_duration_ms {
                 row["limit.output_duration_ms"] = json!(limit);
@@ -125,7 +127,7 @@ impl Inputs {
                 .or_insert_with(|| json!({"existence":"present"}));
             row["model.type"] = json!("search");
             if let Some(grade) = fact.grade {
-                row["quality.grade"] = json!(grade);
+                row["quality.grade.search"] = json!(grade);
             }
             if let Some(price) = &fact.price {
                 for (key, rate) in &price.rates {
@@ -141,7 +143,22 @@ impl Inputs {
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+        let mut snapshot = (*snapshot).clone();
+        for (key, fact) in &self.facts.media {
+            let kind = kinds.get(key).map(String::as_str);
+            let grade_kind = match kind {
+                Some("transcribe" | "stream_transcribe") => Some("transcription"),
+                Some("synthesize") => Some("speech"),
+                Some("image") => Some("image"),
+                Some("video") => Some("video"),
+                _ => None,
+            };
+            if let Some((grade, kind)) = fact.grade.zip(grade_kind) {
+                snapshot =
+                    snapshot.with_local_media_grade(&format!("local:{key}"), kind, grade as f64);
+            }
+        }
+        h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
         h.edit_config(|config| {
             for key in &self.policies {
                 if let Some(model) = config["models"][key].as_object_mut() {

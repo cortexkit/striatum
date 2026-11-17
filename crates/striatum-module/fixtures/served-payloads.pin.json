@@ -2,5 +2,7 @@
   "repository": "CortexKit/fusiform",
   "commit": "9591c735106d7d31f6ba917be96b00810be81af0",
   "path": "crates/fusiform-module/fixtures/served-payloads.json",
-  "sha256": "afeac184c2481f67afe3c7dee03b5a96c069cfa86ffd7fb037f9674c5de4aa46"
+  "sha256": "1ad59d65a4d7306f9462fc5f849c97bdc54cb58d902450f988787d56aa2bf4d1",
+  "upstream_sha256": "afeac184c2481f67afe3c7dee03b5a96c069cfa86ffd7fb037f9674c5de4aa46",
+  "consumer_port": "operator transcription grade key: quality.grade -> quality.grade.transcription"
 }

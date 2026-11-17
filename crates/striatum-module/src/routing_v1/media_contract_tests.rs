@@ -21,7 +21,7 @@ fn video(model: &str) -> Value {
 }
 
 fn video_row() -> Value {
-    json!({"existence":"present","model.type":"video","quality.grade":80,
+    json!({"existence":"present","model.type":"video","quality.grade.video":80,
         "limit.output_duration_ms":1000,"capability.aspect_ratios":["16:9"],"capability.output_audio":true})
 }
 
@@ -31,7 +31,7 @@ async fn video_choice(field: &str, invalid: Value, required: Value) {
         async {
             let h = setup(vec![video("a-invalid"), video("z-valid")]);
             let mut bad = video_row();
-            bad["quality.grade"] = json!(100);
+            bad["quality.grade.video"] = json!(100);
             bad[field] = invalid;
             catalog(
                 &h,
@@ -271,7 +271,7 @@ async fn equal_quantity_free_unit_rates_prefer_only_a_known_lower_minimum() {
         params["kind"] = json!(kind);
         params["requirements"]["iq"] = json!(40);
         for (low, expected) in [(json!({"kind":"minimum","quantity":10}),"z-low"),(json!({"kind":"none"}),"z-low"),(json!({"kind":"unknown"}),"a-high")] {
-            let row = |minimum| json!({"existence":"present","model.type":model_type,"quality.grade":80,
+            let row = |minimum| json!({"existence":"present","model.type":model_type,format!("quality.grade.{model_type}"):80,
                 rate_key:{"state":"priced","currency":"USD","units":2,"exponent":0,"per":1,"minimum_quantity":minimum}});
             catalog(&h,json!({"media-vendor/a-high":row(json!({"kind":"minimum","quantity":30})),"media-vendor/z-low":row(low)}));
             assert_eq!(select(&route,&params).await["engine"]["model"],expected);
@@ -285,7 +285,7 @@ async fn mixed_unknown_minima_keep_a_transitive_order_in_every_candidate_permuta
     super::super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         for order in [["a","b","c"],["a","c","b"],["b","a","c"],["b","c","a"],["c","a","b"],["c","b","a"]] {
             let h = setup(order.iter().map(|model| engine(model,false)).collect());
-            let row = |minimum| json!({"existence":"present","model.type":"transcription","quality.grade":80,
+            let row = |minimum| json!({"existence":"present","model.type":"transcription","quality.grade.transcription":80,
                 "rate.input_audio.per_second":{"state":"priced","currency":"USD","units":2,"exponent":0,"per":1,"minimum_quantity":minimum}});
             catalog(&h,json!({"media-vendor/a":row(json!({"kind":"minimum","quantity":30})),"media-vendor/b":row(json!({"kind":"unknown"})),"media-vendor/c":row(json!({"kind":"minimum","quantity":10}))}));
             for (model, score) in [("a",0.9),("b",0.8),("c",0.7)] { ranking::measure(&h,model,score); }
@@ -307,10 +307,10 @@ async fn mixed_unknown_minima_keep_a_transitive_order_in_every_candidate_permuta
 }
 
 #[tokio::test]
-async fn phone_voice_offer_uses_its_catalog_grade_and_zero_cost_but_never_a_price() {
+async fn phone_voice_offer_uses_only_its_local_grade_and_zero_cost_but_never_a_price() {
     super::super::super::describe::with_candidate_capabilities(&["select_kind", "select_media"], async {
         let h = setup(vec![ranking::engine("remote",false)]);
-        let remote = json!({"existence":"present","model.type":"transcription","quality.grade":80,
+        let remote = json!({"existence":"present","model.type":"transcription","quality.grade.transcription":80,
             "rate.input_audio.per_second":{"state":"priced","currency":"USD","units":1,"exponent":0,"per":1}});
         catalog(&h,json!({"media-vendor/remote":remote}));
         let route = h.bind(reserved("colliculus"), None).await;
@@ -319,7 +319,10 @@ async fn phone_voice_offer_uses_its_catalog_grade_and_zero_cost_but_never_a_pric
         params["requirements"]["iq"] = json!(40);
         params["caller_local"] = json!([ranking::engine("phone",true)]);
         assert_eq!(select(&route,&params).await["engine"]["model"],"remote");
-        catalog(&h,json!({"media-vendor/remote":remote,"media-vendor/phone":{"existence":"present","model.type":"transcription","quality.grade":80}}));
+        catalog(&h,json!({"media-vendor/remote":remote,"media-vendor/phone":{"existence":"present","model.type":"transcription","quality.grade.transcription":80}}));
+        assert_eq!(select(&route,&params).await["engine"]["model"],"remote");
+        let snapshot = h.credentials().lock().unwrap().catalog_snapshot.clone().unwrap();
+        h.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new((*snapshot).clone().with_local_media_grade("local:media-vendor/phone", "transcription", 80.0)));
         let with_row = select(&route,&params).await;
         assert_eq!(with_row["engine"]["model"],"phone");
         assert_eq!(with_row["engine"]["caller_local"],true);

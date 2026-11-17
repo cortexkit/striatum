@@ -85,8 +85,9 @@ pub(super) fn media_routes(
             return join.routes.clone();
         }
     }
-    // Only module declarations have catalog identities. Caller-local offers
-    // arrive with each request and must never acquire a catalog grade.
+    // Only module declarations are joined here. Caller-local offers arrive per
+    // request and read cached grades under local:<provider>/<model> keys rather
+    // than catalog row identities.
     let mut routes = MediaRoutes::default();
     for (module, slot) in &catalog.engines {
         for engine in &slot.engines {

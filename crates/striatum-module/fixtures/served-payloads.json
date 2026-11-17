@@ -4522,7 +4522,7 @@
       "models": {
         "openai/gpt-transcribe": {
           "model.type": "transcription",
-          "quality.grade": 87.500
+          "quality.grade.transcription": 87.500
         }
       },
       "quality_scores": {

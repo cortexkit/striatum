@@ -73,9 +73,9 @@ fn fixture_for_phone(with_phone_languages: bool) -> Arc<Harness> {
         config["consumers"]["colliculus.speech"] = json!({"mode":"demand","iq":40});
     });
     let mut audio = served_row("openai/gpt-transcribe");
-    audio["quality.grade"] = json!(80);
+    audio["quality.grade.transcription"] = json!(80);
     let mut speech = served_row("elevenlabs/eleven_flash_v2_5");
-    speech["quality.grade"] = json!(80);
+    speech["quality.grade.speech"] = json!(80);
     let mut catalog = json!({
         "catalog_version":41,"resolved_at_ms":NOW,
         "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},
@@ -83,21 +83,30 @@ fn fixture_for_phone(with_phone_languages: bool) -> Arc<Harness> {
             "media-vendor/fixture-transcribe":audio,
             "media-vendor/fixture-speech":speech,
             "media-vendor/phone-transcriber":{
-                "existence":"present","model.type":"transcription","quality.grade":80
+                "existence":"present","model.type":"transcription","quality.grade.transcription":80
             },
             "media-vendor/fixture-premium":{
-                "existence":"present","model.type":"transcription","quality.grade":100
+                "existence":"present","model.type":"transcription","quality.grade.transcription":100
             }
         }
     });
     if with_phone_languages {
-        catalog["models"]["apple/phone-transcriber"] =
-            json!({"existence":"present","model.type":"transcription","quality.grade":80});
+        catalog["models"]["apple/phone-transcriber"] = json!({"existence":"present","model.type":"transcription","quality.grade.transcription":80});
     }
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
             .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+    let snapshot = (*snapshot).clone().with_local_media_grade(
+        "local:media-vendor/phone-transcriber",
+        "transcription",
+        80.0,
+    );
+    let snapshot = if with_phone_languages {
+        snapshot.with_local_media_grade("local:apple/phone-transcriber", "transcription", 80.0)
+    } else {
+        snapshot
+    };
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
     harness
 }
 
@@ -149,7 +158,7 @@ fn install_realtime_catalog(harness: &Harness, live_grade: u8, voice_grade: u8) 
     live["quality.grade"] = json!(live_grade);
     let mut voice = served_row("openai/gpt-realtime-2.1");
     voice["quality.grade"] = json!(voice_grade);
-    // The rate-only snapshots need synthetic type/existence facts for realtime grades.
+    // Realtime has no operator grade kind; these retired bare grades must be ignored.
     for row in [&mut live, &mut voice] {
         row["existence"] = json!("present");
         row["model.type"] = json!("realtime");
@@ -167,11 +176,11 @@ fn install_realtime_catalog(harness: &Harness, live_grade: u8, voice_grade: u8) 
             .unwrap();
     assert_eq!(
         snapshot.media_grade("realtime", "openai/gpt-live-transcribe"),
-        Some(f64::from(live_grade))
+        None
     );
     assert_eq!(
         snapshot.media_grade("realtime", "openai/gpt-realtime-2.1"),
-        Some(f64::from(voice_grade))
+        None
     );
     harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
 }
@@ -467,7 +476,7 @@ async fn serving_bytes_match_transcription_bias_vectors() {
     key.provider_ids = vec!["openai".into(), "google".into()];
     harness.set_credentials(super::super::media_credentials(vec![key]));
     let mut audio = served_row("openai/gpt-transcribe");
-    audio["quality.grade"] = json!(80);
+    audio["quality.grade.transcription"] = json!(80);
     // Preserve the older samples' priced/adequate versus unpriced/higher-grade contrast.
     let catalog = json!({
         "catalog_version":41,"resolved_at_ms":NOW,
@@ -475,17 +484,22 @@ async fn serving_bytes_match_transcription_bias_vectors() {
         "models":{
             "openai/gpt-transcribe":audio,
             "google/gemini-3.8-flash":{
-                "existence":"present","model.type":"transcription","quality.grade":100
+                "existence":"present","model.type":"transcription","quality.grade.transcription":100
             },
             "apple/phone-transcriber":{
-                "existence":"present","model.type":"transcription","quality.grade":80
+                "existence":"present","model.type":"transcription","quality.grade.transcription":80
             }
         }
     });
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
             .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
+    let snapshot = (*snapshot).clone().with_local_media_grade(
+        "local:apple/phone-transcriber",
+        "transcription",
+        80.0,
+    );
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
     let phone = harness.bind(reserved("callosum"), None).await;
     let base: Value = serde_json::from_str(include_str!(
         "../../../../test-vectors/route-select-media-v1/voice-message-caller-local-en.json"

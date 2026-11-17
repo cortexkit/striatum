@@ -83,3 +83,29 @@ The reader tests send the request bytes unchanged through routing's v1 handler.
 | `thalamus-route-fork-of-v1/request.json` | `a96e194685b92151f7ceceed5e0dafc580ed3b0f5836b43d6d14fe5299151a36` |
 | `thalamus-route-fork-of-v1/hold-answer.json` | `94b1c12960b67c9841db267888af00a66fe847bf9a2911ea0c85c7ff395c54f8` |
 | `thalamus-route-fork-of-v1/SHA256SUMS` | `73031db341c99611a1a92e71b8fea6fdec1bf7ef72fdbcbe9d74b5b731ffe4ac` |
+
+## Per-kind and caller-local media grades
+
+`quality-grades-prefix-v1/` copies Fusiform's real-serializer samples byte for
+byte, supplied by its owner from Fusiform commit `a4e36712`, source path
+`crates/fusiform-module/fixtures/quality-grades-prefix-v1/`. The older-prefix
+refusal is the owner's additional live older-Fusiform capture. The supplied
+research copy was `.cortexkit/internal-docs/research/quality-grades-prefix-v1/`.
+Its updated `SHA256SUMS` covers all four JSON files and has SHA-256
+`8831211c65f0bfabe3e6d9fb6642659f07602108481b2a8e64325801b9c58fc8`.
+The byte-pinned decoder tests retain the grade spelling `72.50` in the fixture.
+
+`colliculus-voice-message-demand/routing-v1-declaration.json` is the supplied
+output of Colliculus's own routing/v1 declaration serializer, copied unchanged
+from `.cortexkit/internal-docs/research/colliculus-voice-message-demand/`, together
+with its `SHA256SUMS`. Its SHA-256 is
+`2fa96a8a79cdfa1213d8560e2df73bdcb200cd672fb47ee29029972feff466ba`.
+The declaration sets `colliculus.voice_message` to IQ 75 without a mode member;
+the approved-values ranking test loads these bytes through the real reader.
+
+The earlier `served-payloads.json` capture has one explicit consumer fixture
+port: `catalog.get — operator transcription grade` renames `quality.grade` to
+`quality.grade.transcription`, preserving `87.500` and every other byte. The new
+digest is `1ad59d65a4d7306f9462fc5f849c97bdc54cb58d902450f988787d56aa2bf4d1`.
+`catalog_fixture_port_changes_only_the_media_grade_key` reverses that rename and
+checks the original capture's digest, proving that no other fields changed.

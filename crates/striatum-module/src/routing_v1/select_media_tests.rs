@@ -30,6 +30,9 @@ mod contract;
 #[path = "media_samples_tests.rs"]
 mod samples;
 
+#[path = "media_local_grades_tests.rs"]
+mod local_grades;
+
 async fn select(route: &Route, params: &Value) -> Value {
     let (frame, value) = route.call("route.select", params).await;
     assert_eq!(frame, FrameType::Response, "{value}");

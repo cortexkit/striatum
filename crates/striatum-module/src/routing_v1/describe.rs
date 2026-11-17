@@ -117,6 +117,8 @@ pub(crate) fn inherit_capabilities<F: std::future::Future>(
     future: F,
 ) -> impl std::future::Future<Output = F::Output> {
     let candidate = CANDIDATE_CAPABILITIES.try_with(Clone::clone).ok();
+    let future =
+        crate::fusiform_catalog::inherit_calls(super::engines::grade_observer::inherit(future));
     async move {
         match candidate {
             Some(candidate) => CANDIDATE_CAPABILITIES.scope(candidate, future).await,
