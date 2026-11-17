@@ -180,10 +180,14 @@ mod account_writer {
             Some(BORROWED),
         )
         .unwrap();
-        let inherited: bool = store.with_reader_for_test(|conn| conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM model_route_state WHERE route_key=?1 AND cooldown_until>?2)",
-            rusqlite::params![format!("{BORROWED}/writer-new-model"), now as i64], |row| row.get(0)
-        )).unwrap();
+        // Catalogue inserts leave model_route_state.cooldown_until and
+        // quota_exhausted_until null; provider blocking comes from the snapshot.
+        let inherited = striatum_core::RouteStateStore::build_snapshot(store.as_ref(), now as f64)
+            .unwrap()
+            .by_route
+            .get(&format!("{BORROWED}/writer-new-model"))
+            .and_then(|row| row.cooldown_until)
+            .is_some_and(|until| until > now as f64);
         assert!(
             inherited,
             "the catalogue insert must create inherited route state"

@@ -1859,8 +1859,8 @@ mod tests {
                 "UPDATE routing_call_window SET started_at_ms = {start};
                  INSERT INTO routing_call_count VALUES ('route.old', 's', 'p', 3, {idle});
                  INSERT INTO routing_call_count VALUES ('route.select', 's', 'p', 9, {recent});
-                 INSERT INTO fence_retired_origin VALUES ('route', '[\"x/old\"]', 'e', 0, {idle});
-                 INSERT INTO fence_retired_origin VALUES ('route', '[\"x/new\"]', 'e', 0, {recent});
+                 INSERT INTO retirement_tombstone VALUES ('route', '[\"x/old\"]', 'e', 0, {idle});
+                 INSERT INTO retirement_tombstone VALUES ('route', '[\"x/new\"]', 'e', 0, {recent});
                  INSERT INTO routing_unscored_admissible_models VALUES ('m/old', 0, {idle});
                  INSERT INTO routing_unscored_admissible_models VALUES ('m/new', 0, {recent});
                  INSERT INTO quota_reading_log (account_key, window_key, observed_at, used_percent, is_stale)
@@ -1912,7 +1912,7 @@ mod tests {
         );
         assert_eq!(count(&path, "SELECT calls FROM routing_call_count"), 9);
         assert_eq!(
-            count(&path, "SELECT retired_at FROM fence_retired_origin"),
+            count(&path, "SELECT retired_at FROM retirement_tombstone"),
             NOW - DAY_MS
         );
         assert_eq!(

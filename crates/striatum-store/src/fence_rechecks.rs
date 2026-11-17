@@ -2898,14 +2898,11 @@ mod tests {
     #[test]
     fn blocks_parity_rows_cover_all_kinds_states_and_lifetimes() {
         let scratch = cortexkit_test_support::ScratchDir::new("block-parity");
-        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "block-parity",
-            scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
         let now = 1_900_000_000_000;
-        store.seed_block_parity_fixture_for_test(now);
-        store.assert_block_parity_fixture_coverage_for_test(now);
+        let store = crate::legacy_fixture_inputs::migrated_parity_store(
+            &scratch.path().join("store.db"),
+            now,
+        );
         let report = store.block_parity(now).unwrap();
         assert!(report.differences.is_empty(), "{report:#?}");
         assert!(report.identities > 0 && report.function_comparisons > 0);

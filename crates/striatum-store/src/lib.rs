@@ -4369,8 +4369,13 @@ fn confidence_str(c: Confidence) -> &'static str {
 mod consumer_names_tests;
 
 #[cfg(test)]
+#[path = "legacy_fixture_inputs/tests.rs"]
+mod legacy_fixture_inputs;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use legacy_fixture_inputs::{insert_legacy_account_wall, legacy_account_wall_error};
     use striatum_core::ScoreProvenance;
 
     #[cfg(unix)]
@@ -4479,9 +4484,7 @@ mod tests {
                 Ok((columns, values))
             })
             .unwrap();
-        let old_fences = legacy
-            .account_transaction(|tx| tx.active_fences("anthropic"))
-            .unwrap();
+        let old_fences = legacy_fixture_inputs::legacy_fences(&legacy, "anthropic");
         drop(legacy);
 
         let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
@@ -4609,7 +4612,7 @@ mod tests {
         restarted
             .store
             .with_conn(|c| {
-                let (code,due):(String,i64)=c.query_row("SELECT json_extract(evidence,'$[0]'),next_recheck_at FROM fence_recheck WHERE kind='credential'",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
+                let (code,due):(String,i64)=c.query_row("SELECT json_extract(evidence,'$[0]'),next_recheck_at FROM block WHERE kind='credential' AND managed=1",[],|row|Ok((row.get(0)?,row.get(1)?)))?;
                 assert_eq!(code,"ENTITLEMENT_ERROR","migration preserves the standing refusal evidence");
                 assert!(due<=now_ms(),"old credentials get one immediately due probe");
                 let dropped: i64 = c.query_row(
@@ -4712,34 +4715,20 @@ mod tests {
         );
     }
 
-    fn legacy_account_wall_error() -> String {
-        let vectors: serde_json::Value = serde_json::from_str(include_str!(
-            "../../striatum-core/tests/fixtures/account-wall-scope.json"
-        ))
-        .unwrap();
-        vectors[0]["error"].as_str().unwrap().into()
-    }
-
-    fn insert_legacy_account_wall(store: &SqliteRouteStateStore, route: &str, class: &str) {
-        store.store.with_conn(|conn| conn.execute(
-            "INSERT INTO model_route_state (route_key,capacity_key,provider_id,model_id,cooldown_until,quota_exhausted_until,last_error,wall_class,updated_at)
-             VALUES (?1,'anthropic/opus','anthropic','opus',1791493229401,1791493229401,?2,?3,1791048824539)",
-            params![route,legacy_account_wall_error(),class],
-        )).unwrap();
-    }
-
     #[test]
     fn legacy_account_wall_is_quarantined_without_erasing_evidence_or_real_walls() {
         let scratch = cortexkit_test_support::ScratchDir::new("account-wall-quarantine");
-        let store = SqliteRouteStateStore::open(&dev_descriptor(
+        let descriptor = dev_descriptor(
             "account-wall-quarantine",
             scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
+        );
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
         insert_legacy_account_wall(&store, "anthropic/opus/medium", "quota");
         insert_legacy_account_wall(&store, "anthropic/billing", "billing");
         let now = now_ms();
         store.store.with_conn(|conn|conn.execute("UPDATE model_route_state SET cooldown_until=?1,quota_exhausted_until=?1,updated_at=?2 WHERE route_key='anthropic/billing'",params![now+86_400_000,now-1_800_000])).unwrap();
+        drop(store);
+        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
         let snapshot = store.build_snapshot(now as f64).unwrap();
         let scoped = &snapshot.by_route["anthropic/opus/medium"];
         assert_eq!(scoped.cooldown_until, None);
@@ -4892,31 +4881,7 @@ mod tests {
         ));
         let descriptor = dev_descriptor("striatum-clear-failure-backoff", path.to_string_lossy());
         let store = SqliteRouteStateStore::open(&descriptor).unwrap();
-        store
-            .store
-            .with_conn(|connection| {
-                connection.execute(
-                    "INSERT INTO model_route_state (
-                       route_key, capacity_key, provider_id, model_id, updated_at,
-                       consecutive_terminal_failures, failure_backoff_until,
-                       failure_backoff_reason, cooldown_until, quota_exhausted_until
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-                    params![
-                        "test-provider/test-model",
-                        "test-provider/test-model",
-                        "test-provider",
-                        "test-model",
-                        1_i64,
-                        3_i64,
-                        1_000_i64,
-                        "consecutive terminal send failures: 3",
-                        // A 17-day wall, the shape a misread stack trace once wrote.
-                        1_500_000_000_000_i64,
-                        1_500_000_000_000_i64
-                    ],
-                )
-            })
-            .unwrap();
+        legacy_fixture_inputs::seed_failure_clear(&store);
 
         assert_eq!(
             store
@@ -4928,26 +4893,7 @@ mod tests {
                 failure_backoff_reason: Some("consecutive terminal send failures: 3".into()),
             })
         );
-        let after: (i64, Option<f64>, Option<String>, Option<f64>, Option<f64>) = store
-            .store
-            .with_conn(|connection| {
-                connection.query_row(
-                    "SELECT consecutive_terminal_failures, failure_backoff_until,
-                            failure_backoff_reason, cooldown_until, quota_exhausted_until
-                     FROM model_route_state WHERE route_key = ?1",
-                    ["test-provider/test-model"],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-            })
-            .unwrap();
+        let after = legacy_fixture_inputs::failure_clear_row(&store);
         assert_eq!(
             after,
             (
