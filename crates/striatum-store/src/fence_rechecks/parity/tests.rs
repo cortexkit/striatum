@@ -3,9 +3,9 @@
 
 use super::*;
 
-#[path = "functions.rs"]
+#[path = "functions/tests.rs"]
 mod functions;
-#[path = "native_reference.rs"]
+#[path = "native_reference/tests.rs"]
 mod native_reference;
 
 pub(super) use functions::compare as compare_functions;

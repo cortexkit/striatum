@@ -1,7 +1,7 @@
 //! Independent reference predicates for quota grouping and the request's
 //! policy/listing composition. They do not call the core block evaluator.
 
-#[path = "block_parity_tests/native_fixture.rs"]
+#[path = "block_parity_tests/native_fixture/tests.rs"]
 mod native_fixture;
 
 use super::*;

@@ -709,6 +709,59 @@ fn a_continuation_with_a_partial_offer_is_refused_at_load_naming_the_row() {
     );
 }
 
+fn state_blind_source_offenders(
+    path: &std::path::Path,
+    text: &str,
+    forbidden: &[&str],
+    command_only: &[&str],
+) -> Vec<String> {
+    // Only this exact first-line inner gate excludes the whole file from a
+    // production build. Mixed, feature-only and outer gates still get scanned.
+    let tests = path.ends_with("account_state/tests.rs")
+        || path.ends_with("account_state/admission_tests.rs")
+        || text.lines().next() == Some("#![cfg(test)]");
+    let mut offenders = Vec::new();
+    for &name in forbidden {
+        if text.contains(name) && !tests {
+            offenders.push(format!("{}: {name}", path.display()));
+        }
+    }
+    for &name in command_only {
+        if text.contains(name) && !tests && !path.ends_with("src/account_state.rs") {
+            offenders.push(format!("{}: {name}", path.display()));
+        }
+    }
+    offenders
+}
+
+#[test]
+fn state_blind_source_scan_honors_only_the_exact_whole_file_test_gate() {
+    let path = std::path::Path::new("src/production_plant.rs");
+    let calls = "tx.v1_commit_report(); tx.set_admission_lifecycle(); tx.admission_in_states();";
+    let forbidden = [".v1_commit_report("];
+    let command_only = [".set_admission_lifecycle(", ".admission_in_states("];
+    for prefix in [
+        "",
+        "#![cfg(any(test, feature = \"x\"))]\n",
+        "#![cfg(feature = \"x\")]\n",
+        "#[cfg(test)]\n",
+    ] {
+        let source = format!("{prefix}{calls}");
+        assert_eq!(
+            state_blind_source_offenders(path, &source, &forbidden, &command_only).len(),
+            3,
+            "runtime-capable or ungated source is still scanned: {prefix:?}"
+        );
+    }
+    assert!(state_blind_source_offenders(
+        path,
+        &format!("#![cfg(test)]\n{calls}"),
+        &forbidden,
+        &command_only,
+    )
+    .is_empty());
+}
+
 /// Once the module's state is installed, the store-level writers that change
 /// admission-group rows without it refuse, and the module never calls them.
 #[test]
@@ -763,18 +816,12 @@ fn state_blind_admission_writers_refuse_once_state_is_installed() {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let text = std::fs::read_to_string(&path).unwrap();
-                let tests = path.ends_with("account_state/tests.rs")
-                    || path.ends_with("account_state/admission_tests.rs");
-                for name in forbidden {
-                    if text.contains(name) && !tests {
-                        offenders.push(format!("{}: {name}", path.display()));
-                    }
-                }
-                for name in command_only {
-                    if text.contains(name) && !tests && !path.ends_with("src/account_state.rs") {
-                        offenders.push(format!("{}: {name}", path.display()));
-                    }
-                }
+                offenders.extend(state_blind_source_offenders(
+                    &path,
+                    &text,
+                    &forbidden,
+                    &command_only,
+                ));
             }
         }
     }

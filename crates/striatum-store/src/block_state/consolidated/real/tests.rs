@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 
 fn synthetic_state(value: f64) -> BlockState {

@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use striatum_store::AccountExclusionRow;
 
