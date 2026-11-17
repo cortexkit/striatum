@@ -261,13 +261,20 @@ pub const REVIEWED_TRIGGERS: [(&str, &str); 4] = [
     ),
 ];
 
-/// The allocator reads only insertion-order bookkeeping, never refusal policy.
-/// The exact statement is exempt only while a writer command is executing;
-/// placing its comment on another read or using it from a request exempts nothing.
-pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 1] = [(
-    crate::block_storage::NEXT_SOURCE_ORDER,
-    "writer bookkeeping: next source order per kind",
-)];
+/// These read only insertion-order bookkeeping, never refusal policy.
+/// The exact statements are exempt only while a writer command is executing;
+/// copying a comment onto another read, or running a catalogued statement from
+/// a request, exempts nothing.
+pub const REVIEWED_WRITER_BOOKKEEPING: [(&str, &str); 2] = [
+    (
+        crate::block_storage::NEXT_SOURCE_ORDER,
+        "writer bookkeeping: next source order per kind",
+    ),
+    (
+        crate::block_storage::ROUTE_SOURCE_ORDER,
+        "writer bookkeeping: source order is the live route row's rowid",
+    ),
+];
 
 /// A rare observation-effect insert checks one origin's retirement receipts.
 /// The archive is not loaded. Only the exact guarded insert inside a writer

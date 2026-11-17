@@ -392,3 +392,75 @@ impl ReplayStates {
         }
     }
 }
+
+#[tokio::test]
+async fn route_order_lookup_never_runs_during_select_or_account_check() {
+    use striatum_core::RouteStateStore;
+    let _clock = crate::InjectedClock::set(NOW as u64);
+    let _inputs = striatum_store::replay::Inputs::new(NOW).install();
+    let (harness, mut caller) = configured().await;
+    let trace = harness.store().trace_block_reads_for_test().unwrap();
+    harness
+        .store()
+        .update_route_state(
+            "bookkeeping-unrelated/model",
+            "bookkeeping-unrelated/model",
+            &striatum_core::RouteStateUpdate {
+                cooldown_until: Some((NOW + 60_000) as f64),
+                observed_at_ms: Some(NOW),
+                last_error: Some("route capacity".into()),
+                unscoped_wall: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let lookup = striatum_store::group_reads::REVIEWED_WRITER_BOOKKEEPING
+        .iter()
+        .map(|(sql, _)| *sql)
+        .find(|sql| sql.contains("FROM model_route_state"))
+        .unwrap();
+    assert!(trace
+        .take()
+        .writer_bookkeeping
+        .iter()
+        .any(|sql| sql == lookup));
+    let verify_request = |label: &str| {
+        let reads = trace.take();
+        for sql in reads
+            .reader
+            .iter()
+            .chain(&reads.writer)
+            .chain(&reads.writer_bookkeeping)
+            .chain(&reads.checks)
+            .chain(&reads.route_writes)
+        {
+            assert_ne!(
+                sql, lookup,
+                "{label} must not run the writer's route-order lookup"
+            );
+        }
+    };
+    let (_, selected) = caller
+        .call(
+            "route.select",
+            &json!({"consumer":fixture::SUMMARY,
+        "requirements":{"iq":50},"pin":"example-subscription/model-c"}),
+        )
+        .await;
+    assert!(selected["result"]["decision_id"].is_string(), "{selected}");
+    verify_request("route.select");
+    let mut runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    let (_, account) = runner
+        .call(
+            "route.account_for",
+            &json!({"provider":"example-subscription","model":"model-c",
+        "conversation_key":"route-order-check","admission_id":"route-order-check",
+        "decision_id":selected["result"]["decision_id"]}),
+        )
+        .await;
+    assert!(
+        account["result"]["account"]["credential_id"].is_string(),
+        "{account}"
+    );
+    verify_request("route.account_for");
+}

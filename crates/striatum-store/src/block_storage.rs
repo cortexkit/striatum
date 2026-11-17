@@ -220,6 +220,12 @@ pub(crate) const NEXT_SOURCE_ORDER: &str = "/* writer bookkeeping: next source o
             COALESCE((SELECT MAX(source_order) FROM block WHERE kind='transient_route'),0))+1
     ELSE COALESCE((SELECT MAX(source_order) FROM block WHERE kind=?1),0)+1 END";
 
+/// Route source order is the live catalogue row's rowid.
+/// Refusals arriving later must not reorder established routes. This
+/// exact keyed metadata lookup is writer-only insertion-order bookkeeping.
+pub(crate) const ROUTE_SOURCE_ORDER: &str =
+    "SELECT rowid FROM model_route_state WHERE route_key=json_extract(?1,'$[0]')";
+
 pub(crate) const OBSERVATION_RETIREMENT_GUARD_MARKER: &str =
     "/* writer guard: observation-effect retirement */";
 pub(crate) const OBSERVATION_RETIREMENT_LOOKUP: &str =
@@ -284,11 +290,9 @@ pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Re
         if block.kind == "route" {
             // Catalogue rows exist before their first refusal. Later reports
             // must keep that established scan order, not refusal-arrival order.
-            conn.query_row(
-                "SELECT rowid FROM model_route_state WHERE route_key=json_extract(?1,'$[0]')",
-                [&block.origin_key],
-                |row| row.get::<_, i64>(0),
-            )?
+            conn.query_row(ROUTE_SOURCE_ORDER, [&block.origin_key], |row| {
+                row.get::<_, i64>(0)
+            })?
         } else {
             conn.query_row(NEXT_SOURCE_ORDER, [&block.kind], |row| row.get::<_, i64>(0))?
         }

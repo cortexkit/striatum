@@ -5435,3 +5435,105 @@ fn route_source_order_keeps_existing_metadata_order_through_reverse_reports_and_
     assert_eq!(rig.owner.loads.load(Ordering::Relaxed), loads + 1);
     check_order();
 }
+
+#[test]
+fn route_source_order_bookkeeping_uses_a_unique_keyed_lookup() {
+    let rig = rig("route-order-keyed-plan");
+    let (plan, unique_indexes) = rig
+        .store
+        .with_reader_for_test(|conn| {
+            let mut statement = conn.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                crate::block_storage::ROUTE_SOURCE_ORDER
+            ))?;
+            let parameters = if statement.parameter_count() == 0 {
+                Vec::new()
+            } else {
+                vec![Value::Text(
+                    serde_json::json!(["plan-provider/model"]).to_string(),
+                )]
+            };
+            let plan = statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let indexes = conn
+                .prepare(
+                    "SELECT name FROM pragma_index_list('model_route_state') WHERE \"unique\"=1",
+                )?
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok((plan, indexes))
+        })
+        .unwrap();
+    assert!(
+        plan.iter().all(|detail| !detail.contains("SCAN")),
+        "route order must not scan metadata: {plan:?}"
+    );
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("SEARCH model_route_state")
+                && detail.contains("(route_key=?)")
+                && unique_indexes.iter().any(|name| detail.contains(name))),
+        "route order requires the unique route_key lookup: {plan:?}"
+    );
+}
+
+#[test]
+fn route_source_order_bookkeeping_does_not_exempt_unkeyed_or_request_reads() {
+    let rig = rig("route-order-exact-trace");
+    let sql = crate::block_storage::ROUTE_SOURCE_ORDER;
+    let trace = rig.store.trace_block_reads_for_test().unwrap();
+    rig.store
+        .with_reader_for_test(|conn| {
+            conn.query_row(
+                sql,
+                [serde_json::json!(["trace-provider/model"]).to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        })
+        .unwrap();
+    let request = trace.take();
+    assert_eq!(request.reader, vec![sql.to_string()]);
+    assert!(request.writer_bookkeeping.is_empty());
+
+    let near_miss = sql.split_once(" WHERE ").unwrap().0.to_string();
+    let expected = near_miss.clone();
+    rig.store
+        .account_command(AccountCommandKind::Maintenance, move |tx| {
+            tx.pool_sql(&|conn| {
+                conn.prepare(&near_miss)?
+                    .query_map([], |row| row.get::<_, i64>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                Ok(())
+            })
+        })
+        .unwrap();
+    let unkeyed = trace.take();
+    assert!(
+        unkeyed.writer.iter().any(|read| read == &expected),
+        "unkeyed read must stay visible: {unkeyed:#?}"
+    );
+    assert!(unkeyed.writer_bookkeeping.is_empty());
+
+    rig.store
+        .update_route_state(
+            "trace-provider/model",
+            "trace-provider/model",
+            &RouteStateUpdate {
+                cooldown_until: Some((NOW + 60_000) as f64),
+                observed_at_ms: Some(NOW),
+                last_error: Some("route capacity".into()),
+                unscoped_wall: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let writer = trace.take();
+    assert!(
+        writer.writer_bookkeeping.iter().any(|read| read == sql),
+        "real route-source writer must record its exact lookup: {writer:#?}"
+    );
+}
