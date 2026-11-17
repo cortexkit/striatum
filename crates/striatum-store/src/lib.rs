@@ -3113,15 +3113,13 @@ impl SqliteRouteStateStore {
         let limit = filter.limit.min(100) as i64;
         self.store
             .with_conn(|connection: &Connection| {
-                // Observability queries that pulled send-payload-scale JSON caused measured disk
-                // churn. Keep this list to compact scalars and derive rejection counts in SQLite;
-                // requirements, scores, explanations, and quota snapshots stay on explain only.
+                // Keep payload-scale JSON on explain; lists need only compact scalars.
                 let mut statement = connection.prepare(
                     "WITH filtered AS (
                          SELECT id, created_at, selected_route_key, decision_kind, rejected_json
                          FROM model_route_decisions
                          WHERE (?1 IS NULL OR send_id=?1)
-                           AND (?2 IS NULL OR target_agent=?2)
+                            AND (?2 IS NULL OR target_agent IN (?2, ?7))
                            AND (?3 IS NULL OR selected_route_key=?3)
                            AND (?4 IS NULL OR created_at>=?4)
                            AND (?5 IS NULL OR created_at<=?5)
@@ -3167,6 +3165,7 @@ impl SqliteRouteStateStore {
                         filter.since_ms,
                         filter.until_ms,
                         limit,
+                        filter.target_agent.as_deref().map(striatum_core::module_identity::alternate).as_deref(),
                     ],
                     |row| {
                         let top_rejection_count = row.get::<_, i64>(5)?;

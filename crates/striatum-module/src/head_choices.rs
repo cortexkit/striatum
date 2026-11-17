@@ -81,17 +81,13 @@ pub(super) fn remember_bind(
     principal: Option<&subc_protocol::Principal>,
     scoped: bool,
     harness: &str,
-    session: &str,
+    _session: &str,
 ) {
     // Mirror core's operator_route: Callosum attests federated operators;
-    // local direct callers must not be scoped agents or the shared plugin.
+    // Local direct callers must not be scoped agents.
     let operator = match principal {
         Some(subc_protocol::Principal::Reserved { module_id }) => module_id == "callosum",
-        Some(subc_protocol::Principal::Direct) => {
-            !scoped
-                && !harness.starts_with("fed-")
-                && !(harness == "alfonso" && session == "prefrontal-core")
-        }
+        Some(subc_protocol::Principal::Direct) => !scoped && !harness.starts_with("fed-"),
         _ => false,
     };
     if let Ok(mut binds) = operator_binds().lock() {
