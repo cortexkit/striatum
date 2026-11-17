@@ -19,7 +19,6 @@ use striatum_core::{
 };
 
 use super::{err, SqliteRouteStateStore};
-
 /// `account_decision.mode` for a decision routing answered a caller with,
 /// the only mode routing writes. (The schema also allows `shadow`, from the
 /// retired shadow mode; retention purges those rows.)
@@ -1167,15 +1166,15 @@ pub struct AccountDecisionRecord {
 /// A conversation's current pin, keyed by principal, hashed conversation key
 /// and provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountAffinityRow {
-    pub principal: String,
-    pub conversation_hash: String,
-    pub provider: String,
-    pub affinity_model: String,
+pub struct AccountAffinityRow<Text = String, Hash = String> {
+    pub principal: Text,
+    pub conversation_hash: Hash,
+    pub provider: Text,
+    pub affinity_model: Text,
     pub pin_id: String,
     pub pin_generation: u64,
-    pub account_id: String,
-    pub credential_id: String,
+    pub account_id: Text,
+    pub credential_id: Text,
     pub credential_binding_revision: u64,
     pub policy_version: u32,
     pub initial_demand_bytes: u64,
@@ -1205,22 +1204,22 @@ pub struct AccountPinRow {
 
 /// One admission and the demand it charged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountAdmissionRow {
-    pub principal: String,
+pub struct AccountAdmissionRow<Text = String, Hash = String> {
+    pub principal: Text,
     pub admission_id: String,
     pub request_fingerprint: String,
     /// `admit`, `renew` or `reassign`.
-    pub request_mode: String,
+    pub request_mode: Text,
     pub decision_id: String,
-    pub conversation_hash: String,
-    pub provider: String,
-    pub model: String,
-    pub account_id: String,
-    pub credential_id: String,
+    pub conversation_hash: Hash,
+    pub provider: Text,
+    pub model: Text,
+    pub account_id: Text,
+    pub credential_id: Text,
     pub pin_id: String,
     pub pin_generation: u64,
     /// `reserved`, `started`, `released`, `expired` or `finished`.
-    pub state: String,
+    pub state: Text,
     /// False for a renewal, which charges no demand.
     pub charged: bool,
     pub request_bytes: u64,
@@ -1616,6 +1615,7 @@ impl<'a> AccountTx<'a> {
 }
 
 mod continuation;
+mod row_repr;
 mod state_rows;
 pub use state_rows::*;
 

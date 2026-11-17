@@ -169,7 +169,7 @@ fn conversation_column(
         .collect()
 }
 
-fn rows() -> AdmissionGroupRows {
+pub(super) fn rows() -> AdmissionGroupRows {
     let mut rows = AdmissionGroupRows::default();
     let principals: Vec<_> = (0..CONVERSATIONS)
         .map(|c| {
@@ -254,7 +254,7 @@ fn rows() -> AdmissionGroupRows {
         let committed_at = NOW - 29 * 86_400_000 + i as i64 * (29 * 86_400_000 / ADMISSIONS as i64);
         let latest = LatestAdmissionRow {
             principal: principals[c].clone(),
-            conversation_hash: text('h', c, 64),
+            conversation_hash: format!("{c:064x}"),
             provider: providers[c].clone(),
             admission_id: admission_id.clone(),
             committed_at,
@@ -319,7 +319,7 @@ fn rows() -> AdmissionGroupRows {
             } else {
                 text('p', 0, 14)
             },
-            conversation_hash: text('h', c, 64),
+            conversation_hash: format!("{c:064x}"),
             provider: if i >= 125_868 {
                 text('v', 0, 21)
             } else if c < 101_622 {
@@ -463,6 +463,7 @@ fn live_shaped_account_heap() {
     release("closing", closing);
     release("signed_out", signed_out);
     release("pending", pending);
+    release("text_pool", super::shared_text::take_heap_pool());
 }
 
 fn string_inventory<'a>(state: &'a AdmissionState) {
@@ -470,16 +471,18 @@ fn string_inventory<'a>(state: &'a AdmissionState) {
     let mut strings: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
     let mut bytes = 0_usize;
     let mut count = 0_usize;
-    let mut add = |value: &'a String| {
-        bytes += value.capacity();
+    let mut add = |value: &'a str| {
+        bytes += value.len();
         count += 1;
-        let entry = strings.entry(value.as_str()).or_default();
-        entry.0 = entry.0.max(value.capacity());
+        let entry = strings.entry(value).or_default();
+        entry.0 = entry.0.max(value.len());
         entry.1 += 1;
     };
     let mut conversation = |key: &'a admissions::ConversationKey| {
         add(&key.0);
-        add(&key.1);
+        if let Some(text) = key.1.heap_text() {
+            add(text);
+        }
         add(&key.2);
     };
     for (key, _) in state.latest.iter() {
@@ -505,12 +508,11 @@ fn string_inventory<'a>(state: &'a AdmissionState) {
         }
         let row = &row.row;
         for value in [
-            &row.principal,
+            row.principal.as_str(),
             &row.admission_id,
             &row.request_fingerprint,
             &row.request_mode,
             &row.decision_id,
-            &row.conversation_hash,
             &row.provider,
             &row.model,
             &row.account_id,
@@ -527,8 +529,7 @@ fn string_inventory<'a>(state: &'a AdmissionState) {
     }
     for (_, row) in state.latest.iter() {
         for value in [
-            &row.principal,
-            &row.conversation_hash,
+            row.principal.as_str(),
             &row.provider,
             &row.admission_id,
             &row.pin_id,
@@ -540,8 +541,7 @@ fn string_inventory<'a>(state: &'a AdmissionState) {
     }
     for (_, row) in state.affinity.iter() {
         for value in [
-            &row.principal,
-            &row.conversation_hash,
+            row.principal.as_str(),
             &row.provider,
             &row.affinity_model,
             &row.pin_id,
@@ -554,7 +554,7 @@ fn string_inventory<'a>(state: &'a AdmissionState) {
     for (key, rows) in state.demand.iter() {
         add(&key.0);
         add(&key.1);
-        rows.visit_heap_strings(&mut add);
+        rows.visit_heap_strings(|s| add(s));
     }
     for (pin, _) in state.affinity_by_pin.iter() {
         add(pin);
