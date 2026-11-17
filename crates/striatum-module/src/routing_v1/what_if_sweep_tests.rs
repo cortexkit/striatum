@@ -613,41 +613,45 @@ async fn what_if_cleared_account_source_drops_its_clock_like_sql_without_live_wr
         "the ordinary SQL clear trigger and loader remove the clock"
     );
     let before = rows(&harness);
-    let checks = Arc::new(AtomicUsize::new(0));
-    let checked = checks.clone();
+    let observations = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = observations.clone();
     let _hook = crate::account_selection::Sweep::hook(
         &harness.config_path_for_test(),
         move |sweep, _, _| {
             let crate::account_state::Published::State(state) = sweep.published() else {
                 panic!("this regression must exercise native private sweep state");
             };
-            assert!(state
-                .blocks
-                .active_fences("example-subscription")
-                .iter()
-                .all(|fence| fence.fence_id != "fresh-headroom-fixture"));
-            assert_eq!(
+            observed.lock().unwrap().push((
                 state
                     .blocks
                     .clock("account", &key)
                     .map(|(clock, cleared)| (clock.clone(), cleared)),
-                expected,
-                "a what-if clear must drop the complete clock, not only hide its source"
-            );
-            assert_eq!(
                 state.blocks.needs_sync(),
-                expected_sync,
-                "the private clear must not leave a repairable orphan clock"
-            );
-            checked.fetch_add(1, Ordering::Relaxed);
+                state
+                    .blocks
+                    .active_fences("example-subscription")
+                    .iter()
+                    .all(|fence| fence.fence_id != "fresh-headroom-fixture"),
+            ));
         },
     );
     let trace = harness.store().trace_block_reads_for_test().unwrap();
     let _answer = evaluate(&operator, request()).await;
     assert!(
-        checks.load(Ordering::Relaxed) >= 2,
+        observations.lock().unwrap().len() >= 2,
         "multiple points use the same cleared private state"
     );
+    for (clock, sync, source_cleared) in observations.lock().unwrap().iter() {
+        assert!(*source_cleared);
+        assert_eq!(
+            *clock, expected,
+            "a what-if clear must drop the complete clock, not only hide its source"
+        );
+        assert_eq!(
+            *sync, expected_sync,
+            "the private clear must not leave a repairable orphan clock"
+        );
+    }
     assert!(
         trace.take().reader.is_empty(),
         "a live what-if must not read block SQL"
