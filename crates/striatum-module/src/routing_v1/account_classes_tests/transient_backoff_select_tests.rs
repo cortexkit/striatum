@@ -9,7 +9,8 @@ const MODELS: [&str; 3] = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"];
 fn one_account() -> Arc<Harness> {
     let harness = Harness::new("transient-backoff-select");
     let mut credentials = BrocaCredentials::default();
-    // Only the three adequate OpenAI routes belong to this incident fixture.
+    // Only the three OpenAI routes adequate for this demand exist here, so a
+    // refusal can come only from the account test held on them.
     rusqlite::Connection::open(harness.store_path())
         .unwrap()
         .execute("DELETE FROM model_facts", [])

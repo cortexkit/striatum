@@ -953,8 +953,9 @@ async fn candidates(
         .collect();
     let outcome = live.apply(&mut facts);
     // Panel ranking can reject an account-blocked route before the final account
-    // admission check. Status-check hints must also respect the original route
-    // walls, panel exclusions, quality floor and package ceiling.
+    // admission check. Status-check hints must also respect the route's own
+    // cooldown, quota and backoff limits, panel exclusions, the quality floor and
+    // the package ceiling.
     let mut test_checks = HashMap::new();
     if let Some(classes) = &priced.classes {
         let admission = striatum_core::model_router::admit_routes(
