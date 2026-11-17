@@ -5543,10 +5543,14 @@ fn s4b_seed_trigger(
                 now as u64,
             );
             harness.set_credentials(credentials.clone());
-            harness.store().with_writer_for_test(|conn| conn.execute(
-                "INSERT INTO pool_key_state(provider,credential_id,cooldown_until,updated_at) VALUES ('synthetic','oauth:test',1,0)",
-                [],
-            ).map(|_| ())).unwrap();
+            // This expired pool source has no managed retry clock (managed=0).
+            // Reading the pool must synchronize once to retire it; a managed
+            // clock would keep the refusal available for a probe instead.
+            harness.store().with_writer_for_test(|conn| conn.execute_batch(
+                "INSERT INTO pool_key_state(provider,credential_id,updated_at) VALUES ('synthetic','oauth:test',0);
+                 INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,quota,deadline,next_recheck_at,observed_at,source_order,source_present,managed)
+                 VALUES ('pool_rate',json_array('synthetic','oauth:test'),'synthetic','oauth:test',json_array(1,NULL,0),0,0,1,1,0,1,1,0);"
+            )).unwrap();
         }
         "size" => {
             harness
@@ -5615,6 +5619,10 @@ fn s4b_repair_rows(
         "account_fence",
         "fence_recheck",
         "fence_retired_origin",
+        "block",
+        "probe_authorization",
+        "success_proof",
+        "retirement_tombstone",
     ]
     .into_iter()
     .map(|table| {

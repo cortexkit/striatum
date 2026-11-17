@@ -401,19 +401,17 @@ impl SqliteRouteStateStore {
         self.read_first_key_states(provider, now_ms, after_read)
     }
 
+    /// Test control for the former always-repair path: always enter a write
+    /// transaction and synchronize before reading native key rows. The current
+    /// path instead checks published state before deciding to repair. Their
+    /// replay compares rows and routing answers, not independent SQL policies.
     #[cfg(feature = "test-support")]
-    pub fn legacy_pool_key_states_for_test(
+    pub fn pre_read_first_pool_key_states_for_test(
         &self,
         provider: &str,
         now_ms: i64,
     ) -> RouteStateResult<BTreeMap<String, PoolKeyState>> {
-        self.account_transaction(|tx| {
-            crate::fence_rechecks::legacy::sync(tx.conn).map_err(err)?;
-            let mut statement=tx.conn.prepare("SELECT credential_id,last_used_at,walled_until,cooldown_until FROM pool_key_state WHERE provider=?1").map_err(err)?;
-            let rows=statement.query_map([provider],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?))).map_err(err)?
-                .collect::<rusqlite::Result<Vec<KeyRow>>>().map_err(err)?;
-            Ok(key_states_from(provider,rows,&crate::fence_rechecks::legacy::read(tx.conn).map_err(err)?,crate::fence_rechecks::legacy::enabled(tx.conn).map_err(err)?,lease_counts(tx.conn,provider,now_ms,None).map_err(err)?))
-        })
+        self.account_transaction(|tx| tx.key_states_on(provider, now_ms, None).map_err(err))
     }
 
     /// Key states for a request outside the writer, from `published`, the

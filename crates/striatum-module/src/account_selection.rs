@@ -1277,7 +1277,7 @@ impl ClassContext {
             #[cfg(test)]
             let read_states = || {
                 if LEGACY_CONTEXT_REPAIRS.load(Ordering::SeqCst) {
-                    store.legacy_pool_key_states_for_test(provider, now_ms)
+                    store.pre_read_first_pool_key_states_for_test(provider, now_ms)
                 } else {
                     read_states()
                 }
