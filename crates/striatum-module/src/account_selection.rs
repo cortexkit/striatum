@@ -227,6 +227,7 @@ pub(crate) struct ClassContext {
     // credential vector. Every hit rechecks the resolver's effective inputs.
     class_memo: std::sync::Arc<std::sync::Mutex<ClassMemo>>,
     rechecks: Vec<striatum_store::FenceRecheck>,
+    probe_authorizations: Vec<striatum_store::ProbeAuthorization>,
     account_ids: crate::broca_credentials::CredentialAccounts,
     pub credentials: crate::broca_credentials::BrocaCredentials,
     pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
@@ -259,8 +260,19 @@ pub(crate) enum ProbeBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct AccountBlock {
     pub reset_at_ms: Option<i64>,
+    /// A status check for another request's test, not a change to its clock.
+    pub test_check_at_ms: Option<i64>,
     pub lifetime: striatum_core::blocks::LifetimeClass,
     pub credential_code: Option<String>,
+}
+
+impl AccountBlock {
+    pub(crate) fn retry_at_ms(&self) -> Option<i64> {
+        self.reset_at_ms
+            .into_iter()
+            .chain(self.test_check_at_ms)
+            .min()
+    }
 }
 
 /// Why a legacy launch could not claim the probes its route needs.
@@ -619,6 +631,7 @@ impl ClassContext {
 }
 
 mod probe_reservations;
+mod retry_hints;
 
 #[cfg(test)]
 type ProbeBindHook = Box<dyn FnOnce(&SqliteRouteStateStore) + Send>;
@@ -1442,6 +1455,9 @@ impl ClassContext {
             .collect::<RouteStateResult<_>>()
             .map_err(|error| error.to_string())?;
         let rechecks = blocks.fence_rechecks().map_err(|error| error.to_string())?;
+        let probe_authorizations = blocks
+            .probe_authorizations_for_origins(&rechecks)
+            .map_err(|error| error.to_string())?;
         drop(blocks);
         let mut context = Self {
             serving_index: crate::serving_index::ServingIndex::get(
@@ -1452,6 +1468,7 @@ impl ClassContext {
             indexes: Default::default(),
             class_memo: Default::default(),
             rechecks,
+            probe_authorizations,
             account_ids,
             credentials,
             config,
@@ -2718,133 +2735,6 @@ impl ClassContext {
             priced,
             self.config.allocator_policy_ref(provider).clone(),
         )
-    }
-
-    fn blocked_account_with_policy(
-        &self,
-        provider: &str,
-        model: &str,
-        priced: bool,
-        policy: AllocatorPolicy,
-    ) -> Option<AccountBlock> {
-        // An empty roster may have lost accounts to route or credential
-        // fences. Reuse admission's classification so only a dated account
-        // limit, not missing credentials or policy exclusions, supplies a reset.
-        let (roster, fenced) = self.roster_and_fences_for(provider, model, priced);
-        if roster
-            .roster
-            .as_ref()
-            .is_some_and(|roster| roster.accounts.is_empty())
-        {
-            if let Some(OpReply::Error { code, detail, .. }) =
-                empty_roster_refusal(self, provider, model, priced, &fenced, self.now_ms, None)
-            {
-                if code == "account_pool_exhausted" {
-                    let reset = detail.and_then(|detail| detail["reset_at_ms"].as_i64());
-                    return Some(self.account_block_at(
-                        provider,
-                        model,
-                        priced,
-                        reset,
-                        striatum_core::blocks::LifetimeClass::NonQuota,
-                    ));
-                }
-            }
-        }
-        let blocked = self.probe_with_policy(
-            provider,
-            model,
-            priced,
-            false,
-            None,
-            "blocked-preflight",
-            policy.clone(),
-        );
-        if !blocked.refusal().is_some_and(|refusal| {
-            matches!(
-                refusal.code,
-                striatum_core::accounts::RefusalCode::AccountPoolExhausted
-                    | striatum_core::accounts::RefusalCode::AccountPoolReserveLimited
-            )
-        }) {
-            return None;
-        }
-        let reset = pool_recovery_reset(
-            &blocked,
-            roster.roster.as_ref(),
-            self.fences.get(provider).map_or(&[], Vec::as_slice),
-            &policy,
-            model,
-            self.now_ms,
-        );
-        let reset = reset.into_iter().chain(fenced.values().copied()).min();
-        // The allocator recovery above comes only from typed quota exclusions.
-        // A route or credential origin at that recovery may instead be non-quota.
-        Some(self.account_block_at(
-            provider,
-            model,
-            priced,
-            reset,
-            striatum_core::blocks::LifetimeClass::Quota,
-        ))
-    }
-
-    fn account_block_at(
-        &self,
-        provider: &str,
-        model: &str,
-        priced: bool,
-        reset_at_ms: Option<i64>,
-        fallback: striatum_core::blocks::LifetimeClass,
-    ) -> AccountBlock {
-        use striatum_core::blocks::LifetimeClass;
-        let mut block = AccountBlock {
-            reset_at_ms,
-            lifetime: fallback,
-            credential_code: None,
-        };
-        let Some(fact) = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model)
-        else {
-            return block;
-        };
-        let mut non_quota = false;
-        for row in self.class(fact, priced).rows {
-            let account = self.account_id(row);
-            for origin in self.indexed_origins(provider, account, &row.id, model) {
-                if !self.origin_applies(origin, provider, account, &row.id, model)
-                    || self.origin_due(origin, account, model)
-                    || reset_at_ms.is_some_and(|reset| {
-                        self.recheck_hint(origin, account, model) != reset
-                            && self.probe_reserved_until(provider, &row.id) != Some(reset)
-                    })
-                {
-                    continue;
-                }
-                // Only origins participating in the named recovery determine
-                // its class; a later non-quota block origin on another account is unrelated.
-                if origin.quota {
-                    if !non_quota {
-                        block.lifetime = LifetimeClass::Quota;
-                    }
-                    continue;
-                }
-                non_quota = true;
-                block.lifetime = LifetimeClass::NonQuota;
-                if origin.kind == "credential" {
-                    block.credential_code = self
-                        .refusals
-                        .iter()
-                        .find(|refusal| {
-                            refusal.provider_id == provider && refusal.credential_id == row.id
-                        })
-                        .map(|refusal| refusal.code.clone());
-                }
-            }
-        }
-        block
     }
 
     /// Read dated account recovery even when a quota recheck has temporarily

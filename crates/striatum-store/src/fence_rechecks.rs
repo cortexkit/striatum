@@ -8,6 +8,8 @@ use striatum_core::RouteStateResult;
 
 pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS};
 
+mod probe_authorizations;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRecheck {
     pub evidence: String,
@@ -2199,23 +2201,6 @@ impl AccountTx<'_> {
         Ok(())
     }
 
-    /// Every owner holding a probe authorization, without joining admissions:
-    /// a caller that holds the admission rows in memory decides which owners
-    /// are expired unstarted admissions, then passes them to
-    /// [`Self::release_admission_probes`].
-    pub fn probe_authorization_owners(&self) -> RouteStateResult<Vec<String>> {
-        if !enabled(self.conn).map_err(err)? {
-            return Ok(Vec::new());
-        }
-        self.conn
-            .prepare("SELECT DISTINCT owner FROM fence_probe_authorization ORDER BY owner")
-            .map_err(err)?
-            .query_map([], |row| row.get(0))
-            .map_err(err)?
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .map_err(err)
-    }
-
     /// Preview cleanup without acquiring a writer. The write path checks again
     /// because a runner may start the admission after this snapshot is read.
     pub fn has_expired_admission_probes(&self, now: i64) -> RouteStateResult<bool> {
@@ -3462,6 +3447,7 @@ impl AccountTx<'_> {
 
 #[cfg(test)]
 mod tests {
+
     /// Tick and every selection preview run this lookup. The authorization
     /// table holds a handful of rows while account_admission keeps months of
     /// history, so the plan must loop over authorizations and look admissions
