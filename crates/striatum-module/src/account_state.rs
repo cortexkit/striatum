@@ -14,6 +14,7 @@ use striatum_store::{
 mod admissions;
 mod blocks;
 mod inflight;
+mod pin_members;
 mod waiters;
 
 pub(crate) use admissions::AdmissionState;

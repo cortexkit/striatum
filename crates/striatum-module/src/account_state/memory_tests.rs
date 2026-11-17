@@ -254,7 +254,7 @@ fn rows() -> AdmissionGroupRows {
         let committed_at = NOW - 29 * 86_400_000 + i as i64 * (29 * 86_400_000 / ADMISSIONS as i64);
         let latest = LatestAdmissionRow {
             principal: principals[c].clone(),
-            conversation_hash: text('h', c, 64),
+            conversation_hash: format!("{c:064x}"),
             provider: providers[c].clone(),
             admission_id: admission_id.clone(),
             committed_at,
@@ -319,7 +319,7 @@ fn rows() -> AdmissionGroupRows {
             } else {
                 text('p', 0, 14)
             },
-            conversation_hash: text('h', c, 64),
+            conversation_hash: format!("{c:064x}"),
             provider: if i >= 125_868 {
                 text('v', 0, 21)
             } else if c < 101_622 {

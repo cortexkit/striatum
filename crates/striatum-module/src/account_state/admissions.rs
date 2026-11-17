@@ -13,6 +13,7 @@
 //! rows on the current pin, and the continuation chains of open originals).
 //! Finished and released admission bodies stay in SQL.
 
+use super::pin_members::PinMembers;
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -368,7 +369,7 @@ pub(crate) struct AdmissionState {
     pub(crate) demand: ShardedMap<(String, String), Arc<AccountDemand>>,
     pub(crate) latest: ShardedMap<ConversationKey, Arc<LatestAdmissionRow>>,
     pub(crate) affinity: ShardedMap<ConversationKey, Arc<AccountAffinityRow>>,
-    pub(crate) affinity_by_pin: ShardedMap<String, Arc<BTreeSet<ConversationKey>>>,
+    pub(crate) affinity_by_pin: ShardedMap<String, Arc<PinMembers>>,
     /// Started rows on each conversation's current pin and generation; absent
     /// means none.
     pub(crate) pin_started: ShardedMap<ConversationKey, u64>,
@@ -508,9 +509,9 @@ impl AdmissionState {
         affinities: Vec<AccountAffinityRow>,
     ) -> (
         ShardedMap<ConversationKey, Arc<AccountAffinityRow>>,
-        ShardedMap<String, Arc<BTreeSet<ConversationKey>>>,
+        ShardedMap<String, Arc<PinMembers>>,
     ) {
-        let mut by_pin: FastMap<String, BTreeSet<ConversationKey>> =
+        let mut by_pin: FastMap<String, PinMembers> =
             FastMap::with_capacity_and_hasher(affinities.len(), Default::default());
         let mut affinity = ShardedMap::default();
         for row in affinities {
@@ -520,7 +521,9 @@ impl AdmissionState {
                     conversations.insert(conversation.clone());
                 }
                 None => {
-                    by_pin.insert(row.pin_id.clone(), BTreeSet::from([conversation.clone()]));
+                    let mut members = PinMembers::default();
+                    members.insert(conversation.clone());
+                    by_pin.insert(row.pin_id.clone(), members);
                 }
             }
             affinity.insert(conversation, Arc::new(row));
@@ -659,8 +662,9 @@ impl AdmissionState {
                 Arc::make_mut(keys).insert(conversation);
             }
             None => {
-                self.affinity_by_pin
-                    .insert(pin, Arc::new(BTreeSet::from([conversation])));
+                let mut members = PinMembers::default();
+                members.insert(conversation);
+                self.affinity_by_pin.insert(pin, Arc::new(members));
             }
         }
     }
