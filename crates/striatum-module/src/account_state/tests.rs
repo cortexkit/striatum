@@ -822,7 +822,7 @@ fn a_block_write_that_bypasses_the_account_writer_fails_the_next_state_read() {
     // table without a writer command.
     store
         .bypass_account_writer_for_test(
-            "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+            "INSERT INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,quota,deadline,next_recheck_at,source_present,managed) VALUES ('observation',json_array('p','a'),'p','a',json_array('k','[]'),1,0,1,1,1,0)",
         )
         .unwrap();
     let _ = super::snapshot(&store);
@@ -836,7 +836,7 @@ fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
     store
         .with_writer_for_test(|conn| {
             conn.execute_batch(
-                "INSERT INTO account_transient_backoff VALUES ('p','a',1,1,'k','[]')",
+                "INSERT INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,quota,deadline,next_recheck_at,source_present,managed) VALUES ('observation',json_array('p','a'),'p','a',json_array('k','[]'),1,0,1,1,1,0)",
             )
         })
         .unwrap();
@@ -850,10 +850,7 @@ fn a_seeded_block_write_is_reloaded_before_the_state_is_read() {
     assert_eq!(owner.loads.load(Ordering::Relaxed), loads + 1);
     let fresh = store.account_transaction(AccountState::load).unwrap();
     assert_eq!(state.blocks, fresh.blocks);
-    assert_eq!(
-        state.blocks.table_sizes()[10],
-        ("account_transient_backoff", 1)
-    );
+    assert_eq!(state.blocks.table_sizes()[0], ("block", 1));
 }
 
 /// A command that writes a block row and then reads the block tables sees
