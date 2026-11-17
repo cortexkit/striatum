@@ -2870,14 +2870,26 @@ impl SqliteRouteStateStore {
                         row.get(0)
                     })
                 };
+                let native: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
+                    [], |row| row.get(0),
+                )?;
+                // Account-fence clears retain their audit row, while removed
+                // principal exclusions no longer count as serving sources.
+                let fences = if native {
+                    c.query_row("SELECT COUNT(*) FROM block WHERE kind='account'", [], |row| row.get(0))?
+                } else { count("account_fence")? };
+                let exclusions = if native {
+                    c.query_row("SELECT COUNT(*) FROM block WHERE kind='principal' AND source_present=1", [], |row| row.get(0))?
+                } else { count("account_principal_exclusion")? };
                 Ok(AccountServingCounts {
                     affinity: count("account_affinity")?,
                     pins: count("account_pin")?,
                     admissions: count("account_admission")?,
                     holds: count("account_hold")?,
                     observations: count("account_observation")?,
-                    fences: count("account_fence")?,
-                    exclusions: count("account_principal_exclusion")?,
+                    fences,
+                    exclusions,
                 })
             })
             .map_err(err)
