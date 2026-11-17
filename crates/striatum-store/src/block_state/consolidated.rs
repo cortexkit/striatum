@@ -574,7 +574,24 @@ impl BlockState {
                 }
                 let block = self
                     .block("route", &serde_json::json!([row.route_key]).to_string())
-                    .filter(|row| row.source_present);
+                    .filter(|row| row.source_present)
+                    .or_else(|| {
+                        let provider =
+                            crate::route_snapshot::provider_lookup_key(&row.route_key).ok()?;
+                        let inherited = self
+                            .block("provider", &serde_json::json!([provider]).to_string())
+                            .filter(|source| source.source_present)?;
+                        let model = row
+                            .capacity_key
+                            .strip_prefix(provider)
+                            .and_then(|key| key.strip_prefix('/'))
+                            .unwrap_or("");
+                        (!inherited
+                            .cleared_models
+                            .iter()
+                            .any(|cleared| cleared == model))
+                        .then_some(inherited)
+                    });
                 Some((
                     row.route_key.clone(),
                     crate::CooldownState {

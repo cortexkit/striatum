@@ -146,3 +146,25 @@ fn failure_only_wall_keeps_the_original_billing_class_and_all_diagnostic_fields(
         vec![old_wall(&old, "projection-p/failure")]
     );
 }
+
+#[test]
+fn expired_malformed_wall_class_does_not_change_diagnostic_success() {
+    let (_scratch, old, native) = stores("diagnostic-expired-class");
+    let now = crate::now_ms();
+    old.with_writer_for_test(|conn| {
+        insert_fact(conn,"expired")?;
+        conn.execute("UPDATE model_route_state SET failure_backoff_until=?1,wall_class='not-a-wall-class' WHERE route_key='projection-p/expired'",[now-1])?;
+        assert_eq!(conn.query_row("SELECT count(*) FROM model_route_state WHERE cooldown_until>?1 OR quota_exhausted_until>?1 OR failure_backoff_until>?1",[now],|r|r.get::<_,i64>(0))?,0);
+        Ok(())
+    }).unwrap();
+    native.with_writer_for_test(|conn| {
+        insert_fact(conn,"expired")?;
+        conn.execute("INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,deadline,next_recheck_at,wall_class)
+            VALUES ('failure',json_array('projection-p/expired'),'projection-p','expired','expired-evidence',?1,0,?2,?2,'not-a-wall-class')",params![now-1000,now-1])?;
+        Ok(())
+    }).unwrap();
+    assert!(
+        native.diagnostic_route_walls(now).unwrap().is_empty(),
+        "expired fields were filtered before old diagnostic class decoding"
+    );
+}

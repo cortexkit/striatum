@@ -112,35 +112,68 @@ impl SqliteRouteStateStore {
         &self,
         now_ms: i64,
     ) -> RouteStateResult<Vec<DiagnosticRouteWall>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut statement = c.prepare(
-                    "SELECT m.route_key,m.capacity_key,m.provider_id,m.model_id,b.cooldown_until,
-                             b.quota_exhausted_until,f.deadline,f.reason,m.last_error,m.last_error_at,b.wall_class
-                      FROM model_route_state m
-                      LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
-                      LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
-                      WHERE b.cooldown_until>?1 OR b.quota_exhausted_until>?1 OR f.deadline>?1
-                      ORDER BY m.capacity_key,m.route_key",
-                )?;
-                let rows = statement.query_map(params![now_ms], |row| {
-                    Ok(DiagnosticRouteWall {
-                        route_key: row.get(0)?,
-                        capacity_key: row.get(1)?,
-                        provider_id: row.get(2)?,
-                        model_id: row.get(3)?,
-                        cooldown_until: row.get(4)?,
-                        quota_exhausted_until: row.get(5)?,
-                        failure_backoff_until: row.get(6)?,
-                        failure_backoff_reason: row.get(7)?,
-                        last_error: row.get(8)?,
-                        last_error_at: row.get(9)?,
-                        wall_class: row_wall_class(row, 10)?,
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
+        self.store.with_conn(|c: &Connection| {
+            struct ProviderWall {
+                cooldown: Option<f64>, quota: Option<f64>, class: Option<String>,
+                cleared_models: Vec<String>,
+            }
+            // One statement keeps route telemetry and provider sources in the
+            // same SQL snapshot. Match providers by canonical routing key, not
+            // unrelated provider_id telemetry that may name another provider.
+            let mut statement=c.prepare("SELECT 0 AS record_kind,m.route_key,m.capacity_key,m.provider_id,m.model_id,b.cooldown_until,
+                    b.quota_exhausted_until,f.deadline,f.reason,m.last_error,m.last_error_at,
+                    CASE WHEN b.kind IS NOT NULL THEN b.wall_class ELSE f.wall_class END,b.kind IS NOT NULL,NULL
+                FROM model_route_state m
+                LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+                LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
+                UNION ALL
+                SELECT 1,p.origin_key,NULL,NULL,NULL,p.cooldown_until,p.quota_exhausted_until,NULL,NULL,NULL,NULL,p.wall_class,0,p.cleared_models
+                FROM block p WHERE p.kind='provider' AND p.is_origin=1 AND p.source_present=1
+                ORDER BY record_kind,3,2")?;
+            let mut cursor=statement.query([])?;
+            let mut routes=Vec::new();
+            let mut providers=std::collections::HashMap::<String,ProviderWall>::new();
+            while let Some(row)=cursor.next()? {
+                if row.get::<_,i64>(0)?==0 {
+                    routes.push((DiagnosticRouteWall {
+                        route_key:row.get(1)?,capacity_key:row.get(2)?,provider_id:row.get(3)?,model_id:row.get(4)?,
+                        cooldown_until:row.get(5)?,quota_exhausted_until:row.get(6)?,failure_backoff_until:row.get(7)?,
+                        failure_backoff_reason:row.get(8)?,last_error:row.get(9)?,last_error_at:row.get(10)?,wall_class:None,
+                    },row.get::<_,bool>(12)?,row.get::<_,Option<String>>(11)?));
+                } else {
+                    let text:String=row.get(13)?;
+                    let cleared_models=serde_json::from_str(&text).map_err(|error|rusqlite::Error::FromSqlConversionFailure(13,rusqlite::types::Type::Text,Box::new(error)))?;
+                    providers.insert(row.get(1)?,ProviderWall {cooldown:row.get(5)?,quota:row.get(6)?,class:row.get(11)?,cleared_models});
+                }
+            }
+            let mut result=Vec::new();
+            for (mut row,own_wall,mut stored_class) in routes {
+                if !own_wall {
+                    if let Ok(provider)=crate::route_snapshot::provider_lookup_key(&row.route_key) {
+                        let key=serde_json::json!([provider]).to_string();
+                        if let Some(wall)=providers.get(&key) {
+                            let model=row.capacity_key.strip_prefix(provider).and_then(|key|key.strip_prefix('/')).unwrap_or("");
+                            if !wall.cleared_models.iter().any(|cleared|cleared==model) {
+                                row.cooldown_until=wall.cooldown;
+                                row.quota_exhausted_until=wall.quota;
+                                stored_class=wall.class.clone();
+                            }
+                        }
+                    }
+                }
+                if row.cooldown_until.is_some_and(|until|until>now_ms as f64)
+                    || row.quota_exhausted_until.is_some_and(|until|until>now_ms as f64)
+                    || row.failure_backoff_until.is_some_and(|until|until>now_ms as f64) {
+                    // The old SQL predicate removed expired rows before class
+                    // decoding. Do not make irrelevant malformed history fail diagnostics.
+                    row.wall_class=stored_class.map(|value| RouteWallClass::parse(&value).map_err(|error|
+                        rusqlite::Error::FromSqlConversionFailure(11,rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData,error))))).transpose()?;
+                    result.push(row);
+                }
+            }
+            Ok(result)
+        }).map_err(err)
     }
 
     /// Every account hold whose retry time (`created_at + retry_after_s`) is
