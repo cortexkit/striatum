@@ -5429,7 +5429,9 @@ fn route_source_order_keeps_existing_metadata_order_through_reverse_reports_and_
     check_order();
     let loads = rig.owner.loads.load(Ordering::Relaxed);
     rig.owner.request_reload();
-    rig.store.sync_fence_rechecks().unwrap();
+    rig.store
+        .account_command(AccountCommandKind::Tick, |tx| tx.tick(now))
+        .unwrap();
     assert_eq!(rig.owner.loads.load(Ordering::Relaxed), loads + 1);
     check_order();
 }
