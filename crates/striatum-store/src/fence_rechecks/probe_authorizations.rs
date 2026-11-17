@@ -82,13 +82,11 @@ mod tests {
     #[test]
     fn probe_authorizations_for_origins_match_sql_and_reject_stale_proofs() {
         let scratch = cortexkit_test_support::ScratchDir::new("probe-authorization-read");
-        let store = crate::SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "probe-authorization-read",
-            scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
         let now = 1_900_000_000_000;
-        store.seed_block_parity_fixture_for_test(now);
+        let store = crate::legacy_fixture_inputs::migrated_parity_store(
+            &scratch.path().join("store.db"),
+            now,
+        );
         let origin = store
             .account_read(|tx| tx.load_block_state()?.fence_rechecks(now))
             .unwrap()
