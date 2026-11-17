@@ -345,11 +345,17 @@ pub(crate) fn read_snapshot(
     recheck_now: i64,
 ) -> RouteStateResult<ModelRouteStateSnapshot> {
     let rechecks = fence_rechecks::read_effective_at(conn, recheck_now).map_err(crate::err)?;
-    let rows=conn.prepare_cached("SELECT m.route_key,m.capacity_key,b.cooldown_until,b.quota_exhausted_until,
+    // Catalogue rows have no copied route block or wall observation time.
+    // Derive their public fields from the provider, not the frozen columns;
+    // an explicit route refusal or model clear prevents that inheritance.
+    let rows=conn.prepare_cached("SELECT m.route_key,m.capacity_key,COALESCE(b.cooldown_until,p.cooldown_until),COALESCE(b.quota_exhausted_until,p.quota_exhausted_until),
         m.quota_pressure,m.latency_ema_ms,m.success_ema,f.deadline,f.reason,m.last_error,
-        CASE WHEN b.kind IS NOT NULL THEN b.wall_class ELSE f.wall_class END,
-        CASE WHEN b.kind IS NOT NULL THEN b.wall_unscoped ELSE COALESCE(f.wall_unscoped,0) END
+        CASE WHEN b.kind IS NOT NULL THEN b.wall_class WHEN p.kind IS NOT NULL THEN p.wall_class ELSE f.wall_class END,
+        CASE WHEN b.kind IS NOT NULL THEN b.wall_unscoped WHEN p.kind IS NOT NULL THEN p.wall_unscoped ELSE COALESCE(f.wall_unscoped,0) END
         FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+        LEFT JOIN block p ON p.kind='provider' AND p.origin_key=json_array(m.provider_id) AND p.is_origin=1 AND p.source_present=1
+            AND b.kind IS NULL AND m.wall_observed_at IS NULL
+            AND NOT EXISTS (SELECT 1 FROM json_each(p.cleared_models) WHERE value=m.model_id)
         LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
         ORDER BY m.rowid").map_err(crate::err)?.query_map([],|row|route_row_at(row,0)).map_err(crate::err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(crate::err)?;
     overlay(&rows, &rechecks, true, now)

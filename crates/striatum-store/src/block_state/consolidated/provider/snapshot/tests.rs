@@ -234,7 +234,7 @@ fn native_catalogue_provider_projection_keeps_the_claimed_provider_term_raw() {
 }
 
 #[test]
-fn native_catalogue_route_minted_after_provider_expiry_gets_no_derived_wall() {
+fn route_minted_after_provider_expiry_is_not_blocked() {
     let pair = Pair::new(true);
     let provider = pair
         .native
@@ -255,8 +255,29 @@ fn native_catalogue_route_minted_after_provider_expiry_gets_no_derived_wall() {
     pair.insert_catalogue();
     let snapshot = pair.compare_frozen(pair.now);
     let new = &snapshot.by_route["derived/new"];
-    assert_eq!(new.cooldown_until, None);
-    assert_eq!(new.quota_exhausted_until, None);
-    assert_eq!(new.wall_class, None);
+    // The old SQL snapshot keeps expired deadlines and the billing class.
+    // Preserve those fields exactly; without a later probe claim they must
+    // not cool this newly minted route.
+    assert_eq!(new.cooldown_until, Some(pair.deadline as f64));
+    assert_eq!(
+        new.quota_exhausted_until,
+        Some((pair.deadline + 10_000) as f64)
+    );
+    assert_eq!(new.wall_class, Some(striatum_core::RouteWallClass::Billing));
+    let empty = striatum_core::model_router::ModelRouteStateSnapshot::default();
+    assert!(!striatum_core::route_state_store::route_cooled(
+        Some(&raw),
+        &empty,
+        "derived/new",
+        "derived/new",
+        pair.now as f64
+    ));
+    assert!(!striatum_core::route_state_store::route_cooled(
+        Some(&raw),
+        &snapshot,
+        "derived/new",
+        "derived/new",
+        pair.now as f64
+    ));
     pair.assert_no_stored_inheritance();
 }
