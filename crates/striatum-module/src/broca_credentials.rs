@@ -167,6 +167,8 @@ struct ServingInputs {
     view: Option<String>,
     listed: Vec<ListedCredential>,
     declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    declarations_seen: BTreeSet<String>,
+    retained_declarations: BTreeSet<String>,
     billing: crate::fusiform_catalog::PlaneCatalog,
     wire_apis: BTreeMap<String, String>,
     wire_api_models: BTreeSet<String>,
@@ -254,6 +256,11 @@ pub struct CredentialData {
     gateway_grant_warned: bool,
     catalog_providers: AuthCatalog,
     pub(crate) runner_declarations: BTreeMap<String, crate::routing_v1::runners::RunnerDeclaration>,
+    // Process-lifetime marks prevent an expired declaration from becoming a
+    // legacy runner. After routing restarts, an absent configured runner is
+    // treated as legacy until it first declares again.
+    pub(crate) runner_declarations_seen: BTreeSet<String>,
+    pub(crate) runner_retained_declarations: BTreeSet<String>,
     pub(crate) first_party_runners:
         BTreeMap<String, crate::routing_v1::runners::enrollment::Identity>,
     pub(crate) runner_catalog_wake: Arc<tokio::sync::Notify>,
@@ -475,6 +482,8 @@ impl CredentialData {
                     old.view == self.view
                         && old.listed == self.listed
                         && old.declarations == self.runner_declarations
+                        && old.declarations_seen == self.runner_declarations_seen
+                        && old.retained_declarations == self.runner_retained_declarations
                         && old.billing == self.billing_catalog
                         && old.wire_apis == self.wire_apis
                         && old.wire_api_models == self.wire_api_models
@@ -489,6 +498,8 @@ impl CredentialData {
                     view: self.view.clone(),
                     listed: self.listed.clone(),
                     declarations: self.runner_declarations.clone(),
+                    declarations_seen: self.runner_declarations_seen.clone(),
+                    retained_declarations: self.runner_retained_declarations.clone(),
                     billing: self.billing_catalog.clone(),
                     wire_apis: self.wire_apis.clone(),
                     wire_api_models: self.wire_api_models.clone(),

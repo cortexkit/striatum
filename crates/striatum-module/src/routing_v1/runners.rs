@@ -173,13 +173,14 @@ impl<'a> RunnerPolicies<'a> {
         }
     }
 
-    fn enrolled(&self, credentials: &BrocaCredentials) -> Vec<RunnerPolicy> {
+    fn enrolled(&self, credentials: &BrocaCredentials, now_ms: u64) -> Vec<RunnerPolicy> {
         let global = if self.auto_enroll {
-            enrollment::policies(&self.policies, credentials)
+            enrollment::policies_at(&self.policies, credentials, now_ms as i64)
         } else {
             self.policies.clone()
         };
-        self.consumer
+        let policies = self
+            .consumer
             .and_then(|consumer| consumer.runners.as_ref())
             .map_or(global.clone(), |entries| {
                 entries
@@ -187,7 +188,13 @@ impl<'a> RunnerPolicies<'a> {
                     .filter(|entry| global.iter().any(|allowed| allowed.module == entry.module))
                     .cloned()
                     .collect()
+            });
+        policies
+            .into_iter()
+            .filter(|policy| {
+                enrollment::declaration_available_at(&policy.module, credentials, now_ms as i64)
             })
+            .collect()
     }
 }
 
@@ -234,7 +241,7 @@ impl Registry {
             return registry;
         };
         registry.entries = RunnerPolicies::for_consumer(config, consumer)
-            .enrolled(credentials)
+            .enrolled(credentials, now_ms)
             .into_iter()
             .filter(|policy| policy.module == module)
             .map(|policy| {
@@ -259,7 +266,9 @@ impl Registry {
         facts: &[ModelFact],
         now_ms: u64,
     ) -> Self {
-        if !credentials.classifier_models.contains_key(module) {
+        if !credentials.classifier_models.contains_key(module)
+            || !enrollment::declaration_available_at(module, credentials, now_ms as i64)
+        {
             return Self::default();
         }
         super::classifier::report_missing_rows(credentials, module, now_ms as i64);
@@ -356,7 +365,7 @@ impl Registry {
             .iter()
             .collect::<crate::broca_credentials::AuthCatalog>();
         let entries = source
-            .enrolled(credentials)
+            .enrolled(credentials, now_ms)
             .into_iter()
             .map(|mut policy| {
                 let wire_declaration = credentials.runner_declarations.get(&policy.module);
@@ -882,8 +891,8 @@ fn report_unknown_pair_tokens_once(
     }
 }
 
-/// Each successful catalog read replaces the declaration snapshot, so removal
-/// or loss of both nonce verification and the first-party mark removes its facts.
+/// Read the current trusted declarations. DescribeCache retains absent configured
+/// runners briefly; a present row that loses trust or withdraws facts is not retained.
 pub(crate) fn declarations_from_catalog(
     modules: &serde_json::Value,
 ) -> std::collections::BTreeMap<String, RunnerDeclaration> {
