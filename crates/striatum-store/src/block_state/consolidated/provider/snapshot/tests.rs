@@ -96,16 +96,19 @@ impl Pair {
         sql
     }
 
-    fn compare_frozen(&self, now: i64) -> striatum_core::model_router::ModelRouteStateSnapshot {
-        let expected = self
-            .legacy
+    fn frozen_snapshot(&self, now: i64) -> striatum_core::model_router::ModelRouteStateSnapshot {
+        self.legacy
             .with_reader_for_test(|conn| {
                 Ok(crate::route_snapshot::legacy_read_snapshot(
                     conn, now as f64, now,
                 ))
             })
             .unwrap()
-            .unwrap();
+            .unwrap()
+    }
+
+    fn compare_frozen(&self, now: i64) -> striatum_core::model_router::ModelRouteStateSnapshot {
+        let expected = self.frozen_snapshot(now);
         let actual = self.native_snapshot(now);
         assert_eq!(actual, expected, "the native public snapshot matches the untouched frozen SQL reader and old insert trigger");
         actual
@@ -291,18 +294,53 @@ fn route_minted_after_provider_expiry_is_not_blocked() {
 }
 
 #[test]
-fn provider_projection_does_not_retroactively_inherit_an_existing_catalogue_row() {
+fn preexisting_route_is_blocked_only_while_the_provider_is_active() {
     let pair = Pair::with_prior_catalogue_route(false, true);
     pair.insert_catalogue();
-    let snapshot = pair.compare_frozen(pair.now);
-    let before = &snapshot.by_route["derived/before"];
+    // The old insert trigger left this earlier row empty. That stored-data
+    // artifact must not bypass an active provider block after migration.
+    let frozen = pair.frozen_snapshot(pair.now);
+    let before = &frozen.by_route["derived/before"];
     assert_eq!(before.cooldown_until, None);
     assert_eq!(before.quota_exhausted_until, None);
     assert_eq!(before.wall_class, None);
     assert_eq!(
-        snapshot.by_route["derived/new"].cooldown_until,
+        frozen.by_route["derived/new"].cooldown_until,
         Some(pair.deadline as f64)
     );
+    let snapshot = pair.native_snapshot(pair.now);
+    for route in ["derived/before", "derived/new"] {
+        assert!(striatum_core::route_state_store::route_cooled(
+            None,
+            &snapshot,
+            route,
+            route,
+            pair.now as f64
+        ));
+    }
+    pair.native
+        .account_transaction(|tx| {
+            tx.heal_serving_fences(
+                "derived",
+                "account",
+                "credential",
+                "before",
+                None,
+                pair.now + 1,
+                pair.now + 2,
+            )
+        })
+        .unwrap();
+    let healed = pair.native_snapshot(pair.now + 2);
+    for route in ["derived/before", "derived/new"] {
+        assert!(!striatum_core::route_state_store::route_cooled(
+            None,
+            &healed,
+            route,
+            route,
+            (pair.now + 2) as f64
+        ));
+    }
     pair.assert_no_stored_inheritance();
 }
 
@@ -391,17 +429,43 @@ fn real_older_model_success_can_leave_a_newer_provider_without_a_route_source() 
             .cooldown_until,
         Some((now + 90_000) as f64)
     );
+    let mut after = fact.clone();
+    after.model_id = "after".into();
+    store
+        .upsert_fact(&after, striatum_core::FactSource::Override)
+        .unwrap();
     let snapshot = store.build_snapshot(now as f64).unwrap();
-    assert!(
-        striatum_core::route_state_store::route_cooled(
+    for route in ["reach/before", "reach/after"] {
+        assert!(
+            striatum_core::route_state_store::route_cooled(
+                None, &snapshot, route, route, now as f64
+            ),
+            "the shared snapshot must still enforce the newer provider wall: {route}"
+        );
+    }
+    store
+        .account_transaction(|tx| {
+            tx.heal_serving_fences(
+                "reach",
+                "account",
+                "credential",
+                "before",
+                None,
+                now + 1,
+                now + 2,
+            )
+        })
+        .unwrap();
+    let healed = store.build_snapshot((now + 2) as f64).unwrap();
+    for route in ["reach/before", "reach/after"] {
+        assert!(!striatum_core::route_state_store::route_cooled(
             None,
-            &snapshot,
-            "reach/before",
-            "reach/before",
-            now as f64
-        ),
-        "the shared snapshot must still enforce the newer provider wall"
-    );
+            &healed,
+            route,
+            route,
+            (now + 2) as f64
+        ));
+    }
 }
 
 #[test]

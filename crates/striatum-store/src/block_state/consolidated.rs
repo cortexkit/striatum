@@ -59,7 +59,6 @@ impl ProviderTelemetry {
 struct RouteTelemetry {
     route_key: String,
     capacity_key: String,
-    wall_observed_at_is_null: bool,
     quota_pressure: Option<SqlReal>,
     latency_ema_ms: Option<SqlReal>,
     success_ema: Option<SqlReal>,
@@ -1030,14 +1029,11 @@ impl BlockState {
             };
             let key = serde_json::json!([telemetry.route_key]).to_string();
             let wall = self.block("route", &key).filter(|row| row.source_present);
-            // Catalogue insertion no longer copies stored wall columns. A row
-            // with no route refusal or wall observation time still exposes
-            // the provider's fields unless this model was cleared. A model's
-            // own stored refusal is never replaced with provider fields.
+            // Provider pressure still applies when this route predates it or
+            // an older model refusal has healed. Keep independent route
+            // evidence when present; an explicit provider-model clear prevents
+            // inheritance from the provider block.
             let wall = wall.or_else(|| {
-                if !telemetry.wall_observed_at_is_null {
-                    return None;
-                }
                 let model = telemetry
                     .capacity_key
                     .strip_prefix(provider.as_str())
@@ -1493,7 +1489,7 @@ fn select(table: usize) -> String {
         3 => "SELECT rowid,json_array(kind,origin_key,evidence) FROM retirement_tombstone".into(),
         4 => "SELECT rowid,json_array(provider,credential_id),provider,credential_id,last_used_at FROM pool_key_state".into(),
         5 => "SELECT rowid,json_array(provider_key),provider_key,NULL,NULL,quota_pressure,NULL,last_error FROM provider_cooldown_state".into(),
-        6 => "SELECT rowid,json_array(route_key),provider_id,route_key,capacity_key,NULL,NULL,quota_pressure,latency_ema_ms,success_ema,NULL,NULL,last_error,NULL,0,wall_observed_at IS NULL FROM model_route_state".into(),
+        6 => "SELECT rowid,json_array(route_key),provider_id,route_key,capacity_key,NULL,NULL,quota_pressure,latency_ema_ms,success_ema,NULL,NULL,last_error,NULL,0 FROM model_route_state".into(),
         7 => "SELECT rowid,json_array(provider,credential_id,model),provider,credential_id,model,listing_fingerprint,code,observed_at FROM account_eligibility".into(),
         _ => unreachable!("unknown captured block table"),
     }
@@ -1543,7 +1539,6 @@ fn decode(table: usize, row: &Row<'_>) -> rusqlite::Result<(i64, String, Option<
             row: RouteTelemetry {
                 route_key: row.get(3)?,
                 capacity_key: row.get(4)?,
-                wall_observed_at_is_null: row.get(15)?,
                 quota_pressure: row.get(7)?,
                 latency_ema_ms: row.get(8)?,
                 success_ema: row.get(9)?,

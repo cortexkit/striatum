@@ -51,7 +51,6 @@ fn synthetic_state(value: f64) -> BlockState {
             row: RouteTelemetry {
                 route_key: "float-provider/model".into(),
                 capacity_key: "float-provider/model".into(),
-                wall_observed_at_is_null: false,
                 quota_pressure: Some(real),
                 latency_ema_ms: Some(real),
                 success_ema: Some(real),
