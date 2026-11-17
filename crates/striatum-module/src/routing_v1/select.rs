@@ -3435,23 +3435,20 @@ impl<'a> Selection<'a> {
                         self.priced_per_token,
                     )
                 });
-                if block.as_ref().is_some_and(|block| {
+                let test_check = block.as_ref().and_then(|block| block.test_check_at_ms);
+                let reset = refusal.reset_at_ms.into_iter().chain(test_check).min();
+                let mut refusal = if block.as_ref().is_some_and(|block| {
                     block.lifetime == striatum_core::blocks::LifetimeClass::NonQuota
                 }) {
-                    let block = block.as_ref().unwrap();
-                    let reset = refusal
-                        .reset_at_ms
-                        .into_iter()
-                        .chain(block.retry_at_ms())
-                        .min();
-                    let mut refusal = account_limit_refusal(None, reset);
-                    if reset.is_some() && reset == block.test_check_at_ms {
-                        refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
-                    }
-                    refusal
+                    account_limit_refusal(None, reset)
                 } else {
-                    quota_account_limit_refusal(None, refusal.reset_at_ms, self.now as u64)
+                    quota_account_limit_refusal(None, reset, self.now as u64)
+                };
+                if test_check.is_some() && test_check.map(|at| at as u64) == refusal.wait_until_ms()
+                {
+                    refusal.message = IN_FLIGHT_TEST_MESSAGE.into();
                 }
+                refusal
             } else {
                 provider_refusal(&refusal.code, refusal.message)
             }

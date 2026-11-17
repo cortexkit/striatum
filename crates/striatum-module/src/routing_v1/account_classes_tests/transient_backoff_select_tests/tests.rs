@@ -259,3 +259,97 @@ async fn in_flight_test_shortens_mixed_quota_retry_only_on_a_usable_route() {
         .unwrap()
         .contains("being tested"));
 }
+
+#[tokio::test]
+async fn same_route_quota_alternative_does_not_hide_held_test_hint() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, owner, runner) = blocked(NOW + 5_000).await;
+    let _due = crate::InjectedClock::set(NOW + 5_001);
+    claim(&owner, &runner, false).await;
+    let mut credentials = harness.credentials().lock().unwrap().clone();
+    let mut rows = credentials.listed_credentials().to_vec();
+    rows.push(ListedCredential {
+        id: "oauth:quota-sibling".into(),
+        account_id: Some("quota-sibling".into()),
+        state: "active".into(),
+        categories: vec!["llm-provider".into()],
+        provider_ids: vec!["openai".into()],
+        serves: vec!["openai".into()],
+        credential_type: "oauth".into(),
+        auth_method: Some("oauth".into()),
+        ..Default::default()
+    });
+    credentials.apply_listing(
+        &ScopedCredentialListing {
+            view: "two-openai-accounts".into(),
+            credentials: rows,
+            ..Default::default()
+        },
+        NOW + 5_001,
+    );
+    credentials.refresh_serving_methods(
+        &Default::default(),
+        &harness.store().get_facts().unwrap(),
+        NOW as i64 + 5_001,
+        &[],
+    );
+    harness.set_credentials(credentials);
+    let scope = FenceScope::General(GeneralWindow::SevenDay);
+    let fence = Fence {
+        account_id: "quota-sibling".into(),
+        pool: Some(scope.clone().into()),
+        recovery_set: Vec::new(),
+        observed_at_ms: NOW as i64,
+        reset: ResetTime::At(NOW as i64 + 60_000),
+        retry_hint_ms: None,
+        source: ConfirmationSource::BrocaAccountLimit,
+    };
+    harness
+        .store()
+        .account_transaction(|tx| {
+            tx.insert_fence(&AccountFenceRow {
+                fence_id: "quota-sibling".into(),
+                provider: "openai".into(),
+                account_id: fence.account_id.clone(),
+                scope_json: serde_json::to_string(&scope).unwrap(),
+                fence_json: serde_json::to_string(&fence).unwrap(),
+                source: "broca_limit_exhausted".into(),
+                observed_at: NOW as i64,
+                principal: "fixture".into(),
+                admission_id: None,
+                observation_id: None,
+                created_at: NOW as i64,
+                cleared_at: None,
+                cleared_reason: None,
+            })
+        })
+        .unwrap();
+    let _later = crate::InjectedClock::set(NOW + 6_000);
+    let automatic = owner.call("route.select", &select()).await;
+    assert_eq!(
+        automatic.1["detail"]["reset_at_ms"],
+        NOW + 36_000,
+        "{}",
+        automatic.1
+    );
+    let mut request = select();
+    request["pin"] = json!(format!("openai/{}", MODELS[0]));
+    request["hold_wait_max_s"] = json!(0);
+    let pinned = owner.call("route.select", &request).await;
+    assert_eq!(pinned.1["code"], "pin_unavailable", "{}", pinned.1);
+    assert_eq!(
+        pinned.1["detail"]["reason"], "quota_exhausted",
+        "{}",
+        pinned.1
+    );
+    assert_eq!(
+        pinned.1["detail"]["reset_at_ms"],
+        NOW + 36_000,
+        "{}",
+        pinned.1
+    );
+    assert!(pinned.1["message"]
+        .as_str()
+        .unwrap()
+        .contains("being tested"));
+}

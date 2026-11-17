@@ -952,9 +952,9 @@ async fn candidates(
         .map(|fact| (fact_to_route(fact).capacity_key, fact.family.clone()))
         .collect();
     let outcome = live.apply(&mut facts);
-    // Ranking can reject an account wall before a seat reaches select. Judge
-    // status-check hints against the original route walls and the same panel
-    // exclusions, quality floor and package ceiling, not just its account clock.
+    // Panel ranking can reject an account-blocked route before the final account
+    // admission check. Status-check hints must also respect the original route
+    // walls, panel exclusions, quality floor and package ceiling.
     let mut test_checks = HashMap::new();
     if let Some(classes) = &priced.classes {
         let admission = striatum_core::model_router::admit_routes(
