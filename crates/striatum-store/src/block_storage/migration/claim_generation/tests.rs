@@ -49,7 +49,12 @@ fn changed_evidence_migration_preserves_generation_and_rejects_an_aba_stale_proo
             let blocks = tx.load_block_state()?;
             let origins = blocks.fence_rechecks(probe_at)?;
             assert_eq!(
-                origins[0].claim_generation, 2,
+                blocks
+                    .clock("account_route", &origins[0].origin_key)
+                    .unwrap()
+                    .0
+                    .claim_generation,
+                2,
                 "a new claim must advance the pre-upgrade generation, never reuse it"
             );
             let memory = blocks.probe_authorizations_for_origins(&origins);
