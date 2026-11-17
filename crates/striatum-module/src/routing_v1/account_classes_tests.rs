@@ -3399,12 +3399,16 @@ async fn persisted_subscription_billing_fence_rechecks_without_expiring_at_its_r
     let _later = crate::InjectedClock::set(reset as u64 + 1);
     // A newer refusal in a different input band must not veto the account's
     // extra reset check for ordinary small requests, or consume that band's trial.
-    rusqlite::Connection::open(harness.store_path())
-        .unwrap()
-        .execute(
-            "INSERT INTO account_size_refusal VALUES ('synthetic','oauth:test','model',17,?1,?2)",
-            rusqlite::params![reset + 3_600_000, reset + 1],
-        )
+    harness
+        .store()
+        .record_account_size_refusal(&striatum_store::AccountSizeRefusal {
+            provider: "synthetic".into(),
+            credential_id: "oauth:test".into(),
+            model: "model".into(),
+            size_class: 17,
+            expires_at: reset + 3_600_000,
+            observed_at: reset + 1,
+        })
         .unwrap();
     // The reset permits a check, not deletion of quota evidence.
     let after = runner
@@ -6169,8 +6173,7 @@ fn bind_and_launch_claims_check_the_rows_that_chose_their_clocks() {
         harness
             .store()
             .write_unseen_for_test(
-                "INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'model',evidence
-                 FROM fence_recheck WHERE kind='provider';",
+                "UPDATE block SET cleared_models=json_array('model') WHERE kind='provider';",
             )
             .unwrap();
         let answer = selection_step(&context, &harness, step);

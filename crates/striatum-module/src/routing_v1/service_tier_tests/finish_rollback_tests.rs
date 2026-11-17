@@ -6,7 +6,7 @@ const TABLES: &[&str] = &[
     "account_pin",
     "account_continue",
     "routing_v1_admission",
-    "fence_probe_authorization",
+    "probe_authorization",
 ];
 
 fn row_counts(harness: &Harness) -> Vec<i64> {
