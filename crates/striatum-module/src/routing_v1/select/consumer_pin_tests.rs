@@ -89,6 +89,26 @@ fn assert_chair(answer: &Value) {
 }
 
 #[tokio::test]
+async fn prefrontal_rename_chair_pin_uses_new_consumer() {
+    let (harness, _) = configured(CHAIR).await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
+    assert_chair(&answered(&route, &request("prefrontal.athena.synthesizer")).await);
+}
+
+#[tokio::test]
+async fn prefrontal_rename_new_chair_setting_reaches_legacy_panel_policy() {
+    let (harness, _) = configured("prefrontal.athena.synthesizer").await;
+    let route = harness.bind(reserved("prefrontal"), None).await;
+    assert_chair(&answered(&route, &request("prefrontal.athena.synthesizer")).await);
+    let reply = route.call("route.select_panel", &json!({"panelSpec":{"class":"AUDIT"},"substrate":"broca","availableModels":[OPUS,FABLE],"packageTokens":1000})).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(
+        reply.1["result"]["policy"]["pins"]["synthesizer"],
+        json!({"model":OPUS,"variant":"medium"})
+    );
+}
+
+#[tokio::test]
 async fn settings_pin_selects_exact_model_and_variant_through_hard_admission() {
     let (harness, route) = configured(CHAIR).await;
     for pin_only in [false, true] {

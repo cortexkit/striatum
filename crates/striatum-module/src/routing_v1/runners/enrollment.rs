@@ -92,6 +92,14 @@ pub(crate) fn policies(
     settings: &[RunnerPolicy],
     credentials: &BrocaCredentials,
 ) -> Vec<RunnerPolicy> {
+    policies_at(settings, credentials, crate::now_ms() as i64)
+}
+
+pub(super) fn policies_at(
+    settings: &[RunnerPolicy],
+    credentials: &BrocaCredentials,
+    now: i64,
+) -> Vec<RunnerPolicy> {
     let mut policies = settings.to_vec();
     for module in credentials.first_party_runners.keys() {
         if !settings.iter().any(|policy| policy.module == *module) {
@@ -104,7 +112,19 @@ pub(crate) fn policies(
             });
         }
     }
+    policies.retain(|policy| declaration_available_at(&policy.module, credentials, now));
     policies
+}
+
+pub(super) fn declaration_available_at(
+    module: &str,
+    credentials: &BrocaCredentials,
+    now: i64,
+) -> bool {
+    !credentials.runner_declarations_seen.contains(module)
+        || (credentials.runner_declarations.contains_key(module)
+            && (!credentials.runner_retained_declarations.contains(module)
+                || super::describe_cache::fresh_observation(credentials, module, now)))
 }
 
 pub(super) fn replace_catalog(modules: &Value, credentials: &mut BrocaCredentials) {

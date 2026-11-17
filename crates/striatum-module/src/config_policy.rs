@@ -435,16 +435,21 @@ fn dotted_prefix(prefix: &str, consumer: &str) -> bool {
 }
 
 pub fn consumer_specificity(name: &str) -> usize {
-    name.len()
+    striatum_core::module_identity::canonical(name).len()
 }
 
 pub fn consumer_entry<'a, T>(entries: &'a BTreeMap<String, T>, name: &str) -> Option<&'a T> {
-    entries.get(name)
+    striatum_core::module_identity::spellings(name)
+        .iter()
+        .find_map(|key| entries.get(key.as_ref()))
 }
 
 /// Match whole dotted segments, so children inherit their namespace's policy.
 pub fn consumer_matches(prefix: &str, consumer: &str) -> bool {
-    dotted_prefix(prefix, consumer)
+    dotted_prefix(
+        &striatum_core::module_identity::canonical(prefix),
+        &striatum_core::module_identity::canonical(consumer),
+    )
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -610,8 +615,8 @@ pub fn is_slot(name: &str) -> bool {
 /// The `route.select` consumer a pin slot is requested under, so the slot's
 /// pin is judged by that consumer's `only_for` / `not_for` rules. Core asks for
 /// the synthesizer pin and the Spec Campaigns designer's `spec_designer` slot as
-/// consumer `prefrontal-core.athena`, and for the `lab_planner` slot as consumer
-/// `prefrontal-core.lab`.
+/// prefrontal's Athena consumer, and `lab_planner` as its Lab consumer. The old
+/// spelling remains the comparison representative during the rename window.
 pub fn slot_consumer(slot: &str) -> Option<&'static str> {
     match slot {
         "synthesizer" | "spec_designer" => Some("prefrontal-core.athena"),

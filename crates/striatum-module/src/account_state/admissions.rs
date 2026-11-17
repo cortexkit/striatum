@@ -13,6 +13,9 @@
 //! rows on the current pin, and the continuation chains of open originals).
 //! Finished and released admission bodies stay in SQL.
 
+use super::pin_members::PinMembers;
+use super::shared_text::SharedText;
+use super::{compact_rows, conversation_hash::ConversationHash};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
@@ -125,7 +128,13 @@ impl<K: Eq + Hash + Clone, V: Clone> ShardedMap<K, V> {
         if !self.contains_key(key) {
             return None;
         }
-        let removed = self.shard_mut(key).remove(key);
+        let shard = self.shard_mut(key);
+        let removed = shard.remove(key);
+        // Keep deletion-heavy shards near their live size, with hysteresis so
+        // alternating insertions and removals do not repeatedly resize them.
+        if shard.is_empty() || shard.len() < shard.capacity() / 4 {
+            shard.shrink_to_fit();
+        }
         self.len -= 1;
         removed
     }
@@ -173,22 +182,26 @@ impl<K: Ord + Hash + Clone + std::fmt::Debug, V: Clone + std::fmt::Debug> std::f
 }
 
 /// (principal, admission id) or, for continuations, (principal, selection id).
-pub(crate) type RowKey = (String, String);
+pub(crate) type RowKey = (SharedText, String);
 /// (principal, conversation hash, provider).
-pub(crate) type ConversationKey = (String, String, String);
+pub(crate) type ConversationKey = (SharedText, ConversationHash, SharedText);
 
 fn key(a: &str, b: &str) -> RowKey {
-    (a.to_owned(), b.to_owned())
+    (a.into(), b.to_owned())
 }
 
-fn conversation(principal: &str, hash: &str, provider: &str) -> ConversationKey {
-    (principal.to_owned(), hash.to_owned(), provider.to_owned())
+fn conversation(
+    principal: &str,
+    hash: impl Into<ConversationHash>,
+    provider: &str,
+) -> ConversationKey {
+    (principal.into(), hash.into(), provider.into())
 }
 
 /// An admission in `reserved`, `started` or `expired`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct OpenAdmission {
-    pub(crate) row: AccountAdmissionRow,
+    pub(crate) row: compact_rows::Admission,
     pub(crate) input_size_class: Option<u32>,
     pub(crate) model_decision_id: Option<String>,
     pub(crate) rowid: i64,
@@ -196,7 +209,7 @@ pub(crate) struct OpenAdmission {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Demand {
-    pub(crate) state: String,
+    pub(crate) state: SharedText,
     pub(crate) request_bytes: u64,
 }
 
@@ -207,7 +220,7 @@ const DEMAND_BUCKET_MS: i64 = 3_600_000;
 
 /// One demand entry's key: (commit time, principal, admission id), the order
 /// of `ACCOUNT_DEMAND_SQL`.
-pub(crate) type DemandKey = (i64, String, String);
+pub(crate) type DemandKey = (i64, SharedText, String);
 
 /// Demand of one (provider, account), in `ACCOUNT_DEMAND_SQL` order: hour
 /// buckets of entries, so iterating buckets then entries keeps that order.
@@ -219,6 +232,17 @@ pub(crate) struct AccountDemand {
 }
 
 impl AccountDemand {
+    #[cfg(all(test, feature = "heap-measure"))]
+    pub(crate) fn visit_heap_strings<'a>(&'a self, mut visit: impl FnMut(&'a str)) {
+        for entries in self.buckets.values() {
+            for ((_, principal, admission), demand) in entries.iter() {
+                visit(principal);
+                visit(admission);
+                visit(&demand.state);
+            }
+        }
+    }
+
     fn bucket(committed_at: i64) -> i64 {
         committed_at.div_euclid(DEMAND_BUCKET_MS)
     }
@@ -354,10 +378,10 @@ impl Chain {
 pub(crate) struct AdmissionState {
     pub(crate) open: ShardedMap<RowKey, Arc<OpenAdmission>>,
     /// Keyed by (provider, account id).
-    pub(crate) demand: ShardedMap<(String, String), Arc<AccountDemand>>,
-    pub(crate) latest: ShardedMap<ConversationKey, Arc<LatestAdmissionRow>>,
-    pub(crate) affinity: ShardedMap<ConversationKey, Arc<AccountAffinityRow>>,
-    pub(crate) affinity_by_pin: ShardedMap<String, Arc<BTreeSet<ConversationKey>>>,
+    pub(crate) demand: ShardedMap<(SharedText, SharedText), Arc<AccountDemand>>,
+    pub(crate) latest: ShardedMap<ConversationKey, Arc<compact_rows::Latest>>,
+    pub(crate) affinity: ShardedMap<ConversationKey, Arc<compact_rows::Affinity>>,
+    pub(crate) affinity_by_pin: ShardedMap<String, Arc<PinMembers>>,
     /// Started rows on each conversation's current pin and generation; absent
     /// means none.
     pub(crate) pin_started: ShardedMap<ConversationKey, u64>,
@@ -423,7 +447,7 @@ impl SignedOut {
 /// The index state an admission row contributes, before and after a change.
 struct Contribution<'a> {
     principal: &'a str,
-    hash: &'a str,
+    hash: ConversationHash,
     provider: &'a str,
     pin_id: &'a str,
     pin_generation: u64,
@@ -447,7 +471,7 @@ impl AdmissionState {
                 input_size_class: row.input_size_class,
                 model_decision_id: row.model_decision_id,
                 rowid: row.rowid,
-                row: row.row,
+                row: compact_rows::admission(row.row),
             };
             if open.row.state == "started" {
                 state.add_started_pin(&open.row.pin_id, 1);
@@ -496,10 +520,10 @@ impl AdmissionState {
     fn affinity_indexes(
         affinities: Vec<AccountAffinityRow>,
     ) -> (
-        ShardedMap<ConversationKey, Arc<AccountAffinityRow>>,
-        ShardedMap<String, Arc<BTreeSet<ConversationKey>>>,
+        ShardedMap<ConversationKey, Arc<compact_rows::Affinity>>,
+        ShardedMap<String, Arc<PinMembers>>,
     ) {
-        let mut by_pin: FastMap<String, BTreeSet<ConversationKey>> =
+        let mut by_pin: FastMap<String, PinMembers> =
             FastMap::with_capacity_and_hasher(affinities.len(), Default::default());
         let mut affinity = ShardedMap::default();
         for row in affinities {
@@ -509,10 +533,12 @@ impl AdmissionState {
                     conversations.insert(conversation.clone());
                 }
                 None => {
-                    by_pin.insert(row.pin_id.clone(), BTreeSet::from([conversation.clone()]));
+                    let mut members = PinMembers::default();
+                    members.insert(conversation.clone());
+                    by_pin.insert(row.pin_id.clone(), members);
                 }
             }
-            affinity.insert(conversation, Arc::new(row));
+            affinity.insert(conversation, Arc::new(compact_rows::affinity(row)));
         }
         let mut affinity_by_pin = ShardedMap::default();
         for (pin, conversations) in by_pin {
@@ -529,14 +555,16 @@ impl AdmissionState {
     fn scan_admissions(
         admissions: Vec<AdmissionScanRow>,
     ) -> (
-        FastMap<ConversationKey, (LatestAdmissionRow, Vec<(String, u64)>)>,
-        ShardedMap<(String, String), Arc<AccountDemand>>,
+        FastMap<ConversationKey, (compact_rows::Latest, Vec<(String, u64)>)>,
+        ShardedMap<(SharedText, SharedText), Arc<AccountDemand>>,
     ) {
-        let mut conversations: FastMap<ConversationKey, (LatestAdmissionRow, Vec<(String, u64)>)> =
-            FastMap::with_capacity_and_hasher(admissions.len(), Default::default());
-        let mut demand: HashMap<String, HashMap<String, AccountDemand>> = HashMap::new();
+        let mut conversations: FastMap<
+            ConversationKey,
+            (compact_rows::Latest, Vec<(String, u64)>),
+        > = FastMap::default();
+        let mut demand: HashMap<SharedText, HashMap<SharedText, AccountDemand>> = HashMap::new();
         for scanned in admissions {
-            let row = scanned.latest;
+            let row = compact_rows::latest(scanned.latest);
             let conversation = conversation(&row.principal, &row.conversation_hash, &row.provider);
             let started = scanned
                 .started
@@ -648,8 +676,9 @@ impl AdmissionState {
                 Arc::make_mut(keys).insert(conversation);
             }
             None => {
-                self.affinity_by_pin
-                    .insert(pin, Arc::new(BTreeSet::from([conversation])));
+                let mut members = PinMembers::default();
+                members.insert(conversation);
+                self.affinity_by_pin.insert(pin, Arc::new(members));
             }
         }
     }
@@ -684,7 +713,7 @@ impl AdmissionState {
     /// A started row counts toward `pin_has_started` only while it names the
     /// conversation's current pin and generation.
     fn add_pin_started(&mut self, row: &Contribution<'_>, delta: i64) {
-        let conversation = conversation(row.principal, row.hash, row.provider);
+        let conversation = conversation(row.principal, &row.hash, row.provider);
         let current = self.affinity.get(&conversation).is_some_and(|affinity| {
             affinity.pin_id == row.pin_id && affinity.pin_generation == row.pin_generation
         });
@@ -697,12 +726,12 @@ impl AdmissionState {
         &mut self,
         provider: &str,
         account_id: &str,
-        entry: (i64, String, String),
+        entry: DemandKey,
         demand: Option<Demand>,
     ) {
         // Copy on write: an account shared with the published snapshot copies
         // its bucket pointers and one bucket, once per command.
-        let account = key(provider, account_id);
+        let account = (provider.into(), account_id.into());
         match demand {
             Some(demand) => match self.demand.get_mut(&account) {
                 Some(entries) => Arc::make_mut(entries).insert(entry, demand),
@@ -726,7 +755,7 @@ impl AdmissionState {
     }
 
     /// Mirror a state change in demand and in the conversation's newest row.
-    fn restate(&mut self, row: &AccountAdmissionRow) {
+    fn restate(&mut self, row: &compact_rows::Admission) {
         if row.charged {
             let entry = (
                 row.committed_at,
@@ -767,7 +796,8 @@ impl AdmissionState {
             (candidate.committed_at, candidate.rowid) > (latest.committed_at, latest.rowid)
         });
         if newer {
-            self.latest.insert(conversation, Arc::new(candidate));
+            self.latest
+                .insert(conversation, Arc::new(compact_rows::latest(candidate)));
         }
         if row.charged && row.state != "released" {
             self.set_demand(
@@ -775,11 +805,11 @@ impl AdmissionState {
                 &row.account_id,
                 (
                     row.committed_at,
-                    row.principal.clone(),
+                    row.principal.as_str().into(),
                     row.admission_id.clone(),
                 ),
                 Some(Demand {
-                    state: row.state.clone(),
+                    state: row.state.as_str().into(),
                     request_bytes: row.request_bytes,
                 }),
             );
@@ -787,7 +817,7 @@ impl AdmissionState {
         self.add_pin_started(
             &Contribution {
                 principal: &row.principal,
-                hash: &row.conversation_hash,
+                hash: (&row.conversation_hash).into(),
                 provider: &row.provider,
                 pin_id: &row.pin_id,
                 pin_generation: row.pin_generation,
@@ -802,7 +832,7 @@ impl AdmissionState {
             self.open.insert(
                 key(&row.principal, &row.admission_id),
                 Arc::new(OpenAdmission {
-                    row: row.clone(),
+                    row: compact_rows::admission(row.clone()),
                     input_size_class: None,
                     model_decision_id: None,
                     rowid,
@@ -818,7 +848,7 @@ impl AdmissionState {
         self.add_pin_started(
             &Contribution {
                 principal: &row.principal,
-                hash: &row.conversation_hash,
+                hash: (&row.conversation_hash).into(),
                 provider: &row.provider,
                 pin_id: &row.pin_id,
                 pin_generation: row.pin_generation,
@@ -850,7 +880,7 @@ impl AdmissionState {
         principal: &str,
         admission_id: &str,
         from: &[&str],
-        change: impl FnOnce(&mut AccountAdmissionRow),
+        change: impl FnOnce(&mut compact_rows::Admission),
     ) -> bool {
         let id = key(principal, admission_id);
         if !self
@@ -868,7 +898,7 @@ impl AdmissionState {
         }
         let open = self.open.get(&id).expect("checked above");
         let mut row = open.row.clone();
-        let from = row.state.clone();
+        let from = row.state.to_string();
         let was_started = row.started_at.is_some();
         let was_state_started = row.state == "started";
         change(&mut row);
@@ -879,7 +909,7 @@ impl AdmissionState {
             self.add_pin_started(
                 &Contribution {
                     principal: &row.principal,
-                    hash: &row.conversation_hash,
+                    hash: (&row.conversation_hash).into(),
                     provider: &row.provider,
                     pin_id: &row.pin_id,
                     pin_generation: row.pin_generation,
@@ -890,7 +920,7 @@ impl AdmissionState {
         }
         self.restate(&row);
         self.pending.push(Effect::Admission {
-            row: row.clone(),
+            row: compact_rows::expand_admission(&row),
             from,
         });
         if matches!(row.state.as_str(), "released" | "finished") {
@@ -934,11 +964,13 @@ impl AdmissionState {
 
     pub(crate) fn observe_admission(&mut self, original: &AccountAdmissionRow, at: i64) {
         let original_key = key(&original.principal, &original.admission_id);
-        let mut rows = vec![self
+        let (previous, started) = self
             .open
             .get(&original_key)
-            .map(|open| open.row.clone())
-            .unwrap_or_else(|| original.clone())];
+            .map_or((original.last_observed_at, original.started_at), |open| {
+                (open.row.last_observed_at, open.row.started_at)
+            });
+        let mut rows = vec![(original_key.clone(), previous, started)];
         if let Some(chain) = self.chains.get(&original_key) {
             rows.extend(
                 chain
@@ -946,25 +978,26 @@ impl AdmissionState {
                     .values()
                     .flat_map(|offers| offers.values())
                     .filter_map(|offer| {
-                        self.open
-                            .get(&key(&original.principal, &offer.reservation_id))
-                    })
-                    .filter(|open| open.row.state == "started")
-                    .map(|open| open.row.clone()),
+                        let id = key(&original.principal, &offer.reservation_id);
+                        let open = self.open.get(&id)?;
+                        (open.row.state == "started").then_some((
+                            id,
+                            open.row.last_observed_at,
+                            open.row.started_at,
+                        ))
+                    }),
             );
         }
-        for row in rows {
-            let admission = key(&row.principal, &row.admission_id);
-            let latest = row
-                .last_observed_at
+        for (admission, previous, started) in rows {
+            let latest = previous
                 .into_iter()
-                .chain(row.started_at)
+                .chain(started)
                 .chain([at])
                 .max()
                 .unwrap();
             self.pending.push(Effect::Observed {
                 admission: admission.clone(),
-                previous: row.last_observed_at,
+                previous,
                 at: latest,
             });
             if let Some(open) = self.open.get_mut(&admission) {
@@ -1013,7 +1046,8 @@ impl AdmissionState {
             self.pin_started.remove(&conversation);
         }
         self.index_pin(&row.pin_id, conversation.clone());
-        self.affinity.insert(conversation, Arc::new(row.clone()));
+        self.affinity
+            .insert(conversation, Arc::new(compact_rows::affinity(row.clone())));
         true
     }
 
@@ -1075,8 +1109,8 @@ impl AdmissionState {
             .get(&key(principal, reservation_id))
             .map(|open| ReservationRef {
                 pin_id: open.row.pin_id.clone(),
-                account_id: open.row.account_id.clone(),
-                credential_id: open.row.credential_id.clone(),
+                account_id: open.row.account_id.to_string(),
+                credential_id: open.row.credential_id.to_string(),
             })
     }
 
@@ -1250,7 +1284,7 @@ impl AdmissionState {
     }
 
     /// An already used offer of a live chain, by decision id.
-    fn used_row(&self, decision: &str) -> Option<(String, Offer)> {
+    fn used_row(&self, decision: &str) -> Option<(SharedText, Offer)> {
         self.chains
             .iter()
             .find_map(|((principal, original), chain)| {
@@ -1402,7 +1436,7 @@ impl AdmissionState {
                     &row.account_id,
                     (
                         row.committed_at,
-                        row.principal.clone(),
+                        row.principal.as_str().into(),
                         row.admission_id.clone(),
                     ),
                     None,
@@ -1411,7 +1445,7 @@ impl AdmissionState {
             self.add_pin_started(
                 &Contribution {
                     principal: &row.principal,
-                    hash: &row.conversation_hash,
+                    hash: (&row.conversation_hash).into(),
                     provider: &row.provider,
                     pin_id: &row.pin_id,
                     pin_generation: row.pin_generation,
@@ -1487,7 +1521,8 @@ impl AdmissionState {
     ) {
         match latest {
             Some(latest) => {
-                self.latest.insert(conversation, Arc::new(latest));
+                self.latest
+                    .insert(conversation, Arc::new(compact_rows::latest(latest)));
             }
             None => {
                 self.latest.remove(&conversation);
@@ -1638,7 +1673,7 @@ impl AdmissionState {
         principal: &str,
         hash: &str,
         provider: &str,
-    ) -> Option<&AccountAffinityRow> {
+    ) -> Option<&compact_rows::Affinity> {
         self.affinity
             .get(&conversation(principal, hash, provider))
             .map(Arc::as_ref)
@@ -1655,12 +1690,12 @@ impl AdmissionState {
     ) -> Vec<AccountDemandRow> {
         let floor = committed_after.unwrap_or(i64::MIN);
         self.demand
-            .get(&key(provider, account_id))
+            .get(&(provider.into(), account_id.into()))
             .into_iter()
             .flat_map(|entries| entries.after(floor))
             .map(|((committed_at, _, _), demand)| AccountDemandRow {
                 account_id: account_id.to_owned(),
-                state: demand.state.clone(),
+                state: demand.state.to_string(),
                 committed_at: *committed_at,
                 request_bytes: demand.request_bytes,
             })
@@ -1696,7 +1731,7 @@ impl AdmissionState {
         }
         let holds = (latest.state == "reserved" && latest.admission_valid_until > now)
             || (latest.state == "started" && latest.lease_valid_until > now);
-        holds.then(|| latest.account_id.clone())
+        holds.then(|| latest.account_id.to_string())
     }
 
     /// `has_expired_continuations`: an unused, unreleased offer past its deadline.
@@ -1784,3 +1819,7 @@ impl AdmissionState {
 fn conversation_of(row: &AccountAffinityRow) -> ConversationKey {
     conversation(&row.principal, &row.conversation_hash, &row.provider)
 }
+
+#[cfg(test)]
+#[path = "sharded_map_tests.rs"]
+mod sharded_map_tests;

@@ -67,6 +67,29 @@ struct CompiledPolicy {
     metered_fallback: std::collections::BTreeSet<String>,
 }
 
+#[cfg(all(test, feature = "heap-measure"))]
+mod heap_measurements {
+    use super::*;
+    #[test]
+    #[ignore = "repository settings snapshot heap profile; run alone"]
+    fn repository_settings_heap() {
+        use crate::memory_measurements::{operation, profiler, release};
+        let document = crate::config_convert::convert(include_str!(
+            "../fixtures/routing-config-live-2026-10-24.jsonc"
+        ))
+        .unwrap();
+        println!(
+            "COUNTS repository_settings_document_bytes={}",
+            document.len()
+        );
+        let _profiler = profiler("settings");
+        let settings = operation("LiveConfig::new", || {
+            LiveConfig::new(parse_config(&document).unwrap(), Some(document.clone()))
+        });
+        release("LiveConfig_with_compiled_policy", settings);
+    }
+}
+
 impl CompiledPolicy {
     fn compile(config: &RoutingConfigFile) -> Self {
         let model_pools: Vec<_> = config
@@ -971,7 +994,7 @@ impl LiveConfig {
         self.config
             .pin_origin_callers
             .iter()
-            .any(|caller| caller == principal)
+            .any(|caller| striatum_core::module_identity::equal(caller, principal))
     }
 
     /// Operator owners add exact-name claims too, so conflicting owners lock
@@ -1299,7 +1322,8 @@ struct RoutingConfigFile {
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
     /// Full caller principals allowed to mark user pins with `pin_origin`.
-    /// Absent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.
+    /// Defaults to reserved:prefrontal-core and reserved:prefrontal during the
+    /// module rename window; an explicit empty list enrolls nobody.
     #[serde(default = "default_pin_origin_callers")]
     pin_origin_callers: Vec<String>,
     /// Target agents that are heads: operator-facing sessions that may spend
@@ -1320,7 +1344,10 @@ struct RoutingConfigFile {
 }
 
 fn default_pin_origin_callers() -> Vec<String> {
-    vec!["reserved:prefrontal-core".into()]
+    striatum_core::module_identity::spellings("reserved:prefrontal-core")
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 impl Default for RoutingConfigFile {

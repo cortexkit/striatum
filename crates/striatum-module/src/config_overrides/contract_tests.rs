@@ -930,7 +930,7 @@ fn generated_schema_is_current_and_closed() {
     assert_eq!(properties["pin_origin_callers"]["items"]["type"], "string");
     assert_eq!(
         properties["pin_origin_callers"]["default"],
-        serde_json::json!(["reserved:prefrontal-core"])
+        serde_json::json!(["reserved:prefrontal-core", "reserved:prefrontal"])
     );
     assert!(schema["$defs"].get("AccountSelectionFlags").is_none());
     assert!(schema["$defs"].get("AccountModelFamily").is_none());

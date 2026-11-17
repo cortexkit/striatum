@@ -66,7 +66,7 @@ impl Registry {
     ) -> Self {
         let source = policies.into();
         let config = source.config;
-        let original = source.enrolled(credentials);
+        let original = source.enrolled(credentials, now_ms);
         let source_policies = original.clone();
         // A settings entry's harness narrows only where new sessions start.
         // The head-choice picker still lists every model the runner can open

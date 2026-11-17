@@ -81,7 +81,10 @@ fn retained(id: &str, caller: &Caller, deps: &Deps<'_>) -> Result<SelectAnswer, 
     deps.store
         .v1_decision(id)
         .map_err(store_refusal)?
-        .filter(|decision| decision.principal == caller.principal && caller.binding_is_current())
+        .filter(|decision| {
+            striatum_core::module_identity::equal(&decision.principal, &caller.principal)
+                && caller.binding_is_current()
+        })
         .ok_or_else(unknown)?;
     let snapshot = deps
         .store

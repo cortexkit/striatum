@@ -141,7 +141,7 @@ impl Inputs {
             .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
-        h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+        h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
         h.edit_config(|config| {
             for key in &self.policies {
                 if let Some(model) = config["models"][key].as_object_mut() {

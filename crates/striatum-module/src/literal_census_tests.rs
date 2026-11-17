@@ -74,6 +74,13 @@ const EXEMPTIONS: &[Exemption] = &[
         file: "striatum-store/src/test_exe.rs",
         item: ExemptItem::Module,
     },
+    // A test-only module (declared under `#[cfg(all(test, feature =
+    // "heap-measure"))]`) of opt-in heap probes. Its fixtures name providers
+    // to build live-shaped sample rows; no routing decision reads them.
+    Exemption {
+        file: "striatum-module/src/memory_measurements.rs",
+        item: ExemptItem::Module,
+    },
     // Model-family names, not provider references: the stored and wire
     // spellings of each grand family (some equal a provider id, such as
     // `deepseek`), and the historical store spellings (`anthropic`, `openai`)

@@ -9,6 +9,13 @@ use crate::config_policy::RunnerPolicy;
 
 pub(super) const LAST_GOOD_MS: i64 = 5 * 60_000;
 
+pub(super) fn fresh_observation(credentials: &BrocaCredentials, module: &str, now: i64) -> bool {
+    credentials
+        .runner_describe_observed
+        .get(module)
+        .is_some_and(|at| now.saturating_sub(*at) < LAST_GOOD_MS)
+}
+
 #[derive(Default)]
 pub(crate) struct DescribeCache {
     modules: BTreeSet<String>,
@@ -24,7 +31,37 @@ impl DescribeCache {
         credentials: &mut BrocaCredentials,
         now: i64,
     ) -> BTreeSet<String> {
-        credentials.runner_declarations = super::declarations_from_catalog(modules);
+        let previous = std::mem::replace(
+            &mut credentials.runner_declarations,
+            super::declarations_from_catalog(modules),
+        );
+        let seen: BTreeSet<_> = previous
+            .keys()
+            .chain(credentials.runner_declarations.keys())
+            .cloned()
+            .collect();
+        credentials.runner_declarations_seen.extend(seen);
+        let present: BTreeSet<_> = modules
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["module_id"].as_str())
+            .collect();
+        credentials.runner_retained_declarations.clear();
+        // A restart gap retains the full declaration under the same observation
+        // clock as tiers and accounts. A present replacement or removed policy
+        // is not a gap, so neither may borrow an old declaration.
+        for (module, declaration) in previous {
+            if !present.contains(module.as_str())
+                && policies.iter().any(|policy| policy.module == module)
+                && fresh_observation(credentials, &module, now)
+            {
+                credentials
+                    .runner_declarations
+                    .insert(module.clone(), declaration);
+                credentials.runner_retained_declarations.insert(module);
+            }
+        }
         super::enrollment::replace_catalog(modules, credentials);
         let auto_enrolled: BTreeSet<_> = credentials
             .first_party_runners
@@ -39,17 +76,11 @@ impl DescribeCache {
             crate::warn_operator(format!("runner auto-enrollment left: module={module:?}"));
         }
         self.auto_enrolled = auto_enrolled;
-        let policies = super::enrollment::policies(policies, credentials);
+        let policies = super::enrollment::policies_at(policies, credentials, now);
         let policies = policies.as_slice();
         self.modules =
             super::tier_discovery_modules(modules, &credentials.runner_declarations, policies);
         self.expire(credentials, now);
-        let present: BTreeSet<_> = modules
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| entry["module_id"].as_str())
-            .collect();
         // The catalog lists live connections, so a configured runner can vanish
         // during a restart without losing tier support. Keep its last answer
         // until the original deadline, but do not trust an unverified replacement
@@ -58,6 +89,7 @@ impl DescribeCache {
             .runner_describe_observed
             .keys()
             .chain(credentials.runner_service_tiers.keys())
+            .chain(credentials.runner_retained_declarations.iter())
             .cloned()
             .collect();
         for module in observed {
@@ -96,6 +128,9 @@ impl DescribeCache {
         credentials: &mut BrocaCredentials,
         now: i64,
     ) {
+        // A late describe can refresh tiers, but cannot revive an already
+        // expired routing declaration without a new trusted catalog row.
+        self.expire(credentials, now);
         let Some(describe) = describe.filter(|describe| {
             let describe = describe.get("result").unwrap_or(describe);
             describe["capabilities"].as_array().is_some_and(|groups| {
@@ -167,41 +202,38 @@ impl DescribeCache {
             .runner_describe_observed
             .keys()
             .chain(credentials.runner_service_tiers.keys())
+            .chain(credentials.runner_retained_declarations.iter())
             .cloned()
             .collect();
-        let expired: Vec<_> = observed
-            .into_iter()
-            .filter(|module| {
-                credentials
-                    .runner_describe_observed
-                    .get(module)
-                    .is_none_or(|at| now.saturating_sub(*at) >= LAST_GOOD_MS)
-            })
+        let fresh: BTreeSet<_> = observed
+            .iter()
+            .filter(|module| fresh_observation(credentials, module, now))
+            .cloned()
             .collect();
-        for module in expired {
-            let cause = if credentials.runner_describe_observed.contains_key(&module) {
+        for module in observed.difference(&fresh) {
+            let cause = if credentials.runner_describe_observed.contains_key(module) {
                 "expired"
             } else {
                 "cleared_catalog"
             };
-            view_event(credentials, &module, cause, now);
+            view_event(credentials, module, cause, now);
         }
         let credentials = &mut **credentials;
-        let fresh = |module: &String| {
-            credentials
-                .runner_describe_observed
-                .get(module)
-                .is_some_and(|at| now.saturating_sub(*at) < LAST_GOOD_MS)
-        };
+        credentials.runner_declarations.retain(|module, _| {
+            !credentials.runner_retained_declarations.contains(module) || fresh.contains(module)
+        });
+        credentials
+            .runner_retained_declarations
+            .retain(|module| fresh.contains(module));
         credentials
             .runner_service_tiers
-            .retain(|module, _| fresh(module));
+            .retain(|module, _| fresh.contains(module));
         credentials
             .runner_routed_accounts
-            .retain(|module, _| fresh(module));
+            .retain(|module, _| fresh.contains(module));
         credentials
             .runner_describe_observed
-            .retain(|_, at| now.saturating_sub(*at) < LAST_GOOD_MS);
+            .retain(|module, _| fresh.contains(module));
     }
 }
 
@@ -232,6 +264,105 @@ mod tests {
         cache.catalog(&modules, &policies, &mut credentials, 0);
         cache.reply("runner-a", Some(&describe()), &mut credentials, 0);
         (cache, credentials, policies, modules)
+    }
+
+    fn declared_modules() -> Value {
+        json!([{"module_id":"runner-a","nonce_verified":true,
+        "role_declarations":{"routing/v1":{"runner":{
+            "pairs":[{"wire_api":"anthropic.messages","auth_method":"apikey"}],
+            "harnesses":["runner-a"],
+            "harness_limits":{"runner-a":{"capabilities":["one_off"]}}
+        }}}}])
+    }
+
+    #[test]
+    fn declaration_retention_shares_deadline_and_marks_survive_repeated_gaps() {
+        let (mut cache, mut credentials, policies, _) = setup();
+        let modules = declared_modules();
+        for cycle in 0..64 {
+            let start = cycle * LAST_GOOD_MS * 2;
+            cache.catalog(&modules, &policies, &mut credentials, start);
+            cache.reply("runner-a", Some(&describe()), &mut credentials, start);
+            assert_eq!(
+                super::super::enrollment::policies_at(&policies, &credentials, start).len(),
+                1
+            );
+            let declaration = credentials.runner_declarations["runner-a"].clone();
+            for age in [1, LAST_GOOD_MS - 1] {
+                cache.catalog(&json!([]), &policies, &mut credentials, start + age);
+                assert_eq!(credentials.runner_declarations["runner-a"], declaration);
+                assert!(credentials.runner_service_tiers.contains_key("runner-a"));
+                assert_eq!(credentials.runner_routed_accounts["runner-a"], ["oauth"]);
+                assert_eq!(credentials.runner_describe_observed["runner-a"], start);
+            }
+            cache.missed_all(&mut credentials, start + LAST_GOOD_MS);
+            assert!(credentials.runner_declarations.is_empty());
+            assert!(credentials.runner_service_tiers.is_empty());
+            assert!(credentials.runner_routed_accounts.is_empty());
+            assert!(credentials.runner_describe_observed.is_empty());
+            assert!(super::super::enrollment::policies_at(
+                &policies,
+                &credentials,
+                start + LAST_GOOD_MS
+            )
+            .is_empty());
+            assert_eq!(
+                credentials.runner_declarations_seen,
+                BTreeSet::from(["runner-a".into()])
+            );
+        }
+        cache.catalog(&json!([]), &[], &mut credentials, 128 * LAST_GOOD_MS);
+        assert!(credentials.runner_declarations_seen.contains("runner-a"));
+    }
+
+    #[test]
+    fn declaration_retention_never_masks_replacement_or_removed_policy() {
+        for (replacement, keep_policy) in [
+            (
+                json!([{"module_id":"runner-a","nonce_verified":false}]),
+                true,
+            ),
+            (
+                json!([{"module_id":"runner-a","nonce_verified":true}]),
+                true,
+            ),
+            (
+                json!([{"module_id":"runner-a","nonce_verified":true,"role_declarations":{"routing/v1":{"runner":{"pairs":"invalid"}}}}]),
+                true,
+            ),
+            (json!([]), false),
+        ] {
+            let (mut cache, mut credentials, policies, _) = setup();
+            cache.catalog(&declared_modules(), &policies, &mut credentials, 0);
+            cache.catalog(
+                &replacement,
+                if keep_policy { &policies } else { &[] },
+                &mut credentials,
+                1,
+            );
+            assert!(credentials.runner_declarations.is_empty(), "{replacement}");
+            assert!(credentials.runner_retained_declarations.is_empty());
+            assert!(credentials.runner_declarations_seen.contains("runner-a"));
+            assert!(super::super::enrollment::policies_at(&policies, &credentials, 1).is_empty());
+        }
+    }
+
+    #[test]
+    fn expired_declaration_is_not_restored_by_describe() {
+        let (mut cache, mut credentials, policies, _) = setup();
+        cache.catalog(&declared_modules(), &policies, &mut credentials, 0);
+        cache.catalog(&json!([]), &policies, &mut credentials, 1);
+        DescribeCache::default().reply(
+            "runner-a",
+            Some(&describe()),
+            &mut credentials,
+            LAST_GOOD_MS,
+        );
+        assert!(credentials.runner_declarations.is_empty());
+        assert!(credentials.runner_service_tiers.contains_key("runner-a"));
+        assert!(
+            super::super::enrollment::policies_at(&policies, &credentials, LAST_GOOD_MS).is_empty()
+        );
     }
 
     #[test]

@@ -91,11 +91,27 @@ impl Harness {
     }
 
     pub(super) fn new_at_version(label: &str, version: Option<u32>) -> Arc<Self> {
+        Self::new_with_template(label, version, None)
+    }
+
+    /// Copy a migrated scratch database, but start with fresh in-process state.
+    pub(super) fn from_template(label: &str, template: &std::path::Path) -> Arc<Self> {
+        Self::new_with_template(label, None, Some(template))
+    }
+
+    fn new_with_template(
+        label: &str,
+        version: Option<u32>,
+        template: Option<&std::path::Path>,
+    ) -> Arc<Self> {
         super::consumers::replace_catalog(&json!([]));
         let n = NEXT_HARNESS.fetch_add(1, Ordering::Relaxed);
         let dir = cortexkit_test_support::scratch_root()
             .join(format!("striatum-v1-{label}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        if let Some(template) = template {
+            std::fs::copy(template, dir.join("store.db")).unwrap();
+        }
         let descriptor = striatum_store::dev_descriptor(
             DEFAULT_MODULE_ID,
             dir.join("store.db").to_string_lossy().into_owned(),
@@ -903,7 +919,7 @@ pub(super) fn install_head_snapshot(harness: &Harness) {
         .unwrap()
         .lock()
         .unwrap()
-        .catalog_snapshot = Some(Arc::new(snapshot));
+        .catalog_snapshot = Some(snapshot);
 }
 
 /// The kit's subject: a fresh [`Harness`] per check.

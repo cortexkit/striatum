@@ -206,6 +206,7 @@ struct CatalogStatusRequest {
     arguments: CatalogStatusArguments,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Deserialize)]
 struct CatalogGetReply {
     catalog_version: i64,
@@ -229,6 +230,7 @@ struct QualityScores {
 
 /// Keep disclosures with their model pages until the entire read is assembled.
 /// Only then can decoding and catalog application publish a coherent snapshot.
+#[cfg(test)]
 #[derive(Debug, Deserialize, Serialize)]
 struct CatalogPage {
     source: String,
@@ -251,6 +253,7 @@ struct CatalogPage {
     quality_scores: Option<QualityScores>,
 }
 
+#[cfg(test)]
 impl CatalogPage {
     fn append(&mut self, mut page: Self) -> Result<(), FusiformCatalogError> {
         if self.source != page.source
@@ -399,11 +402,12 @@ enum CatalogRate {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
-    rates: BTreeMap<String, ModelRates>,
+    rates: BTreeMap<String, Arc<ModelRates>>,
     pub(crate) wire_apis: BTreeMap<String, String>,
     /// Rows serving an endpoint in `wire.api`, distinct from `wire_apis`' wire families.
     pub(crate) wire_api_models: BTreeSet<String>,
@@ -659,14 +663,14 @@ struct ModelRates {
 /// The basket rates of every model on a billing-plane page. Unlike the
 /// whole-catalog read, a plane page is still all-or-nothing: any unreadable
 /// entry rejects the page.
-fn model_rates(models: &Value) -> Result<BTreeMap<String, ModelRates>, FusiformCatalogError> {
+fn model_rates(models: &Value) -> Result<BTreeMap<String, Arc<ModelRates>>, FusiformCatalogError> {
     models
         .as_object()
         .ok_or_else(|| error("catalog models must be an object"))?
         .iter()
         .map(|(model, facts)| {
             entry_rates(model, facts)
-                .map(|rates| (model.clone(), rates))
+                .map(|rates| (model.clone(), Arc::new(rates)))
                 .map_err(|reason| error(format!("model {model}: {reason}")))
         })
         .collect()
@@ -740,7 +744,7 @@ struct BillingRule {
 #[derive(Debug, Clone, PartialEq)]
 struct PlanePage {
     plane: PlaneDescriptor,
-    rates: BTreeMap<String, ModelRates>,
+    rates: BTreeMap<String, Arc<ModelRates>>,
     wire_apis: BTreeMap<String, String>,
     wire_api_models: BTreeSet<String>,
     billing_rules: Vec<BillingRule>,
@@ -814,9 +818,9 @@ fn decode_plane_get(bytes: &[u8]) -> Result<PlaneReply, FusiformCatalogError> {
 /// own rates, plus the previous rates of every entry it could not read, so an
 /// unreadable entry keeps its prices instead of losing them.
 fn base_rates_after(
-    mut prior: BTreeMap<String, ModelRates>,
+    mut prior: BTreeMap<String, Arc<ModelRates>>,
     snapshot: &CatalogSnapshot,
-) -> BTreeMap<String, ModelRates> {
+) -> BTreeMap<String, Arc<ModelRates>> {
     let mut base = snapshot.rates.clone();
     for (provider_id, model_id) in &snapshot.retained {
         let served_key = format!("{provider_id}/{model_id}");
@@ -831,7 +835,7 @@ fn base_rates_after(
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct PlaneCatalog {
     version: Option<i64>,
-    base: BTreeMap<String, ModelRates>,
+    base: BTreeMap<String, Arc<ModelRates>>,
     pages: BTreeMap<(String, String), PlaneReply>,
 }
 
@@ -910,7 +914,7 @@ impl PlaneCatalog {
 
     #[cfg(test)]
     pub(crate) fn with_test_catalog(mut self, bytes: &[u8]) -> Self {
-        self.base = decode_catalog_get(bytes).unwrap().rates;
+        self.base = decode_catalog_get(bytes).unwrap().rates.clone();
         self
     }
 
@@ -977,10 +981,10 @@ impl PlaneCatalog {
                         },
                         rates: BTreeMap::from([(
                             format!("{}/{}", fact.provider_id, fact.model_id),
-                            ModelRates {
+                            Arc::new(ModelRates {
                                 rates: plane.rates.clone(),
                                 inherited: BTreeSet::new(),
-                            },
+                            }),
                         )]),
                         billing_rules: vec![],
                         wire_apis: BTreeMap::new(),
@@ -991,7 +995,7 @@ impl PlaneCatalog {
             }
             catalog.base.insert(
                 format!("{}/{}", fact.provider_id, fact.model_id),
-                ModelRates {
+                Arc::new(ModelRates {
                     rates: striatum_core::BasketDimension::ALL
                         .into_iter()
                         .filter_map(|dimension| {
@@ -1001,7 +1005,7 @@ impl PlaneCatalog {
                         })
                         .collect(),
                     inherited: BTreeSet::new(),
-                },
+                }),
             );
             catalog.pages.insert(
                 (fact.provider_id.clone(), "apikey".into()),
@@ -1210,16 +1214,23 @@ fn cost_tier(cost_per_mtok_out: Option<f64>) -> Option<f64> {
 /// fixture pins the bare payload; accept both so the fixture pin and the live wire
 /// decode through one path.
 fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
-    let value: Value = serde_json::from_slice(bytes).map_err(FusiformCatalogError::Json)?;
-    Ok(match value {
-        Value::Object(ref map) if map.len() == 1 && map.contains_key("result") => {
-            value["result"].clone()
-        }
-        other => other,
-    })
+    decode::tool_reply(bytes)
 }
 
-pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
+#[cfg(test)]
+pub(crate) mod allocation_tests;
+mod decode;
+
+pub(crate) fn decode_catalog_get(
+    bytes: impl AsRef<[u8]>,
+) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError> {
+    let page = decode::CatalogPage::read(bytes.as_ref(), false)?;
+    drop(bytes);
+    page.finish()
+}
+
+#[cfg(test)]
+fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCatalogError> {
     let value = unwrap_tool_result(bytes)?;
     let reply: CatalogGetReply =
         serde_json::from_value(value).map_err(FusiformCatalogError::Json)?;
@@ -1350,7 +1361,7 @@ pub(crate) fn decode_catalog_get(bytes: &[u8]) -> Result<CatalogSnapshot, Fusifo
                 if let Some(api) = entry.get("wire.family").and_then(Value::as_str) {
                     wire_apis.insert(served_key.clone(), api.to_owned());
                 }
-                rates.insert(served_key, model_rates);
+                rates.insert(served_key, Arc::new(model_rates));
             }
             Err(reason) => {
                 retained.insert((provider_id.to_string(), model_id.to_string()));
@@ -1479,7 +1490,7 @@ fn report_unreadable_entries_once(catalog_version: i64, unreadable: &[(String, S
 }
 
 fn decode_catalog_status(bytes: &[u8]) -> Result<CatalogStatusReply, FusiformCatalogError> {
-    serde_json::from_value(unwrap_tool_result(bytes)?).map_err(FusiformCatalogError::Json)
+    decode::status(bytes)
 }
 
 /// Short-lived Fusiform connection. Callers create one per bootstrap/poll cycle
@@ -1617,18 +1628,10 @@ impl FusiformCatalogConsumer {
 
     async fn call(&mut self, body: Vec<u8>) -> Result<Vec<u8>, FusiformCatalogError> {
         let reply = self.call_frame(body).await?;
-        if let Ok(value) = unwrap_tool_result(&reply.body) {
-            let refusal = value
-                .get("error")
-                .or_else(|| (reply.header.ty == FrameType::Error).then_some(&value));
-            if let Some(refusal) = refusal {
-                if let Some(code) = refusal["code"].as_str() {
-                    return Err(FusiformCatalogError::Refused {
-                        code: code.to_string(),
-                        message: refusal["message"].as_str().unwrap_or_default().to_string(),
-                    });
-                }
-            }
+        if let Some((code, message)) =
+            decode::refusal(&reply.body, reply.header.ty == FrameType::Error)
+        {
+            return Err(FusiformCatalogError::Refused { code, message });
         }
         if reply.header.ty == FrameType::Error {
             return Err(error(String::from_utf8_lossy(&reply.body).to_string()));
@@ -1685,7 +1688,7 @@ trait CatalogWire {
     fn credentials(&self) -> Option<crate::broca_credentials::SharedBrocaCredentials> {
         None
     }
-    async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError>;
+    async fn catalog_get(&mut self) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError>;
     async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError>;
     async fn close(&mut self) -> Result<(), FusiformCatalogError>;
     async fn refresh_planes(
@@ -1754,10 +1757,10 @@ impl CatalogWire for FusiformCatalogConsumer {
         Ok(())
     }
 
-    async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
+    async fn catalog_get(&mut self) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError> {
         for restart in 0..=MAX_CATALOG_RESTARTS {
             let mut request = CatalogGetRequest::all_with_retired();
-            let mut whole: Option<CatalogPage> = None;
+            let mut whole: Option<decode::CatalogPage> = None;
             let mut tokens = BTreeSet::new();
             loop {
                 let body = serde_json::to_vec(&request).map_err(FusiformCatalogError::Json)?;
@@ -1780,8 +1783,8 @@ impl CatalogWire for FusiformCatalogConsumer {
                     }
                     other => other?,
                 };
-                let page: CatalogPage = serde_json::from_value(unwrap_tool_result(&reply)?)
-                    .map_err(FusiformCatalogError::Json)?;
+                let page = decode::CatalogPage::read(&reply, true)?;
+                drop(reply);
                 let next = page.next_page_token.clone();
                 if let Some(whole) = whole.as_mut() {
                     whole.append(page)?;
@@ -1789,8 +1792,7 @@ impl CatalogWire for FusiformCatalogConsumer {
                     whole = Some(page);
                 }
                 let Some(token) = next else {
-                    let bytes = serde_json::to_vec(&whole).map_err(FusiformCatalogError::Json)?;
-                    return decode_catalog_get(&bytes);
+                    return whole.expect("at least one catalog page").finish();
                 };
                 if !tokens.insert(token.clone()) {
                     return Err(error("Fusiform catalog repeated a page token"));
@@ -1906,7 +1908,7 @@ struct CycleOutcome {
 /// given the winner ladder is compared around it and a move is announced.
 fn apply_catalog_snapshot(
     store: &SqliteRouteStateStore,
-    snapshot: &CatalogSnapshot,
+    snapshot: &Arc<CatalogSnapshot>,
     config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
     credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
@@ -1978,7 +1980,7 @@ pub(crate) fn report_unserved_routes(
 
 pub(crate) fn apply_mapped_catalog(
     store: &SqliteRouteStateStore,
-    snapshot: &CatalogSnapshot,
+    snapshot: &Arc<CatalogSnapshot>,
     credentials: Option<&crate::broca_credentials::SharedBrocaCredentials>,
     explicit_provider: Option<&str>,
 ) -> Result<(), FusiformCatalogError> {
@@ -2039,7 +2041,7 @@ pub(crate) fn apply_mapped_catalog(
             .map_err(|_| error("credential cache poisoned"))?;
         credentials.wire_apis = snapshot.wire_apis.clone();
         credentials.wire_api_models = snapshot.wire_api_models.clone();
-        credentials.catalog_snapshot = Some(Arc::new(snapshot.clone()));
+        credentials.catalog_snapshot = Some(Arc::clone(snapshot));
     }
     Ok(())
 }
@@ -2075,7 +2077,7 @@ pub(crate) async fn ingest_before_upsert(
             let mut client = FusiformCatalogConsumer::connect(&connection, &root).await?;
             let snapshot = client.catalog_get().await?;
             client.close().await?;
-            Some(Arc::new(snapshot))
+            Some(snapshot)
         } else {
             snapshot
         }
@@ -2115,7 +2117,7 @@ async fn on_blocking_thread<T: Send + 'static>(
 async fn apply_and_report(
     store: &Arc<SqliteRouteStateStore>,
     health: &SharedCatalogHealth,
-    snapshot: CatalogSnapshot,
+    snapshot: Arc<CatalogSnapshot>,
     config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
     credentials: Option<crate::broca_credentials::SharedBrocaCredentials>,
@@ -2387,7 +2389,7 @@ mod tests {
         serde_json::to_vec(&fixture()[name]["response"]).unwrap()
     }
 
-    fn media_snapshot(models: Value, graded_by: Option<&str>) -> CatalogSnapshot {
+    fn media_snapshot(models: Value, graded_by: Option<&str>) -> Arc<CatalogSnapshot> {
         let mut reply = json!({"catalog_version": 1, "resolved_at_ms": 1, "models": models});
         if let Some(graded_by) = graded_by {
             reply["quality_scores"] = json!({"graded_by": graded_by, "graded_at_ms": 1});
@@ -2779,7 +2781,7 @@ mod tests {
             let snapshot = isolation_catalog(1, json!({model: entry.clone()}));
             let plane_page = model_rates(&json!({model: entry})).unwrap();
             let catalog = PlaneCatalog {
-                base: snapshot.rates,
+                base: snapshot.rates.clone(),
                 ..Default::default()
             };
             assert_eq!(catalog.base, plane_page);
@@ -3559,12 +3561,14 @@ mod tests {
         assert_eq!(objective.cost, 1.0);
         assert!(objective.price_unknown);
         let mut partial = antigravity_catalog(true);
-        partial
-            .base
-            .get_mut("google/antigravity-gemini-4-carbon")
-            .unwrap()
-            .rates
-            .insert("rate.cache_read".into(), BillingRate::Unpriced);
+        Arc::make_mut(
+            partial
+                .base
+                .get_mut("google/antigravity-gemini-4-carbon")
+                .unwrap(),
+        )
+        .rates
+        .insert("rate.cache_read".into(), BillingRate::Unpriced);
         let partial_objective = antigravity_task_objective(&partial, false);
         assert!(partial_objective.price_unknown);
         assert_eq!(partial_objective.cost, 1.0);
@@ -3836,7 +3840,7 @@ mod tests {
             decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         client.refresh_planes(Some(&snapshot)).await.unwrap();
         client.refresh_planes(None).await.unwrap(); // no network request
-        snapshot.cursor.catalog_version = 1;
+        Arc::make_mut(&mut snapshot).cursor.catalog_version = 1;
         client.refresh_planes(Some(&snapshot)).await.unwrap(); // both refusals retried
         store
             .apply_fusiform_catalog(&snapshot.facts, snapshot.cursor)
@@ -4015,7 +4019,8 @@ mod tests {
         let priced_reasoning = decode_catalog_get(&serde_json::to_vec(&response).unwrap())
             .unwrap()
             .facts
-            .pop()
+            .last()
+            .cloned()
             .unwrap();
         assert_eq!(priced_reasoning.reasoning_rate, Some(2.0));
 
@@ -4024,7 +4029,8 @@ mod tests {
         let refused_reasoning = decode_catalog_get(&serde_json::to_vec(&response).unwrap())
             .unwrap()
             .facts
-            .pop()
+            .last()
+            .cloned()
             .unwrap();
         assert_eq!(refused_reasoning.reasoning_rate, None);
     }
@@ -4185,13 +4191,13 @@ mod tests {
     #[derive(Clone)]
     struct FakeWire {
         status: CatalogStatusReply,
-        snapshot: CatalogSnapshot,
+        snapshot: Arc<CatalogSnapshot>,
         get_calls: usize,
         closed: bool,
     }
 
     impl CatalogWire for FakeWire {
-        async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
+        async fn catalog_get(&mut self) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError> {
             self.get_calls += 1;
             Ok(self.snapshot.clone())
         }
@@ -4230,7 +4236,7 @@ mod tests {
         assert!(unchanged.closed);
 
         let mut advanced_snapshot = initial;
-        advanced_snapshot.cursor.catalog_version = 1;
+        Arc::make_mut(&mut advanced_snapshot).cursor.catalog_version = 1;
         let mut advanced = FakeWire {
             status: CatalogStatusReply { catalog_version: 1 },
             snapshot: advanced_snapshot,
@@ -4318,7 +4324,7 @@ mod tests {
 
         let mut advanced = initial;
         let next_version = advanced.cursor.catalog_version + 1;
-        advanced.cursor.catalog_version = next_version;
+        Arc::make_mut(&mut advanced).cursor.catalog_version = next_version;
         let mut poll = FakeWire {
             status: CatalogStatusReply {
                 catalog_version: next_version,
@@ -4342,7 +4348,7 @@ mod tests {
             .contains(&json!("test/unserved-override")));
     }
 
-    fn isolation_catalog(version: i64, models: Value) -> CatalogSnapshot {
+    fn isolation_catalog(version: i64, models: Value) -> Arc<CatalogSnapshot> {
         decode_catalog_get(
             &serde_json::to_vec(&json!({
                 "catalog_version": version,
@@ -4598,7 +4604,7 @@ mod multiplier_fallback_tests {
         }
     }
 
-    fn rates(provider: &str, model: &str) -> ModelRates {
+    fn rates(provider: &str, model: &str) -> std::sync::Arc<ModelRates> {
         let served = json!({
             "rate.input": {"state": "priced", "currency": "USD", "units": 2_000_000_000_i64, "exponent": 9},
             "rate.output": {"state": "priced", "currency": "USD", "units": 6_000_000_000_i64, "exponent": 9},

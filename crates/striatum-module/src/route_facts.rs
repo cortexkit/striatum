@@ -100,7 +100,34 @@ pub(crate) fn filters_ready(
     let expected = fact_subjects(names);
     durable == Some("m_striatum")
         && !expected.is_empty()
-        && expected.iter().all(|subject| filters.contains(subject))
+        && expected.iter().all(|subject| {
+            filters
+                .iter()
+                .any(|filter| equivalent_subject(names, subject, filter))
+        })
+}
+
+fn equivalent_subject(names: &AccountNames, left: &str, right: &str) -> bool {
+    if left == right {
+        return true;
+    }
+    match (
+        names.parse_event_subject(left),
+        names.parse_event_subject(right),
+    ) {
+        (Ok(left_parts), Ok(right_parts)) => {
+            let left_prefix = format!("ck.{}.event.{}.", names.account(), left_parts.module);
+            let right_prefix = format!("ck.{}.event.{}.", names.account(), right_parts.module);
+            // Only the module token is aliased; every remaining token must match
+            // exactly. A filter ending in `.v1.striatum` cannot replace `.v1`.
+            striatum_core::module_identity::equal(&left_parts.module, &right_parts.module)
+                && left
+                    .strip_prefix(&left_prefix)
+                    .zip(right.strip_prefix(&right_prefix))
+                    .is_some_and(|(left, right)| left == right)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Deserialize)]
@@ -236,7 +263,10 @@ impl Handler {
             let publisher_subject = names
                 .event_subject(&subject.module, "route_fact", 1)
                 .map_err(|e| e.to_string())?;
-            if fact_subjects(names).contains(&publisher_subject) {
+            if fact_subjects(names)
+                .iter()
+                .any(|allowed| equivalent_subject(names, allowed, &publisher_subject))
+            {
                 striatum_store::job_timing::run("route_fact", self.dispatch(&subject.module, body))
                     .await
             } else {
@@ -264,7 +294,9 @@ impl Handler {
                     health.retries += 1;
                     health
                         .publishers
-                        .entry(subject.module.clone())
+                        .entry(
+                            striatum_core::module_identity::canonical(&subject.module).into_owned(),
+                        )
                         .or_default()
                         .retried += 1;
                 }
@@ -274,7 +306,12 @@ impl Handler {
                 let refused = result.is_err();
                 if let Ok(mut cache) = self.quota_cache.lock() {
                     let health = &mut cache.consumer.route_facts;
-                    let publisher = health.publishers.entry(subject.module.clone()).or_default();
+                    let publisher = health
+                        .publishers
+                        .entry(
+                            striatum_core::module_identity::canonical(&subject.module).into_owned(),
+                        )
+                        .or_default();
                     if let Err(code) = result {
                         health.refused += 1;
                         publisher.refused += 1;
@@ -341,7 +378,7 @@ impl Handler {
                 health.refused += 1;
                 health
                     .publishers
-                    .entry(module.to_owned())
+                    .entry(striatum_core::module_identity::canonical(module).into_owned())
                     .or_default()
                     .refused += 1;
             }

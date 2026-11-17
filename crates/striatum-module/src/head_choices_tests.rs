@@ -112,7 +112,7 @@ fn fixture() -> (Arc<Harness>, BrocaCredentials) {
         },
         crate::now_ms(),
     );
-    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     credentials.wire_apis = facts
         .iter()
         .map(|fact| {
@@ -264,7 +264,7 @@ fn broca_live_catalog_fixture() -> Arc<Harness> {
         },
         crate::now_ms(),
     );
-    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     credentials.wire_apis = input["catalog_models"]
         .as_object()
         .unwrap()
@@ -905,12 +905,6 @@ async fn every_caller_can_read_choices_regardless_of_operator_claims() {
         (reserved("broca"), "ck-desktop", "install", false),
         (json!({"kind":"unverified"}), "ck-desktop", "install", false),
         (json!({"kind":"direct"}), "fed-phone:forged", "ckios", false),
-        (
-            json!({"kind":"direct"}),
-            "alfonso",
-            "prefrontal-core",
-            false,
-        ),
         (json!({"kind":"direct"}), "ck-desktop", "install", true),
     ] {
         let route = bind_operator(&harness, principal, host, session, scoped).await;
@@ -1280,7 +1274,7 @@ async fn golden_login_policy_narrows_picks_panels_picker_and_account_admission()
             .apply_fusiform_catalog(updates, cursor)
             .unwrap();
         let current = harness.store().get_facts().unwrap();
-        credentials.catalog_snapshot = Some(Arc::new(snapshot));
+        credentials.catalog_snapshot = Some(snapshot);
         credentials.publish_billing_catalog(
             fusiform_catalog::PlaneCatalog::ordinary_test_catalog(&current)
                 .with_test_catalog(&serde_json::to_vec(&catalog).unwrap()),

@@ -19,19 +19,19 @@ pub struct AdmissionStateRow {
 /// `parent_used_account`: `committed_at DESC, rowid DESC`, finished and
 /// released rows included.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LatestAdmissionRow {
-    pub principal: String,
-    pub conversation_hash: String,
-    pub provider: String,
+pub struct LatestAdmissionRow<Text = String, Hash = String> {
+    pub principal: Text,
+    pub conversation_hash: Hash,
+    pub provider: Text,
     pub admission_id: String,
     pub committed_at: i64,
     pub rowid: i64,
     pub pin_id: String,
     pub pin_generation: u64,
-    pub state: String,
+    pub state: Text,
     pub admission_valid_until: i64,
     pub lease_valid_until: i64,
-    pub account_id: String,
+    pub account_id: Text,
 }
 
 /// The columns of one admission row that the derived indexes need. The

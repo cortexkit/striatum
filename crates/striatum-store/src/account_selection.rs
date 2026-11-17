@@ -15,10 +15,26 @@
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use striatum_core::{
     accounts::{FenceScope, PoolKey},
+    module_identity::alternate,
     RouteStateResult,
 };
 
 use super::{err, SqliteRouteStateStore};
+
+fn observation_event_sql(logged: bool) -> String {
+    let (columns, table) = if logged {
+        (OBSERVATION_COLUMNS, "account_observation")
+    } else {
+        (
+            "observation_id, bound, effects_json, received_at",
+            "account_observation_event",
+        )
+    };
+    format!("SELECT {columns} FROM {table} WHERE principal IN (?1, ?4) AND runner = ?2 AND event_id = ?3")
+}
+
+const OBSERVER_EVENT_SQL: &str = "SELECT runner FROM account_observation WHERE principal IN (?1,?3) AND event_id=?2 \
+    UNION ALL SELECT runner FROM account_observation_event WHERE principal IN (?1,?3) AND event_id=?2 LIMIT 1";
 
 /// `account_decision.mode` for a decision routing answered a caller with,
 /// the only mode routing writes. (The schema also allows `shadow`, from the
@@ -198,6 +214,93 @@ mod account_fact_tests {
                 observation_json: r#"{"run_id":"kept"}"#.into(),
             }]
         );
+    }
+
+    #[test]
+    fn prefrontal_rename_observer_log_and_restored_event_cache_replay_once() {
+        let scratch = cortexkit_test_support::ScratchDir::new("rename-observer-cache");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "rename-observer-cache",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        store
+            .account_transaction(|tx| {
+                tx.insert_observation(&AccountObservationRow {
+                    observation_id: "old-observation".into(),
+                    principal: "reserved:prefrontal-core".into(),
+                    runner: "broca".into(),
+                    event_id: "same-event".into(),
+                    kind: "transient_backoff".into(),
+                    admission_id: Some("runner-admission".into()),
+                    bound: true,
+                    observation_json: "{}".into(),
+                    effects_json: "[{}]".into(),
+                    received_at: 1,
+                })
+                .map(|_| ())
+            })
+            .unwrap();
+        for cached_only in [false, true] {
+            if cached_only {
+                store
+                    .with_writer_for_test(|c| {
+                        c.execute("DELETE FROM account_observation", []).map(|_| ())
+                    })
+                    .unwrap();
+            }
+            let found = store
+                .account_read(|tx| {
+                    tx.observation_by_principal_event("reserved:prefrontal", "same-event")
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(found.observation_id, "old-observation");
+            assert_eq!(found.effects_json, "[{}]");
+            assert!(found.bound);
+        }
+    }
+
+    #[test]
+    fn alias_observer_replay_queries_keep_principal_indexes() {
+        let scratch = cortexkit_test_support::ScratchDir::new("rename-observer-plan");
+        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+            "rename-observer-plan",
+            scratch.path().join("store.db").to_string_lossy(),
+        ))
+        .unwrap();
+        for sql in [
+            observation_event_sql(true),
+            observation_event_sql(false),
+            OBSERVER_EVENT_SQL.into(),
+        ] {
+            store
+                .with_writer_for_test(|c| {
+                    let mut statement = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+                    let count = statement.parameter_count();
+                    let plan: Vec<String> = statement
+                        .query_map(
+                            rusqlite::params_from_iter(
+                                std::iter::repeat("reserved:prefrontal").take(count),
+                            ),
+                            |row| row.get(3),
+                        )?
+                        .collect::<rusqlite::Result<_>>()?;
+                    assert!(
+                        !plan.iter().any(|line| line.starts_with("SCAN ")),
+                        "{plan:?}"
+                    );
+                    assert!(
+                        plan.iter()
+                            .filter(|line| line.contains("SEARCH"))
+                            .all(|line| line.contains("principal=?")),
+                        "{plan:?}"
+                    );
+                    assert!(plan.iter().any(|line| line.contains("SEARCH")), "{plan:?}");
+                    Ok(())
+                })
+                .unwrap();
+        }
     }
 
     #[test]
@@ -1203,15 +1306,15 @@ pub struct AccountDecisionRecord {
 /// A conversation's current pin, keyed by principal, hashed conversation key
 /// and provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountAffinityRow {
-    pub principal: String,
-    pub conversation_hash: String,
-    pub provider: String,
-    pub affinity_model: String,
+pub struct AccountAffinityRow<Text = String, Hash = String> {
+    pub principal: Text,
+    pub conversation_hash: Hash,
+    pub provider: Text,
+    pub affinity_model: Text,
     pub pin_id: String,
     pub pin_generation: u64,
-    pub account_id: String,
-    pub credential_id: String,
+    pub account_id: Text,
+    pub credential_id: Text,
     pub credential_binding_revision: u64,
     pub policy_version: u32,
     pub initial_demand_bytes: u64,
@@ -1241,22 +1344,22 @@ pub struct AccountPinRow {
 
 /// One admission and the demand it charged.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountAdmissionRow {
-    pub principal: String,
+pub struct AccountAdmissionRow<Text = String, Hash = String> {
+    pub principal: Text,
     pub admission_id: String,
     pub request_fingerprint: String,
     /// `admit`, `renew` or `reassign`.
-    pub request_mode: String,
+    pub request_mode: Text,
     pub decision_id: String,
-    pub conversation_hash: String,
-    pub provider: String,
-    pub model: String,
-    pub account_id: String,
-    pub credential_id: String,
+    pub conversation_hash: Hash,
+    pub provider: Text,
+    pub model: Text,
+    pub account_id: Text,
+    pub credential_id: Text,
     pub pin_id: String,
     pub pin_generation: u64,
     /// `reserved`, `started`, `released`, `expired` or `finished`.
-    pub state: String,
+    pub state: Text,
     /// False for a renewal, which charges no demand.
     pub charged: bool,
     pub request_bytes: u64,
@@ -1652,6 +1755,7 @@ impl<'a> AccountTx<'a> {
 }
 
 mod continuation;
+mod row_repr;
 mod state_rows;
 pub use state_rows::*;
 
@@ -2375,11 +2479,8 @@ impl AccountTx<'_> {
         let logged = self
             .conn
             .query_row(
-                &format!(
-                    "SELECT {OBSERVATION_COLUMNS} FROM account_observation \
-                     WHERE principal = ?1 AND runner = ?2 AND event_id = ?3"
-                ),
-                params![principal, runner, event_id],
+                &observation_event_sql(true),
+                params![principal, runner, event_id, alternate(principal).as_ref()],
                 observation_from_row,
             )
             .optional()
@@ -2389,10 +2490,8 @@ impl AccountTx<'_> {
         }
         self.conn
             .query_row(
-                "SELECT observation_id, bound, effects_json, received_at \
-                 FROM account_observation_event \
-                 WHERE principal = ?1 AND runner = ?2 AND event_id = ?3",
-                params![principal, runner, event_id],
+                &observation_event_sql(false),
+                params![principal, runner, event_id, alternate(principal).as_ref()],
                 |row| {
                     Ok(AccountObservationRow {
                         observation_id: row.get(0)?,
@@ -2423,11 +2522,15 @@ impl AccountTx<'_> {
         let _writer_entry = crate::writer_entry_trace::enter(
             "account_tx::account_selection::observation_by_principal_event",
         );
-        let runner: Option<String> = self.conn.query_row(
-            "SELECT runner FROM account_observation WHERE principal=?1 AND event_id=?2 \
-             UNION ALL SELECT runner FROM account_observation_event WHERE principal=?1 AND event_id=?2 LIMIT 1",
-            params![principal, event_id], |row| row.get(0),
-        ).optional().map_err(err)?;
+        let runner: Option<String> = self
+            .conn
+            .query_row(
+                OBSERVER_EVENT_SQL,
+                params![principal, event_id, alternate(principal).as_ref()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(err)?;
         match runner {
             Some(runner) => self.observation_by_event(principal, &runner, event_id),
             None => Ok(None),

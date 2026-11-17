@@ -784,6 +784,219 @@ async fn harness_choice_output_need_uses_declared_and_operator_defaults() {
 }
 
 #[tokio::test]
+async fn broca_dream_settings_ladder_names_harness_from_verified_declaration() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"broca"}]));
+    prepare_broca_endpoints(&harness);
+    let fixture: Value =
+        serde_json::from_slice(include_bytes!("broca-runner-slot.after.json")).unwrap();
+    let ladder = ["example-provider/model-a", "example-provider/model-b"];
+    let owner =
+        cortexkit_role_routing_conformance::fixture::CONSUMER.trim_start_matches("reserved:");
+    harness.edit_config(|config| {
+        config["consumers"]["magic-context.dream"] =
+            json!({"owner":owner, "mode":"ladder", "ladder":ladder});
+    });
+
+    // The old declaration has the same sole harness but no task capabilities.
+    // Both shapes must name it, including when the first ladder step is excluded.
+    let mut legacy = fixture.clone();
+    legacy["runner"]
+        .as_object_mut()
+        .unwrap()
+        .remove("harness_limits");
+    for declaration in [&fixture, &legacy] {
+        install(&harness, "broca", declaration);
+        for consumer in [
+            "magic-context.dream.compress-cues",
+            "magic-context.dream.verify",
+        ] {
+            for tools in [None, Some("none"), Some("required")] {
+                for requested in [None, Some("broca")] {
+                    for exclude_first in [false, true] {
+                        for iq in [30, 60] {
+                            let mut params = json!({"consumer":consumer, "requirements":{"iq":iq}});
+                            if let Some(tools) = tools {
+                                params["requirements"]["tools"] = json!(tools);
+                            }
+                            if let Some(requested) = requested {
+                                params["harness"] = json!(requested);
+                            }
+                            if exclude_first {
+                                params["exclude"] = json!([ladder[0]]);
+                            }
+                            let answer = selected(route.call("route.select", &params).await);
+                            assert_eq!(answer["runner"]["module"], "broca", "{params}: {answer}");
+                            assert_eq!(answer["runner"]["harness"], "broca", "{params}: {answer}");
+                            assert!(answer.get("pin_outcome").is_none(), "{answer}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    install(&harness, "broca", &fixture);
+    let mut capped = json!({"consumer":"magic-context.dream.compress-cues", "requirements":{"iq":0,"max_output_tokens":1}});
+    refused(
+        route.call("route.select", &capped).await,
+        "harness_unavailable",
+    );
+    capped["requirements"]
+        .as_object_mut()
+        .unwrap()
+        .remove("max_output_tokens");
+    capped["harness"] = json!("not-hosted");
+    refused(
+        route.call("route.select", &capped).await,
+        "harness_unavailable",
+    );
+}
+
+fn prepare_broca_endpoints(harness: &crate::routing_v1::conformance_tests::Harness) {
+    let shared = harness.credentials();
+    let mut credentials = shared.lock().unwrap();
+    // Broca requires endpoint facts as well as wire-family names. The shared
+    // conformance catalog supplies only families until a test marks endpoints.
+    credentials.wire_api_models = credentials.wire_apis.keys().cloned().collect();
+    let catalog = credentials
+        .billing_catalog
+        .clone()
+        .with_wire_api_models(&credentials.wire_api_models);
+    credentials.publish_billing_catalog(catalog);
+    credentials.set_watch_confirmed(Some("conformance-credentials"));
+}
+
+#[tokio::test]
+async fn broca_dream_settings_ladder_catalog_gap_retains_harness() {
+    let _clock = crate::InjectedClock::set(1_800_000_000_000);
+    let (harness, route) = configured().await;
+    setup(&harness, json!([{"module":"broca"}]));
+    prepare_broca_endpoints(&harness);
+    harness.edit_config(|config| {
+        config["consumers"]["magic-context.dream"] = json!({
+            "owner":cortexkit_role_routing_conformance::fixture::CONSUMER.trim_start_matches("reserved:"),
+            "mode":"ladder", "ladder":["example-provider/model-a"]
+        });
+    });
+    let fixture: Value =
+        serde_json::from_slice(include_bytes!("broca-runner-slot.after.json")).unwrap();
+    let modules = json!([{"module_id":"broca", "nonce_verified":true, "first_party":true,
+        "role_declarations":{"routing/v1":fixture}}]);
+    let policies = harness.operator_config().v1_runners();
+    let now = crate::now_ms() as i64;
+    let mut cache = super::super::DescribeCache::default();
+    {
+        let shared = harness.credentials();
+        let mut credentials = shared.lock().unwrap();
+        cache.catalog(&modules, &policies, &mut credentials, now);
+        cache.reply(
+            "broca",
+            Some(&json!({"capabilities":["service_tier","routed_accounts"],
+            "service_tiers":{"anthropic.messages":{"levels":["fast"],"served":"reported"}},
+            "routed_accounts":["apikey"]})),
+            &mut credentials,
+            now,
+        );
+    }
+    let params = json!({"consumer":"magic-context.dream.compress-cues", "requirements":{"iq":30}});
+    let declared = selected(route.call("route.select", &params).await);
+    assert_eq!(declared["runner"]["harness"], "broca", "{declared}");
+
+    let _gap_clock = crate::InjectedClock::set((now + 120_000) as u64);
+    {
+        let shared = harness.credentials();
+        let mut credentials = shared.lock().unwrap();
+        cache.catalog(&json!([]), &policies, &mut credentials, now + 120_000);
+        assert!(credentials.runner_service_tiers.contains_key("broca"));
+        assert!(credentials.runner_routed_accounts.contains_key("broca"));
+        assert_eq!(credentials.runner_describe_observed["broca"], now);
+        assert!(!credentials.first_party_runners.contains_key("broca"));
+    }
+    let retained = selected(route.call("route.select", &params).await);
+    assert_eq!(retained["runner"]["module"], "broca", "{retained}");
+    assert_eq!(retained["runner"]["harness"], "broca", "{retained}");
+    assert_eq!(retained["route"], declared["route"]);
+
+    let expired_at = now + super::super::describe_cache::LAST_GOOD_MS;
+    let _expired_clock = crate::InjectedClock::set(expired_at as u64);
+    // Eligibility must notice expiry even before the next cache refresh.
+    assert!(harness
+        .credentials()
+        .lock()
+        .unwrap()
+        .runner_declarations
+        .contains_key("broca"));
+    refused(
+        route.call("route.select", &params).await,
+        "no_available_model",
+    );
+    {
+        let shared = harness.credentials();
+        let mut credentials = shared.lock().unwrap();
+        cache.missed_all(&mut credentials, expired_at);
+        assert!(!credentials.runner_declarations.contains_key("broca"));
+        assert!(!credentials.runner_service_tiers.contains_key("broca"));
+        assert!(!credentials.runner_routed_accounts.contains_key("broca"));
+        assert!(credentials.runner_declarations_seen.contains("broca"));
+        cache.catalog(&modules, &policies, &mut credentials, expired_at);
+        cache.reply(
+            "broca",
+            Some(&json!({"capabilities":[]})),
+            &mut credentials,
+            expired_at,
+        );
+    }
+    let reappeared = selected(route.call("route.select", &params).await);
+    assert_eq!(reappeared["runner"]["harness"], "broca", "{reappeared}");
+}
+
+#[tokio::test]
+async fn broca_dream_settings_ladder_never_declared_runner_keeps_legacy_settings_only() {
+    let (harness, route) = configured().await;
+    setup(&harness, json!([]));
+    harness.edit_config(|config| {
+        config["consumers"]["magic-context.dream"] = json!({
+            "owner":cortexkit_role_routing_conformance::fixture::CONSUMER.trim_start_matches("reserved:"),
+            "mode":"ladder", "ladder":["example-provider/model-a"]
+        });
+    });
+    let mut cache = super::super::DescribeCache::default();
+    {
+        let shared = harness.credentials();
+        let mut credentials = shared.lock().unwrap();
+        cache.catalog(
+            &json!([{"module_id":"broca", "first_party":true}]),
+            &[],
+            &mut credentials,
+            crate::now_ms() as i64,
+        );
+        assert!(!credentials.runner_declarations.contains_key("broca"));
+        assert!(!credentials.first_party_runners.contains_key("broca"));
+    }
+    refused(
+        route
+            .call(
+                "route.select",
+                &json!({"consumer":"magic-context.dream.compress-cues", "requirements":{"iq":30}}),
+            )
+            .await,
+        "no_available_model",
+    );
+    harness.edit_config(|config| config["runners"] = json!([{"module":"broca"}]));
+    let legacy = selected(
+        route
+            .call(
+                "route.select",
+                &json!({"consumer":"magic-context.dream.compress-cues", "requirements":{"iq":30}}),
+            )
+            .await,
+    );
+    assert_eq!(legacy["runner"]["module"], "broca", "{legacy}");
+    assert!(legacy["runner"].get("harness").is_none(), "{legacy}");
+}
+
+#[tokio::test]
 async fn harness_choice_broca_fixture_never_hosts_output_limited_tasks() {
     describe::with_candidate_capabilities(&[GROUP], async {
         let (harness, route) = configured().await;

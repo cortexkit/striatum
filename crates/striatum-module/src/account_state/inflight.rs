@@ -7,10 +7,17 @@ use std::sync::Arc;
 
 use striatum_store::{AccountAdmissionRow, ContinuationSourceRow, PrunedContinuation};
 
-use super::admissions::{AdmissionState, Effect, RowKey, ShardedMap};
+use super::admissions::{AdmissionState, Effect, ShardedMap};
 
 const STARTED_WINDOW_MS: i64 = 30 * 60 * 1_000;
 type AccountKey = (String, String);
+// Unlike historical admission indexes, inflight identities are bounded by the
+// active runs and reservations, so their text stays owned rather than interned.
+type RowKey = (String, String);
+
+#[cfg(test)]
+#[path = "inflight_sharing_tests.rs"]
+mod sharing_tests;
 
 /// A model contributes either to the shared account count or its own count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +40,8 @@ struct InflightEntry {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InflightLedger {
-    accounts: ShardedMap<AccountKey, Arc<BTreeMap<RowKey, InflightEntry>>>,
+    // A command copies an account bucket, not its immutable keys or payloads.
+    accounts: ShardedMap<AccountKey, Arc<BTreeMap<Arc<RowKey>, Arc<InflightEntry>>>>,
     /// Only offers retain source identities, not historical admission rows.
     /// Used evidence must survive a source closing while another row of the
     /// run is still started, so it is independent of the open-admission index.
@@ -57,7 +65,8 @@ impl InflightLedger {
         }
         // Build each account once; repeatedly touching a growing account while
         // loading would turn a large set of live rows into a quadratic scan.
-        let mut accounts: BTreeMap<AccountKey, BTreeMap<RowKey, InflightEntry>> = BTreeMap::new();
+        let mut accounts: BTreeMap<AccountKey, BTreeMap<Arc<RowKey>, Arc<InflightEntry>>> =
+            BTreeMap::new();
         for (_, open) in admissions.open.iter() {
             let row = &open.row;
             if ledger.succeeded(row) {
@@ -65,9 +74,12 @@ impl InflightLedger {
             }
             if let Some(entry) = Self::entry(row, now) {
                 accounts
-                    .entry((row.provider.clone(), row.account_id.clone()))
+                    .entry((row.provider.to_string(), row.account_id.to_string()))
                     .or_default()
-                    .insert((row.principal.clone(), row.admission_id.clone()), entry);
+                    .insert(
+                        Arc::new((row.principal.as_str().into(), row.admission_id.clone())),
+                        entry,
+                    );
             }
         }
         for (account, entries) in accounts {
@@ -78,13 +90,16 @@ impl InflightLedger {
 
     pub(crate) fn cache_source(&mut self, source: ContinuationSourceRow) {
         self.sources.insert(
-            (source.principal.clone(), source.selection_id.clone()),
+            (
+                source.principal.as_str().into(),
+                source.selection_id.clone(),
+            ),
             Arc::new(source),
         );
     }
 
     fn record_succession(&mut self, source: ContinuationSourceRow) {
-        let run = (source.principal.clone(), source.run_id.clone());
+        let run: RowKey = (source.principal.as_str().into(), source.run_id.clone());
         if !self.successions.contains_key(&run) {
             self.successions
                 .insert(run.clone(), Arc::new(BTreeMap::new()));
@@ -93,17 +108,20 @@ impl InflightLedger {
             .insert(source.selection_id.clone(), source);
     }
 
-    fn succeeded(&self, row: &AccountAdmissionRow) -> bool {
-        row.state == "started"
+    fn succeeded<T: AsRef<str>, H: std::fmt::Display>(
+        &self,
+        row: &AccountAdmissionRow<T, H>,
+    ) -> bool {
+        row.state.as_ref() == "started"
             && row.run_id.as_ref().is_some_and(|run| {
                 self.successions
-                    .get(&(row.principal.clone(), run.clone()))
+                    .get(&(row.principal.as_ref().into(), run.clone()))
                     .is_some_and(|offers| {
                         offers.values().any(|offer| {
-                            offer.provider == row.provider
-                                && offer.account_id == row.account_id
+                            offer.provider == row.provider.as_ref()
+                                && offer.account_id == row.account_id.as_ref()
                                 && (offer.left_admission_id == row.admission_id
-                                    || (row.request_mode != "renew"
+                                    || (row.request_mode.as_ref() != "renew"
                                         && row
                                             .started_at
                                             .is_some_and(|at| Some(at) < offer.used_at_ms)))
@@ -115,8 +133,8 @@ impl InflightLedger {
     pub(crate) fn prune_continuations(&mut self, deleted: &[PrunedContinuation]) {
         for row in deleted {
             self.sources
-                .remove(&(row.principal.clone(), row.selection_id.clone()));
-            let run = (row.principal.clone(), row.run_id.clone());
+                .remove(&(row.principal.as_str().into(), row.selection_id.clone()));
+            let run: RowKey = (row.principal.as_str().into(), row.run_id.clone());
             if let Some(offers) = self.successions.get_mut(&run) {
                 Arc::make_mut(offers).remove(&row.selection_id);
                 if offers.is_empty() {
@@ -183,8 +201,11 @@ impl InflightLedger {
         }
     }
 
-    fn entry(row: &AccountAdmissionRow, now: i64) -> Option<InflightEntry> {
-        let until_ms = match row.state.as_str() {
+    fn entry<T: AsRef<str>, H: std::fmt::Display>(
+        row: &AccountAdmissionRow<T, H>,
+        now: i64,
+    ) -> Option<Arc<InflightEntry>> {
+        let until_ms = match row.state.as_ref() {
             "reserved" => Some(row.admission_valid_until),
             "started" => row
                 .last_observed_at
@@ -195,33 +216,45 @@ impl InflightLedger {
             _ => None,
         };
         let until_ms = until_ms.filter(|until| now < *until)?;
-        Some(InflightEntry {
-            principal: row.principal.clone(),
-            conversation_hash: row.conversation_hash.clone(),
-            model: row.model.clone(),
+        Some(Arc::new(InflightEntry {
+            principal: row.principal.as_ref().into(),
+            conversation_hash: row.conversation_hash.to_string(),
+            model: row.model.as_ref().to_owned(),
             run_id: row.run_id.clone(),
-            renewal: row.request_mode == "renew",
-            started: row.state == "started",
+            renewal: row.request_mode.as_ref() == "renew",
+            started: row.state.as_ref() == "started",
             started_at: row.started_at,
             until_ms,
-        })
+        }))
     }
 
-    pub(crate) fn update(&mut self, row: &AccountAdmissionRow, now: i64) {
-        let admission = (row.principal.clone(), row.admission_id.clone());
-        self.remove(&row.provider, &row.account_id, &admission, now);
+    pub(crate) fn update<T: AsRef<str>, H: std::fmt::Display>(
+        &mut self,
+        row: &AccountAdmissionRow<T, H>,
+        now: i64,
+    ) {
+        let admission: RowKey = (row.principal.as_ref().into(), row.admission_id.clone());
+        self.remove(
+            row.provider.as_ref(),
+            row.account_id.as_ref(),
+            &admission,
+            now,
+        );
         if self.succeeded(row) {
             return;
         }
         let Some(entry) = Self::entry(row, now) else {
             return;
         };
-        let key = (row.provider.clone(), row.account_id.clone());
+        let key = (
+            row.provider.as_ref().to_owned(),
+            row.account_id.as_ref().to_owned(),
+        );
         if !self.accounts.contains_key(&key) {
             self.accounts.insert(key.clone(), Arc::new(BTreeMap::new()));
         }
         Arc::make_mut(self.accounts.get_mut(&key).expect("inserted above"))
-            .insert(admission, entry);
+            .insert(Arc::new(admission), entry);
     }
 
     /// Lifecycle effects include closed rows after their bodies leave memory;
@@ -245,7 +278,8 @@ impl InflightLedger {
                 Effect::Offer {
                     selection, used_at, ..
                 } => {
-                    let Some(source) = self.sources.remove(selection) else {
+                    let key = (selection.0.to_string(), selection.1.clone());
+                    let Some(source) = self.sources.remove(&key) else {
                         continue;
                     };
                     let Some(used_at) = used_at else {
@@ -259,7 +293,8 @@ impl InflightLedger {
                     if let Some(entries) = self.accounts.get_mut(&account) {
                         // The explicitly left row is succeeded even at the same
                         // millisecond. Other rows started then are new holds.
-                        Arc::make_mut(entries).retain(|(_, id), entry| {
+                        Arc::make_mut(entries).retain(|key, entry| {
+                            let (_, id) = key.as_ref();
                             !(entry.principal == offer.principal
                                 && entry.run_id.as_deref() == Some(&offer.run_id)
                                 && entry.started

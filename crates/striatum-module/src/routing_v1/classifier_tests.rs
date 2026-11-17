@@ -85,7 +85,7 @@ pub(super) fn rig(
         .unwrap();
     let mut credentials = BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&json!({"prices":[]}));
-    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     let mut description = describe();
     edit_describe(&mut description);
     let mut cache = super::classifier::DescribeCache::default();

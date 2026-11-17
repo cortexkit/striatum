@@ -738,6 +738,41 @@ fn overlay_pools(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "heap-measure")]
+    #[test]
+    #[ignore = "repository subscription-economics heap profile; run alone"]
+    fn subscription_economics_heap() {
+        use crate::memory_measurements::{operation, profiler, release};
+        let _profiler = profiler("subscription-economics");
+        let runtime = operation("subscription_economics_runtime", || {
+            let now = 1_800_000_000_000;
+            let mut runtime = super::Runtime {
+                inputs: Some(super::Inputs {
+                    state: v2_state(now),
+                    prices: prices(),
+                    credentials: Default::default(),
+                    unpriced_tiers: Default::default(),
+                }),
+                report: report_v2(),
+                ..Default::default()
+            };
+            runtime.rebuild(now);
+            runtime
+        });
+        println!(
+            "COUNTS economics_sample_readings={} economics_pools={}",
+            runtime
+                .inputs
+                .as_ref()
+                .unwrap()
+                .state
+                .readings
+                .readings
+                .len(),
+            runtime.economics.pools.len()
+        );
+        release("subscription_economics_Runtime_sample", runtime);
+    }
     #[test]
     fn multiplier_watch_reuses_the_quota_bus_connection() {
         let source = include_str!("quota_bus.rs");

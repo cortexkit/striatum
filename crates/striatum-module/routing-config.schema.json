@@ -111,10 +111,11 @@
       "default": {}
     },
     "pin_origin_callers": {
-      "description": "Full caller principals allowed to mark user pins with `pin_origin`.\nAbsent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.",
+      "description": "Full caller principals allowed to mark user pins with `pin_origin`.\nDefaults to reserved:prefrontal-core and reserved:prefrontal during the\nmodule rename window; an explicit empty list enrolls nobody.",
       "type": "array",
       "default": [
-        "reserved:prefrontal-core"
+        "reserved:prefrontal-core",
+        "reserved:prefrontal"
       ],
       "items": {
         "type": "string"

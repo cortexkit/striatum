@@ -284,7 +284,7 @@ fn commit_block_and_admission(harness: &Harness) {
     let provider = facts[0].provider_id.clone();
     let model = facts[0].model_id.clone();
     crate::account_writer::repair(harness.store(), move |tx| {
-        let row = striatum_store::AccountAdmissionRow {
+        let row: striatum_store::AccountAdmissionRow = striatum_store::AccountAdmissionRow {
             principal: "p".into(),
             admission_id: "interleaved".into(),
             request_fingerprint: "fp".into(),
@@ -395,34 +395,35 @@ pub(super) fn seed_open_offer(
         .store()
         .account_transaction(|tx| {
             for id in ["offer-source", "offer-reservation"] {
-                let row = striatum_store::AccountAdmissionRow {
-                    principal: "p".into(),
-                    admission_id: id.into(),
-                    request_fingerprint: "fp".into(),
-                    request_mode: "admit".into(),
-                    decision_id: format!("decision-{id}"),
-                    conversation_hash: format!("conversation-{id}"),
-                    provider: provider.into(),
-                    model: model.into(),
-                    account_id: account.into(),
-                    credential_id: credential.into(),
-                    pin_id: format!("pin-{id}"),
-                    pin_generation: 1,
-                    state: "reserved".into(),
-                    charged: true,
-                    request_bytes: 1,
-                    request_bytes_estimated: false,
-                    committed_at: NOW,
-                    admission_valid_until: NOW + 60_000,
-                    lease_valid_until: NOW + 120_000,
-                    reply_json: "{}".into(),
-                    run_id: None,
-                    started_at: None,
-                    started_late: false,
-                    released_at: None,
-                    finished_at: None,
-                    last_observed_at: None,
-                };
+                let row: striatum_store::AccountAdmissionRow =
+                    striatum_store::AccountAdmissionRow {
+                        principal: "p".into(),
+                        admission_id: id.into(),
+                        request_fingerprint: "fp".into(),
+                        request_mode: "admit".into(),
+                        decision_id: format!("decision-{id}"),
+                        conversation_hash: format!("conversation-{id}"),
+                        provider: provider.into(),
+                        model: model.into(),
+                        account_id: account.into(),
+                        credential_id: credential.into(),
+                        pin_id: format!("pin-{id}"),
+                        pin_generation: 1,
+                        state: "reserved".into(),
+                        charged: true,
+                        request_bytes: 1,
+                        request_bytes_estimated: false,
+                        committed_at: NOW,
+                        admission_valid_until: NOW + 60_000,
+                        lease_valid_until: NOW + 120_000,
+                        reply_json: "{}".into(),
+                        run_id: None,
+                        started_at: None,
+                        started_late: false,
+                        released_at: None,
+                        finished_at: None,
+                        last_observed_at: None,
+                    };
                 tx.insert_pin(&striatum_store::AccountPinRow {
                     pin_id: row.pin_id.clone(),
                     principal: row.principal.clone(),
