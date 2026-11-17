@@ -403,3 +403,83 @@ fn real_older_model_success_can_leave_a_newer_provider_without_a_route_source() 
         "the shared snapshot must still enforce the newer provider wall"
     );
 }
+
+#[test]
+fn migration_can_keep_newer_provider_above_a_model_healed_by_older_success() {
+    let scratch = cortexkit_test_support::ScratchDir::new("migrated-provider-reachability");
+    let descriptor = crate::dev_descriptor(
+        "migrated-provider-reachability",
+        scratch.path().join("state.db").to_string_lossy(),
+    );
+    let migrations = crate::route_state_migrations();
+    let block = migrations
+        .iter()
+        .position(|migration| migration.statements == block_storage::MIGRATION)
+        .unwrap();
+    let previous = migrations[..block].last().unwrap().version;
+    let old =
+        crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, previous).unwrap();
+    let now = crate::now_ms();
+    old.with_writer_for_test(|conn| {
+        conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_unscoped,wall_observed_at,last_error,last_error_at,updated_at)
+            VALUES ('migrated-reach/before','migrated-reach/before','migrated-reach','before',?1,1,?2,'independent-capacity',?2,?2)", rusqlite::params![now+120_000,now-200])?;
+        conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_unscoped,wall_observed_at,last_error,last_error_at,updated_at)
+            VALUES ('migrated-reach',?1,1,?2,'provider-capacity',?2,?2)", rusqlite::params![now+90_000,now-100])?;
+        fence_rechecks::legacy::sync_at(conn,now)?;
+        // Reproduce legacy heal_origins' route writes: clear the model's wall
+        // fields and set fence_recheck.cleared_at. A run admitted at now-150
+        // follows the now-200 model evidence but predates the now-100 provider
+        // evidence, so provider_cooldown_state must retain the provider refusal.
+        conn.execute("UPDATE model_route_state SET cooldown_until=NULL,quota_exhausted_until=NULL,wall_class=NULL WHERE route_key='migrated-reach/before'", [])?;
+        conn.execute("UPDATE fence_recheck SET cleared_at=?1,claim_owner=NULL WHERE kind='route' AND origin_key=json_array('migrated-reach/before')", [now])?;
+        let active = fence_rechecks::legacy::read_effective_at(conn,now)?;
+        assert!(active.iter().any(|row|row.kind=="provider" && row.provider=="migrated-reach"));
+        assert!(!active.iter().any(|row|row.kind=="route" && row.provider=="migrated-reach"));
+        let frozen = crate::route_snapshot::legacy_read_snapshot(conn,now as f64,now).unwrap();
+        assert_eq!(frozen.by_route["migrated-reach/before"].cooldown_until,None);
+        Ok(())
+    }).unwrap();
+    drop(old);
+    let store = crate::SqliteRouteStateStore::open(&descriptor).unwrap();
+    store.with_reader_for_test(|conn| {
+        let sources: (bool,bool,bool) = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM block WHERE kind='provider' AND provider='migrated-reach' AND source_present=1),
+             EXISTS(SELECT 1 FROM block WHERE kind='route' AND origin_key=json_array('migrated-reach/before') AND source_present=1),
+             EXISTS(SELECT 1 FROM block WHERE kind='route' AND origin_key=json_array('migrated-reach/before') AND cleared_at IS NOT NULL)", [],
+            |row|Ok((row.get(0)?,row.get(1)?,row.get(2)?)))?;
+        assert_eq!(sources,(true,false,true));
+        Ok(())
+    }).unwrap();
+    let snapshot = store.build_snapshot(now as f64).unwrap();
+    assert!(
+        striatum_core::route_state_store::route_cooled(
+            None,
+            &snapshot,
+            "migrated-reach/before",
+            "migrated-reach/before",
+            now as f64
+        ),
+        "migration must not make a route usable beneath the still-active provider wall"
+    );
+    store
+        .account_transaction(|tx| {
+            tx.heal_serving_fences(
+                "migrated-reach",
+                "account",
+                "credential",
+                "before",
+                None,
+                now + 1,
+                now + 2,
+            )
+        })
+        .unwrap();
+    let healed = store.build_snapshot((now + 2) as f64).unwrap();
+    assert!(!striatum_core::route_state_store::route_cooled(
+        None,
+        &healed,
+        "migrated-reach/before",
+        "migrated-reach/before",
+        (now + 2) as f64
+    ));
+}
