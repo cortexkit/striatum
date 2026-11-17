@@ -13,6 +13,10 @@ struct Pair {
 
 impl Pair {
     fn new(expired: bool) -> Self {
+        Self::with_prior_catalogue_route(expired, false)
+    }
+
+    fn with_prior_catalogue_route(expired: bool, prior_route: bool) -> Self {
         let scratch = cortexkit_test_support::ScratchDir::new("derived-provider-snapshot");
         let old = crate::dev_descriptor(
             "old-provider-snapshot",
@@ -37,6 +41,10 @@ impl Pair {
         let deadline = if expired { now - 60_000 } else { now + 60_000 };
         for store in [&legacy, &staged] {
             store.with_writer_for_test(|conn| {
+                if prior_route {
+                    conn.execute("INSERT INTO model_facts(route_key,capacity_key,provider_id,model_id,scores_json,confidence,updated_at)
+                        VALUES ('derived/before','derived/before','derived','before','{}','curated',?1)", [now-200])?;
+                }
                 conn.execute("INSERT INTO provider_cooldown_state(provider_key,cooldown_until,quota_exhausted_until,wall_class,wall_unscoped,wall_observed_at,last_error,last_error_at,updated_at)
                     VALUES ('derived',?1,?2,'billing',1,?3,'provider-capacity',?3,?3)", rusqlite::params![deadline, deadline + 10_000, evidence_at])?;
                 conn.execute("INSERT INTO model_route_state(route_key,capacity_key,provider_id,model_id,cooldown_until,wall_unscoped,wall_observed_at,last_error,last_error_at,updated_at)
@@ -279,5 +287,21 @@ fn route_minted_after_provider_expiry_is_not_blocked() {
         "derived/new",
         pair.now as f64
     ));
+    pair.assert_no_stored_inheritance();
+}
+
+#[test]
+fn provider_projection_does_not_retroactively_inherit_an_existing_catalogue_row() {
+    let pair = Pair::with_prior_catalogue_route(false, true);
+    pair.insert_catalogue();
+    let snapshot = pair.compare_frozen(pair.now);
+    let before = &snapshot.by_route["derived/before"];
+    assert_eq!(before.cooldown_until, None);
+    assert_eq!(before.quota_exhausted_until, None);
+    assert_eq!(before.wall_class, None);
+    assert_eq!(
+        snapshot.by_route["derived/new"].cooldown_until,
+        Some(pair.deadline as f64)
+    );
     pair.assert_no_stored_inheritance();
 }
