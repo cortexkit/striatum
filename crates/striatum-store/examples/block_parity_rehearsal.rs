@@ -80,9 +80,38 @@ fn blocks_parity_rehearsal_clones_without_touching_source() {
     let before = std::fs::read(&source).unwrap();
     let report = rehearse(&source, &scratch.path().join("rehearsal"), now).unwrap();
     assert!(report.differences.is_empty(), "{report:#?}");
-    assert_eq!(report.active, 14);
+    // There are fourteen source kinds and two account origins: one ordinary
+    // fence and one whose two recovery pools have only been partly proved.
+    assert_eq!(report.active, 15);
     assert_eq!(report.cleared_evidence, 1);
     assert!(report.identities > 0 && report.function_comparisons > 0);
+    let migrated = SqliteRouteStateStore::open(&dev_descriptor(
+        "block-parity-reloaded",
+        scratch.path().join("rehearsal/state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    let loaded = migrated.load_blocks(now).unwrap();
+    assert_eq!(
+        loaded.blocks.iter().map(|row| (row.kind.as_str(), row.origin_key.as_str())).collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from([
+            ("account", r#"["parity-fence"]"#),
+            ("account", r#"["parity-recovery"]"#),
+            ("credential", r#"["cpu-provider-0","oauth:cpu-0"]"#),
+            ("account_route", r#"["cpu-provider-0","oauth:cpu-0","model-0"]"#),
+            ("non_quota_route", r#"["cpu-provider-0","oauth:cpu-0","model-0"]"#),
+            ("transient_route", r#"["cpu-provider-0","oauth:cpu-0","model-0"]"#),
+            ("pool_billing", r#"["cpu-provider-0","oauth:cpu-0"]"#),
+            ("pool_rate", r#"["cpu-provider-0","oauth:cpu-0"]"#),
+            ("provider", r#"["cpu-provider-0"]"#),
+            ("route", r#"["parity/route"]"#),
+            ("failure", r#"["parity/route"]"#),
+            ("size", r#"["cpu-provider-0","oauth:cpu-0","model-0",17]"#),
+            ("non_quota_size", r#"["cpu-provider-0","oauth:cpu-0","model-0",17]"#),
+            ("principal", r#"["parity-principal","parity-admission","oauth:cpu-0"]"#),
+            ("observation", r#"["cpu-provider-0","account-0"]"#),
+        ]),
+        "all fifteen origin identities, including both account fences, survive migration and reload",
+    );
     assert_eq!(std::fs::read(source).unwrap(), before);
     println!("synthetic copy rehearsal: {report:?}");
 }
