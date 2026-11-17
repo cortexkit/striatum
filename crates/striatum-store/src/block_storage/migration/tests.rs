@@ -6,6 +6,9 @@ mod clock_normalization;
 #[path = "observation_receipts/tests.rs"]
 mod observation_receipts;
 
+#[path = "claim_generation/tests.rs"]
+mod claim_generation;
+
 fn migration_function_is_absent(conn: &Connection) {
     let error = conn
         .query_row(
