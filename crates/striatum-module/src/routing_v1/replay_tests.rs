@@ -78,93 +78,11 @@ fn merge(target: &mut Value, patch: &Value) {
     }
 }
 
+#[path = "replay_tests/native_state/tests.rs"]
+mod native_state;
+
 pub(super) fn persistent_effects(harness: &Harness) -> Value {
-    let connection = rusqlite::Connection::open(harness.store_path()).unwrap();
-    let mut names = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
-        .unwrap();
-    let names = names
-        .query_map([], |row| row.get::<_, String>(0))
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    let mut tables = serde_json::Map::new();
-    for name in names {
-        if name.starts_with("sqlite_")
-            || ![
-                "state",
-                "fence",
-                "affinity",
-                "admission",
-                "usage",
-                "report",
-                "continuation",
-                "block",
-                "cooldown",
-                "lease",
-                "pin",
-                "decision",
-            ]
-            .iter()
-            .any(|part| name.contains(part))
-        {
-            continue;
-        }
-        let mut statement = connection
-            .prepare(&format!("SELECT * FROM \"{}\"", name.replace('"', "\"\"")))
-            .unwrap();
-        let columns: Vec<String> = statement
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut rows = statement
-            .query_map([], |row| {
-                let mut object = serde_json::Map::new();
-                for (index, column) in columns.iter().enumerate() {
-                    let value = match row.get_ref(index)? {
-                        ValueRef::Null => Value::Null,
-                        ValueRef::Integer(value) => json!(value),
-                        ValueRef::Real(value) => json!(value),
-                        ValueRef::Text(value) => {
-                            let text = std::str::from_utf8(value).unwrap();
-                            serde_json::from_str(text).unwrap_or_else(|_| json!(text))
-                        }
-                        ValueRef::Blob(value) => json!(value),
-                    };
-                    object.insert(column.clone(), value);
-                }
-                Ok(Value::Object(object))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        // The store seeds neutral state for its bundled catalog. Omit only
-        // those untouched rows; every non-neutral health or wall field remains
-        // in the oracle, including any new field a later migration adds.
-        if name == "model_route_state" {
-            rows.retain(|row| {
-                !row.as_object()
-                    .unwrap()
-                    .iter()
-                    .all(|(field, value)| match field.as_str() {
-                        "route_key" | "capacity_key" | "provider_id" | "model_id" | "variant" => {
-                            true
-                        }
-                        "updated_at"
-                        | "consecutive_terminal_failures"
-                        | "failure_count"
-                        | "quota_error_count"
-                        | "wall_unscoped" => value == 0,
-                        "wall_observed_at" | "failure_observed_at" => value.is_null() || value == 0,
-                        _ => value.is_null(),
-                    })
-            });
-        }
-        rows.sort_by_key(Value::to_string);
-        tables.insert(name, json!(rows));
-    }
-    Value::Object(tables)
+    native_state::snapshot(harness)
 }
 
 pub(super) fn normalize_paths(value: Value, harness: &Harness) -> Value {
