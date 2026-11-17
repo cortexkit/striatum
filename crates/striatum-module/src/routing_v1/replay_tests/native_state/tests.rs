@@ -275,3 +275,120 @@ fn replay_state_schema_requires_every_table_to_be_explicitly_classified() {
     }
     check_tables(&conn).unwrap();
 }
+
+/// Preserve complete physical state while the historical wire-shape comparison
+/// projects additive response fields. Native expectations come from independent
+/// pinned-main SQL frames migrated through the real block migration.
+pub(super) struct ReplayStates {
+    observed: BTreeMap<String, Value>,
+    expected: BTreeMap<String, Value>,
+}
+
+fn is_state_frame(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.contains_key("model_route_state") && object.contains_key("routing_v1_decision")
+    })
+}
+
+fn collect_state_frames(value: &Value, path: &str, frames: &mut BTreeMap<String, Value>) {
+    if is_state_frame(value) {
+        assert!(frames.insert(path.to_string(), value.clone()).is_none());
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                collect_state_frames(value, &format!("{path}.{key}"), frames);
+            }
+        }
+        Value::Array(array) => {
+            for (index, value) in array.iter().enumerate() {
+                collect_state_frames(value, &format!("{path}[{index}]"), frames);
+            }
+        }
+        _ => {}
+    }
+}
+
+pub(super) fn capture_for_comparison(file: &str, observed: &Value) -> Option<ReplayStates> {
+    let count = match file {
+        "report-outcomes" => 17,
+        "availability" => 78,
+        "tier-consumers" => 4,
+        _ => return None,
+    };
+    assert!(std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_none(),
+        "historical wire recordings stay frozen; derive native state from the independent main reference");
+    let path = Path::new(ROOT).join(format!("{file}.native-096-state.golden.json"));
+    let golden: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(golden["schema_version"], 96);
+    assert_eq!(
+        golden["reference_commit"],
+        "445f292b6285a635d041f0f23fe0c9d81d0fe18b"
+    );
+    let expected = golden["frames"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(path, state)| (path.clone(), state.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut captured = BTreeMap::new();
+    collect_state_frames(observed, "$", &mut captured);
+    assert_eq!(captured.len(), count);
+    assert_eq!(
+        captured.keys().collect::<Vec<_>>(),
+        expected.keys().collect::<Vec<_>>()
+    );
+    let included = INCLUDED_TABLES.iter().copied().collect::<BTreeSet<_>>();
+    for state in expected.values().chain(captured.values()) {
+        assert_eq!(
+            state
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>(),
+            included
+        );
+    }
+    Some(ReplayStates {
+        observed: captured,
+        expected,
+    })
+}
+
+fn restore_state_frames(
+    value: &mut Value,
+    path: &str,
+    frames: &BTreeMap<String, Value>,
+    seen: &mut BTreeSet<String>,
+) {
+    if is_state_frame(value) {
+        *value = frames.get(path).unwrap().clone();
+        assert!(seen.insert(path.to_string()));
+        return;
+    }
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                restore_state_frames(value, &format!("{path}.{key}"), frames, seen);
+            }
+        }
+        Value::Array(array) => {
+            for (index, value) in array.iter_mut().enumerate() {
+                restore_state_frames(value, &format!("{path}[{index}]"), frames, seen);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ReplayStates {
+    pub(super) fn restore_after_wire_projection(self, observed: &mut Value, expected: &mut Value) {
+        for (document, frames) in [(observed, &self.observed), (expected, &self.expected)] {
+            let mut seen = BTreeSet::new();
+            restore_state_frames(document, "$", frames, &mut seen);
+            assert_eq!(seen, frames.keys().cloned().collect::<BTreeSet<_>>());
+        }
+    }
+}

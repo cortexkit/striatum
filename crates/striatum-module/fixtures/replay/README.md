@@ -148,3 +148,9 @@ cargo nextest run --locked -p striatum-module --bin ck-striatum -E 'test(/^routi
 The panel, tier-consumer, model-fact and renderer recorders also have `replay_`
 in their test names, under their own modules. Filter those names explicitly;
 do not run a whole package.
+
+## Native persisted-state recordings
+
+`report-outcomes`, `availability` and `tier-consumers` retain their historical wire goldens. Their sibling `*.native-096-state.golden.json` files hold complete physical state for every recorded frame, including all four block tables and the frozen audit tables. The reference is the actual pre-cutover main commit `445f292b6285a635d041f0f23fe0c9d81d0fe18b`: its raw schema-095 SQL rows, storage classes and rowids were captured during the same replays, then passed through registered migration 096. Fresh-store frozen audit baselines and declared null/zero frozen-column defaults are the only storage-baseline adjustments; the files record their source and policy hashes.
+
+The historical response projections still govern wire comparisons. Complete native state is captured before those projections and restored on both sides of the final equality, so the old projections cannot hide a newly persisted column or table. Runtime guards also compare raw frozen audit rows to each fixture's initial migrated baseline at every frame. The recording environment flag refuses these three cases: update their native expectations from an independent reference, never by recording the implementation being tested.

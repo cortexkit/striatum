@@ -172,6 +172,7 @@ async fn replay(file: &str) {
 }
 
 pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
+    let native_frames = native_state::capture_for_comparison(file, &observed);
     let golden = Path::new(ROOT).join(format!("{file}.golden.json"));
     if std::env::var_os("PREFRONTAL_RECORD_ROUTING_REPLAY").is_some()
         || (file == "availability-public"
@@ -246,6 +247,9 @@ pub(crate) fn assert_or_record(file: &str, mut observed: Value) {
         project_additive_shape_members(&mut expected);
         if file == "availability" {
             apply_availability_difference(&mut expected);
+        }
+        if let Some(frames) = native_frames {
+            frames.restore_after_wire_projection(&mut observed, &mut expected);
         }
         assert!(
             observed == expected,
