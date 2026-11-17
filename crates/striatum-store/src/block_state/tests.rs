@@ -5503,7 +5503,7 @@ fn route_source_order_bookkeeping_does_not_exempt_unkeyed_or_request_reads() {
     let expected = near_miss.clone();
     rig.store
         .account_command(AccountCommandKind::Maintenance, move |tx| {
-            tx.pool_sql(&|conn| {
+            tx.pool_sql(&|conn: &rusqlite::Connection| {
                 conn.prepare(&near_miss)?
                     .query_map([], |row| row.get::<_, i64>(0))?
                     .collect::<rusqlite::Result<Vec<_>>>()?;

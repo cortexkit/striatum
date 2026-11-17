@@ -398,7 +398,7 @@ async fn route_order_lookup_never_runs_during_select_or_account_check() {
     use striatum_core::RouteStateStore;
     let _clock = crate::InjectedClock::set(NOW as u64);
     let _inputs = striatum_store::replay::Inputs::new(NOW).install();
-    let (harness, mut caller) = configured().await;
+    let (harness, caller) = configured().await;
     let trace = harness.store().trace_block_reads_for_test().unwrap();
     harness
         .store()
@@ -449,7 +449,7 @@ async fn route_order_lookup_never_runs_during_select_or_account_check() {
         .await;
     assert!(selected["result"]["decision_id"].is_string(), "{selected}");
     verify_request("route.select");
-    let mut runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
     let (_, account) = runner
         .call(
             "route.account_for",
