@@ -118,6 +118,19 @@ impl crate::AccountTx<'_> {
                     |row| row.get::<_, bool>(0),
                 )?;
                 if eligible {
+                    // These origins used to live in the route row. End their
+                    // sources and clocks before deleting that catalogue row so
+                    // rediscovering the route cannot restore those old refusals.
+                    let key = serde_json::json!([route]).to_string();
+                    for kind in ["route", "failure"] {
+                        crate::block_storage::remove_source(
+                            tx,
+                            kind,
+                            &key,
+                            crate::now_ms(),
+                            "catalogue prune",
+                        )?;
+                    }
                     tx.execute("DELETE FROM model_route_state WHERE route_key=?1", [route])?;
                     tx.execute("DELETE FROM model_facts WHERE route_key=?1", [route])?;
                 }
