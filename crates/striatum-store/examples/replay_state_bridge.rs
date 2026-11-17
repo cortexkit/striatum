@@ -1,6 +1,9 @@
 //! Reconstruct recorded replay rows in schema 095, then apply registered 096.
 //! Missing clock history and original rowids stay declared unknown; this tool
 //! produces derivation evidence, never accepted expectations from live output.
+#[path = "replay_state_bridge/raw.rs"]
+mod raw;
+
 use rusqlite::{
     params_from_iter,
     types::{Value as SqlValue, ValueRef},
@@ -151,7 +154,11 @@ fn run_frame(frame: &Value, work: &Path) -> Result<Value> {
         work.join("store.db").to_string_lossy(),
     );
     let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95)?;
-    let provenance = seed(&old, &frame["tables"])?;
+    let provenance = if frame.get("sqlite_rows").is_some() {
+        raw::seed(&old, &frame["sqlite_rows"])?
+    } else {
+        seed(&old, &frame["tables"])?
+    };
     if !provenance["recorded_column_roundtrip_differences"]
         .as_array()
         .ok_or("missing roundtrip results")?
@@ -257,5 +264,58 @@ mod tests {
         );
         assert_eq!(result["accepted_as_expectation"], false);
         assert_eq!(result["clock_overridden"], false);
+    }
+
+    #[test]
+    fn captured_sql_cells_and_source_rowid_survive_the_real_bridge() {
+        let source = cortexkit_test_support::ScratchDir::new("replay-bridge-raw-source");
+        let descriptor = striatum_store::dev_descriptor(
+            "raw-source",
+            source.path().join("store.db").to_string_lossy(),
+        );
+        let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
+        let at = 1_900_000_000_000i64;
+        old.with_writer_for_test(|conn| {
+            conn.execute("DELETE FROM model_route_state", [])?;
+            conn.execute(
+                "INSERT INTO model_route_state(rowid,route_key,capacity_key,provider_id,model_id,updated_at,cooldown_until,wall_observed_at,last_error)
+                 VALUES(41,'raw-provider/model','raw-provider/model','raw-provider','model',?1,?2,?1,?3)",
+                rusqlite::params![at, at + 60_000, "{\"why\":\"overload\"}"],
+            )?;
+            Ok(())
+        }).unwrap();
+        let captured = old
+            .with_reader_for_test(|conn| {
+                raw::rows(conn, "model_route_state")
+                    .map_err(rusqlite::Error::ToSqlConversionFailure)
+            })
+            .unwrap();
+        assert_eq!(captured[0]["rowid"], 41);
+        assert_eq!(
+            captured[0]["cells"]["last_error"],
+            json!({"type":"text","value":"{\"why\":\"overload\"}"})
+        );
+        let frame = json!({"group":"raw-synthetic","path":"$.state","sqlite_rows":{"model_route_state":captured}});
+        let destination = cortexkit_test_support::ScratchDir::new("replay-bridge-raw-destination");
+        let result = run_frame(&frame, destination.path()).unwrap();
+        assert_eq!(
+            result["status"], "actual registered095to096 bridge; provenance limits apply",
+            "{result}"
+        );
+        assert!(
+            result["provenance"]["recorded_column_roundtrip_differences"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            result["provenance"]["raw_sql_storage_classes_preserved"],
+            true
+        );
+        let blocks = result["tables"]["block"].as_array().unwrap();
+        let route = blocks.iter().find(|row| row["kind"] == "route").unwrap();
+        assert_eq!(route["source_order"], 41);
+        assert_eq!(route["cooldown_until"], at + 60_000);
+        assert_eq!(route["scope_error"], json!({"why":"overload"}));
     }
 }
