@@ -578,6 +578,10 @@ impl AccountTx<'_> {
         principal: &str,
         id: &str,
     ) -> RouteStateResult<Option<(AccountAdmissionRow, bool)>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::fork_parent_by_key",
+        );
         self.conn
             .query_row(&fork_parent_sql(), params![principal, id], |row| {
                 Ok((
@@ -595,6 +599,10 @@ impl AccountTx<'_> {
         principal: &str,
         id: &str,
     ) -> RouteStateResult<Option<AccountAdmissionRow>> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::state_rows::fork_used_binding_by_key",
+        );
         self.conn
             .query_row(
                 &fork_used_binding_sql(),

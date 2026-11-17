@@ -64,6 +64,7 @@ impl World {
             .find(|row| row.provider == fixture::SUBSCRIPTION_PROVIDER)
             .unwrap();
         let (account, credential) = (first.account_id.clone(), first.credential_id.clone());
+        self.delete_unkeyed_admission(&account, &credential, at, before, now);
         let sequence = self.sequence;
         for index in 0..2 {
             let (pin, row) = crate::account_state::pinned_admission_for_route(
@@ -112,5 +113,57 @@ impl World {
             );
         }
         self.witness("retention_delete");
+    }
+
+    fn delete_unkeyed_admission(
+        &mut self,
+        account: &str,
+        credential: &str,
+        at: i64,
+        before: i64,
+        now: i64,
+    ) {
+        let (pin, row) = crate::account_state::pinned_admission_for_route(
+            &format!("reserved:{}", fixture::RUNNER_ONE),
+            &format!("unkeyed-prune-{}", self.sequence),
+            fixture::SUBSCRIPTION_PROVIDER,
+            "model-c",
+            account,
+            credential,
+            at,
+        );
+        let principal = row.principal.clone();
+        let admission = row.admission_id.clone();
+        self.command("retention/unkeyed finished admission input", move |tx| {
+            tx.insert_pin(&pin)?;
+            tx.insert_admission(&row)?;
+            assert!(tx.mark_admission_finished(&row.principal, &row.admission_id, at + 1)?);
+            Ok(())
+        });
+        // The adapter deletes preselected row identities. This facade selects
+        // eligible rows itself, so give it a real deletion rather than a no-op.
+        assert_eq!(
+            self.command("retention/unkeyed admission facade", move |tx| {
+                tx.prune_account_admissions(before, 1, now)
+            }),
+            1
+        );
+        self.command("retention/unkeyed target is gone", move |tx| {
+            assert!(tx.admission(&principal, &admission)?.is_none());
+            Ok(())
+        });
+        assert_eq!(
+            self.adapter("retention/remove the unkeyed witness pin", |store| {
+                writer::prune_account_pins(store, before, 1)
+            }),
+            1
+        );
+        assert!(
+            self.trace.entries().iter().any(|entry| {
+                entry.name == "account_command::prune_account_admissions"
+                    && entry.account_rows_written.is_some_and(|rows| rows > 0)
+            }),
+            "the actual unkeyed facade must delete durable rows"
+        );
     }
 }

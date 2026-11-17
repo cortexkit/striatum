@@ -81,6 +81,24 @@ impl World {
         self.adapter("fence/clear credential routes", |store| {
             writer::clear_all_account_route_fences_for_credential(store, &credential)
         });
+        let mut recovered = route.clone();
+        recovered.recorded_at = now + 2;
+        self.adapter("fence/model recovery source", |store| {
+            writer::record_account_route_fence(store, &recovered)
+        });
+        let (p, c) = (provider.clone(), credential.clone());
+        assert_eq!(
+            self.command("fence/clear only the recovered model", move |tx| {
+                striatum_store::AccountTx::clear_account_route_fence_before(
+                    tx,
+                    &p,
+                    &c,
+                    "model-c",
+                    now + 3,
+                )
+            }),
+            1
+        );
         let size = AccountSizeRefusal {
             provider: provider.clone(),
             credential_id: credential.clone(),

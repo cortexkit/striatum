@@ -893,6 +893,9 @@ impl AccountCommand<'_> {
         &mut self,
         row: &striatum_store::AccountObservationRow,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::insert_observation");
         self.sql.insert_observation(row)?;
         if row.kind != striatum_core::route_state_store::SIGNED_OUT_FENCE_CODE {
             return Ok(());
@@ -926,6 +929,9 @@ impl AccountCommand<'_> {
         bound: bool,
         effects_json: &str,
     ) -> RouteStateResult<()> {
+        #[cfg(test)]
+        let _writer_entry =
+            striatum_store::writer_entry_trace::enter("account_command::set_observation_effects");
         self.sql
             .set_observation_effects(observation_id, bound, effects_json)?;
         if bound {

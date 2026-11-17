@@ -746,11 +746,17 @@ impl AccountTx<'_> {
         model: &str,
         reading_at: i64,
     ) -> RouteStateResult<usize> {
+        #[cfg(any(test, feature = "test-support"))]
+        let _writer_entry = crate::writer_entry_trace::enter(
+            "account_tx::account_selection::clear_account_route_fence_before",
+        );
+        // The recovered reading justifies this clear. Keep its captured time
+        // as both the evidence cutoff and the audit stamp, without a new clock.
         self.conn
             .execute(
-                "DELETE FROM account_route_fence
-            WHERE provider=?1 AND credential_id=?2 AND model=?3
-            AND COALESCE(last_reported_at,recorded_at)<?4",
+                "UPDATE block SET source_present=0,cleared_at=?4,cleared_by='removed',claim_owner=NULL
+                 WHERE kind='account_route' AND source_present=1 AND provider=?1 AND credential_id=?2 AND model=?3
+                 AND COALESCE(last_reported_at,recorded_at)<?4",
                 params![provider, credential, model, reading_at],
             )
             .map_err(err)
