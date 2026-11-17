@@ -1020,11 +1020,7 @@ impl BlockState {
     ) -> striatum_core::RouteStateResult<striatum_core::model_router::ModelRouteStateSnapshot> {
         let mut rows = Vec::new();
         for (rowid, record) in self.rows(6) {
-            let Record::Route {
-                provider,
-                row: telemetry,
-            } = record
-            else {
+            let Record::Route { row: telemetry, .. } = record else {
                 continue;
             };
             let key = serde_json::json!([telemetry.route_key]).to_string();
@@ -1034,9 +1030,11 @@ impl BlockState {
             // evidence when present; an explicit provider-model clear prevents
             // inheritance from the provider block.
             let wall = wall.or_else(|| {
+                let provider =
+                    striatum_core::model_facts::derive_provider_key(&telemetry.route_key)?;
                 let model = telemetry
                     .capacity_key
-                    .strip_prefix(provider.as_str())
+                    .strip_prefix(provider)
                     .and_then(|key| key.strip_prefix('/'))
                     .unwrap_or("");
                 self.block("provider", &serde_json::json!([provider]).to_string())

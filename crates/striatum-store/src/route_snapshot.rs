@@ -345,18 +345,76 @@ pub(crate) fn read_snapshot(
     recheck_now: i64,
 ) -> RouteStateResult<ModelRouteStateSnapshot> {
     let rechecks = fence_rechecks::read_effective_at(conn, recheck_now).map_err(crate::err)?;
-    // A route can have no source after an older refusal heals, not only when
-    // newly catalogued. The surviving provider still covers it. Derive those
-    // fields unless independent route evidence or a model clear applies.
-    let rows=conn.prepare_cached("SELECT m.route_key,m.capacity_key,COALESCE(b.cooldown_until,p.cooldown_until),COALESCE(b.quota_exhausted_until,p.quota_exhausted_until),
-        m.quota_pressure,m.latency_ema_ms,m.success_ema,f.deadline,f.reason,m.last_error,
-        CASE WHEN b.kind IS NOT NULL THEN b.wall_class WHEN p.kind IS NOT NULL THEN p.wall_class ELSE f.wall_class END,
-        CASE WHEN b.kind IS NOT NULL THEN b.wall_unscoped WHEN p.kind IS NOT NULL THEN p.wall_unscoped ELSE COALESCE(f.wall_unscoped,0) END
-        FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
-        LEFT JOIN block p ON p.kind='provider' AND p.origin_key=json_array(m.provider_id) AND p.is_origin=1 AND p.source_present=1
-            AND b.kind IS NULL
-            AND NOT EXISTS (SELECT 1 FROM json_each(p.cleared_models) WHERE value=m.model_id)
-        LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
-        ORDER BY m.rowid").map_err(crate::err)?.query_map([],|row|route_row_at(row,0)).map_err(crate::err)?.collect::<rusqlite::Result<Vec<_>>>().map_err(crate::err)?;
+    struct ProviderFields {
+        cooldown: Option<f64>,
+        quota: Option<f64>,
+        class: Option<String>,
+        unscoped: bool,
+        cleared_models: Vec<String>,
+    }
+    // Fetch both sets in one SQL statement, preserving route row order.
+    // derive_provider_key resolves each provider from the routing key;
+    // unrelated provider_id telemetry must not change another route's cause.
+    let (mut rows, providers) = (|| -> rusqlite::Result<_> {
+        let mut statement = conn.prepare_cached("SELECT 0 AS record_kind,m.rowid,m.route_key,m.capacity_key,b.cooldown_until,b.quota_exhausted_until,
+            m.quota_pressure,m.latency_ema_ms,m.success_ema,f.deadline,f.reason,m.last_error,
+            CASE WHEN b.kind IS NOT NULL THEN b.wall_class ELSE f.wall_class END,
+            CASE WHEN b.kind IS NOT NULL THEN b.wall_unscoped ELSE COALESCE(f.wall_unscoped,0) END,
+            b.kind IS NOT NULL,NULL
+            FROM model_route_state m LEFT JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key) AND b.is_origin=1 AND b.source_present=1
+            LEFT JOIN block f ON f.kind='failure' AND f.origin_key=json_array(m.route_key) AND f.is_origin=1 AND f.source_present=1
+            UNION ALL
+            SELECT 1,p.rowid,p.origin_key,NULL,p.cooldown_until,p.quota_exhausted_until,
+            NULL,NULL,NULL,NULL,NULL,NULL,p.wall_class,p.wall_unscoped,0,p.cleared_models
+            FROM block p WHERE p.kind='provider' AND p.is_origin=1 AND p.source_present=1
+            ORDER BY record_kind,2")?;
+        let mut cursor = statement.query([])?;
+        let mut rows = Vec::new();
+        let mut providers = HashMap::<String, ProviderFields>::new();
+        while let Some(row) = cursor.next()? {
+            if row.get::<_, i64>(0)? == 0 {
+                rows.push((route_row_at(row, 2)?, row.get::<_, bool>(14)?));
+            } else {
+                let cleared: String = row.get(15)?;
+                let cleared_models = serde_json::from_str(&cleared).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, Box::new(error))
+                })?;
+                providers.insert(row.get(2)?, ProviderFields {
+                    cooldown: row.get(4)?, quota: row.get(5)?, class: row.get(12)?,
+                    unscoped: row.get(13)?, cleared_models,
+                });
+            }
+        }
+        Ok((rows, providers))
+    })().map_err(crate::err)?;
+    for (row, own_wall) in &mut rows {
+        if *own_wall {
+            continue;
+        }
+        let Some(provider) = derive_provider_key(&row.route_key) else {
+            continue;
+        };
+        let key = serde_json::json!([provider]).to_string();
+        let Some(source) = providers.get(&key) else {
+            continue;
+        };
+        let model = row
+            .capacity_key
+            .strip_prefix(provider)
+            .and_then(|key| key.strip_prefix('/'))
+            .unwrap_or("");
+        if source
+            .cleared_models
+            .iter()
+            .any(|cleared| cleared.as_str() == model)
+        {
+            continue;
+        }
+        row.cooldown_until = source.cooldown;
+        row.quota_exhausted_until = source.quota;
+        row.wall_class = source.class.clone();
+        row.wall_unscoped = source.unscoped;
+    }
+    let rows: Vec<_> = rows.into_iter().map(|(row, _)| row).collect();
     overlay(&rows, &rechecks, true, now)
 }
