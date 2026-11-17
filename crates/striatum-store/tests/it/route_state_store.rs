@@ -699,7 +699,7 @@ fn contract_errors_preserve_route_failures_and_record_contract_quality() {
     let conn = rusqlite::Connection::open(rig.db_path()).unwrap();
     let route_state = || {
         conn.query_row(
-        "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+        "SELECT m.consecutive_terminal_failures, m.failure_count, b.deadline, b.reason FROM model_route_state m LEFT JOIN block b ON b.kind='failure' AND b.origin_key=json_array(m.route_key) AND b.source_present=1 WHERE m.route_key=?1",
         [ROUTE], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?, row.get::<_, Option<String>>(3)?))
     ).unwrap()
     };
@@ -832,7 +832,7 @@ fn request_invalid_does_not_reset_genuine_failures_or_existing_backoff() {
             attempt * 2,
         );
         let before: (i64, i64, Option<f64>, Option<String>) = conn.query_row(
-            "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+            "SELECT m.consecutive_terminal_failures, m.failure_count, b.deadline, b.reason FROM model_route_state m LEFT JOIN block b ON b.kind='failure' AND b.origin_key=json_array(m.route_key) AND b.source_present=1 WHERE m.route_key=?1",
             [ROUTE], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
         ).unwrap();
         assert_eq!(before.0, attempt);
@@ -851,7 +851,7 @@ fn request_invalid_does_not_reset_genuine_failures_or_existing_backoff() {
             attempt * 2 + 1,
         );
         let after = conn.query_row(
-            "SELECT consecutive_terminal_failures, failure_count, failure_backoff_until, failure_backoff_reason FROM model_route_state WHERE route_key=?1",
+            "SELECT m.consecutive_terminal_failures, m.failure_count, b.deadline, b.reason FROM model_route_state m LEFT JOIN block b ON b.kind='failure' AND b.origin_key=json_array(m.route_key) AND b.source_present=1 WHERE m.route_key=?1",
             [ROUTE], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<f64>>(2)?, row.get::<_, Option<String>>(3)?))
         ).unwrap();
         assert_eq!(
@@ -1592,7 +1592,7 @@ fn wall_classes_round_trip_and_a_null_legacy_class_keeps_break_glass_behavior() 
     let raw: String = rusqlite::Connection::open(rig.db_path())
         .unwrap()
         .query_row(
-            "SELECT wall_class FROM model_route_state WHERE route_key='p/quota'",
+            "SELECT wall_class FROM block WHERE kind='route' AND source_present=1 AND origin_key=json_array('p/quota')",
             [],
             |row| row.get(0),
         )
