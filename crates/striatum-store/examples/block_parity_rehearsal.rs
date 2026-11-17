@@ -80,8 +80,9 @@ fn blocks_parity_rehearsal_clones_without_touching_source() {
     let before = std::fs::read(&source).unwrap();
     let report = rehearse(&source, &scratch.path().join("rehearsal"), now).unwrap();
     assert!(report.differences.is_empty(), "{report:#?}");
-    // There are fourteen source kinds and two account origins: one ordinary
-    // fence and one whose two recovery pools have only been partly proved.
+    // There are fourteen source kinds and two account origins. The second
+    // account-wide refusal stays active: only one of its two quota pools has
+    // a recorded successful probe.
     assert_eq!(report.active, 15);
     assert_eq!(report.cleared_evidence, 1);
     assert!(report.identities > 0 && report.function_comparisons > 0);
