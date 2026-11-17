@@ -856,6 +856,42 @@ impl BlockState {
             .collect()
     }
 
+    /// Current test authorizations for these exact origins, ordered by owner and
+    /// origin. Old evidence, superseded generations and cleared clocks do not
+    /// describe an in-flight test.
+    pub fn probe_authorizations_for_origins(
+        &self,
+        origins: &[crate::FenceRecheck],
+    ) -> Vec<ProbeAuthorization> {
+        let mut rows: Vec<_> = self
+            .authorizations()
+            .filter(|row| {
+                origins.iter().any(|origin| {
+                    origin.kind == row.kind
+                        && origin.origin_key == row.origin_key
+                        && origin.evidence == row.evidence
+                        && origin.evidence_at == row.evidence_at
+                }) && self
+                    .clock(&row.kind, &row.origin_key)
+                    .is_some_and(|(clock, cleared)| {
+                        cleared.is_none()
+                            && clock.evidence == row.evidence
+                            && clock.evidence_at == row.evidence_at
+                            && clock.claim_generation == row.claim_generation
+                            && clock
+                                .claim_owner
+                                .as_ref()
+                                .is_none_or(|owner| owner == &row.owner)
+                    })
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| {
+            (&a.owner, &a.kind, &a.origin_key).cmp(&(&b.owner, &b.kind, &b.origin_key))
+        });
+        rows
+    }
+
     pub fn authorizations_of(&self, owner: &str) -> Vec<ProbeAuthorization> {
         let mut rows: Vec<_> = self
             .authorizations()

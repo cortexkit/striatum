@@ -344,6 +344,17 @@ impl Published<'_> {
         }
     }
 
+    pub(crate) fn probe_authorizations_for_origins(
+        &self,
+        origins: &[FenceRecheck],
+    ) -> RouteStateResult<Vec<striatum_store::ProbeAuthorization>> {
+        read!(
+            self.blocks(),
+            self.sql(|tx| tx.probe_authorizations_for_origins(origins)),
+            |blocks| blocks.probe_authorizations_for_origins(origins)
+        )
+    }
+
     /// The route-state snapshot at `now`. Its probe clocks are evaluated at
     /// the wall clock, as the store's SQL `build_snapshot` evaluates them.
     pub(crate) fn route_state_snapshot(
