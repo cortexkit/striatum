@@ -7,6 +7,51 @@ fn config(value: serde_json::Value) -> LiveConfig {
 }
 
 #[test]
+fn prefrontal_rename_slot_rules_use_new_consumer_roots() {
+    let error = parse_config(r#"{"consumers":{"synthesizer":{"pin":{"model":"p/m"}}},"providers":{"p":{"not_for":["prefrontal.athena"]}}}"#).unwrap_err();
+    assert!(error.contains("prefrontal.athena"), "{error}");
+}
+
+#[test]
+fn prefrontal_rename_both_consumer_spellings_are_refused_with_both_keys() {
+    let error = parse_config(r#"{"consumers":{"prefrontal-core.mason":{},"prefrontal.mason":{}}}"#)
+        .unwrap_err();
+    assert!(
+        error.contains("prefrontal-core.mason") && error.contains("prefrontal.mason"),
+        "{error}"
+    );
+}
+
+#[test]
+fn prefrontal_rename_explicit_enrollment_is_not_rewritten() {
+    let config = parse_config(r#"{"pin_origin_callers":["reserved:prefrontal-core"]}"#).unwrap();
+    assert_eq!(config.pin_origin_callers, ["reserved:prefrontal-core"]);
+    assert!(LiveConfig::new(config, None).honours_pin_origin("reserved:prefrontal"));
+    assert!(
+        !self::config(json!({"pin_origin_callers":[]})).honours_pin_origin("reserved:prefrontal")
+    );
+}
+
+#[test]
+fn prefrontal_rename_mason_defaults_and_explicit_pin_callers() {
+    let config = config(json!({"pin_origin_callers":["reserved:operator"]}));
+    assert_eq!(
+        config
+            .consumer_policy(
+                "prefrontal.mason.review",
+                &Default::default(),
+                &BTreeMap::new()
+            )
+            .below_bar,
+        Some(crate::config_policy::BelowBarPolicy::Refuse)
+    );
+    assert!(config.honours_pin_origin("reserved:operator"));
+    assert!(!config.honours_pin_origin("reserved:prefrontal"));
+    assert!(!config.honours_pin_origin("reserved:prefrontal-core"));
+    assert!(crate::select_policy::Consumer::from_id("prefrontal.mason").is_some());
+}
+
+#[test]
 fn below_bar_policy_defaults_and_inherits_per_consumer_key() {
     use crate::config_policy::BelowBarPolicy;
 

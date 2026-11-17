@@ -47,7 +47,7 @@ use tokio::sync::mpsc;
 
 use crate::{render_age, routing_v1, send, ModuleError, SharedStore};
 
-/// The operation name, shared with prefrontal-core's operation of the same
+/// The operation name, shared with prefrontal's operation of the same
 /// shape.
 pub(crate) const OP: &str = "diagnostics.findings";
 
@@ -832,10 +832,13 @@ fn refusal_hint(code: &str) -> String {
 }
 
 fn refusal_rate(evidence: &Evidence) -> Vec<Finding> {
-    let mut by_consumer: BTreeMap<&str, Vec<&DiagnosticDecision>> = BTreeMap::new();
+    let mut by_consumer: BTreeMap<std::borrow::Cow<'_, str>, Vec<&DiagnosticDecision>> =
+        BTreeMap::new();
     for decision in &evidence.decisions {
         by_consumer
-            .entry(decision.consumer.as_str())
+            .entry(striatum_core::module_identity::canonical(
+                &decision.consumer,
+            ))
             .or_default()
             .push(decision);
     }
@@ -956,15 +959,20 @@ fn iq_band(iq: Option<f64>) -> String {
 fn empty_candidate_sets(evidence: &Evidence) -> Vec<Finding> {
     // A head's model pin names one model on purpose, so it is no sign of a
     // thin candidate set.
-    let mut groups: BTreeMap<(&str, String), Vec<(&DiagnosticDecision, BTreeSet<&str>)>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<
+        (std::borrow::Cow<'_, str>, String),
+        Vec<(&DiagnosticDecision, BTreeSet<&str>)>,
+    > = BTreeMap::new();
     for decision in evidence
         .decisions
         .iter()
         .filter(|decision| !decision.pinned)
     {
         groups
-            .entry((decision.consumer.as_str(), iq_band(decision.iq)))
+            .entry((
+                striatum_core::module_identity::canonical(&decision.consumer),
+                iq_band(decision.iq),
+            ))
             .or_default()
             .push((
                 decision,
@@ -1505,6 +1513,34 @@ mod tests {
         let mut clean = empty();
         clean.account_blocks = vec![block("lapsed", NOW - MINUTE, None)];
         assert!(findings(&clean, CHECK_ROUTE_BLOCKS).is_empty());
+    }
+
+    #[test]
+    fn prefrontal_rename_diagnostic_populations_do_not_split_at_the_cut() {
+        let mut evidence = empty();
+        evidence.decisions = (0..10)
+            .map(|i| {
+                decision(
+                    &format!("d-{i}"),
+                    if i < 5 {
+                        "prefrontal-core.mason"
+                    } else {
+                        "prefrontal.mason"
+                    },
+                    NOW - MINUTE,
+                    None,
+                    &[],
+                    Some("not_available"),
+                    Some(40.0),
+                )
+            })
+            .collect();
+        let refused = refusal_rate(&evidence);
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].count, 10);
+        let thin = empty_candidate_sets(&evidence);
+        assert_eq!(thin.len(), 1);
+        assert_eq!(thin[0].count, 10);
     }
 
     #[test]

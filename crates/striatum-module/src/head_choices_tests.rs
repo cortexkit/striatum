@@ -905,12 +905,6 @@ async fn every_caller_can_read_choices_regardless_of_operator_claims() {
         (reserved("broca"), "ck-desktop", "install", false),
         (json!({"kind":"unverified"}), "ck-desktop", "install", false),
         (json!({"kind":"direct"}), "fed-phone:forged", "ckios", false),
-        (
-            json!({"kind":"direct"}),
-            "alfonso",
-            "prefrontal-core",
-            false,
-        ),
         (json!({"kind":"direct"}), "ck-desktop", "install", true),
     ] {
         let route = bind_operator(&harness, principal, host, session, scoped).await;

@@ -54,11 +54,7 @@ pub(super) fn honor(
     issues: &mut Vec<String>,
 ) -> bool {
     let name = &declaration.name;
-    if name == module
-        || name
-            .strip_prefix(module)
-            .is_some_and(|tail| tail.starts_with('.'))
-    {
+    if crate::config_policy::consumer_matches(module, name) {
         return true;
     }
     issues.push(format!(

@@ -60,7 +60,10 @@ impl ProfileSnapshot {
         let Some(bucket) = iq_bucket(iq) else {
             return RouteTaskProfiles::new();
         };
-        let Some(cell) = self.cells.get(&(workload.to_owned(), bucket)) else {
+        let Some(cell) = self.cells.get(&(
+            striatum_core::module_identity::canonical(workload).into_owned(),
+            bucket,
+        )) else {
             return RouteTaskProfiles::new();
         };
         let mut selected = RouteTaskProfiles::new();
@@ -157,7 +160,13 @@ fn build_cells(
                 })
                 .collect();
             if !cell.is_empty() {
-                snapshot.cells.insert((workload.to_owned(), bucket), cell);
+                snapshot.cells.insert(
+                    (
+                        striatum_core::module_identity::canonical(workload).into_owned(),
+                        bucket,
+                    ),
+                    cell,
+                );
             }
         }
     }
@@ -556,6 +565,31 @@ mod tests {
             new_cpu < 500_000,
             "aggregation exceeded 0.5s CPU: {new_cpu} us"
         );
+    }
+
+    #[test]
+    fn prefrontal_rename_snapshot_prices_new_requests_from_split_history() {
+        let rig = Rig::new("rename-snapshot");
+        let fact = rig.model("p", "sol");
+        for i in 0..40 {
+            rig.task(&format!("t-{i}"), "p", "sol", 75.0, (i + 1) as f64);
+        }
+        let mut rows = rig.store.closed_task_usage(NOW).unwrap();
+        for row in &mut rows {
+            row.workload = "prefrontal-core.mason".into();
+        }
+        let all_old = build_snapshot(&rows, std::slice::from_ref(&fact));
+        let expected = all_old.lookup("prefrontal-core.mason", 75.0, std::slice::from_ref(&fact));
+        assert_eq!(expected.len(), 1);
+        for row in &mut rows[20..] {
+            row.workload = "prefrontal.mason".into();
+        }
+        let mixed = build_snapshot(&rows, std::slice::from_ref(&fact));
+        assert_eq!(
+            mixed.lookup("prefrontal.mason", 75.0, std::slice::from_ref(&fact)),
+            expected
+        );
+        assert_eq!(all_old.lookup("prefrontal.mason", 75.0, &[fact]), expected);
     }
 
     #[test]

@@ -57,14 +57,26 @@ GROUP BY provider_id";
 // Windowing the sums themselves would lose old executions of recent tasks; the
 // final MAX must also see newer follow-ups that reopen a candidate task. Aggregate
 // before joining decisions so multiple executions cannot multiply token sums.
-const CLOSED_TASK_USAGE_SQL: &str = "
+static CLOSED_TASK_USAGE_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let workload = striatum_core::module_identity::workload_sql("task_workload");
+    let decision_workload = striatum_core::module_identity::workload_sql(
+        "COALESCE(consumer, selected_workload, target_agent)",
+    );
+    let alternate = striatum_core::module_identity::NEW;
+    let canonical = striatum_core::module_identity::OLD;
+    format!("
 WITH candidate_tasks AS (
     SELECT task_workload, task_id
     FROM model_route_usage INDEXED BY model_route_usage_observed_idx
     WHERE observed_at > ?1 AND observed_at <= ?2
       AND task_id IS NOT NULL AND task_workload IS NOT NULL
+), candidate_workloads AS (
+    SELECT task_workload, task_id FROM candidate_tasks
+    UNION SELECT {workload}, task_id FROM candidate_tasks
+    UNION SELECT '{alternate}' || substr(task_workload, {}), task_id FROM candidate_tasks
+          WHERE substr(task_workload,1,{})='{canonical}.' OR task_workload='{canonical}'
 ), usage_totals AS (
-    SELECT task_workload AS workload, task_id,
+    SELECT {workload} AS workload, task_id,
            SUM(CAST(input_tokens AS REAL)) AS fresh_input,
            SUM(CAST(cached_read_tokens AS REAL)) AS cached_read,
            SUM(CAST(cache_write_tokens AS REAL)) AS cache_write,
@@ -77,14 +89,14 @@ WITH candidate_tasks AS (
            COUNT(DISTINCT provider_id) > 1 AS multi_provider
     FROM model_route_usage INDEXED BY model_route_usage_task_idx
     WHERE task_id IS NOT NULL AND task_workload IS NOT NULL
-      AND (task_workload, task_id) IN (SELECT task_workload, task_id FROM candidate_tasks)
-    GROUP BY task_workload, task_id
+      AND (task_workload, task_id) IN (SELECT task_workload, task_id FROM candidate_workloads)
+    GROUP BY {workload}, task_id
     HAVING MAX(observed_at) > ?1 AND MAX(observed_at) <= ?2
 ), decisions AS (
-    SELECT task_id, COALESCE(consumer, selected_workload, target_agent) AS workload,
+    SELECT task_id, {decision_workload} AS workload,
            selected_model_id, selected_variant, requirements_json,
            ROW_NUMBER() OVER (
-               PARTITION BY COALESCE(consumer, selected_workload, target_agent), task_id
+                PARTITION BY {decision_workload}, task_id
                ORDER BY created_at, id
            ) AS ordinal
     FROM model_route_decisions INDEXED BY model_route_decisions_task_idx
@@ -108,7 +120,8 @@ SELECT u.workload, u.task_id,
 FROM usage_totals u
 JOIN decisions d ON d.task_id = u.task_id AND d.workload = u.workload AND d.ordinal = 1
 JOIN model_counts m ON m.task_id = u.task_id AND m.workload = u.workload
-ORDER BY u.workload, u.task_id";
+ORDER BY u.workload, u.task_id", canonical.len() + 1, canonical.len() + 1)
+});
 
 impl SqliteRouteStateStore {
     fn with_profile_usage_read<T>(
@@ -146,7 +159,7 @@ impl SqliteRouteStateStore {
     /// This potentially large read belongs in the background refresh, not boot.
     pub fn closed_task_usage(&self, now_ms: i64) -> RouteStateResult<Vec<ClosedTaskUsage>> {
         self.with_profile_usage_read(|c: &Connection| {
-            let mut stmt = c.prepare(CLOSED_TASK_USAGE_SQL)?;
+            let mut stmt = c.prepare(&CLOSED_TASK_USAGE_SQL)?;
             let rows = stmt.query_map(
                 params![
                     now_ms.saturating_sub(30 * DAY_MS),
@@ -267,6 +280,41 @@ mod tests {
     }
 
     #[test]
+    fn prefrontal_rename_task_history_merges_before_token_totals() {
+        let store = store("rename-profile");
+        for (id, workload, at, iq) in [
+            ("old", "prefrontal-core.mason", NOW - 4 * DAY_MS, 45.0),
+            ("new", "prefrontal.mason", NOW - 3 * DAY_MS, 75.0),
+        ] {
+            decision(
+                &store,
+                id,
+                Some("same-task"),
+                workload,
+                ("sol", None),
+                iq,
+                at,
+            );
+            usage(&store, id, id, NOW - 2 * DAY_MS);
+        }
+        let tasks = store.closed_task_usage(NOW).unwrap();
+        assert_eq!(tasks.len(), 1, "one task must not split at the rename");
+        assert_eq!(tasks[0].iq_bucket, Some(4));
+        assert_eq!(tasks[0].totals.fresh_input, Some(22.0));
+        let raw: String = store
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT consumer FROM model_route_decisions WHERE id='old'",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(raw, "prefrontal-core.mason");
+    }
+
+    #[test]
     fn request_write_completes_while_profile_reader_is_paused() {
         use std::sync::{mpsc, Arc};
         use std::time::Duration;
@@ -354,7 +402,7 @@ mod tests {
             store
                 .store
                 .with_conn(|connection| {
-                    let mut statement = connection.prepare(CLOSED_TASK_USAGE_SQL)?;
+                    let mut statement = connection.prepare(&CLOSED_TASK_USAGE_SQL)?;
                     let mut rows = statement.query(params![NOW - 30 * DAY_MS, NOW - DAY_MS])?;
                     let mut count = 0;
                     while rows.next()?.is_some() {
@@ -484,7 +532,8 @@ mod tests {
         let details: Vec<String> = store
             .store
             .with_conn(|c: &Connection| {
-                let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {CLOSED_TASK_USAGE_SQL}"))?;
+                let mut stmt =
+                    c.prepare(&format!("EXPLAIN QUERY PLAN {}", &*CLOSED_TASK_USAGE_SQL))?;
                 let rows =
                     stmt.query_map(params![NOW - 30 * DAY_MS, NOW - DAY_MS], |row| row.get(3))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()

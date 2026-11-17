@@ -994,7 +994,7 @@ impl LiveConfig {
         self.config
             .pin_origin_callers
             .iter()
-            .any(|caller| caller == principal)
+            .any(|caller| striatum_core::module_identity::equal(caller, principal))
     }
 
     /// Operator owners add exact-name claims too, so conflicting owners lock
@@ -1322,7 +1322,8 @@ struct RoutingConfigFile {
     #[serde(default)]
     runners: Vec<RunnerPolicy>,
     /// Full caller principals allowed to mark user pins with `pin_origin`.
-    /// Absent enrolls only reserved:prefrontal-core; an empty list enrolls nobody.
+    /// Defaults to reserved:prefrontal-core and reserved:prefrontal during the
+    /// module rename window; an explicit empty list enrolls nobody.
     #[serde(default = "default_pin_origin_callers")]
     pin_origin_callers: Vec<String>,
     /// Target agents that are heads: operator-facing sessions that may spend
@@ -1343,7 +1344,10 @@ struct RoutingConfigFile {
 }
 
 fn default_pin_origin_callers() -> Vec<String> {
-    vec!["reserved:prefrontal-core".into()]
+    striatum_core::module_identity::spellings("reserved:prefrontal-core")
+        .iter()
+        .map(ToString::to_string)
+        .collect()
 }
 
 impl Default for RoutingConfigFile {

@@ -101,13 +101,21 @@ impl AccountCaller<'_> {
         )
     }
 
+    // Session namespaces feed the salted conversation hash. Retain prefrontal's
+    // old spelling through the rename, and even after general aliases retire,
+    // until old sessions expire (seven days idle plus one hour). Otherwise heads
+    // lose their account pins and prompt caches when the module name changes.
     fn recorded_principal(&self) -> String {
         self.session.map_or_else(
             || self.principal.clone(),
             |scope| {
                 format!(
                     "session:{}",
-                    serde_json::to_string(&(&scope.owner, &scope.reference)).unwrap()
+                    serde_json::to_string(&(
+                        striatum_core::module_identity::canonical(&scope.owner),
+                        &scope.reference
+                    ))
+                    .unwrap()
                 )
             },
         )
@@ -155,7 +163,8 @@ fn account_caller<'a>(caller: &'a Caller, deps: &Deps<'_>) -> Result<AccountCall
                 module: scope.owner.strip_prefix("reserved:").unwrap(),
                 principal: format!(
                     "session-owner:{}",
-                    serde_json::to_string(&scope.owner).unwrap()
+                    serde_json::to_string(&striatum_core::module_identity::canonical(&scope.owner))
+                        .unwrap()
                 ),
                 session: Some(scope),
             });
@@ -1097,10 +1106,9 @@ fn account_observe_inner(
                 .store
                 .v1_decision(decision_id)
                 .map_err(store_unavailable)?;
-            let Some(decision) = owner_decision
-                .as_ref()
-                .filter(|decision| decision.principal == caller.principal)
-            else {
+            let Some(decision) = owner_decision.as_ref().filter(|decision| {
+                striatum_core::module_identity::equal(&decision.principal, &caller.principal)
+            }) else {
                 return Err(refusal);
             };
             checking("observation_consumer_authorization");

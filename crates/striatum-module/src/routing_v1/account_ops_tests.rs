@@ -42,6 +42,44 @@ fn response(reply: &(FrameType, Value)) -> &Value {
 }
 
 #[tokio::test]
+async fn prefrontal_rename_head_session_keeps_its_old_owner_account_pin_and_replay() {
+    let _clock = crate::InjectedClock::set(NOW);
+    let (harness, _) = setup("synthetic", false);
+    hosts(&[("prefrontal-core", true, true)]);
+    let old = session(&harness, "prefrontal-core", "same-head", "head").await;
+    let first = old
+        .call("route.account_for", &request("old-admission"))
+        .await;
+    let first = response(&first).clone();
+    response(&old.call("route.account_observe", &json!({"event_id":"started","kind":"admission_started","admission_id":"old-admission","run_id":"head-run"})).await);
+    hosts(&[("prefrontal", true, true)]);
+    let new = session(&harness, "prefrontal", "same-head", "head").await;
+    assert_eq!(
+        response(
+            &new.call("route.account_for", &request("old-admission"))
+                .await
+        ),
+        &first
+    );
+    let next = new
+        .call("route.account_for", &request("new-admission"))
+        .await;
+    assert_eq!(response(&next)["account"], first["account"]);
+    assert_eq!(response(&next)["pin"], first["pin"]);
+    let rows = harness
+        .store()
+        .account_read(|tx| tx.load_admission_group())
+        .unwrap();
+    let loaded = crate::account_state::AdmissionState::from_rows(rows);
+    assert_eq!(
+        crate::account_state::snapshot(harness.store())
+            .unwrap()
+            .admissions,
+        loaded
+    );
+}
+
+#[tokio::test]
 async fn nonrunners_cannot_admit_or_observe_even_with_a_decision_or_body_identity() {
     let _clock = crate::InjectedClock::set(NOW);
     let (harness, _) = setup("synthetic", false);

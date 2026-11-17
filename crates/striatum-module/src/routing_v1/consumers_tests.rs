@@ -33,6 +33,58 @@ fn select(consumer: &str) -> Value {
     json!({"consumer": consumer, "requirements": {"iq": 30}})
 }
 
+#[tokio::test]
+async fn prefrontal_rename_declared_root_and_operator_owner_are_one_claim() {
+    let h = harness();
+    h.edit_config(|config| {
+        config["consumers"]["prefrontal-core.mason"] = json!({"owner":"prefrontal-core","iq":20})
+    });
+    consumers::replace_catalog(&json!([entry("prefrontal", true, &["prefrontal.mason"])]));
+    let route = h.bind(reserved("prefrontal"), None).await;
+    let reply = route
+        .call("route.select", &select("prefrontal.mason"))
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+    assert_eq!(selected_input(&h, &reply)["iq"].as_f64(), Some(20.0));
+    let old_name = route
+        .call("route.select", &select("prefrontal-core.mason"))
+        .await;
+    assert_eq!(old_name.0, FrameType::Response, "{old_name:?}");
+    let denied = h
+        .bind(reserved("unrelated"), None)
+        .await
+        .call("route.select", &select("prefrontal.mason"))
+        .await;
+    assert_eq!(denied.1["code"], "consumer_not_owned");
+}
+
+#[tokio::test]
+async fn prefrontal_rename_declared_old_module_honors_new_root() {
+    let h = harness();
+    consumers::replace_catalog(&json!([entry(
+        "prefrontal-core",
+        true,
+        &["prefrontal.sidekick"]
+    )]));
+    let route = h.bind(reserved("prefrontal"), None).await;
+    let reply = route
+        .call("route.select", &select("prefrontal.sidekick.explore"))
+        .await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+}
+
+#[tokio::test]
+async fn prefrontal_rename_selector_accepts_the_new_attested_module() {
+    let h = harness();
+    consumers::replace_catalog(&json!([{
+        "module_id":"other", "nonce_verified":true,
+        "role_declarations":{"routing/v1":{"consumers":[{"name":"other.task","iq":30,"selectors":["prefrontal-core"]}]}}
+    }]));
+    let route = h.bind(reserved("prefrontal"), None).await;
+    let reply = route.call("route.select", &select("other.task")).await;
+    assert_eq!(reply.0, FrameType::Response, "{reply:?}");
+}
+
 fn selected_input(h: &Harness, reply: &(FrameType, Value)) -> Value {
     assert_eq!(reply.0, FrameType::Response, "{}", reply.1);
     let id = reply.1["result"]["decision_id"].as_str().unwrap();

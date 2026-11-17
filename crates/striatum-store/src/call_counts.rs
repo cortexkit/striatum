@@ -41,7 +41,11 @@ impl RoutingCallCounts {
         for instance in instances {
             for row in &instance.counts {
                 let aggregate = counts
-                    .entry((row.method.clone(), row.shape.clone(), row.principal.clone()))
+                    .entry((
+                        row.method.clone(),
+                        row.shape.clone(),
+                        striatum_core::module_identity::canonical(&row.principal).into_owned(),
+                    ))
                     .or_default();
                 aggregate.0 += row.calls;
                 aggregate.1 = aggregate.1.max(row.last_called_at_ms);
@@ -194,6 +198,34 @@ mod tests {
                 )
             })
             .unwrap()
+    }
+
+    #[test]
+    fn prefrontal_rename_call_counts_merge_pending_and_stored_principals() {
+        let store = store();
+        store
+            .record_routing_call("route.select", "contract", "reserved:prefrontal-core")
+            .unwrap();
+        store.flush_routing_calls().unwrap();
+        store
+            .record_routing_call("route.select", "contract", "reserved:prefrontal")
+            .unwrap();
+        let counts = store.routing_call_counts().unwrap();
+        assert_eq!(counts.counts.len(), 1);
+        assert_eq!(counts.counts[0].principal, "reserved:prefrontal-core");
+        assert_eq!(counts.counts[0].calls, 2);
+        store.flush_routing_calls().unwrap();
+        let raw: i64 = store
+            .store
+            .with_conn(|c| {
+                c.query_row(
+                    "SELECT count(DISTINCT principal) FROM routing_call_count",
+                    [],
+                    |r| r.get(0),
+                )
+            })
+            .unwrap();
+        assert_eq!(raw, 2, "stored principal spellings are not migrated");
     }
 
     #[test]
