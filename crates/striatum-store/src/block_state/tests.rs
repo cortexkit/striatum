@@ -5362,3 +5362,74 @@ fn native_sql_projection_is_an_independent_reference() {
     let credential = origins.iter().find(|row| row.kind == "credential").unwrap();
     assert_eq!(credential.quota, Some(true));
 }
+
+#[test]
+fn route_source_order_keeps_existing_metadata_order_through_reverse_reports_and_reload() {
+    let rig = rig("route-source-metadata-order");
+    let now = 1_900_000_000_000i64;
+    for model in ["first", "second"] {
+        let fact = serde_json::from_value(serde_json::json!({
+            "providerID":"source-order-provider", "modelID":model,
+            "scores":{"elo":1000,"eq":50,"speed":50}, "confidence":"unknown"
+        }))
+        .unwrap();
+        rig.store.upsert_fact(&fact, FactSource::Override).unwrap();
+    }
+    // Catalogue order exists before either route reports a refusal. Receiving
+    // the reports in reverse order must not replace that established order.
+    for model in ["second", "first"] {
+        let key = format!("source-order-provider/{model}");
+        rig.store
+            .update_route_state(
+                &key,
+                "source-order-provider/shared",
+                &RouteStateUpdate {
+                    cooldown_until: Some((now + 60_000) as f64),
+                    observed_at_ms: Some(now),
+                    last_error: Some(format!("independent route capacity: {model}")),
+                    unscoped_wall: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+    let check_order = || {
+        let rows = rig
+            .store
+            .with_reader_for_test(|conn| {
+                conn.prepare(
+                    "SELECT m.route_key,m.rowid,b.source_order FROM model_route_state m
+                JOIN block b ON b.kind='route' AND b.origin_key=json_array(m.route_key)
+                WHERE m.provider_id='source-order-provider' ORDER BY m.rowid",
+                )?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "source-order-provider/first");
+        assert_eq!(rows[1].0, "source-order-provider/second");
+        for (key, metadata_order, source_order) in rows {
+            assert_eq!(
+                source_order, metadata_order,
+                "source keeps existing route metadata order: {key}"
+            );
+        }
+        rig.check(
+            &[now, now + 60_001],
+            "reverse route reports retain metadata order",
+        );
+    };
+    check_order();
+    let loads = rig.owner.loads.load(Ordering::Relaxed);
+    rig.owner.request_reload();
+    rig.store.sync_fence_rechecks().unwrap();
+    assert_eq!(rig.owner.loads.load(Ordering::Relaxed), loads + 1);
+    check_order();
+}
