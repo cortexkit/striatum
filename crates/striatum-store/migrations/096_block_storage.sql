@@ -49,7 +49,7 @@ CREATE TABLE block (
   is_origin INTEGER GENERATED ALWAYS AS (kind!='account_route' OR wall_class IS 'quota') STORED,
   wall_unscoped INTEGER NOT NULL DEFAULT 0 CHECK (wall_unscoped IN (0,1)),
   scope_error TEXT,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(meta)),
+  source_metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(source_metadata_json)),
   PRIMARY KEY (kind, origin_key)
 );
 CREATE INDEX block_scope ON block(provider,credential_id,account_id,model);
@@ -159,22 +159,22 @@ FROM account_fence WHERE cleared_at IS NOT NULL;
 -- Metadata contains only details decoded by Rust. Fields named by SQL indexes,
 -- ordering, retention or compare-and-set predicates have their own columns.
 UPDATE block SET
-  (source_order,observed_at,created_at,observation_id,pool_key_json,cleared_reason,recovery_set_json,meta) =
+  (source_order,observed_at,created_at,observation_id,pool_key_json,cleared_reason,recovery_set_json,source_metadata_json) =
   (SELECT f.rowid,f.observed_at,f.created_at,f.observation_id,f.pool_key_json,f.cleared_reason,f.recovery_set_json,
     json_object('scope_json',f.scope_json,'fence_json',f.fence_json,'source',f.source,
       'principal',f.principal,'admission_id',f.admission_id)
    FROM account_fence f WHERE block.origin_key=json_array(f.fence_id))
 WHERE kind='account';
-UPDATE block SET (source_order,code,observed_at,listing_fingerprint,meta) =
+UPDATE block SET (source_order,code,observed_at,listing_fingerprint,source_metadata_json) =
   (SELECT c.rowid,c.code,c.observed_at_ms,c.listing_fingerprint,'{}'
    FROM credential_entitlement_fences c
    WHERE block.origin_key=json_array(c.provider_id,c.credential_id))
 WHERE kind='credential';
-UPDATE block SET (source_order,recorded_at,last_reported_at,wall_class,meta) =
+UPDATE block SET (source_order,recorded_at,last_reported_at,wall_class,source_metadata_json) =
   (SELECT f.rowid,f.recorded_at,f.last_reported_at,f.wall_class,json_object('decision_id',f.decision_id)
    FROM account_route_fence f WHERE block.origin_key=json_array(f.provider,f.credential_id,f.model))
 WHERE kind='account_route';
-UPDATE block SET (source_order,recorded_at,last_reported_at,wall_class,meta) =
+UPDATE block SET (source_order,recorded_at,last_reported_at,wall_class,source_metadata_json) =
   (SELECT f.rowid,f.recorded_at,f.last_reported_at,f.wall_kind,json_object('decision_id',f.decision_id)
    FROM account_non_quota_route_fence f
    WHERE block.origin_key=json_array(f.provider,f.credential_id,f.model)
@@ -189,7 +189,7 @@ UPDATE block SET (source_order,observed_at) =
   (SELECT s.rowid,s.observed_at FROM account_non_quota_size_refusal s
    WHERE block.origin_key=json_array(s.provider,s.credential_id,s.model,s.size_class))
 WHERE kind='non_quota_size';
-UPDATE block SET (source_order,recorded_at,observation_id,meta) =
+UPDATE block SET (source_order,recorded_at,observation_id,source_metadata_json) =
   (SELECT x.rowid,x.recorded_at,x.observation_id,
     json_object('runner_view_digest',x.runner_view_digest,'roster_view_digest',x.roster_view_digest)
    FROM account_principal_exclusion x

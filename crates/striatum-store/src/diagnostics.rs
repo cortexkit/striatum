@@ -178,7 +178,7 @@ impl SqliteRouteStateStore {
             .with_conn(|c: &Connection| {
                 let mut statement = c.prepare(
                     "SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
-                             json_extract(meta,'$.fence_json'),json_extract(meta,'$.source'),observed_at,created_at
+                             json_extract(source_metadata_json,'$.fence_json'),json_extract(source_metadata_json,'$.source'),observed_at,created_at
                       FROM block WHERE kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
                       ORDER BY created_at,json_extract(origin_key,'$[0]')",
                 )?;

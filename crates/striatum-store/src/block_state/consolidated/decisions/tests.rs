@@ -35,7 +35,7 @@ fn decision_checks_match_legacy_for_clock_source_clear_success_and_scope_changes
             ),
             (
                 "UPDATE credential_entitlement_fences SET listing_fingerprint='changed'",
-                "UPDATE block SET meta=json_set(meta,'$.listing_fingerprint','changed') WHERE kind='credential' AND source_present=1",
+                "UPDATE block SET source_metadata_json=json_set(source_metadata_json,'$.listing_fingerprint','changed') WHERE kind='credential' AND source_present=1",
                 [false,true,false,true,true],
             ),
             (
@@ -50,7 +50,7 @@ fn decision_checks_match_legacy_for_clock_source_clear_success_and_scope_changes
             ),
             (
                 "UPDATE account_principal_exclusion SET runner_view_digest='changed'",
-                "UPDATE block SET meta=json_set(meta,'$.runner_view_digest','changed') WHERE kind='principal' AND source_present=1",
+                "UPDATE block SET source_metadata_json=json_set(source_metadata_json,'$.runner_view_digest','changed') WHERE kind='principal' AND source_present=1",
                 [true,true,true,false,true],
             ),
             (

@@ -243,9 +243,9 @@ fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
             true,
         )
         .unwrap();
-    // Source upserts mention meta even when its value is unchanged. Updates
+    // Source upserts mention source_metadata_json even when its value is unchanged. Updates
     // to managed probe clocks, quota/classified or source_order do not name
-    // meta, so they must not add a second source transition to the report audit.
+    // source_metadata_json, so they must not add a second source transition to the report audit.
     store.store.with_conn(|c| {
         c.execute_batch("CREATE TABLE IF NOT EXISTS report_transition(kind TEXT NOT NULL);
             CREATE TRIGGER IF NOT EXISTS report_audit_outcome AFTER UPDATE OF outcome ON model_route_decisions BEGIN INSERT INTO report_transition VALUES ('outcome'); END;
@@ -256,9 +256,9 @@ fn seed(store: &SqliteRouteStateStore, id: &str, principal: &str) {
         // predate block and never inspect the source-transition audit.
         if c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')", [], |row|row.get::<_,bool>(0))? {
             c.execute_batch("CREATE TRIGGER IF NOT EXISTS report_audit_route_insert AFTER INSERT ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
-                CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE OF meta ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_route_update AFTER UPDATE OF source_metadata_json ON block WHEN NEW.kind='account_route' BEGIN INSERT INTO report_transition VALUES ('route_fence'); END;
                 CREATE TRIGGER IF NOT EXISTS report_audit_credential_insert AFTER INSERT ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
-                CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE OF meta ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
+                CREATE TRIGGER IF NOT EXISTS report_audit_credential_update AFTER UPDATE OF source_metadata_json ON block WHEN NEW.kind='credential' BEGIN INSERT INTO report_transition VALUES ('credential'); END;
                 CREATE TRIGGER IF NOT EXISTS report_audit_pool AFTER INSERT ON block WHEN NEW.kind='account' BEGIN INSERT INTO report_transition VALUES ('pool'); END;")?;
         }
         c.execute("INSERT INTO routing_v1_affinity (principal,consumer,affinity,decision_id,updated_at_ms) VALUES (?1,'summary',?2,?2,1)",params![principal,id])?;

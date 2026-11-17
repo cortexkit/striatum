@@ -390,7 +390,7 @@ fn successor_tables_are_rowid_tables_and_retirement_enforces_only_its_exact_evid
             assert_eq!(after.cleared_by.as_deref(), Some("retired"));
             assert!(!after.held());
             assert!(conn
-                .execute("UPDATE block SET meta='not json'", [])
+                .execute("UPDATE block SET source_metadata_json='not json'", [])
                 .is_err());
             Ok(())
         })

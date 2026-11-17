@@ -207,7 +207,7 @@ pub(crate) struct StoredBlock {
 }
 
 pub(crate) fn select() -> String {
-    format!("SELECT rowid,{CLOCK_COLUMNS},cleared_by,cleared_reason,source_present,managed,source_order,observation_id,pool_key_json,listing_fingerprint,recovery_set_json,deadline,reset_at,observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,reason,code,wall_class,is_origin,wall_unscoped,scope_error,cleared_models,meta FROM block")
+    format!("SELECT rowid,{CLOCK_COLUMNS},cleared_by,cleared_reason,source_present,managed,source_order,observation_id,pool_key_json,listing_fingerprint,recovery_set_json,deadline,reset_at,observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,reason,code,wall_class,is_origin,wall_unscoped,scope_error,cleared_models,source_metadata_json FROM block")
 }
 
 /// Writer bookkeeping: next source order per kind. A recreated source must
@@ -229,7 +229,7 @@ fn source_insert_sql(kind: &str) -> String {
     const BINDINGS: &str = ":kind,:key,:provider,:account,:credential,:model,:size,:principal,:admission,
         :evidence,:at,:quota,:next,:reset,:observation,:pool,:deadline,:reset_at,
         :observed,:created,:recorded,:reported,:cooldown,:exhausted,
-        :reason,:code,:class,:unscoped,:error,:fingerprint,:recovery,:meta,:clear_reason,:clear_at,:clear_by,:present,:order";
+        :reason,:code,:class,:unscoped,:error,:fingerprint,:recovery,:source_metadata_json,:clear_reason,:clear_at,:clear_by,:present,:order";
     let (marker, values) = if kind == "observation" {
         (
             format!("{OBSERVATION_RETIREMENT_GUARD_MARKER} "),
@@ -241,7 +241,7 @@ fn source_insert_sql(kind: &str) -> String {
     format!("{marker}INSERT INTO block(kind,origin_key,provider,account_id,credential_id,model,size_class,principal,admission_id,
         evidence,evidence_at,quota,next_recheck_at,reset_check_at,observation_id,pool_key_json,deadline,reset_at,
         observed_at,created_at,recorded_at,last_reported_at,cooldown_until,quota_exhausted_until,
-        reason,code,wall_class,wall_unscoped,scope_error,listing_fingerprint,recovery_set_json,meta,cleared_reason,cleared_at,cleared_by,source_present,source_order)
+        reason,code,wall_class,wall_unscoped,scope_error,listing_fingerprint,recovery_set_json,source_metadata_json,cleared_reason,cleared_at,cleared_by,source_present,source_order)
         {values}
         ON CONFLICT(kind,origin_key) DO UPDATE SET
         provider=excluded.provider,account_id=excluded.account_id,credential_id=excluded.credential_id,
@@ -260,7 +260,7 @@ fn source_insert_sql(kind: &str) -> String {
         quota_exhausted_until=excluded.quota_exhausted_until,reason=excluded.reason,code=excluded.code,
         wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
         listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
-        meta=excluded.meta,cleared_reason=excluded.cleared_reason,
+        source_metadata_json=excluded.source_metadata_json,cleared_reason=excluded.cleared_reason,
         source_order=CASE WHEN block.source_present=1 THEN block.source_order ELSE excluded.source_order END,source_present=1
         WHERE excluded.kind NOT IN ('account','principal') OR (excluded.kind='principal' AND block.source_present=0)")
 }
@@ -297,7 +297,7 @@ pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Re
             ":exhausted":row.quota_exhausted_until,":reason":row.reason,":code":row.code,":class":row.wall_class,
             ":unscoped":row.wall_unscoped,":error":row.scope_error,
             ":fingerprint":row.listing_fingerprint,":recovery":row.recovery_set_json,
-            ":meta":row.meta.encode().map_err(|error|json_error(0,error))?,":clear_reason":row.cleared_reason,":order":source_order,
+            ":source_metadata_json":row.meta.encode().map_err(|error|json_error(0,error))?,":clear_reason":row.cleared_reason,":order":source_order,
             ":clear_at":row.cleared_at,":clear_by":row.cleared_by,":present":row.source_present,
         },
     )
@@ -330,7 +330,7 @@ pub(crate) fn decode(row: &Row<'_>) -> rusqlite::Result<StoredBlock> {
     };
     let clears: String = row.get("cleared_models")?;
     let cleared_models = serde_json::from_str(&clears).map_err(|e| json_error(41, e))?;
-    let meta: String = row.get("meta")?;
+    let meta: String = row.get("source_metadata_json")?;
     let source_present: bool = row.get("source_present")?;
     let meta = Meta::decode(
         if !source_present && meta == "{}" {

@@ -594,7 +594,7 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     let fence = |cleared: &str| {
         format!(
             "INSERT OR REPLACE INTO block(kind,origin_key,provider,account_id,evidence,evidence_at,
-              quota,next_recheck_at,observed_at,created_at,cleared_at,cleared_by,source_present,recovery_set_json,meta)
+              quota,next_recheck_at,observed_at,created_at,cleared_at,cleared_by,source_present,recovery_set_json,source_metadata_json)
              VALUES ('account',json_array('f'),'p','a','{{}}',{NOW},1,{NOW}+900000,
                {NOW},{NOW},{cleared},CASE WHEN {cleared} IS NULL THEN NULL ELSE 'kept' END,
                {cleared} IS NULL,'[]',
@@ -610,7 +610,7 @@ fn a_replace_that_moves_a_key_to_a_new_rowid_leaves_no_stale_row() {
     let route = |replace: &str, class: &str| {
         format!(
             "INSERT {replace} INTO block(kind,origin_key,provider,credential_id,model,evidence,
-              evidence_at,quota,next_recheck_at,deadline,recorded_at,last_reported_at,wall_class,meta)
+              evidence_at,quota,next_recheck_at,deadline,recorded_at,last_reported_at,wall_class,source_metadata_json)
              VALUES ('account_route',json_array('p','c','m'),'p','c','m','route-evidence',
                {NOW},1,{NOW}+60000,{NOW}+60000,{NOW},{NOW},'{class}','{{\"decision_id\":\"d\"}}');"
         )
