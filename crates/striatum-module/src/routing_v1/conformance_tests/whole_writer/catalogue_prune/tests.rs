@@ -10,7 +10,7 @@ async fn catalogue_prune_ends_a_route_wall_before_sibling_select_and_rediscovery
     let mut sibling = original.clone();
     sibling.variant = Some("still-listed".into());
     store.upsert_fact(&sibling, FactSource::Override).unwrap();
-    let sibling_key = sibling.route_key();
+    let sibling_key = format!("{route}/still-listed");
     store
         .update_route_state(
             &route,
