@@ -15,7 +15,7 @@ mod rebind_tests {
         fn credentials(&self) -> Option<crate::broca_credentials::SharedBrocaCredentials> {
             Some(self.credentials.clone())
         }
-        async fn catalog_get(&mut self) -> Result<CatalogSnapshot, FusiformCatalogError> {
+        async fn catalog_get(&mut self) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError> {
             self.inner.catalog_get().await
         }
         async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError> {
@@ -115,8 +115,8 @@ mod rebind_tests {
 
         fn change_catalog(&mut self, version: i64) {
             self.wire.inner.status.catalog_version = version;
-            self.wire.inner.snapshot.cursor.catalog_version = version;
-            self.wire.inner.snapshot.facts[0].cost_per_mtok_out = Some(42.0);
+            Arc::make_mut(&mut self.wire.inner.snapshot).cursor.catalog_version = version;
+            Arc::make_mut(&mut self.wire.inner.snapshot).facts[0].cost_per_mtok_out = Some(42.0);
         }
 
         async fn newer_event(&self) {

@@ -126,17 +126,17 @@ fn credentials(rows: Vec<ListedCredential>, granted: bool, listed_at: i64) -> Br
         },
         listed_at as u64,
     );
-    credentials.catalog_snapshot = Some(Arc::new(
+    credentials.catalog_snapshot = Some(
         crate::fusiform_catalog::decode_catalog_get(
             &serde_json::to_vec(&json!({"catalog_version":41,"resolved_at_ms":NOW,
-                "models":{"media-vendor/fixture-transcribe":{"existence":"present",
-                    "rate.input_audio.per_second":{"state":"priced","currency":"USD",
-                        "units":4500000,"exponent":9,"per":60,
-                        "increment":{"kind":"unknown"},"minimum_quantity":{"kind":"unknown"}}}}}))
+            "models":{"media-vendor/fixture-transcribe":{"existence":"present",
+                "rate.input_audio.per_second":{"state":"priced","currency":"USD",
+                    "units":4500000,"exponent":9,"per":60,
+                    "increment":{"kind":"unknown"},"minimum_quantity":{"kind":"unknown"}}}}}))
             .unwrap(),
         )
         .unwrap(),
-    ));
+    );
     credentials
 }
 

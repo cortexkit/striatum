@@ -107,7 +107,7 @@ fn setup() -> (Arc<Harness>, BrocaCredentials, Vec<ModelFact>) {
                 &serde_json::to_vec(&fixtures["refused — undeclared google antigravity"]).unwrap(),
             ),
     );
-    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     credentials.refresh_serving_methods(&Default::default(), &facts, NOW as i64, &[]);
     harness.set_credentials(credentials.clone());
     harness.edit_config(|config| {

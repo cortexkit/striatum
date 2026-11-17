@@ -36,15 +36,13 @@ fn install(h: &Harness, rows: &[(&str, Value)]) -> Arc<crate::fusiform_catalog::
         .iter()
         .map(|(model, row)| (format!("media-vendor/{model}"), row.clone()))
         .collect();
-    let snapshot = Arc::new(
-        crate::fusiform_catalog::decode_catalog_get(
-            &serde_json::to_vec(&json!({
-                "catalog_version":1,"resolved_at_ms":1,"models":models
-            }))
-            .unwrap(),
-        )
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({
+            "catalog_version":1,"resolved_at_ms":1,"models":models
+        }))
         .unwrap(),
-    );
+    )
+    .unwrap();
     h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot.clone());
     snapshot
 }

@@ -44,17 +44,14 @@ fn catalog(version: i64, anthropic: bool) -> Arc<fusiform_catalog::CatalogSnapsh
     if anthropic {
         models["anthropic/claude-opus-5-5"] = json!({"existence": "present"});
     }
-    Arc::new(
-        fusiform_catalog::decode_catalog_get(
-            &serde_json::to_vec(&json!({
-                "catalog_version": version,
-                "resolved_at_ms": 123,
-                "models": models,
-            }))
-            .unwrap(),
-        )
+    fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({
+            "catalog_version": version,
+            "resolved_at_ms": 123,
+            "models": models,
+        }))
         .unwrap(),
-    )
+    ).unwrap()
 }
 
 async fn request(

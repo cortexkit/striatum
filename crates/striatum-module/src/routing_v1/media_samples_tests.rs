@@ -97,7 +97,7 @@ fn fixture_for_phone(with_phone_languages: bool) -> Arc<Harness> {
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&catalog).unwrap())
             .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
     harness
 }
 
@@ -173,7 +173,7 @@ fn install_realtime_catalog(harness: &Harness, live_grade: u8, voice_grade: u8) 
         snapshot.media_grade("realtime", "openai/gpt-realtime-2.1"),
         Some(f64::from(voice_grade))
     );
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
 }
 
 #[tokio::test]

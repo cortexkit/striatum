@@ -283,10 +283,7 @@ async fn paged_restart_limit_preserves_the_previous_store_and_cached_snapshot() 
     store
         .upsert_fact(&crate::tests::fact("alpha", "m"), FactSource::Seed)
         .unwrap();
-    let initial = Arc::new(
-        decode_catalog_get(&serde_json::to_vec(&paged_payload(0, 10, "alpha", None)).unwrap())
-            .unwrap(),
-    );
+    let initial = decode_catalog_get(&serde_json::to_vec(&paged_payload(0, 10, "alpha", None)).unwrap()).unwrap();
     store
         .apply_fusiform_catalog(&initial.facts, initial.cursor)
         .unwrap();

@@ -620,7 +620,7 @@ fn served_wire_family_requires_an_exact_known_wire_and_canonical_auth_pair() {
         &serde_json::to_vec(&served_wire_example("catalog.get — one model, current")).unwrap(),
     )
     .unwrap();
-    credentials.wire_apis = snapshot.wire_apis;
+    credentials.wire_apis = snapshot.wire_apis.clone();
     for (wire, auth, matches) in [
         ("anthropic.messages", "oauth", true),
         ("openai.responses", "oauth", false),
@@ -657,7 +657,8 @@ fn served_billing_plane_wire_overrides_base_and_missing_plane_wire_fails_closed(
     credentials.wire_apis =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&base).unwrap())
             .unwrap()
-            .wire_apis;
+            .wire_apis
+            .clone();
     let mut plane = served_wire_example("chatgpt luna — named, unfiltered");
     credentials.billing_catalog = credentials
         .billing_catalog

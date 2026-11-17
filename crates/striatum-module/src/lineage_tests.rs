@@ -192,7 +192,7 @@ fn catalog_lineage_replaces_stale_rules_on_variants_and_clears_on_absence() {
         }
     };
     assert_lineage(Some("qwen"));
-    snapshot
+    Arc::get_mut(&mut snapshot).unwrap()
         .facts
         .iter_mut()
         .find(|fact| fact.model_id == "claude-impostor-a")

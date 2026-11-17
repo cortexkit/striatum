@@ -91,7 +91,7 @@ async fn media_policy_pin_only_routes_are_outside_the_grade_top() {
                 .unwrap(),
             )
             .unwrap();
-            h.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new(catalog));
+            h.credentials().lock().unwrap().catalog_snapshot = Some(catalog);
             h.edit_config(|config| {
                 config["models"]["media-vendor/a-manual"] = json!({"pin_only":true});
                 config["consumers"]["colliculus"]["below_bar"] = json!("refuse");

@@ -169,7 +169,7 @@ async fn check_chat_classification(classification: Value, reason: &str) {
         .store()
         .apply_fusiform_catalog(updates, cursor)
         .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(catalog));
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(catalog);
     let route = harness.bind(reserved("example-consumer"), None).await;
     let automatic = route
         .call("route.select", &select("prefrontal-core.mason"))

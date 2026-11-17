@@ -330,7 +330,7 @@ async fn media_ordering_decommissioned_is_never_automatic_laddered_or_pinned() {
                     "media-vendor/a-retired":{"model.type":"transcription","quality.decommissioned":true}
                 }
             })).unwrap()).unwrap();
-            h.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new(catalog));
+            h.credentials().lock().unwrap().catalog_snapshot = Some(catalog);
             let mut params = request();
             params["caller_local"] = json!([engine("a-retired", true)]);
             assert_eq!(select(&route, &params).await["engine"]["model"], "z-live");

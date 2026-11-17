@@ -900,7 +900,7 @@ pub(super) fn install_head_snapshot(harness: &Harness) {
         .unwrap()
         .lock()
         .unwrap()
-        .catalog_snapshot = Some(Arc::new(snapshot));
+        .catalog_snapshot = Some(snapshot);
 }
 
 /// The kit's subject: a fresh [`Harness`] per check.

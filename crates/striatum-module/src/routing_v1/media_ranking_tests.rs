@@ -34,16 +34,14 @@ pub(super) fn catalog(
             )
         })
         .collect();
-    let snapshot = Arc::new(
-        crate::fusiform_catalog::decode_catalog_get(
-            &serde_json::to_vec(&json!({
-                "catalog_version":1,"resolved_at_ms":1,
-                "quality_scores":{"graded_by":"operator","graded_at_ms":1},"models":models
-            }))
-            .unwrap(),
-        )
+    let snapshot = crate::fusiform_catalog::decode_catalog_get(
+        &serde_json::to_vec(&json!({
+            "catalog_version":1,"resolved_at_ms":1,
+            "quality_scores":{"graded_by":"operator","graded_at_ms":1},"models":models
+        }))
         .unwrap(),
-    );
+    )
+    .unwrap();
     h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot.clone());
     snapshot
 }
@@ -388,7 +386,7 @@ async fn media_ranking_top_obeys_static_keys_policy_privacy_and_requirements() {
             "media-vendor/z-top":{"existence":"present","model.type":"transcription","quality.grade":100,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":2,"exponent":0,"per":1}},
             "media-vendor/z-cheap":{"existence":"present","model.type":"transcription","quality.grade":30,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":1,"exponent":0,"per":1}}
         }});
-        h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&wire).unwrap()).unwrap()));
+        h.credentials().lock().unwrap().catalog_snapshot = Some(crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&wire).unwrap()).unwrap());
         let route = h.bind(reserved("colliculus"),None).await;
         let mut params = job(); params["requirements"]["iq"] = json!(40);
         assert_eq!(select(&route,&params).await["engine"]["model"],"z-top");
