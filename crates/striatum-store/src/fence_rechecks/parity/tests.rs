@@ -3,6 +3,7 @@
 
 use super::*;
 
+#[path = "functions.rs"]
 mod functions;
 #[path = "native_reference.rs"]
 mod native_reference;
