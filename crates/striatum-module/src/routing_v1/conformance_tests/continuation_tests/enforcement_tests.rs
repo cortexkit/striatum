@@ -165,10 +165,10 @@ fn untouched_by_refusal(harness: &Harness) -> Vec<Vec<Vec<rusqlite::types::Value
         "SELECT * FROM account_affinity ORDER BY principal, conversation_hash, provider".into(),
         "SELECT * FROM account_pin ORDER BY pin_id".into(),
         "SELECT * FROM routing_v1_admission ORDER BY 1, 2".into(),
-        format!("SELECT * FROM account_fence WHERE account_id = '{B}'"),
-        format!("SELECT * FROM account_route_fence WHERE credential_id = '{b}'"),
-        format!("SELECT * FROM account_non_quota_route_fence WHERE credential_id = '{b}'"),
-        format!("SELECT * FROM fence_recheck WHERE account_id = '{B}' OR credential_id = '{b}'"),
+        format!("SELECT * FROM block WHERE kind='account' AND account_id = '{B}'"),
+        format!("SELECT * FROM block WHERE kind='account_route' AND credential_id = '{b}'"),
+        format!("SELECT * FROM block WHERE kind IN ('non_quota_route','transient_route') AND credential_id = '{b}'"),
+        format!("SELECT * FROM block WHERE managed=1 AND (account_id = '{B}' OR credential_id = '{b}')"),
     ]
     .iter()
     .map(|sql| query(harness, sql))
@@ -179,14 +179,17 @@ fn untouched_by_refusal(harness: &Harness) -> Vec<Vec<Vec<rusqlite::types::Value
 /// leaves, without generated ids so two stores can be compared.
 fn exhaustion_evidence(harness: &Harness) -> Vec<Vec<rusqlite::types::Value>> {
     let mut rows: Vec<_> = [
-        "SELECT 'account_fence', provider, account_id, scope_json, fence_json, source,
-            observed_at, created_at, cleared_at FROM account_fence",
-        "SELECT 'route_fence', provider, credential_id, model, until_ms, recorded_at,
-            last_reported_at, wall_class FROM account_route_fence",
-        "SELECT 'non_quota_route_fence', provider, credential_id, model, until_ms,
-            recorded_at, last_reported_at, wall_kind FROM account_non_quota_route_fence",
+        "SELECT 'account_fence', provider, account_id,
+            json_extract(source_metadata_json,'$.scope_json'),json_extract(source_metadata_json,'$.fence_json'),
+            json_extract(source_metadata_json,'$.source'),observed_at,created_at,cleared_at
+            FROM block WHERE kind='account' AND json_type(source_metadata_json,'$.fence_json')='text'",
+        "SELECT 'route_fence', provider, credential_id, model, deadline, recorded_at,
+            last_reported_at, wall_class FROM block WHERE kind='account_route' AND source_present=1",
+        "SELECT 'non_quota_route_fence', provider, credential_id, model, deadline,
+            recorded_at,last_reported_at,wall_class FROM block
+            WHERE kind IN ('non_quota_route','transient_route') AND source_present=1",
         "SELECT 'recheck', kind, provider, account_id, credential_id, model, evidence_at,
-            quota, next_recheck_at, reset_check_at, cleared_at FROM fence_recheck",
+            quota,next_recheck_at,reset_check_at,cleared_at FROM block WHERE managed=1",
     ]
     .into_iter()
     .flat_map(|sql| query(harness, sql))

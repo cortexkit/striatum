@@ -185,15 +185,28 @@ fn report(label: &str, runs: &[(String, u64)], held_ms: f64) {
     }
 }
 
-/// Statements that select rows of `account_observation`, apart from the
-/// observation-effects write (`INSERT INTO account_transient_backoff ...`),
-/// which selects only the one observation it names by primary key.
+// Pin the complete keyed effect read. A prefix exemption could also accept a
+// statement that scans observation history after losing its id predicate.
+const OBSERVATION_EFFECT_READ: &str = "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
+                o.received_at,json_array(o.observation_id,e.key)
+            FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
+            WHERE o.observation_id=?1 AND o.kind='transient_backoff' AND o.bound=1 AND e.type='object'
+                AND json_extract(e.value,'$.effect')='transient_backoff'
+                AND json_type(e.value,'$.provider')='text' AND json_type(e.value,'$.account_id')='text'
+                AND json_type(e.value,'$.retry_at_ms') IN ('integer','real')";
+
+fn keyed_effect_read(sql: &str) -> bool {
+    sql == OBSERVATION_EFFECT_READ
+}
+
+/// Statements selecting observation rows, except the complete keyed effect
+/// lookup that the continuation's observation write needs.
 fn observation_reads(runs: &[(String, u64)]) -> Vec<String> {
     runs.iter()
         .map(|(sql, _)| sql)
         .filter(|sql| {
             striatum_store::group_reads::reads_tables(sql, &["account_observation"])
-                && !sql.contains("INSERT INTO account_transient_backoff")
+                && !keyed_effect_read(sql)
         })
         .cloned()
         .collect()
@@ -364,6 +377,7 @@ async fn a_continue_reads_no_observation_rows() {
         loads,
         "neither continue may reload the account state"
     );
+    let mut effect_reads = 0;
     for (label, runs) in [
         ("quota continue", &quota),
         ("sign-in continue", &signed_out),
@@ -377,10 +391,8 @@ async fn a_continue_reads_no_observation_rows() {
             reads.is_empty(),
             "{label} read account_observation: {reads:#?}"
         );
-        for (sql, _) in runs
-            .iter()
-            .filter(|(sql, _)| sql.contains("INSERT INTO account_transient_backoff"))
-        {
+        for (sql, _) in runs.iter().filter(|(sql, _)| keyed_effect_read(sql)) {
+            effect_reads += 1;
             let steps = plan(&store, sql);
             assert!(
                 steps
@@ -391,4 +403,32 @@ async fn a_continue_reads_no_observation_rows() {
             );
         }
     }
+    assert!(
+        effect_reads > 0,
+        "the continue mix must execute the keyed observation-effect read"
+    );
+}
+
+#[tokio::test]
+async fn observation_effect_read_allowance_rejects_the_same_select_without_its_id_predicate() {
+    let (subject, _, _, _) = paused().await;
+    let keyed = OBSERVATION_EFFECT_READ.to_string();
+    let id_predicate = "o.observation_id=?1 AND ";
+    assert_eq!(keyed.matches(id_predicate).count(), 1);
+    let scan = keyed.replacen(id_predicate, "", 1);
+    assert!(observation_reads(&[(keyed.clone(), 1)]).is_empty());
+    assert_eq!(observation_reads(&[(scan.clone(), 1)]), vec![scan.clone()]);
+    let indexed = plan(subject.harness().store(), &keyed);
+    assert!(
+        indexed
+            .iter()
+            .any(|step| step.starts_with("SEARCH o USING INDEX")
+                && step.contains("(observation_id=?)")),
+        "{indexed:?}"
+    );
+    let unkeyed = plan(subject.harness().store(), &scan);
+    assert!(
+        unkeyed.iter().any(|step| step.starts_with("SCAN o")),
+        "{unkeyed:?}"
+    );
 }

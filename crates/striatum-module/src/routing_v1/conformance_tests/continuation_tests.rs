@@ -511,7 +511,7 @@ async fn continuation_refuses_a_caller_pinned_account_and_records_exhaustion() {
     );
     let count: i64 = conn
         .query_row(
-            "SELECT count(*) FROM account_fence WHERE cleared_at IS NULL",
+            "SELECT count(*) FROM block WHERE kind='account' AND source_present=1 AND cleared_at IS NULL",
             [],
             |r| r.get(0),
         )
@@ -522,7 +522,7 @@ async fn continuation_refuses_a_caller_pinned_account_and_records_exhaustion() {
     );
     let billing: i64 = conn
         .query_row(
-            "SELECT count(*) FROM account_non_quota_route_fence WHERE wall_kind='billing'",
+            "SELECT count(*) FROM block WHERE kind='non_quota_route' AND source_present=1 AND wall_class='billing'",
             [],
             |row| row.get(0),
         )

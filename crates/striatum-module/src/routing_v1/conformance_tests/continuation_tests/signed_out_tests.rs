@@ -41,8 +41,13 @@ fn relist(subject: &KitSubject, credential: &str, state: &str, new_record: bool)
 fn age_fence(subject: &KitSubject) {
     let harness = subject.harness();
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    // Aging the refusal changes its evidence signature. Let normal code
+    // schedule the changed refusal again, retaining earlier probe history.
     conn.execute(
-        "UPDATE credential_entitlement_fences SET observed_at_ms=?1 WHERE code='signed_out'",
+        "UPDATE block SET observed_at=?1,evidence_at=?1,
+            evidence=json_array(code,listing_fingerprint,?1),managed=0,classified=0,
+            claim_owner=NULL,cleared_at=NULL,cleared_by=NULL,cleared_models='[]'
+            WHERE kind='credential' AND code='signed_out'",
         [account_selection::now_ms() - 3_600_001],
     )
     .unwrap();
