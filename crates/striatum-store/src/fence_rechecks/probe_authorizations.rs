@@ -8,7 +8,7 @@ impl AccountTx<'_> {
     pub fn probe_authorization_owners(&self) -> RouteStateResult<Vec<String>> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::fence_rechecks::probe_authorization_owners",
+            "account_tx::fence_rechecks::probe_authorizations::probe_authorization_owners",
         );
         if !enabled(self.conn).map_err(err)? {
             return Ok(Vec::new());

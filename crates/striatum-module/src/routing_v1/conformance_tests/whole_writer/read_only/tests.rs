@@ -194,8 +194,12 @@ pub(super) const ADDITIONAL_READ_ONLY: &[(&str, &str)] = &[
         "tests whether an admission's authorized probe has expired",
     ),
     (
-        "account_tx::fence_rechecks::probe_authorization_owners",
+        "account_tx::fence_rechecks::probe_authorizations::probe_authorization_owners",
         "selects distinct authorization owners",
+    ),
+    (
+        "account_tx::fence_rechecks::probe_authorizations::probe_authorizations_for_origins",
+        "selects exact origin evidence and current generation proofs without changing them",
     ),
     (
         "account_command::inflight_count",
