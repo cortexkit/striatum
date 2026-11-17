@@ -789,6 +789,7 @@ async fn candidates(
         .as_ref()
         .and_then(|s| s.tier_consumer.as_deref())
         .unwrap_or(&request.consumer);
+    let unprojected_snapshot = prepared.snapshot.clone();
     if let Some(classes) = &mut priced.classes {
         classes.apply_configured_service_tiers(
             &mut prepared.facts,
@@ -951,6 +952,53 @@ async fn candidates(
         .map(|fact| (fact_to_route(fact).capacity_key, fact.family.clone()))
         .collect();
     let outcome = live.apply(&mut facts);
+    // Ranking can reject an account wall before a seat reaches select. Judge
+    // status-check hints against the original route walls and the same panel
+    // exclusions, quality floor and package ceiling, not just its account clock.
+    let mut test_checks = HashMap::new();
+    if let Some(classes) = &priced.classes {
+        let admission = striatum_core::model_router::admit_routes(
+            &facts,
+            Some(&unprojected_snapshot),
+            striatum_core::provider_model_spec::ExclusionPolicy {
+                operator: &operator_exclude,
+                caller: &exclude,
+            },
+            None,
+            &available.iter().cloned().collect(),
+            &striatum_core::ModelRequirements { iq: 0.0, eq: 0.0 },
+            &outcome.routing_config,
+        );
+        let bar = panel_policy.floor.map(|floor| {
+            striatum_core::routing_config::demand_bar(
+                admission.top_routable.elo,
+                f64::from(floor),
+                outcome.routing_config.demand_exponent,
+            )
+        });
+        for admitted in admission.admitted {
+            let route = admitted.route;
+            if bar.is_some_and(|bar| route.fact.scores.elo < bar)
+                || request.package_tokens.is_some_and(|tokens| {
+                    let fit = package_fit(tokens, &route.fact);
+                    fit.package_tokens > fit.budget_tokens
+                })
+            {
+                continue;
+            }
+            if let Some(block) =
+                classes.blocked_account(&route.provider_id, &route.model_id, metered)
+            {
+                if let Some(check) = block
+                    .test_check_at_ms
+                    .filter(|check| block.retry_at_ms() == Some(*check))
+                {
+                    test_checks.insert(route.capacity_key, check as u64);
+                    test_checks.insert(route.route_key, check as u64);
+                }
+            }
+        }
+    }
     let mut evidence = HashMap::new();
     for fact in &facts {
         let route = fact_to_route(fact);
@@ -1062,6 +1110,13 @@ async fn candidates(
                     | scoring::PanelCauseReason::BackoffActive
             ) {
                 candidate.reset_at_ms = reset.or(candidate.reset_at_ms);
+                if let Some(check) = test_checks
+                    .get(&cause.model)
+                    .or_else(|| capacity.as_ref().and_then(|key| test_checks.get(key)))
+                {
+                    candidate.reset_at_ms = Some(*check);
+                    candidate.detail = Some(json!(super::select::IN_FLIGHT_TEST_MESSAGE));
+                }
             }
         }
         candidate

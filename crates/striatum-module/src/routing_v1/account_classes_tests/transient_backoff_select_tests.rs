@@ -1,5 +1,7 @@
 use super::*;
 
+mod controls;
+
 const ACCOUNT: &str = "only-chatgpt-account";
 const CREDENTIAL: &str = "oauth:only-chatgpt-login";
 const MODELS: [&str; 3] = ["gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra"];
@@ -160,12 +162,56 @@ async fn expired_transient_backoff_with_inflight_probe_refuses_fresh_sidekick_se
         "{}",
         ignored.1
     );
+    let trace = harness.store().trace_block_reads_for_test().unwrap();
+    let owners = harness
+        .store()
+        .account_read(|tx| tx.probe_authorization_owners())
+        .unwrap();
+    assert!(!owners.is_empty());
+    let oracle_reads = trace.take();
+    assert!(
+        oracle_reads
+            .reader
+            .iter()
+            .any(|sql| sql.contains("fence_probe_authorization")),
+        "the counter must see the SQL oracle: {oracle_reads:?}"
+    );
     let (frame, bytes) = owner.call_raw("route.select", &select).await;
+    let reads = trace.take();
+    assert!(
+        reads.reader.is_empty() && reads.writer.is_empty(),
+        "live select must not read probe authorizations from SQL: {reads:?}"
+    );
     println!("HELD_PROBE_REFUSAL={}", String::from_utf8_lossy(&bytes));
     assert_eq!(frame, FrameType::Error);
     let refusal: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(refusal["code"], "no_route", "{refusal}");
-    assert_eq!(bytes, br#"{"code":"no_route","message":"no route meets the request: accounts_blocked: no admissible model route for requirements. Earliest route wall expiry: openai/gpt-6-luna (until_ms=1800003652650); other fences may remain.","detail":{"reason":"accounts_blocked","reset_at_ms":1800003652650}}"#);
+    assert_eq!(bytes, br#"{"code":"no_route","message":"An account that can serve this request is being tested. Check again shortly.","detail":{"reason":"accounts_blocked","reset_at_ms":1800000089128}}"#);
+    let during = harness
+        .store()
+        .fence_rechecks()
+        .unwrap()
+        .into_iter()
+        .find(|origin| origin.kind == "observation")
+        .unwrap();
+    assert_eq!(
+        during, origin,
+        "a check-again hint must not move the test clock"
+    );
+    let account_wait = runner
+        .call("route.account_for", &admission("another-run"))
+        .await;
+    assert_eq!(account_wait.0, FrameType::Error, "{}", account_wait.1);
+    assert_eq!(
+        account_wait.1["code"], "account_pool_exhausted",
+        "{}",
+        account_wait.1
+    );
+    assert_eq!(
+        account_wait.1["detail"]["reset_at_ms"], origin.next_recheck_at,
+        "account_for retains its separate admission hint in this slice: {}",
+        account_wait.1
+    );
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
     let rejected: String = conn
         .query_row(

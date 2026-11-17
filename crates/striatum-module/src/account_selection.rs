@@ -227,6 +227,7 @@ pub(crate) struct ClassContext {
     // credential vector. Every hit rechecks the resolver's effective inputs.
     class_memo: std::sync::Arc<std::sync::Mutex<ClassMemo>>,
     rechecks: Vec<striatum_store::FenceRecheck>,
+    probe_authorizations: Vec<striatum_store::ProbeAuthorization>,
     account_ids: crate::broca_credentials::CredentialAccounts,
     pub credentials: crate::broca_credentials::BrocaCredentials,
     pub config: std::sync::Arc<crate::config_overrides::LiveConfig>,
@@ -259,8 +260,19 @@ pub(crate) enum ProbeBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct AccountBlock {
     pub reset_at_ms: Option<i64>,
+    /// A status check for another request's test, not a change to its clock.
+    pub test_check_at_ms: Option<i64>,
     pub lifetime: striatum_core::blocks::LifetimeClass,
     pub credential_code: Option<String>,
+}
+
+impl AccountBlock {
+    pub(crate) fn retry_at_ms(&self) -> Option<i64> {
+        self.reset_at_ms
+            .into_iter()
+            .chain(self.test_check_at_ms)
+            .min()
+    }
 }
 
 /// Why a legacy launch could not claim the probes its route needs.
@@ -1442,6 +1454,9 @@ impl ClassContext {
             .collect::<RouteStateResult<_>>()
             .map_err(|error| error.to_string())?;
         let rechecks = blocks.fence_rechecks().map_err(|error| error.to_string())?;
+        let probe_authorizations = blocks
+            .probe_authorizations_for_origins(&rechecks)
+            .map_err(|error| error.to_string())?;
         drop(blocks);
         let mut context = Self {
             serving_index: crate::serving_index::ServingIndex::get(
@@ -1452,6 +1467,7 @@ impl ClassContext {
             indexes: Default::default(),
             class_memo: Default::default(),
             rechecks,
+            probe_authorizations,
             account_ids,
             credentials,
             config,
@@ -2741,13 +2757,16 @@ impl ClassContext {
             {
                 if code == "account_pool_exhausted" {
                     let reset = detail.and_then(|detail| detail["reset_at_ms"].as_i64());
-                    return Some(self.account_block_at(
+                    let mut block = self.account_block_at(
                         provider,
                         model,
                         priced,
                         reset,
                         striatum_core::blocks::LifetimeClass::NonQuota,
-                    ));
+                    );
+                    block.test_check_at_ms =
+                        self.in_flight_test_check_at(provider, model, priced, &policy);
+                    return Some(block);
                 }
             }
         }
@@ -2780,13 +2799,107 @@ impl ClassContext {
         let reset = reset.into_iter().chain(fenced.values().copied()).min();
         // The allocator recovery above comes only from typed quota exclusions.
         // A route or credential origin at that recovery may instead be non-quota.
-        Some(self.account_block_at(
+        let mut block = self.account_block_at(
             provider,
             model,
             priced,
             reset,
             striatum_core::blocks::LifetimeClass::Quota,
-        ))
+        );
+        block.test_check_at_ms = self.in_flight_test_check_at(provider, model, priced, &policy);
+        Some(block)
+    }
+
+    fn in_flight_test_check_at(
+        &self,
+        provider: &str,
+        model: &str,
+        priced: bool,
+        policy: &AllocatorPolicy,
+    ) -> Option<i64> {
+        let fact = self
+            .facts
+            .iter()
+            .find(|fact| fact.provider_id == provider && fact.model_id == model)?;
+        self.class(fact, priced)
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                let account = self.account_id(row);
+                let blocked: Vec<_> = self
+                    .indexed_origins(provider, account, &row.id, model)
+                    .filter(|origin| {
+                        self.origin_applies(origin, provider, account, &row.id, model)
+                            && !self.origin_due(origin, account, model)
+                    })
+                    .collect();
+                if blocked.is_empty()
+                    || !blocked.iter().all(|origin| {
+                        let authorizations: Vec<_> = self
+                            .probe_authorizations
+                            .iter()
+                            .filter(|proof| {
+                                proof.kind == origin.kind
+                                    && proof.origin_key == origin.origin_key
+                                    && proof.evidence == origin.evidence
+                                    && proof.evidence_at == origin.evidence_at
+                            })
+                            .collect();
+                        !origin.quota
+                            && origin.due_at() > self.now_ms
+                            && !(self.probe_owner.is_some()
+                                && (origin.claim_owner == self.probe_owner
+                                    || authorizations.iter().any(|proof| {
+                                        Some(&proof.owner) == self.probe_owner.as_ref()
+                                    })))
+                            && (origin.claim_owner.is_some() || !authorizations.is_empty())
+                    })
+                {
+                    return None;
+                }
+                // Relax only these tests in a private view. A quota, reserve or
+                // credential restriction on the same account must still prevent
+                // this route from advertising a short status check.
+                let mut recovered = self.clone();
+                recovered.replace_rechecks(
+                    self.rechecks
+                        .iter()
+                        .cloned()
+                        .map(|mut origin| {
+                            if blocked.iter().any(|held| {
+                                held.kind == origin.kind && held.origin_key == origin.origin_key
+                            }) {
+                                origin.next_recheck_at = self.now_ms;
+                                origin.reset_check_at = None;
+                                origin.claim_owner = None;
+                            }
+                            origin
+                        })
+                        .collect(),
+                );
+                if !matches!(
+                    recovered
+                        .probe_with_policy(
+                            provider,
+                            model,
+                            priced,
+                            false,
+                            None,
+                            "in-flight-test-recovery",
+                            policy.clone()
+                        )
+                        .outcome,
+                    Outcome::Admit(_)
+                ) {
+                    return None;
+                }
+                blocked
+                    .iter()
+                    .map(|origin| origin.due_at())
+                    .min()
+                    .map(|clock| clock.min(self.now_ms.saturating_add(30_000)))
+            })
+            .min()
     }
 
     fn account_block_at(
@@ -2800,6 +2913,7 @@ impl ClassContext {
         use striatum_core::blocks::LifetimeClass;
         let mut block = AccountBlock {
             reset_at_ms,
+            test_check_at_ms: None,
             lifetime: fallback,
             credential_code: None,
         };
