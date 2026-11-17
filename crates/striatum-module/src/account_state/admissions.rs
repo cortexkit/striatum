@@ -219,6 +219,17 @@ pub(crate) struct AccountDemand {
 }
 
 impl AccountDemand {
+    #[cfg(all(test, feature = "heap-measure"))]
+    pub(crate) fn visit_heap_strings<'a>(&'a self, mut visit: impl FnMut(&'a String)) {
+        for entries in self.buckets.values() {
+            for ((_, principal, admission), demand) in entries.iter() {
+                visit(principal);
+                visit(admission);
+                visit(&demand.state);
+            }
+        }
+    }
+
     fn bucket(committed_at: i64) -> i64 {
         committed_at.div_euclid(DEMAND_BUCKET_MS)
     }

@@ -67,6 +67,29 @@ struct CompiledPolicy {
     metered_fallback: std::collections::BTreeSet<String>,
 }
 
+#[cfg(all(test, feature = "heap-measure"))]
+mod heap_measurements {
+    use super::*;
+    #[test]
+    #[ignore = "repository settings snapshot heap profile; run alone"]
+    fn repository_settings_heap() {
+        use crate::memory_measurements::{operation, profiler, release};
+        let document = crate::config_convert::convert(include_str!(
+            "../fixtures/routing-config-live-2026-10-24.jsonc"
+        ))
+        .unwrap();
+        println!(
+            "COUNTS repository_settings_document_bytes={}",
+            document.len()
+        );
+        let _profiler = profiler("settings");
+        let settings = operation("LiveConfig::new", || {
+            LiveConfig::new(parse_config(&document).unwrap(), Some(document.clone()))
+        });
+        release("LiveConfig_with_compiled_policy", settings);
+    }
+}
+
 impl CompiledPolicy {
     fn compile(config: &RoutingConfigFile) -> Self {
         let model_pools: Vec<_> = config

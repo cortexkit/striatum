@@ -13,6 +13,10 @@ path = "src/main.rs"
 [build-dependencies]
 sha2 = { workspace = true }
 
+[features]
+# Heap profiling is opt-in because its process-wide allocator changes test costs.
+heap-measure = []
+
 [dependencies]
 async-nats = { workspace = true, default-features = false, features = ["jetstream", "kv", "nkeys", "nuid", "ring", "server_2_10"] }
 async-trait = { workspace = true }
@@ -43,6 +47,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+dhat = "=0.3.3"
 cortexkit-bus-inmemory = { workspace = true }
 # Drives this module through every routing/v1 contract rule.
 cortexkit-role-routing-conformance = { workspace = true }

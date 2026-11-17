@@ -33,6 +33,8 @@ mod diagnostics_findings;
 mod engram_catalog;
 mod fusiform_catalog;
 mod head_choices;
+#[cfg(all(test, feature = "heap-measure"))]
+mod memory_measurements;
 mod key_pool;
 mod legacy_wire;
 #[cfg(test)]

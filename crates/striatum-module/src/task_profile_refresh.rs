@@ -430,12 +430,23 @@ mod tests {
     #[test]
     #[ignore = "live-sized CPU comparison; run in release with --ignored --nocapture"]
     fn live_sized_profile_refresh_cpu() {
+        live_sized_profile_refresh(false);
+    }
+
+    #[cfg(feature = "heap-measure")]
+    #[test]
+    #[ignore = "live-shaped profile-refresh heap profile; run alone"]
+    fn live_shaped_profile_heap() {
+        live_sized_profile_refresh(true);
+    }
+
+    fn live_sized_profile_refresh(heap: bool) {
         use crate::routing_v1::request_cpu_bench::{cpu_us, representative_fixture, FixtureCounts};
         let fixture = representative_fixture(FixtureCounts {
             subscription_rules: 8,
             exclusion_rules: 8,
             runner_route_rules: 8,
-            catalog_facts: 838,
+            catalog_facts: if heap { 852 } else { 838 },
             listed_credentials: 40,
         });
         let mut facts = fixture.store().get_facts().unwrap();
@@ -446,7 +457,7 @@ mod tests {
             fact.cost_per_m_tok_out = Some(2.0 + (i % 5) as f64);
             fact.reasoning_rate = Some(3.0);
         }
-        assert_eq!(facts.len(), 838);
+        assert_eq!(facts.len(), if heap { 852 } else { 838 });
         let rig = Rig::new("live-sized-cpu");
         let mut connection = rusqlite::Connection::open(rig.dir.join("routing.sqlite")).unwrap();
         connection.execute("DELETE FROM model_facts", []).unwrap();
@@ -473,21 +484,51 @@ mod tests {
         // Match the measured thirty-day row counts. Repeated executions of a
         // task keep one model, workload and IQ demand so they remain eligible.
         tx.execute(
-            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<181264)
+            &format!("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<{})
              INSERT INTO model_route_decisions(id,task_id,target_agent,consumer,selected_workload,requirements_json,selected_route_key,selected_model_id,selected_variant,score_json,rejected_json,anchor_version,created_at)
              SELECT 'd-'||x,'task-'||(x%16817),'mason','workload-'||((x%16817)%3),'ephemeral',
-                    json_object('iq',((x%16817)%11)*10),m.route,m.model,m.variant,'{}','[]',1,?1
-             FROM n JOIN cpu_models m ON m.n=(x%16817)%67", [NOW - 3 * 24 * 60 * 60 * 1000],
+                    json_object('iq',((x%16817)%11)*10),m.route,m.model,m.variant,'{{}}','[]',1,?1
+              FROM n JOIN cpu_models m ON m.n=(x%16817)%67",if heap {175701} else {181264}), [NOW - 3 * 24 * 60 * 60 * 1000],
         ).unwrap();
         tx.execute(
-            "WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<726485)
+            &format!("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<{})
              INSERT INTO model_route_usage(id,task_id,task_workload,workload_class,route_key,capacity_key,provider_id,input_tokens,cached_read_tokens,cache_write_tokens,output_tokens,reasoning_tokens,observed_at)
              SELECT 'u-'||x,'task-'||(x%10530),'workload-'||((x%10530)%3),
                     CASE x%3 WHEN 0 THEN 'ephemeral' WHEN 1 THEN 'coding' ELSE 'reasoning' END,
                     m.route,m.route,m.provider,1000+x%100,100,50,500+x%50,100,?1-x%17*1000
-             FROM n JOIN cpu_models m ON m.n=(x%10530)%67", [NOW - 2 * 24 * 60 * 60 * 1000],
+              FROM n JOIN cpu_models m ON m.n=(x%10530)%67",if heap {707464} else {726485}), [NOW - 2 * 24 * 60 * 60 * 1000],
         ).unwrap();
         tx.commit().unwrap();
+        #[cfg(feature = "heap-measure")]
+        if heap {
+            use crate::memory_measurements::{operation, profiler, release};
+            if std::env::var_os("STRIATUM_NATIVE_RSS").is_some() {
+                let snapshot =
+                    crate::memory_measurements::native_rss("task_profile_refresh", || {
+                        refresh(&rig.store, &rig.config, NOW, None).unwrap()
+                    });
+                println!("COUNTS profile_cells={} usage_rows=707465 decisions=175702 facts=852 tasks=10530",snapshot.cells.len());
+                return;
+            }
+            let _profiler = profiler("profile-refresh");
+            let snapshot = operation("task_profile_refresh", || {
+                refresh(&rig.store, &rig.config, NOW, None).unwrap()
+            });
+            println!(
+                "COUNTS profile_cells={} usage_rows=707465 decisions=175702 facts=852 tasks=10530",
+                snapshot.cells.len()
+            );
+            let cache = ProfileCache::default();
+            cache.publish(snapshot);
+            let reader = operation("ProfileCache::snapshot", || cache.snapshot());
+            release("ProfileSnapshot_reader_extra", reader);
+            release("ProfileCache_and_snapshot", cache);
+            let rows = operation("closed_task_usage", || {
+                rig.store.closed_task_usage(NOW).unwrap()
+            });
+            release("profile_input_10530_tasks", rows);
+            return;
+        }
         let read_cpu = cpu_us();
         let rows = rig.store.closed_task_usage(NOW).unwrap();
         eprintln!("profile input read: cpu_us={} tasks={} usage_rows=726486 decisions=181265 facts=838 workloads=3 active_routes=67", cpu_us()-read_cpu, rows.len());
