@@ -180,7 +180,7 @@ pub(super) fn effective(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Fen
 
 pub(super) fn generations(
     conn: &Connection,
-) -> rusqlite::Result<BTreeMap<(String, String), (String, u64)>> {
+) -> rusqlite::Result<BTreeMap<(String, String), (String, i64)>> {
     conn.prepare("SELECT kind,origin_key,evidence,claim_generation FROM block WHERE managed=1 AND is_origin=1")?
         .query_map([],|row|Ok(((row.get(0)?,row.get(1)?),(row.get(2)?,row.get(3)?))))?.collect()
 }

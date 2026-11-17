@@ -76,7 +76,7 @@ impl SqliteRouteStateStore {
             let generations=if current {native_reference::generations(conn)?} else {
                 conn.prepare("SELECT kind,origin_key,evidence,claim_generation FROM fence_recheck")?
                     .query_map([],|row|Ok(((row.get(0)?,row.get(1)?),(row.get(2)?,row.get(3)?))))?
-                    .collect::<rusqlite::Result<std::collections::BTreeMap<(String,String),(String,u64)>>>()?
+                    .collect::<rusqlite::Result<std::collections::BTreeMap<(String,String),(String,i64)>>>()?
             };
             for block in &loaded.blocks {
                 if let Some((evidence,generation))=generations.get(&(block.kind.clone(),block.origin_key.clone())) {
