@@ -1,6 +1,9 @@
 //! Independent reference predicates for quota grouping and the request's
 //! policy/listing composition. They do not call the core block evaluator.
 
+#[path = "block_parity_tests/native_fixture.rs"]
+mod native_fixture;
+
 use super::*;
 use crate::routing_v1::request_cpu_bench as bench;
 use striatum_store::FenceRecheck;
@@ -318,12 +321,7 @@ fn blocks_parity_fixture() {
     let _clock = crate::InjectedClock::set(bench::FIXTURE_NOW);
     let fixture = bench::representative_fixture(smoke());
     let mut c = context(&fixture);
-    fixture
-        .store()
-        .seed_block_parity_fixture_for_test(bench::FIXTURE_NOW as i64);
-    fixture
-        .store()
-        .assert_block_parity_fixture_coverage_for_test(bench::FIXTURE_NOW as i64);
+    native_fixture::seed(&fixture, bench::FIXTURE_NOW as i64);
     c.fences.insert(
         "cpu-provider-0".into(),
         fixture

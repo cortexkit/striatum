@@ -6,6 +6,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use striatum_core::blocks::{Block, Cause, LifetimeClass, Origin, Scope};
 use striatum_core::RouteStateResult;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "fence_rechecks/parity/tests.rs"]
+mod parity;
+
 pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1011,67 +1015,6 @@ impl SqliteRouteStateStore {
             .map_err(err)
     }
 
-    /// Boundary domain includes source deadlines even when a stored clock has
-    /// capped them, and all persisted probe clocks, each with its neighbours.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn block_parity_times(&self, now: i64) -> RouteStateResult<Vec<i64>> {
-        self.store
-            .with_read(|conn| Ok(parity_times(conn, now)?.into_iter().collect()))
-            .map_err(err)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn block_parity_identities(&self) -> RouteStateResult<Vec<[String; 4]>> {
-        self.store.with_read(parity_identities).map_err(err)
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn effective_blocks_oracle_for_test(
-        &self,
-        now: i64,
-    ) -> RouteStateResult<Vec<FenceRecheck>> {
-        self.store
-            .with_read(|conn| legacy::read_effective_at(conn, now))
-            .map_err(err)
-    }
-
-    /// Compare in one read snapshot, so a concurrent report cannot produce a
-    /// false difference between the adapter and the SQL oracle.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn block_parity(&self, now: i64) -> RouteStateResult<BlockParity> {
-        self.store.with_read(|conn| {
-            let tx = conn;
-            let started = std::time::Instant::now();
-            let loaded = legacy::load_blocks(&tx, now)?;
-            let load_time = started.elapsed();
-            let rows = legacy::read_effective_at(&tx, now)?;
-            let mut report = BlockParity { load_time, active: loaded.blocks.len(), cleared_evidence: loaded.cleared_evidence.len(), identities: 0, combinations_per_identity: 0, function_comparisons: 0, differences: Vec::new() };
-            let canonical = |rows: Vec<FenceRecheck>| -> std::collections::BTreeMap<_,_> {
-                rows.into_iter().map(|mut row| {
-                    row.cleared_models.sort();
-                    ((row.kind.clone(), row.origin_key.clone()),row)
-                }).collect()
-            };
-            let expected = canonical(rows);
-            let actual = canonical(loaded.blocks.iter().map(FenceRecheck::from).collect());
-            for key in expected.keys().chain(actual.keys()).collect::<std::collections::BTreeSet<_>>() {
-                if expected.get(key) != actual.get(key) {
-                    report.differences.push(format!("row {key:?}: SQL={:?}, block={:?}", expected.get(key), actual.get(key)));
-                }
-            }
-            for block in &loaded.blocks {
-                let clock: Option<(String,i64)> = tx.query_row("SELECT evidence,claim_generation FROM fence_recheck WHERE kind=?1 AND origin_key=?2", params![block.kind,block.origin_key], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
-                if let Some((evidence,generation)) = clock {
-                    if evidence == block.evidence && generation != block.claim_generation {
-                        report.differences.push(format!("claim generation {} {}: clock={generation}, block={}",block.kind,block.origin_key,block.claim_generation));
-                    }
-                }
-            }
-            compare_block_functions(&tx, now, &expected, &loaded.blocks, &mut report)?;
-            Ok(report)
-        }).map_err(err)
-    }
-
     pub fn bind_fence_probe_owner(&self, from: &str, to: &str) -> RouteStateResult<()> {
         let from = from.to_owned();
         let to = to.to_owned();
@@ -1099,6 +1042,9 @@ pub struct BlockParity {
 
 #[cfg(any(test, feature = "test-support"))]
 fn parity_times(conn: &Connection, now: i64) -> rusqlite::Result<std::collections::BTreeSet<i64>> {
+    if parity::native(conn)? {
+        return parity::times(conn, now);
+    }
     let mut times = std::collections::BTreeSet::from([now]);
     let mut statement = conn.prepare("SELECT next_recheck_at FROM fence_recheck UNION SELECT reset_check_at FROM fence_recheck UNION SELECT last_claimed_at FROM fence_recheck UNION SELECT deadline FROM fence_origin UNION SELECT reset_at FROM fence_origin")?;
     for at in statement.query_map([], |r| r.get::<_, Option<f64>>(0))? {
@@ -1112,6 +1058,9 @@ fn parity_times(conn: &Connection, now: i64) -> rusqlite::Result<std::collection
 
 #[cfg(any(test, feature = "test-support"))]
 fn parity_identities(conn: &Connection) -> rusqlite::Result<Vec<[String; 4]>> {
+    if parity::native(conn)? {
+        return parity::identities(conn);
+    }
     use std::collections::BTreeSet;
     let mut statement = conn.prepare("SELECT provider,account_id,credential_id,model FROM fence_origin UNION SELECT provider,account_id,credential_id,model FROM fence_recheck UNION SELECT provider,NULL,NULL,model FROM fence_recheck_route_clear")?;
     let scopes: Vec<(String, Option<String>, Option<String>, Option<String>)> = statement
