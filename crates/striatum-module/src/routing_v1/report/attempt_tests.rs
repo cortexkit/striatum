@@ -547,14 +547,52 @@ fn effect_snapshot(harness: &Harness) -> Vec<(String, Vec<Vec<SqlValue>>)> {
     rows
 }
 
+// Supplemental presence counts use block rows where source_present=1.
+// The complete snapshots still compare every persisted table and column.
+fn source_snapshot(harness: &Harness) -> Vec<Vec<SqlValue>> {
+    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let mut query = conn
+        .prepare(
+            "SELECT kind,* FROM block WHERE source_present=1 ORDER BY kind,source_order,origin_key",
+        )
+        .unwrap();
+    let columns = query.column_count();
+    let rows = query
+        .query_map([], |row| {
+            (0..columns).map(|column| row.get(column)).collect()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    rows
+}
+
 struct EffectCase {
     before: Vec<(String, Vec<Vec<SqlValue>>)>,
     after: Vec<(String, Vec<Vec<SqlValue>>)>,
+    sources: Vec<Vec<SqlValue>>,
+    before_sources: Vec<Vec<SqlValue>>,
 }
 
 impl EffectCase {
-    fn rows(&self, table: &str) -> &Vec<Vec<SqlValue>> {
-        &self.after.iter().find(|(name, _)| name == table).unwrap().1
+    fn source_rows_before(&self, kinds: &[&str]) -> Vec<&Vec<SqlValue>> {
+        self.before_sources
+            .iter()
+            .filter(|row| match row.first() {
+                Some(SqlValue::Text(kind)) => kinds.contains(&kind.as_str()),
+                _ => panic!("the explicit kind column must be text"),
+            })
+            .collect()
+    }
+
+    fn source_rows(&self, kinds: &[&str]) -> Vec<&Vec<SqlValue>> {
+        self.sources
+            .iter()
+            .filter(|row| match row.first() {
+                Some(SqlValue::Text(kind)) => kinds.contains(&kind.as_str()),
+                _ => panic!("the explicit kind column must be text"),
+            })
+            .collect()
     }
 }
 
@@ -601,9 +639,17 @@ async fn effect_case(status: Option<&str>, outcome: &str, extra: Value, seed: bo
                 EFFECT_NOW as i64 - 100,
             )
             .unwrap();
-        conn.execute("INSERT INTO account_route_fence (provider,credential_id,model,until_ms,decision_id,recorded_at,last_reported_at,wall_class)
-            VALUES ('example-subscription',?1,'model-c',?2,?3,?4,?4,'quota')",
-            rusqlite::params![credential,EFFECT_NOW as i64 + 1000,id,EFFECT_NOW as i64 - 100]).unwrap();
+        harness
+            .store()
+            .record_account_route_fence(&striatum_store::AccountRouteFence {
+                provider: "example-subscription".into(),
+                credential_id: credential.clone(),
+                model: "model-c".into(),
+                until_ms: EFFECT_NOW as i64 + 1000,
+                decision_id: id.clone(),
+                recorded_at: EFFECT_NOW as i64 - 100,
+            })
+            .unwrap();
     }
     let mut body = json!({"decision_id":id,"outcome":outcome,"credential_id":credential});
     body.as_object_mut()
@@ -616,12 +662,15 @@ async fn effect_case(status: Option<&str>, outcome: &str, extra: Value, seed: bo
         }
     }
     let before = effect_snapshot(&harness);
+    let before_sources = source_snapshot(&harness);
     let answer = result(route.call("route.report", &body).await);
     assert_eq!(answer["outcome"], outcome);
     assert_eq!(delivery_keys(&harness, &id), ["outcome"]);
     EffectCase {
         before,
         after: effect_snapshot(&harness),
+        sources: source_snapshot(&harness),
+        before_sources,
     }
 }
 
@@ -632,8 +681,8 @@ async fn attempt_effects_match_legacy_twins_and_typed_account_additions() {
             let attempt = effect_case(Some(status), "completed", json!({}), true).await;
             let legacy = effect_case(None, "completed", json!({}), true).await;
             assert_eq!(attempt.after, legacy.after, "{status}");
-            assert!(attempt.rows("credential_entitlement_fences").is_empty());
-            assert!(attempt.rows("account_route_fence").is_empty());
+            assert!(attempt.source_rows(&["credential"]).is_empty());
+            assert!(attempt.source_rows(&["account_route"]).is_empty());
         }
         for extra in [
             json!({}),
@@ -665,15 +714,19 @@ async fn attempt_effects_match_legacy_twins_and_typed_account_additions() {
                 let legacy = effect_case(None, "failed", twin, false).await;
                 assert_eq!(attempt.after, legacy.after, "{status}: {extra}");
                 if extra.get("credential_id").is_some() {
-                    assert!(attempt.rows("credential_entitlement_fences").is_empty());
-                    assert!(attempt.rows("account_route_fence").is_empty());
-                    assert!(attempt.rows("account_non_quota_route_fence").is_empty());
+                    assert!(attempt.source_rows(&["credential"]).is_empty());
+                    assert!(attempt.source_rows(&["account_route"]).is_empty());
+                    assert!(attempt
+                        .source_rows(&["non_quota_route", "transient_route"])
+                        .is_empty());
                 } else {
                     let walls = if status == "quota" {
-                        attempt.rows("account_route_fence").len()
-                            + attempt.rows("account_non_quota_route_fence").len()
+                        attempt.source_rows(&["account_route"]).len()
+                            + attempt
+                                .source_rows(&["non_quota_route", "transient_route"])
+                                .len()
                     } else {
-                        attempt.rows("credential_entitlement_fences").len()
+                        attempt.source_rows(&["credential"]).len()
                     };
                     assert_eq!(
                         walls,
@@ -746,8 +799,9 @@ async fn rejected_and_unknown_suppress_all_legacy_evidence_but_commit_cancelled(
             if let Some(class) = refusal_class { extra["refusal_class"] = json!(class); }
             let attempt = effect_case(Some(status), outcome, extra, true).await;
             assert_eq!(attempt.after, legacy.after, "{status} {outcome}");
-            assert_eq!(attempt.rows("credential_entitlement_fences").len(), 1);
-            for table in ["model_route_state", "account_route_fence", "routing_v1_affinity"] {
+            assert_eq!(attempt.source_rows(&["credential"]).len(), 1);
+            assert_eq!(attempt.source_rows_before(&["account_route"]), attempt.source_rows(&["account_route"]), "account_route_fence");
+            for table in ["model_route_state", "routing_v1_affinity"] {
                 assert_eq!(attempt.before.iter().find(|(name, _)| name == table),
                     attempt.after.iter().find(|(name, _)| name == table), "{table}");
             }
