@@ -50,3 +50,54 @@ pub(super) fn route_unscoped(conn: &Connection, route: &str) -> rusqlite::Result
         |row| row.get(0),
     )
 }
+
+/// `block_parity` compares the legacy adapter with its SQL evaluator. Also
+/// compare the public loader over block records and its functions with frozen
+/// SQL evaluated from the same pre-migration input.
+pub(super) fn load_and_compare(store: &SqliteRouteStateStore, now: i64) -> super::LoadedBlocks {
+    let loaded = store.load_blocks(now).unwrap();
+    store
+        .with_reader_for_test(|conn| {
+            let canonical = |rows: Vec<super::FenceRecheck>| -> std::collections::BTreeMap<_, _> {
+                rows.into_iter()
+                    .map(|mut row| {
+                        row.cleared_models.sort();
+                        ((row.kind.clone(), row.origin_key.clone()), row)
+                    })
+                    .collect()
+            };
+            let expected = canonical(super::legacy::read_effective_at(conn, now)?);
+            let actual = canonical(
+                loaded
+                    .blocks
+                    .iter()
+                    .map(super::FenceRecheck::from)
+                    .collect(),
+            );
+            assert_eq!(
+                actual, expected,
+                "the native loader matches the frozen SQL effective rows"
+            );
+            let mut report = super::BlockParity {
+                load_time: std::time::Duration::ZERO,
+                active: loaded.blocks.len(),
+                cleared_evidence: loaded.cleared_evidence.len(),
+                identities: 0,
+                combinations_per_identity: 0,
+                function_comparisons: 0,
+                differences: Vec::new(),
+            };
+            super::compare_block_functions(conn, now, &expected, &loaded.blocks, &mut report)?;
+            assert!(
+                report.identities > 0 && report.function_comparisons > 0,
+                "the native/SQL function sweep actually ran: {report:#?}"
+            );
+            assert!(
+                report.differences.is_empty(),
+                "native functions versus frozen SQL: {report:#?}"
+            );
+            Ok(())
+        })
+        .unwrap();
+    loaded
+}

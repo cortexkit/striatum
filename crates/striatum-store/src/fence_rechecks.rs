@@ -3081,7 +3081,7 @@ mod tests {
     fn blocks_parity_new_evidence_and_orphan_observation() {
         let now = 1_900_000_000_000;
         let (_scratch, store) = native_fixture::changed_evidence_parity_store(now);
-        let loaded = store.load_blocks(now).unwrap();
+        let loaded = native_fixture::load_and_compare(&store, now);
         let credential = loaded
             .blocks
             .iter()
