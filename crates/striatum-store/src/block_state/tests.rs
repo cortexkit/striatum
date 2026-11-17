@@ -3701,11 +3701,11 @@ fn real_sync_case_change(state: &Rig, before: &Rig, name: &str) -> (u64, Arc<Ato
         .unwrap();
     let path = std::fs::canonicalize(state._scratch.path().join("state.db")).unwrap();
     let loads = state.owner.loads.load(Ordering::Relaxed);
-    let mut outside = Connection::open(&path).unwrap();
+    let outside = Connection::open(&path).unwrap();
     outside
         .busy_timeout(std::time::Duration::from_secs(5))
         .unwrap();
-    let tx = outside.transaction().unwrap();
+    let tx = crate::transactions::write_transaction(&outside).unwrap();
     assert_eq!(
         tx.execute(
             "UPDATE block SET source_present=0,managed=0,cleared_at=?1,cleared_by='removed'
@@ -3746,10 +3746,10 @@ fn real_sync_case_change(state: &Rig, before: &Rig, name: &str) -> (u64, Arc<Ato
                 0,
                 "{label}: removed clock"
             );
-            let mut conn = Connection::open(outside_path).unwrap();
+            let conn = Connection::open(outside_path).unwrap();
             conn.busy_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
-            let tx = conn.transaction().unwrap();
+            let tx = crate::transactions::write_transaction(&conn).unwrap();
             assert_eq!(
                 tx.execute(
                     "UPDATE block SET managed=?1,quota=?2,classified=?3,next_recheck_at=?4,
