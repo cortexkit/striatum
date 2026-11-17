@@ -261,7 +261,8 @@ fn source_insert_sql(kind: &str) -> String {
         wall_class=excluded.wall_class,wall_unscoped=excluded.wall_unscoped,scope_error=excluded.scope_error,
         listing_fingerprint=excluded.listing_fingerprint,recovery_set_json=excluded.recovery_set_json,
         source_metadata_json=excluded.source_metadata_json,cleared_reason=excluded.cleared_reason,
-        source_order=CASE WHEN block.source_present=1 THEN block.source_order ELSE excluded.source_order END,source_present=1
+        source_order=CASE WHEN excluded.kind='route' THEN excluded.source_order
+            WHEN block.source_present=1 THEN block.source_order ELSE excluded.source_order END,source_present=1
         WHERE excluded.kind NOT IN ('account','principal') OR (excluded.kind='principal' AND block.source_present=0)")
 }
 
@@ -280,7 +281,17 @@ pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Re
     let block = &row.block;
     let scope = &block.scope;
     let source_order = if row.source_order == 0 {
-        conn.query_row(NEXT_SOURCE_ORDER, [&block.kind], |row| row.get::<_, i64>(0))?
+        if block.kind == "route" {
+            // Catalogue rows exist before their first refusal. Later reports
+            // must keep that established scan order, not refusal-arrival order.
+            conn.query_row(
+                "SELECT rowid FROM model_route_state WHERE route_key=json_extract(?1,'$[0]')",
+                [&block.origin_key],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            conn.query_row(NEXT_SOURCE_ORDER, [&block.kind], |row| row.get::<_, i64>(0))?
+        }
     } else {
         row.source_order
     };
