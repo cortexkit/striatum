@@ -277,7 +277,54 @@ async fn request_paths_read_no_block_table_outside_the_writer() {
         .account_transaction(|tx| tx.active_fences(POOL))
         .unwrap();
     let seen = trace.take();
-    assert_eq!((seen.reader.len(), seen.writer.len()), (0, 1), "{seen:#?}");
+    // The active_fences(POOL) calibration loads all seven native record sets,
+    // one statement each. Every statement must be on the writer connection.
+    assert_eq!((seen.reader.len(), seen.writer.len()), (0, 7), "{seen:#?}");
+    assert_eq!(
+        (
+            seen.triggers.len(),
+            seen.clock_normalization_reads.len(),
+            seen.clock_normalizations
+        ),
+        (0, 0, 0),
+        "the read-only calibration fires no reading trigger: {seen:#?}"
+    );
+    let table_names = store
+        .with_reader_for_test(|conn| {
+            let mut statement =
+                conn.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?;
+            let names = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(names)
+        })
+        .unwrap();
+    let mut writer_records = std::collections::BTreeMap::<String, usize>::new();
+    for sql in &seen.writer {
+        let tables: Vec<_> = table_names
+            .iter()
+            .filter(|table| reads_tables(sql, &[table.as_str()]))
+            .collect();
+        assert_eq!(
+            tables.len(),
+            1,
+            "one physical record set per calibration statement: {sql}"
+        );
+        *writer_records.entry(tables[0].to_string()).or_default() += 1;
+    }
+    assert_eq!(
+        writer_records,
+        std::collections::BTreeMap::from([
+            ("block".into(), 1),
+            ("probe_authorization".into(), 1),
+            ("success_proof".into(), 1),
+            ("pool_key_state".into(), 1),
+            ("provider_cooldown_state".into(), 1),
+            ("model_route_state".into(), 1),
+            ("account_eligibility".into(), 1),
+        ]),
+        "the calibration sees exactly one writer statement per native record set"
+    );
     // Collect the oracle statements' text, to look for them on the writer.
     // `fence_rechecks`' statements are left out: the store's own claim
     // statements still run them inside the writer.
@@ -608,8 +655,8 @@ async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_wa
     store
         .with_writer_for_test(|conn| {
             conn.execute_batch(&format!(
-                "INSERT INTO fence_recheck_route_clear SELECT kind,origin_key,provider,'model-a',evidence
-                 FROM fence_recheck WHERE kind='provider' AND provider='{BORROWED}';"
+                "UPDATE block SET cleared_models=json_array('model-a')
+                 WHERE kind='provider' AND provider='{BORROWED}' AND is_origin=1 AND managed=1 AND source_present=1;"
             ))
         })
         .unwrap();
@@ -622,7 +669,9 @@ async fn an_admission_on_a_state_holding_a_dropped_route_clear_runs_again_and_wa
     .await;
     // SQL drops the clear where neither the capture nor a reload sees it.
     store
-        .write_unseen_for_test("DELETE FROM fence_recheck_route_clear;")
+        .write_unseen_for_test(&format!(
+            "UPDATE block SET cleared_models='[]' WHERE kind='provider' AND provider='{BORROWED}';"
+        ))
         .unwrap();
     let reply = runner
         .call(
