@@ -1,6 +1,6 @@
 use super::*;
 
-mod controls;
+mod tests;
 
 const ACCOUNT: &str = "only-chatgpt-account";
 const CREDENTIAL: &str = "oauth:only-chatgpt-login";
