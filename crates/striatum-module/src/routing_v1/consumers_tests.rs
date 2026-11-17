@@ -68,7 +68,7 @@ fn placement_catalog(h: &Harness, declarations: Value) {
     .unwrap();
     let shared = h.credentials();
     let mut credentials = shared.lock().unwrap();
-    credentials.catalog_snapshot = Some(Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     let runner = credentials.runner_declarations[fixture::RUNNER_ONE].clone();
     credentials
         .runner_declarations
@@ -1770,7 +1770,7 @@ async fn declared_names_mixed_runner_slot_and_preview_follow_serving_capabilitie
             .unwrap(),
     )
     .unwrap();
-    h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
     h.edit_config(|config| {
         config["consumers"] = json!({"preview": {}});
         config["runners"] = json!([{"module":"broca"}]);

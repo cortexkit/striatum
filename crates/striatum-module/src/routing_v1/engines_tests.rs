@@ -548,7 +548,7 @@ async fn engine_transcription_prices_use_audio_units_and_never_guess_token_conve
     assert_eq!(first.engine_cost(&parsed, "media-vendor", "b"), None);
     assert_eq!(first.engine_cost(&parsed, "media-vendor", "a"), None);
     let mut credentials = media_credentials(vec![key("opaque-media")]);
-    credentials.catalog_snapshot = Some(Arc::new(first));
+    credentials.catalog_snapshot = Some(first);
     harness.set_credentials(credentials);
     // Declarations need to state a duration limit before a duration request can match.
     let mut entries: Vec<_> = ["a", "b", "z"]
@@ -566,7 +566,7 @@ async fn engine_transcription_prices_use_audio_units_and_never_guess_token_conve
     let second = snapshot(&models);
     assert!((second.engine_cost(&parsed, "media-vendor", "b").unwrap() - 0.00288).abs() < 1e-12);
     let mut credentials = media_credentials(vec![key("opaque-media")]);
-    credentials.catalog_snapshot = Some(Arc::new(second));
+    credentials.catalog_snapshot = Some(second);
     harness.set_credentials(credentials);
     assert_eq!(selected(&route, &params).await["engine"]["model"], "b");
     params["requirements"] = json!({});

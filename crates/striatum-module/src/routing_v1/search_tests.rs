@@ -34,7 +34,7 @@ fn catalog(allowance_grade: u64) -> Value {
 fn install(h: &Harness, catalog: &Value) {
     let snapshot =
         crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(catalog).unwrap()).unwrap();
-    h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
 }
 
 fn setup(grade: u64) -> Arc<Harness> {

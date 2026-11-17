@@ -10240,7 +10240,7 @@ mod tests {
         )
         .unwrap();
         let credentials = empty_broca_credentials();
-        credentials.lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+        credentials.lock().unwrap().catalog_snapshot = Some(snapshot);
         for variant in [None, Some("thinking")] {
             let response = run_route_wire_request_with_paths(&store, json!({"method": ROUTE_MODEL_UPSERT_OP,
                 "params":{"providerID":"meta","modelID":"muse-wonder-1.0","variant":variant,"elo":1808,"eq":1600}

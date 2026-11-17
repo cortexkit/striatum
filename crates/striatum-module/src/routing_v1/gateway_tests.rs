@@ -222,10 +222,10 @@ fn fixture_for_catalog(served_provider: &str, model: &str) -> Arc<Harness> {
     credentials.publish_billing_catalog(
         PlaneCatalog::ordinary_test_catalog(&billing).with_wire_apis(&credentials.wire_apis),
     );
-    credentials.catalog_snapshot = Some(Arc::new(crate::fusiform_catalog::decode_catalog_get(
+    credentials.catalog_snapshot = Some(crate::fusiform_catalog::decode_catalog_get(
         &serde_json::to_vec(&json!({"catalog_version":41, "resolved_at_ms":123,
             "models":{format!("{served_provider}/{model}"):{"existence":"present", "model.type":"chat", "capability.tool_call":true}}}))
-            .unwrap()).unwrap()));
+            .unwrap()).unwrap());
     credentials.runner_declarations = super::runners::declarations_from_catalog(&json!([
         {"module_id":"broca", "nonce_verified":true, "role_declarations":{"routing/v1":{"runner":{
             "follows_account_choice":true,

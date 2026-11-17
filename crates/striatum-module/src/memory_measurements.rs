@@ -138,8 +138,8 @@ async fn live_shaped_other_holders_heap() {
     let catalog = operation("decode_catalog_get_852", || {
         crate::fusiform_catalog::decode_catalog_get(&bytes).unwrap()
     });
-    let catalog_copy = operation("catalog_deep_clone", || catalog.clone());
-    release("catalog_deep_clone", catalog_copy);
+    let catalog_copy = operation("catalog_shared_reader", || catalog.clone());
+    release("catalog_shared_reader", catalog_copy);
     release("CatalogSnapshot_852_sample_rows", catalog);
     let facts = operation("store_get_facts_852", || {
         fixture.store().get_facts().unwrap()
@@ -326,37 +326,7 @@ async fn live_shaped_catalog_job_heap() {
             ))
             .unwrap();
     }
-    let samples: serde_json::Value =
-        serde_json::from_str(include_str!("../fixtures/served-payloads.json")).unwrap();
-    let mut payload = samples["catalog.get — one model, current"]["response"].clone();
-    let model = payload["models"]
-        .as_object()
-        .unwrap()
-        .values()
-        .next()
-        .unwrap()
-        .clone();
-    payload["models"] = serde_json::Value::Object(
-        (0..12_193)
-            .map(|i| {
-                (
-                    format!(
-                        "{}/claude-sonnet-4-5-{i}",
-                        if i < 852 {
-                            "anthropic"
-                        } else {
-                            "unmapped-provider"
-                        }
-                    ),
-                    model.clone(),
-                )
-            })
-            .collect(),
-    );
-    payload["catalog_version"] = serde_json::json!(0);
-    let bytes = serde_json::to_vec(&payload).unwrap();
-    drop(payload);
-    drop(samples);
+    let bytes = crate::fusiform_catalog::allocation_tests::live_shaped_reply();
     let native = std::env::var_os("STRIATUM_NATIVE_RSS").is_some();
     let _profiler = (!native).then(|| profiler("catalog-job"));
     let old = crate::fusiform_catalog::decode_catalog_get(&bytes).unwrap();
@@ -377,7 +347,7 @@ async fn live_shaped_catalog_job_heap() {
             .position(|w| w == needle)
             .unwrap();
         wire[offset + needle.len() - 1] = b'1';
-        let snapshot = crate::fusiform_catalog::decode_catalog_get(&wire).unwrap();
+        let snapshot = crate::fusiform_catalog::decode_catalog_get(wire).unwrap();
         crate::fusiform_catalog::apply_mapped_catalog(
             &store,
             &snapshot,

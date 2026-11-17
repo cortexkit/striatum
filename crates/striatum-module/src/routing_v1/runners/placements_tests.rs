@@ -393,7 +393,7 @@ async fn settings_placement_describe_uses_first_entry_and_pickers_ignore_harness
         .unwrap(),
     )
     .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
     entries(
         &harness,
         json!([{ "module":"thalamus-harness","routes":["anthropic/model-a","anthropic/model-b"],"tool_capabilities":["first/v1"] }]),
@@ -909,7 +909,7 @@ fn classifier_harness() -> std::sync::Arc<Harness> {
         .unwrap();
     let mut credentials = crate::broca_credentials::BrocaCredentials::api_test_credentials(&facts);
     credentials.publish_plan_prices(&json!({"prices":[]}));
-    credentials.catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     let mut cache = crate::routing_v1::classifier::DescribeCache::default();
     cache.catalog(&json!([{"module_id":"broca", "nonce_verified":true,"capabilities":{"provides":["classifier/v1"]}}]), &mut credentials, crate::now_ms() as i64);
     cache.reply(

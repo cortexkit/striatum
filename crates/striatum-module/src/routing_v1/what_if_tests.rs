@@ -197,7 +197,7 @@ fn prepare_runner_preview(harness: &Harness) {
     .unwrap();
     let shared = harness.credentials();
     let mut credentials = shared.lock().unwrap();
-    credentials.catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    credentials.catalog_snapshot = Some(snapshot);
     credentials.runner_declarations.clear();
 }
 

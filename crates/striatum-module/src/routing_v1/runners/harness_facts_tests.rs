@@ -62,7 +62,7 @@ fn prepare_selects(harness: &crate::routing_v1::conformance_tests::Harness) {
             .unwrap(),
     )
     .unwrap();
-    harness.credentials().lock().unwrap().catalog_snapshot = Some(std::sync::Arc::new(snapshot));
+    harness.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
 }
 
 #[tokio::test]

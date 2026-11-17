@@ -11,7 +11,7 @@ fn catalog(h: &Harness, models: Value) {
         .unwrap(),
     )
     .unwrap();
-    h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+    h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
 }
 
 fn video(model: &str) -> Value {
@@ -166,7 +166,7 @@ async fn pinned_served_video_rows_still_refuse_all_unstated_output_facts() {
                         &serde_json::to_vec(response).unwrap(),
                     )
                     .unwrap();
-                    h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+                    h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
                     let route = h.bind(reserved("colliculus"), None).await;
                     for (field, value, fact) in [
                         ("output_duration_ms", json!(1), "limit.output_duration_ms"),

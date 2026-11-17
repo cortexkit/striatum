@@ -444,7 +444,7 @@ async fn media_preview_speech_job_cost_and_decommissioned_exclusions() {
             let snapshot = crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&json!({
                 "catalog_version":1,"resolved_at_ms":1,"models":{"media-vendor/speech":row}
             })).unwrap()).unwrap();
-            h.credentials().lock().unwrap().catalog_snapshot = Some(Arc::new(snapshot));
+            h.credentials().lock().unwrap().catalog_snapshot = Some(snapshot);
         };
         install(row.clone());
         let op = operator(&h).await;
