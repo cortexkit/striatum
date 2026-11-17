@@ -5430,7 +5430,7 @@ fn route_source_order_keeps_existing_metadata_order_through_reverse_reports_and_
     let loads = rig.owner.loads.load(Ordering::Relaxed);
     rig.owner.request_reload();
     rig.store
-        .account_command(AccountCommandKind::Tick, |tx| tx.tick(now))
+        .account_command(AccountCommandKind::Tick, move |tx| tx.tick(now))
         .unwrap();
     assert_eq!(rig.owner.loads.load(Ordering::Relaxed), loads + 1);
     check_order();
