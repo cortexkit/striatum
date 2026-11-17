@@ -153,7 +153,11 @@ fn expired_malformed_wall_class_does_not_change_diagnostic_success() {
     let now = crate::now_ms();
     old.with_writer_for_test(|conn| {
         insert_fact(conn,"expired")?;
+        // Deliberately corrupt only this old fixture: ordinary writers reject
+        // the class, but an expired field must not be decoded by diagnostics.
+        conn.execute_batch("PRAGMA ignore_check_constraints=ON")?;
         conn.execute("UPDATE model_route_state SET failure_backoff_until=?1,wall_class='not-a-wall-class' WHERE route_key='projection-p/expired'",[now-1])?;
+        conn.execute_batch("PRAGMA ignore_check_constraints=OFF")?;
         assert_eq!(conn.query_row("SELECT count(*) FROM model_route_state WHERE cooldown_until>?1 OR quota_exhausted_until>?1 OR failure_backoff_until>?1",[now],|r|r.get::<_,i64>(0))?,0);
         Ok(())
     }).unwrap();
