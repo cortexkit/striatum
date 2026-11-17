@@ -321,7 +321,10 @@ fn migration_new_evidence_keeps_the_prior_claim_time_without_its_authorization()
         assert_eq!(after.last_claimed_at,Some(now));
         assert_eq!(after.next_recheck_at,now+990000);
         assert_eq!(after.claim_owner,None);
-        assert_eq!(after.claim_generation,0);
+        // The changed refusal signature invalidates the old probe authorization.
+        // Preserve claim_generation so a later claim cannot match that stale
+        // authorization if the earlier refusal returns.
+        assert_eq!(after.claim_generation,41);
         Ok(())
     }).unwrap();
 }
