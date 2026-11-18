@@ -23,11 +23,11 @@ fn declarations() -> Value {
 fn catalog(allowance_grade: u64) -> Value {
     json!({"catalog_version":1,"resolved_at_ms":NOW,
     "quality_scores":{"graded_by":"operator","graded_at_ms":NOW},"models":{
-        "search-fixture/allowance":{"existence":"present","model.type":"search","quality.grade":allowance_grade,
+        "search-fixture/allowance":{"existence":"present","model.type":"search","quality.grade.search":allowance_grade,
                 "rate.request.per_request":{"state":"priced","currency":"USD","units":10,"exponent":3,"per":1}},
-        "search-fixture/paid":{"existence":"present","model.type":"search","quality.grade":400,
+        "search-fixture/paid":{"existence":"present","model.type":"search","quality.grade.search":400,
                 "rate.output.per_result":{"state":"priced","currency":"USD","units":1,"exponent":3,"per":1}},
-        "search-fixture/unpriced":{"existence":"present","model.type":"search","quality.grade":400}
+        "search-fixture/unpriced":{"existence":"present","model.type":"search","quality.grade.search":400}
     }})
 }
 

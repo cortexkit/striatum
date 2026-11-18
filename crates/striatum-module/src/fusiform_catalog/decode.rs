@@ -130,7 +130,7 @@ struct ModelRow {
     decoded: Result<(FusiformFactUpdate, ModelRates), String>,
     decommissioned: Option<String>,
     grade: Option<striatum_store::OperatorQuality>,
-    media_grade: Option<MediaGrade>,
+    media_grade: MediaGrade,
     video: Option<VideoFacts>,
     media_rates: BTreeMap<String, MediaRate>,
     audio: Option<AudioInputPrice>,
@@ -171,19 +171,7 @@ impl ModelRow {
                     elo,
                     eq,
                 }),
-            media_grade: entry
-                .get("model.type")
-                .and_then(Value::as_str)
-                .zip(
-                    entry
-                        .get("quality.grade")
-                        .and_then(Value::as_f64)
-                        .filter(|grade| grade.is_finite() && *grade > 0.0),
-                )
-                .map(|(kind, value)| MediaGrade {
-                    model_type: kind.to_owned(),
-                    value,
-                }),
+            media_grade: media_grades::catalog_row(entry),
             video: (readable && entry.get("model.type").and_then(Value::as_str) == Some("video"))
                 .then(|| VideoFacts::decode(key, entry)),
             media_rates: if readable {
@@ -316,6 +304,7 @@ impl CatalogPage {
             model_kinds: BTreeMap::new(),
             audio_input_prices: BTreeMap::new(),
             media_grades: BTreeMap::new(),
+            local_grades: Default::default(),
             media_rates: BTreeMap::new(),
             video_facts: BTreeMap::new(),
             quality_scores: self.quality_scores,
@@ -337,9 +326,7 @@ impl CatalogPage {
                 if let Some(grade) = row.grade {
                     snapshot.grades.insert(key.clone(), grade);
                 }
-                if let Some(grade) = row.media_grade {
-                    snapshot.media_grades.insert(key.clone(), grade);
-                }
+                snapshot.media_grades.insert(key.clone(), row.media_grade);
             }
             match row.decoded {
                 Ok((mut fact, rates)) => {

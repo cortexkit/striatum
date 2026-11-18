@@ -16,6 +16,10 @@ use super::{store_refusal, Caller, Deps};
 #[path = "media_ranking.rs"]
 mod ranking;
 
+#[cfg(test)]
+#[path = "media_grade_observer_tests.rs"]
+pub(crate) mod grade_observer;
+
 #[path = "media_pricing.rs"]
 mod pricing;
 
@@ -752,7 +756,7 @@ fn select_request(
             let key = format!("{}/{}", candidate.engine.provider, candidate.engine.model);
             if let Some(grade) = catalog
                 .as_ref()
-                .and_then(|catalog| catalog.media_grade(request.kind.as_str(), &key))
+                .and_then(|catalog| catalog.local_media_grade(request.kind.as_str(), &key))
             {
                 media_grades.insert(key, grade);
             }

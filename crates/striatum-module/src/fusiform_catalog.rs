@@ -402,8 +402,7 @@ enum CatalogRate {
     Unknown,
 }
 
-#[derive(Debug, PartialEq)]
-#[cfg_attr(test, derive(Clone))]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CatalogSnapshot {
     cursor: FusiformCatalogCursor,
     facts: Vec<FusiformFactUpdate>,
@@ -414,6 +413,7 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) model_kinds: BTreeMap<String, String>,
     audio_input_prices: BTreeMap<String, AudioInputPrice>,
     media_grades: BTreeMap<String, MediaGrade>,
+    local_grades: media_grades::LocalGrades,
     media_rates: BTreeMap<String, BTreeMap<String, MediaRate>>,
     video_facts: BTreeMap<String, VideoFacts>,
     quality_scores: Option<QualityScores>,
@@ -471,20 +471,16 @@ impl CatalogSnapshot {
     pub(crate) fn video_facts(&self, route: &str) -> Option<&VideoFacts> {
         self.video_facts.get(route)
     }
-    /// A grade compares models of one media type, never unrelated catalog rows.
-    #[allow(
-        dead_code,
-        reason = "Media facts must not alter legacy engine selection."
-    )]
+    /// A row can carry independent grades for several media tasks.
     pub(crate) fn media_grade(&self, kind: &str, route: &str) -> Option<f64> {
-        let expected_type = match kind {
-            "transcribe" | "stream_transcribe" => "transcription",
-            "synthesize" => "speech",
-            "image" | "video" | "realtime" | "search" => kind,
-            _ => return None,
-        };
-        let grade = self.media_grades.get(route)?;
-        (grade.model_type == expected_type).then_some(grade.value)
+        self.media_grades
+            .get(route)?
+            .get(if kind == "search" {
+                "search"
+            } else {
+                media_grades::grade_kind(kind)?
+            })
+            .copied()
     }
 
     /// Keys retain the catalog's `rate.` prefix so no rate can disappear when
@@ -552,11 +548,7 @@ impl CatalogSnapshot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-struct MediaGrade {
-    model_type: String,
-    value: f64,
-}
+type MediaGrade = BTreeMap<String, f64>;
 
 /// Only absent or explicitly unknown quantity rules permit billing the measured
 /// quantity unchanged. Preserve other kinds so callers can leave the route
@@ -1220,6 +1212,9 @@ fn unwrap_tool_result(bytes: &[u8]) -> Result<Value, FusiformCatalogError> {
 #[cfg(test)]
 pub(crate) mod allocation_tests;
 mod decode;
+mod media_grades;
+#[cfg(test)]
+pub(crate) use media_grades::{count_calls, inherit_calls};
 
 pub(crate) fn decode_catalog_get(
     bytes: impl AsRef<[u8]>,
@@ -1282,21 +1277,7 @@ fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCa
             .as_ref()
             .is_some_and(|scores| scores.graded_by == "operator")
         {
-            if let (Some(model_type), Some(value)) = (
-                entry.get("model.type").and_then(Value::as_str),
-                entry
-                    .get("quality.grade")
-                    .and_then(Value::as_f64)
-                    .filter(|grade| grade.is_finite() && *grade > 0.0),
-            ) {
-                media_grades.insert(
-                    served_key.clone(),
-                    MediaGrade {
-                        model_type: model_type.to_owned(),
-                        value,
-                    },
-                );
-            }
+            media_grades.insert(served_key.clone(), media_grades::catalog_row(&entry));
             if let (Some(elo), Some(eq)) = (
                 entry.get("quality.elo").and_then(Value::as_f64),
                 entry.get("quality.eq").and_then(Value::as_f64),
@@ -1383,6 +1364,7 @@ fn decode_catalog_get_legacy(bytes: &[u8]) -> Result<CatalogSnapshot, FusiformCa
         model_kinds,
         audio_input_prices,
         media_grades,
+        local_grades: Default::default(),
         media_rates,
         video_facts,
         quality_scores: reply.quality_scores,
@@ -1511,7 +1493,7 @@ impl FusiformCatalogConsumer {
         credentials: crate::broca_credentials::SharedBrocaCredentials,
     ) -> Result<(), FusiformCatalogError> {
         self.credentials = Some(credentials);
-        let snapshot = self.catalog_get().await?;
+        let snapshot = media_grades::refresh_snapshot(self).await?;
         self.refresh_planes(Some(&snapshot)).await?;
         apply_catalog_snapshot(store, &snapshot, None, None, None, "dry run copy")?;
         self.close().await
@@ -1607,6 +1589,8 @@ impl FusiformCatalogConsumer {
     }
 
     async fn call_frame(&mut self, body: Vec<u8>) -> Result<Frame, FusiformCatalogError> {
+        #[cfg(test)]
+        media_grades::count_call();
         let corr = self.corr();
         let frame = Frame::build(
             FrameType::Request,
@@ -1690,6 +1674,9 @@ trait CatalogWire {
     }
     async fn catalog_get(&mut self) -> Result<Arc<CatalogSnapshot>, FusiformCatalogError>;
     async fn catalog_status(&mut self) -> Result<CatalogStatusReply, FusiformCatalogError>;
+    async fn local_grades(&mut self) -> Result<media_grades::LocalGrades, FusiformCatalogError> {
+        Ok(Default::default())
+    }
     async fn close(&mut self) -> Result<(), FusiformCatalogError>;
     async fn refresh_planes(
         &mut self,
@@ -1700,6 +1687,9 @@ trait CatalogWire {
 }
 
 impl CatalogWire for FusiformCatalogConsumer {
+    async fn local_grades(&mut self) -> Result<media_grades::LocalGrades, FusiformCatalogError> {
+        self.read_local_grades().await
+    }
     fn credentials(&self) -> Option<crate::broca_credentials::SharedBrocaCredentials> {
         self.credentials.clone()
     }
@@ -2075,7 +2065,8 @@ pub(crate) async fn ingest_before_upsert(
         if let Some(connection) = connection {
             let root = std::env::temp_dir().join("routing-upsert-catalog");
             let mut client = FusiformCatalogConsumer::connect(&connection, &root).await?;
-            let snapshot = client.catalog_get().await?;
+            client.credentials = Some(Arc::clone(credentials));
+            let snapshot = media_grades::refresh_snapshot(&mut client).await?;
             client.close().await?;
             Some(snapshot)
         } else {
@@ -2150,7 +2141,7 @@ async fn bootstrap_cycle<C: CatalogWire>(
     config_path: Option<&Path>,
     ladder: Option<&LadderSources>,
 ) -> Result<CycleOutcome, FusiformCatalogError> {
-    let snapshot = client.catalog_get().await?;
+    let snapshot = media_grades::refresh_snapshot(client).await?;
     striatum_store::job_timing::run(
         "billing_plane_refresh",
         client.refresh_planes(Some(&snapshot)),
@@ -2195,7 +2186,7 @@ async fn poll_cycle<C: CatalogWire>(
         .map(|cursor| status.catalog_version != cursor.catalog_version)
         .unwrap_or(true);
     let get_calls = if should_get {
-        let snapshot = client.catalog_get().await?;
+        let snapshot = media_grades::refresh_snapshot(client).await?;
         striatum_store::job_timing::run(
             "billing_plane_refresh",
             client.refresh_planes(Some(&snapshot)),
@@ -2342,6 +2333,7 @@ async fn wait_for_catalog_cycle(
 
 #[cfg(test)]
 mod tests {
+    include!("fusiform_local_grade_tests.rs");
     include!("fusiform_catalog_login_methods_tests.rs");
     include!("operator_quality_tests.rs");
     include!("fusiform_catalog_paging_tests.rs");
@@ -2402,18 +2394,18 @@ mod tests {
     }
 
     #[test]
-    fn media_grades_require_operator_positive_numbers_and_matching_types() {
+    fn media_grades_require_operator_positive_numbers_and_matching_kinds() {
         let kinds = [
             ("transcription", "transcribe"),
             ("transcription", "stream_transcribe"),
             ("speech", "synthesize"),
             ("image", "image"),
             ("video", "video"),
-            ("realtime", "realtime"),
         ];
         for (model_type, kind) in kinds {
+            let grade_key = format!("quality.grade.{model_type}");
             let row =
-                json!({"existence": "present", "model.type": model_type, "quality.grade": 80});
+                json!({"existence": "present", "model.type": model_type, grade_key.clone(): 80});
             let snapshot = media_snapshot(json!({"p/m": row}), Some("operator"));
             assert_eq!(snapshot.media_grade(kind, "p/m"), Some(80.0), "{kind}");
             assert_eq!(snapshot.media_grade(kind, "p/missing"), None);
@@ -2438,7 +2430,7 @@ mod tests {
                 json!("Infinity"),
             ] {
                 let mut invalid = row.clone();
-                invalid["quality.grade"] = grade;
+                invalid[&grade_key] = grade;
                 let snapshot = media_snapshot(json!({"p/m": invalid}), Some("operator"));
                 assert_eq!(snapshot.media_grade(kind, "p/m"), None);
             }
@@ -2446,10 +2438,10 @@ mod tests {
                 let mut wrong_type = row.clone();
                 wrong_type["model.type"] = model_type;
                 let snapshot = media_snapshot(json!({"p/m": wrong_type}), Some("operator"));
-                assert_eq!(snapshot.media_grade(kind, "p/m"), None);
+                assert_eq!(snapshot.media_grade(kind, "p/m"), Some(80.0));
             }
             let mut missing = row.clone();
-            missing.as_object_mut().unwrap().remove("quality.grade");
+            missing.as_object_mut().unwrap().remove(&grade_key);
             assert_eq!(
                 media_snapshot(json!({"p/m": missing}), Some("operator")).media_grade(kind, "p/m"),
                 None
@@ -2459,7 +2451,7 @@ mod tests {
             assert_eq!(
                 media_snapshot(json!({"p/m": missing_type}), Some("operator"))
                     .media_grade(kind, "p/m"),
-                None
+                Some(80.0)
             );
         }
     }
@@ -2472,7 +2464,7 @@ mod tests {
                 let row = &mut reply["models"]["elevenlabs/eleven_flash_v2_5"];
                 row["existence"] = json!(existence);
                 row["model.status"] = json!(status);
-                row["quality.grade"] = json!(75);
+                row["quality.grade.speech"] = json!(75);
                 reply["quality_scores"] = json!({"graded_by": "operator", "graded_at_ms": 1});
                 let snapshot = decode_catalog_get(&serde_json::to_vec(&reply).unwrap()).unwrap();
                 let route = "elevenlabs/eleven_flash_v2_5";
@@ -2689,7 +2681,7 @@ mod tests {
 
     #[test]
     fn media_decoding_preserves_chat_quality_without_media_grade_type_or_value_gates() {
-        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.elo": 1200, "quality.eq": 90, "quality.grade": 0, "quality.decommissioned": true});
+        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.elo": 1200, "quality.eq": 90, "quality.grade.speech": 0, "quality.decommissioned": true});
         for marker in [None, Some("creator"), Some("operator")] {
             let snapshot = media_snapshot(json!({"p/m": row}), marker);
             if marker == Some("operator") {
@@ -2703,7 +2695,7 @@ mod tests {
 
     #[test]
     fn media_decoding_preserves_decommissioning_without_operator_or_grade_gates() {
-        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.grade": 0, "quality.decommissioned": true});
+        let row = json!({"existence": "absent", "model.type": "speech", "model.status": "deprecated", "quality.grade.speech": 0, "quality.decommissioned": true});
         for marker in [None, Some("creator"), Some("operator")] {
             let snapshot = media_snapshot(json!({"p/m": row}), marker);
             assert!(snapshot.is_decommissioned("p/m"));
@@ -4043,7 +4035,7 @@ mod tests {
         );
         assert_eq!(
             digest,
-            "afeac184c2481f67afe3c7dee03b5a96c069cfa86ffd7fb037f9674c5de4aa46"
+            "1ad59d65a4d7306f9462fc5f849c97bdc54cb58d902450f988787d56aa2bf4d1"
         );
         let snapshot = decode_catalog_get(&get_reply("catalog.get — one model, current")).unwrap();
         assert_eq!(snapshot.cursor.catalog_version, 0);

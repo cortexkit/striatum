@@ -139,6 +139,11 @@ async fn paged_three_pages_apply_together_with_retired_models_and_auth_policies(
             FrameType::Response,
             last,
         ),
+        (
+            json!({"name":"quality.grades","arguments":{"prefix":"local:"}}),
+            FrameType::Response,
+            json!({"grades":[]}),
+        ),
     ])
     .await;
     let credentials = Arc::new(Mutex::new(
@@ -149,7 +154,7 @@ async fn paged_three_pages_apply_together_with_retired_models_and_auth_policies(
     bootstrap_cycle(&mut client, &store, &health, None, None)
         .await
         .unwrap();
-    paged_finish(peer, 3).await;
+    paged_finish(peer, 4).await;
     assert_eq!(
         store.fusiform_catalog_cursor().unwrap(),
         Some(FusiformCatalogCursor {

@@ -117,6 +117,13 @@ pub(super) fn rank<'a>(
                 .then_with(|| identity(a, b))
         });
     }
+    #[cfg(test)]
+    super::grade_observer::record(
+        policy.iq,
+        top.map(|n| n.0),
+        bar.map(|n| n.0),
+        adequate.len(),
+    );
     Ranked {
         top: top.map(|n| n.0),
         bar: bar.map(|n| n.0),

@@ -18,7 +18,7 @@ pub(super) fn catalog(
         .map(|(model, kind, grade, cost)| {
             let mut row = json!({"existence":"present", "model.type":kind});
             if let Some(grade) = grade {
-                row["quality.grade"] = json!(grade);
+                row[format!("quality.grade.{kind}")] = json!(grade);
             }
             if let Some(cost) = cost {
                 row["rate.input_audio.per_second"] =
@@ -382,9 +382,9 @@ async fn media_ranking_top_obeys_static_keys_policy_privacy_and_requirements() {
         // The fixture lists a media API key for media-vendor, but none whose
         // provider coverage includes absent-provider. Its row cannot set the scale.
         let wire: Value = json!({"catalog_version":2,"resolved_at_ms":1,"quality_scores":{"graded_by":"operator","graded_at_ms":1},"models":{
-            "absent-provider/a-no-key":{"existence":"present","model.type":"transcription","quality.grade":1000},
-            "media-vendor/z-top":{"existence":"present","model.type":"transcription","quality.grade":100,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":2,"exponent":0,"per":1}},
-            "media-vendor/z-cheap":{"existence":"present","model.type":"transcription","quality.grade":30,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":1,"exponent":0,"per":1}}
+            "absent-provider/a-no-key":{"existence":"present","model.type":"transcription","quality.grade.transcription":1000},
+            "media-vendor/z-top":{"existence":"present","model.type":"transcription","quality.grade.transcription":100,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":2,"exponent":0,"per":1}},
+            "media-vendor/z-cheap":{"existence":"present","model.type":"transcription","quality.grade.transcription":30,"rate.input_audio.per_second":{"state":"priced","currency":"USD","units":1,"exponent":0,"per":1}}
         }});
         h.credentials().lock().unwrap().catalog_snapshot = Some(crate::fusiform_catalog::decode_catalog_get(&serde_json::to_vec(&wire).unwrap()).unwrap());
         let route = h.bind(reserved("colliculus"),None).await;
@@ -492,7 +492,7 @@ async fn media_ranking_excluded_local_engine_neither_sets_bar_nor_wins() {
 }
 
 #[tokio::test]
-async fn media_ranking_each_nontranscribe_kind_uses_only_its_row_type() {
+async fn media_ranking_each_nontranscribe_kind_uses_only_its_grade_kind() {
     super::super::super::describe::with_candidate_capabilities(
         &["select_kind", "select_media"],
         async {
@@ -517,7 +517,14 @@ async fn media_ranking_each_nontranscribe_kind_uses_only_its_row_type() {
                 let route = h.bind(reserved("colliculus"), None).await;
                 let mut params = request();
                 params["kind"] = json!(kind);
-                assert_eq!(select(&route, &params).await["engine"]["model"], "z-graded");
+                assert_eq!(
+                    select(&route, &params).await["engine"]["model"],
+                    if kind == "realtime" {
+                        "a-wrong-type"
+                    } else {
+                        "z-graded"
+                    }
+                );
             }
         },
     )

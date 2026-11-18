@@ -84,8 +84,8 @@ async fn media_policy_pin_only_routes_are_outside_the_grade_top() {
                     "catalog_version":1,"resolved_at_ms":1,
                     "quality_scores":{"graded_by":"operator","graded_at_ms":1},
                     "models":{
-                        "media-vendor/a-manual":{"model.type":"transcription","quality.grade":100},
-                        "media-vendor/z-auto":{"model.type":"transcription","quality.grade":30}
+                        "media-vendor/a-manual":{"model.type":"transcription","quality.grade.transcription":100},
+                        "media-vendor/z-auto":{"model.type":"transcription","quality.grade.transcription":30}
                     }
                 }))
                 .unwrap(),
