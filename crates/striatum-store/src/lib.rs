@@ -4960,7 +4960,7 @@ mod tests {
             .unwrap();
         drop(legacy);
 
-        let migrated = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let migrated = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
         let indexes: Vec<String> = migrated
             .store
             .with_conn(|connection| {
@@ -6141,10 +6141,13 @@ mod tests {
     #[test]
     fn retention_migration_093_has_exact_nonpartial_lookup_indexes() {
         let scratch = cortexkit_test_support::ScratchDir::new("pin-retention-indexes");
-        let store = SqliteRouteStateStore::open(&dev_descriptor(
-            "striatum",
-            scratch.path().join("store.db").to_string_lossy(),
-        ))
+        let store = SqliteRouteStateStore::open_at_version_for_test(
+            &dev_descriptor(
+                "striatum",
+                scratch.path().join("store.db").to_string_lossy(),
+            ),
+            97,
+        )
         .unwrap();
         store
             .store

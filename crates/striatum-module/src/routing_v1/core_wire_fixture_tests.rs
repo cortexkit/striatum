@@ -30,6 +30,7 @@ async fn core(label: &str) -> (std::sync::Arc<Harness>, Route) {
 }
 fn report_snapshot(path: &Path) -> Value {
     let conn = rusqlite::Connection::open(path).unwrap();
+    let history = rusqlite::Connection::open(path.with_file_name("history.db")).unwrap();
     let mut tables = serde_json::Map::new();
     for (name,query) in [
         ("route","SELECT route_key,cooldown_until,quota_exhausted_until,failure_count,quota_error_count,consecutive_terminal_failures,quota_pressure,wall_class FROM model_route_state ORDER BY route_key"),
@@ -38,7 +39,8 @@ fn report_snapshot(path: &Path) -> Value {
         ("credential_fence","SELECT * FROM credential_entitlement_fences"),
         ("pool_fence","SELECT * FROM account_fence"),
     ] {
-        let mut statement=conn.prepare(query).unwrap();let columns=statement.column_count();
+        let database = if name.ends_with("_fence") { &history } else { &conn };
+        let mut statement=database.prepare(query).unwrap();let columns=statement.column_count();
         let rows=statement.query_map([],|row|{let mut values=Vec::new();for index in 0..columns{values.push(match row.get_ref(index)?{
             rusqlite::types::ValueRef::Null=>Value::Null,rusqlite::types::ValueRef::Integer(v)=>json!(v),rusqlite::types::ValueRef::Real(v)=>json!(v),rusqlite::types::ValueRef::Text(v)=>json!(std::str::from_utf8(v).unwrap()),rusqlite::types::ValueRef::Blob(_)=>panic!("unexpected blob"),
         });}Ok(Value::Array(values))}).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();tables.insert(name.into(),json!(rows));

@@ -98,10 +98,10 @@ async fn fixture_with_repairs() -> (Arc<Harness>, Route) {
         "account-1",
         &credential,
     );
-    harness.store().with_writer_for_test(|conn| conn.execute_batch(
+    rusqlite::Connection::open(harness.store_path().with_file_name("history.db")).unwrap().execute_batch(
         "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
          INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
-    )).unwrap();
+    ).unwrap();
     // This billing refusal has fresh headroom at receipt, so its first
     // classification is non-quota and must survive a contradictory reading.
     let (provider, credential, fingerprint) = {

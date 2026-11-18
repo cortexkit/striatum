@@ -5634,6 +5634,8 @@ fn s4b_repair_rows(
     harness: &Harness,
 ) -> std::collections::BTreeMap<String, Vec<Vec<rusqlite::types::Value>>> {
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let archive =
+        rusqlite::Connection::open(harness.store_path().with_file_name("history.db")).unwrap();
     [
         "account_continue",
         "account_eligibility",
@@ -5651,7 +5653,16 @@ fn s4b_repair_rows(
     ]
     .into_iter()
     .map(|table| {
-        let mut query = conn
+        let database = match table {
+            "credential_entitlement_fences"
+            | "account_size_refusal"
+            | "account_route_fence"
+            | "account_fence"
+            | "fence_recheck"
+            | "fence_retired_origin" => &archive,
+            _ => &conn,
+        };
+        let mut query = database
             .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3"))
             .unwrap();
         let columns = query.column_count();
@@ -6439,7 +6450,8 @@ fn a_transient_block_recorded_after_the_selection_read_is_a_timed_wait_not_a_poo
         selection_step(&context, &harness, "bind"),
         format!("Ok(Lost {{ retry_at: {} }})", NOW + 5_000)
     );
-    let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
+    let conn =
+        rusqlite::Connection::open(harness.store_path().with_file_name("history.db")).unwrap();
     let walls: i64 = conn
         .query_row(
             "SELECT count(*) FROM account_fence WHERE cleared_at IS NULL",

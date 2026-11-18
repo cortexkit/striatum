@@ -605,8 +605,8 @@ fn history_trace_retains_writer_delete_authorizer() {
     let scratch = ScratchDir::new("history-authorizer");
     let store = open(&scratch.path().join("store.db"));
     store.with_writer_for_test(|conn| conn.execute_batch(
-        "INSERT INTO account_observation_event (principal,runner,event_id,observation_id,received_at)
-         VALUES ('p','r','a','x',1),('p','r','b','y',1)",
+        "INSERT INTO account_observation_event (principal,runner,event_id,observation_id,received_at,bound)
+         VALUES ('p','r','a','x',1,0),('p','r','b','y',1,0)",
     )).unwrap();
     store.watch_history_reads_for_test().unwrap();
     store.stop_watching_history_reads_for_test().unwrap();

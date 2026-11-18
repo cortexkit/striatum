@@ -3581,11 +3581,9 @@ mod tests {
             0
         }
         let scratch = cortexkit_test_support::ScratchDir::new("linear-admission-sync");
-        let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
-            "linear-admission-sync",
-            scratch.path().join("store.db").to_string_lossy(),
-        ))
-        .unwrap();
+        let path = scratch.path().join("store.db");
+        let descriptor = crate::dev_descriptor("linear-admission-sync", path.to_string_lossy());
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
         store.store.with_conn(|conn| {
             conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<10000)
                 INSERT INTO account_non_quota_route_fence SELECT 'p','c'||i,'m',8640000000000000,'d',100,100,'billing' FROM n;")?;

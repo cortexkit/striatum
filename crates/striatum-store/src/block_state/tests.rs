@@ -93,18 +93,18 @@ pub(crate) struct Rig {
 }
 
 fn rig(name: &str) -> Rig {
-    make_rig(name, false)
+    make_rig(name, None)
 }
 
 pub(crate) fn rig_before_block_migration(name: &str) -> Rig {
-    make_rig(name, true)
+    make_rig(name, Some(93))
 }
 
-fn make_rig(name: &str, before_block_migration: bool) -> Rig {
+fn make_rig(name: &str, version: Option<u32>) -> Rig {
     let scratch = cortexkit_test_support::ScratchDir::new(name);
     let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-    let store = if before_block_migration {
-        SqliteRouteStateStore::open_at_version_for_test(&descriptor, 93)
+    let store = if let Some(version) = version {
+        SqliteRouteStateStore::open_at_version_for_test(&descriptor, version)
     } else {
         SqliteRouteStateStore::open(&descriptor)
     }
@@ -1610,7 +1610,7 @@ fn the_tick_finds_and_reloads_a_block_write_the_capture_missed() {
 /// is current again, both leave the same rows.
 #[test]
 fn retirement_without_a_replace_policy_leaves_the_rows_the_replace_left() {
-    let rig = rig("block-state-retirement-pin");
+    let rig = make_rig("block-state-retirement-pin", Some(97));
     rig.store
         .with_writer_for_test(|conn| {
             crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW)?;
@@ -2170,7 +2170,7 @@ fn a_superseded_test_request_heals_nothing() {
 
 #[test]
 fn a_fork_shares_every_table() {
-    let rig = rig("block-state-fork");
+    let rig = make_rig("block-state-fork", Some(97));
     rig.run(|conn| crate::block_parity_fixture::seed_block_parity_fixture(conn, NOW));
     let state = rig.published();
     let fork = state.clone();

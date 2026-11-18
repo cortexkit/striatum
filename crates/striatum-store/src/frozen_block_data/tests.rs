@@ -17,7 +17,7 @@ impl FrozenBlockData {
     /// trigger must still exist here; the normal post-migration audit requires
     /// that one trigger to be gone and every retained object to be identical.
     pub fn before_migration(conn: &Connection) -> rusqlite::Result<Self> {
-        read_at_boundary(conn, false)
+        read_at_boundary(conn, false, false)
     }
 
     /// Stored legacy rows and schema stay identical. Surviving telemetry
@@ -72,15 +72,23 @@ impl FrozenBlockData {
 
 impl crate::SqliteRouteStateStore {
     pub fn frozen_block_data_for_test(&self) -> striatum_core::RouteStateResult<FrozenBlockData> {
-        self.store.with_read(read).map_err(crate::err)
+        if self.history.is_some() {
+            self.with_history_reader(|conn| read_at_boundary(conn, true, true))
+        } else {
+            self.store.with_read(read).map_err(crate::err)
+        }
     }
 }
 
 pub(crate) fn read(conn: &Connection) -> rusqlite::Result<FrozenBlockData> {
-    read_at_boundary(conn, true)
+    read_at_boundary(conn, true, false)
 }
 
-fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<FrozenBlockData> {
+fn read_at_boundary(
+    conn: &Connection,
+    migrated: bool,
+    split: bool,
+) -> rusqlite::Result<FrozenBlockData> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../scripts/frozen-block-names.txt");
     let catalogue = std::fs::read_to_string(path)
@@ -106,13 +114,39 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
                 if !identifier(name) {
                     return Err(rusqlite::Error::InvalidQuery);
                 }
+                let schema = if split && *kind == "table" {
+                    "archive"
+                } else {
+                    "main"
+                };
                 let actual: Option<String> = conn
                     .query_row(
-                        "SELECT type FROM sqlite_schema WHERE name=?1",
+                        &format!("SELECT type FROM {schema}.sqlite_schema WHERE name=?1"),
                         [name],
                         |row| row.get(0),
                     )
                     .optional()?;
+                // These objects queried or wrote live state and cannot exist
+                // in the read-only audit archive. The 096 boundary keeps its
+                // original checks for them.
+                if split && matches!(*kind, "view" | "trigger") {
+                    assert_eq!(
+                        actual, None,
+                        "obsolete audit object is still in state: {name}"
+                    );
+                    let archived: Option<String> = conn
+                        .query_row(
+                            "SELECT type FROM archive.sqlite_schema WHERE name=?1",
+                            [name],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    assert_eq!(
+                        archived, None,
+                        "obsolete audit object is still in history: {name}"
+                    );
+                    continue;
+                }
                 if *kind == "removed_trigger" {
                     assert_eq!(
                         actual.as_deref(),
@@ -126,7 +160,7 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
                     Some(*kind),
                     "frozen audit object missing or replaced: {name}"
                 );
-                let mut schema=conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name=?1 OR tbl_name=?1 ORDER BY name")?;
+                let mut schema=conn.prepare(&format!("SELECT type,name,tbl_name,sql FROM {schema}.sqlite_schema WHERE name=?1 OR tbl_name=?1 ORDER BY name"))?;
                 for row in schema.query_map([name], |row| {
                     Ok((
                         row.get::<_, String>(1)?,
@@ -140,7 +174,7 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
                 }
                 if *kind != "trigger" {
                     let count = conn
-                        .prepare(&format!("SELECT * FROM {name}"))?
+                        .prepare(&format!("SELECT * FROM {schema}.{name}"))?
                         .column_count();
                     let (prefix, order) = if *kind == "table" {
                         ("rowid,", "rowid".into())
@@ -153,8 +187,9 @@ fn read_at_boundary(conn: &Connection, migrated: bool) -> rusqlite::Result<Froze
                                 .join(","),
                         )
                     };
-                    let mut query =
-                        conn.prepare(&format!("SELECT {prefix}* FROM {name} ORDER BY {order}"))?;
+                    let mut query = conn.prepare(&format!(
+                        "SELECT {prefix}* FROM {schema}.{name} ORDER BY {order}"
+                    ))?;
                     let width = query.column_count();
                     data.legacy_columns.insert(
                         (*name).into(),

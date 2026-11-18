@@ -588,7 +588,9 @@ async fn continuation_refuses_credit_without_creating_quota_or_billing_evidence(
     let refused = runner.call("route.account_for", &request).await;
     assert_eq!(refused.0, FrameType::Error, "{}", refused.1);
     assert_eq!(refused.1["code"], "invalid_request", "{}", refused.1);
-    let conn = rusqlite::Connection::open(subject.harness().store_path()).unwrap();
+    let conn =
+        rusqlite::Connection::open(subject.harness().store_path().with_file_name("history.db"))
+            .unwrap();
     let rows: i64 = conn
         .query_row(
             "SELECT (SELECT count(*) FROM account_fence) +

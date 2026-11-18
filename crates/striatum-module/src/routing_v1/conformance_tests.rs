@@ -1206,14 +1206,13 @@ impl RoutingSubject for KitSubject {
             // the success checks deliberately replay admissions across replacements.
             let h = harness.clone();
             tokio::task::spawn_blocking(move || {
-                h.store().with_writer_for_test(|conn| {
-                    conn.execute_batch(
+                rusqlite::Connection::open(h.store_path().with_file_name("history.db"))?
+                    .execute_batch(
                         "DELETE FROM account_fence;
                     DELETE FROM credential_entitlement_fences;
                     DELETE FROM account_non_quota_route_fence; DELETE FROM account_route_fence;
                     DELETE FROM fence_recheck; DELETE FROM fence_probe_authorization;",
                     )
-                })
             })
             .await
             .map_err(|e| e.to_string())?

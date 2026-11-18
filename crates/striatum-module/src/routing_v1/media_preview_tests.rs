@@ -379,7 +379,7 @@ async fn media_preview_account_healing_and_decisions_stay_disposable() {
         catalog(&h, &[("ok", "transcription", Some(80.0), Some(1))]);
         measure(&h, "ok", 0.9);
         let op = operator(&h).await;
-        rusqlite::Connection::open(h.store_path()).unwrap().execute_batch("INSERT INTO account_size_refusal VALUES ('media-vendor','old','ok',17,1,0); INSERT INTO credential_entitlement_fences VALUES ('media-vendor','removed','auth_required','old-listing',0);").unwrap();
+        rusqlite::Connection::open(h.store_path().with_file_name("history.db")).unwrap().execute_batch("INSERT INTO account_size_refusal VALUES ('media-vendor','old','ok',17,1,0); INSERT INTO credential_entitlement_fences VALUES ('media-vendor','removed','auth_required','old-listing',0);").unwrap();
         let before = super::super::super::what_if_tests::rows(&h);
         let batches = h.store().account_writer_batch_sizes_for_test();
         let credentials = format!("{:?}", h.credentials().lock().unwrap().listed_credentials());

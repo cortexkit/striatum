@@ -84,7 +84,7 @@ async fn s8a3_what_if_matches_recorded_base_response_without_live_commands() {
     let (harness, _) = configured().await;
     prepare_runner_preview(&harness);
     let operator = operator(&harness).await;
-    Connection::open(harness.store_path()).unwrap().execute_batch(
+    Connection::open(harness.store_path().with_file_name("history.db")).unwrap().execute_batch(
         "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
          INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
     ).unwrap();
@@ -118,33 +118,42 @@ async fn s8a3_what_if_matches_recorded_base_response_without_live_commands() {
 }
 
 pub(super) fn rows(harness: &Harness) -> BTreeMap<String, Vec<Vec<SqlValue>>> {
-    let connection = Connection::open(harness.store_path()).unwrap();
-    let tables: Vec<String> = connection
-        .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-        .unwrap()
-        .query_map([], |row| row.get(0))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    tables
-        .into_iter()
-        .map(|table| {
-            let mut query = connection
-                .prepare(&format!("SELECT * FROM \"{table}\" "))
-                .unwrap();
-            let columns = query.column_count();
-            let rows = query
-                .query_map([], |row| {
-                    (0..columns)
-                        .map(|column| row.get(column))
-                        .collect::<Result<Vec<SqlValue>, _>>()
-                })
-                .unwrap()
-                .collect::<Result<Vec<_>, _>>()
-                .unwrap();
-            (table, rows)
-        })
-        .collect()
+    let state_path = harness.store_path();
+    [
+        ("main", state_path.clone()),
+        ("archive", state_path.with_file_name("history.db")),
+    ]
+    .into_iter()
+    .flat_map(|(schema, path)| {
+        let connection = Connection::open(path).unwrap();
+        let tables: Vec<String> = connection
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        tables
+            .into_iter()
+            .map(|table| {
+                let mut query = connection
+                    .prepare(&format!("SELECT * FROM \"{table}\" "))
+                    .unwrap();
+                let columns = query.column_count();
+                let rows = query
+                    .query_map([], |row| {
+                        (0..columns)
+                            .map(|column| row.get(column))
+                            .collect::<Result<Vec<SqlValue>, _>>()
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                (format!("{schema}.{table}"), rows)
+            })
+            .collect::<Vec<_>>()
+    })
+    .collect()
 }
 
 fn runner_slot() -> Value {
@@ -431,7 +440,7 @@ async fn what_if_changes_no_rows_even_when_account_loading_reconciles_old_eviden
     let (harness, _) = configured().await;
     prepare_runner_preview(&harness);
     let operator = operator(&harness).await;
-    Connection::open(harness.store_path()).unwrap().execute_batch(
+    Connection::open(harness.store_path().with_file_name("history.db")).unwrap().execute_batch(
         "INSERT INTO account_size_refusal VALUES ('example-provider','old','model-a',17,1,0);
          INSERT INTO credential_entitlement_fences VALUES ('example-provider','removed','auth_required','old-listing',0);"
     ).unwrap();
