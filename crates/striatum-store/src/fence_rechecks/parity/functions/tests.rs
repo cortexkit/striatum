@@ -44,7 +44,8 @@ pub(in crate::fence_rechecks) fn compare(
     // Group by the arguments forwarded to the pure predicates, not by the
     // request labels. The other arguments are fixed by the enclosing loops.
     // Neither request flag is forwarded today. If a predicate takes new
-    // request inputs, project them here so unlike calls cannot share a result.
+    // request inputs, include them in this grouping key so calls with
+    // different inputs cannot share a result.
     let request_groups = request_groups(|_continuation, _media| ());
     let workers = std::thread::available_parallelism()
         .map_or(1, usize::from)

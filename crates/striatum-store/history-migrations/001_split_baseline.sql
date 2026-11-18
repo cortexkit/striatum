@@ -187,7 +187,8 @@ CREATE INDEX IF NOT EXISTS fence_retired_origin_by_retired ON fence_retired_orig
 
 CREATE INDEX IF NOT EXISTS account_hold_by_pin ON account_hold(pin_id);
 
--- The first open or the offline split binds this archive to its state file.
+-- Binds this archive to its state file. The store's first open writes it, or
+-- script/split-state-history.sh does when it splits an existing store offline.
 CREATE TABLE IF NOT EXISTS history_binding (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   split_identity TEXT NOT NULL CHECK (length(split_identity) = 32),

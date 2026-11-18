@@ -522,7 +522,7 @@ keeps it there, not just a generic “state” label.
 | `routing_v1_report` | `state.db` | Mandatory whole table: `v1_report`/`v1_commit_report` body and answer replay. |
 | `routing_v1_report_delivery` | `state.db` | Mandatory whole table: report-delivery key/body/answer comparison and effect commit. |
 | `account_admission` | `state.db` | Mandatory whole table; T open admissions, charged-unreleased demand, keyed closed replay/association. |
-| `account_observation` | `state.db` | Mandatory whole table; event-ID de-duplication, effects, bound backoff association and the finishing admission's keyed failure/verdict reads. The 097 verdict index stays in state. |
+| `account_observation` | `state.db` | Mandatory whole table; event-ID de-duplication, effects, bound backoff association and the finishing admission's keyed failure/verdict reads. The index migration 097 added for those verdict reads stays in state. |
 | `account_decision` | `state.db` | Owner ruling: keyed account service-tier read/update; ages at S9b, not S9a. |
 | `model_route_usage` | `state.db` | Owner ruling: `record_usage` enriches by message ID and `record_usage_service_tier` updates existing rows. Ages at S9b. |
 | `quota_snapshot` | `state.db` | `quota_snapshot`/`put_quota_snapshot` restart-loaded process-wide quota snapshot (`M/main.rs:708–756`). |

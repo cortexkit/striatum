@@ -531,9 +531,12 @@ impl SqliteRouteStateStore {
                 })
                 .map_err(err)?;
             after_archive_delete()?;
-            // If interrupted, a duplicate not covered by a watermark must
-            // remain pending so a replay cannot reinsert it and count it again.
-            // Retention never advances the watermark.
+            // The archive copy is deleted first. If we stop before the pending
+            // copy is deleted too, the reading is still pending, so a replay of
+            // it is recognised as already stored. That matters for a reading
+            // newer than its window's moved-through mark in quota_reading_moved,
+            // which is the only other way a replay is recognised. Retention
+            // never advances that mark.
             let batch_size = keys.len();
             let pending: Vec<_> = keys
                 .into_iter()

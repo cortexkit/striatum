@@ -501,8 +501,10 @@ impl AccountWriter {
                             let result: Result<bool, String> = store
                                 .with_conn(|conn| {
                                     // SQLite recompiles cached statements once after
-                                    // attachment. Only archive-reference retention
-                                    // uses this lane; state-only maintenance does not.
+                                    // attachment. Only the retention steps that check
+                                    // whether a pin, affinity or decision is still
+                                    // referenced by a moved hold attach history here;
+                                    // maintenance that touches only state never does.
                                     // In a fixture with 800 facts and 40 credentials,
                                     // the first request paid 0.5–1.0 ms per attachment.
                                     // A steady retention pass runs once a minute and

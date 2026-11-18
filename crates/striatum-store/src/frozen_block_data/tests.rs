@@ -127,8 +127,8 @@ fn read_at_boundary(
                     )
                     .optional()?;
                 // These objects queried or wrote live state and cannot exist
-                // in the read-only audit archive. The 096 boundary keeps its
-                // original checks for them.
+                // in the read-only audit archive. The test of the store as
+                // migration 096 left it keeps its original checks for them.
                 if split && matches!(*kind, "view" | "trigger") {
                     assert_eq!(
                         actual, None,
