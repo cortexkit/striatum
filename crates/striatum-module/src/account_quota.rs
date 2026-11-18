@@ -1846,9 +1846,9 @@ fn refresh_account_views(
         ) {
             tracing::warn!(error = %error, "credential quota holds not refreshed");
         }
-        if let Err(error) =
-            crate::account_selection::refresh_all_blocks(store, &snapshot, &config, at_ms)
-        {
+        if let Err(error) = crate::account_selection::block_recovery::refresh_all_blocks(
+            store, &snapshot, &config, at_ms,
+        ) {
             tracing::warn!(error = %error, "account blocks not refreshed");
         }
     }

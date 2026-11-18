@@ -473,7 +473,7 @@ fn refresh_blocks(harness: &Harness, quota: &crate::account_quota::SharedAccount
         },
         now,
     );
-    crate::account_selection::refresh_all_blocks(
+    crate::account_selection::block_recovery::refresh_all_blocks(
         harness.store(),
         &state,
         &harness.operator_config(),

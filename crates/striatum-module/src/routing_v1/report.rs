@@ -189,7 +189,7 @@ pub(super) fn report_at(
                     // state, so these reads and the reconcile's decisions
                     // answer from it, with the report's own writes laid over.
                     let command = crate::account_state::AccountCommand::new(tx, None);
-                    crate::account_selection::refresh_credential_quota_holds_in(
+                    crate::account_selection::block_recovery::refresh_credential_quota_holds_in(
                         &command,
                         &account_ids,
                         &quota,

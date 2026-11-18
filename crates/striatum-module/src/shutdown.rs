@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{async_main, ModuleError};
+use crate::{operator_commands::async_main, ModuleError};
 
 const CLOSE_LIMIT: Duration = Duration::from_secs(5);
 

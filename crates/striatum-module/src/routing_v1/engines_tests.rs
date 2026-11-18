@@ -416,10 +416,9 @@ fn media_credentials(rows: Vec<ListedCredential>) -> crate::broca_credentials::B
 #[test]
 fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids() {
     let valid = key("opaque-17");
-    assert!(crate::account_selection::media_credential_serves(
-        &valid,
-        "media-vendor"
-    ));
+    assert!(
+        crate::account_selection::class_context::media_credential_serves(&valid, "media-vendor")
+    );
     let mut cases = Vec::new();
     let mut row = valid.clone();
     row.categories = vec!["llm-provider".into()];
@@ -443,7 +442,7 @@ fn engine_media_keys_use_category_method_and_explicit_provider_not_synthetic_ids
     cases.push(row);
     for row in cases {
         assert!(
-            !crate::account_selection::media_credential_serves(&row, "media-vendor"),
+            !crate::account_selection::class_context::media_credential_serves(&row, "media-vendor"),
             "{row:?}"
         );
     }
@@ -467,9 +466,7 @@ fn engine_media_key_matches_the_vault_listing_spelling() {
         state: "active".into(),
         ..Default::default()
     };
-    assert!(crate::account_selection::media_credential_serves(
-        &row, "openai"
-    ));
+    assert!(crate::account_selection::class_context::media_credential_serves(&row, "openai"));
 }
 
 #[tokio::test]
@@ -654,10 +651,13 @@ async fn engine_admission_refused_after_its_twin_committed_replays_the_twin() {
             twin.clone(),
             harness.credentials(),
         );
-        crate::account_selection::after_roster_prepared("v1-replay-checked:twin", move || {
-            *twin.lock().unwrap() = Some(route.account_for_direct(&params));
-            credentials.lock().unwrap().engine_clock_offset_ms = 600_000;
-        });
+        crate::account_selection::admission::after_roster_prepared(
+            "v1-replay-checked:twin",
+            move || {
+                *twin.lock().unwrap() = Some(route.account_for_direct(&params));
+                credentials.lock().unwrap().engine_clock_offset_ms = 600_000;
+            },
+        );
     }
     let late = route.account_for_direct(&params);
     let twin = twin

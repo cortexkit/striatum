@@ -9,7 +9,7 @@ use striatum_core::{
 
 use super::conformance_tests::{reserved, Harness};
 use crate::{
-    account_selection::resolve_class,
+    account_selection::class_context::resolve_class,
     broca_credentials::{credential_serves_fact, BrocaCredentials},
 };
 

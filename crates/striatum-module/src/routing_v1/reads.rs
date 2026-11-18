@@ -195,7 +195,7 @@ pub(super) fn account_status(
         classes: None,
     };
     let crate::account_selection::OpReply::Result(mut answer) =
-        crate::account_selection::account_status(params, &ctx)
+        crate::account_selection::status::account_status(params, &ctx)
     else {
         return Err(provider_refusal(
             "internal_error",

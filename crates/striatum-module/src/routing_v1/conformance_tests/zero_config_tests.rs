@@ -241,7 +241,7 @@ async fn absent_settings_keeps_runners_unenrolled_but_installs_safe_billing_and_
     let credentials = shared.lock().unwrap();
     let providers = facts.iter().collect();
     for fact in &facts {
-        let class = account_selection::resolve_class(
+        let class = account_selection::class_context::resolve_class(
             credentials.listed_credentials(),
             fact,
             &providers,

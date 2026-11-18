@@ -490,7 +490,7 @@ pub(crate) fn prepare_candidates(
                 }
                 let resolved = classes.map_or_else(
                     || {
-                        crate::account_selection::resolve_class(
+                        crate::account_selection::class_context::resolve_class(
                             rows,
                             fact,
                             &catalog_providers,

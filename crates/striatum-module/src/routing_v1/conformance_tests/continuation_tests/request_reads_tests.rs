@@ -287,7 +287,7 @@ fn a_late_duplicate_replays_an_admission_closed_meanwhile() {
             direct.principal.clone(),
             direct.now,
         );
-        crate::account_selection::after_roster_prepared("raced", move || {
+        crate::account_selection::admission::after_roster_prepared("raced", move || {
             let reply = admit();
             crate::account_writer::execute(
                 &store,
@@ -325,7 +325,7 @@ fn a_late_duplicate_reassignment_replays_instead_of_reporting_a_pin_conflict() {
             direct.principal.clone(),
             direct.now,
         );
-        crate::account_selection::after_roster_prepared("reassigned", move || {
+        crate::account_selection::admission::after_roster_prepared("reassigned", move || {
             let reply = admit();
             crate::account_writer::execute(
                 &store,

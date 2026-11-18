@@ -1,6 +1,8 @@
 //! Route and panel selection, including policy inputs and decision provenance.
 
 use super::*;
+#[cfg(test)]
+use crate::account_selection::class_context::LaunchRefusal;
 
 /// One refresh snapshot supplies both profiles and provider reporting metadata.
 pub(crate) struct TaskProfileLookup {
@@ -1154,7 +1156,7 @@ pub(crate) fn runner_for_route(
         striatum_core::runner::RunnerModel,
         Option<key_pool::PoolGrant>,
     ),
-    account_selection::LaunchRefusal,
+    LaunchRefusal,
 > {
     if !needs_runner_pin(catalog_targets, provider) {
         if let Some(classes) = classes {
@@ -1194,13 +1196,13 @@ pub(crate) fn runner_for_route(
         variant,
         session,
     )
-    .map_err(|refusal| account_selection::LaunchRefusal::Refused {
+    .map_err(|refusal| LaunchRefusal::Refused {
         code: refusal.code,
         message: refusal.message,
     })?;
     if let Some(owner) = owner {
         crate::account_writer::bind_fence_probe_owner(store, &grant.lease_id, owner)
-            .map_err(account_selection::LaunchRefusal::store)?;
+            .map_err(LaunchRefusal::store)?;
     }
     Ok((grant.runner.clone(), Some(grant)))
 }

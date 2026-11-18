@@ -39,7 +39,7 @@ fn gateway_is_not_an_implicit_fallback_for_an_exhausted_subscription() {
         let fact = crate::tests::fact("anthropic", "claude");
         let catalog = [&fact].into_iter().collect();
         for fallback in [false, true] {
-            let class = crate::account_selection::resolve_class(
+            let class = crate::account_selection::class_context::resolve_class(
                 &rows,
                 &fact,
                 &catalog,
@@ -82,7 +82,7 @@ fn explicit_metered_account_class_accepts_gateways_but_not_subscriptions() {
             ..Default::default()
         })
         .collect();
-    let private = crate::account_selection::resolve_class(
+    let private = crate::account_selection::class_context::resolve_class(
         &rows,
         &facts,
         &catalog,
@@ -102,7 +102,7 @@ fn explicit_metered_account_class_accepts_gateways_but_not_subscriptions() {
             .collect::<Vec<_>>(),
         ["gateway", "apikey"]
     );
-    let gateway_only = crate::account_selection::resolve_class(
+    let gateway_only = crate::account_selection::class_context::resolve_class(
         &rows[1..2],
         &facts,
         &catalog,
