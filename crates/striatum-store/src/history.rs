@@ -334,16 +334,81 @@ impl History {
     }
 }
 
-// A delivery over an hour late can arrive behind a sample already moved for
-// its window. Treat it as a replay: the quota state already ignores older values.
-pub(super) const APPEND_QUOTA: &str = concat!(
-    "INSERT INTO pending_quota_reading_log SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12 ",
-    "WHERE ?3 > COALESCE((SELECT moved_through_observed_at FROM quota_reading_moved ",
-    "WHERE account_key=?1 AND window_key=?2), -1) ",
-    "ON CONFLICT(account_key,window_key,observed_at) DO NOTHING"
-);
-pub(super) const APPEND_LEGACY_QUOTA: &str =
+const QUOTA_WATERMARK: &str = "SELECT moved_through_observed_at FROM quota_reading_moved
+    WHERE account_key=?1 AND window_key=?2";
+const APPEND_QUOTA: &str = "INSERT INTO pending_quota_reading_log
+    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
+    ON CONFLICT(account_key,window_key,observed_at) DO NOTHING";
+const APPEND_LEGACY_QUOTA: &str =
     "INSERT OR IGNORE INTO quota_reading_log VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)";
+
+pub(super) fn append_quota(
+    conn: &Connection,
+    split: bool,
+    rows: &[QuotaReadingLogRow],
+) -> rusqlite::Result<usize> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut insert = conn.prepare_cached(if split {
+        APPEND_QUOTA
+    } else {
+        APPEND_LEGACY_QUOTA
+    })?;
+    let mut read_watermark = split
+        .then(|| conn.prepare_cached(QUOTA_WATERMARK))
+        .transpose()?;
+    let mut watermarks = HashMap::new();
+    let mut inserted = 0;
+    for row in rows {
+        if row.account_key.is_empty()
+            || row.window_key.is_empty()
+            || row.observed_at < 0
+            || !row.used_percent.is_finite()
+            || row.raw_used_percent.is_some_and(|value| !value.is_finite())
+        {
+            continue;
+        }
+        if let Some(statement) = read_watermark.as_mut() {
+            use std::collections::hash_map::Entry;
+            let key = (row.account_key.as_str(), row.window_key.as_str());
+            let moved_through: i64 = match watermarks.entry(key) {
+                Entry::Occupied(value) => *value.get(),
+                Entry::Vacant(entry) => *entry.insert(
+                    statement
+                        .query_row(params![key.0, key.1], |r| r.get(0))
+                        .optional()?
+                        .unwrap_or(-1),
+                ),
+            };
+            // A delivery over an hour late can fall behind a sample already
+            // moved for its window. Treat it as a replay: live quota ignores
+            // older readings too, though the log could otherwise retain one.
+            if row.observed_at <= moved_through {
+                continue;
+            }
+        }
+        let (is_stale, stale_since, stale_class) = match row.stale.as_ref() {
+            Some(stale) => (1_i64, stale.since.as_deref(), stale.class.as_deref()),
+            None => (0_i64, None, None),
+        };
+        inserted += insert.execute(params![
+            row.account_key,
+            row.window_key,
+            row.observed_at,
+            row.used_percent,
+            row.raw_used_percent,
+            row.resets_at,
+            row.window_minutes,
+            row.banked_credit_count,
+            row.fetched_at,
+            is_stale,
+            stale_since,
+            stale_class
+        ])?;
+    }
+    Ok(inserted)
+}
 
 pub(super) fn hold_sink(conn: &Connection) -> &'static str {
     #[cfg(any(test, feature = "test-support"))]

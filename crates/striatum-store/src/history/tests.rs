@@ -197,12 +197,17 @@ fn quota_outbox_rolls_back_with_state_and_watermark_lookup_is_keyed() {
     let reading = quota("atomic", NOW);
     store.with_writer_for_test(|c| {
         c.execute_batch("CREATE TEMP TRIGGER reject_quota_poll BEFORE INSERT ON main.account_quota_reading BEGIN SELECT RAISE(ABORT,'planted quota state failure'); END;")?;
-        let explain = format!("EXPLAIN QUERY PLAN {APPEND_QUOTA}");
-        let mut plan = c.prepare(&explain)?;
-        let bindings: Vec<Value> = (0..12).map(|_| Value::Null).collect();
-        let steps = plan.query_map(rusqlite::params_from_iter(bindings), |r| r.get::<_,String>(3))?.collect::<Result<Vec<_>,_>>()?;
-        assert!(steps.iter().any(|step| step.contains("SEARCH quota_reading_moved USING PRIMARY KEY (account_key=? AND window_key=?)")), "{steps:?}");
-        assert!(!steps.iter().any(|step| step.contains("SCAN quota_reading_moved")), "{steps:?}");
+        let plan = |sql| {
+            let mut statement = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+            let steps = statement.query_map(["acct", "window"], |r| r.get::<_,String>(3))?;
+            steps.collect::<Result<Vec<_>,_>>()
+        };
+        let keyed = |steps: &[String]| steps.iter().any(|step| step.contains("SEARCH quota_reading_moved USING PRIMARY KEY (account_key=? AND window_key=?)"))
+            && !steps.iter().any(|step| step.contains("SCAN quota_reading_moved"));
+        let steps = plan(QUOTA_WATERMARK)?;
+        assert!(keyed(&steps), "{steps:?}");
+        let near_miss = QUOTA_WATERMARK.replace("account_key=?1", "account_key||''=?1");
+        assert!(!keyed(&plan(&near_miss)?));
         Ok(())
     }).unwrap();
     let poll = crate::PersistedAccountReading {
@@ -281,4 +286,37 @@ fn history_maintenance_never_leaves_an_archive_on_the_state_writer() {
         .with_writer_for_test(|conn| conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)"))
         .unwrap();
     store.checkpoint_wal().unwrap();
+}
+
+#[test]
+fn hold_in_history_still_protects_the_state_decision() {
+    let scratch = ScratchDir::new("split-hold-reference");
+    let store = open(&scratch.path().join("state.db"));
+    store.with_writer_for_test(|conn| conn.execute_batch(
+        "INSERT INTO account_decision (decision_id,principal,mode,trigger,provider,model,family,outcome,code,policy_version,decision_json,created_at)
+           VALUES ('held','principal','serve','acct','provider','model','model','hold','account_hold',1,'{}',1);
+         INSERT INTO pending_account_hold VALUES ('held','principal','conversation','provider','pin',1,'acct','cred','quota',100,60,1);"
+    )).unwrap();
+    assert_eq!(store.prune_serve_decisions(NOW, 10).unwrap(), 0);
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
+    assert_eq!(store.prune_serve_decisions(NOW, 10).unwrap(), 0);
+    assert_eq!(store.prune_account_holds(NOW, 10).unwrap(), 1);
+    assert_eq!(store.prune_serve_decisions(NOW, 10).unwrap(), 1);
+}
+
+#[test]
+fn full_mover_batch_acknowledges_only_a_bounded_prefix() {
+    let scratch = ScratchDir::new("split-mover-hold");
+    let store = open(&scratch.path().join("state.db"));
+    let readings = (0..(BATCH + 1))
+        .map(|ix| quota("busy", NOW - 7_200_000 + ix as i64))
+        .collect::<Vec<_>>();
+    assert_eq!(store.append_quota_readings(&readings).unwrap(), BATCH + 1);
+    let before = store.writer_hold_ns_for_test();
+    assert_eq!(store.move_history_batch(NOW).unwrap(), BATCH);
+    println!(
+        "full_history_ack_rows={BATCH} writer_hold_ns={}",
+        store.writer_hold_ns_for_test() - before
+    );
+    assert_eq!(store.move_history_batch(NOW).unwrap(), 1);
 }

@@ -64,6 +64,9 @@ fn registered_block_migration_opens_fresh_and_older_chains_without_leaving_its_f
         }).unwrap();
         store.frozen_block_data_for_test().unwrap();
         drop(store);
+        // The rollback check targets the last pre-split release, which also
+        // carries the admission verdict index.
+        drop(crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap());
         let error = crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 93)
             .err()
             .unwrap();

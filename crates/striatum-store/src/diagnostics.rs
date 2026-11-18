@@ -112,7 +112,7 @@ impl SqliteRouteStateStore {
         &self,
         now_ms: i64,
     ) -> RouteStateResult<Vec<DiagnosticRouteWall>> {
-        self.store.with_conn(|c: &Connection| {
+        self.store.with_read(|c: &Connection| {
             struct ProviderWall {
                 cooldown: Option<f64>, quota: Option<f64>, class: Option<String>,
                 cleared_models: Vec<String>,
@@ -212,7 +212,7 @@ impl SqliteRouteStateStore {
     /// provider clears it, so the caller compares the evidence's reset time.
     pub fn diagnostic_account_blocks(&self) -> RouteStateResult<Vec<DiagnosticAccountBlock>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(&account_blocks_sql())?;
                 let rows = statement.query_map([], |row| {
                     Ok(DiagnosticAccountBlock {
@@ -235,7 +235,7 @@ impl SqliteRouteStateStore {
     /// still ahead of `now_ms`.
     pub fn diagnostic_key_walls(&self, now_ms: i64) -> RouteStateResult<Vec<DiagnosticKeyWall>> {
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(
                     "SELECT p.provider,p.credential_id,b.deadline,b.reason,r.deadline,r.reason,p.updated_at
                       FROM pool_key_state p
@@ -272,7 +272,7 @@ impl SqliteRouteStateStore {
         let static_reasons = serde_json::to_string(STATIC_REJECTION_REASONS).map_err(err)?;
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.store
-            .with_conn(|c: &Connection| {
+            .with_read(|c: &Connection| {
                 let mut statement = c.prepare(
                     "WITH windowed AS (
                          SELECT id, created_at, consumer, target_agent, selected_route_key,
@@ -618,4 +618,22 @@ pub(crate) fn account_blocks_sql() -> String {
         json_extract(source_metadata_json,'$.fence_json'),json_extract(source_metadata_json,'$.source'),observed_at,created_at
         FROM block INDEXED BY block_held_identity WHERE {} AND kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
         ORDER BY created_at,json_extract(origin_key,'$[0]')",crate::block_storage::HELD_SQL)
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_reads_do_not_acquire_the_state_writer() {
+    let scratch = cortexkit_test_support::ScratchDir::new("diagnostics-readers");
+    let store = SqliteRouteStateStore::open(&crate::dev_descriptor(
+        "diagnostics-readers",
+        scratch.path().join("state.db").to_string_lossy(),
+    ))
+    .unwrap();
+    let acquisitions = store.writer_acquisition_count_for_test();
+    store.diagnostic_route_walls(0).unwrap();
+    store.diagnostic_account_holds(0).unwrap();
+    store.diagnostic_account_blocks().unwrap();
+    store.diagnostic_key_walls(0).unwrap();
+    store.diagnostic_decisions(0, i64::MAX, 100).unwrap();
+    assert_eq!(store.writer_acquisition_count_for_test(), acquisitions);
 }

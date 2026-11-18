@@ -1,7 +1,7 @@
 //! The offline script runs this verifier on the original and staged copies
 //! before it publishes either file. Build with `--features test-support`.
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OptionalExtension;
 use std::error::Error;
 use std::path::Path;
 use striatum_store::{
@@ -34,10 +34,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !parity.differences.is_empty() {
         return Err(parity.differences.join("\n").into());
     }
-    let archive = Connection::open_with_flags(
-        history_path(Path::new(staged)),
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let archive = open_offline_split_copy(&history_path(Path::new(staged)))?;
     let plan: String = archive.query_row(
         "EXPLAIN QUERY PLAN SELECT * FROM account_hold WHERE decision_id=?1",
         ["split-verification"],
@@ -58,13 +55,30 @@ fn main() -> Result<(), Box<dyn Error>> {
     let start = std::time::Instant::now();
     let reopened = SqliteRouteStateStore::open(&descriptor)?;
     let mut explained = 0;
+    let mut without_decision = 0;
     for id in hold_decisions {
-        if reopened.get_decision_by_id(&id)?.is_some() {
+        let before: Option<(String, String, String)> = original.query_row(
+            "SELECT target_agent, score_json, rejected_json FROM model_route_decisions WHERE id=?1",
+            [&id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).optional()?;
+        let after = reopened.get_decision_by_id(&id)?;
+        if before
+            .as_ref()
+            .map(|(agent, score, rejected)| (agent, score, rejected))
+            != after
+                .as_ref()
+                .map(|row| (&row.target_agent, &row.score_json, &row.rejected_json))
+        {
+            return Err(format!("decision explain changed for moved hold {id}").into());
+        }
+        if after.is_some() {
             explained += 1;
+        } else {
+            without_decision += 1;
         }
     }
     println!(
-        "restart: ok, {:.3}ms; explained {explained} decisions referenced by moved holds",
+        "restart: ok, {:.3}ms; explained {explained} decisions referenced by moved holds ({without_decision} previously absent)",
         start.elapsed().as_secs_f64() * 1000.0
     );
     Ok(())

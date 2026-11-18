@@ -2480,30 +2480,7 @@ impl SqliteRouteStateStore {
         self.account_command(AccountCommandKind::QuotaDelta, move |account| {
             let tx = account.conn;
             (|| -> rusqlite::Result<usize> {
-                let mut inserted = 0;
-                {
-                    let mut statement = tx.prepare(if split { history::APPEND_QUOTA } else { history::APPEND_LEGACY_QUOTA })?;
-                    for row in &rows {
-                        if row.account_key.is_empty()
-                            || row.window_key.is_empty()
-                            || row.observed_at < 0
-                            || !row.used_percent.is_finite()
-                            || row.raw_used_percent.is_some_and(|value| !value.is_finite())
-                        {
-                            continue;
-                        }
-                        let (is_stale, stale_since, stale_class) = match row.stale.as_ref() {
-                            Some(stale) => (1_i64, stale.since.as_deref(), stale.class.as_deref()),
-                            None => (0_i64, None, None),
-                        };
-                        inserted += statement.execute(params![
-                            row.account_key, row.window_key, row.observed_at,
-                            row.used_percent, row.raw_used_percent, row.resets_at,
-                            row.window_minutes, row.banked_credit_count, row.fetched_at,
-                            is_stale, stale_since, stale_class,
-                        ])?;
-                    }
-                }
+                let inserted = history::append_quota(tx, split, &rows)?;
                 for reading in &readings {
                     tx.execute(
                         "INSERT INTO account_quota_reading
