@@ -32,7 +32,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<bool> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::account_selection::admission_reported_failure",
+            "account_tx::account_selection::admission_verdicts::admission_reported_failure",
         );
         self.conn
             .prepare_cached(&admission_failure_sql())
@@ -47,10 +47,6 @@ impl AccountTx<'_> {
         &self,
         admission: &AccountAdmissionRow,
     ) -> RouteStateResult<bool> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::account_selection::admission_reported_verdict",
-        );
         self.conn
             .prepare_cached(&admission_verdict_sql())
             .and_then(|mut stmt| {

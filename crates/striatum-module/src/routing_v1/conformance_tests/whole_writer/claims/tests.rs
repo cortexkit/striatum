@@ -8,7 +8,7 @@ impl World {
     }
 
     async fn claims_group_at_reload(&mut self, nonce: u64, reload: bool) {
-        for mode in 0..5 {
+        for mode in 0..6 {
             let originals = self
                 .catalog
                 .accounts
@@ -38,12 +38,15 @@ impl World {
                 code: "ENTITLEMENT_ERROR".into(),
             };
             self.adapter("claim/fresh identity with due refusal", |store| {
-                writer::record_credential_entitlement_fence(store, &refusal, None, now - 900_001)
+                let age = if mode == 5 { 3_600_001 } else { 900_001 };
+                writer::record_credential_entitlement_fence(store, &refusal, None, now - age)
             });
-            let (p, c) = (admission.provider.clone(), admission.credential_id.clone());
-            self.command("claim/classify evidence", move |tx| {
-                tx.classify_credential_quota(&p, &c, true)
-            });
+            if mode != 5 {
+                let (p, c) = (admission.provider.clone(), admission.credential_id.clone());
+                self.command("claim/classify evidence", move |tx| {
+                    tx.classify_credential_quota(&p, &c, true)
+                });
+            }
             let credential = admission.credential_id.clone();
             let origins = self.command("claim/current due evidence", move |tx| {
                 Ok(tx
@@ -82,7 +85,7 @@ impl World {
                         tx, &origins, now, None,
                     )
                 })),
-                3 | 4 => {
+                3..=5 => {
                     let authorized = owner.clone();
                     assert!(self.command("claim/authorized admission", move |tx| {
                         striatum_store::AccountTx::claim_fence_rechecks_for_authorized_admission(
@@ -114,7 +117,7 @@ impl World {
                     }),
                     "an unowned admission claim reused its newly renewed quota clock, reload={reload}"
                 ),
-                3 | 4 => {
+                3..=5 => {
                     let authorized = owner.clone();
                     assert!(
                         !self.command("claim/not-due authorized admission is refused", move |tx| {
@@ -122,7 +125,7 @@ impl World {
                                 tx, &claimed, now, None, &authorized,
                             )
                         }),
-                        "an unowned authorized claim reused its newly renewed quota clock, reload={reload}"
+                        "an unowned authorized claim reused its newly renewed clock, reload={reload}"
                     );
                 }
                 _ => {}
@@ -155,11 +158,27 @@ impl World {
                     .contains(&o))));
                 self.witness("probe_expiry");
             }
+            if mode == 5 {
+                self.ok(
+                    Caller::Runner,
+                    "route.account_observe",
+                    json!({
+                        "kind":"run_finished", "event_id":format!("{id}/finish"), "admission_id":id
+                    }),
+                )
+                .await;
+                let key = owner.clone();
+                assert!(
+                    !self.command("claim/finish returned authorization", move |tx| Ok(tx
+                        .probe_authorization_owners()?
+                        .contains(&key)))
+                );
+            }
             let (p, c) = (admission.provider.clone(), admission.credential_id.clone());
             self.command("claim/clear remaining refusal", move |tx| {
                 tx.clear_credential_entitlement_fence(&p, &c)
             });
-            if mode != 4 {
+            if mode < 4 {
                 let (p, a) = (principal.clone(), id.clone());
                 self.command("claim/release issued admission", move |tx| {
                     tx.mark_admission_released(&p, &a, now)

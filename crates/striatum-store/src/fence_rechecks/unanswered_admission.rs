@@ -13,7 +13,7 @@ impl AccountTx<'_> {
     ) -> RouteStateResult<()> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::fence_rechecks::release_unanswered_admission_probes",
+            "account_tx::fence_rechecks::unanswered_admission::release_unanswered_admission_probes",
         );
         if !enabled(self.conn).map_err(err)? {
             return Ok(());
