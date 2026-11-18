@@ -13,6 +13,7 @@ mod parity;
 pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS};
 
 mod probe_authorizations;
+mod provider_healing;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FenceRecheck {
@@ -373,7 +374,7 @@ fn upsert_clock_on(
     let reset = reset.filter(|reset| *reset > claimed as f64);
     let changed = tx.conn.execute(
         "UPDATE block SET quota=?3,classified=0,next_recheck_at=?4,reset_check_at=?5,
-        managed=1,cleared_at=NULL,cleared_by=NULL,claim_owner=NULL,cleared_models='[]'
+        managed=1,cleared_at=NULL,cleared_by=NULL,claim_owner=NULL
         WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND source_present=1 AND managed=0 AND evidence=?6
             AND next_recheck_at=?7 AND last_claimed_at IS ?8 AND claim_generation=?9",
         params![
@@ -2557,24 +2558,7 @@ impl AccountTx<'_> {
                 }
             }
             "provider" => {
-                // Only the rows stamped by this provider evidence inherit
-                // its recovery. A separate model refusal has its own clock.
-                for (route, evidence, last_error, observed) in
-                    blocks.routes_stamped_by_provider(provider, origin.evidence_at, admitted_at)
-                {
-                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?5,cleared_by='removed',claim_owner=NULL
-                        WHERE kind='route' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2
-                        AND scope_error IS ?3 AND observed_at=?4",
-                        params![route,evidence,last_error,observed,now]).map_err(err)?;
-                    expect_changes(changed, 1, format_args!("{what}: route {route}"))
-                        .map_err(err)?;
-                }
-                if let Some(held) = blocks.source_origin("provider", &origin.origin_key) {
-                    let changed = self.conn.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
-                        WHERE kind='provider' AND origin_key=json_array(?1) AND source_present=1 AND evidence=?2",
-                        params![provider,held.evidence,now]).map_err(err)?;
-                    expect_changes(changed, 1, &what).map_err(err)?;
-                }
+                provider_healing::heal_provider(self, &blocks, origin, admitted_at, now, &what)?;
             }
             "failure" => {
                 if let Some(held) = blocks.source_origin("failure", &origin.origin_key) {

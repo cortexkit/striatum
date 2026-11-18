@@ -2608,8 +2608,7 @@ impl AccountTx<'_> {
                 .map_err(err)?;
             if state
                 .block("observation", &key)
-                .filter(|row| row.source_present)
-                .and_then(|row| row.observed_at)
+                .map(|row| row.observed_at.unwrap_or(row.block.evidence_at))
                 .is_some_and(|prior| prior > at)
             {
                 continue;

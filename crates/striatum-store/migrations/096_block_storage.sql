@@ -266,12 +266,13 @@ UPDATE block SET cleared_models=COALESCE((SELECT json_group_array(c.model)
 -- clocks remain as stored tombstones but are not loaded as active evidence.
 INSERT INTO block(kind,origin_key,provider,account_id,credential_id,model,size_class,
   principal,admission_id,evidence,evidence_at,quota,classified,next_recheck_at,
-  reset_check_at,last_claimed_at,claim_generation,claim_owner,cleared_at,cleared_by,source_present,managed)
+  reset_check_at,last_claimed_at,claim_generation,claim_owner,cleared_at,cleared_by,source_present,managed,observed_at)
 SELECT r.kind,r.origin_key,r.provider,r.account_id,r.credential_id,r.model,r.size_class,
   r.principal,r.admission_id,r.evidence,r.evidence_at,r.quota,r.classified,r.next_recheck_at,
   r.reset_check_at,r.last_claimed_at,r.claim_generation,r.claim_owner,
   CASE WHEN r.kind='observation' THEN r.cleared_at ELSE COALESCE(r.cleared_at,(SELECT at FROM block_migration_now)) END,
-  CASE WHEN r.kind='observation' AND r.cleared_at IS NULL THEN NULL ELSE 'removed' END,0,1
+  CASE WHEN r.kind='observation' AND r.cleared_at IS NULL THEN NULL ELSE 'removed' END,0,1,
+  CASE WHEN r.kind='observation' THEN r.evidence_at END
 FROM fence_recheck r
 WHERE NOT EXISTS (SELECT 1 FROM block b WHERE b.kind=r.kind AND b.origin_key=r.origin_key)
   AND NOT EXISTS (SELECT 1 FROM block_migration_quarantine q WHERE q.kind=r.kind AND q.origin_key=r.origin_key);
@@ -318,13 +319,14 @@ BEGIN
   WHERE kind=NEW.kind AND origin_key=NEW.origin_key;
 END;
 
--- Earlier successful observation probes only cleared their clocks. Retire
--- that exact evidence and spend every authorization for it in the successors,
+-- Earlier successful observation probes only cleared their clocks, including
+-- clocks whose sparse source was already pruned. Retire that exact evidence
+-- and delete matching permissions from probe_authorization,
 -- without changing the retained source, clock or authorization audit tables.
 INSERT INTO retirement_tombstone(kind,origin_key,evidence,evidence_at,retired_at)
 SELECT kind,origin_key,evidence,evidence_at,cleared_at FROM block
-WHERE kind='observation' AND is_origin=1 AND managed=1 AND source_present=1
-  AND cleared_by='kept' AND cleared_at IS NOT NULL
+WHERE kind='observation' AND is_origin=1 AND managed=1
+  AND cleared_by IN ('kept','removed') AND cleared_at IS NOT NULL
 ON CONFLICT(kind,origin_key,evidence) DO NOTHING;
 DELETE FROM probe_authorization AS p
 WHERE p.kind='observation' AND EXISTS (

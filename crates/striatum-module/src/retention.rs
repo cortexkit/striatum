@@ -377,6 +377,8 @@ pub struct RetentionPassReport {
     pub account_continuations: usize,
     pub speed_samples: usize,
     pub routing_call_counts: usize,
+    /// Physical rows deleted across retired blocks, rows for absent sources,
+    /// and the retirement archive.
     pub retired_fence_origins: usize,
     pub unscored_admissible_models: usize,
     pub quota_readings: usize,

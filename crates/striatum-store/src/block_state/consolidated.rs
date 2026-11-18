@@ -427,6 +427,7 @@ impl BlockState {
                 .map_err(crate::err)?;
         for block in &mut loaded.blocks {
             self.pending_claim_history(block);
+            block.cleared_models.sort();
         }
         loaded
             .blocks
@@ -460,6 +461,9 @@ impl BlockState {
         else {
             return;
         };
+        // Model clears belong to this source evidence even before its first
+        // clock registration; operators see them before periodic synchronization.
+        block.cleared_models = row.cleared_models.clone();
         let Some(claimed) = row.block.last_claimed_at else {
             return;
         };
@@ -1124,7 +1128,7 @@ impl BlockState {
     pub fn routes_stamped_by_provider(
         &self,
         provider: &str,
-        evidence_at: i64,
+        observed_at: i64,
         admitted_at: i64,
     ) -> Vec<(
         String,
@@ -1142,8 +1146,8 @@ impl BlockState {
                     && row.block.kind == "route"
                     && row.block.scope.provider == provider
                     && row.scope_error == covering.scope_error
-                    && row.block.evidence_at == evidence_at
-                    && evidence_at < admitted_at
+                    && row.observed_at == Some(observed_at)
+                    && observed_at < admitted_at
                     && row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                         <= covering.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                     && row
@@ -1163,7 +1167,7 @@ impl BlockState {
                     row.scope_error
                         .clone()
                         .map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text),
-                    rusqlite::types::Value::Integer(row.block.evidence_at),
+                    rusqlite::types::Value::Integer(observed_at),
                 ))
             })
             .collect()
@@ -1573,7 +1577,7 @@ fn provider_check_sql(table: usize, column: &str) -> String {
 }
 
 fn success_provider_check_sql() -> String {
-    format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2))
+    format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block INDEXED BY block_held_provider WHERE {} AND kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2),block_storage::HELD_SQL)
 }
 
 fn select(table: usize) -> String {
