@@ -74,10 +74,10 @@ mod heap_measurements {
     #[ignore = "repository settings snapshot heap profile; run alone"]
     fn repository_settings_heap() {
         use crate::memory_measurements::{operation, profiler, release};
-        let document = crate::config_convert::convert(include_str!(
+        let document = crate::test_config::convert_archived(include_str!(
             "../fixtures/routing-config-live-2026-10-24.jsonc"
         ))
-        .unwrap();
+        .to_string();
         println!(
             "COUNTS repository_settings_document_bytes={}",
             document.len()

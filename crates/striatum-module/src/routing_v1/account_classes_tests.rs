@@ -733,16 +733,9 @@ fn configure_harness(
     harness.set_credentials(credentials.clone());
     harness.edit_config(|config| {
         if converted_live {
-            *config = crate::config_convert::convert_value(
-                serde_json::from_str::<Value>(
-                    &subc_jsonc::jsonc_to_json(include_str!(
-                        "../../fixtures/routing-config-live-2026-10-24.jsonc"
-                    ))
-                    .unwrap(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            *config = crate::test_config::convert_archived(include_str!(
+                "../../fixtures/routing-config-live-2026-10-24.jsonc"
+            ));
         }
         config["runners"] = json!([{"module":RUNNER,"via_vault":true}]);
         config["consumers"] = json!({

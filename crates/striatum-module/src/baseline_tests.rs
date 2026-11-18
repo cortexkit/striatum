@@ -95,18 +95,7 @@ impl World {
             .expect("open the routing store"),
         );
         let config_path = dir.join("striatum.jsonc");
-        let mut archived: Value =
-            serde_json::from_str(&subc_jsonc::jsonc_to_json(config).unwrap()).unwrap();
-        // Keep the captured settings bytes for provenance; the replay cannot
-        // load the historical effort override table on current routing.
-        if let Some(policy) = archived
-            .get_mut("model_routing")
-            .and_then(Value::as_object_mut)
-        {
-            policy.remove("variants");
-        }
-        let mut fixture_config = crate::config_convert::convert_value(archived)
-            .expect("the fixture config converts after removing the retired effort table");
+        let mut fixture_config = crate::test_config::convert_archived(config);
         // Authorize the fixture's attested callers without changing its frozen
         // requests, policy choices, or expected execution identities.
         fixture_config["consumers"]["mc_dream_curate"]["owner"] = json!("magic-context");
