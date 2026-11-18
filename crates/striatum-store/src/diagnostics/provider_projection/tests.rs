@@ -40,7 +40,7 @@ fn old_wall(store: &SqliteRouteStateStore, key: &str) -> DiagnosticRouteWall {
         FROM model_route_state WHERE route_key=?1",[key],|row|Ok(DiagnosticRouteWall {
             route_key:row.get(0)?,capacity_key:row.get(1)?,provider_id:row.get(2)?,model_id:row.get(3)?,
             cooldown_until:row.get(4)?,quota_exhausted_until:row.get(5)?,failure_backoff_until:row.get(6)?,failure_backoff_reason:row.get(7)?,
-            last_error:row.get(8)?,last_error_at:row.get(9)?,wall_class:crate::row_wall_class(row,10)?,
+            last_error:row.get(8)?,last_error_at:row.get(9)?,wall_class:crate::route_state::row_wall_class(row,10)?,
         }))).unwrap()
 }
 

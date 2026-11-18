@@ -4,6 +4,28 @@
 use super::*;
 use std::sync::Arc;
 
+/// The time the store's SQL readers evaluate expiry at: the wall clock, or a
+/// replayed request's recorded time in test builds. Readers of the account
+/// state that stand in for those SQL readers use it too, so both answer alike.
+pub fn store_now_ms() -> i64 {
+    now_ms()
+}
+
+pub(super) fn now_ms() -> i64 {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(now) = replay::current().map(|inputs| inputs.now_ms) {
+        return now;
+    }
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+pub(super) fn err(e: impl std::fmt::Display) -> RouteStateStoreError {
+    RouteStateStoreError(e.to_string())
+}
+
 #[cfg(any(test, feature = "test-support"))]
 const ACCOUNT_COPY_BLOCK_TABLES: [&str; 8] = [
     "block",

@@ -130,7 +130,7 @@ pub(crate) fn provider_cooldown(
     // A provider row written from one credential's refusal (before such
     // refusals were kept off the provider) is read as absent: it is evidence
     // about that credential, which its fence covers.
-    if crate::credential_refusal_wall(row.last_error.as_deref()) {
+    if crate::route_state::credential_refusal_wall(row.last_error.as_deref()) {
         return Ok(None);
     }
     Ok(Some(ProviderCooldownState {
@@ -298,9 +298,10 @@ pub(crate) fn overlay(
         // fresh quota reading can replace a stale stored value for every
         // sibling route at once.
         let cap = by_capacity.entry(row.capacity_key.clone()).or_default();
-        cap.cooldown_until = crate::max_defined(cap.cooldown_until, state.cooldown_until);
+        cap.cooldown_until =
+            crate::route_state::max_defined(cap.cooldown_until, state.cooldown_until);
         cap.quota_exhausted_until =
-            crate::max_defined(cap.quota_exhausted_until, state.quota_exhausted_until);
+            crate::route_state::max_defined(cap.quota_exhausted_until, state.quota_exhausted_until);
         let row_wall_is_live = state.cooldown_until.is_some_and(|until| until > now)
             || state.quota_exhausted_until.is_some_and(|until| until > now);
         if row_wall_is_live
