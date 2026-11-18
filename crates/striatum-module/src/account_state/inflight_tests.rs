@@ -123,8 +123,13 @@ fn reserve(store: &SqliteRouteStateStore, row: AccountAdmissionRow, now: i64) {
 
 fn start(store: &SqliteRouteStateStore, principal: &str, id: &str, run_id: &str, now: i64) {
     let (principal, id, run_id) = (principal.to_owned(), id.to_owned(), run_id.to_owned());
-    assert!(run(store, now, move |tx| tx
-        .mark_admission_started(&principal, &id, &run_id, now, true))
+    assert!(run(store, now, move |tx| tx.mark_admission_started(
+        &principal,
+        &id,
+        Some(&run_id),
+        now,
+        true
+    ))
     .unwrap());
 }
 
@@ -470,7 +475,7 @@ fn inflight_randomized_writer_sequences_equal_durable_rows_at_each_restart_insta
                 run(&store, now, move |tx| {
                     match operation {
                         1 => {
-                            tx.mark_admission_started(&principal, &id, &run_id, now, true)?;
+                            tx.mark_admission_started(&principal, &id, Some(&run_id), now, true)?;
                         }
                         2 => {
                             let row = tx.admission(&principal, &id)?.unwrap();
@@ -682,15 +687,20 @@ fn inflight_divergence_uses_the_writer_reload_instead_of_publishing_a_different_
     let error = store
         .account_transaction(|sql| {
             let _clock = crate::InjectedClock::set(T as u64);
-            AccountCommand::new(sql, Some(&mut stale))
-                .mark_admission_started("p", "original", "run", T, false)
+            AccountCommand::new(sql, Some(&mut stale)).mark_admission_started(
+                "p",
+                "original",
+                Some("run"),
+                T,
+                false,
+            )
         })
         .unwrap_err()
         .to_string();
     assert!(error.contains(striatum_store::STATE_DIVERGED), "{error}");
     let loads = owner.loads.load(Ordering::Relaxed);
     let changed = run(&store, T, |tx| {
-        tx.mark_admission_started("p", "original", "run", T, false)
+        tx.mark_admission_started("p", "original", Some("run"), T, false)
     })
     .unwrap();
     assert!(!changed);
@@ -703,7 +713,7 @@ fn inflight_attempt_readds_each_lapsed_started_reservation_it_reaches() {
     let (_scratch, store, owner) = fixture("inflight-observation-reach");
     run(&store, T, |tx| {
         insert(tx, &row("original", T))?;
-        tx.mark_admission_started("p", "original", "run", T, false)?;
+        tx.mark_admission_started("p", "original", Some("run"), T, false)?;
         let mut reservation = row("reservation", T);
         reservation.account_id = "b".into();
         insert(tx, &reservation)?;

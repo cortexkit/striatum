@@ -440,7 +440,7 @@ pub(super) fn seed_open_offer(
                 })?;
                 tx.insert_admission(&row)?;
                 if id == "offer-source" {
-                    tx.mark_admission_started("p", id, "offer-run", NOW, false)?;
+                    tx.mark_admission_started("p", id, Some("offer-run"), NOW, false)?;
                 }
             }
             tx.record_continuation(

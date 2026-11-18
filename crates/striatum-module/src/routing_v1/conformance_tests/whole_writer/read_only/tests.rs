@@ -11,7 +11,7 @@ pub(super) const READ_ONLY: &[(&str, &str)] = &[
         "selects a decision's admitted size and commit time",
     ),
     (
-        "account_tx::account_selection::admission_reported_failure",
+        "account_tx::account_selection::admission_verdicts::admission_reported_failure",
         "tests for a persisted refusal observation",
     ),
     (

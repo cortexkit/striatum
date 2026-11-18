@@ -29,7 +29,7 @@ fn migration_function_is_absent(conn: &Connection) {
 fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_function() {
     assert_eq!(
         crate::SqliteRouteStateStore::latest_migration_version_for_test(),
-        96
+        97
     );
     let versions = std::iter::once(0).chain(
         crate::route_state_migrations()
@@ -63,7 +63,7 @@ fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_functio
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"), "{error}");
-        assert!(error.to_string().contains("96"), "{error}");
+        assert!(error.to_string().contains("version 97"), "{error}");
         assert!(error.to_string().contains("93"), "{error}");
     }
 }
@@ -77,7 +77,11 @@ fn failed_registered_migration_is_atomic_and_removes_the_function_on_its_writer(
     );
     let store = crate::open_sqlite(&descriptor).unwrap();
     let chain = crate::route_state_migrations();
-    crate::migrate_route_state(&store, &chain[..chain.len() - 1]).unwrap();
+    let block = chain
+        .iter()
+        .position(|migration| migration.version == 96)
+        .unwrap();
+    crate::migrate_route_state(&store, &chain[..block]).unwrap();
     store.with_conn(|conn| {
         conn.execute("INSERT INTO pool_key_state(provider,credential_id,walled_until,wall_observed_at,updated_at) VALUES ('bad-real','key',1.5,1,1)",[])?;
         Ok(())

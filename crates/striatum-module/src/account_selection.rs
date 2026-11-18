@@ -8982,12 +8982,8 @@ fn apply_bound_observation(
     let id = &admission.admission_id;
     match parsed.kind.as_str() {
         "admission_started" => {
-            let Some(run_id) = parsed.run_id.as_deref() else {
-                effects.push(json!({ "effect": "none", "why": "admission_started needs run_id" }));
-                return Ok(());
-            };
             let late = now >= admission.admission_valid_until;
-            if tx.mark_admission_started(principal, id, run_id, now, late)? {
+            if tx.mark_admission_started(principal, id, parsed.run_id.as_deref(), now, late)? {
                 effects.push(json!({ "effect": "admission_started", "late": late }));
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
@@ -8996,7 +8992,7 @@ fn apply_bound_observation(
         "run_finished" => {
             // Read while the admission is still open: finishing closes it.
             let size_class = tx.admission_size_class(principal, id)?;
-            if tx.mark_admission_finished(principal, id, now)? {
+            let release_unanswered = if tx.mark_admission_finished(principal, id, now)? {
                 effects.push(json!({ "effect": "admission_finished" }));
                 let lease_ended = tx.end_lease(&admission.pin_id, now)?;
                 effects.push(json!({ "effect": "lease_ended", "lease_ended": lease_ended }));
@@ -9050,9 +9046,11 @@ fn apply_bound_observation(
                         &admission.admission_id,
                     ))?;
                 }
+                !media_success
             } else {
                 effects.push(json!({ "effect": "none", "state": admission.state }));
-            }
+                false
+            };
             if parsed
                 .served_account_id
                 .as_deref()
@@ -9067,6 +9065,9 @@ fn apply_bound_observation(
                     observation_id,
                     effects,
                 )?;
+            }
+            if release_unanswered && !effects.iter().any(|effect| effect["effect"] == "fence") {
+                tx.release_unanswered_admission_probes(admission, now)?;
             }
         }
         "attempt" => {
@@ -12686,7 +12687,7 @@ mod tests {
                 reservation.account_id = other_account.into();
                 tx.insert_admission(&reservation)?;
                 if id == "other-admission" {
-                    tx.mark_admission_started(BROCA, id, "run", NOW, false)?;
+                    tx.mark_admission_started(BROCA, id, Some("run"), NOW, false)?;
                 } else {
                     tx.record_continuation(
                         BROCA,

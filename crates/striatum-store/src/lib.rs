@@ -358,7 +358,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 95] {
+fn route_state_migrations() -> [Migration; 96] {
     [
         Migration {
             version: 1,
@@ -739,6 +739,10 @@ fn route_state_migrations() -> [Migration; 95] {
         Migration {
             version: 96,
             statements: block_storage::MIGRATION,
+        },
+        Migration {
+            version: 97,
+            statements: include_str!("../migrations/097_admission_verdict_index.sql"),
         },
     ]
 }

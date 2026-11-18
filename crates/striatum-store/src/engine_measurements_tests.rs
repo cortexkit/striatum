@@ -1,5 +1,5 @@
 use super::*;
-use crate::{dev_descriptor, route_state_migrations, V1Decision};
+use crate::{dev_descriptor, V1Decision};
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 use striatum_core::accounts::AllowedAccountClass;
@@ -161,12 +161,7 @@ fn engine_measurement_selection_reads_do_not_acquire_the_writer() {
 fn engine_measurement_migration_upgrades_existing_decisions_without_samples() {
     let scratch = cortexkit_test_support::ScratchDir::new("engine-measurement-migration");
     let descriptor = descriptor(&scratch);
-    let migrations = route_state_migrations();
-    let old = SqliteRouteStateStore::open_with_migrations(
-        &descriptor,
-        &migrations[..migrations.len() - 1],
-    )
-    .unwrap();
+    let old = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
     old.v1_record_selection(&decision("old"), None).unwrap();
     drop(old);
     let store = SqliteRouteStateStore::open(&descriptor).unwrap();

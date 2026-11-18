@@ -3220,9 +3220,7 @@ fn stale_sync_drop_migration_representability_probe() {
             "stale-sync-drop-migration",
             scratch.path().join("state.db").to_string_lossy(),
         );
-        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
-        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
-            .unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
         store
             .with_writer_for_test(|conn| {
                 let insert = || {
@@ -3365,9 +3363,7 @@ fn stale_sync_renew_guard_migration_representability_probe() {
         let scratch = cortexkit_test_support::ScratchDir::new(name);
         let descriptor =
             crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-        let preceding_version = crate::route_state_migrations().last().unwrap().version - 1;
-        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, preceding_version)
-            .unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
         let legacy_clock = store.with_writer_for_test(|conn| {
             conn.execute(
                 "INSERT INTO provider_cooldown_state(provider_key,cooldown_until,wall_observed_at,last_error,last_error_at,updated_at)
@@ -3458,8 +3454,7 @@ fn stale_sync_renew_guard_migration_representability_probe() {
 fn legacy_sync_rig(name: &str) -> Rig {
     let scratch = cortexkit_test_support::ScratchDir::new(name);
     let descriptor = crate::dev_descriptor(name, scratch.path().join("state.db").to_string_lossy());
-    let version = crate::route_state_migrations().last().unwrap().version - 1;
-    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, version).unwrap();
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 95).unwrap();
     Rig {
         store,
         owner: Arc::new(TestOwner::default()),

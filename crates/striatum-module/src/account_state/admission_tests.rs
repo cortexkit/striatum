@@ -498,7 +498,7 @@ fn apply(
             let late = rng.below(2) == 0;
             let started = (target.principal.clone(), target.id.clone(), run_id.clone());
             let result = both(store, oracle, move |tx| {
-                tx.mark_admission_started(&target.principal, &target.id, &run_id, now, late)
+                tx.mark_admission_started(&target.principal, &target.id, Some(&run_id), now, late)
             });
             if matches!(result, Ok(true)) {
                 world.runs.push(started);
@@ -1004,7 +1004,7 @@ fn pruning_the_newest_finished_admission_reveals_the_older_open_one() {
     run(&store, move |tx| {
         admit(tx, &older, true)?;
         admit(tx, &newer, true)?;
-        tx.mark_admission_started("p", "newer", "run", 20, false)?;
+        tx.mark_admission_started("p", "newer", Some("run"), 20, false)?;
         tx.mark_admission_finished("p", "newer", 21)?;
         Ok(())
     })
@@ -1035,7 +1035,7 @@ fn pruning_a_pins_last_started_admission_clears_its_started_count() {
     let only = admission("p", "only", "pin-1", 1, 10, 1);
     run(&store, move |tx| {
         admit(tx, &only, true)?;
-        tx.mark_admission_started("p", "only", "run", 10, false)?;
+        tx.mark_admission_started("p", "only", Some("run"), 10, false)?;
         tx.mark_admission_finished("p", "only", 11)?;
         Ok(())
     })
@@ -1545,7 +1545,7 @@ fn a_probe_release_leaves_a_started_admission_and_its_authorization_alone() {
     let first = admission("p", "first", "pin-1", 1, 1_000, 60_000);
     run(&store, move |tx| {
         admit(tx, &first, true)?;
-        tx.mark_admission_started("p", "first", "run", 2_000, false)
+        tx.mark_admission_started("p", "first", Some("run"), 2_000, false)
             .map(|_| ())
     })
     .unwrap();

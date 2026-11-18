@@ -21,6 +21,8 @@ use striatum_core::{
 
 use super::{err, SqliteRouteStateStore};
 
+mod admission_verdicts;
+
 fn observation_event_sql(logged: bool) -> String {
     let (columns, table) = if logged {
         (OBSERVATION_COLUMNS, "account_observation")
@@ -928,27 +930,6 @@ impl AccountTx<'_> {
             )
             .optional()
             .map(|context| context.flatten())
-            .map_err(err)
-    }
-
-    /// A failed attempt must not be healed by its later run_finished event.
-    pub fn admission_reported_failure(
-        &self,
-        principal: &str,
-        admission_id: &str,
-    ) -> RouteStateResult<bool> {
-        #[cfg(any(test, feature = "test-support"))]
-        let _writer_entry = crate::writer_entry_trace::enter(
-            "account_tx::account_selection::admission_reported_failure",
-        );
-        self.conn
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM account_observation
-                 WHERE principal = ?1 AND admission_id = ?2
-                 AND kind IN ('credential_refused', 'transient_backoff', 'account_limit_exhausted'))",
-                params![principal, admission_id],
-                |row| row.get(0),
-            )
             .map_err(err)
     }
 
@@ -1912,13 +1893,14 @@ impl AccountTx<'_> {
 
     /// The runner started the admitted run. A start after the reservation
     /// expired is still accepted, and marked late, because the run's freeze
-    /// wins. Returns whether the lifecycle transitioned to started; a finished
+    /// wins. The first start counts even without a run ID. Returns whether
+    /// the lifecycle transitioned to started; a finished
     /// row can still gain missing start evidence without making that transition.
     pub fn mark_admission_started(
         &self,
         principal: &str,
         admission_id: &str,
-        run_id: &str,
+        run_id: Option<&str>,
         at: i64,
         late: bool,
     ) -> RouteStateResult<bool> {
@@ -1939,10 +1921,12 @@ impl AccountTx<'_> {
         if !changed {
             // Redelivery can put the start after the finish. Retain the run's
             // evidence without reopening the admission or its concurrency slot.
+            // An anonymous start already recorded its first start time.
             self.conn.execute(
                 "UPDATE account_admission SET run_id = ?3, started_at = ?4, started_late = ?5, \
                  last_observed_at = MAX(COALESCE(last_observed_at, ?4), ?4) \
-                 WHERE principal = ?1 AND admission_id = ?2 AND state = 'finished' AND run_id IS NULL",
+                 WHERE principal = ?1 AND admission_id = ?2 AND state = 'finished'
+                   AND run_id IS NULL AND started_at IS NULL",
                 params![principal, admission_id, run_id, at, i64::from(late)],
             ).map_err(err)?;
         }
