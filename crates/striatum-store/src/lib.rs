@@ -6263,7 +6263,11 @@ mod tests {
         );
         assert!(legacy_shape.iter().any(|line| line.contains(" index ")));
 
-        let migrated = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
+        let migrated = SqliteRouteStateStore::open_at_version_for_test(
+            &descriptor,
+            history::STATE_MIGRATION.version - 1,
+        )
+        .unwrap();
         migrated
             .store
             .with_conn(|c| {

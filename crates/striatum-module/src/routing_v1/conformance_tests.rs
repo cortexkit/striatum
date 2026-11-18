@@ -2602,7 +2602,7 @@ async fn split_restart_replays_a_completed_admission_before_and_after_moving_his
     use striatum_store::{dev_descriptor, SqliteRouteStateStore};
     let now = 1_800_000_000_000i64;
     let _clock = crate::InjectedClock::set(now as u64);
-    let harness = Harness::new_at_version("split-replay", Some(96));
+    let harness = Harness::new_at_version("split-replay", Some(97));
     let request = json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
         "conversation_key":"split-conversation","admission_id":"split-admission"});
     let expected = seed_062_admission(&harness, &request, true, now);

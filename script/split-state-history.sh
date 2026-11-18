@@ -17,7 +17,7 @@ import time
 ROOT = Path(sys.argv[1])
 MIGRATIONS = ROOT / 'crates/striatum-store'
 HISTORY_TABLES = (MIGRATIONS / 'history-migrations/tables.txt').read_text().splitlines()
-STATE_VERSION = 96
+STATE_VERSION = 97
 
 
 def quote(name):
@@ -85,7 +85,7 @@ def stage_state(original, state, history):
     shutil.copyfile(original, state)
     with connect(state) as db:
         db.execute('PRAGMA journal_mode=DELETE')
-        db.executescript((MIGRATIONS / 'migrations/097_history_outbox.sql').read_text())
+        db.executescript((MIGRATIONS / 'migrations/098_history_outbox.sql').read_text())
         db.execute('ATTACH DATABASE ? AS archive', (history.as_uri() + '?mode=ro&immutable=1',))
         # The compatibility view joins live and frozen tables in the old file.
         # No production reader uses it since block storage took over.
@@ -165,7 +165,7 @@ def main(args):
           f'duration_s={time.monotonic() - started:.3f}; original backup: {backup}')
 
 
-parser = argparse.ArgumentParser(description='Split a clean, offline route_state v96 copy; never run on the live store.')
+parser = argparse.ArgumentParser(description='Split a clean, offline route_state v97 copy; never run on the live store.')
 parser.add_argument('state_db')
 parser.add_argument('--now-ms', type=int, required=True, help='fixed evaluation clock, in Unix milliseconds')
 parser.add_argument('--verifier', required=True, help='path to the built verify_history_split example from this release')

@@ -28,7 +28,7 @@ fn split_refuses_unsplit_before_writing_or_creating_history() {
     let scratch = ScratchDir::new("split-refusal");
     let path = scratch.path().join("state.db");
     let descriptor = dev_descriptor("split-test", path.to_str().unwrap());
-    let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
+    let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
     assert_eq!(
         legacy
             .append_quota_readings(&[quota("baseline", NOW)])
@@ -168,7 +168,7 @@ fn split_and_fresh_stores_have_the_same_history_schema_and_ledger() {
     let path = scratch.path().join("offline.db");
     let fresh_path = scratch.path().join("fresh.db");
     let descriptor = dev_descriptor("split-offline-fixture", path.to_str().unwrap());
-    let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
+    let legacy = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
     legacy
         .append_quota_readings(&[quota("fixture", NOW)])
         .unwrap();

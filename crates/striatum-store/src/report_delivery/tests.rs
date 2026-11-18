@@ -739,7 +739,7 @@ fn split_restart_report_settles_a_probe_bound_before_the_split() {
     let StorageBackend::Sqlite { path } = &descriptor.backend else {
         unreachable!()
     };
-    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 97).unwrap();
     seed(&store, "d", "p");
     claim_decision_probe(&store, 1);
     assert_eq!(store.fence_rechecks().unwrap().len(), 1);

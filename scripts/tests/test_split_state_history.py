@@ -35,7 +35,7 @@ class SplitStateHistoryTest(unittest.TestCase):
         with db:
             db.executescript((MIGRATIONS / '001_split_baseline.sql').read_text())
             db.execute('CREATE TABLE cortexkit_schema_version(namespace TEXT, version INTEGER)')
-            db.execute("INSERT INTO cortexkit_schema_version VALUES ('route_state', 96)")
+            db.execute("INSERT INTO cortexkit_schema_version VALUES ('route_state', 97)")
             for table in sorted(STATE):
                 db.execute(f'CREATE TABLE {table}(sample TEXT)')
                 db.execute(f'INSERT INTO {table} VALUES (?)', (table,))

@@ -6,8 +6,8 @@ use rusqlite::{types::Value, OpenFlags};
 use std::path::{Path, PathBuf};
 
 pub(super) const STATE_MIGRATION: Migration = Migration {
-    version: 97,
-    statements: include_str!("../migrations/097_history_outbox.sql"),
+    version: 98,
+    statements: include_str!("../migrations/098_history_outbox.sql"),
 };
 const NAMESPACE: &str = "route_history";
 const CHAIN: [Migration; 1] = [Migration {
