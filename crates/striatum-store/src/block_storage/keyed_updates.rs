@@ -1,5 +1,7 @@
 //! Writer statements shared with the query-plan regressions. Keeping the actual
 //! statements here lets tests inspect the writers' keys, not copied test SQL.
+//! Credential updates name their partial index so the planner cannot substitute
+//! a kind-only search that visits every live credential instead of one id.
 
 pub(crate) fn rebind_claim_owner_sql() -> String {
     format!(
@@ -17,7 +19,7 @@ pub(crate) fn bind_claim_owner_sql() -> String {
 
 pub(crate) fn clear_credential_sql() -> String {
     format!(
-        "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
+        "UPDATE block INDEXED BY block_held_credential SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
         WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1",
         super::HELD_SQL
     )
@@ -43,22 +45,22 @@ pub(crate) fn clear_credential_for_id(
 }
 
 pub(crate) fn clear_matching_credential_sql() -> String {
-    format!("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+    format!("UPDATE block INDEXED BY block_held_credential SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
         WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS ?2",super::HELD_SQL)
 }
 
 pub(crate) fn adopt_credential_fingerprint_sql() -> String {
-    format!("UPDATE block SET listing_fingerprint=?2
+    format!("UPDATE block INDEXED BY block_held_credential SET listing_fingerprint=?2
         WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS NULL",super::HELD_SQL)
 }
 
 pub(crate) fn clear_credential_routes_sql() -> String {
-    format!("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
+    format!("UPDATE block INDEXED BY block_held_credential SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
         WHERE {} AND credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')",super::HELD_SQL)
 }
 
 pub(crate) fn drop_credential_route_clocks_sql() -> String {
-    format!("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+    format!("UPDATE block INDEXED BY block_held_credential SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
         WHERE {} AND credential_id=?1 AND kind IN ('account_route','non_quota_route','transient_route')",super::HELD_SQL)
 }
 

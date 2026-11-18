@@ -147,9 +147,10 @@ fn periodic_fingerprint_scans_only_the_held_index_not_permanent_account_history(
             let sql = crate::block_state::fingerprint_sql(0, "block");
             let steps = plan(conn, &sql);
             assert!(
-                steps
-                    .iter()
-                    .any(|step| step.contains("USING") && step.contains("block_held_provider")),
+                steps.iter().any(|step| step.contains("USING")
+                    && ["block_held_provider", "block_held_credential"]
+                        .iter()
+                        .any(|index| step.contains(index))),
                 "the aggregate may scan held entries, never permanent history: {steps:?}"
             );
             let actual = conn.query_row(&sql, [], |row| {
@@ -368,9 +369,13 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
         replay.fence_id = id.into();
         replay.cleared_at = None;
         replay.cleared_reason = None;
-        store
+        let error = store
             .account_transaction(|tx| tx.insert_fence(&replay))
-            .unwrap();
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed"),
+            "main rejects a duplicate fence id rather than resurrecting it: {error}"
+        );
         store.with_reader_for_test(|conn| {
             assert_eq!(conn.query_row("SELECT source_present FROM block WHERE kind='account' AND origin_key=json_array(?1)",[id],|r|r.get::<_,i64>(0))?,0,"a cleared permanent fence id cannot be replayed after retention");
             Ok(())
@@ -411,7 +416,7 @@ fn residue_and_retirement_batches_seek_only_their_age_indexes() {
 }
 
 #[test]
-fn source_order_allocation_seeks_live_sources_without_account_history() {
+fn source_order_allocation_uses_covering_max_seeks_even_with_account_history() {
     let (_scratch, store, now) = fixture("held-source-order-plan");
     store
         .with_writer_for_test(|conn| seed_account_history(conn, now))
@@ -421,9 +426,10 @@ fn source_order_allocation_seeks_live_sources_without_account_history() {
             let steps = plan(conn, crate::block_storage::NEXT_SOURCE_ORDER);
             assert!(
                 steps.iter().any(|step| step.contains("SEARCH block")
-                    && step.contains("block_live_source_order")),
-                "allocating the next live ordinal must not walk cleared ids: {steps:?}"
+                    && step.contains("COVERING INDEX block_source_order")),
+                "the existing monotonic allocator must seek each kind's indexed maximum: {steps:?}"
             );
+            assert!(steps.iter().all(|step|!step.contains("SCAN block")),"preserving a global source-order maximum must not walk historical records: {steps:?}");
             Ok(())
         })
         .unwrap();

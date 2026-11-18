@@ -61,7 +61,6 @@ CREATE INDEX block_held_credential ON block(credential_id)
 CREATE INDEX block_held_owner ON block(claim_owner)
   WHERE (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')
     AND is_origin=1 AND managed=1 AND claim_owner IS NOT NULL;
-CREATE INDEX block_live_source_order ON block(kind,source_order) WHERE source_present=1;
 CREATE INDEX block_retired_time ON block(cleared_at) WHERE cleared_by='retired' AND is_origin=1 AND kind!='account';
 CREATE INDEX block_absent_time ON block(cleared_at)
   WHERE source_present=0 AND kind!='account'
