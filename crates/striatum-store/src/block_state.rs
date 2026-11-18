@@ -38,9 +38,7 @@ pub(crate) fn sql_fingerprints(conn: &Connection) -> rusqlite::Result<Vec<(usize
 
 pub(crate) fn fingerprint_sql(table: usize, name: &str) -> String {
     let held = match table {
-        0 => {
-            "(cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')"
-        }
+        0 => crate::block_storage::HELD_SQL,
         3 => "0",
         _ => "1",
     };

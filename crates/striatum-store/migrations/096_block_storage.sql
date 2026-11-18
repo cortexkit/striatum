@@ -54,7 +54,18 @@ CREATE TABLE block (
 );
 CREATE INDEX block_scope ON block(provider,credential_id,account_id,model);
 CREATE INDEX block_source_order ON block(kind,source_order);
-CREATE INDEX block_retired_time ON block(cleared_at) WHERE cleared_by='retired' AND is_origin=1;
+CREATE INDEX block_held_provider ON block(provider)
+  WHERE (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation');
+CREATE INDEX block_held_credential ON block(credential_id)
+  WHERE (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation');
+CREATE INDEX block_held_owner ON block(claim_owner)
+  WHERE (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')
+    AND is_origin=1 AND managed=1 AND claim_owner IS NOT NULL;
+CREATE INDEX block_live_source_order ON block(kind,source_order) WHERE source_present=1;
+CREATE INDEX block_retired_time ON block(cleared_at) WHERE cleared_by='retired' AND is_origin=1 AND kind!='account';
+CREATE INDEX block_absent_time ON block(cleared_at)
+  WHERE source_present=0 AND kind!='account'
+    AND (cleared_by='removed' OR (cleared_by='kept' AND kind!='observation'));
 CREATE INDEX block_exclusions ON block(principal,admission_id,credential_id)
   WHERE kind='principal';
 CREATE INDEX block_observation ON block(observation_id) WHERE observation_id IS NOT NULL;

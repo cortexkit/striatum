@@ -8,6 +8,15 @@ use striatum_core::blocks::Block;
 
 pub(crate) mod keyed_updates;
 
+// Keep SQL's loaded-row boundary identical to StoredBlock::held(). Inactive
+// audit history must never be decoded by an admission or periodic state check.
+pub(crate) const HELD_SQL: &str =
+    "(cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')";
+
+// Account fence ids are permanent replay barriers, as on the old schema.
+// A source still held (including a sparse observation clock) is not garbage.
+pub(crate) const COLLECTIBLE_SQL: &str = "source_present=0 AND kind!='account' AND (cleared_by='removed' OR (cleared_by='kept' AND kind!='observation'))";
+
 pub(crate) const MIGRATION: &str = include_str!("../migrations/096_block_storage.sql");
 
 #[cfg(any(test, feature = "test-support"))]

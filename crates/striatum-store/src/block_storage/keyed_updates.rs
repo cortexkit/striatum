@@ -2,17 +2,25 @@
 //! statements here lets tests inspect the writers' keys, not copied test SQL.
 
 pub(crate) fn rebind_claim_owner_sql() -> String {
-    "UPDATE block SET claim_owner=?2 WHERE claim_owner=?1 AND is_origin=1 AND managed=1".into()
+    format!(
+        "UPDATE block SET claim_owner=?2 WHERE {} AND claim_owner=?1 AND is_origin=1 AND managed=1",
+        super::HELD_SQL
+    )
 }
 
 pub(crate) fn bind_claim_owner_sql() -> String {
-    "UPDATE block SET claim_owner=?2 WHERE is_origin=1 AND managed=1 AND claim_owner=?1".into()
+    format!(
+        "UPDATE block SET claim_owner=?2 WHERE {} AND is_origin=1 AND managed=1 AND claim_owner=?1",
+        super::HELD_SQL
+    )
 }
 
 pub(crate) fn clear_credential_sql() -> String {
-    "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
-        WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1"
-        .into()
+    format!(
+        "UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL
+        WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1",
+        super::HELD_SQL
+    )
 }
 
 pub(crate) fn clear_credential_for_id(
@@ -35,22 +43,36 @@ pub(crate) fn clear_credential_for_id(
 }
 
 pub(crate) fn clear_matching_credential_sql() -> String {
-    "UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
-        WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS ?2".into()
+    format!("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+        WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS ?2",super::HELD_SQL)
 }
 
 pub(crate) fn adopt_credential_fingerprint_sql() -> String {
-    "UPDATE block SET listing_fingerprint=?2
-        WHERE kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS NULL".into()
+    format!("UPDATE block SET listing_fingerprint=?2
+        WHERE {} AND kind='credential' AND is_origin=1 AND source_present=1 AND credential_id=?1 AND listing_fingerprint IS NULL",super::HELD_SQL)
 }
 
 pub(crate) fn clear_credential_routes_sql() -> String {
-    "UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
-        WHERE credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')".into()
+    format!("UPDATE block SET source_present=0,cleared_at=COALESCE(cleared_at,?2),cleared_by='removed',claim_owner=NULL
+        WHERE {} AND credential_id=?1 AND source_present=1 AND kind IN ('account_route','non_quota_route','transient_route')",super::HELD_SQL)
 }
 
 pub(crate) fn drop_credential_route_clocks_sql() -> String {
-    "UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
-        WHERE credential_id=?1 AND kind IN ('account_route','non_quota_route','transient_route')"
+    format!("UPDATE block SET managed=0,claim_owner=NULL,last_claimed_at=NULL,claim_generation=0
+        WHERE {} AND credential_id=?1 AND kind IN ('account_route','non_quota_route','transient_route')",super::HELD_SQL)
+}
+
+pub(crate) fn retired_block_prune_sql() -> String {
+    "DELETE FROM block WHERE rowid IN (SELECT rowid FROM block
+        WHERE is_origin=1 AND cleared_by='retired' AND kind!='account' AND cleared_at<?1
+        ORDER BY cleared_at LIMIT ?2)"
         .into()
+}
+
+pub(crate) fn inactive_block_prune_sql() -> String {
+    format!(
+        "DELETE FROM block WHERE rowid IN (SELECT rowid FROM block WHERE {} AND cleared_at<?1
+        ORDER BY cleared_at LIMIT ?2)",
+        super::COLLECTIBLE_SQL
+    )
 }

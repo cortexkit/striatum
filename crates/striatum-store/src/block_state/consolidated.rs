@@ -1542,7 +1542,11 @@ impl StoredBlock {
 }
 
 fn load_select(table: usize) -> String {
-    select(table)
+    if table == 0 {
+        format!("{} WHERE {}", select(table), block_storage::HELD_SQL)
+    } else {
+        select(table)
+    }
 }
 
 fn principal_clock_check_sql() -> String {
@@ -1550,7 +1554,16 @@ fn principal_clock_check_sql() -> String {
 }
 
 fn provider_check_sql(table: usize, column: &str) -> String {
-    format!("{} {} WHERE {column}=?1", super::STATE_CHECK, select(table))
+    let held = if table == 0 {
+        format!(" AND {}", block_storage::HELD_SQL)
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {} WHERE {column}=?1{held}",
+        super::STATE_CHECK,
+        select(table)
+    )
 }
 
 fn select(table: usize) -> String {
@@ -1668,7 +1681,7 @@ pub(super) fn reviewed_exempt_reads() -> Vec<String> {
         format!("{mark} {} WHERE kind=?1 AND origin_key=?2",select(0)),
         format!("{mark} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
         format!("{mark} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key"),
-        format!("{mark} SELECT rowid,{},cleared_models FROM block WHERE provider=?1 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
+        principal_clock_check_sql(),
         format!("{mark} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",select(2)),
         format!("{mark} {} WHERE kind='principal' AND principal=?1 AND admission_id=?2",select(0)),
     ];
@@ -1679,7 +1692,7 @@ pub(super) fn reviewed_exempt_reads() -> Vec<String> {
             (5, "provider_key"),
             (6, "provider_id"),
         ]
-        .map(|(table, column)| format!("{mark} {} WHERE {column}=?1", select(table))),
+        .map(|(table, column)| provider_check_sql(table, column)),
     );
     reads
 }

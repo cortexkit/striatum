@@ -219,6 +219,8 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
     let boundary = credential("retention-boundary");
     let held = credential("retention-held-source");
     let sparse = serde_json::json!(["cpu-provider-0", "retention-sparse-observation"]).to_string();
+    let kept_sparse =
+        serde_json::json!(["cpu-provider-0", "retention-kept-observation"]).to_string();
     let removed_observation =
         serde_json::json!(["cpu-provider-0", "retention-removed-observation"]).to_string();
     store
@@ -290,6 +292,15 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
             copy_residue(
                 conn,
                 "observation",
+                &kept_sparse,
+                Some("kept"),
+                Some(before - 1),
+                false,
+                true,
+            )?;
+            copy_residue(
+                conn,
+                "observation",
                 &removed_observation,
                 Some("removed"),
                 Some(before - 1),
@@ -300,7 +311,19 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
         })
         .unwrap();
     for _ in 0..5 {
+        let count = || {
+            store
+                .with_reader_for_test(|conn| {
+                    conn.query_row("SELECT count(*) FROM block", [], |row| row.get::<_, i64>(0))
+                })
+                .unwrap()
+        };
+        let prior = count();
         store.prune_retired_fence_origins(before, 1).unwrap();
+        assert!(
+            prior - count() <= 2,
+            "each of the retired and absent-source relations has its own short batch limit"
+        );
     }
     store
         .with_reader_for_test(|conn| {
@@ -322,6 +345,7 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
                 &boundary,
                 &held,
                 &sparse,
+                &kept_sparse,
             ] {
                 assert_eq!(
                     conn.query_row(
@@ -352,4 +376,55 @@ fn inactive_residue_retention_is_bounded_without_losing_account_replay_barriers(
             Ok(())
         }).unwrap();
     }
+}
+
+#[test]
+fn residue_and_retirement_batches_seek_only_their_age_indexes() {
+    let (_scratch, store, _now) = fixture("held-retention-plans");
+    store
+        .with_reader_for_test(|conn| {
+            for (sql, index) in [
+                (
+                    keyed_updates::inactive_block_prune_sql(),
+                    "block_absent_time",
+                ),
+                (
+                    keyed_updates::retired_block_prune_sql(),
+                    "block_retired_time",
+                ),
+            ] {
+                let steps = plan(conn, &sql);
+                assert!(
+                    steps
+                        .iter()
+                        .any(|step| step.contains("SEARCH block") && step.contains(index)),
+                    "short retention batches must seek eligible ages: {steps:?}"
+                );
+                assert!(
+                    steps.iter().all(|step| !step.contains("SCAN block")),
+                    "retention must not walk permanent account ids: {steps:?}"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn source_order_allocation_seeks_live_sources_without_account_history() {
+    let (_scratch, store, now) = fixture("held-source-order-plan");
+    store
+        .with_writer_for_test(|conn| seed_account_history(conn, now))
+        .unwrap();
+    store
+        .with_reader_for_test(|conn| {
+            let steps = plan(conn, crate::block_storage::NEXT_SOURCE_ORDER);
+            assert!(
+                steps.iter().any(|step| step.contains("SEARCH block")
+                    && step.contains("block_live_source_order")),
+                "allocating the next live ordinal must not walk cleared ids: {steps:?}"
+            );
+            Ok(())
+        })
+        .unwrap();
 }

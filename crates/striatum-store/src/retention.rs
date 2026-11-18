@@ -1191,9 +1191,17 @@ impl crate::AccountTx<'_> {
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_retired_fence_origins");
         self.retention_write(|tx| {
-            tx.execute("DELETE FROM block WHERE rowid IN (
-                SELECT rowid FROM block INDEXED BY block_retired_time
-                WHERE is_origin=1 AND cleared_by='retired' AND cleared_at<?1 ORDER BY cleared_at LIMIT ?2)",params![before,limit_param(limit)])?;
+            // A cleared account fence's id remains a replay barrier forever,
+            // as on the old schema. Only absent, non-held non-account residue
+            // joins the existing age cutoff and short per-relation batches.
+            tx.execute(
+                &crate::block_storage::keyed_updates::retired_block_prune_sql(),
+                params![before, limit_param(limit)],
+            )?;
+            tx.execute(
+                &crate::block_storage::keyed_updates::inactive_block_prune_sql(),
+                params![before, limit_param(limit)],
+            )?;
             tx.execute(
                 "DELETE FROM retirement_tombstone WHERE rowid IN ( \
                    SELECT rowid FROM retirement_tombstone INDEXED BY retirement_tombstone_time \
