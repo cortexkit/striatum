@@ -5044,11 +5044,11 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         drop(store);
+        crate::history::complete_test_upgrade(&descriptor, now);
         let error = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 81)
             .err()
             .unwrap();
         assert!(error.to_string().contains("store_ahead"));
-        // The refusal names the store's version, the newest migration.
         let latest = crate::route_state_migrations().last().unwrap().version;
         assert!(error.to_string().contains(&latest.to_string()));
     }
