@@ -1,4 +1,8 @@
 use super::*;
+use crate::routing_v1::conformance_tests::case_shards::{self, CaseLabel, CaseShard};
+
+const TEMPLATE_ENV: &str = "CK_STRIATUM_ADMISSION_ORDER_TEMPLATE";
+const REFERENCE_ENV: &str = "CK_STRIATUM_ADMISSION_ORDER_REFERENCE";
 
 fn permutations(items: &mut [usize], at: usize, out: &mut Vec<Vec<usize>>) {
     if at == items.len() {
@@ -153,11 +157,30 @@ fn schema(path: &std::path::Path) -> (i64, Vec<(String, String, String, Option<S
     (version, objects)
 }
 
-async fn assert_every_order(legacy: bool) {
+async fn assert_every_order(legacy: bool, test: &str) {
     let _clock = crate::InjectedClock::set(NOW);
-    let mut orders = Vec::new();
-    permutations(&mut [0, 1, 2, 3, 4, 5], 0, &mut orders);
-    assert_eq!(orders.len(), 720);
+    if let Some(shard) = CaseShard::current() {
+        let template = std::path::PathBuf::from(std::env::var_os(TEMPLATE_ENV).unwrap());
+        let expected: Value = serde_json::from_str(&std::env::var(REFERENCE_ENV).unwrap()).unwrap();
+        let mut orders = Vec::new();
+        permutations(&mut [0, 1, 2, 3, 4, 5], 0, &mut orders);
+        assert_eq!(orders.len(), 720);
+        let mut cases = 0;
+        let mut compared = 0;
+        for (index, order) in orders
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| shard.contains(*index))
+        {
+            let _case = CaseLabel(|| format!("legacy={legacy} permutation {index}: {order:?}"));
+            let actual = end_state(order, legacy, false, Some(&template)).await;
+            cases += 1;
+            assert_eq!(actual, expected, "legacy={legacy} order={order:?}");
+            compared += 1;
+        }
+        shard.report(&[cases, compared]);
+        return;
+    }
     // Migrate once, then copy a consistent SQLite snapshot instead of rerunning
     // the entire migration chain for each order. Each copy still gets its own
     // setup, selection, admission, caches and six production frame-handler calls.
@@ -177,27 +200,33 @@ async fn assert_every_order(legacy: bool) {
     assert_eq!(expected["inflight"], 0);
     assert_eq!(expected["usage"], json!([1, 20]));
     assert!(!expected["blocks"].as_array().unwrap().is_empty());
-    let mut compared = 0;
-    for order in &orders {
-        assert_eq!(
-            end_state(order, legacy, false, Some(&template)).await,
-            expected,
-            "legacy={legacy} order={order:?}"
-        );
-        compared += 1;
-    }
+    let expected = expected.to_string();
+    let [cases, compared] = case_shards::run(module_path!(), test, |command| {
+        command
+            .env(TEMPLATE_ENV, &template)
+            .env(REFERENCE_ENV, &expected);
+    });
+    assert_eq!(cases, 720);
     assert_eq!(compared, 720);
     println!("legacy={legacy}: compared all {compared} admission fact permutations");
 }
 
 #[tokio::test]
 async fn every_admission_fact_order_has_the_in_order_end_state() {
-    assert_every_order(false).await;
+    assert_every_order(
+        false,
+        stringify!(every_admission_fact_order_has_the_in_order_end_state),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn every_legacy_admission_fact_order_has_the_in_order_end_state() {
-    assert_every_order(true).await;
+    assert_every_order(
+        true,
+        stringify!(every_legacy_admission_fact_order_has_the_in_order_end_state),
+    )
+    .await;
 }
 
 #[tokio::test]

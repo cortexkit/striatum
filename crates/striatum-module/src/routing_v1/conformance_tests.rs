@@ -48,6 +48,8 @@ use crate::{
 static NEXT_HARNESS: AtomicU64 = AtomicU64::new(0);
 
 mod admission_cost_tests;
+#[path = "conformance_tests/case_shards/tests.rs"]
+pub(super) mod case_shards;
 mod continuation_tests;
 mod first_party_tests;
 #[path = "media_conformance.rs"]

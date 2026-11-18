@@ -1,6 +1,7 @@
 //! Whole-state checks around real writer requests, using the conformance
 //! catalogue and account seeds also used by the grouped request properties.
 
+use super::case_shards::{self, CaseLabel, CaseShard};
 use super::*;
 use std::collections::BTreeSet;
 
@@ -54,6 +55,12 @@ mod shared_keys;
 const START: u64 = 1_800_000_000_000;
 const POOL_PROVIDER: &str = "pool-provider";
 const POOL_MODEL: &str = "model-pool";
+
+thread_local! {
+    // Witnesses open additional worlds on the same test thread. Count those
+    // comparisons too, not just the ones on the seed's original world.
+    static COMPARED_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Copy)]
 enum Caller {
@@ -202,6 +209,7 @@ impl World {
             self.outside,
             "{context}: a writer bypassed its batch"
         );
+        COMPARED_STATES.set(COMPARED_STATES.get() + 1);
     }
 
     fn install_replay_inputs(&self) -> Option<striatum_store::replay::Guard> {
@@ -663,11 +671,28 @@ fn shuffled_request_groups(seed: u64) -> Vec<(u8, u64)> {
 
 #[tokio::test]
 async fn generated_request_groups_compare_all_state_after_every_real_step() {
+    let Some(shard) = CaseShard::current() else {
+        let [seeds, groups, states] = case_shards::run(
+            module_path!(),
+            stringify!(generated_request_groups_compare_all_state_after_every_real_step),
+            |_| {},
+        );
+        assert_eq!((seeds, groups, states), (6, 264, 6_619));
+        println!("compared {states} whole states across {seeds} seeds and {groups} generated request groups");
+        return;
+    };
     let _clock = crate::InjectedClock::set(START);
-    for seed in 1..=6 {
+    let mut seeds = 0;
+    let mut groups = 0;
+    for (index, seed) in (1..=6)
+        .enumerate()
+        .filter(|(index, _)| shard.contains(*index))
+    {
+        let _case = CaseLabel(|| format!("whole-writer seed {seed} (case index {index})"));
         let mut world = World::new(&format!("whole-writer-requests-{seed}")).await;
         for (draw, nonce) in shuffled_request_groups(seed) {
             world.request_group(draw, nonce).await;
+            groups += 1;
         }
         world.finished_charge_witnesses(seed).await;
         world.outside_state_witnesses(seed).await;
@@ -679,7 +704,9 @@ async fn generated_request_groups_compare_all_state_after_every_real_step() {
         assert_all_producers_driven(&world.trace);
         world.assert_semantic_coverage();
         world.compare("all semantic obligations reached");
+        seeds += 1;
     }
+    shard.report(&[seeds, groups, COMPARED_STATES.get()]);
 }
 
 #[tokio::test]
