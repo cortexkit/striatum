@@ -33,7 +33,9 @@ fn fusiform_golden_workload_facts_survive_store_reopen() {
     };
     let store = open();
     let mut payload = golden_complete();
-    payload["models"][MODEL]["capability.reasoning_default"] = json!("low");
+    // Fusiform's served shape (wire contract, capability.reasoning_default).
+    payload["models"][MODEL]["capability.reasoning_default"] =
+        json!({"type":"effort","value":"low"});
     payload["models"][EXCLUDED]["workload.reason.excluded"] = json!(false);
     let snapshot = decode_catalog_get(serde_json::to_vec(&payload).unwrap()).unwrap();
     apply_mapped_catalog(&store, &snapshot, None, Some("synthetic-quality-reseller")).unwrap();
@@ -66,7 +68,7 @@ fn invalid_and_unoffered_effort_keys_are_skipped_without_refusing_the_row() {
     let row = &mut payload["models"][MODEL];
     row["capability.reasoning_options"][0]["values"] = json!(["low", "high", "turbo"]);
     row["quality.graded_effort"] = json!("max");
-    row["capability.reasoning_default"] = json!("medium");
+    row["capability.reasoning_default"] = json!({"type":"effort","value":"medium"});
     row["quality.elo.effort.xhigh"] = json!(2000);
     row["quality.eq.effort.typo"] = json!(2000);
     row["workload.code.effort_default"] = json!("xhigh");
@@ -91,4 +93,33 @@ fn invalid_and_unoffered_effort_keys_are_skipped_without_refusing_the_row() {
     assert_eq!(efforts.eq, [("low".into(), 1400.0)].into());
     assert!(!efforts.workloads.contains_key("code"));
     assert_eq!(efforts.workloads["quick"].default, None);
+}
+
+#[test]
+fn vendor_default_reads_only_the_typed_effort_entry() {
+    let decode_default = |value: Value| {
+        let mut payload = golden_complete();
+        payload["models"][MODEL]["capability.reasoning_default"] = value;
+        let decoded = decode_catalog_get(serde_json::to_vec(&payload).unwrap()).unwrap();
+        decoded
+            .facts
+            .iter()
+            .find(|fact| fact.model_id == "synthetic-model")
+            .unwrap()
+            .catalog_efforts
+            .as_ref()
+            .and_then(|efforts| efforts.vendor_default.clone())
+    };
+    assert_eq!(
+        decode_default(json!({"type":"effort","value":"high"})).as_deref(),
+        Some("high")
+    );
+    // A bare string, another entry type or a missing value is not the served
+    // shape; each is skipped rather than guessed at.
+    assert_eq!(decode_default(json!("high")), None);
+    assert_eq!(
+        decode_default(json!({"type":"budget","value":"high"})),
+        None
+    );
+    assert_eq!(decode_default(json!({"type":"effort"})), None);
 }

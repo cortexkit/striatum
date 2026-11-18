@@ -26,7 +26,10 @@ pub(super) fn decode(
             if rank(effort).is_some() {
                 return true;
             }
-            tracing::warn!(route, effort, "ignoring unknown catalog reasoning option");
+            // Vendors publish option names outside the effort order (for
+            // example a budget mode); they are valid catalog data, so this is
+            // not worth a warning on every catalog refresh.
+            tracing::debug!(route, effort, "ignoring unranked catalog reasoning option");
             false
         });
     }
@@ -65,9 +68,19 @@ pub(super) fn decode(
         graded: row
             .get("quality.graded_effort")
             .and_then(|v| read("quality.graded_effort", v)),
-        vendor_default: row
-            .get("capability.reasoning_default")
-            .and_then(|v| read("capability.reasoning_default", v)),
+        // Fusiform serves the vendor default as `{"type":"effort","value":E}`,
+        // the same entry shape as `capability.reasoning_options`, not as a bare
+        // effort string like the workload and grade keys.
+        vendor_default: row.get("capability.reasoning_default").and_then(|v| {
+            match (v.get("type").and_then(Value::as_str), v.get("value")) {
+                (Some("effort"), Some(effort)) => read("capability.reasoning_default", effort),
+                _ if v.is_null() => None,
+                _ => {
+                    tracing::warn!(route, %v, "ignoring malformed capability.reasoning_default");
+                    None
+                }
+            }
+        }),
         ..Default::default()
     };
     for (key, value) in row.as_object().into_iter().flatten() {
