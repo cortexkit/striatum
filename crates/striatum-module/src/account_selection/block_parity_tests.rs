@@ -82,41 +82,25 @@ fn old_due(c: &ClassContext, origin: &FenceRecheck, account: &str, model: &str) 
     (at <= c.now_ms || owned) && (!origin.quota || !c.origin_has_binding_reading(origin, account))
 }
 
-fn old_probe(c: &ClassContext, provider: &str, model: &str, credential: &str) -> bool {
-    let account = crate::credential_fences::credential_account_id(&c.account_ids, credential)
-        .unwrap_or_else(|| credential.into());
-    c.rechecks.iter().any(|origin| {
-        old_applies(c, origin, provider, &account, credential, model)
-            && old_due(c, origin, &account, model)
-    })
+fn old_probe(c: &ClassContext, identity: &ParityIdentity<'_>, scope: &ReferenceScope<'_>) -> bool {
+    scope
+        .probe_origins
+        .iter()
+        .any(|origin| old_due(c, origin, &scope.probe_account, &identity.fact.model_id))
 }
 
 fn old_eligible(
     c: &ClassContext,
-    row: &cortexkit_claustrum_client::ListedCredential,
-    fact: &striatum_core::ModelFact,
+    identity: &ParityIdentity<'_>,
+    scope: &ReferenceScope<'_>,
 ) -> bool {
-    !c.rechecks.iter().any(|origin| {
-        !matches!(
-            origin.kind.as_str(),
-            "account"
-                | "account_route"
-                | "non_quota_route"
-                | "transient_route"
-                | "observation"
-                | "route"
-                | "provider"
-                | "failure"
-        ) && old_applies(
-            c,
-            origin,
-            &fact.provider_id,
-            c.account_id(row),
-            &row.id,
-            &fact.model_id,
-        ) && !old_due(c, origin, c.account_id(row), &fact.model_id)
-    }) && (!old_probe(c, &fact.provider_id, &fact.model_id, &row.id)
-        || c.probe_reserved_until(&fact.provider_id, &row.id).is_none())
+    let ParityIdentity { row, fact, .. } = identity;
+    !scope
+        .entitlement_origins
+        .iter()
+        .any(|origin| !old_due(c, origin, c.account_id(row), &fact.model_id))
+        && (!old_probe(c, identity, scope)
+            || c.probe_reserved_until(&fact.provider_id, &row.id).is_none())
         && c.tier_accounts.as_ref().is_none_or(|accounts| {
             accounts
                 .get(&format!("{}/{}", fact.provider_id, fact.model_id))
@@ -131,7 +115,7 @@ fn old_eligible(
             .refusals
             .iter()
             .any(|r| r.provider_id == fact.provider_id && r.credential_id == row.id)
-            || old_probe(c, &fact.provider_id, &fact.model_id, &row.id))
+            || old_probe(c, identity, scope))
 }
 
 fn context(fixture: &bench::RequestFixture) -> ClassContext {
@@ -152,11 +136,79 @@ struct ParityIdentity<'a> {
     source: bool,
 }
 
+/// The reference scope depends on the fixture and identity, not the time,
+/// probe owner, continuation, or media flag. The oracle still evaluates due
+/// time and eligibility in each context. Every production call still receives
+/// the full context, including the time, owner, continuation and media flag.
+struct ReferenceScope<'a> {
+    applies: Vec<bool>,
+    probe_account: String,
+    probe_origins: Vec<&'a FenceRecheck>,
+    entitlement_origins: Vec<&'a FenceRecheck>,
+}
+
+impl<'a> ReferenceScope<'a> {
+    fn new(
+        old: &'a ClassContext,
+        reference_origins: &[usize],
+        identity: &ParityIdentity<'_>,
+    ) -> Self {
+        let ParityIdentity {
+            account, row, fact, ..
+        } = identity;
+        let probe_account =
+            crate::credential_fences::credential_account_id(&old.account_ids, &row.id)
+                .unwrap_or_else(|| row.id.clone());
+        let applies_to = |origin: &FenceRecheck, account| {
+            old_applies(
+                old,
+                origin,
+                &fact.provider_id,
+                account,
+                &row.id,
+                &fact.model_id,
+            )
+        };
+        let applies = reference_origins
+            .iter()
+            .map(|&i| applies_to(&old.rechecks[i], account))
+            .collect();
+        let probe_origins = old
+            .rechecks
+            .iter()
+            .filter(|origin| applies_to(origin, &probe_account))
+            .collect();
+        let entitlement_origins = old
+            .rechecks
+            .iter()
+            .filter(|origin| {
+                !matches!(
+                    origin.kind.as_str(),
+                    "account"
+                        | "account_route"
+                        | "non_quota_route"
+                        | "transient_route"
+                        | "observation"
+                        | "route"
+                        | "provider"
+                        | "failure"
+                ) && applies_to(origin, old.account_id(row))
+            })
+            .collect();
+        Self {
+            applies,
+            probe_account,
+            probe_origins,
+            entitlement_origins,
+        }
+    }
+}
+
 fn compare_identity(
     new: &ClassContext,
     old: &ClassContext,
-    reference_origins: &[usize],
     identity: &ParityIdentity<'_>,
+    scope: &ReferenceScope<'_>,
 ) {
     let ParityIdentity {
         account,
@@ -171,22 +223,21 @@ fn compare_identity(
     let owner = &new.probe_owner;
     let continuation = new.continuation_credential.is_some();
     let media = new.media_route;
-    for (origin, &reference_index) in new.rechecks.iter().zip(reference_origins) {
-        let reference_origin = &old.rechecks[reference_index];
+    for (origin, &expected) in new.rechecks.iter().zip(&scope.applies) {
         assert_eq!(
             new.origin_applies(origin, provider, account, credential, model),
-            old_applies(old, reference_origin, provider, account, credential, model),
+            expected,
             "origin_applies source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media} origin={origin:?}"
         );
     }
     assert_eq!(
         new.probe_eligible(provider, model, credential),
-        old_probe(old, provider, model, credential),
+        old_probe(old, identity, scope),
         "probe source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media}"
     );
     assert_eq!(
         new.eligible(row, fact),
-        old_eligible(old, row, fact),
+        old_eligible(old, identity, scope),
         "eligible source={source} identity {provider}/{account}/{credential}/{model} now={at} owner={owner:?} continuation={continuation} media={media}"
     );
 }
@@ -196,6 +247,10 @@ fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
     let report = fixture.store().block_parity(now).unwrap();
     assert!(report.differences.is_empty(), "{report:#?}");
     assert!(report.identities > 0 && report.function_comparisons > 0);
+    println!(
+        "store parity: {} identities, {} combinations per identity, {} predicate comparisons",
+        report.identities, report.combinations_per_identity, report.function_comparisons
+    );
     let loaded = fixture.store().load_blocks(now).unwrap();
     let mut reference = current.clone();
     reference.replace_rechecks(
@@ -297,9 +352,11 @@ fn compare(fixture: &bench::RequestFixture, mut current: ClassContext) {
                         break;
                     }
                     let chunk = &identities[start..(start + 64).min(identities.len())];
-                    for (new, old) in &contexts {
-                        for identity in chunk {
-                            compare_identity(new, old, reference_origins, identity);
+                    for identity in chunk {
+                        let reference_scope =
+                            ReferenceScope::new(&reference, reference_origins, identity);
+                        for (new, old) in &contexts {
+                            compare_identity(new, old, identity, &reference_scope);
                             comparisons += 1;
                         }
                     }
