@@ -40,10 +40,16 @@ fn plan(conn: &Connection, sql: &str) -> Vec<String> {
 
 fn keyed_plan(conn: &Connection, sql: &str, index: &str) {
     let steps = plan(conn, sql);
+    let key = match index {
+        "block_held_owner" => "claim_owner=?",
+        "block_held_credential" => "credential_id=?",
+        "block_held_provider" => "provider=?",
+        _ => panic!("unreviewed keyed plan index {index}"),
+    };
     assert!(
-        steps
-            .iter()
-            .any(|step| step.contains("SEARCH block") && step.contains(index)),
+        steps.iter().any(|step| step.contains("SEARCH block")
+            && step.contains(index)
+            && step.contains(key)),
         "writer must seek its held-row key through {index}: {steps:?}; SQL={sql}"
     );
     assert!(
@@ -99,7 +105,18 @@ fn owner_rebinds_and_credential_updates_seek_held_partial_indexes() {
 fn provider_verification_and_reload_do_not_visit_ten_thousand_cleared_accounts() {
     let (_scratch, store, now) = fixture("held-provider-history");
     store
-        .with_writer_for_test(|conn| seed_account_history(conn, now))
+        .with_writer_for_test(|conn| {
+            seed_account_history(conn, now)?;
+            copy_residue(
+                conn,
+                "observation",
+                &serde_json::json!(["cpu-provider-0", "history-removed-observation"]).to_string(),
+                Some("removed"),
+                Some(now - 1),
+                false,
+                true,
+            )
+        })
         .unwrap();
     store
         .with_reader_for_test(|conn| {
@@ -429,6 +446,7 @@ fn source_order_allocation_uses_covering_max_seeks_even_with_account_history() {
                     && step.contains("COVERING INDEX block_source_order")),
                 "the existing monotonic allocator must seek each kind's indexed maximum: {steps:?}"
             );
+            assert!(steps.iter().filter(|step|step.contains("SEARCH block")).all(|step|step.contains("COVERING INDEX block_source_order") && step.contains("kind=?")),"every allocator branch must keep its kind key: {steps:?}");
             assert!(steps.iter().all(|step|!step.contains("SCAN block")),"preserving a global source-order maximum must not walk historical records: {steps:?}");
             Ok(())
         })
