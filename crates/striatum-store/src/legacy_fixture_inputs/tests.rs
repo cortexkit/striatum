@@ -79,7 +79,7 @@ pub(super) fn migrated_parity_store(path: &std::path::Path, now: i64) -> SqliteR
     old.assert_block_parity_fixture_coverage_for_test(now);
     let mut expected = old.effective_blocks_oracle_for_test(now).unwrap();
     drop(old);
-    let native = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let native = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     let mut actual = native.effective_blocks_oracle_for_test(now).unwrap();
     for rows in [&mut expected, &mut actual] {
         for row in rows.iter_mut() {

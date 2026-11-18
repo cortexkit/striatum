@@ -159,17 +159,18 @@ fn usage_and_reading_rows_share_a_byte_equal_account_key_and_join() {
         1
     );
 
-    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
-    let (usage_key, reading_key, joins): (Vec<u8>, Vec<u8>, i64) = connection
-        .query_row(
-            "SELECT CAST(u.account_key AS BLOB), CAST(l.account_key AS BLOB),
+    let (usage_key, reading_key, joins): (Vec<u8>, Vec<u8>, i64) = store
+        .with_history_reader_for_test(|connection| {
+            connection.query_row(
+                "SELECT CAST(u.account_key AS BLOB), CAST(l.account_key AS BLOB),
                     (SELECT COUNT(*) FROM model_route_usage u2
-                     JOIN quota_reading_log l2 ON l2.account_key = u2.account_key)
+                     JOIN visible_quota_readings l2 ON l2.account_key = u2.account_key)
              FROM model_route_usage u
-             JOIN quota_reading_log l ON l.account_key = u.account_key",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+             JOIN visible_quota_readings l ON l.account_key = u.account_key",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+        })
         .unwrap();
     assert_eq!(usage_key, reading_key);
     assert_eq!(usage_key, account_key.as_bytes());
@@ -239,7 +240,8 @@ fn duplicate_composite_key_never_rewrites_the_original_reading() {
         vec![original]
     );
 
-    let connection = rusqlite::Connection::open(rig.db_path()).unwrap();
+    assert_eq!(store.move_history_batch(EPOCH_MS + 3_600_001).unwrap(), 1);
+    let connection = rusqlite::Connection::open(rig.dir.join("history.db")).unwrap();
     let update = connection.execute(
         "UPDATE quota_reading_log SET used_percent = 50 WHERE account_key = ?1",
         ["openai/team-a"],

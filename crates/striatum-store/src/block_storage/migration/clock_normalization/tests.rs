@@ -35,7 +35,7 @@ fn registered_store_copy_normalizes_absent_and_record_only_clocks_without_touchi
     drop(old);
     // Normal open runs the registered chain on the on-disk copy, not a custom
     // test-only variant of the block migration.
-    let store = crate::SqliteRouteStateStore::open(&descriptor).unwrap();
+    let store = crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     let (normalized,remaining)=store.with_reader_for_test(|conn| {
         let normalized=conn.query_row("SELECT count(*) FROM block b JOIN fence_recheck r
             ON r.kind=b.kind AND r.origin_key=b.origin_key

@@ -44,7 +44,7 @@ fn migrated(
     drop(old);
     (
         scratch,
-        SqliteRouteStateStore::open(&descriptor).unwrap(),
+        SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap(),
         now,
         body,
     )
@@ -199,7 +199,7 @@ fn migrated_orphan(
     drop(old);
     (
         scratch,
-        SqliteRouteStateStore::open(&descriptor).unwrap(),
+        SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap(),
         receipt,
         body,
     )

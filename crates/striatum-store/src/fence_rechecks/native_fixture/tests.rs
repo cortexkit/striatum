@@ -29,7 +29,7 @@ pub(super) fn changed_evidence_parity_store(
             UPDATE pool_key_state SET wall_reason='new-evidence',walled_until={now}-1;
         "#))).unwrap();
     drop(store);
-    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     (scratch, store)
 }
 

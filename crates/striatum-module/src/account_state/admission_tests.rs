@@ -1339,7 +1339,7 @@ fn live_sized_admission_state_costs() {
            WHERE mode='serve' AND created_at<?1
              AND NOT EXISTS (SELECT 1 FROM account_pin p WHERE p.decision_id=account_decision.decision_id)
              AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.decision_id=account_decision.decision_id)
-             AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.decision_id=account_decision.decision_id)
+             AND NOT EXISTS (SELECT 1 FROM pending_account_hold h WHERE h.decision_id=account_decision.decision_id)
            ORDER BY created_at LIMIT 256)", [now])).unwrap();
     assert_eq!(reference, 0);
     let after = store.writer_hold_ns_for_test();

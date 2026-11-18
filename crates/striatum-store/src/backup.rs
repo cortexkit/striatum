@@ -56,6 +56,9 @@ pub const BACKUP_EXCLUDABLE_TABLES: &[(&str, &str)] = &[
 
 /// Tables every backup must carry, each with the reason.
 pub const BACKUP_REQUIRED_TABLES: &[(&str, &str)] = &[
+    ("pending_account_hold", "committed diagnostic holds not yet durable in history, also protects live references"),
+    ("pending_quota_reading_log", "committed quota samples not yet durable in history"),
+    ("quota_reading_moved", "deduplication watermark for quota replay across restarts"),
     (
         "routing_operator_decommissioned",
         "operator withdrawals must survive restore; an empty cache would route withdrawn models before the next catalog poll",

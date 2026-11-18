@@ -8,7 +8,7 @@ use striatum_core::RouteStateResult;
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "fence_rechecks/parity/tests.rs"]
-mod parity;
+pub(crate) mod parity;
 
 pub use striatum_core::fence_lifetimes::{NON_QUOTA_FENCE_MAX_MS, QUOTA_FENCE_RECHECK_MS};
 
@@ -4250,7 +4250,7 @@ mod tests {
             INSERT INTO provider_cooldown_state(provider_key,cooldown_until,updated_at) VALUES ('old',{0},100);
         ",now-10_000,now-7*3_600_000,now+86_400_000))).unwrap();
         drop(old);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         let clocks = store.fence_rechecks().unwrap();
         assert_eq!(
             clocks.len(),
@@ -4998,7 +4998,7 @@ mod tests {
         // opens, so bound it by the second containing `now` and a reading taken
         // after the open, rather than assuming both land in the same second.
         let earliest = now - now.rem_euclid(1000);
-        let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         let latest = crate::now_ms();
         let clocks = store.fence_rechecks().unwrap();
         let quota = clocks

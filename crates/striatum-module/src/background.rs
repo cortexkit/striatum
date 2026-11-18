@@ -156,6 +156,7 @@ pub(super) async fn start(
         "routing call counts",
         flush_call_counts_loop(Arc::clone(store), std::time::Duration::from_secs(30)),
     );
+    loops.spawn("history mover", history_mover_loop(Arc::clone(store)));
     loops.spawn(
         "retention",
         retention::retention_loop(Arc::clone(&store), config_overrides::config_path()),
@@ -317,6 +318,29 @@ async fn account_tick_loop(store: SharedStore, period: std::time::Duration) {
             }
         })
         .await;
+    }
+}
+
+async fn history_mover_loop(store: SharedStore) {
+    let period = std::time::Duration::from_secs(5);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticks.tick().await;
+        let store = Arc::clone(&store);
+        let result = striatum_store::job_timing::run(
+            "history_move",
+            crate::stage_timing::spawn_job_blocking(move || {
+                store.move_history_batch(crate::now_ms() as i64)
+            }),
+        )
+        .await;
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => tracing::warn!(%error, "history move failed; retrying next tick"),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => tracing::warn!(%error, "history mover worker failed"),
+        }
     }
 }
 

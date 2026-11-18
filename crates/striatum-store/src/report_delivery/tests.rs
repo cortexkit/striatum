@@ -732,3 +732,20 @@ fn report_delivery_migration_preserves_opaque_legacy_evidence() {
         .unwrap();
     assert_eq!(standing, Some(first));
 }
+
+#[test]
+fn split_restart_report_settles_a_probe_bound_before_the_split() {
+    let descriptor = descriptor();
+    let StorageBackend::Sqlite { path } = &descriptor.backend else {
+        unreachable!()
+    };
+    let store = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
+    seed(&store, "d", "p");
+    claim_decision_probe(&store, 1);
+    assert_eq!(store.fence_rechecks().unwrap().len(), 1);
+    drop(store);
+    crate::history::run_split_for_test(path, 2);
+    let store = SqliteRouteStateStore::open(&descriptor).unwrap();
+    report_outcome_for_run(&store, "selected", RouteOutcome::Completed, 2);
+    assert!(store.fence_rechecks().unwrap().is_empty());
+}

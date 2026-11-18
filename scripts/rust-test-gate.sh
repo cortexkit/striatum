@@ -26,6 +26,7 @@ python3 scripts/subc-daemon-env.py
 python3 -m unittest scripts/tests/test_write_transactions.py
 python3 scripts/write-transactions.py
 python3 -m unittest scripts/tests/test_convert_consumer_names.py
+python3 -m unittest scripts/tests/test_split_state_history.py
 
 # The tests build with test-support features, which hide code that only
 # compiles there. Check the shipped binary as it is built for deploy.

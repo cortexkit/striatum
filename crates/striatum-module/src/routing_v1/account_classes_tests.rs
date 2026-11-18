@@ -253,9 +253,11 @@ async fn transient_overload_rotates_a_fresh_model_pin_but_never_walls_the_accoun
     assert_eq!(held.1["detail"]["until_ms"], NOW + 5_000);
     let conn = rusqlite::Connection::open(harness.store_path()).unwrap();
     let held_credential: String = conn
-        .query_row("SELECT credential_id FROM account_hold", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT credential_id FROM pending_account_hold",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(held_credential, "oauth:first");
     let fences = harness

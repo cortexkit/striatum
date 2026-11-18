@@ -27,6 +27,7 @@ mod credential_refused_tests;
 
 mod account_writer {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     async fn ok(
         route: &super::super::conformance_tests::Route,
@@ -48,6 +49,18 @@ mod account_writer {
         let operator = harness.bind(json!({"kind":"direct"}), None).await;
         let store = harness.store();
         let outside = store.outside_account_writer_count_for_test();
+        let history_reads = store.watch_history_reads_for_test().unwrap();
+        assert!(
+            store
+                .with_writer_for_test(|conn| conn.query_row(
+                    "SELECT count(*) FROM archive.account_hold",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                ))
+                .is_err(),
+            "the trace must catch a history read"
+        );
+        assert!(history_reads.swap(0, Ordering::Relaxed) > 0);
         let selected = ok(&owner, "route.select", json!({"consumer":"mason","requirements":{"iq":30},"pin":format!("{POOL}/{POOL_MODEL_SHORT}"),"affinity":"writer-coverage"})).await;
         let affinities: i64 = store
             .with_reader_for_test(|conn| {
@@ -216,6 +229,12 @@ mod account_writer {
             store.account_command_count_for_test(striatum_store::AccountCommandKind::Tick),
             0
         );
+        assert_eq!(
+            history_reads.load(Ordering::Relaxed),
+            0,
+            "routing handlers must not read history"
+        );
+        store.stop_watching_history_reads_for_test().unwrap();
         crate::account_writer::tick(store, now as i64 + 120_000).unwrap();
         let budget = crate::retention::PassBudget {
             batch_rows: 64,
@@ -236,6 +255,7 @@ mod account_writer {
             "{report:?}"
         );
         assert_eq!(store.outside_account_writer_count_for_test(), outside);
+        assert!(store.history_tables_in_state_empty_for_test().unwrap());
     }
 }
 
@@ -1271,4 +1291,42 @@ async fn s8c_pool_wall_and_open_offer_match_the_sql_reference() {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(answer, recorded);
     }
+}
+
+#[tokio::test]
+async fn history_mover_batches_do_not_reload_account_state() {
+    use striatum_core::RouteStateStore;
+    let now = 1_800_000_000_000i64;
+    let _clock = crate::InjectedClock::set(now as u64);
+    let harness = harness_with_routed_accounts(Some(&["apikey"]));
+    let owner = harness.bind(reserved("example-consumer"), None).await;
+    let selected = owner
+        .call(
+            "route.select",
+            &json!({"consumer":"mason","requirements":{"iq":30},"pin":PLAIN}),
+        )
+        .await;
+    assert_eq!(selected.0, FrameType::Response, "{}", selected.1);
+    let store = harness.store();
+    crate::account_writer::tick(store, now).unwrap();
+    let reloads = striatum_store::block_reconcile_reloads();
+    for index in 0..100 {
+        let row = striatum_core::route_state_store::QuotaReadingLogRow {
+            account_key: "p/acct".into(),
+            window_key: "primary".into(),
+            observed_at: now - 7_200_000 + index,
+            used_percent: 10.0,
+            raw_used_percent: None,
+            resets_at: None,
+            window_minutes: None,
+            banked_credit_count: None,
+            fetched_at: None,
+            stale: None,
+        };
+        assert_eq!(store.append_quota_readings(&[row]).unwrap(), 1);
+        assert_eq!(store.move_history_batch(now).unwrap(), 1);
+        crate::account_writer::tick(store, now).unwrap();
+    }
+    assert_eq!(store.get_quota_readings("p/acct").unwrap().len(), 100);
+    assert_eq!(striatum_store::block_reconcile_reloads(), reloads);
 }

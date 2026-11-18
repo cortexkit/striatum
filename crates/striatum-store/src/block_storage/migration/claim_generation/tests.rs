@@ -24,7 +24,7 @@ fn changed_evidence_migration_preserves_generation_and_rejects_an_aba_stale_proo
         Ok(())
     }).unwrap();
     drop(old);
-    let native = SqliteRouteStateStore::open(&descriptor).unwrap();
+    let native = SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
     let back_to_a = crate::AccountRouteFence {
         provider: "aba-p".into(),
         credential_id: "aba-credential".into(),

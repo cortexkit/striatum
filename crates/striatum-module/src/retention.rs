@@ -1359,7 +1359,7 @@ mod tests {
             )
             .unwrap();
         connection.execute(
-            "INSERT INTO account_hold (decision_id,principal,conversation_hash,provider,pin_id, \
+            "INSERT INTO pending_account_hold (decision_id,principal,conversation_hash,provider,pin_id, \
                pin_generation,account_id,credential_id,basis,reset_at,retry_after_s,created_at) \
              VALUES ('held','runner','held','p','held',1,'acct','cred','five_hour',?1,60,?1)",
             [NOW],
@@ -1611,12 +1611,13 @@ mod tests {
         for index in 0..5 {
             connection
                 .execute(
-                    "INSERT INTO quota_reading_log (account_key, window_key, observed_at, \
+                    "INSERT INTO pending_quota_reading_log (account_key, window_key, observed_at, \
                        used_percent, is_stale) VALUES ('a/b', 'w', ?1, 10.0, 0)",
                     [NOW - 4 * DAY_MS + index],
                 )
                 .unwrap();
         }
+        assert_eq!(store.move_history_batch(NOW).unwrap(), 5);
         let budget = PassBudget {
             batch_rows: 2,
             detail_batch_rows: 2,
@@ -1948,7 +1949,7 @@ mod tests {
                  INSERT INTO retirement_tombstone VALUES ('route', '[\"x/new\"]', 'e', 0, {recent});
                  INSERT INTO routing_unscored_admissible_models VALUES ('m/old', 0, {idle});
                  INSERT INTO routing_unscored_admissible_models VALUES ('m/new', 0, {recent});
-                 INSERT INTO quota_reading_log (account_key, window_key, observed_at, used_percent, is_stale)
+                 INSERT INTO pending_quota_reading_log (account_key, window_key, observed_at, used_percent, is_stale)
                    VALUES ('a/b', 'w', {four_days}, 10.0, 0), ('a/b', 'w', {two_days}, 20.0, 0);",
                 start = NOW - 100 * DAY_MS,
                 idle = NOW - 31 * DAY_MS,
@@ -1958,6 +1959,7 @@ mod tests {
             ))
             .unwrap();
 
+        assert_eq!(store.move_history_batch(NOW).unwrap(), 2);
         let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &no_pause());
         assert_eq!(report.speed_samples, 11);
         assert_eq!(report.routing_call_counts, 1);
@@ -2008,7 +2010,10 @@ mod tests {
             1
         );
         assert_eq!(
-            count(&path, "SELECT observed_at FROM quota_reading_log"),
+            count(
+                &path.with_file_name("history.db"),
+                "SELECT observed_at FROM quota_reading_log"
+            ),
             NOW - 2 * DAY_MS
         );
         drop(store);

@@ -161,7 +161,7 @@ fn untouched_by_refusal(harness: &Harness) -> Vec<Vec<Vec<rusqlite::types::Value
     let b = credential_on(B);
     [
         "SELECT * FROM account_admission ORDER BY principal, admission_id".to_owned(),
-        "SELECT * FROM account_hold".into(),
+        "SELECT * FROM pending_account_hold".into(),
         "SELECT * FROM account_affinity ORDER BY principal, conversation_hash, provider".into(),
         "SELECT * FROM account_pin ORDER BY pin_id".into(),
         "SELECT * FROM routing_v1_admission ORDER BY 1, 2".into(),

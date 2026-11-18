@@ -72,7 +72,7 @@ const AFFINITY_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
     JOIN account_admission a ON a.pin_id=p.pin_id \
     WHERE p.principal=f.principal AND p.conversation_hash=f.conversation_hash \
       AND p.provider=f.provider) \
-  AND NOT EXISTS (SELECT 1 FROM account_pin p JOIN account_hold h ON h.pin_id=p.pin_id \
+  AND NOT EXISTS (SELECT 1 FROM account_pin p JOIN {holds} h ON h.pin_id=p.pin_id \
     WHERE p.principal=f.principal AND p.conversation_hash=f.conversation_hash \
       AND p.provider=f.provider)";
 
@@ -84,14 +84,14 @@ const DECISION_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_pin p \
        WHERE p.decision_id = account_decision.decision_id) \
      AND NOT EXISTS (SELECT 1 FROM account_admission a \
        WHERE a.decision_id = account_decision.decision_id) \
-     AND NOT EXISTS (SELECT 1 FROM account_hold h \
+     AND NOT EXISTS (SELECT 1 FROM {holds} h \
         WHERE h.decision_id = account_decision.decision_id)";
 
 const PIN_UNREFERENCED: &str = "NOT EXISTS (SELECT 1 FROM account_affinity f \
     WHERE f.principal=p.principal AND f.conversation_hash=p.conversation_hash \
       AND f.provider=p.provider) \
   AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.pin_id=p.pin_id) \
-  AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.pin_id=p.pin_id)";
+  AND NOT EXISTS (SELECT 1 FROM {holds} h WHERE h.pin_id=p.pin_id)";
 
 fn limit_param(limit: usize) -> i64 {
     i64::try_from(limit).unwrap_or(i64::MAX)
@@ -149,43 +149,44 @@ impl SqliteRouteStateStore {
         after: Option<AffinityRetentionPosition>,
         scan_limit: usize,
     ) -> RouteStateResult<AffinityRetentionPlan> {
-        self.store
-            .with_read(|conn| {
-                let after = after.unwrap_or(AffinityRetentionPosition {
-                    expires_at: i64::MIN,
-                    rowid: i64::MIN,
-                });
-                let mut statement = conn.prepare(&format!(
-                    "WITH candidates AS MATERIALIZED ( \
+        self.with_history_reader(|conn| {
+            let holds = crate::history::hold_source(conn);
+            let after = after.unwrap_or(AffinityRetentionPosition {
+                expires_at: i64::MIN,
+                rowid: i64::MIN,
+            });
+            let mut statement = conn.prepare(&format!(
+                "WITH candidates AS MATERIALIZED ( \
                    SELECT rowid,principal,conversation_hash,provider,expires_at,lease_valid_until \
                    FROM account_affinity INDEXED BY account_affinity_by_expiry \
                    WHERE expires_at < ?1 AND (expires_at,rowid) > (?2,?3) \
                    ORDER BY expires_at,rowid LIMIT ?4) \
                  SELECT f.rowid,f.principal,f.conversation_hash,f.provider,f.expires_at, \
-                   COALESCE(f.lease_valid_until,0)<=?5 AND {AFFINITY_UNREFERENCED} \
-                 FROM candidates f ORDER BY f.expires_at,f.rowid"
-                ))?;
-                let mut plan = AffinityRetentionPlan::default();
-                let mut rows = statement.query(params![
-                    before,
-                    after.expires_at,
-                    after.rowid,
-                    limit_param(scan_limit),
-                    lease_before
-                ])?;
-                while let Some(row) = rows.next()? {
-                    plan.examined += 1;
-                    plan.last = Some(AffinityRetentionPosition {
-                        expires_at: row.get(4)?,
-                        rowid: row.get(0)?,
-                    });
-                    if row.get::<_, bool>(5)? {
-                        plan.keys.push((row.get(1)?, row.get(2)?, row.get(3)?));
-                    }
+                   COALESCE(f.lease_valid_until,0)<=?5 AND {} \
+                 FROM candidates f ORDER BY f.expires_at,f.rowid",
+                AFFINITY_UNREFERENCED.replace("{holds}", holds)
+            ))?;
+            let mut plan = AffinityRetentionPlan::default();
+            let mut rows = statement.query(params![
+                before,
+                after.expires_at,
+                after.rowid,
+                limit_param(scan_limit),
+                lease_before
+            ])?;
+            while let Some(row) = rows.next()? {
+                plan.examined += 1;
+                plan.last = Some(AffinityRetentionPosition {
+                    expires_at: row.get(4)?,
+                    rowid: row.get(0)?,
+                });
+                if row.get::<_, bool>(5)? {
+                    plan.keys.push((row.get(1)?, row.get(2)?, row.get(3)?));
                 }
-                Ok(plan)
-            })
-            .map_err(err)
+            }
+            Ok(plan)
+        })
+        .map_err(err)
     }
 
     fn delete_unreferenced_decisions(
@@ -195,12 +196,12 @@ impl SqliteRouteStateStore {
         limit: usize,
     ) -> RouteStateResult<usize> {
         let keys = self
-            .store
-            .with_read(|conn| {
+            .with_history_reader(|conn| {
+                let holds = crate::history::hold_source(conn);
                 let mut statement = conn.prepare(&format!(
                 "SELECT decision_id FROM account_decision INDEXED BY account_decision_by_mode_time \
-                 WHERE mode=?1 AND created_at<?2 AND {DECISION_UNREFERENCED} \
-                 ORDER BY created_at LIMIT ?3"
+                 WHERE mode=?1 AND created_at<?2 AND {} \
+                 ORDER BY created_at LIMIT ?3", DECISION_UNREFERENCED.replace("{holds}", holds)
             ))?;
                 let rows = statement
                     .query_map(params![mode, created_before, limit_param(limit)], |row| {
@@ -214,11 +215,13 @@ impl SqliteRouteStateStore {
         }
         let keys = serde_json::to_string(&keys).map_err(err)?;
         self.retention_write(|tx| {
+            let holds = crate::history::hold_source(tx);
             tx.execute(
                 &format!(
                     "DELETE FROM account_decision \
                          WHERE decision_id IN (SELECT value FROM json_each(?3)) \
-                           AND mode = ?1 AND created_at < ?2 AND {DECISION_UNREFERENCED}"
+                           AND mode = ?1 AND created_at < ?2 AND {}",
+                    DECISION_UNREFERENCED.replace("{holds}", holds)
                 ),
                 params![mode, created_before, keys],
             )
@@ -286,6 +289,9 @@ impl SqliteRouteStateStore {
     /// milliseconds), oldest first. A hold is a retry answer that lapses
     /// within minutes; only the decision row it names keeps any meaning.
     pub fn prune_account_holds(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        if let Some(deleted) = self.prune_history(crate::history::Kind::Hold, before, limit)? {
+            return Ok(deleted);
+        }
         self.store
             .with_conn(|conn: &Connection| {
                 conn.execute(
@@ -315,17 +321,18 @@ impl SqliteRouteStateStore {
     /// Find unreferenced history on a pooled reader. The writer checks the
     /// references again by pin identity, since planning does not reserve rows.
     pub fn plan_account_pins(&self, before: i64, limit: usize) -> RouteStateResult<Vec<String>> {
-        self.store
-            .with_read(|conn| {
-                let mut statement = conn.prepare(&format!(
-                    "SELECT p.pin_id FROM account_pin p INDEXED BY account_pin_by_created \
-                 WHERE p.created_at<?1 AND {PIN_UNREFERENCED} ORDER BY p.created_at LIMIT ?2"
-                ))?;
-                let rows =
-                    statement.query_map(params![before, limit_param(limit)], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
+        self.with_history_reader(|conn| {
+            let holds = crate::history::hold_source(conn);
+            let mut statement = conn.prepare(&format!(
+                "SELECT p.pin_id FROM account_pin p INDEXED BY account_pin_by_created \
+                 WHERE p.created_at<?1 AND {} ORDER BY p.created_at LIMIT ?2",
+                PIN_UNREFERENCED.replace("{holds}", holds)
+            ))?;
+            let rows =
+                statement.query_map(params![before, limit_param(limit)], |row| row.get(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(err)
     }
 
     /// Delete at most `limit` conversation affinity rows whose idle expiry and
@@ -635,6 +642,9 @@ impl SqliteRouteStateStore {
     /// Delete at most `limit` quota readings observed before `before`, oldest
     /// first.
     pub fn prune_quota_reading_log(&self, before: i64, limit: usize) -> RouteStateResult<usize> {
+        if let Some(deleted) = self.prune_history(crate::history::Kind::Quota, before, limit)? {
+            return Ok(deleted);
+        }
         self.retention_write(|tx| {
             tx.execute(
                 "DELETE FROM quota_reading_log \
@@ -798,10 +808,11 @@ impl crate::AccountTx<'_> {
             crate::writer_entry_trace::enter("account_tx::retention::delete_account_pins");
         let keys = serde_json::to_string(keys).map_err(err)?;
         self.command_sql(|tx| {
+            let holds = crate::history::hold_source(tx);
             tx.execute(
                 &format!(
                 "DELETE FROM account_pin AS p WHERE pin_id IN (SELECT value FROM json_each(?2)) \
-                 AND created_at<?1 AND {PIN_UNREFERENCED}"
+                 AND created_at<?1 AND {}", PIN_UNREFERENCED.replace("{holds}", holds)
             ),
                 params![before, keys],
             )
@@ -814,16 +825,19 @@ impl crate::AccountTx<'_> {
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_account_pins");
         self.retention_write(|tx| {
+            let holds = crate::history::hold_source(tx);
             tx.execute(
-                "DELETE FROM account_pin WHERE rowid IN ( \
+                &format!(
+                    "DELETE FROM account_pin WHERE rowid IN ( \
                    SELECT p.rowid FROM account_pin p INDEXED BY account_pin_by_created \
                    WHERE p.created_at < ?1 \
                      AND NOT EXISTS (SELECT 1 FROM account_affinity f \
                        WHERE f.principal=p.principal AND f.conversation_hash=p.conversation_hash \
                          AND f.provider=p.provider) \
                      AND NOT EXISTS (SELECT 1 FROM account_admission a WHERE a.pin_id=p.pin_id) \
-                     AND NOT EXISTS (SELECT 1 FROM account_hold h WHERE h.pin_id=p.pin_id) \
-                   ORDER BY p.created_at LIMIT ?2)",
+                     AND NOT EXISTS (SELECT 1 FROM {holds} h WHERE h.pin_id=p.pin_id) \
+                   ORDER BY p.created_at LIMIT ?2)"
+                ),
                 params![before, limit_param(limit)],
             )
         })
@@ -937,11 +951,12 @@ impl crate::AccountTx<'_> {
             "account_tx::retention::delete_account_affinities_returning",
         );
         self.command_sql(|tx: &Connection| {
+            let holds = crate::history::hold_source(tx);
             let mut eligible = tx.prepare(&format!(
                 "SELECT EXISTS(SELECT 1 FROM account_affinity f \
                  WHERE f.principal=?1 AND f.conversation_hash=?2 AND f.provider=?3 \
                    AND f.expires_at<?4 AND COALESCE(f.lease_valid_until,0)<=?5 \
-                   AND {AFFINITY_UNREFERENCED})"
+                   AND {})", AFFINITY_UNREFERENCED.replace("{holds}", holds)
             ))?;
             let mut delete_pins = tx.prepare(
                 "DELETE FROM account_pin WHERE principal=?1 AND conversation_hash=?2 AND provider=?3"

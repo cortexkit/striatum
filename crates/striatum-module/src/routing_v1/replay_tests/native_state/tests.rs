@@ -143,6 +143,14 @@ pub(super) const EXCLUDED_TABLES: &[(&str, &str)] = &[
     ),
 ];
 
+// These tables implement placement or replay of data rather than add a new
+// logical relation to the existing 096 replay image.
+const SPLIT_STATE_TABLES: &[&str] = &[
+    "pending_account_hold",
+    "pending_quota_reading_log",
+    "quota_reading_moved",
+];
+
 pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
     let included: BTreeSet<_> = INCLUDED_TABLES.iter().copied().collect();
     let excluded: BTreeSet<_> = EXCLUDED_TABLES.iter().map(|(name, _)| *name).collect();
@@ -154,7 +162,9 @@ pub(super) fn check_tables(conn: &rusqlite::Connection) -> Result<(), String> {
     }
     let expected: BTreeSet<String> = included
         .union(&excluded)
-        .map(|name| (*name).to_string())
+        .copied()
+        .chain(SPLIT_STATE_TABLES.iter().copied())
+        .map(|name| name.to_string())
         .collect();
     let mut query = conn
         .prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*'")
@@ -180,35 +190,50 @@ pub(super) fn snapshot(harness: &Harness) -> Value {
     frozen_audit::check(harness, &connection);
     let mut tables = serde_json::Map::new();
     for name in INCLUDED_TABLES {
-        let mut statement = connection
-            .prepare(&format!("SELECT * FROM \"{name}\""))
-            .unwrap();
-        let columns: Vec<String> = statement
-            .column_names()
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut rows = statement
-            .query_map([], |row| {
-                let mut object = serde_json::Map::new();
-                for (index, column) in columns.iter().enumerate() {
-                    let value = match row.get_ref(index)? {
-                        ValueRef::Null => Value::Null,
-                        ValueRef::Integer(value) => json!(value),
-                        ValueRef::Real(value) => json!(value),
-                        ValueRef::Text(value) => {
-                            let text = std::str::from_utf8(value).unwrap();
-                            serde_json::from_str(text).unwrap_or_else(|_| json!(text))
-                        }
-                        ValueRef::Blob(value) => json!(value),
-                    };
-                    object.insert(column.clone(), value);
-                }
-                Ok(Value::Object(object))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
+        let source = if *name == "account_hold" {
+            "visible_account_holds"
+        } else {
+            name
+        };
+        let collect = |connection: &rusqlite::Connection| {
+            let mut statement = connection
+                .prepare(&format!("SELECT * FROM \"{source}\""))
+                .unwrap();
+            let columns: Vec<String> = statement
+                .column_names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let rows = statement
+                .query_map([], |row| {
+                    let mut object = serde_json::Map::new();
+                    for (index, column) in columns.iter().enumerate() {
+                        let value = match row.get_ref(index)? {
+                            ValueRef::Null => Value::Null,
+                            ValueRef::Integer(value) => json!(value),
+                            ValueRef::Real(value) => json!(value),
+                            ValueRef::Text(value) => {
+                                let text = std::str::from_utf8(value).unwrap();
+                                serde_json::from_str(text).unwrap_or_else(|_| json!(text))
+                            }
+                            ValueRef::Blob(value) => json!(value),
+                        };
+                        object.insert(column.clone(), value);
+                    }
+                    Ok(Value::Object(object))
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        };
+        let mut rows = if *name == "account_hold" {
+            harness
+                .store()
+                .with_history_reader_for_test(collect)
+                .unwrap()
+        } else {
+            collect(&connection).unwrap()
+        };
         // Keep the old neutral catalogue-row omission exactly: non-neutral
         // stored health fields are never removed from the comparison.
         if *name == "model_route_state" {

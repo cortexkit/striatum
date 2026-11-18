@@ -2197,12 +2197,15 @@ impl AccountTx<'_> {
         #[cfg(any(test, feature = "test-support"))]
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::account_selection::insert_hold");
+        let table = crate::history::hold_sink(self.conn);
         self.conn
             .execute(
-                "INSERT INTO account_hold (decision_id, principal, conversation_hash, provider, \
+                &format!(
+                    "INSERT INTO {table} (decision_id, principal, conversation_hash, provider, \
                    pin_id, pin_generation, account_id, credential_id, basis, reset_at, \
                    retry_after_s, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
+                ),
                 params![
                     row.decision_id,
                     row.principal,
@@ -2861,36 +2864,48 @@ impl SqliteRouteStateStore {
     /// Row counts of the tables serving writes.
     #[cfg(any(test, feature = "test-support"))]
     pub fn account_serving_counts(&self) -> RouteStateResult<AccountServingCounts> {
-        self.store
-            .with_read(|c: &Connection| {
-                let count = |table: &str| -> rusqlite::Result<i64> {
-                    c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                        row.get(0)
-                    })
-                };
-                let native: bool = c.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
-                    [], |row| row.get(0),
-                )?;
-                // Account-fence clears retain their audit row, while removed
-                // principal exclusions no longer count as serving sources.
-                let fences = if native {
-                    c.query_row("SELECT COUNT(*) FROM block WHERE kind='account'", [], |row| row.get(0))?
-                } else { count("account_fence")? };
-                let exclusions = if native {
-                    c.query_row("SELECT COUNT(*) FROM block WHERE kind='principal' AND source_present=1", [], |row| row.get(0))?
-                } else { count("account_principal_exclusion")? };
-                Ok(AccountServingCounts {
-                    affinity: count("account_affinity")?,
-                    pins: count("account_pin")?,
-                    admissions: count("account_admission")?,
-                    holds: count("account_hold")?,
-                    observations: count("account_observation")?,
-                    fences,
-                    exclusions,
+        self.with_history_reader(|c| {
+            let count = |table: &str| -> rusqlite::Result<i64> {
+                c.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
                 })
+            };
+            let native: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='block')",
+                [],
+                |row| row.get(0),
+            )?;
+            // Account-fence clears retain their audit row, while removed
+            // principal exclusions no longer count as serving sources.
+            let fences = if native {
+                c.query_row(
+                    "SELECT COUNT(*) FROM block WHERE kind='account'",
+                    [],
+                    |row| row.get(0),
+                )?
+            } else {
+                count("account_fence")?
+            };
+            let exclusions = if native {
+                c.query_row(
+                    "SELECT COUNT(*) FROM block WHERE kind='principal' AND source_present=1",
+                    [],
+                    |row| row.get(0),
+                )?
+            } else {
+                count("account_principal_exclusion")?
+            };
+            Ok(AccountServingCounts {
+                affinity: count("account_affinity")?,
+                pins: count("account_pin")?,
+                admissions: count("account_admission")?,
+                holds: count(crate::history::hold_source(c))?,
+                observations: count("account_observation")?,
+                fences,
+                exclusions,
             })
-            .map_err(err)
+        })
+        .map_err(err)
     }
 }
 

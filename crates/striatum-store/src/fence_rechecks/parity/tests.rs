@@ -150,3 +150,62 @@ impl SqliteRouteStateStore {
         })
     }
 }
+
+/// Verify the block evaluator before publishing an offline split. The original
+/// and staged state are both opened read-only by the caller.
+pub fn verify_split_evaluation(
+    original: &Connection,
+    staged: &Connection,
+    now: i64,
+) -> rusqlite::Result<BlockParity> {
+    use std::collections::BTreeMap;
+    let start = std::time::Instant::now();
+    let before = load_blocks(original, now)?;
+    let after = load_blocks(staged, now)?;
+    let canonical = |blocks: Vec<Block>| -> BTreeMap<_, _> {
+        blocks
+            .into_iter()
+            .map(|block| ((block.kind.clone(), block.origin_key.clone()), block))
+            .collect()
+    };
+    let before_rows = canonical(before.blocks);
+    let after_rows = canonical(after.blocks.clone());
+    let times_match = parity_times(original, now)? == parity_times(staged, now)?;
+    let identities_match = parity_identities(original)? == parity_identities(staged)?;
+    let mut report = BlockParity {
+        load_time: start.elapsed(),
+        active: after_rows.len(),
+        cleared_evidence: after.cleared_evidence.len(),
+        identities: 0,
+        combinations_per_identity: 0,
+        function_comparisons: 0,
+        differences: Vec::new(),
+    };
+    for key in before_rows
+        .keys()
+        .chain(after_rows.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if before_rows.get(key) != after_rows.get(key) {
+            report
+                .differences
+                .push(format!("block differs after split: {key:?}"));
+        }
+    }
+    if before.cleared_evidence != after.cleared_evidence {
+        report
+            .differences
+            .push("cleared evidence differs after split".into());
+    }
+    if !times_match || !identities_match {
+        report
+            .differences
+            .push("evaluation domain differs after split".into());
+    }
+    let reference = native_reference::effective(original, now)?
+        .into_iter()
+        .map(|row| ((row.kind.clone(), row.origin_key.clone()), row))
+        .collect();
+    compare_block_functions(original, now, &reference, &after.blocks, &mut report)?;
+    Ok(report)
+}

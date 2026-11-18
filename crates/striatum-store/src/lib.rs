@@ -68,8 +68,14 @@ mod fence_rechecks;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "frozen_block_data/tests.rs"]
 mod frozen_block_data;
+mod history;
+#[cfg(any(test, feature = "test-support"))]
+pub use fence_rechecks::parity::verify_split_evaluation;
+#[cfg(any(test, feature = "test-support"))]
+pub use history::{open_offline as open_offline_split_copy, run_split_for_test};
 mod route_snapshot;
 mod sql_real;
+mod store_open;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "writer_entry_trace/tests.rs"]
 pub mod writer_entry_trace;
@@ -358,7 +364,7 @@ struct ObservedSpeedAggregate {
     speed: Option<f64>,
 }
 
-fn route_state_migrations() -> [Migration; 95] {
+fn route_state_migrations() -> [Migration; 96] {
     [
         Migration {
             version: 1,
@@ -740,6 +746,7 @@ fn route_state_migrations() -> [Migration; 95] {
             version: 96,
             statements: block_storage::MIGRATION,
         },
+        history::STATE_MIGRATION,
     ]
 }
 
@@ -1275,6 +1282,7 @@ pub struct SqliteRouteStateStore {
     /// so a caller can tell that a retry finished while it waited.
     account_state_retries: AtomicU64,
     maintenance: Option<Mutex<Connection>>,
+    history: Option<history::History>,
     call_counts: call_counts::RoutingCallBuffer,
     /// Class vectors are means over every complete token profile in a seven-day
     /// window, recomputed from the whole population on every route selection
@@ -1803,101 +1811,6 @@ impl SqliteRouteStateStore {
             }
             Ok(())
         }).map_err(err)
-    }
-
-    fn open_with_migrations(
-        descriptor: &StorageDescriptor,
-        migrations: &[Migration],
-    ) -> RouteStateResult<Self> {
-        let store = open_sqlite(descriptor).map_err(err)?;
-        migrate_route_state(&store, migrations)?;
-        validate_family_spellings(&store)?;
-        // Changing temp_store discards existing TEMP objects, so configure it
-        // before installing the catalog write counter and its TEMP triggers.
-        store
-            .with_conn(|conn| {
-                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                conn.pragma_update(None, "journal_size_limit", WAL_SIZE_CAP_BYTES)?;
-                conn.pragma_update(None, "synchronous", "NORMAL")?;
-                // Savepoint statement journals otherwise create and delete a
-                // temp file per account command once they spill out of memory.
-                conn.pragma_update(None, "temp_store", "MEMORY")
-            })
-            .map_err(err)?;
-        // A failure here costs only the cache: every fingerprint read finds the
-        // tracking missing, computes the value fresh and tries to install it again.
-        if let Err(error) = store.with_conn(install_catalog_change_tracking) {
-            tracing::warn!(%error, "catalog change tracking not installed at open; fingerprints are computed fresh until it is");
-        }
-        // Hold each checkout until the next is configured, filling the lazy pool.
-        // Move this to cortexkit-store 0.4's open_sqlite_with_init hook when upgrading,
-        // so replacements after failed rollbacks get the larger cache too. A rare
-        // replacement keeps SQLite's default cache; configuring every checkout is
-        // more expensive than the larger cache can save.
-        fn prewarm(store: &SqliteStore, count: usize) -> Result<(), cortexkit_store::StoreError> {
-            if count == 0 {
-                return Ok(());
-            }
-            let mut nested = Ok(());
-            store.with_read(|conn| {
-                conn.pragma_update(None, "cache_size", READER_CACHE_SIZE_KIB)?;
-                nested = prewarm(store, count - 1);
-                Ok(())
-            })?;
-            nested
-        }
-        let memory = matches!(&descriptor.backend, StorageBackend::Sqlite { path }
-            if path.is_empty() || path == ":memory:" || path == "file::memory:" || path.starts_with("file::memory:?"));
-        prewarm(
-            &store,
-            if memory {
-                1
-            } else {
-                cortexkit_store::SqliteOpenOptions::default().read_pool_size
-            },
-        )
-        .map_err(err)?;
-        let mut result = Self::from_inner(connection_store::ConnectionStore::live(store));
-        if !memory {
-            let StorageBackend::Sqlite { path } = &descriptor.backend else {
-                unreachable!()
-            };
-            let maintenance = Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_URI,
-            )
-            .map_err(err)?;
-            maintenance
-                .busy_timeout(WAL_TRUNCATE_WAIT_BOUND)
-                .map_err(err)?;
-            maintenance
-                .pragma_update(None, "synchronous", "NORMAL")
-                .map_err(err)?;
-            result.maintenance = Some(Mutex::new(maintenance));
-        }
-        Ok(result)
-    }
-
-    fn from_inner(store: connection_store::ConnectionStore) -> Self {
-        Self {
-            maintenance: None,
-            store: std::sync::Arc::new(store),
-            account_writer: std::sync::OnceLock::new(),
-            account_state: std::sync::Arc::new(std::sync::OnceLock::new()),
-            account_state_retry: Mutex::new(None),
-            account_state_retries: AtomicU64::new(0),
-            call_counts: Default::default(),
-            class_vectors: Mutex::new(HashMap::new()),
-            usage_generation: AtomicU64::new(0),
-            reported_score_conflicts: Mutex::new(HashSet::new()),
-            catalog_fingerprint: Mutex::new(None),
-            resolved_facts: Mutex::new(None),
-            selection_catalog: Mutex::new(None),
-            catalog_facts: Mutex::new(None),
-            catalog_cache_identity: AtomicU64::new(next_catalog_cache_identity()),
-            #[cfg(any(test, feature = "test-support"))]
-            account_write_transactions: std::sync::Arc::new(AtomicU64::new(0)),
-        }
     }
 
     /// The single-writer fence epoch for this open (for diagnostics / future
@@ -2559,19 +2472,13 @@ impl SqliteRouteStateStore {
         let rows = rows.to_vec();
         let readings = readings.to_vec();
         let completeness = completeness.to_vec();
+        let split = self.history.is_some();
         self.account_command(AccountCommandKind::QuotaDelta, move |account| {
             let tx = account.conn;
             (|| -> rusqlite::Result<usize> {
                 let mut inserted = 0;
                 {
-                    let mut statement = tx.prepare(
-                        "INSERT OR IGNORE INTO quota_reading_log
-                           (account_key, window_key, observed_at, used_percent,
-                            raw_used_percent, resets_at, window_minutes,
-                            banked_credit_count, fetched_at, is_stale,
-                            stale_since, stale_class)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    )?;
+                    let mut statement = tx.prepare(if split { history::APPEND_QUOTA } else { history::APPEND_LEGACY_QUOTA })?;
                     for row in &rows {
                         if row.account_key.is_empty()
                             || row.window_key.is_empty()
@@ -4107,57 +4014,47 @@ impl RouteStateStore for SqliteRouteStateStore {
     }
 
     fn get_quota_readings(&self, account_key: &str) -> RouteStateResult<Vec<QuotaReadingLogRow>> {
-        self.store
-            .with_read(|connection: &Connection| {
-                let mut statement = connection.prepare(
-                    "SELECT account_key, window_key, observed_at, used_percent,
-                            raw_used_percent, resets_at, window_minutes,
-                            banked_credit_count, fetched_at, is_stale,
-                            stale_since, stale_class
-                     FROM quota_reading_log
-                     WHERE account_key = ?1
-                     ORDER BY window_key, observed_at",
-                )?;
-                let rows = statement
-                    .query_map([account_key], |row| {
-                        let is_stale = row.get::<_, i64>(9)? != 0;
-                        let stale = if is_stale {
-                            Some(QuotaStaleDisclosure {
-                                since: row.get(10)?,
-                                class: row.get(11)?,
-                            })
-                        } else {
-                            None
-                        };
-                        Ok(QuotaReadingLogRow {
-                            account_key: row.get(0)?,
-                            window_key: row.get(1)?,
-                            observed_at: row.get(2)?,
-                            used_percent: row.get(3)?,
-                            raw_used_percent: row.get(4)?,
-                            resets_at: row.get(5)?,
-                            window_minutes: row.get(6)?,
-                            banked_credit_count: row.get(7)?,
-                            fetched_at: row.get(8)?,
-                            stale,
+        let source = if self.history.is_some() {
+            "visible_quota_readings"
+        } else {
+            "quota_reading_log"
+        };
+        self.with_history_reader(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT * FROM {source} WHERE account_key = ?1 ORDER BY window_key, observed_at",
+            ))?;
+            let rows = statement
+                .query_map([account_key], |row| {
+                    let is_stale = row.get::<_, i64>(9)? != 0;
+                    let stale = if is_stale {
+                        Some(QuotaStaleDisclosure {
+                            since: row.get(10)?,
+                            class: row.get(11)?,
                         })
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            })
-            .map_err(err)
+                    } else {
+                        None
+                    };
+                    Ok(QuotaReadingLogRow {
+                        account_key: row.get(0)?,
+                        window_key: row.get(1)?,
+                        observed_at: row.get(2)?,
+                        used_percent: row.get(3)?,
+                        raw_used_percent: row.get(4)?,
+                        resets_at: row.get(5)?,
+                        window_minutes: row.get(6)?,
+                        banked_credit_count: row.get(7)?,
+                        fetched_at: row.get(8)?,
+                        stale,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .map_err(err)
     }
 
     fn prune_quota_readings(&self, now_ms: i64) -> RouteStateResult<usize> {
-        let cutoff = reading_log_retention_cutoff(now_ms);
-        self.store
-            .with_conn(|connection: &Connection| {
-                connection.execute(
-                    "DELETE FROM quota_reading_log WHERE observed_at < ?1",
-                    [cutoff],
-                )
-            })
-            .map_err(err)
+        self.prune_quota_reading_log(reading_log_retention_cutoff(now_ms), usize::MAX)
     }
 
     fn get_observed_speed(&self, route_key: &str, now: f64) -> RouteStateResult<Option<f64>> {

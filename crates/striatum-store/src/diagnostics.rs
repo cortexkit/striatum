@@ -182,29 +182,29 @@ impl SqliteRouteStateStore {
         &self,
         now_ms: i64,
     ) -> RouteStateResult<Vec<DiagnosticAccountHold>> {
-        self.store
-            .with_conn(|c: &Connection| {
-                let mut statement = c.prepare(
-                    "SELECT provider, account_id, credential_id, basis, reset_at, retry_after_s,
+        self.with_history_reader(|c| {
+            let source = crate::history::hold_source(c);
+            let mut statement = c.prepare(&format!(
+                "SELECT provider, account_id, credential_id, basis, reset_at, retry_after_s,
                             created_at
-                     FROM account_hold
+                     FROM {source}
                      WHERE created_at + retry_after_s * 1000 > ?1
                      ORDER BY created_at, decision_id",
-                )?;
-                let rows = statement.query_map(params![now_ms], |row| {
-                    Ok(DiagnosticAccountHold {
-                        provider: row.get(0)?,
-                        account_id: row.get(1)?,
-                        credential_id: row.get(2)?,
-                        basis: row.get(3)?,
-                        reset_at: row.get(4)?,
-                        retry_after_s: row.get(5)?,
-                        created_at: row.get(6)?,
-                    })
-                })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .map_err(err)
+            ))?;
+            let rows = statement.query_map(params![now_ms], |row| {
+                Ok(DiagnosticAccountHold {
+                    provider: row.get(0)?,
+                    account_id: row.get(1)?,
+                    credential_id: row.get(2)?,
+                    basis: row.get(3)?,
+                    reset_at: row.get(4)?,
+                    retry_after_s: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(err)
     }
 
     /// Every account pool block not yet cleared, oldest first. A block whose

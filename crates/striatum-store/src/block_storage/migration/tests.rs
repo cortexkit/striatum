@@ -51,7 +51,8 @@ fn registered_migration_opens_fresh_and_older_chains_without_leaving_its_functio
                 .collect::<Vec<_>>();
             crate::migrate_route_state(&store, &older).unwrap();
         }
-        let store = crate::SqliteRouteStateStore::open(&descriptor).unwrap();
+        let store =
+            crate::SqliteRouteStateStore::open_at_version_for_test(&descriptor, 96).unwrap();
         store.with_writer_for_test(|conn| {
             migration_function_is_absent(conn);
             assert_eq!(conn.query_row("SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('block','probe_authorization','success_proof','retirement_tombstone')",[],|row|row.get::<_,i64>(0))?,4);

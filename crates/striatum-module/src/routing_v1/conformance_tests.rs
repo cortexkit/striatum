@@ -2595,3 +2595,67 @@ pub(super) fn upgrade_harness(harness: Arc<Harness>) -> Arc<Harness> {
     state.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
     Arc::new(state)
 }
+
+#[tokio::test]
+async fn split_restart_replays_a_completed_admission_before_and_after_moving_history() {
+    use striatum_core::{route_state_store::QuotaReadingLogRow, RouteStateStore};
+    use striatum_store::{dev_descriptor, SqliteRouteStateStore};
+    let now = 1_800_000_000_000i64;
+    let _clock = crate::InjectedClock::set(now as u64);
+    let harness = Harness::new_at_version("split-replay", Some(96));
+    let request = json!({"provider":fixture::SUBSCRIPTION_PROVIDER,"model":"model-c",
+        "conversation_key":"split-conversation","admission_id":"split-admission"});
+    let expected = seed_062_admission(&harness, &request, true, now);
+    install_catalog(&harness, &fixture::catalog());
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    for (kind, id) in [
+        ("admission_started", "split-start"),
+        ("run_finished", "split-finish"),
+    ] {
+        let answer = runner.call("route.account_observe", &json!({"kind":kind,"event_id":id,"admission_id":"split-admission","run_id":"split-run"})).await;
+        assert_eq!(answer.0, FrameType::Response, "{}", answer.1);
+        assert_eq!(
+            answer.1["result"]["observation"]["bound"], true,
+            "{}",
+            answer.1
+        );
+    }
+    drop(runner);
+    let mut harness = Arc::try_unwrap(harness).ok().unwrap();
+    let descriptor = dev_descriptor(DEFAULT_MODULE_ID, harness.store_path().to_string_lossy());
+    let path = harness.store_path();
+    let placeholder = SqliteRouteStateStore::open(&dev_descriptor(
+        "split-placeholder",
+        harness.dir.join("placeholder/store.db").to_string_lossy(),
+    ))
+    .unwrap();
+    drop(std::mem::replace(&mut harness.store, Arc::new(placeholder)));
+    striatum_store::run_split_for_test(path.to_str().unwrap(), now);
+    harness.store = Arc::new(SqliteRouteStateStore::open(&descriptor).unwrap());
+    harness.route_epochs = tokio::sync::Mutex::new(RouteEpochs::new());
+    let harness = Arc::new(harness);
+    let runner = harness.bind(reserved(fixture::RUNNER_ONE), None).await;
+    let replay = runner.call("route.account_for", &request).await;
+    assert_eq!(replay.0, FrameType::Response, "{}", replay.1);
+    assert_eq!(replay.1, expected);
+    let reading = QuotaReadingLogRow {
+        account_key: "p/acct".into(),
+        window_key: "w".into(),
+        observed_at: now - 7_200_000,
+        used_percent: 10.0,
+        raw_used_percent: None,
+        resets_at: None,
+        window_minutes: None,
+        banked_credit_count: None,
+        fetched_at: None,
+        stale: None,
+    };
+    assert_eq!(
+        harness.store().append_quota_readings(&[reading]).unwrap(),
+        1
+    );
+    assert_eq!(harness.store().move_history_batch(now).unwrap(), 1);
+    let replay = runner.call("route.account_for", &request).await;
+    assert_eq!(replay.0, FrameType::Response, "{}", replay.1);
+    assert_eq!(replay.1, expected);
+}

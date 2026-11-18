@@ -818,6 +818,13 @@ async fn measure(fixture: RequestFixture, batches: usize) -> RequestFixture {
         outside_before,
         "the request mix wrote account state outside the writer"
     );
+    assert!(
+        harness
+            .store()
+            .history_tables_in_state_empty_for_test()
+            .unwrap(),
+        "the request mix wrote a history-assigned table in state"
+    );
     for (name, samples) in [
         "select",
         "account_for",

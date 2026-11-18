@@ -4644,3 +4644,69 @@ fn migration_83_preserves_unknown_classification_and_catalog_refreshes_all_varia
     let latest = SqliteRouteStateStore::latest_migration_version_for_test();
     assert!(error.to_string().contains(&latest.to_string()));
 }
+
+#[test]
+fn observed_speed_and_class_vector_match_unsplit_before_the_mover_and_after_restart() {
+    use striatum_core::usage_facts::SpeedSampleObservation;
+    let old_rig = Rig::new("observed-before-split");
+    let new_rig = Rig::new("observed-after-split");
+    let old = SqliteRouteStateStore::open_at_version_for_test(
+        &dev_descriptor("old", old_rig.db_path()),
+        96,
+    )
+    .unwrap();
+    let new = new_rig.open();
+    let now = 1_800_000_000_000.0;
+    for store in [&old, &new] {
+        assert!(store.get_class_vector("ephemeral", now).unwrap().is_none());
+        for index in 0..50 {
+            store
+                .record_usage_delivery(&class_obs(
+                    &format!("usage-{index}"),
+                    Some("ephemeral"),
+                    Some(100.0),
+                    Some(200.0),
+                    Some(80.0),
+                    Some(30.0),
+                    Some(50.0),
+                    None,
+                    now - 100.0,
+                ))
+                .unwrap();
+        }
+        for index in 0..5 {
+            let mut facts = striatum_core::usage_facts::NativeUsageFacts {
+                message_id: format!("speed-{index}"),
+                provider_id: "p".into(),
+                model_id: "m".into(),
+                output_tokens: 320.0,
+                created_ms: now - 2_100.0,
+                completed_ms: now - 100.0,
+                speed_sample: true,
+                ..Default::default()
+            };
+            facts.reasoning_tokens = Some(40.0);
+            let sample: SpeedSampleObservation =
+                striatum_core::usage_facts::build_speed_sample_observation(&facts, &[]).unwrap();
+            assert!(
+                store
+                    .record_speed_sample_delivery(&sample)
+                    .unwrap()
+                    .recorded
+            );
+        }
+    }
+    let vector = old.get_class_vector("ephemeral", now).unwrap().unwrap();
+    let speed = old.get_observed_speed("p/m", now).unwrap().unwrap();
+    let compare = |store: &SqliteRouteStateStore| {
+        assert_eq!(store.get_observed_speed("p/m", now).unwrap(), Some(speed));
+        assert_eq!(
+            serde_json::to_value(store.get_class_vector("ephemeral", now).unwrap().unwrap())
+                .unwrap(),
+            serde_json::to_value(&vector).unwrap()
+        );
+    };
+    compare(&new);
+    drop(new);
+    compare(&new_rig.open());
+}
