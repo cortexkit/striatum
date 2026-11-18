@@ -17,7 +17,6 @@ fn upsert_params(provider: &str, model: &str) -> ModelUpsertParams {
         cost_per_m_tok_out: None,
         supports_vision: None,
         supports_tool_use: None,
-        default_variant: None,
         notes: None,
     }
 }
@@ -105,19 +104,28 @@ fn model_upsert_refuses_operator_family_in_favor_of_catalog_lineage() {
     assert!(error.contains("Fusiform's model.lineage"));
 }
 
-#[test]
-fn model_upsert_default_variant_lands_in_prompt_defaults() {
-    let stored = fact("xai", "grok-z");
-    let mut params = upsert_params("xai", "grok-z");
-    params.default_variant = Some("xhigh".into());
-    let merged = merge_model_upsert(Some(stored), &params).unwrap();
-    assert_eq!(
-        merged
-            .prompt_defaults
-            .as_ref()
-            .and_then(|d| d.variant.as_deref()),
-        Some("xhigh")
+#[tokio::test]
+async fn model_upsert_refuses_default_variant_without_writing_a_row() {
+    let rig = Rig::new("route-model-upsert-effort-refusal");
+    let store = Arc::new(rig.open_store());
+    let response = run_route_wire_request(
+        &store,
+        json!({
+            "method": ROUTE_MODEL_UPSERT_OP,
+            "params": {"providerID":"xai", "modelID":"grok-z", "elo":1500, "eq":1000,
+                "defaultVariant":"xhigh"},
+        }),
+    )
+    .await;
+    assert_eq!(response.header.ty, FrameType::Error);
+    let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(body["code"], "invalid_request");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("defaultVariant") && message.contains("model catalog"),
+        "{body}"
     );
+    assert!(store.get_fact_by_route_key("xai/grok-z").unwrap().is_none());
 }
 
 #[test]

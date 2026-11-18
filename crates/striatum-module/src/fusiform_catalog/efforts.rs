@@ -18,7 +18,7 @@ pub(super) fn decode(
     row: &Value,
     mut offered: Option<Vec<String>>,
 ) -> Option<CatalogEfforts> {
-    // This filtered copy is the preview's own: a workload minimum can only be
+    // A workload minimum can only be
     // compared against efforts with a known rank. Live selection keeps checking
     // a pinned effort against the full published list, unknown names included.
     if let Some(list) = &mut offered {

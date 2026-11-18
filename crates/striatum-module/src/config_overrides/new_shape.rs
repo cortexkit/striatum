@@ -108,7 +108,7 @@ async fn panel_policy_memo_matches_uncached_verdicts() {
     assert_eq!(facts.len(), 800);
     let mut consumers: Vec<_> = crate::select_policy::Consumer::ALL
         .iter()
-        .filter_map(|consumer| crate::variant_policy::consumer_group(Some(*consumer)))
+        .map(|consumer| consumer.exclusion_group())
         .map(str::to_owned)
         .collect();
     consumers.extend(original.config.consumers.keys().cloned());
@@ -249,7 +249,6 @@ impl RoutingConfigFile {
         // Two spellings of one policy cannot be ordered without silently
         // discarding an operator's intent, even when their values happen to agree.
         let mut exclusion_groups = serde_json::Map::new();
-        let mut variants = serde_json::Map::new();
         let mut global = Vec::new();
         let mut subscription = Vec::new();
         let entities: Vec<(&str, &EntityPolicy)> = self
@@ -289,46 +288,13 @@ impl RoutingConfigFile {
             .sort_by_key(|key| (key.trim_start_matches('-').split('/').count(), key.clone()));
         exclusion_groups.insert("all".into(), serde_json::json!(global));
         for consumer in crate::select_policy::Consumer::ALL {
-            let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) else {
-                continue;
-            };
+            let id = consumer.exclusion_group();
             let exclusions = self.consumer_exclusions(consumer.id());
             exclusion_groups.insert(id.into(), serde_json::json!(exclusions));
-        }
-        for id in self.consumers.keys().filter(|id| !is_slot(id)) {
-            let policy = resolve_consumer_policy(
-                id,
-                &self.consumers,
-                &ConsumerPolicy::default(),
-                &BTreeMap::new(),
-            );
-            variants.insert(
-                id.clone(),
-                serde_json::json!(policy.variants.unwrap_or_default()),
-            );
         }
         self.model_routing.exclude =
             serde_json::from_value(serde_json::Value::Object(exclusion_groups))
                 .map_err(|error| error.to_string())?;
-        let mut groups = serde_json::Map::new();
-        for consumer in crate::select_policy::Consumer::ALL {
-            if let Some(id) = crate::variant_policy::consumer_group(Some(consumer)) {
-                let policy = resolve_consumer_policy(
-                    consumer.id(),
-                    &self.consumers,
-                    &ConsumerPolicy::default(),
-                    &BTreeMap::new(),
-                );
-                groups.insert(
-                    id.into(),
-                    serde_json::json!(policy.variants.unwrap_or_default()),
-                );
-            }
-        }
-        groups.insert("all".into(), serde_json::json!(self.default_variants));
-        groups.insert("consumers".into(), serde_json::Value::Object(variants));
-        self.model_routing.variants = serde_json::from_value(serde_json::Value::Object(groups))
-            .map_err(|error| error.to_string())?;
         let mut pins = serde_json::Map::new();
         for (name, policy) in &self.consumers {
             let other = striatum_core::module_identity::alternate(name);
@@ -337,19 +303,6 @@ impl RoutingConfigFile {
             }
             if name.is_empty() || name.chars().any(char::is_whitespace) {
                 return Err(format!("consumer id {name:?} must be one non-empty word"));
-            }
-            for (key, variant) in policy.variants.iter().flatten() {
-                if striatum_core::provider_model_spec::parse_spec(key)
-                    .is_none_or(|spec| spec.negated)
-                    || key.trim() != key
-                {
-                    return Err(format!("consumers.{name}.variants: key {key:?} must be provider, provider/model or provider/model/variant"));
-                }
-                if variant.is_empty() || variant.chars().any(char::is_whitespace) {
-                    return Err(format!(
-                        "consumers.{name}.variants: variant must be one non-empty word"
-                    ));
-                }
             }
             for pin in policy.ladder.iter().flatten() {
                 if cortexkit_role_routing::select::RouteRef::parse_pin(pin).is_none() {

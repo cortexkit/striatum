@@ -276,6 +276,7 @@ pub struct CatalogFactsSnapshot {
     pub generation: CatalogFingerprintKey,
     pub facts: Vec<ModelFact>,
     pub providers: BTreeSet<String>,
+    pub efforts: Arc<BTreeMap<String, crate::CatalogEfforts>>,
 }
 
 pub(super) fn next_catalog_cache_identity() -> u64 {
@@ -356,8 +357,12 @@ pub(super) fn row_to_fact(row: &Row<'_>) -> rusqlite::Result<ModelFact> {
     let scores_json: String = row.get("scores_json")?;
     let scores = stored_scores(&scores_json);
     let prompt_defaults_json: Option<String> = row.get("prompt_defaults_json")?;
-    let prompt_defaults: Option<ModelPromptDefaults> =
-        prompt_defaults_json.and_then(|s| serde_json::from_str(&s).ok());
+    let prompt_defaults = prompt_defaults_json
+        .and_then(|s| serde_json::from_str::<ModelPromptDefaults>(&s).ok())
+        .map(|mut defaults| {
+            defaults.variant = None;
+            defaults
+        });
     let confidence = match row.get::<_, String>("confidence")?.as_str() {
         "unknown" => Confidence::Unknown,
         _ => Confidence::Curated,
@@ -465,7 +470,7 @@ impl SqliteRouteStateStore {
         {
             return Ok(Arc::clone(snapshot));
         }
-        let rows = self
+        let (rows, efforts) = self
             .store
             .with_read(|connection| {
                 // A pooled reader arrives inside its own read transaction. The
@@ -477,14 +482,16 @@ impl SqliteRouteStateStore {
                     None
                 };
                 let rows = self.load_resolved_facts(connection)?;
+                let efforts = crate::catalog_efforts::read(connection)?;
                 if let Some(tx) = tx {
                     crate::connection_store::timed_commit(tx)?;
                 }
-                Ok(rows)
+                Ok((rows, efforts))
             })
             .map_err(err)?;
         let snapshot = Arc::new(CatalogFactsSnapshot {
             generation,
+            efforts: Arc::new(efforts),
             providers: rows
                 .iter()
                 .map(|(fact, _)| fact.provider_id.clone())
@@ -517,7 +524,7 @@ impl SqliteRouteStateStore {
     /// need uncommitted-transaction visibility must stay on this writer path;
     /// selection uses the reader-backed path instead.
     pub fn get_facts_with_generation(&self) -> RouteStateResult<CatalogFactsSnapshot> {
-        let (generation, facts) = self.read_resolved_facts()?;
+        let (generation, facts, efforts) = self.read_resolved_facts()?;
         let generation = generation.ok_or_else(|| err("catalog generation unavailable"))?;
         let providers = facts
             .iter()
@@ -526,6 +533,7 @@ impl SqliteRouteStateStore {
         Ok(CatalogFactsSnapshot {
             generation,
             providers,
+            efforts,
             facts: facts
                 .into_iter()
                 .filter_map(|(fact, present)| present.then_some(fact))
@@ -748,12 +756,16 @@ impl SqliteRouteStateStore {
     /// still NULL (an older row before its first full sync), or when `source` is
     /// an operator `override`. The bool carries that final routing decision.
     pub(super) fn read_resolved_fact_rows(&self) -> RouteStateResult<Vec<(ModelFact, bool)>> {
-        self.read_resolved_facts().map(|(_, facts)| facts)
+        self.read_resolved_facts().map(|(_, facts, _)| facts)
     }
 
-    fn read_resolved_facts(
+    pub(super) fn read_resolved_facts(
         &self,
-    ) -> RouteStateResult<(Option<CatalogFingerprintKey>, Vec<(ModelFact, bool)>)> {
+    ) -> RouteStateResult<(
+        Option<CatalogFingerprintKey>,
+        Vec<(ModelFact, bool)>,
+        Arc<BTreeMap<String, crate::CatalogEfforts>>,
+    )> {
         self.store
             .with_conn(|c: &Connection| {
                 loop {
@@ -774,13 +786,13 @@ impl SqliteRouteStateStore {
                             .resolved_facts
                             .lock()
                             .unwrap_or_else(|p| p.into_inner());
-                        if let Some((_, facts)) =
-                            cache.as_ref().filter(|(cached, _)| Some(*cached) == key)
+                        if let Some((_, facts, efforts)) =
+                            cache.as_ref().filter(|(cached, _, _)| Some(*cached) == key)
                         {
                             let mut generation = key.unwrap();
                             generation.store_identity =
                                 self.catalog_cache_identity.load(Ordering::Relaxed);
-                            return Ok((Some(generation), facts.clone()));
+                            return Ok((Some(generation), facts.clone(), Arc::clone(efforts)));
                         }
                     }
                     // Keep catalog rows and their operator-grade overlay in one SQLite
@@ -791,6 +803,7 @@ impl SqliteRouteStateStore {
                         None
                     };
                     let facts = self.load_resolved_facts(c)?;
+                    let efforts = Arc::new(crate::catalog_efforts::read(c)?);
                     if let Some(tx) = tx {
                         crate::connection_store::timed_commit(tx)?;
                     }
@@ -801,7 +814,8 @@ impl SqliteRouteStateStore {
                         *self
                             .resolved_facts
                             .lock()
-                            .unwrap_or_else(|p| p.into_inner()) = Some((key, facts.clone()));
+                            .unwrap_or_else(|p| p.into_inner()) =
+                            Some((key, facts.clone(), Arc::clone(&efforts)));
                     }
                     let generation = key.map(|mut key| {
                         key.store_identity = if cacheable {
@@ -811,7 +825,7 @@ impl SqliteRouteStateStore {
                         };
                         key
                     });
-                    return Ok((generation, facts));
+                    return Ok((generation, facts, efforts));
                 }
             })
             .map_err(err)
@@ -1401,7 +1415,11 @@ impl crate::AccountTx<'_> {
         let prompt_defaults_json = fact
             .prompt_defaults
             .as_ref()
-            .map(serde_json::to_string)
+            .map(|defaults| {
+                let mut defaults = defaults.clone();
+                defaults.variant = None;
+                serde_json::to_string(&defaults)
+            })
             .transpose()
             .map_err(err)?;
         let (aa_index, review_by_ms, eq_source) = if source == FactSource::AaInferred {

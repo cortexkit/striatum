@@ -79,6 +79,15 @@ mod class_panel_policy {
             crate::test_config::write(&self.path, config.to_string()).unwrap();
             set_config_mtime(&self.path, mtime);
         }
+
+        fn efforts(&self, route: &str, graded: &str, workloads: &[(&str, &str)]) {
+            use crate::routing_v1::effort_preview::{seed_for_test, test_graded};
+            let mut facts = test_graded(graded, &["low", "medium", "high", "xhigh", "max"]);
+            for (workload, effort) in workloads {
+                facts.workloads.entry((*workload).into()).or_default().default = Some((*effort).into());
+            }
+            seed_for_test(self._rig.dir.join("store.db"), route, facts);
+        }
     }
 
     fn routes(reply: &serde_json::Value) -> Vec<&str> {
@@ -157,11 +166,11 @@ mod class_panel_policy {
         let config = json!({"model_routing": {"variants": {
             "athena": {"openai/gpt-6-astra": "xhigh", "anthropic/a": "high"}
         }}});
-        // The golden keeps its original policy document. Serve the same rules
-        // from the current consumer key without rewriting the archived bytes.
-        let rig = PanelRig::new(json!({"consumers":{"prefrontal-core.athena":{
-            "variants":config["model_routing"]["variants"]["athena"]
-        }}}));
+        // Keep the archived policy as input provenance. Supply its efforts from
+        // catalog rows when replaying against today's selection pipeline.
+        let rig = PanelRig::new(json!({"consumers":{"prefrontal-core.athena":{"workload":"reason"}}}));
+        rig.efforts("openai/gpt-6-astra", "xhigh", &[("reason", "xhigh")]);
+        rig.efforts("anthropic/a", "high", &[("reason", "high")]);
         let mut panels = Vec::new();
         for (name, class) in [("Athena audit", "AUDIT"), ("Spec round zero", "SPEC")] {
             let mut request = rig.params(class);
@@ -203,15 +212,18 @@ mod class_panel_policy {
         }
     }
 
-    /// Athena and lab panels read their canonical consumers' variants for every
+    /// Athena and lab panels read their canonical consumers' workloads for every
     /// seat, including the extra draw, and record each rule in `seatedVariants`.
     #[tokio::test]
-    async fn panel_seats_run_their_class_consumers_variants_including_the_extra_draw() {
-        let rig = PanelRig::new(json!({"variants":{"anthropic":"low"}, "consumers":{
-            "prefrontal-core.athena":{"variants":{"openai/gpt-6-astra":"xhigh","anthropic/a":"high"}},
-            "prefrontal-core.lab":{"variants":{"openai/gpt-6-astra":"medium"}},
-            "prefrontal-core.mason":{"variants":{"openai/gpt-6-astra":"max","anthropic/a":"max"}}
+    async fn panel_seats_run_their_class_workload_efforts_including_the_extra_draw() {
+        let rig = PanelRig::new(json!({"consumers":{
+            "prefrontal-core.athena":{"workload":"reason"},
+            "prefrontal-core.lab":{"workload":"quick"},
+            "prefrontal-core.mason":{"workload":"code"}
         }}));
+        rig.efforts("openai/gpt-6-astra", "xhigh", &[("reason", "xhigh"), ("quick", "medium"), ("code", "max")]);
+        rig.efforts("anthropic/a", "low", &[("reason", "high"), ("code", "max")]);
+        rig.efforts("anthropic/b", "low", &[]);
         let audit = rig.select(rig.params("AUDIT")).await;
         assert_eq!(
             routes(&audit),
@@ -222,9 +234,9 @@ mod class_panel_policy {
         assert_eq!(policy["seats"][2]["reason"], "extra", "{policy}");
         let members = audit["result"]["members"].as_array().unwrap();
         for (slot, variant, source) in [
-            (0, Some("xhigh"), "consumer"),
-            (1, None, "curated"),
-            (2, Some("high"), "consumer"),
+            (0, Some("xhigh"), Some("workload_default")),
+            (1, None, None),
+            (2, Some("high"), Some("workload_default")),
         ] {
             assert_eq!(
                 members[slot]["promptParams"]["variant"].as_str(),
@@ -234,7 +246,7 @@ mod class_panel_policy {
             let seated = &policy["seatedVariants"][slot];
             assert_eq!(seated["slot"], slot);
             assert_eq!(seated["reasoningVariant"].as_str(), variant, "{seated}");
-            assert_eq!(seated["reasoningVariantSource"], source, "{seated}");
+            assert_eq!(seated["reasoningVariantSource"].as_str(), source, "{seated}");
         }
         // The recorded panel decision carries the same per-seat record.
         let decisions = rig.store.get_decisions_for_task("audit-consult").unwrap();

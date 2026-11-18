@@ -206,13 +206,6 @@ fn expand_variants(
             ))
         })
         .collect();
-    variants.extend(facts.iter().filter_map(|fact| {
-        Some((
-            fact.provider_id.clone(),
-            fact.model_id.clone(),
-            Some(fact.prompt_defaults.as_ref()?.variant.clone()?),
-        ))
-    }));
     for ((provider, model), _) in &templates {
         if let Some(PublishedEfforts::Published(efforts)) =
             crate::variant_policy::published(catalog, aliases, provider, model)

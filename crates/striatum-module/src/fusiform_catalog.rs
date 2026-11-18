@@ -8,7 +8,7 @@
 //! | field group | default authority | operator override |
 //! | --- | --- | --- |
 //! | vision, tool use, context/output limits, rates/output tier | Fusiform | an explicit override of that same field wins |
-//! | published reasoning efforts (`capability.reasoning_options`) | Fusiform | none; the operator's `model_routing.variants` must name one of them |
+//! | published reasoning efforts (`capability.reasoning_options`) | Fusiform | none; an explicit pin must name one of them |
 //! | Elo, EQ | operator | live Elo overrides win, then Fusiform operator grades, then stored placements |
 //! | speed, variants, exclusions, multipliers, prompt defaults | operator | always retained; Fusiform cannot represent them |
 //!

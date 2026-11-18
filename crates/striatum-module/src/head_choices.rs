@@ -130,16 +130,16 @@ pub(crate) fn choices_for_harness(
     module: &str,
     harness: Option<&str>,
 ) -> Result<serde_json::Value, ErrorBody> {
-    choices_for_harness_preview(store, config, credentials, module, harness, None)
+    choices_for_harness_with_effort_detail(store, config, credentials, module, harness, false)
 }
 
-pub(crate) fn choices_for_harness_preview(
+pub(crate) fn choices_for_harness_with_effort_detail(
     store: &SqliteRouteStateStore,
     config: &config_overrides::LiveConfig,
     credentials: &BrocaCredentials,
     module: &str,
     harness: Option<&str>,
-    preview: Option<&routing_v1::effort_preview::Preview>,
+    effort_detail: bool,
 ) -> Result<serde_json::Value, ErrorBody> {
     if credentials.listing_version().is_none() {
         return Err(not_ready());
@@ -150,7 +150,12 @@ pub(crate) fn choices_for_harness_preview(
         .ok_or_else(not_ready)?;
     let (catalog_version, _) = snapshot.provider_index();
     let catalog_version = catalog_version.to_string();
-    let mut facts = store.get_facts().map_err(store_error)?;
+    let serving_catalog = store.get_selection_catalog().map_err(store_error)?;
+    let efforts = routing_v1::effort_preview::Efforts {
+        models: serving_catalog.efforts.clone(),
+        workloads: Default::default(),
+    };
+    let mut facts = serving_catalog.facts.clone();
     let aliases = credentials.catalog_targets(&facts);
     striatum_core::score_alias::append_alias_rows(&mut facts, &aliases);
     config.apply(&mut facts);
@@ -250,33 +255,9 @@ pub(crate) fn choices_for_harness_preview(
             Some(PublishedEfforts::Published(values)) => values.clone(),
             _ => rows.iter().filter_map(|row| row.variant.clone()).collect(),
         };
-        let curated = fact
-            .prompt_defaults
-            .as_ref()
-            .and_then(|defaults| defaults.variant.as_deref())
-            .or(fact.variant.as_deref());
-        let catalog_choice = preview.map(|preview| {
-            preview.head_default(fact, &aliases, |variant| allowed(Some(variant), true))
-        });
-        let default_variant = if let Some(choice) = &catalog_choice {
-            choice.variant.clone()
-        } else {
-            variant_policy::resolve(
-                config.variant_groups(),
-                &aliases,
-                Some(&reasoning),
-                &variant_policy::VariantRequest {
-                    route_key: &striatum_core::fact_to_route(fact).route_key,
-                    provider_id: provider,
-                    model_id: model,
-                    explicit: None,
-                    curated,
-                    consumer: Some("head"),
-                },
-            )
-            .variant
-            .filter(|variant| allowed(Some(variant), true))
-        };
+        let catalog_choice =
+            efforts.head_default(fact, &aliases, |variant| allowed(Some(variant), true));
+        let default_variant = catalog_choice.variant.clone();
         if !matches!(published, Some(PublishedEfforts::Published(_))) {
             variants.extend(default_variant.iter().cloned());
         }
@@ -333,7 +314,7 @@ pub(crate) fn choices_for_harness_preview(
             default_variant,
             service_tiers,
         });
-        if let Some(catalog_choice) = &catalog_choice {
+        if effort_detail {
             catalog_choice.append_to(&mut choice);
         }
         models.push(choice);

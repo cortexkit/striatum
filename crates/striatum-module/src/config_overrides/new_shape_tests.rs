@@ -134,7 +134,7 @@ fn dotted_consumer_settings_keep_the_existing_operator_ancestor_walk() {
     let config = config(json!({"consumers": {
         "athena": {
             "iq": 41, "eq": 52, "service_tier": "fast",
-            "variants": {"p/model": "high"}, "pin": {"model": "p/model"},
+            "workload": "reason", "pin": {"model": "p/model"},
             "projects": {"project": {"pin": "p/project"}}
         },
         "athena.gather": {"iq": 31}
@@ -144,26 +144,12 @@ fn dotted_consumer_settings_keep_the_existing_operator_ancestor_walk() {
         assert_eq!(policy.iq, Some(31.0));
         assert_eq!(policy.eq, Some(52.0));
         assert_eq!(policy.ladder, Some(vec!["p/model".into()]));
-        assert_eq!(policy.variants.as_ref().unwrap()["p/model"], "high");
+        assert_eq!(config.consumer_workload(consumer), Some("reason"));
         assert_eq!(config.project_pin("project", consumer), Some("p/project"));
         assert_eq!(
             config.service_tier(consumer, "p", "model"),
             Some(cortexkit_role_routing::service_tier::ServiceTier::Fast)
         );
-        let choice = crate::variant_policy::resolve(
-            config.variant_groups(),
-            &BTreeMap::new(),
-            None,
-            &crate::variant_policy::VariantRequest {
-                route_key: "p/model",
-                provider_id: "p",
-                model_id: "model",
-                explicit: None,
-                curated: Some("low"),
-                consumer: Some(consumer),
-            },
-        );
-        assert_eq!(choice.variant.as_deref(), Some("high"));
     }
 }
 
@@ -222,75 +208,6 @@ fn absent_model_config_is_dormant_and_reported_without_creating_candidates() {
     assert_eq!(warmed.unknown_keys, ["p/policy-only"]);
     assert_eq!(warmed.applied, 1);
     assert_eq!((facts[0].scores.elo, facts[0].scores.eq), (1500.0, 1500.0));
-}
-
-#[test]
-fn nonlegacy_consumer_variants_are_materialized_with_dotted_inheritance() {
-    let config = config(json!({
-        "variants": {"p/model": "low"},
-        "consumers": {
-            "mc_summary": {"variants": {"p/model": "high"}},
-            "mc_summary.child": {}
-        }
-    }));
-    let groups = serde_json::to_value(config.variant_groups()).unwrap();
-    assert_eq!(groups["consumers"]["mc_summary"]["p/model"], "high");
-    assert_eq!(groups["consumers"]["mc_summary.child"]["p/model"], "high");
-}
-
-#[test]
-fn a_consumer_named_all_does_not_replace_top_level_variants() {
-    let config = config(json!({
-        "variants": {"p/model": "low"},
-        "consumers": {"all": {"variants": {"p/model": "high"}}}
-    }));
-    let request = crate::variant_policy::VariantRequest {
-        route_key: "p/model",
-        provider_id: "p",
-        model_id: "model",
-        explicit: None,
-        curated: None,
-        consumer: Some("all"),
-    };
-    let choice =
-        crate::variant_policy::resolve(config.variant_groups(), &BTreeMap::new(), None, &request);
-    assert_eq!(choice.variant.as_deref(), Some("high"));
-    let other = crate::variant_policy::VariantRequest {
-        consumer: Some("other"),
-        ..request
-    };
-    let choice =
-        crate::variant_policy::resolve(config.variant_groups(), &BTreeMap::new(), None, &other);
-    assert_eq!(choice.variant.as_deref(), Some("low"));
-}
-
-#[test]
-fn converter_omits_empty_variants_but_keeps_consumer_registration() {
-    for variants in [json!({}), json!({"all": {}, "mason": {"p/model": "high"}})] {
-        let converted = crate::config_convert::convert_value(json!({"model_routing": {
-            "consumers": ["mason", "mc_summary"], "variants": variants
-        }}))
-        .unwrap();
-        let consumers = converted["consumers"].as_object().unwrap();
-        assert!(consumers.contains_key("mc_summary"));
-        for (name, consumer) in consumers {
-            if let Some(variants) = consumer.get("variants") {
-                assert!(
-                    !variants.as_object().unwrap().is_empty(),
-                    "{name}: {consumer}"
-                );
-            }
-        }
-    }
-    let converted = crate::config_convert::convert_value(json!({"consumers": {
-        "mc_summary": {"variants": {}}, "mason": {"variants": {"p/model": "high"}}
-    }}))
-    .unwrap();
-    assert_eq!(converted["consumers"]["mc_summary"], json!({}));
-    assert_eq!(
-        converted["consumers"]["mason"]["variants"],
-        json!({"p/model": "high"})
-    );
 }
 
 #[test]
@@ -376,16 +293,11 @@ fn conversion_round_trip_keeps_every_policy_and_materializes_data_defaults() {
         "consumers": ["mc.dream.curate", "mason", "codemode"],
         "exclude": {"all": ["p", "-p/open"], "mason": ["p/blocked"]},
         "subscription": ["fireworks-ai", "-fireworks-ai/metered"],
-        "variants": {"mason": {"p/model": "high"}},
         "pins": {"synthesizer": {"model": "p/model", "variant": "high"}, "lab_planner": {"model": "p/model"}, "spec_designer": {"model": "p/model", "variant": "medium"}},
         "project_pins": {"project": {"mason": "p/model:low"}},
         "score_alias": {"alias": "p"}
     }, "account_selection": {"enabled": false}});
     let converted = crate::config_convert::convert_value(old).unwrap();
-    assert_eq!(
-        converted["consumers"]["mason"]["variants"]["p/model"],
-        "high"
-    );
     assert_eq!(
         converted["consumers"]["mason"]["projects"]["project"]["pin"],
         "p/model:low"
@@ -795,13 +707,14 @@ fn module_consumer_policy_inherits_without_legacy_aliases() {
     let config = config(json!({"consumers": {
         "prefrontal-core.sidekick": {
             "iq":71, "eq":52, "below_bar":"refuse", "service_tier":"fast",
-            "variants":{"p/model":"high"}, "pin":{"model":"p/model"},
+            "workload":"lookup", "pin":{"model":"p/model"},
             "projects":{"project":{"pin":"p/project"}}
         },
         "magic-context.dream": {"iq":71},
         "magic-context.dream.map-memories": {"iq":31}
     }, "providers":{"p":{"only_for":["prefrontal-core.sidekick"]}}}));
     let consumer = "prefrontal-core.sidekick.explore";
+    assert_eq!(config.consumer_workload(consumer), Some("lookup"));
     let policy = config.consumer_policy(consumer, &Default::default(), &BTreeMap::new());
     assert_eq!(policy.iq, Some(71.0));
     assert_eq!(policy.eq, Some(52.0));
@@ -810,7 +723,6 @@ fn module_consumer_policy_inherits_without_legacy_aliases() {
         Some(crate::config_policy::BelowBarPolicy::Refuse)
     );
     assert_eq!(policy.ladder, Some(vec!["p/model".into()]));
-    assert_eq!(policy.variants.unwrap()["p/model"], "high");
     assert_eq!(config.project_pin("project", consumer), Some("p/project"));
     assert_eq!(
         config.service_tier(consumer, "p", "model"),

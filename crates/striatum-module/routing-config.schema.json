@@ -156,13 +156,6 @@
         "format": "double"
       },
       "writeOnly": true
-    },
-    "variants": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "string"
-      },
-      "default": {}
     }
   },
   "additionalProperties": false,
@@ -476,16 +469,6 @@
           "items": {
             "type": "string"
           }
-        },
-        "variants": {
-          "type": [
-            "object",
-            "null"
-          ],
-          "additionalProperties": {
-            "type": "string"
-          },
-          "default": null
         },
         "workload": {
           "type": [

@@ -326,7 +326,7 @@ const MIGRATION_068: &str = include_str!("../migrations/068_account_demand_by_ac
 const MIGRATION_069: &str = include_str!("../migrations/069_task_workload.sql");
 const MIGRATION_071: &str = include_str!("../migrations/071_service_tiers.sql");
 
-fn route_state_migrations() -> [Migration; 98] {
+fn route_state_migrations() -> [Migration; 99] {
     [
         Migration {
             version: 1,
@@ -717,6 +717,10 @@ fn route_state_migrations() -> [Migration; 98] {
             version: 99,
             statements: include_str!("../migrations/099_catalog_efforts.sql"),
         },
+        Migration {
+            version: 100,
+            statements: include_str!("../migrations/100_clear_curated_efforts.sql"),
+        },
     ]
 }
 
@@ -866,7 +870,13 @@ pub struct SqliteRouteStateStore {
     catalog_fingerprint: Mutex<Option<CachedCatalogFingerprint>>,
     /// Resolved capabilities and operator grades share the catalog fingerprint's
     /// write tracking. Unrelated writes on this connection do not invalidate it.
-    resolved_facts: Mutex<Option<(CatalogFingerprintKey, Vec<(ModelFact, bool)>)>>,
+    resolved_facts: Mutex<
+        Option<(
+            CatalogFingerprintKey,
+            Vec<(ModelFact, bool)>,
+            Arc<BTreeMap<String, CatalogEfforts>>,
+        )>,
+    >,
     selection_catalog: Mutex<Option<Arc<CatalogFactsSnapshot>>>,
     /// Inventory metadata shares the catalog-change key and keeps withdrawn
     /// rows, but does not apply operator grades used only for selection.

@@ -67,7 +67,6 @@ pub(super) async fn select_panel(
             accounts: &accounts,
             inputs: &inputs,
             profile_lookup: &super::select::live_profile_lookup,
-            catalog_efforts: None,
         };
         let evaluated = evaluate_panel(&request, policy, caller, deps, &dry).await?;
         let seats = evaluated
@@ -162,7 +161,6 @@ pub(super) struct DryRun<'a> {
     pub accounts: &'a crate::account_selection::Sweep,
     pub inputs: &'a super::select::RequestInputs,
     pub profile_lookup: &'a super::select::ProfileLookup,
-    pub catalog_efforts: Option<&'a super::effort_preview::Preview>,
 }
 
 /// A seat a dry-run panel would fill. No decision backs it.
@@ -285,9 +283,7 @@ async fn seat_panel(
                     deps,
                     dry,
                     &shared,
-                    catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.choices.get(&member.route_key)),
+                    catalog.choices.get(&member.route_key),
                 )
                 .await?
                 .map(Seat::Evaluated)
@@ -363,9 +359,7 @@ async fn seat_panel(
                     deps,
                     dry,
                     &shared,
-                    catalog
-                        .as_ref()
-                        .and_then(|catalog| catalog.choices.get(&member.route_key)),
+                    catalog.choices.get(&member.route_key),
                 )
                 .await?
                 .map(Seat::Evaluated),
@@ -396,12 +390,7 @@ async fn seat_panel(
             rejected,
         )
     });
-    Ok((
-        panel,
-        seats,
-        shortfall,
-        catalog.map(|catalog| catalog.diagnostics),
-    ))
+    Ok((panel, seats, shortfall, Some(catalog.diagnostics)))
 }
 
 fn concurrency_rejection(cause: &PanelRejectedCandidate) -> bool {
@@ -499,9 +488,11 @@ fn seat_select(
     let mut select = serde_json::to_value(request.seat_request(&[])).map_err(store_refusal)?;
     let mut route = cortexkit_role_routing::select::RouteRef::parse_pin(&member.route_key)
         .ok_or_else(|| store_refusal("scorer returned an invalid route"))?;
-    if let Some(variant) = member.prompt_params.get("variant").and_then(Value::as_str) {
-        route.variant = Some(variant.to_owned());
-    }
+    route.variant = member
+        .prompt_params
+        .get("variant")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     select["pin"] = json!(route.pin());
     // Panel policy, not the consumer's ordinary single-model quality defaults,
     // has already ranked and admitted this candidate.
@@ -589,13 +580,7 @@ async fn evaluate_seat(
     shared: &super::select::RequestInputs,
     catalog_choice: Option<&super::effort_preview::Choice>,
 ) -> Result<SeatAdmission<EvaluatedSeat>, Refusal> {
-    let (mut select, mut route) = seat_select(request, member)?;
-    // Admission uses a pin to check the exact scored seat, but the preview
-    // reports why the automatic panel scorer chose that effort.
-    if let Some(choice) = catalog_choice {
-        route.variant = choice.variant.clone();
-        select["pin"] = json!(route.pin());
-    }
+    let (select, route) = seat_select(request, member)?;
     // The seat request's requirements are the inert `iq: 0`; the evaluation's
     // demand must match it, as the live seat check reads it from the request.
     let view = super::select::Evaluation {
@@ -606,7 +591,6 @@ async fn evaluate_seat(
         iq: 0.0,
         eq: None,
         evidence: Mutex::new(Default::default()),
-        catalog_efforts: dry.catalog_efforts,
         effort_diagnostics: Mutex::new(Default::default()),
     };
     let evaluated = super::select::evaluate_with_inputs(
@@ -771,7 +755,7 @@ async fn candidates(
         bool,
         Vec<PanelRejectedCandidate>,
         HashMap<String, String>,
-        Option<CatalogSeats>,
+        CatalogSeats,
     ),
     Refusal,
 > {
@@ -1004,7 +988,8 @@ async fn candidates(
         .map(|fact| (fact_to_route(fact).capacity_key, fact.family.clone()))
         .collect();
     let outcome = live.apply(&mut facts);
-    let catalog = dry.and_then(|dry| dry.catalog_efforts).map(|preview| {
+    let catalog = {
+        let preview = &shared.efforts;
         let workload = preview.workload(&request.consumer, config);
         let mut catalog = CatalogSeats::default();
         facts.retain_mut(|fact| {
@@ -1038,7 +1023,7 @@ async fn candidates(
             }
         });
         catalog
-    });
+    };
     // Panel ranking can reject an account-blocked route before the final account
     // admission check. Status-check hints must also respect the route's own
     // cooldown, quota and backoff limits, panel exclusions, the quality floor and
@@ -1151,23 +1136,18 @@ async fn candidates(
         .shortfall
         .as_ref()
         .is_some_and(|s| s.code == scoring::PanelShortfallCode::PackageUnmeetable);
-    let models: HashMap<_, _> = prepared_models(&panel);
-    let variant_consumer = crate::select_policy::Consumer::from_id(&request.consumer).unwrap_or(
-        if class == scoring::PanelClass::Lab {
-            crate::select_policy::Consumer::Lab
-        } else {
-            crate::select_policy::Consumer::Athena
-        },
-    );
-    if catalog.is_none() {
-        crate::select::apply_panel_variant_policy(
-            &mut panel,
-            &config,
-            deps.operator_config_path,
-            &aliases,
-            variant_consumer,
-            &models,
-        );
+    // Admission pins the exact served effort, while the route key still
+    // identifies the catalog row used for ranking and capacity.
+    let apply = |key: &str, params: &mut serde_json::Map<String, Value>| {
+        if let Some(choice) = catalog.choices.get(key) {
+            choice.apply_prompt_map(params);
+        }
+    };
+    for member in &mut panel.members {
+        apply(&member.route_key, &mut member.prompt_params);
+    }
+    for spare in &mut panel.runner_up {
+        apply(&spare.route_key, &mut spare.prompt_params);
     }
     rejected.extend(panel.rejected_causes.iter().map(|cause| {
         let reason = serde_json::to_value(cause.reason).expect("panel reason is JSON");
@@ -1242,18 +1222,6 @@ fn package_fit(tokens: u64, fact: &striatum_core::ModelFact) -> PanelPackageFit 
             .min(PACKAGE_OUTPUT_RESERVE_TOKENS),
         SEAT_PROMPT_RESERVE_TOKENS,
     )
-}
-
-fn prepared_models(panel: &scoring::SelectedPanel) -> HashMap<String, (String, String)> {
-    panel
-        .members
-        .iter()
-        .filter_map(|m| {
-            m.route_key.split_once('/').map(|(provider, model)| {
-                (m.route_key.clone(), (provider.to_owned(), model.to_owned()))
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

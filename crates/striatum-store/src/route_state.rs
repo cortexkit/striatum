@@ -762,7 +762,12 @@ impl RouteStateStore for SqliteRouteStateStore {
         now: f64,
         pricing: &striatum_core::RoutePricing,
     ) -> RouteStateResult<Vec<ModelFact>> {
-        self.overlay_observed_speed(self.get_facts()?, now, pricing)
+        let (_, facts, efforts) = self.read_resolved_facts()?;
+        let facts = facts
+            .into_iter()
+            .filter_map(|(fact, present)| present.then_some(fact))
+            .collect();
+        self.overlay_observed_speed(facts, &efforts, now, pricing)
     }
 
     fn build_snapshot(&self, now: f64) -> RouteStateResult<ModelRouteStateSnapshot> {

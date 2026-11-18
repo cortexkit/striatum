@@ -62,33 +62,31 @@ pub struct CatalogWorkload {
 }
 
 impl SqliteRouteStateStore {
-    /// Only catalog previews read these facts; the live facts snapshot never
-    /// loads or fingerprints them.
     pub fn catalog_efforts(&self) -> RouteStateResult<BTreeMap<String, CatalogEfforts>> {
-        self.store
-            .with_conn(|conn: &Connection| {
-                let mut stmt = conn.prepare(
-                    "SELECT DISTINCT provider_id, model_id, catalog_efforts_json FROM model_facts
-                     WHERE fusiform_present = 1 AND catalog_efforts_json IS NOT NULL",
-                )?;
-                let mut rows = stmt.query([])?;
-                let mut efforts = BTreeMap::new();
-                while let Some(row) = rows.next()? {
-                    let provider: String = row.get(0)?;
-                    let model: String = row.get(1)?;
-                    let key = striatum_core::make_route_key(&provider, &model, None);
-                    let encoded: String = row.get(2)?;
-                    let decoded = serde_json::from_str(&encoded).map_err(|error| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(error),
-                        )
-                    })?;
-                    efforts.insert(key, decoded);
-                }
-                Ok(efforts)
-            })
-            .map_err(err)
+        self.store.with_read(read).map_err(err)
     }
+}
+
+pub(super) fn read(conn: &Connection) -> rusqlite::Result<BTreeMap<String, CatalogEfforts>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT provider_id, model_id, catalog_efforts_json FROM model_facts
+         WHERE fusiform_present = 1 AND catalog_efforts_json IS NOT NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut efforts = BTreeMap::new();
+    while let Some(row) = rows.next()? {
+        let provider: String = row.get(0)?;
+        let model: String = row.get(1)?;
+        let key = striatum_core::make_route_key(&provider, &model, None);
+        let encoded: String = row.get(2)?;
+        let decoded = serde_json::from_str(&encoded).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+        efforts.insert(key, decoded);
+    }
+    Ok(efforts)
 }

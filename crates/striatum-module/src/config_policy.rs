@@ -47,94 +47,6 @@ pub struct ExcludeGroups {
     pub flow: Vec<String>,
 }
 
-/// Per-consumer reasoning-variant overrides, grouped like `model_routing.exclude`.
-/// Each key is a route spec in the exclusion grammar without negation
-/// (`provider`, `provider/model`, `provider/model/variant`); each value is a
-/// variant name the catalog publishes for the matched models.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(default, deny_unknown_fields)]
-pub struct VariantGroups {
-    pub all: BTreeMap<String, String>,
-    pub mason: BTreeMap<String, String>,
-    pub sidekick: BTreeMap<String, String>,
-    pub athena: BTreeMap<String, String>,
-    pub lab: BTreeMap<String, String>,
-    pub core: BTreeMap<String, String>,
-    pub codemode: BTreeMap<String, String>,
-    pub flow: BTreeMap<String, String>,
-    pub consumers: BTreeMap<String, BTreeMap<String, String>>,
-}
-
-impl VariantGroups {
-    /// Every group with its config name, `all` first.
-    pub fn named(&self) -> Vec<(&str, &BTreeMap<String, String>)> {
-        std::iter::once(("all", &self.all))
-            .chain(self.consumer_groups())
-            .collect()
-    }
-
-    pub fn consumer_groups(&self) -> Vec<(&str, &BTreeMap<String, String>)> {
-        [
-            ("mason", &self.mason),
-            ("sidekick", &self.sidekick),
-            ("athena", &self.athena),
-            ("lab", &self.lab),
-            ("core", &self.core),
-            ("codemode", &self.codemode),
-            ("flow", &self.flow),
-        ]
-        .into_iter()
-        .filter(|(name, _)| !self.consumers.contains_key(*name))
-        .chain(
-            self.consumers
-                .iter()
-                .map(|(name, entries)| (name.as_str(), entries)),
-        )
-        .collect()
-    }
-
-    pub fn maps_mut(&mut self) -> Vec<&mut BTreeMap<String, String>> {
-        [
-            &mut self.all,
-            &mut self.mason,
-            &mut self.sidekick,
-            &mut self.athena,
-            &mut self.lab,
-            &mut self.core,
-            &mut self.codemode,
-            &mut self.flow,
-        ]
-        .into_iter()
-        .chain(self.consumers.values_mut())
-        .collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.named().iter().all(|(_, group)| group.is_empty())
-    }
-
-    /// Shape checks that need no catalog: every key is a non-negated route spec
-    /// and every value is a single non-empty word.
-    pub fn validate(&self) -> Result<(), String> {
-        for (group, entries) in self.named() {
-            for (key, variant) in entries {
-                let spec = striatum_core::provider_model_spec::parse_spec(key);
-                if key.trim() != key || spec.is_none() || spec.is_some_and(|spec| spec.negated) {
-                    return Err(format!(
-                        "model_routing.variants.{group}: key {key:?} must be provider, provider/model or provider/model/variant"
-                    ));
-                }
-                if variant.is_empty() || variant.chars().any(char::is_whitespace) {
-                    return Err(format!(
-                        "model_routing.variants.{group}.{key}: variant {variant:?} must be one non-empty word"
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Ranking {
@@ -589,7 +501,6 @@ pub struct ConsumerPolicy {
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) ladder_source: Option<ConsumerLadderSource>,
-    pub variants: Option<BTreeMap<String, String>>,
     pub runner: Option<String>,
     /// Replaces the global runner list for this consumer and its dotted children, including when empty.
     #[serde(skip_serializing_if = "Option::is_none")]

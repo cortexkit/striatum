@@ -9,9 +9,7 @@
       "family": "claude",
       "maxOutputTokens": 64000,
       "modelID": "claude-opus-4-5",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 698.0,
@@ -29,9 +27,7 @@
       "family": "claude",
       "maxOutputTokens": 64000,
       "modelID": "claude-opus-4-6",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 1130.0,
@@ -49,9 +45,7 @@
       "family": "claude",
       "maxOutputTokens": 64000,
       "modelID": "claude-opus-4-7",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 1635.0,
@@ -69,9 +63,7 @@
       "family": "claude",
       "maxOutputTokens": 64000,
       "modelID": "claude-opus-4-8",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 1728.0,
@@ -89,9 +81,7 @@
       "family": "claude",
       "maxOutputTokens": 64000,
       "modelID": "claude-sonnet-4-6",
-      "promptDefaults": {
-        "variant": "max"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 637.0,
@@ -140,9 +130,7 @@
       "costTier": 3.0,
       "family": "gemini",
       "modelID": "antigravity-gemini-3.1-pro",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "google",
       "scores": {
         "elo": 1280.0,
@@ -159,9 +147,7 @@
       "costTier": 3.0,
       "family": "gemini",
       "modelID": "antigravity-gemini-3.5-flash",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "google",
       "scores": {
         "elo": 1345.0,
@@ -179,9 +165,7 @@
       "family": "gpt",
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.4",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1589.0,
@@ -199,9 +183,7 @@
       "family": "gpt",
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.4-mini",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 956.0,
@@ -219,9 +201,7 @@
       "family": "gpt",
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.5",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1690.0,
@@ -239,9 +219,7 @@
       "family": "grok",
       "maxOutputTokens": 32768,
       "modelID": "grok-4.3",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "xai",
       "scores": {
         "elo": 659.0,
@@ -274,9 +252,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-sol",
       "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1838.0,
@@ -295,9 +271,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-sol-pro",
       "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1838.0,
@@ -316,9 +290,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-terra",
       "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1685.0,
@@ -337,9 +309,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-terra-pro",
       "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1685.0,
@@ -358,9 +328,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-luna",
       "notes": "AA 2026-07-09 chart xhigh score rescaled via the 5.5 bridge (x1.341); re-snapshot promotes to the AA pipeline",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1621.0,
@@ -379,9 +347,7 @@
       "maxOutputTokens": 128000,
       "modelID": "gpt-5.6-luna-pro",
       "notes": "pro route: same price and same benchmarked iq as its sibling (AA does not cover pro), extended compute (slow). Structurally unroutable: same cost, loses the speed tiebreak: reserved for explicit Athena-v2 selection",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "openai",
       "scores": {
         "elo": 1621.0,
@@ -400,9 +366,7 @@
       "maxOutputTokens": 32768,
       "modelID": "grok-4.5",
       "notes": "AA Intelligence Index 54 (2026-07-08); eq curated; speed AA-measured 120 tok/s",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "xai",
       "scores": {
         "elo": 1649.0,
@@ -609,9 +573,7 @@
       "maxOutputTokens": 64000,
       "modelID": "claude-fable-5",
       "notes": "Real list price $10 in / $50 out (Ufuk, 2026-07-25)",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 1911.0,
@@ -717,9 +679,7 @@
       "family": "gemini",
       "modelID": "antigravity-gemini-3.6-flash",
       "notes": "Scores carried from antigravity-gemini-3.5-flash (retired to exclude list 2026-07-22)",
-      "promptDefaults": {
-        "variant": "high"
-      },
+      "promptDefaults": {},
       "providerID": "google",
       "scores": {
         "elo": 1410.0,
@@ -738,9 +698,7 @@
       "maxOutputTokens": 64000,
       "modelID": "claude-opus-5",
       "notes": "Ufuk curation 2026-07-25: iq one below Fable 5, eq equal to Fable 5; speed carried from opus-4-8",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "anthropic",
       "scores": {
         "elo": 1905.0,
@@ -809,9 +767,7 @@
       "maxOutputTokens": 32768,
       "modelID": "grok-4.6",
       "notes": "Ufuk curation 2026-08-13: elo 1798 (~4% below sol per his sizing, value his call); eq grok-4.5+50; speed, context, output ceiling carried from grok-4.5",
-      "promptDefaults": {
-        "variant": "xhigh"
-      },
+      "promptDefaults": {},
       "providerID": "xai",
       "scores": {
         "elo": 1798.0,
@@ -1051,19 +1007,17 @@
             "seatedVariants": [
               {
                 "reasoningVariant": "xhigh",
-                "reasoningVariantSource": "consumer",
+                "reasoningVariantSource": "workload_default",
                 "routeKey": "openai/gpt-6-astra",
                 "slot": 0,
                 "variant": "base"
               },
               {
-                "reasoningVariantSource": "curated",
                 "routeKey": "kimi-code-plan-global/k3",
                 "slot": 1,
                 "variant": "base"
               },
               {
-                "reasoningVariantSource": "curated",
                 "routeKey": "anthropic/b",
                 "slot": 2,
                 "variant": "base"
@@ -1258,26 +1212,24 @@
             "seatedVariants": [
               {
                 "reasoningVariant": "xhigh",
-                "reasoningVariantSource": "consumer",
+                "reasoningVariantSource": "workload_default",
                 "routeKey": "openai/gpt-6-astra",
                 "slot": 0,
                 "variant": "base"
               },
               {
-                "reasoningVariantSource": "curated",
                 "routeKey": "kimi-code-plan-global/k3",
                 "slot": 1,
                 "variant": "base"
               },
               {
                 "reasoningVariant": "high",
-                "reasoningVariantSource": "consumer",
+                "reasoningVariantSource": "workload_default",
                 "routeKey": "anthropic/a",
                 "slot": 2,
                 "variant": "base"
               },
               {
-                "reasoningVariantSource": "curated",
                 "routeKey": "xai/g",
                 "slot": 3,
                 "variant": "base"

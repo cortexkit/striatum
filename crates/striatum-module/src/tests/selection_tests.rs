@@ -114,15 +114,16 @@ fn prepared_inputs_price_and_reserve_every_candidate_on_the_held_configuration()
 fn prepare_selection_inputs_preserves_the_catalog_observed_speed_overlay() {
     let rig = Rig::new("selection-input-observed-speed");
     let store = Arc::new(rig.open_store());
-    let mut base = fact("observed-caller", "fixture");
-    base.prompt_defaults = Some(ModelPromptDefaults {
-        variant: Some("high".into()),
-        ..Default::default()
-    });
+    let base = fact("observed-caller", "fixture");
     let mut sibling = base.clone();
     sibling.variant = Some("low".into());
     store.upsert_fact(&base, FactSource::Override).unwrap();
     store.upsert_fact(&sibling, FactSource::Override).unwrap();
+    crate::routing_v1::effort_preview::seed_for_test(
+        rig.dir.join("store.db"),
+        "observed-caller/fixture",
+        crate::routing_v1::effort_preview::test_graded("high", &["low", "high"]),
+    );
 
     let observed_at = now_ms().saturating_sub(10_000) as f64;
     for index in 0..25 {
