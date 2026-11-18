@@ -7062,8 +7062,7 @@ impl crate::AccountTx<'_> {
             tx.execute(OPERATOR_CLEAR_ROUTE_BLOCKS,params![keys,at])?;
             tx.execute("UPDATE model_route_state SET updated_at=?4 WHERE route_key=?1 OR (?2 AND capacity_key=?3)",params![route_key,base,capacity,at])?;
             tx.execute(OPERATOR_CLEAR_PROVIDER_MODEL,params![provider,model])?;
-            tx.execute("UPDATE block SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
-                WHERE kind IN ('account_route','non_quota_route','transient_route') AND source_present=1 AND provider=?1 AND model=?2",params![provider,model,at])?;
+            tx.execute(&keyed_updates::operator_account_routes_sql(),params![provider,model,at])?;
             // Clearing one route also lifts the provider's credential-wide
             // billing wall, allowing an early retry as the operator requested.
             tx.execute("UPDATE block SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL

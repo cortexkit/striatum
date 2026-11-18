@@ -352,9 +352,10 @@ pub(crate) fn read_snapshot(
         unscoped: bool,
         cleared_models: Vec<String>,
     }
-    // Fetch both sets in one SQL statement, preserving route row order.
-    // derive_provider_key resolves each provider from the routing key;
-    // unrelated provider_id telemetry must not change another route's cause.
+    // Fetch `model_route_state` rows with their `route` and `failure` blocks,
+    // plus `provider` blocks for routes without their own quota or cooldown block.
+    // Preserve route rowid order and match provider blocks by the provider in
+    // `route_key`, not the reported `provider_id`.
     let (mut rows, providers) = (|| -> rusqlite::Result<_> {
         let mut statement = conn.prepare_cached("SELECT 0 AS record_kind,m.rowid,m.route_key,m.capacity_key,b.cooldown_until,b.quota_exhausted_until,
             m.quota_pressure,m.latency_ema_ms,m.success_ema,f.deadline,f.reason,m.last_error,

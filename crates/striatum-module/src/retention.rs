@@ -73,7 +73,8 @@ use crate::config_overrides::read_routing_config_value;
 pub const RETENTION_INTERVAL: Duration = Duration::from_secs(60);
 /// Most rows one batch deletes. Each batch is one short transaction.
 pub const RETENTION_BATCH_ROWS: usize = 256;
-/// Admission cleanup copies demand and latest-admission indexes as it deletes.
+/// Deleting an admission can copy affected shards of the in-memory demand
+/// index (by provider and account) and latest-admission index (by conversation).
 /// Eight keyed rows keep those writer commands below ten milliseconds on the
 /// live-sized admission fixture; candidate discovery runs on a pooled reader.
 pub const ADMISSION_DELETE_BATCH_ROWS: usize = 8;
@@ -376,6 +377,8 @@ pub struct RetentionPassReport {
     pub account_continuations: usize,
     pub speed_samples: usize,
     pub routing_call_counts: usize,
+    /// Physical rows deleted across retired blocks, rows for absent sources,
+    /// and the retirement archive.
     pub retired_fence_origins: usize,
     pub unscored_admissible_models: usize,
     pub quota_readings: usize,
@@ -919,6 +922,87 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 
 #[cfg(test)]
 mod tests {
+    fn seed_carbon_retention_rows(
+        store: &SqliteRouteStateStore,
+        residue: usize,
+        retired: usize,
+        archive: usize,
+    ) {
+        store.with_writer_for_test(|conn| {
+            for index in 0..residue {
+                conn.execute("INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,quota,next_recheck_at,source_present,managed,cleared_by,cleared_at)
+                    VALUES ('credential',json_array('drain-p',?1),'drain-p',?1,'residue',0,0,0,0,0,'removed',?2)",rusqlite::params![format!("c-{index}"),NOW-31*DAY_MS])?;
+            }
+            for index in 0..retired {
+                conn.execute("INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,next_recheck_at,source_present,managed,cleared_by,cleared_at,deadline,cooldown_until,observed_at)
+                    VALUES ('route',json_array(?1),'drain-p',?1,json_array(?2,NULL,?2),?2,0,?2,0,0,'retired',?2,?2,?2,?2)",rusqlite::params![format!("drain-p/retired-{index}"),NOW-31*DAY_MS])?;
+            }
+            for index in 0..archive {
+                conn.execute("INSERT INTO retirement_tombstone VALUES ('route',json_array(?1),'archive',0,?2)",rusqlite::params![format!("drain-p/archive-{index}"),NOW-31*DAY_MS])?;
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn residue_only_retention_drains_multiple_batches_even_without_archive_rows() {
+        let (dir, path, store) = scratch_store("residue-drain-count");
+        seed_carbon_retention_rows(&store, 600, 0, 0);
+        let budget = PassBudget {
+            batch_rows: 256,
+            detail_batch_rows: 256,
+            max_detail_batches: 1,
+            max_batches_per_table: 16,
+            max_shadow_purge_batches: 1,
+            pause: Duration::ZERO,
+        };
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &budget);
+        assert_eq!(
+            count(
+                &path,
+                "SELECT count(*) FROM block WHERE cleared_by='removed'"
+            ),
+            0,
+            "an empty archive table must not stop collection while residue fills another batch"
+        );
+        assert_eq!(
+            report.retired_fence_origins, 600,
+            "retention reports every deleted physical record, not only archive rows"
+        );
+        assert!(report.drained);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_retention_relations_share_one_physical_row_budget_per_transaction() {
+        let (dir, path, store) = scratch_store("retention-shared-budget");
+        seed_carbon_retention_rows(&store, 300, 300, 300);
+        store.account_transaction(|_| Ok(())).unwrap();
+        let total = || {
+            count(
+                &path,
+                "SELECT (SELECT count(*) FROM block)+(SELECT count(*) FROM retirement_tombstone)",
+            )
+        };
+        let before = total();
+        let held_before = store.writer_hold_ns_for_test();
+        let deleted = store
+            .prune_retired_fence_origins(NOW - 30 * DAY_MS, 256)
+            .unwrap();
+        let held_ns = store.writer_hold_ns_for_test() - held_before;
+        eprintln!("retention_full_budget limit=256 deleted={deleted} writer_hold_ns={held_ns} queue_time_excluded=true");
+        let physical = before - total();
+        assert!(physical<=256,"one writer command gets one shared physical-row budget, not one per relation: {physical}");
+        assert_eq!(
+            deleted, physical as usize,
+            "the public count is the complete transaction's actual deletion count"
+        );
+        assert_eq!(deleted, 256);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use serde_json::json;
     use striatum_store::{dev_descriptor, AccountDecisionRecord, AccountObservationRow};
@@ -1728,9 +1812,10 @@ mod tests {
         );
         assert_eq!(left("routing_v1_affinity", "affinity"), ["warm"]);
 
-        // Used moves remain fork bindings while their parent admission is
-        // retained. Age the finished admissions past their thirty-day window
-        // before expecting the old move and its replay records to retire.
+        // Keep an `account_continue` row with `used_at_ms` set while its parent
+        // `account_admission` exists, so the parent cannot start a second
+        // successor. Age the finished admissions past thirty days before
+        // expecting the continuation and its replay records to be deleted.
         let history_old = NOW - 31 * DAY_MS;
         connection
             .execute_batch(&format!(

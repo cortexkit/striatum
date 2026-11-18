@@ -260,7 +260,7 @@ pub(crate) enum ProbeBinding {
 #[derive(Clone, Debug)]
 pub(crate) struct AccountBlock {
     pub reset_at_ms: Option<i64>,
-    /// A status check for another request's test, not a change to its clock.
+    /// When to check again if another request is testing whether the account can serve traffic.
     pub test_check_at_ms: Option<i64>,
     pub lifetime: striatum_core::blocks::LifetimeClass,
     pub credential_code: Option<String>,
@@ -327,6 +327,7 @@ struct RequestIndexes {
     blocks: std::sync::OnceLock<BlockIndex>,
     readings: std::sync::OnceLock<ReadingIndex>,
     rechecks: std::sync::OnceLock<RecheckIndex>,
+    facts: std::sync::OnceLock<fact_index::FactIndex>,
     probe_holds: std::sync::Mutex<std::collections::HashMap<ProbeHoldKey, i64>>,
 }
 
@@ -630,7 +631,9 @@ impl ClassContext {
     }
 }
 
+mod fact_index;
 mod probe_reservations;
+pub(crate) mod recovery_view;
 mod retry_hints;
 
 #[cfg(test)]
@@ -920,6 +923,7 @@ impl ClassContext {
         self.facts
             .retain(|fact| fact.provider_id != provider || fact.model_id != model);
         self.facts.push(fact);
+        self.indexes.facts.take();
         self.media_route = true;
         Ok(())
     }
@@ -2501,10 +2505,7 @@ impl ClassContext {
         model: &str,
         priced_per_token: bool,
     ) -> (RosterBuild, BTreeMap<String, i64>) {
-        let fact = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let fact = self.fact_for(provider, model);
         let fenced = self.route_fenced_accounts(provider, model);
         let mut skipped = BTreeMap::new();
         let mut accounts: BTreeMap<String, AccountView> = BTreeMap::new();
@@ -2733,7 +2734,7 @@ impl ClassContext {
             provider,
             model,
             priced,
-            self.config.allocator_policy_ref(provider).clone(),
+            self.config.allocator_policy_ref(provider),
         )
     }
 
@@ -2755,6 +2756,8 @@ impl ClassContext {
             .and_then(|block| block.reset_at_ms)
     }
 
+    /// One route's recovery in a fresh [`recovery_view::RecoveryView`]. A caller
+    /// reading several routes builds the view once and reads each from it.
     pub(crate) fn account_recovery_with_keep_free(
         &self,
         provider: &str,
@@ -2762,36 +2765,8 @@ impl ClassContext {
         priced: bool,
         keep_free: f64,
     ) -> Option<AccountBlock> {
-        let mut recovered = self.clone();
-        recovered.replace_refusals(
-            self.refusals
-                .iter()
-                .filter(|refusal| {
-                    !self.rechecks.iter().any(|origin| {
-                        origin.quota
-                            && origin.kind == "credential"
-                            && origin.provider == refusal.provider_id
-                            && origin.credential_id.as_deref()
-                                == Some(refusal.credential_id.as_str())
-                    })
-                })
-                .cloned()
-                .collect(),
-        );
-        recovered.replace_rechecks(
-            self.rechecks
-                .iter()
-                .filter(|origin| !origin.quota)
-                .cloned()
-                .collect(),
-        );
-        // The settings keep-free margin for workers (`keep_free_percent`) can
-        // exceed the allocator's own reserve.
-        // Apply it only to this recovery probe, so a weekly reset that frees
-        // that margin is diagnosed without changing account admission policy.
-        let mut policy = self.config.allocator_policy_ref(provider).clone();
-        policy.reserve_seven_day = policy.reserve_seven_day.max(keep_free);
-        recovered.blocked_account_with_policy(provider, model, priced, policy)
+        self.recovery_view(keep_free)
+            .account_recovery(provider, model, priced)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3246,10 +3221,7 @@ impl ClassContext {
                 crate::credential_fences::probe_note(provider, &row.id),
             );
         }
-        let class = self
-            .facts
-            .iter()
-            .find(|fact| fact.provider_id == provider && fact.model_id == model);
+        let class = self.fact_for(provider, model);
         if let Some(fact) = class {
             let serving = self.serving_index.fact(
                 &self.config,
@@ -6903,10 +6875,7 @@ fn empty_roster_refusal(
             }),
         ))
     };
-    let fact = classes
-        .facts
-        .iter()
-        .find(|fact| fact.provider_id == provider && fact.model_id == model);
+    let fact = classes.fact_for(provider, model);
     let route_class = fact.map(|fact| classes.class(fact, priced));
     let paid_rows = if params.is_some_and(|params| params.model_decision_id.is_none())
         && route_class.as_ref().is_some_and(|class| class.subscription)

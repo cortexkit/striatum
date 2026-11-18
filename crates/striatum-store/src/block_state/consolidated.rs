@@ -427,6 +427,7 @@ impl BlockState {
                 .map_err(crate::err)?;
         for block in &mut loaded.blocks {
             self.pending_claim_history(block);
+            block.cleared_models.sort();
         }
         loaded
             .blocks
@@ -460,6 +461,9 @@ impl BlockState {
         else {
             return;
         };
+        // Model clears belong to this source evidence even before its first
+        // clock registration; operators see them before periodic synchronization.
+        block.cleared_models = row.cleared_models.clone();
         let Some(claimed) = row.block.last_claimed_at else {
             return;
         };
@@ -1124,7 +1128,7 @@ impl BlockState {
     pub fn routes_stamped_by_provider(
         &self,
         provider: &str,
-        evidence_at: i64,
+        observed_at: i64,
         admitted_at: i64,
     ) -> Vec<(
         String,
@@ -1142,8 +1146,8 @@ impl BlockState {
                     && row.block.kind == "route"
                     && row.block.scope.provider == provider
                     && row.scope_error == covering.scope_error
-                    && row.block.evidence_at == evidence_at
-                    && evidence_at < admitted_at
+                    && row.observed_at == Some(observed_at)
+                    && observed_at < admitted_at
                     && row.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                         <= covering.cooldown_until.map(SqlReal::as_f64).unwrap_or(0.0)
                     && row
@@ -1163,7 +1167,7 @@ impl BlockState {
                     row.scope_error
                         .clone()
                         .map_or(rusqlite::types::Value::Null, rusqlite::types::Value::Text),
-                    rusqlite::types::Value::Integer(row.block.evidence_at),
+                    rusqlite::types::Value::Integer(observed_at),
                 ))
             })
             .collect()
@@ -1298,8 +1302,12 @@ impl BlockState {
                 let json = serde_json::to_string(value).expect("a string is valid JSON");
                 format!("[{}", &json[..json.len() - 1])
             };
-            let mut sql = conn.prepare_cached(&format!("{} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK))?
-                .query_map([prefix_bound(&prefix),prefix_bound(&upper)],|row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut sql = conn
+                .prepare_cached(&credential_quota_check_sql())?
+                .query_map([prefix_bound(&prefix), prefix_bound(&upper)], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             let mut state: Vec<_> = self
                 .block_rows()
                 .filter(|row| {
@@ -1389,7 +1397,13 @@ impl BlockState {
             .iter()
             .map(|id| serde_json::json!(["fence", id]).to_string())
             .collect();
-        self.compare_rows(conn,2,&format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2)),[provider],scopes.iter().flat_map(|scope| self.tables[2].scoped(scope)))
+        self.compare_rows(
+            conn,
+            2,
+            &success_provider_check_sql(),
+            [provider],
+            scopes.iter().flat_map(|scope| self.tables[2].scoped(scope)),
+        )
     }
 
     pub fn check_exclusions(
@@ -1566,6 +1580,14 @@ fn provider_check_sql(table: usize, column: &str) -> String {
     )
 }
 
+fn success_provider_check_sql() -> String {
+    format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block INDEXED BY block_held_provider WHERE {} AND kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2),block_storage::HELD_SQL)
+}
+
+fn credential_quota_check_sql() -> String {
+    format!("{} SELECT origin_key FROM block INDEXED BY block_held_identity WHERE {} AND kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key",super::STATE_CHECK,block_storage::HELD_SQL)
+}
+
 fn select(table: usize) -> String {
     match table {
         0 => block_storage::select(),
@@ -1680,9 +1702,9 @@ pub(super) fn reviewed_exempt_reads() -> Vec<String> {
     let mut reads=vec![
         format!("{mark} {} WHERE kind=?1 AND origin_key=?2",select(0)),
         format!("{mark} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
-        format!("{mark} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key"),
+        credential_quota_check_sql(),
         principal_clock_check_sql(),
-        format!("{mark} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",select(2)),
+        success_provider_check_sql(),
         format!("{mark} {} WHERE kind='principal' AND principal=?1 AND admission_id=?2",select(0)),
     ];
     reads.extend(

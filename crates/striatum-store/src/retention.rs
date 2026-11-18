@@ -597,9 +597,12 @@ impl SqliteRouteStateStore {
         })
     }
 
-    /// Delete at most `limit` archived fence origins retired before `before`,
-    /// oldest first. The archive's trigger acts only when a row is inserted;
-    /// deleting one changes no enforcement.
+    /// Delete at most `limit` physical rows in total across retired blocks,
+    /// absent-source residue and the retirement archive, older than `before`.
+    /// The returned count includes every relation so a full batch tells the
+    /// retention drain to continue. These rows can no longer block routing.
+    /// Account fence ids stay stored so a delayed repeat of the same fence
+    /// cannot insert it again.
     pub fn prune_retired_fence_origins(
         &self,
         before: i64,
@@ -1191,23 +1194,25 @@ impl crate::AccountTx<'_> {
         let _writer_entry =
             crate::writer_entry_trace::enter("account_tx::retention::prune_retired_fence_origins");
         self.retention_write(|tx| {
-            // A cleared account fence's id remains a replay barrier forever,
-            // as on the old schema. Only absent, non-held non-account residue
-            // joins the existing age cutoff and short per-relation batches.
-            tx.execute(
-                &crate::block_storage::keyed_updates::retired_block_prune_sql(),
-                params![before, limit_param(limit)],
-            )?;
-            tx.execute(
-                &crate::block_storage::keyed_updates::inactive_block_prune_sql(),
-                params![before, limit_param(limit)],
-            )?;
-            tx.execute(
+            // Never prune account block rows: even a cleared fence ID must
+            // prevent replay. Delete other eligible rows in age-limited batches.
+            let statements = [
+                crate::block_storage::keyed_updates::retired_block_prune_sql(),
+                crate::block_storage::keyed_updates::inactive_block_prune_sql(),
                 "DELETE FROM retirement_tombstone WHERE rowid IN ( \
                    SELECT rowid FROM retirement_tombstone INDEXED BY retirement_tombstone_time \
-                   WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)",
-                params![before, limit_param(limit)],
-            )
+                   WHERE retired_at < ?1 ORDER BY retired_at LIMIT ?2)"
+                    .to_owned(),
+            ];
+            let mut deleted = 0;
+            for sql in statements {
+                let remaining = limit.saturating_sub(deleted);
+                if remaining == 0 {
+                    break;
+                }
+                deleted += tx.execute(&sql, params![before, limit_param(remaining)])?;
+            }
+            Ok(deleted)
         })
     }
 }

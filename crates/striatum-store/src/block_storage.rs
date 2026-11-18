@@ -13,7 +13,7 @@ pub(crate) mod keyed_updates;
 pub(crate) const HELD_SQL: &str =
     "(cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')";
 
-// Account fence ids are permanent replay barriers, as on the old schema.
+// Keep account block rows so a cleared fence ID cannot be replayed.
 // A source still held (including a sparse observation clock) is not garbage.
 pub(crate) const COLLECTIBLE_SQL: &str = "source_present=0 AND kind!='account' AND (cleared_by='removed' OR (cleared_by='kept' AND kind!='observation'))";
 
@@ -26,8 +26,9 @@ pub(crate) const CLOCK_NORMALIZATION_BODY: &str =
 
 #[cfg(any(test, feature = "test-support"))]
 impl crate::SqliteRouteStateStore {
-    /// Test and maintenance validation of physical clock fields that the
-    /// bounded state intentionally drops. This is not a request-path reader.
+    /// Check that `block_clock_drop` resets `managed`, `claim_owner`,
+    /// `last_claimed_at`, and `claim_generation` for absent or non-origin
+    /// sources other than observations. Request-path state omits these clocks.
     pub fn assert_canonical_block_clocks_for_test(&self) -> crate::RouteStateResult<()> {
         let sql=format!("{} SELECT kind,origin_key,managed,claim_owner,last_claimed_at,claim_generation FROM block
             WHERE kind!='observation' AND (source_present=0 OR is_origin=0)
@@ -231,9 +232,8 @@ pub(crate) const NEXT_SOURCE_ORDER: &str = "/* writer bookkeeping: next source o
             COALESCE((SELECT MAX(source_order) FROM block WHERE kind='transient_route'),0))+1
     ELSE COALESCE((SELECT MAX(source_order) FROM block WHERE kind=?1),0)+1 END";
 
-/// Route source order is the live catalogue row's rowid.
-/// Refusals arriving later must not reorder established routes. This
-/// exact keyed metadata lookup is writer-only insertion-order bookkeeping.
+/// Use the `model_route_state` rowid as `source_order` so recording a route
+/// refusal does not change the order in which routes are scanned.
 pub(crate) const ROUTE_SOURCE_ORDER: &str =
     "SELECT rowid FROM model_route_state WHERE route_key=json_extract(?1,'$[0]')";
 
@@ -288,19 +288,16 @@ pub(crate) fn is_observation_retirement_insert(sql: &str) -> bool {
     sql == source_insert_sql("observation")
 }
 
-/// Record refusal evidence. The keyed register in the same command schedules
-/// new evidence using its prior claim time; an unchanged signature keeps its
-/// classification, claim and heal.
-/// Observation receipts also reject evidence no newer than a retired generation
-/// of the same origin. Retirement rows are not loaded, so that check is a keyed
-/// guard of this insert rather than a request-side state read.
+/// Write refusal evidence to `block`. For an already managed row with matching
+/// `evidence`, keep its classification, claim owner, and cleared state.
+/// `fence_rechecks::register_on` schedules rechecks using the prior claim time.
+/// An observation insert is skipped if a `retirement_tombstone` with the same
+/// `kind` and `origin_key` has an equal or later `evidence_at`.
 pub(crate) fn write_source(conn: &Connection, row: &StoredBlock) -> rusqlite::Result<usize> {
     let block = &row.block;
     let scope = &block.scope;
     let source_order = if row.source_order == 0 {
         if block.kind == "route" {
-            // Catalogue rows exist before their first refusal. Later reports
-            // must keep that established scan order, not refusal-arrival order.
             conn.query_row(ROUTE_SOURCE_ORDER, [&block.origin_key], |row| {
                 row.get::<_, i64>(0)
             })?

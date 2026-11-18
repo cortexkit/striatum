@@ -1,7 +1,5 @@
 //! Writer statements shared with the query-plan regressions. Keeping the actual
 //! statements here lets tests inspect the writers' keys, not copied test SQL.
-//! Credential updates name their partial index so the planner cannot substitute
-//! a kind-only search that visits every live credential instead of one id.
 
 pub(crate) fn rebind_claim_owner_sql() -> String {
     format!(
@@ -17,6 +15,13 @@ pub(crate) fn bind_claim_owner_sql() -> String {
     )
 }
 
+pub(crate) fn operator_account_routes_sql() -> String {
+    format!("UPDATE block INDEXED BY block_held_provider SET source_present=0,cleared_at=?3,cleared_by='removed',claim_owner=NULL
+        WHERE {} AND kind IN ('account_route','non_quota_route','transient_route') AND source_present=1 AND provider=?1 AND model=?2",super::HELD_SQL)
+}
+
+// Use `block_held_credential` here and in the other credential updates below
+// so SQLite seeks by `credential_id` instead of scanning every row of a `kind`.
 pub(crate) fn clear_credential_sql() -> String {
     format!(
         "UPDATE block INDEXED BY block_held_credential SET source_present=0,cleared_at=?2,cleared_by='removed',claim_owner=NULL

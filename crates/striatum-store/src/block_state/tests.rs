@@ -5537,3 +5537,6 @@ fn route_source_order_bookkeeping_does_not_exempt_unkeyed_or_request_reads() {
         "real route-source writer must record its exact lookup: {writer:#?}"
     );
 }
+
+#[path = "carbon/tests.rs"]
+mod carbon;

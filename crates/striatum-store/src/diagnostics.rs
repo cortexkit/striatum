@@ -213,12 +213,7 @@ impl SqliteRouteStateStore {
     pub fn diagnostic_account_blocks(&self) -> RouteStateResult<Vec<DiagnosticAccountBlock>> {
         self.store
             .with_conn(|c: &Connection| {
-                let mut statement = c.prepare(
-                    "SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
-                             json_extract(source_metadata_json,'$.fence_json'),json_extract(source_metadata_json,'$.source'),observed_at,created_at
-                      FROM block WHERE kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
-                      ORDER BY created_at,json_extract(origin_key,'$[0]')",
-                )?;
+                let mut statement = c.prepare(&account_blocks_sql())?;
                 let rows = statement.query_map([], |row| {
                     Ok(DiagnosticAccountBlock {
                         fence_id: row.get(0)?,
@@ -616,4 +611,11 @@ mod tests {
         assert!(pinned(&head));
         assert!(!pinned(&chosen), "a scored choice is not a pin");
     }
+}
+
+pub(crate) fn account_blocks_sql() -> String {
+    format!("SELECT json_extract(origin_key,'$[0]'),provider,account_id,pool_key_json,
+        json_extract(source_metadata_json,'$.fence_json'),json_extract(source_metadata_json,'$.source'),observed_at,created_at
+        FROM block INDEXED BY block_held_identity WHERE {} AND kind='account' AND is_origin=1 AND source_present=1 AND cleared_at IS NULL
+        ORDER BY created_at,json_extract(origin_key,'$[0]')",crate::block_storage::HELD_SQL)
 }

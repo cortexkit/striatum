@@ -571,8 +571,9 @@ fn fork_used_binding_sql() -> String {
 }
 
 impl AccountTx<'_> {
-    /// The parent lookup also reports whether its run moved. That keyed
-    /// existence check avoids a second statement for a closed unmoved run.
+    /// Fetch the parent admission and whether any of its `account_continue`
+    /// rows has `used_at_ms` set, so a closed parent without a used continuation
+    /// needs no second lookup.
     pub fn fork_parent_by_key(
         &self,
         principal: &str,
@@ -593,7 +594,8 @@ impl AccountTx<'_> {
             .map_err(err)
     }
 
-    /// A closed moved parent's latest used reservation, in one keyed statement.
+    /// Fetch the `account_admission` named by the parent's latest
+    /// `account_continue.reservation_id` among rows with `used_at_ms` set.
     pub fn fork_used_binding_by_key(
         &self,
         principal: &str,

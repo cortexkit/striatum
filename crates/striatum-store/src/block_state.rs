@@ -37,12 +37,19 @@ pub(crate) fn sql_fingerprints(conn: &Connection) -> rusqlite::Result<Vec<(usize
 }
 
 pub(crate) fn fingerprint_sql(table: usize, name: &str) -> String {
+    // This narrow index contains exactly the loaded block rows; additional
+    // source-key indexes must not change the periodic fingerprint's scan path.
+    let index = if table == 0 {
+        " INDEXED BY block_held_provider"
+    } else {
+        ""
+    };
     let held = match table {
         0 => crate::block_storage::HELD_SQL,
         3 => "0",
         _ => "1",
     };
-    format!("{MAINTENANCE_READ} SELECT count(*),max(rowid) FROM {name} WHERE {held}")
+    format!("{MAINTENANCE_READ} SELECT count(*),max(rowid) FROM {name}{index} WHERE {held}")
 }
 
 #[cfg(any(test, feature = "test-support"))]

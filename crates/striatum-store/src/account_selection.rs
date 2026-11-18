@@ -2569,10 +2569,9 @@ impl AccountTx<'_> {
         if !crate::fence_rechecks::enabled(self.conn).map_err(err)? {
             return Ok(());
         }
-        // One observation may name an account more than once. Its last
-        // effect wins, while first occurrence fixes insertion order. Reduce
-        // before writing so a replay cannot temporarily replace a healed
-        // evidence signature and accidentally re-arm its clock.
+        // For each (provider, account), keep the last backoff effect in the
+        // first effect's position. On replay, writing an earlier effect first
+        // would change `block.evidence` and discard any recorded clearance.
         let effects = self
             .conn
             .prepare(TRANSIENT_BACKOFF_EFFECTS_SQL)
@@ -2609,8 +2608,7 @@ impl AccountTx<'_> {
                 .map_err(err)?;
             if state
                 .block("observation", &key)
-                .filter(|row| row.source_present)
-                .and_then(|row| row.observed_at)
+                .map(|row| row.observed_at.unwrap_or(row.block.evidence_at))
                 .is_some_and(|prior| prior > at)
             {
                 continue;
@@ -3295,10 +3293,10 @@ impl crate::AccountTx<'_> {
     }
 }
 
-/// Read the effects of one bound observation by its replay key. Evidence
-/// signatures include the effect key and body as their original stored TEXT.
-/// Empty-string concatenation removes JSON subtypes so the outer array quotes
-/// both values, matching the original two-column origin signature.
+/// Read the transient backoff effects of one bound `account_observation`.
+/// Build `block.evidence` from `[observation_id, e.key]` (where `e.key` is the
+/// effect's array index) and `e.value` (its JSON body). Concatenating `''`
+/// makes SQLite quote both values as strings in the outer array.
 pub(crate) const TRANSIENT_BACKOFF_EFFECTS_SQL: &str = "SELECT json_extract(e.value,'$.provider'),json_extract(e.value,'$.account_id'),MIN(json_extract(e.value,'$.retry_at_ms'),o.received_at+3600000),
                 o.received_at,json_array(json_array(o.observation_id,e.key) || '',e.value || '')
             FROM account_observation o,json_each(CASE WHEN json_valid(?2) THEN ?2 ELSE '[]' END) e
