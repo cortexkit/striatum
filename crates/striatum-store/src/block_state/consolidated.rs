@@ -1389,7 +1389,13 @@ impl BlockState {
             .iter()
             .map(|id| serde_json::json!(["fence", id]).to_string())
             .collect();
-        self.compare_rows(conn,2,&format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2)),[provider],scopes.iter().flat_map(|scope| self.tables[2].scoped(scope)))
+        self.compare_rows(
+            conn,
+            2,
+            &success_provider_check_sql(),
+            [provider],
+            scopes.iter().flat_map(|scope| self.tables[2].scoped(scope)),
+        )
     }
 
     pub fn check_exclusions(
@@ -1566,6 +1572,10 @@ fn provider_check_sql(table: usize, column: &str) -> String {
     )
 }
 
+fn success_provider_check_sql() -> String {
+    format!("{} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",super::STATE_CHECK,select(2))
+}
+
 fn select(table: usize) -> String {
     match table {
         0 => block_storage::select(),
@@ -1682,7 +1692,7 @@ pub(super) fn reviewed_exempt_reads() -> Vec<String> {
         format!("{mark} SELECT {} FROM block WHERE kind=?1 AND origin_key=?2 AND is_origin=1 AND managed=1 AND (cleared_by IS NULL OR cleared_by='kept') AND (source_present=1 OR kind='observation')",block_storage::CLOCK_COLUMNS),
         format!("{mark} SELECT origin_key FROM block WHERE kind='account' AND origin_key>=?1 AND origin_key<?2 AND source_present=1 ORDER BY origin_key"),
         principal_clock_check_sql(),
-        format!("{mark} {} WHERE fence_id IN (SELECT json_extract(origin_key,'$[0]') FROM block WHERE kind='account' AND provider=?1 AND source_present=1)",select(2)),
+        success_provider_check_sql(),
         format!("{mark} {} WHERE kind='principal' AND principal=?1 AND admission_id=?2",select(0)),
     ];
     reads.extend(

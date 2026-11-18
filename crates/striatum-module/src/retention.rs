@@ -919,6 +919,87 @@ pub async fn retention_loop(store: Arc<SqliteRouteStateStore>, config_path: Path
 
 #[cfg(test)]
 mod tests {
+    fn seed_carbon_retention_rows(
+        store: &SqliteRouteStateStore,
+        residue: usize,
+        retired: usize,
+        archive: usize,
+    ) {
+        store.with_writer_for_test(|conn| {
+            for index in 0..residue {
+                conn.execute("INSERT INTO block(kind,origin_key,provider,credential_id,evidence,evidence_at,quota,next_recheck_at,source_present,managed,cleared_by,cleared_at)
+                    VALUES ('credential',json_array('drain-p',?1),'drain-p',?1,'residue',0,0,0,0,0,'removed',?2)",rusqlite::params![format!("c-{index}"),NOW-31*DAY_MS])?;
+            }
+            for index in 0..retired {
+                conn.execute("INSERT INTO block(kind,origin_key,provider,model,evidence,evidence_at,quota,next_recheck_at,source_present,managed,cleared_by,cleared_at,deadline,cooldown_until,observed_at)
+                    VALUES ('route',json_array(?1),'drain-p',?1,json_array(?2,NULL,?2),?2,0,?2,0,0,'retired',?2,?2,?2,?2)",rusqlite::params![format!("drain-p/retired-{index}"),NOW-31*DAY_MS])?;
+            }
+            for index in 0..archive {
+                conn.execute("INSERT INTO retirement_tombstone VALUES ('route',json_array(?1),'archive',0,?2)",rusqlite::params![format!("drain-p/archive-{index}"),NOW-31*DAY_MS])?;
+            }
+            Ok(())
+        }).unwrap();
+    }
+
+    #[test]
+    fn residue_only_retention_drains_multiple_batches_even_without_archive_rows() {
+        let (dir, path, store) = scratch_store("residue-drain-count");
+        seed_carbon_retention_rows(&store, 600, 0, 0);
+        let budget = PassBudget {
+            batch_rows: 256,
+            detail_batch_rows: 256,
+            max_detail_batches: 1,
+            max_batches_per_table: 16,
+            max_shadow_purge_batches: 1,
+            pause: Duration::ZERO,
+        };
+        let report = run_retention_pass(&store, &RetentionWindows::default(), NOW, &budget);
+        assert_eq!(
+            count(
+                &path,
+                "SELECT count(*) FROM block WHERE cleared_by='removed'"
+            ),
+            0,
+            "an empty archive table must not stop collection while residue fills another batch"
+        );
+        assert_eq!(
+            report.retired_fence_origins, 600,
+            "retention reports every deleted physical record, not only archive rows"
+        );
+        assert!(report.drained);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_retention_relations_share_one_physical_row_budget_per_transaction() {
+        let (dir, path, store) = scratch_store("retention-shared-budget");
+        seed_carbon_retention_rows(&store, 300, 300, 300);
+        store.account_transaction(|_| Ok(())).unwrap();
+        let total = || {
+            count(
+                &path,
+                "SELECT (SELECT count(*) FROM block)+(SELECT count(*) FROM retirement_tombstone)",
+            )
+        };
+        let before = total();
+        let held_before = store.writer_hold_ns_for_test();
+        let deleted = store
+            .prune_retired_fence_origins(NOW - 30 * DAY_MS, 256)
+            .unwrap();
+        let held_ns = store.writer_hold_ns_for_test() - held_before;
+        eprintln!("retention_full_budget limit=256 deleted={deleted} writer_hold_ns={held_ns} queue_time_excluded=true");
+        let physical = before - total();
+        assert!(physical<=256,"one writer command gets one shared physical-row budget, not one per relation: {physical}");
+        assert_eq!(
+            deleted, physical as usize,
+            "the public count is the complete transaction's actual deletion count"
+        );
+        assert_eq!(deleted, 256);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     use super::*;
     use serde_json::json;
     use striatum_store::{dev_descriptor, AccountDecisionRecord, AccountObservationRow};

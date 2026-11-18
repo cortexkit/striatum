@@ -452,3 +452,72 @@ fn source_order_allocation_uses_covering_max_seeks_even_with_account_history() {
         })
         .unwrap();
 }
+
+fn provider_check_vm_steps(conn: &Connection, provider: &str) -> rusqlite::Result<usize> {
+    let state = BlockState::load(conn)?;
+    let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = steps.clone();
+    conn.progress_handler(
+        1,
+        Some(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    );
+    let result = state.check_provider_rows(conn, provider);
+    conn.progress_handler(0, None::<fn() -> bool>);
+    result?;
+    Ok(steps.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+#[test]
+fn full_provider_check_does_not_materialize_permanent_history_with_zero_or_one_success_proof() {
+    let (_scratch, store, now) = fixture("whole-provider-history-check");
+    let proof = store
+        .with_writer_for_test(|conn| {
+            let proof = conn.query_row(
+                "SELECT fence_id,pool_key_json,evidence_at,healed_at FROM success_proof LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            conn.execute("DELETE FROM success_proof", [])?;
+            Ok(proof)
+        })
+        .unwrap();
+    let before = store
+        .with_reader_for_test(|conn| provider_check_vm_steps(conn, "cpu-provider-0"))
+        .unwrap();
+    store
+        .with_writer_for_test(|conn| seed_account_history(conn, now))
+        .unwrap();
+    for restore in [false, true] {
+        if restore {
+            store
+                .with_writer_for_test(|conn| {
+                    conn.execute(
+                        "INSERT INTO success_proof VALUES (?1,?2,?3,?4)",
+                        rusqlite::params![proof.0, proof.1, proof.2, proof.3],
+                    )
+                })
+                .unwrap();
+        }
+        let after = store
+            .with_reader_for_test(|conn| provider_check_vm_steps(conn, "cpu-provider-0"))
+            .unwrap();
+        eprintln!("full provider check baseline_vm_steps={before} history10000_vm_steps={after} success_proof={}",usize::from(restore));
+        assert!(after<before+1000,"every SQL statement in the real provider check must stay independent of permanent history, including empty proof sets: before={before}, after={after}, proof={restore}");
+    }
+    store
+        .with_reader_for_test(|conn| {
+            keyed_plan(conn, &success_provider_check_sql(), "block_held_provider");
+            Ok(())
+        })
+        .unwrap();
+}
